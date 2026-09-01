@@ -1368,15 +1368,6 @@ class GuangYaClient:
                 self._save_token()
             return self.token_status(valid=True)
 
-    def refresh(self) -> bool:
-        """兼容旧调用：显式刷新成功返回 True。"""
-        try:
-            self.refresh_now()
-            return True
-        except Exception as e:
-            logger.error("光鸭 token 刷新失败 type=%s", type(e).__name__)
-            return False
-
     def validate(self) -> bool:
         """执行只读校验；不主动刷新，也阻止 SDK 在到期或 401 时刷新。"""
         if self._invalidate_if_stale():
@@ -1732,15 +1723,6 @@ class GuangYaClient:
             ),
             "count": 0,
         }
-
-    def transfer_share(self, share_url: str, target_dir_id: str) -> dict:
-        """兼容旧调用：解析分享并转存全部顶层文件。"""
-        inspected = self.inspect_share(share_url)
-        return self.restore_share(
-            inspected["access_token"],
-            [item["id"] for item in inspected["files"]],
-            target_dir_id,
-        )
 
     # ===== 秒传 JSON =====
     def generate_gcid_json(self, source_dir_id: str, source_name: str = "") -> dict:

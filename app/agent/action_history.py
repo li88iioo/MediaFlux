@@ -57,12 +57,9 @@ _TOOL_LABELS = {
     "strm.run_once": "STRM 手动同步",
     "strm.set_schedule_policy": "STRM 调度策略修改",
     "guangya.organize.set_schedule_policy": "光鸭定时整理策略修改",
-    "guangya.change_plan.execute": "光鸭声明式改名执行",
-    "guangya.media_hygiene.execute": "光鸭媒体名称清理",
     "guangya.rename.execute": "光鸭重命名执行",
     "guangya.directory_scrape.run": "光鸭目录刮削执行",
     "guangya.organize.run_once": "光鸭整理任务",
-    "guangya.organize.clean_empty": "光鸭空目录清理",
     "guangya.organize.cleanup.execute": "光鸭整理残留清理",
     "guangya.organize.stop": "停止光鸭整理任务",
     "indexer.submit_resource": "资源下载提交",
@@ -160,18 +157,11 @@ _SAFE_FIELDS = {
     "strm.run_once": {"accepted", "trigger"},
     "strm.set_schedule_policy": {"runtime_refreshed"},
     "guangya.organize.set_schedule_policy": {"runtime_refreshed"},
-    "guangya.change_plan.execute": {
-        "queued", "queue_position", "replayed", "rename_count", "requires_manual",
-    },
-    "guangya.media_hygiene.execute": {
-        "queued", "queue_position", "replayed", "rename_count", "requires_manual",
-    },
     "guangya.rename.execute": {
         "queued", "queue_position", "replayed", "rename_count", "requires_manual",
     },
     "guangya.directory_scrape.run": {"queued", "queue_position", "replayed", "plan_count"},
     "guangya.organize.run_once": {"trigger_type", "source_count"},
-    "guangya.organize.clean_empty": {"cleaned", "failed", "source_count"},
     "guangya.organize.cleanup.execute": {
         "queued", "queue_position", "replayed", "empty_dir_count",
         "residual_dir_count", "selected_count", "kept_count", "requires_manual",
@@ -225,12 +215,15 @@ _COUNT_FIELDS = {
     "max_series", "progress_current", "progress_total", "instance_number", "rule_id",
     "subscription_number", "watchlist_number", "source_number", "task_number", "season",
     "candidate_number", "queue_position", "plan_count", "outcome_unknown",
+    "rename_count", "empty_dir_count", "residual_dir_count", "selected_count",
+    "kept_count",
     "expired_candidates", "cancelled_admissions", "cancelled_runs", "refreshed", "matched_paths",
 }
 _BOOL_FIELDS = {
     "accepted", "enabled", "runtime_refreshed", "created", "duplicate", "delete_files",
     "reused", "cancelled", "cancel_requested", "sent", "processed", "queued",
     "replayed", "mapping_confirmed",
+    "requires_manual",
     "source_attention_preserved",
 }
 _ENUM_FIELDS = {
@@ -286,7 +279,7 @@ def action_history_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def _safe_details(tool_name: str, data: dict[str, Any] | None) -> dict[str, Any]:
-    allowed = _SAFE_FIELDS.get(tool_name, set())
+    allowed = _SAFE_FIELDS.get(str(tool_name or "").strip(), set())
     if not allowed or not isinstance(data, dict):
         return {}
     projected: dict[str, Any] = {}

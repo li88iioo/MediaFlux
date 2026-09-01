@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 import logging
 import re
@@ -54,6 +54,9 @@ from app.agent import local_media_intents
 from app.agent.local_media_task_actions import clear_local_media_agent_context
 from app.agent.discovery_mapping_actions import clear_discovery_mapping_context
 from app.agent.guangya_directory_scrape_actions import clear_directory_scrape_context
+from app.agent.guangya_cleanup_actions import (
+    validate_empty_only_cleanup_confirmation_binding,
+)
 from app.agent.indexer_config_actions import current_indexer_site_ids
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.agent.llm_router import (
@@ -5948,11 +5951,11 @@ class AgentOrchestrator:
 
     def has_tool(self, tool_name: str) -> bool:
         """在创建动态限流键之前确认工具属于受控注册表。"""
-        return self.registry.has(tool_name)
+        return self.registry.has(str(tool_name or "").strip())
 
     def is_read_tool(self, tool_name: str) -> bool:
         """让入口在执行前区分可直调只读工具与必须确认的动作。"""
-        return self.registry.risk_for(tool_name) is RiskLevel.READ
+        return self.registry.risk_for(str(tool_name or "").strip()) is RiskLevel.READ
 
     def invoke(
         self,
@@ -5963,6 +5966,7 @@ class AgentOrchestrator:
         request_id: str = "",
         session_id: str = "",
     ) -> dict[str, Any]:
+        tool_name = str(tool_name or "").strip()
         trace_context = current_tool_context(
             owner=owner, request_id=request_id, session_id=session_id
         )
@@ -6778,7 +6782,16 @@ class AgentOrchestrator:
         rate_identity: str = "",
         budget_already_reserved: bool = False,
         trusted_resource_owner_binding: bool = False,
+        _cleanup_scope: str = "",
     ) -> dict[str, Any]:
+        tool_name = str(tool_name or "").strip()
+        cleanup_scope = str(_cleanup_scope or "").strip().lower()
+        if cleanup_scope and (
+            cleanup_scope != "empty_only"
+            or tool_name != "guangya.organize.cleanup.execute"
+            or arguments not in (None, {})
+        ):
+            raise AgentToolError("无效的光鸭清理确认范围")
         if tool_name == "indexer.submit_resource_batch":
             result_ids = (
                 arguments.get("result_ids")
@@ -6845,6 +6858,8 @@ class AgentOrchestrator:
         trace_context = current_tool_context(
             owner=owner, request_id=request_id, session_id=session_id
         )
+        if cleanup_scope == "empty_only":
+            trace_context = replace(trace_context, confirmation_bootstrap=True)
         query_epoch = _QUERY_CONFIRMATION_EPOCH.get()
         if (
             expected_owner_generation is None
@@ -6857,6 +6872,18 @@ class AgentOrchestrator:
             if expected_owner_generation is None
             else _strict_confirmation_generation(expected_owner_generation)
         )
+        if cleanup_scope == "empty_only":
+            empty_preview, _elapsed_ms = self.registry.execute(
+                "guangya.organize.cleanup.preview",
+                {"scope": "empty_only"},
+                context=trace_context,
+            )
+            if not empty_preview.ok:  # pragma: no cover - 当前预览失败会抛稳定错误
+                raise AgentToolError(
+                    empty_preview.error or empty_preview.summary or "空目录预检未通过",
+                    code="precondition_failed",
+                )
+            arguments = {}
         emit_agent_progress("preview_start", tool_name=tool_name)
         try:
             spec, normalized, context, preview, elapsed_ms = (
@@ -6874,6 +6901,8 @@ class AgentOrchestrator:
         emit_agent_progress(
             "preview_finish", tool_name=tool_name, ok=bool(preview.ok)
         )
+        if cleanup_scope == "empty_only":
+            validate_empty_only_cleanup_confirmation_binding(trace_context)
         confirmation_contract = build_confirmation_contract(
             tool_name=spec.name,
             risk=spec.risk,
@@ -8964,7 +8993,12 @@ class AgentOrchestrator:
                     LOGIN_REQUIRED_ACTION,
                     ["请通过 Agent 页面重新提交，并在清理范围预检后确认执行。"],
                 )
-            return self.prepare("guangya.organize.clean_empty", {}, owner=owner)
+            return self.prepare(
+                "guangya.organize.cleanup.execute",
+                {},
+                owner=owner,
+                _cleanup_scope="empty_only",
+            )
         if is_guangya_organize_preview_message(lower):
             return self._invoke_query_read("guangya.organize.preview", {})
         if is_guangya_organize_run_message(lower):

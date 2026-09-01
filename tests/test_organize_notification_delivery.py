@@ -96,7 +96,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                 stats, rules, source_name="超能立方", chat_id="100",
             )
             stats["strm"] = {"ok": True, "message": "STRM 同步任务已启动"}
-            Organizer._notify_result(
+            Organizer._publish_or_update_task_summary(
                 stats, rules, source_name="超能立方", chat_id="100",
             )
 
@@ -116,7 +116,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         ) as update, patch(
             "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle"
         ) as publish:
-            Organizer._notify_result(
+            Organizer._publish_or_update_task_summary(
                 stats, OrganizeRules(), source_name="来源", chat_id="100",
             )
 
@@ -138,7 +138,7 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
                 published.append(payload) or _accepted()
             ),
         ):
-            Organizer._notify_result(
+            Organizer._publish_or_update_task_summary(
                 stats, OrganizeRules(), source_name="来源", chat_id="100",
             )
 
@@ -526,6 +526,18 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         event = published[-1]
         self.assertEqual(event.title, "⏳ 光鸭整理等待人工确认")
         self.assertEqual(event.state, "partial")
+
+    def test_task_notification_without_task_id_is_rejected(self) -> None:
+        stats = self._completed_stats([])
+        stats.pop("task_id")
+        with patch(
+            "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle"
+        ) as publish:
+            self.assertFalse(Organizer.notify_task_results(
+                stats, OrganizeRules(), source_name="来源", chat_id="100",
+            ))
+        publish.assert_not_called()
+        self.assertNotIn("task_id", stats)
 
     def test_single_media_task_uses_one_transaction_message(self) -> None:
         events = []

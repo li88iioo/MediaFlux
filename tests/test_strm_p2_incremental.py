@@ -312,7 +312,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["mode"], "incremental")
         self.assertFalse(result["fallback_used"])
         incremental.assert_called_once()
-        self.assertTrue(incremental.call_args.kwargs["defer_metadata"])
+        self.assertNotIn("defer_metadata", incremental.call_args.kwargs)
         full.assert_not_called()
 
     def test_scheduler_rejects_unconfigured_organize_source_without_full_fallback(self):

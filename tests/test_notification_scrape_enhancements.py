@@ -220,10 +220,14 @@ class NotificationEmojiTests(unittest.TestCase):
         terminal_state = manager.task_result.return_value
         progress = Mock()
         handlers._task_lock.acquire()
+        def assert_business_slot_released(*_args):
+            self.assertFalse(handlers._task_lock.locked())
+            self.assertFalse(handlers._organize_running)
+
         with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), patch.object(
-            handlers, "send"
+            handlers, "send_event_result"
         ) as send_mock, patch.object(
-            handlers, "_await_organize_lifecycle"
+            handlers, "_await_organize_lifecycle", side_effect=assert_business_slot_released
         ) as lifecycle_wait:
             handlers._do_organize(
                 "123", [{"id": "source", "name": "电影"}], "target", progress
@@ -316,6 +320,7 @@ class NotificationEmojiTests(unittest.TestCase):
 
     def test_organize_summary_reports_delivery_failure(self):
         stats = {
+            "task_id": "task-delivery-failure",
             "total": 1, "moved": 1, "metadata_moved": 0,
             "need_confirm": 0, "skipped": 0, "failed": 0,
             "media_items": [], "confirmation_groups": [],
@@ -358,12 +363,10 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
     def test_source_result_marks_incremental_fallback_as_partial(self):
         from app.bot import handlers
 
-        event = handlers._strm_source_result_event({
-            "id": "source", "name": "来源", "local_dir": "/tmp/strm",
-            "stats": {"fallback_required": True},
-        })
-
-        self.assertEqual(dict(event.fields)["状态"], "⚠️ 部分完成")
+        self.assertEqual(
+            handlers._strm_result_status({"fallback_required": True}),
+            "⚠️ 部分完成",
+        )
 
     def test_sync_command_sends_one_compact_report_with_source_overview(self):
         from app.bot import handlers
@@ -406,7 +409,7 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         try:
             with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch.object(
                 handlers, "get_bot", return_value=Mock()
-            ), patch.object(handlers, "send") as send_mock:
+            ), patch.object(handlers, "send_event_result") as send_mock:
                 handlers._do_sync("123")
         finally:
             if handlers._task_lock.locked():
@@ -466,7 +469,7 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         try:
             with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch.object(
                 handlers, "get_bot", return_value=Mock()
-            ), patch.object(handlers, "send") as send_mock:
+            ), patch.object(handlers, "send_event_result") as send_mock:
                 handlers._do_sync("123")
         finally:
             if handlers._task_lock.locked():
@@ -511,7 +514,7 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         try:
             with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch.object(
                 handlers, "get_bot", return_value=Mock()
-            ), patch.object(handlers, "send") as send_mock:
+            ), patch.object(handlers, "send_event_result") as send_mock:
                 handlers._do_sync("123")
         finally:
             if handlers._task_lock.locked():
@@ -543,7 +546,7 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         try:
             with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch.object(
                 handlers, "get_bot", return_value=Mock()
-            ), patch.object(handlers, "send") as send_mock:
+            ), patch.object(handlers, "send_event_result") as send_mock:
                 handlers._do_sync("123", progress)
         finally:
             if handlers._task_lock.locked():
@@ -570,7 +573,7 @@ class TelegramStrmCleanupNotificationTests(unittest.TestCase):
         try:
             with patch("app.modules.scheduler.get_scheduler", return_value=scheduler), patch.object(
                 handlers, "get_bot", return_value=Mock()
-            ), patch.object(handlers, "send") as send_mock:
+            ), patch.object(handlers, "send_event_result") as send_mock:
                 handlers._do_sync("123")
         finally:
             if handlers._task_lock.locked():

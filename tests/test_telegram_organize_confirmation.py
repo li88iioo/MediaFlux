@@ -309,6 +309,29 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             }],
         }
 
+    def _capture_confirmation_worker(
+        self, *, group: dict | None = None, selected_index: int = 0,
+    ):
+        actions = create_confirmation_actions(
+            group or self._group(),
+            OrganizeRules(),
+            source_name="下载",
+            chat_id="100",
+        )
+        token = actions[selected_index].callback_data.split(":")[1]
+        callbacks = []
+        manager = SimpleNamespace(
+            start_operation=lambda _name, _reference, callback: (
+                callbacks.append(callback) or {"ok": True, "task_id": "task-1"}
+            )
+        )
+        with patch(
+            "app.modules.organize_tasks.get_organize_manager", return_value=manager
+        ):
+            start_confirmation(token, selected_index, chat_id="100")
+        self.assertEqual(len(callbacks), 1)
+        return token, callbacks[0]
+
     def test_actions_use_opaque_token_and_persist_private_payload(self):
         actions = create_confirmation_actions(
             self._group(), OrganizeRules(), source_name="下载", chat_id="100"
@@ -852,27 +875,22 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         row = db.get_organize_confirmation(token)
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["error"], result["error"])
-        self.assertIsNone(db.get_organize_confirmation_delivery(token))
+        delivery = db.get_organize_confirmation_delivery(token)
+        self.assertIsNotNone(delivery)
+        self.assertEqual(delivery["status"], "sent")
         event = published[-1]
         self.assertIn(("错误原因", "确认任务数据损坏，请重新执行整理"), event.fields)
         self.assertIn("重新执行整理", event.footer)
         self.assertEqual(event.actions, ())
 
-    def test_transient_worker_failure_releases_and_sends_retry_button(self):
-        actions = create_confirmation_actions(
-            self._group(), OrganizeRules(), source_name="下载", chat_id="100"
-        )
-        token = actions[0].callback_data.split(":")[1]
-        callbacks = []
-        manager = SimpleNamespace(
-            start_operation=lambda _name, _reference, callback: (
-                callbacks.append(callback) or {"ok": True, "task_id": "task-1"}
-            )
-        )
-        with patch(
-            "app.modules.organize_tasks.get_organize_manager", return_value=manager
-        ):
-            start_confirmation(token, 0, chat_id="100")
+    def test_prewrite_failure_terminalizes_old_token_and_mints_new_retry(self):
+        group = self._group()
+        group["candidates"].append({
+            "tmdb_id": "999999", "media_type": "tv",
+            "title": "另一个候选", "year": "2020", "score": 0.7,
+            "support": 1,
+        })
+        token, callback = self._capture_confirmation_worker(group=group)
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE organize_confirmations SET expires_at=? WHERE token=?",
@@ -893,15 +911,122 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
                 published.append(event)
                 or NotificationPublishResult(True, delivered=True, status="sent")
             ),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "TMDB 网络"):
-                callbacks[0]()
-        row = db.get_organize_confirmation(token)
-        self.assertEqual(row["status"], "pending")
-        self.assertGreater(str(row["expires_at"] or ""), db.now())
+        ), self.assertRaisesRegex(RuntimeError, "TMDB 网络"):
+            callback()
+
+        old_row = db.get_organize_confirmation(token)
+        self.assertEqual(old_row["status"], "failed")
         event = published[-1]
-        self.assertEqual(event.actions[0].callback_data, f"orgc:{token}:0")
+        retry_callback = event.actions[0].callback_data
+        self.assertRegex(retry_callback, r"^orgc:[A-Za-z0-9_-]+:0$")
+        retry_token = retry_callback.split(":")[1]
+        self.assertNotEqual(retry_token, token)
         self.assertIn("重新尝试", str(event.actions[0].label))
+        self.assertIn("旧确认已失效", event.footer)
+
+        retry_row = db.get_organize_confirmation(retry_token)
+        self.assertIsNotNone(retry_row)
+        self.assertEqual(retry_row["status"], "pending")
+        self.assertGreater(str(retry_row["expires_at"] or ""), db.now())
+        self.assertEqual(retry_row["fingerprint"], old_row["fingerprint"])
+        old_payload = json.loads(old_row["payload_json"])
+        retry_payload = json.loads(retry_row["payload_json"])
+        self.assertEqual(retry_payload.pop("_retry_selected_index"), 0)
+        self.assertEqual(retry_payload, old_payload)
+        with self.assertRaisesRegex(ValueError, "已绑定其他候选"):
+            start_confirmation(retry_token, 1, chat_id="100")
+        self.assertEqual(db.get_organize_confirmation(retry_token)["status"], "pending")
+
+    def test_delayed_old_callback_is_rejected_after_new_retry_is_issued(self):
+        token, callback = self._capture_confirmation_worker()
+        published = []
+        with patch(
+            "app.modules.organize_confirmations.OrganizeRules.from_config",
+            side_effect=RuntimeError("TMDB 网络暂时不可用"),
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ), self.assertRaisesRegex(RuntimeError, "TMDB 网络"):
+            callback()
+
+        retry_token = published[-1].actions[0].callback_data.split(":")[1]
+        with self.assertRaisesRegex(ValueError, "已处理"):
+            start_confirmation(token, 0, chat_id="100")
+        self.assertEqual(db.get_organize_confirmation(token)["status"], "failed")
+        self.assertEqual(db.get_organize_confirmation(retry_token)["status"], "pending")
+
+    def test_failure_after_write_boundary_does_not_issue_retry(self):
+        token, callback = self._capture_confirmation_worker()
+        rules = OrganizeRules()
+        current_file = GuangYaFile(
+            "file-4", "Nagatoro - 04.mp4", False, size=104,
+            etag="etag-4", parent_id="parent",
+        )
+        fake_client = SimpleNamespace(
+            file_info=lambda _file_id: current_file,
+            close=lambda: None,
+        )
+        fake_scraper = SimpleNamespace(close=lambda: None)
+        fake_match = MatchResult(
+            tmdb_id="105556", title="不要欺负我，长瀞同学", year="2021",
+            media_type="tv", confidence=1.0, need_confirm=False,
+        )
+        fake_scoped = SimpleNamespace(begin_source_scan=lambda: None)
+
+        class FailingWriteOrganizer:
+            def _validate_target_outside_source(self, *_args):
+                return None
+
+            def organize(self, *_args, **kwargs):
+                if kwargs["dry_run"]:
+                    return [SimpleNamespace(file_id="file-4")], {}
+                raise RuntimeError("provider 写入结果未知")
+
+            def close(self):
+                return None
+
+        published = []
+        with patch(
+            "app.modules.organize_confirmations.OrganizeRules.from_config",
+            return_value=rules,
+        ), patch(
+            "app.modules.organize_confirmations.GuangYaClient",
+            return_value=fake_client,
+        ), patch(
+            "app.modules.organize_confirmations._resolve_guangya_confirmation_candidate",
+            return_value=(fake_scraper, fake_match, {"id": 105556}, "tmdb"),
+        ), patch(
+            "app.modules.organize_confirmations.ScopedGuangYaClient",
+            return_value=fake_scoped,
+        ), patch(
+            "app.modules.organize_confirmations.FixedMatchScraper",
+            return_value=SimpleNamespace(),
+        ), patch(
+            "app.modules.organize_confirmations.Organizer",
+            return_value=FailingWriteOrganizer(),
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ), self.assertRaisesRegex(RuntimeError, "写入结果未知"):
+            callback()
+
+        row = db.get_organize_confirmation(token)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(published[-1].actions, ())
+        self.assertIn("重新执行整理", published[-1].footer)
+        with db.get_conn() as conn:
+            pending = conn.execute(
+                "SELECT COUNT(*) FROM organize_confirmations WHERE fingerprint=? "
+                "AND status='pending'",
+                (row["fingerprint"],),
+            ).fetchone()[0]
+        self.assertEqual(pending, 0)
 
     def test_init_marks_interrupted_confirmation_failed(self):
         actions = create_confirmation_actions(
@@ -970,7 +1095,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         db.complete_organize_confirmation_with_delivery(
             token,
             result_json='{"moved":1}',
-            event_json=confirmation_module._serialize_notification_event(event),
+            event_json=notification_center.serialize_notification_event(event),
             chat_id="100",
             message_id=77,
         )
@@ -1024,7 +1149,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             db.complete_organize_confirmation_with_delivery(
                 token,
                 result_json='{"moved":1}',
-                event_json=confirmation_module._serialize_notification_event(
+                event_json=notification_center.serialize_notification_event(
                     notifier.NotificationEvent("✅ 迟到成功")
                 ),
                 chat_id="100",
@@ -1719,7 +1844,7 @@ class NotificationActionTests(unittest.TestCase):
             "待确认",
             actions=(notifier.NotificationAction("候选 A", "orgc:token:0"),),
         )
-        self.assertTrue(notifier.send_event(event))
+        self.assertTrue(notifier.send_event_result(event).ok)
         markup = bot.messages[-1][2]["reply_markup"]
         button = markup.keyboard[0][0]
         self.assertEqual(button.text, "候选 A")
@@ -1737,7 +1862,7 @@ class NotificationActionTests(unittest.TestCase):
             image_url="https://example.invalid/poster.jpg",
             actions=(notifier.NotificationAction("候选 A", "orgc:token:0"),),
         )
-        self.assertTrue(notifier.send_event(event))
+        self.assertTrue(notifier.send_event_result(event).ok)
         markup = bot.messages[-1][2]["reply_markup"]
         self.assertEqual(markup.keyboard[0][0].callback_data, "orgc:token:0")
 

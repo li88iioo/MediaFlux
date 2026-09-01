@@ -74,11 +74,11 @@ class GuessItAdapterTests(unittest.TestCase):
         self.assertEqual(mocked.call_count, 1)
         self.assertEqual(second["title"], "Demo")
 
-    def test_scraper_reexports_same_guessit_adapter_functions(self):
+    def test_scraper_uses_only_public_guessit_adapter_functions(self):
         from app.modules import scraper
         from app.modules.recognition.extractors import guessit_adapter
 
-        self.assertIs(scraper._guessit_cached, guessit_adapter._guessit_cached)
+        self.assertFalse(hasattr(scraper, "_guessit_cached"))
         self.assertIs(scraper._guessit_info, guessit_adapter._guessit_info)
         self.assertIs(
             scraper._guessit_episode_is_untrusted,

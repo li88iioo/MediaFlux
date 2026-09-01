@@ -4,7 +4,6 @@
 - /start          开始/帮助
 - /sync_gy        完整扫描并校准光鸭云盘 STRM
 - /organize       选择整理光鸭云盘、本地下载或全部
-- /organize_gy    直接整理光鸭云盘（兼容命令）
 - /rss            列出 RSS 订阅项
 - /rss_refresh <id>  刷新指定订阅并返回新条目数
 - /rss_dl <entry_id>  下载指定条目
@@ -28,11 +27,9 @@ from app.notifier import (
     NotificationEvent,
     get_bot,
     render_event,
-    send_event,
+    send_event_result,
 )
 
-# 保留模块级 send 名称，便于测试和兼容旧补丁。
-send = send_event
 
 logger = get_logger(__name__)
 
@@ -759,7 +756,7 @@ def _start_sync_gy(bot, telebot, source_message) -> bool:
         return False
 
 
-def _start_organize_gy(bot, telebot, source_message) -> bool:
+def _start_guangya_organize(bot, telebot, source_message) -> bool:
     """在确认回调后按当前配置启动光鸭整理。"""
     global _organize_running
     sources = _configured_organize_sources()
@@ -1233,39 +1230,6 @@ def _register_commands(bot, telebot):
             "<b>选择整理范围</b>\n"
             f"当前可用：{html.escape(' · '.join(available))}\n"
             "本地整理会扫描下载目录中已经存在的媒体；全部整理将先执行光鸭，再执行本地。",
-            parse_mode="HTML",
-            reply_markup=markup,
-        )
-
-    @bot.message_handler(commands=["organize_gy"])
-    @require_write_auth
-    def cmd_organize_gy(msg):
-        sources = _configured_organize_sources()
-        dst = get("GY_ORGANIZE_TARGET_DIR", "").strip()
-        if not sources or not dst or dst == "0":
-            bot.reply_to(
-                msg,
-                "未配置整理源目录或目标目录\n"
-                "请在控制台「网盘整理」页选择至少一个源目录和归档目标目录。",
-            )
-            return
-        if _maintenance_task_busy():
-            bot.reply_to(msg, "已有整理或同步任务在执行，请稍后再试")
-            return
-        chat_id, user_id = _telegram_identity(msg)
-        markup = _write_confirmation_markup(
-            telebot,
-            chat_id=chat_id,
-            user_id=user_id,
-            operation="organize_gy",
-            value={},
-        )
-        source_names = "、".join(source["name"] for source in sources)
-        bot.reply_to(
-            msg,
-            "<b>确认执行光鸭整理</b>\n"
-            f"来源：{html.escape(source_names)}\n"
-            "将按当前整理规则移动或重命名文件。确认时会再次读取最新配置。",
             parse_mode="HTML",
             reply_markup=markup,
         )
@@ -1949,7 +1913,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             scope = str(value.get("scope") or "")
             labels = {"guangya": "光鸭整理", "local": "本地下载整理", "all": "全部整理"}
             starter = {
-                "guangya": _start_organize_gy,
+                "guangya": _start_guangya_organize,
                 "local": _start_organize_local,
                 "all": _start_organize_all,
             }.get(scope)
@@ -1962,16 +1926,6 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             if not starter(bot, telebot, call.message):
                 _edit_write_confirmation_message(
                     bot, call.message, f"{labels[scope]}未启动", "请根据提示检查配置或稍后重试。"
-                )
-            return
-        if operation == "organize_gy":
-            _edit_write_confirmation_message(
-                bot, call.message, "光鸭整理已确认", "正在创建整理任务…"
-            )
-            bot.answer_callback_query(call.id, "已确认，开始整理")
-            if not _start_organize_gy(bot, telebot, call.message):
-                _edit_write_confirmation_message(
-                    bot, call.message, "光鸭整理未启动", "请根据提示检查配置或稍后重试。"
                 )
             return
         if operation == "resource_download":
@@ -2554,40 +2508,6 @@ def _strm_result_status(stats: dict, *, partial: bool = False, stopped: bool = F
     return "✅ 同步完成"
 
 
-def _strm_source_result_event(source: dict) -> NotificationEvent:
-    stats = source.get("stats") if isinstance(source.get("stats"), dict) else {}
-    scan_seconds = _strm_seconds(stats, "scan_elapsed_seconds")
-    process_seconds = (
-        _strm_seconds(stats, "generate_elapsed_seconds")
-        + _strm_seconds(stats, "metadata_elapsed_seconds")
-    )
-    cleanup_seconds = _strm_seconds(stats, "cleanup_elapsed_seconds")
-    source_seconds = scan_seconds + process_seconds + cleanup_seconds
-    return NotificationEvent(
-        "光鸭 STRM 同步结果",
-        layout="relaxed",
-        fields=(
-            ("状态", _strm_result_status(stats)),
-            ("目录 ID", str(source.get("id") or "未知")),
-            ("云盘目录名", str(source.get("name") or "未命名")),
-            ("本地同步目录", str(source.get("local_dir") or "未记录")),
-            ("扫描目录", f"{_strm_count(stats, 'directories'):,} 个"),
-            ("扫描文件", f"{_strm_count(stats, 'scanned_files'):,} 个"),
-            ("STRM 新建", f"{_strm_count(stats, 'created'):,} 个"),
-            ("STRM 更新", f"{_strm_count(stats, 'updated'):,} 个"),
-            ("STRM 跳过", f"{_strm_count(stats, 'skipped'):,} 个"),
-            ("STRM 失败", f"{_strm_count(stats, 'failed'):,} 个"),
-            ("元数据更新", f"{_strm_count(stats, 'metadata_generated'):,} 个"),
-            ("元数据排队", f"{_strm_count(stats, 'metadata_queued'):,} 个"),
-            ("清理内容", _strm_cleanup_text(stats)),
-            ("扫描耗时", f"{scan_seconds:.2f} 秒"),
-            ("处理耗时", f"{process_seconds:.2f} 秒"),
-            ("清理耗时", f"{cleanup_seconds:.2f} 秒"),
-            ("来源耗时", f"{source_seconds:.2f} 秒"),
-        ),
-    )
-
-
 def _strm_source_report_line(source: dict) -> str:
     stats = source.get("stats") if isinstance(source.get("stats"), dict) else {}
     name = str(source.get("name") or source.get("id") or "未命名来源").strip()
@@ -2715,7 +2635,7 @@ def _deliver_strm_terminal(
     finisher = getattr(progress_handle, "finish", None)
     if callable(finisher):
         return bool(finisher(render_event(event)))
-    return bool(send(event, chat_id=str(chat_id)))
+    return send_event_result(event, chat_id=str(chat_id)).ok
 
 
 def _do_sync(chat_id, progress_handle=None, sync_mode: str = "full"):
@@ -3202,8 +3122,20 @@ def _do_organize(
     dst: str,
     progress: TelegramProgress | None = None,
 ):
-    """后台执行光鸭多源整理，保持旧命令的独立结果通知。"""
+    """后台执行光鸭多源整理；业务终态后不再占用互斥锁等待 TG 回执。"""
     global _organize_running
+    slot_released = False
+
+    def release_maintenance_slot() -> None:
+        nonlocal slot_released
+        global _organize_running
+        if slot_released:
+            return
+        _organize_running = False
+        if _task_lock.locked():
+            _task_lock.release()
+        slot_released = True
+
     try:
         state = _run_guangya_organize_stage(
             chat_id,
@@ -3213,13 +3145,16 @@ def _do_organize(
             notify_results=True,
             progress_title="光鸭整理进行中",
         )
+        # STRM/媒体库结果卡的投递确认最长可等待 30 分钟，但它已不是整理
+        # 写操作的一部分。先释放业务互斥槽，避免 Telegram 网络状态阻塞后续任务。
+        release_maintenance_slot()
         if progress is not None:
             if state.get("notification_sent"):
                 _await_organize_lifecycle(chat_id, state, progress)
             else:
                 progress.finish(_organize_terminal_progress(state))
         elif str(state.get("status") or "") == "failed":
-            send(
+            send_event_result(
                 NotificationEvent(
                     "整理失败",
                     fields=((
@@ -3235,7 +3170,7 @@ def _do_organize(
         if progress is not None:
             progress.finish("<b>光鸭整理失败</b>\n任务未能正常启动，请查看日志后重试。")
         else:
-            send(
+            send_event_result(
                 NotificationEvent(
                     "整理失败",
                     fields=(("错误原因", "任务未能正常启动"),),
@@ -3244,9 +3179,7 @@ def _do_organize(
                 chat_id=str(chat_id),
             )
     finally:
-        _organize_running = False
-        if _task_lock.locked():
-            _task_lock.release()
+        release_maintenance_slot()
 
 
 def _do_organize_local(chat_id, progress: TelegramProgress | None = None) -> None:
@@ -3260,14 +3193,14 @@ def _do_organize_local(chat_id, progress: TelegramProgress | None = None) -> Non
         if progress is not None:
             progress.finish(render_event(event))
         else:
-            send(event, chat_id=str(chat_id))
+            send_event_result(event, chat_id=str(chat_id))
         _notify_local_organize_confirmations(summary, str(chat_id))
     except Exception as exc:
         logger.error("Telegram 本地整理失败 type=%s", type(exc).__name__)
         if progress is not None:
             progress.finish("<b>本地下载整理失败</b>\n任务执行异常，请查看日志后重试。")
         else:
-            send(
+            send_event_result(
                 NotificationEvent(
                     "本地下载整理失败",
                     fields=(("错误原因", "任务执行异常，请查看日志后重试"),),
@@ -3310,7 +3243,7 @@ def _do_organize_all(
         if progress is not None:
             progress.finish(render_event(event))
         else:
-            send(event, chat_id=str(chat_id))
+            send_event_result(event, chat_id=str(chat_id))
         cloud_stats = (
             cloud_state.get("stats")
             if isinstance(cloud_state.get("stats"), dict)
@@ -3337,7 +3270,7 @@ def _do_organize_all(
         if progress is not None:
             progress.finish("<b>全部整理失败</b>\n任务执行异常，请查看日志后重试。")
         else:
-            send(
+            send_event_result(
                 NotificationEvent(
                     "全部整理失败",
                     fields=(("错误原因", "任务执行异常，请查看日志后重试"),),

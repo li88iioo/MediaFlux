@@ -232,17 +232,6 @@ def validate_schedule(request: Request, data: dict = Body(...)):
     return api_response({"valid": valid, "next_run": next_run})
 
 
-@router.post("/run")
-def run_now(request: Request):
-    require_api_login(request)
-    config_error = get_scheduler().validate_config(auto_only=False)
-    if config_error:
-        return api_error(config_error, 400)
-    # 保留历史 API 的完整同步语义，避免既有自动化升级后静默变成 no-op。
-    result = get_scheduler().trigger("manual", sync_mode="full", force_full=True)
-    return api_response(result, 202 if result.get("ok") else 409)
-
-
 @router.post("/run/fast")
 def run_fast_now(request: Request):
     require_api_login(request)

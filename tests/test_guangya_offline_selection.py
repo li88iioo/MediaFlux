@@ -5,6 +5,7 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -528,6 +529,107 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
         self.assertEqual(client.selection_calls[0]["target_dir_id"], "staging-7")
         self.assertEqual(client.legacy_calls, [])
+
+    def test_isolated_directory_is_persisted_before_provider_submission(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        client.create_dir = Mock(return_value="staging-persisted")
+        sequence: list[str] = []
+
+        def persist(snapshot: dict) -> None:
+            sequence.append("persist")
+            self.assertEqual(snapshot["id"], "staging-persisted")
+            self.assertEqual(snapshot["parent_id"], "9001")
+
+        original_submit = client.add_offline_selection
+
+        def submit(*args, **kwargs):
+            sequence.append("submit")
+            return original_submit(*args, **kwargs)
+
+        client.add_offline_selection = Mock(side_effect=submit)
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:persist-before-submit",
+                title="Demo Release",
+                client=client,
+                isolate_task=True,
+                task_key="persisted",
+                on_staging_created=persist,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(sequence, ["persist", "submit"])
+
+    def test_staging_persistence_failure_prevents_provider_submission(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        client.create_dir = Mock(return_value="staging-rejected")
+        with patch.object(
+            offline.OfflineRules, "from_config", return_value=self.rules
+        ), patch.object(
+            offline, "_remove_empty_staging", return_value=("completed", "")
+        ) as cleanup:
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:persist-rejected",
+                title="Demo Release",
+                client=client,
+                isolate_task=True,
+                task_key="rejected",
+                on_staging_created=lambda _snapshot: (_ for _ in ()).throw(
+                    RuntimeError("database unavailable")
+                ),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("未提交离线任务", result["error"])
+        self.assertEqual(client.selection_calls, [])
+        cleanup.assert_called_once_with(
+            client,
+            "staging-rejected",
+            expected_parent_id="9001",
+            expected_name=result["staging"]["name"],
+        )
+
+    def test_empty_staging_cleanup_uses_version_guard_and_delete_audit(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        info = SimpleNamespace(
+            file_id="staging-clean",
+            name="MF-clean",
+            is_dir=True,
+            parent_id="9001",
+            size=0,
+            etag="etag-clean",
+            updated_at=123,
+        )
+        client.file_info = Mock(return_value=info)
+        client.list_dir = Mock(return_value=[])
+        client.supports_guarded_empty_directory_delete = True
+        client.delete_empty_directory = Mock(return_value=True)
+
+        def execute(_client, **kwargs):
+            kwargs["delete_operation"]()
+            return {"status": "success"}
+
+        with patch(
+            "app.modules.organize_delete_audit.execute_recycle_bin_delete",
+            side_effect=execute,
+        ) as audited_delete:
+            status, error = offline._remove_empty_staging(
+                client,
+                "staging-clean",
+                expected_parent_id="9001",
+                expected_name="MF-clean",
+            )
+
+        self.assertEqual((status, error), ("completed", ""))
+        client.delete_empty_directory.assert_called_once_with(
+            "staging-clean",
+            expected_etag="etag-clean",
+            expected_updated_at=123,
+        )
+        self.assertEqual(
+            audited_delete.call_args.kwargs["trigger"],
+            "offline_staging_rollback",
+        )
 
     def test_torrent_submit_uploads_original_metadata_before_creating_magnet_selection(self):
         response = {

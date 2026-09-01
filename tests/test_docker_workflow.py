@@ -104,6 +104,24 @@ class DockerWorkflowTests(unittest.TestCase):
             test_job.index("unittest discover"),
         )
 
+    def test_full_test_job_has_dependency_free_source_syntax_gate(self) -> None:
+        test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
+        self.assertIn("python -m compileall -q app packaging tests", test_job)
+        self.assertIn("find app/static/js -type f -name '*.js' ! -name '*.min.js' -print0", test_job)
+        self.assertIn('node --check "$file"', test_job)
+        self.assertLess(test_job.index("compileall"), test_job.index("unittest discover"))
+
+    def test_expected_readiness_retries_are_quiet_until_terminal_failure(self) -> None:
+        smoke_job = self.text.split("  smoke:", 1)[1].split("  build:", 1)[0]
+        for port in (1258, 1259):
+            with self.subTest(port=port):
+                self.assertIn(
+                    f"curl --fail --silent http://127.0.0.1:{port}/readyz >/dev/null 2>&1",
+                    smoke_job,
+                )
+        self.assertIn("docker logs mediaflux-smoke", smoke_job)
+        self.assertIn("docker logs mediaflux-v014-upgrade", smoke_job)
+
     def test_full_test_output_is_not_truncated_and_node_is_current(self) -> None:
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
         self.assertIn('PYTHONUNBUFFERED: "1"', test_job)

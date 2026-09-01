@@ -8,7 +8,7 @@ from app import database as db
 from app.clients.guangya import GuangYaClient
 from app.modules.download_dispatcher import DownloadInput, request_key
 from app.modules.download_tracker import DownloadTracker
-from app.modules.indexer_download import _persist_and_dispatch
+from app.indexers.downloads import _persist_and_dispatch
 from app.modules.media_subscriptions import MediaSubscriptionService
 from tests.support import IsolatedDatabaseTestCase
 
@@ -194,7 +194,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             "duplicate": False, "error": "",
         }
         with patch(
-            "app.modules.indexer_download.dispatch_request", return_value=dispatched
+            "app.indexers.downloads.dispatch_request", return_value=dispatched
         ) as dispatch_mock:
             reused, reused_id, result = _persist_and_dispatch(
                 item, "subscription:test", "qb",
@@ -245,7 +245,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         )
 
         with patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             side_effect=RuntimeError("persist after backend failed"),
         ):
             created, request_id, result = _persist_and_dispatch(

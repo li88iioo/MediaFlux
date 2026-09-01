@@ -70,9 +70,9 @@ class NotificationSendingTests(unittest.TestCase):
         ), patch.object(
             notifier, "get", side_effect=lambda key, default="": config.get(key, default)
         ), patch("telebot.TeleBot") as constructor:
-            result = notifier.send_event(notifier.NotificationEvent("测试通知"))
+            result = notifier.send_event_result(notifier.NotificationEvent("测试通知"))
 
-        self.assertFalse(result)
+        self.assertFalse(result.ok)
         constructor.assert_not_called()
         self.assertIsNone(notifier._bot)
 
@@ -80,7 +80,7 @@ class NotificationSendingTests(unittest.TestCase):
         bot = FakeBot()
         with patch.dict(os.environ, {"MEDIAFLUX_TEST_MODE": "1"}, clear=False):
             self._install_bot(bot, "test-chat")
-            self.assertTrue(notifier.send_event(notifier.NotificationEvent("测试通知")))
+            self.assertTrue(notifier.send_event_result(notifier.NotificationEvent("测试通知")).ok)
 
         self.assertEqual(bot.messages, [("test-chat", "<b>ℹ️ 测试通知</b>")])
 
@@ -103,7 +103,7 @@ class NotificationSendingTests(unittest.TestCase):
         self.assertEqual(result.status_code, 429)
         self.assertEqual(result.retry_after_seconds, 37)
         self.assertEqual(result.error, "Too Many Requests: retry later")
-        self.assertFalse(notifier.send("兼容布尔接口"))
+        self.assertFalse(notifier.send_result("未配置通知").ok)
 
     def test_connect_timeout_is_safe_to_retry(self):
         result = notifier._telegram_send_error(notifier.requests.ConnectTimeout("connect"))
@@ -205,7 +205,7 @@ class NotificationSendingTests(unittest.TestCase):
             actions=(notifier.NotificationAction("重试", "orgc:token:0"),),
         )
 
-        self.assertTrue(notifier.edit_event(event, chat_id="-100", message_id="77"))
+        self.assertTrue(notifier.edit_event_result(event, chat_id="-100", message_id="77").ok)
         self.assertEqual(bot.edits[0][1:3], ("-100", 77))
         self.assertEqual(
             bot.edits[0][3].keyboard[0][0].callback_data, "orgc:token:0"
@@ -217,11 +217,11 @@ class NotificationSendingTests(unittest.TestCase):
         ))
         self._install_bot(bot, "configured-chat")
 
-        self.assertTrue(notifier.edit_event(
+        self.assertTrue(notifier.edit_event_result(
             notifier.NotificationEvent("确认整理完成"),
             chat_id="-100",
             message_id="77",
-        ))
+        ).ok)
         self.assertEqual(bot.message_attempts, 0)
 
     def test_test_mode_can_explicitly_opt_in_to_telebot_initialization(self):
@@ -240,7 +240,7 @@ class NotificationSendingTests(unittest.TestCase):
         ), patch.object(
             notifier, "get", side_effect=lambda key, default="": config.get(key, default)
         ), patch("telebot.TeleBot", return_value=bot) as constructor:
-            self.assertTrue(notifier.send("opt-in"))
+            self.assertTrue(notifier.send_result("opt-in").ok)
 
         constructor.assert_called_once_with(
             "dummy-token-final-fix", parse_mode="HTML"
@@ -251,8 +251,8 @@ class NotificationSendingTests(unittest.TestCase):
         """若事件渲染漏掉转义或没有走 sendPhoto，本测试必须失败。"""
         event_type = getattr(notifier, "NotificationEvent", None)
         self.assertIsNotNone(event_type, "NotificationEvent 尚未实现")
-        send_event = getattr(notifier, "send_event", None)
-        self.assertIsNotNone(send_event, "send_event 尚未实现")
+        send_event_result = getattr(notifier, "send_event_result", None)
+        self.assertIsNotNone(send_event_result, "send_event_result 尚未实现")
         bot = FakeBot()
         self._install_bot(bot)
 
@@ -264,7 +264,7 @@ class NotificationSendingTests(unittest.TestCase):
             footer="完成 > 等待刷新",
         )
 
-        self.assertTrue(send_event(event))
+        self.assertTrue(send_event_result(event).ok)
         self.assertEqual(bot.messages, [])
         self.assertEqual(len(bot.photos), 1)
         target, photo, caption = bot.photos[0]
@@ -287,8 +287,8 @@ class NotificationSendingTests(unittest.TestCase):
 
         event_type = getattr(notifier, "NotificationEvent", None)
         self.assertIsNotNone(event_type, "NotificationEvent 尚未实现")
-        send_event = getattr(notifier, "send_event", None)
-        self.assertIsNotNone(send_event, "send_event 尚未实现")
+        send_event_result = getattr(notifier, "send_event_result", None)
+        self.assertIsNotNone(send_event_result, "send_event_result 尚未实现")
         bot = FakeBot(photo_error=TelegramPhotoRejected("photo unavailable"))
         self._install_bot(bot, "200")
         event = event_type(
@@ -297,7 +297,7 @@ class NotificationSendingTests(unittest.TestCase):
             image_url="https://image.example/broken.jpg",
         )
 
-        self.assertTrue(send_event(event))
+        self.assertTrue(send_event_result(event).ok)
         self.assertEqual(bot.photos, [])
         self.assertEqual(bot.messages, [("200", "<b>✅ 整理完成</b>\n<b>📄 文件：</b>1 个")])
 
@@ -322,7 +322,7 @@ class NotificationSendingTests(unittest.TestCase):
             image_url="https://image.example/poster.jpg",
         )
 
-        self.assertFalse(notifier.send_event(event))
+        self.assertFalse(notifier.send_event_result(event).ok)
         self.assertEqual(len(bot.photos), 1)
         self.assertEqual(bot.message_attempts, 1)
 
@@ -356,7 +356,7 @@ class NotificationSendingTests(unittest.TestCase):
         first = "A" * 2500
         second = "B" * 2500
 
-        self.assertTrue(notifier.send(f"{first}\n{second}"))
+        self.assertTrue(notifier.send_result(f"{first}\n{second}").ok)
 
         self.assertEqual(bot.messages, [("300", first), ("300", second)])
         self.assertTrue(all(len(text) <= 4000 for _, text in bot.messages))
@@ -403,13 +403,13 @@ class NotificationSendingTests(unittest.TestCase):
         """若分段切断 HTML entity 或粗体标签，本测试必须失败。"""
         event_type = getattr(notifier, "NotificationEvent", None)
         self.assertIsNotNone(event_type, "NotificationEvent 尚未实现")
-        send_event = getattr(notifier, "send_event", None)
-        self.assertIsNotNone(send_event, "send_event 尚未实现")
+        send_event_result = getattr(notifier, "send_event_result", None)
+        self.assertIsNotNone(send_event_result, "send_event_result 尚未实现")
         bot = FakeBot()
         self._install_bot(bot, "400")
         event = event_type(title="长通知", lines=(("<&>" * 1400),))
 
-        self.assertTrue(send_event(event))
+        self.assertTrue(send_event_result(event).ok)
 
         self.assertGreater(len(bot.messages), 1)
         for _, chunk in bot.messages:
@@ -583,6 +583,7 @@ class MediaCardTests(unittest.TestCase):
 
         sent = []
         stats = {
+            "task_id": "task-incomplete-scan",
             "total": 1, "moved": 1, "metadata_moved": 0,
             "need_confirm": 0, "skipped": 0, "failed": 0,
             "scan_complete": False,
@@ -799,37 +800,40 @@ class BusinessNotificationIntegrationTests(unittest.TestCase):
         self.assertIn("E01", rendered)
         self.assertIn("正常电影", rendered)
 
-    def test_download_and_scheduler_notifications_use_structured_events(self):
-        """兼容下载事件与独立 STRM 错误也必须交给统一通知中心。"""
+    def test_download_uses_canonical_lifecycle_and_scheduler_uses_structured_event(self):
         from app.modules import download_tracker, scheduler
 
         sent = []
-        row = {"status": "downloading", "title": "任务<&>", "chat_id": "900"}
+        row = {
+            "id": 42,
+            "status": "completed",
+            "notification_delivery_status": "pending",
+            "notification_event_status": "completed",
+        }
         with patch(
             "app.modules.telegram_notification_center.publish_notification_event",
             side_effect=lambda _key, event, **kwargs: sent.append((event, kwargs)) or True,
-        ):
+        ), patch(
+            "app.modules.download_tracker.db.claim_download_request_notification",
+            return_value={"token": "lease", "attempts": 0},
+        ), patch.object(
+            download_tracker.DownloadTracker,
+            "_publish_lifecycle",
+            return_value=True,
+        ) as publish_lifecycle, patch(
+            "app.modules.download_tracker.db.finalize_download_request_notification",
+        ) as finalize:
             download_tracker.DownloadTracker._notify_completion(
-                row, "completed", "failed", {"status": "completed"}
-            )
-            download_tracker.DownloadTracker._notify_completion(
-                row, "manual_review", "completed", {"status": "manual_review"}
+                row, "completed", "", {"status": "completed"}
             )
             with patch.object(scheduler, "get_bool", return_value=True):
                 scheduler.STRMScheduler._notify_failure("错误<&>", "cron")
 
-        self.assertEqual(len(sent), 3)
-        download_text = notifier.render_event(sent[0][0])
-        review_text = notifier.render_event(sent[1][0])
-        failure_text = notifier.render_event(sent[2][0])
+        publish_lifecycle.assert_called_once_with(42)
+        finalize.assert_called_once_with(42, "lease", delivered=True, retry_at=None)
+        self.assertEqual(len(sent), 1)
+        failure_text = notifier.render_event(sent[0][0])
         self.assertEqual(sent[0][0].layout, "relaxed")
-        self.assertEqual(sent[1][0].layout, "relaxed")
-        self.assertEqual(sent[2][0].layout, "relaxed")
-        self.assertIn("任务&lt;&amp;&gt;", download_text)
-        self.assertEqual(sent[0][1]["chat_id"], "900")
-        self.assertIn("需要人工核对", review_text)
-        self.assertIn("请勿重复提交", review_text)
-        self.assertEqual(sent[1][1]["chat_id"], "900")
         self.assertIn("错误&lt;&amp;&gt;", failure_text)
 
     def test_plan_one_tolerates_invalid_tmdb_and_parsed_season_numbers(self):

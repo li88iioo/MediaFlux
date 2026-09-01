@@ -157,8 +157,3 @@ def send_library_patrol_notification_result(projection: Any) -> TelegramSendResu
         error="" if outcome else str(outcome.status or "DeliveryFailed"),
         status_code=0 if outcome else 503,
     )
-
-
-def send_library_patrol_notification(projection: Any) -> bool:
-    """兼容既有调用者与测试替身的布尔接口。"""
-    return bool(send_library_patrol_notification_result(projection).ok)

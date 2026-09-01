@@ -21,7 +21,7 @@ from app.indexers.config import tmdb_detail_is_animation
 from app.indexers.models import IndexerMediaSearchRequest
 from app.indexers.runtime import get_indexer_service, run_indexer_awaitable
 from app.logger import get_logger
-from app.modules.indexer_download import download_indexer_result_public
+from app.indexers.downloads import download_indexer_result_public
 from app.modules.media_identity import build_media_key
 from app.sensitive_data import redact_sensitive_text
 from app.services import inspect_media_identity_sources, inspect_series_episode_sources

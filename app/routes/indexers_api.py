@@ -18,7 +18,7 @@ from app.indexers.errors import (
 from app.indexers.models import IndexerMediaSearchRequest
 from app.indexers.release import parse_indexer_release_position
 from app.indexers.runtime import get_indexer_service
-from app.modules.indexer_download import (
+from app.indexers.downloads import (
     DownloadRequestCreationError as _DownloadRequestCreationError,
     InvalidDownloadData as _InvalidDownloadData,
     download_indexer_result,
@@ -281,14 +281,6 @@ async def search_media(request: Request, payload: Any = Body(...)):
     return api_response(_search_payload(service, result))
 
 
-async def _download_result(service, result_id: str, target: str) -> dict[str, Any]:
-    return await download_indexer_result(service, result_id, target)
-
-
-async def _download_result_public(service, result_id: str, target: str) -> dict[str, Any]:
-    return await download_indexer_result_public(service, result_id, target)
-
-
 def _validate_batch_payload(data: Any) -> tuple[list[str], str]:
     if not isinstance(data, dict):
         raise ValueError("批量下载参数必须是 JSON 对象")
@@ -331,7 +323,7 @@ async def download(request: Request, data: Any = Body(default=None)):
 
     service = get_indexer_service()
     try:
-        item = await _download_result(service, result_id, target)
+        item = await download_indexer_result(service, result_id, target)
     except IndexerError as exc:
         return _error_response(exc)
     except _InvalidDownloadData:
@@ -409,7 +401,7 @@ async def batch_download(request: Request, data: Any = Body(default=None)):
     service = get_indexer_service()
 
     async def run(result_id: str) -> dict[str, Any]:
-        return await _download_result_public(service, result_id, target)
+        return await download_indexer_result_public(service, result_id, target)
 
     items = await asyncio.gather(*(run(result_id) for result_id in result_ids))
     summary = {

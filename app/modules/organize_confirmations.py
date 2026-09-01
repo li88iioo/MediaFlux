@@ -33,6 +33,10 @@ from app.modules.organize import (
     restore_organize_rules_snapshot,
 )
 from app.modules.scraper import MatchResult, TMDBScraper
+from app.modules.telegram_notification_center import (
+    deserialize_notification_event,
+    serialize_notification_event,
+)
 from app.notifier import (
     NOTIFICATION_SECTION_BREAK,
     NotificationAction,
@@ -56,10 +60,11 @@ _rollup_guard = threading.Lock()
 _TERMINAL_CONFIRMATION_STATUSES = frozenset({
     "completed", "failed", "expired", "cancelled",
 })
+_RETRY_SELECTED_INDEX_KEY = "_retry_selected_index"
 
 
 class ConfirmationRetryableError(RuntimeError):
-    """外部服务瞬时失败；保留同一快照并允许用户显式重试。"""
+    """外部服务瞬时失败；可基于同一快照签发新的显式重试票据。"""
 
 
 def _timestamp(value: datetime) -> str:
@@ -191,6 +196,7 @@ def _fingerprint(payload: dict) -> str:
         for key, value in payload.items()
         if key not in {
             "organize_task_id", "organize_rollup", "_telegram_message_id",
+            _RETRY_SELECTED_INDEX_KEY,
         }
     }
     encoded = json.dumps(
@@ -224,7 +230,10 @@ def _persist_confirmation_actions(
         source_name=str(payload.get("source_name") or ""),
         directory_path=str(payload.get("directory") or "/"),
         payload=payload,
-        expires_at=_timestamp(datetime.now() + timedelta(hours=_CONFIRMATION_TTL_HOURS)),
+        expires_at=_timestamp(
+            datetime.now(timezone.utc).astimezone()
+            + timedelta(hours=_CONFIRMATION_TTL_HOURS)
+        ),
         organize_task_id=str(payload.get("organize_task_id") or ""),
     )
     actions = [
@@ -238,6 +247,38 @@ def _persist_confirmation_actions(
     return tuple(actions)
 
 
+def _persist_confirmation_retry(
+    payload: dict,
+    *,
+    selected_index: int,
+    chat_id: str,
+) -> tuple[str, NotificationAction]:
+    """基于冻结 payload 和既有选择签发一张新的单次重试票据。"""
+    candidates = list(payload.get("candidates") or [])
+    if selected_index < 0 or selected_index >= len(candidates):
+        raise ValueError("候选参数无效")
+    candidate = dict(candidates[selected_index])
+    retry_payload = dict(payload)
+    retry_payload[_RETRY_SELECTED_INDEX_KEY] = int(selected_index)
+    resolved_chat = str(chat_id or get("TG_CHAT_ID", "") or "").strip()
+    retry_token = secrets.token_urlsafe(12)
+    db.create_organize_confirmation(
+        token=retry_token,
+        fingerprint=_fingerprint(retry_payload),
+        chat_id=resolved_chat,
+        source_name=str(retry_payload.get("source_name") or ""),
+        directory_path=str(retry_payload.get("directory") or "/"),
+        payload=retry_payload,
+        expires_at=_timestamp(
+            datetime.now(timezone.utc).astimezone()
+            + timedelta(hours=_CONFIRMATION_TTL_HOURS)
+        ),
+        organize_task_id=str(retry_payload.get("organize_task_id") or ""),
+    )
+    return retry_token, NotificationAction(
+        f"重新尝试 · {_safe_label(candidate, selected_index)}",
+        f"orgc:{retry_token}:{selected_index}",
+    )
 
 
 def confirmation_token_from_event(event: NotificationEvent) -> str:
@@ -706,44 +747,44 @@ def _expired_confirmation_event(payload: dict, row) -> NotificationEvent:
     )
 
 
-def _publish_expired_confirmation(row) -> None:
+def _publish_expired_confirmation(row) -> bool:
     payload = _decode_json_object(row["payload_json"])
     chat_id = str(row["chat_id"] or "")
     token = str(row["token"] or "")
     event = _expired_confirmation_event(payload, row)
-    if not publish_confirmation_event(
-        event,
+    expired = db.expire_organize_confirmation_with_delivery(
+        token,
+        event_json=serialize_notification_event(event),
         chat_id=chat_id,
-        token=token,
         message_id=_confirmation_message_id(payload),
-        terminal=True,
-    ):
-        logger.warning(
-            "Telegram 过期确认终态未被统一通知中心接纳 token=%s",
-            token[:6],
-        )
+    )
+    if expired is None:
+        return False
+    _dispatch_due_confirmation_delivery(token)
     _finalize_guangya_manual_logs(
         payload, status="skipped", error="人工确认已过期",
     )
     _maybe_update_parent_organize_rollup(
         str(row["organize_task_id"] or ""), chat_id=chat_id,
     )
+    return True
 
 
 def _expire_due_pending_confirmations(
     *, token: str = "", limit: int = 100,
 ) -> int:
-    rows = db.expire_pending_organize_confirmations(token=token, limit=limit)
+    rows = db.list_due_pending_organize_confirmations(token=token, limit=limit)
+    expired = 0
     for row in rows:
         try:
-            _publish_expired_confirmation(row)
+            expired += int(_publish_expired_confirmation(row))
         except Exception as exc:  # noqa: BLE001 - 单卡投影失败不能阻塞其它过期项。
             logger.warning(
                 "人工确认过期收口失败 token=%s type=%s",
                 str(row["token"] or "")[:6],
                 type(exc).__name__,
             )
-    return len(rows)
+    return expired
 
 
 def _raise_if_confirmation_expired(row) -> None:
@@ -793,15 +834,11 @@ def cancel_confirmation(
     db.cancel_organize_confirmation(
         token,
         chat_id=chat_id,
-        event_json=_serialize_notification_event(terminal_event),
+        event_json=serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
-        enqueue_delivery=False,
         resolution="deferred",
     )
-    publish_confirmation_event(
-        terminal_event, chat_id=chat_id, token=token,
-        message_id=resolved_message_id or None, terminal=True,
-    )
+    _dispatch_due_confirmation_delivery(token)
     _finalize_guangya_manual_logs(
         payload, status="skipped", error="用户选择暂不处理",
     )
@@ -853,24 +890,13 @@ def skip_confirmation(
     db.cancel_organize_confirmation(
         token,
         chat_id=chat_id,
-        event_json=_serialize_notification_event(terminal_event),
+        event_json=serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
-        enqueue_delivery=False,
         resolution="skipped",
     )
     reason = "用户选择跳过：暂无可用元数据"
     _finalize_guangya_manual_logs(payload, status="skipped", error=reason)
-    if not publish_confirmation_event(
-        terminal_event,
-        chat_id=chat_id,
-        token=token,
-        message_id=resolved_message_id or None,
-        terminal=True,
-    ):
-        logger.warning(
-            "Telegram 跳过确认终态未被统一通知中心接纳 token=%s",
-            str(token)[:6],
-        )
+    _dispatch_due_confirmation_delivery(token)
     try:
         _maybe_update_parent_organize_rollup(
             str(current["organize_task_id"] or ""), chat_id=str(chat_id or ""),
@@ -935,23 +961,12 @@ def _dispatch_confirmation_token(token: str) -> dict:
         db.fail_organize_confirmation_with_delivery(
             token,
             error=message,
-            event_json=_serialize_notification_event(failure_event),
+            event_json=serialize_notification_event(failure_event),
             chat_id=chat_id,
             message_id=None,
             retryable=False,
-            enqueue_delivery=False,
         )
-        if not publish_confirmation_event(
-            failure_event,
-            chat_id=chat_id,
-            token=token,
-            terminal=True,
-            error=True,
-        ):
-            logger.warning(
-                "Telegram 损坏确认任务回执未被统一通知中心接纳 token=%s",
-                str(token)[:6],
-            )
+        _dispatch_due_confirmation_delivery(token)
         logger.warning(
             "Telegram 排队整理数据损坏 token=%s type=%s",
             str(token)[:6],
@@ -1014,60 +1029,6 @@ def _dispatch_next_queued_confirmation() -> dict:
     return _dispatch_confirmation_token(str(row["token"] or ""))
 
 
-def _serialize_notification_event(event: NotificationEvent) -> str:
-    return json.dumps(
-        {
-            "title": str(event.title or ""),
-            "fields": [[str(key or ""), str(value or "")] for key, value in event.fields],
-            "lines": [str(line or "") for line in event.lines],
-            "image_url": str(event.image_url or ""),
-            "footer": str(event.footer or ""),
-            "actions": [
-                {"label": str(action.label or ""), "callback_data": str(action.callback_data or "")}
-                for action in event.actions
-            ],
-            "layout": str(event.layout or "default"),
-            "field_emojis": bool(event.field_emojis),
-        },
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
-
-
-def _deserialize_notification_event(raw: object) -> NotificationEvent:
-    try:
-        data = json.loads(str(raw or "{}"))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise ValueError("Telegram 整理回执数据损坏") from exc
-    if not isinstance(data, dict):
-        raise ValueError("Telegram 整理回执数据损坏")
-    raw_fields = data.get("fields") or []
-    raw_actions = data.get("actions") or []
-    fields = tuple(
-        (str(item[0] or ""), str(item[1] or ""))
-        for item in raw_fields
-        if isinstance(item, (list, tuple)) and len(item) == 2
-    )
-    actions = tuple(
-        NotificationAction(
-            str(item.get("label") or ""),
-            str(item.get("callback_data") or ""),
-        )
-        for item in raw_actions
-        if isinstance(item, dict) and str(item.get("callback_data") or "").strip()
-    )
-    return NotificationEvent(
-        str(data.get("title") or "Telegram 整理结果"),
-        fields=fields,
-        lines=tuple(str(line or "") for line in (data.get("lines") or [])),
-        image_url=str(data.get("image_url") or ""),
-        footer=str(data.get("footer") or ""),
-        actions=actions,
-        layout=str(data.get("layout") or "default"),
-        field_emojis=bool(data.get("field_emojis", True)),
-    )
-
-
 def _delivery_timestamp(delay_seconds: int = 0) -> str:
     return _timestamp(datetime.now() + timedelta(seconds=int(delay_seconds)))
 
@@ -1084,7 +1045,7 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
     delivery_id = int(item["id"])
     generation = int(item["lease_generation"])
     try:
-        event = _deserialize_notification_event(item["event_json"])
+        event = deserialize_notification_event(item["event_json"])
     except ValueError:
         event = NotificationEvent(
             "❌ Telegram 整理结果回执异常",
@@ -1094,8 +1055,8 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
     chat_id = str(item["chat_id"] or "")
     token = str(item["confirmation_token"] or "").strip()
     try:
-        # 兼容升级前已写入的旧回执：这里只负责一次性交给统一通知中心，
-        # 后续发送、编辑、重试与 message_id 维护全部由统一 outbox 接管。
+        # 领域事务 outbox 只保证确认终态与回执原子落库；后续发送、编辑、
+        # 重试与 message_id 维护全部由统一 Telegram outbox 接管。
         accepted = publish_confirmation_event(
             event,
             chat_id=chat_id,
@@ -1107,7 +1068,7 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
     except Exception as exc:
         accepted = False
         logger.warning(
-            "Telegram 旧整理回执迁移失败 token=%s type=%s",
+            "Telegram 整理回执移交失败 token=%s type=%s",
             token[:6],
             type(exc).__name__,
         )
@@ -1117,7 +1078,7 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
         )
         if not completed:
             logger.info(
-                "Telegram 旧整理回执已移交，但投递租约已变化 token=%s",
+                "Telegram 整理回执已移交，但投递租约已变化 token=%s",
                 token[:6],
             )
         return True
@@ -1245,6 +1206,14 @@ def start_confirmation(
     candidates = list(payload.get("candidates") or [])
     if selected_index < 0 or selected_index >= len(candidates):
         raise ValueError("候选参数无效")
+    retry_selected_index = payload.get(_RETRY_SELECTED_INDEX_KEY)
+    if retry_selected_index is not None:
+        try:
+            bound_index = int(retry_selected_index)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("确认任务数据损坏，请重新执行整理") from exc
+        if selected_index != bound_index:
+            raise ValueError("该重试确认已绑定其他候选")
     candidate = dict(candidates[selected_index])
     status = str(preview["status"] or "pending")
 
@@ -1638,16 +1607,11 @@ def _execute_local_media_confirmation(
         db.complete_organize_confirmation_with_delivery(
             token,
             result_json=json.dumps(result, ensure_ascii=False, default=str),
-            event_json=_serialize_notification_event(terminal_event),
+            event_json=serialize_notification_event(terminal_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
-            enqueue_delivery=False,
         )
-        publish_confirmation_event(
-            terminal_event, chat_id=chat_id, token=token,
-            message_id=_confirmation_message_id(payload), terminal=True,
-            error=terminal_event.title.startswith("⚠️"),
-        )
+        _dispatch_due_confirmation_delivery(token)
         return {"candidate": candidate, "stats": result, "local_task_id": task_id}
     except Exception as exc:
         message = str(exc or "本地媒体确认整理失败").strip() or "本地媒体确认整理失败"
@@ -1701,16 +1665,12 @@ def _execute_local_media_confirmation(
         db.fail_organize_confirmation_with_delivery(
             token,
             error=message,
-            event_json=_serialize_notification_event(failure_event),
+            event_json=serialize_notification_event(failure_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
             retryable=False,
-            enqueue_delivery=False,
         )
-        publish_confirmation_event(
-            failure_event, chat_id=chat_id, token=token,
-            message_id=_confirmation_message_id(payload), terminal=True, error=True,
-        )
+        _dispatch_due_confirmation_delivery(token)
         raise
     finally:
         close = getattr(qb_client, "close", None)
@@ -1746,7 +1706,8 @@ def _execute_confirmation(
         )
     finally:
         # 成功、不可重试失败都在各自执行器内先落终态；由唯一出口尝试
-        # 收口父汇总。可重试失败会回到 pending，因此不会提前更新汇总。
+        # 收口父汇总。写前可重试失败会以相同指纹签发新的 pending 行，
+        # 最新行尚未终结，因此不会把旧 token 的失败提前计入父汇总。
         row = db.get_organize_confirmation(token)
         if row is not None and str(row["status"] or "") in (
             _TERMINAL_CONFIRMATION_STATUSES
@@ -1815,6 +1776,7 @@ def _execute_guangya_confirmation(
     client = None
     scraper = None
     organizer = None
+    write_started = False
     try:
         source_dir_id = str(payload.get("source_dir_id") or "").strip()
         current_rules = OrganizeRules.from_config().for_source(source_dir_id)
@@ -1876,6 +1838,9 @@ def _execute_guangya_confirmation(
             raise DirectoryScrapeConflictError("待确认文件集合已变化，请重新执行整理")
 
         scoped.begin_source_scan()
+        # 从这里开始 Organizer 可以调用真实 provider 写接口。即使异常看似
+        # 瞬时，也不能再自动签发重试票据，必须先核对实际落盘结果。
+        write_started = True
         _plans, stats = organizer.organize(
             parent_id,
             current_rules,
@@ -1898,18 +1863,13 @@ def _execute_guangya_confirmation(
         db.complete_organize_confirmation_with_delivery(
             token,
             result_json=json.dumps(stats, ensure_ascii=False, default=str),
-            event_json=_serialize_notification_event(terminal_event),
+            event_json=serialize_notification_event(terminal_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
-            enqueue_delivery=False,
         )
         # 先把候选卡收敛为整理终态，再排队 STRM；即使 debounce=0，
         # 后续刷新也只会在同一条终态消息上补字段，不会被较旧内容覆盖。
-        publish_confirmation_event(
-            terminal_event, chat_id=chat_id, token=token,
-            message_id=_confirmation_message_id(payload), terminal=True,
-            error=terminal_event.title.startswith("⚠️"),
-        )
+        _dispatch_due_confirmation_delivery(token)
         try:
             Organizer.trigger_post_actions(
                 stats,
@@ -1960,21 +1920,29 @@ def _execute_guangya_confirmation(
             )
         return {"candidate": candidate, "stats": stats}
     except Exception as exc:
+        current = db.get_organize_confirmation(token)
+        if current is not None and str(current["status"] or "") in (
+            _TERMINAL_CONFIRMATION_STATUSES
+        ):
+            logger.warning(
+                "人工确认整理在终态后抛出异常 token=%s status=%s type=%s",
+                token[:6],
+                str(current["status"] or ""),
+                type(exc).__name__,
+            )
+            raise
         message = str(exc or "Telegram 确认整理失败").strip() or "Telegram 确认整理失败"
-        retryable = not isinstance(exc, (DirectoryScrapeConflictError, ValueError))
-        actions: tuple[NotificationAction, ...] = ()
-        if retryable:
-            actions = (NotificationAction(
-                f"重新尝试 · {_safe_label(candidate, selected_index)}",
-                f"orgc:{token}:{selected_index}",
-            ),)
+        retryable = (
+            not write_started
+            and not isinstance(exc, (DirectoryScrapeConflictError, ValueError))
+        )
         logger.warning(
             "Telegram 确认整理失败 token=%s type=%s retryable=%s",
             token[:6],
             type(exc).__name__,
             retryable,
         )
-        failure_event = NotificationEvent(
+        terminal_failure_event = NotificationEvent(
             "❌ Telegram 确认整理失败",
             fields=(
                 ("所在目录", payload.get("directory") or "/"),
@@ -1982,34 +1950,47 @@ def _execute_guangya_confirmation(
                 NOTIFICATION_SECTION_BREAK,
                 ("错误原因", message),
             ),
-            footer=(
-                "可点击下方按钮重试。"
-                if retryable else "请重新执行整理生成新候选。"
-            ),
-            actions=actions,
+            footer="请重新执行整理生成新候选。",
             layout="relaxed",
         )
+        actions: tuple[NotificationAction, ...] = ()
+        if retryable:
+            try:
+                _retry_token, retry_action = _persist_confirmation_retry(
+                    payload,
+                    selected_index=selected_index,
+                    chat_id=chat_id,
+                )
+                actions = (retry_action,)
+            except Exception as retry_exc:  # noqa: BLE001 - 新票据失败必须 fail closed。
+                logger.warning(
+                    "Telegram 确认整理新重试票据创建失败 token=%s type=%s",
+                    token[:6],
+                    type(retry_exc).__name__,
+                )
+
+        failure_event = NotificationEvent(
+            terminal_failure_event.title,
+            fields=terminal_failure_event.fields,
+            footer=(
+                "旧确认已失效；请点击下方新按钮重新确认。"
+                if actions else terminal_failure_event.footer
+            ),
+            actions=actions,
+            layout=terminal_failure_event.layout,
+        )
+        # 旧 token 一旦被选择便永久进入终态；终态和最终按钮卡在同一事务
+        # 写入领域 outbox，再由唯一的 Telegram 通知中心接管发送与重试。
         db.fail_organize_confirmation_with_delivery(
             token,
             error=message,
-            event_json=_serialize_notification_event(failure_event),
+            event_json=serialize_notification_event(failure_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
-            retryable=retryable,
-            enqueue_delivery=False,
-            retry_expires_at=(
-                _timestamp(
-                    datetime.now(timezone.utc).astimezone()
-                    + timedelta(hours=_CONFIRMATION_TTL_HOURS)
-                )
-                if retryable else ""
-            ),
+            retryable=False,
         )
-        publish_confirmation_event(
-            failure_event, chat_id=chat_id, token=token,
-            message_id=_confirmation_message_id(payload), terminal=True, error=True,
-        )
-        if not retryable:
+        _dispatch_due_confirmation_delivery(token)
+        if not actions:
             _finalize_guangya_manual_logs(
                 payload, status="failed", error=message,
             )

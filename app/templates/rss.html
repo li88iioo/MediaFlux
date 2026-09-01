@@ -790,5 +790,5 @@ window.ensureRssPanelLoaded=()=>{
 };
 </script>
 {% if discovery_enabled %}<script src="{{ url_for('static', path='js/discovery.js') }}?v=20260825a" defer></script>{% endif %}
-<script src="/static/js/subscriptions.js?v=20260831a"></script>
+<script src="{{ url_for('static', path='js') }}/subscriptions.js?v=20260831a"></script>
 {% endblock %}

@@ -37,3 +37,9 @@ def public_error_message(exc: DirectoryScrapePublicError) -> str:
     if exc.args:
         return str(exc.args[0])
     return "目录刮削请求失败"
+
+def safe_organize_failure(exc: Exception) -> str:
+    """只向用户暴露经过审查的目录刮削错误，其余异常统一收敛。"""
+    if isinstance(exc, DirectoryScrapePublicError):
+        return public_error_message(exc)
+    return "文件整理失败，请稍后重试"

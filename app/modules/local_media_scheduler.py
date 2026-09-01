@@ -20,6 +20,10 @@ from app.modules.local_media_service import (
     LocalMediaService,
 )
 from app.modules.local_media_candidates import discover_local_media_candidates
+from app.modules.local_media_models import (
+    canonical_local_media_content_path,
+    local_media_paths_overlap,
+)
 from app.modules.local_media_notifications import notify_local_media_task
 from app.modules.local_path_mapping import (
     PathMapping,
@@ -94,14 +98,15 @@ def _source_path_error(source) -> str:
 
 
 class LocalMediaScheduler:
-    def __init__(self, *, owner: str = "admin", interval: float = 10.0, service=None, qb_factory=None, clock=None):
+    def __init__(
+        self, *, owner: str = "admin", interval: float = 10.0,
+        service=None, qb_factory=None,
+    ):
         self.owner = owner
         self.interval = max(0.2, float(interval))
         self._owns_service = service is None
         self.service = service or LocalMediaService()
         self.qb_factory = qb_factory or self._default_qb_client
-        # ``clock`` 仅为旧调用签名保留；目录定时轮询已经移除。
-        _ = clock
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
@@ -278,10 +283,6 @@ class LocalMediaScheduler:
         return task_id
 
     _source_candidates = staticmethod(discover_local_media_candidates)
-
-    def _enqueue_scan_candidates(self) -> int:
-        """兼容旧调用：目录定时轮询已移除，不再自动创建整理任务。"""
-        return 0
 
     def enqueue_manual_scan_candidates(
         self,
@@ -485,18 +486,12 @@ class LocalMediaScheduler:
 
     @staticmethod
     def _canonical_task_path(task) -> str:
-        return str(Path(task.content_path).expanduser().resolve(strict=False))
-
-    @staticmethod
-    def _paths_overlap(first: str, second: str) -> bool:
-        left = Path(first)
-        right = Path(second)
-        return left == right or left in right.parents or right in left.parents
+        return canonical_local_media_content_path(task.content_path)
 
     def _acquire_task_path(self, task) -> str | None:
         key = self._canonical_task_path(task)
         with self._guard:
-            if any(self._paths_overlap(key, locked) for locked in self._path_locks):
+            if any(local_media_paths_overlap(key, locked) for locked in self._path_locks):
                 return None
             self._path_locks.add(key)
         return key

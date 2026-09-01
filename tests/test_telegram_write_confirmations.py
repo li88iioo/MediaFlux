@@ -84,7 +84,7 @@ class TelegramWriteConfirmationStoreTests(unittest.TestCase):
             with self.assertRaisesRegex(TelegramWriteConfirmationError, "已处理"):
                 store.claim(action_id, chat_id="-100", user_id="9")
 
-    def test_capacity_evicts_whole_oldest_group(self):
+    def test_new_group_replaces_previous_owner_confirmation(self):
         store = TelegramWriteConfirmationStore(max_actions=4)
         old_ids = store.create_group(
             chat_id="100",
@@ -110,10 +110,11 @@ class TelegramWriteConfirmationStoreTests(unittest.TestCase):
 class SQLiteTelegramWriteConfirmationStoreTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         with db.get_conn() as conn:
-            conn.execute("DELETE FROM telegram_write_confirmations")
+            conn.execute("DELETE FROM agent_confirmations")
+            conn.execute("DELETE FROM agent_confirmation_epochs")
 
     def test_pair_persists_owner_hashed_and_consumes_across_instances(self):
-        tokens = iter(["group-token", "confirm-token", "cancel-token"])
+        tokens = iter(["confirm_ticket_000001"])
         first = SQLiteTelegramWriteConfirmationStore(
             token_factory=lambda: next(tokens)
         )
@@ -125,9 +126,9 @@ class SQLiteTelegramWriteConfirmationStoreTests(IsolatedDatabaseTestCase):
         )
         with db.get_conn() as conn:
             owner_digest = conn.execute(
-                "SELECT owner_digest FROM telegram_write_confirmations "
-                "WHERE action_id=?",
-                (confirm,),
+                "SELECT owner_digest FROM agent_confirmations "
+                "WHERE confirmation_id=?",
+                (confirm.rsplit(".", 1)[0],),
             ).fetchone()["owner_digest"]
         self.assertNotIn("100", str(owner_digest))
         self.assertRegex(str(owner_digest), r"^[0-9a-f]{64}$")
@@ -147,7 +148,7 @@ class SQLiteTelegramWriteConfirmationStoreTests(IsolatedDatabaseTestCase):
             first.claim(cancel, chat_id="100", user_id="9")
 
     def test_group_claim_is_atomic_across_store_instances(self):
-        tokens = iter(["group-race", "choice-a", "choice-b"])
+        tokens = iter(["group_choice_ticket_0001"])
         action_ids = SQLiteTelegramWriteConfirmationStore(
             token_factory=lambda: next(tokens)
         ).create_group(

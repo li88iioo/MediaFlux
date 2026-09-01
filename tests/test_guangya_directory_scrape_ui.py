@@ -550,10 +550,23 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
                         method: options.method || 'GET',
                         body: options.body ? JSON.parse(options.body) : null,
                     });
+                    if (path === '/api/guangya/organize/status') {
+                        return {
+                            ok: true,
+                            status: 200,
+                            json: async () => ({
+                                id: 'delete-task',
+                                status: 'completed',
+                                result: {stats: {deleted: 1}},
+                                operation_queue: {items: []},
+                                operation_history: [],
+                            }),
+                        };
+                    }
                     return {
                         ok: true,
-                        status: 200,
-                        json: async () => ({ok: true, file_id: 'junk'}),
+                        status: 202,
+                        json: async () => ({ok: true, task_id: 'delete-task'}),
                     };
                 };
             }
@@ -580,7 +593,10 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
                 window.__deleteAction = action;
                 window.GuangYaDirectoryScrapeUI.bindMediaRow(
                     row,
-                    {file_id: 'junk', name: '广告.txt', is_dir: false, is_video: false},
+                    {
+                        file_id: 'junk', name: '广告.txt', is_dir: false, is_video: false,
+                        parent_id: 'parent-a', etag: 'etag-junk', updated_at: 77,
+                    },
                     action,
                 );
                 action.click();
@@ -639,11 +655,25 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
         self.assertNotIn("verifyText", state["confirms"][0])
         self.assertEqual(
             state["requests"],
-            [{
-                "path": "/api/guangya/delete-item",
-                "method": "POST",
-                "body": {"file_id": "junk"},
-            }],
+            [
+                {
+                    "path": "/api/guangya/delete-item",
+                    "method": "POST",
+                    "body": {
+                        "file_id": "junk",
+                        "expected_name": "广告.txt",
+                        "expected_parent_id": "parent-a",
+                        "expected_is_dir": False,
+                        "expected_etag": "etag-junk",
+                        "expected_updated_at": 77,
+                    },
+                },
+                {
+                    "path": "/api/guangya/organize/status",
+                    "method": "GET",
+                    "body": None,
+                },
+            ],
         )
         self.assertEqual(state["reloads"], 1)
         self.assertEqual(state["alerts"][-1]["type"], "success")
@@ -680,7 +710,7 @@ class GuangYaDirectDeleteBrowserTests(unittest.TestCase):
         )
         self.assertEqual(state["actionState"], "done")
         self.assertTrue(state["actionDisabled"])
-        self.assertEqual(len(state["requests"]), 1)
+        self.assertEqual(len(state["requests"]), 2)
         self.assertEqual(len(state["alerts"]), 1)
         self.assertEqual(state["alerts"][0]["type"], "warning")
         self.assertIn("文件已删除", state["alerts"][0]["title"])

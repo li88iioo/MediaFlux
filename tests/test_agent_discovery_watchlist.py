@@ -264,8 +264,8 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             parameters={},
             validator=add_watchlist_arguments,
             requires_confirmation=True,
-            confirmed_handler=add_watchlist_confirmed,
-            confirmation_preparer=prepare_add_watchlist,
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(add_watchlist_confirmed),
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_add_watchlist),
         ))
         registry.register(ToolSpec(
             name="discovery.remove_watchlist",
@@ -274,8 +274,8 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             parameters={},
             validator=remove_watchlist_arguments,
             requires_confirmation=True,
-            confirmed_handler=remove_watchlist_confirmed,
-            confirmation_preparer=prepare_remove_watchlist,
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(remove_watchlist_confirmed),
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_remove_watchlist),
         ))
         registry.register(ToolSpec(
             name="discovery.watchlist_summaries",

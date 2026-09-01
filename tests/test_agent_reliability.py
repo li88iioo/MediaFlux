@@ -375,14 +375,14 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
             risk=RiskLevel.WRITE,
             parameters={"type": "object"},
             validator=lambda arguments: {"value": str(arguments.get("value") or "")},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(True, "confirmation_required", "preview", data=arguments),
                 f"write-test:{arguments['value']}",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: (
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
                 calls.append(dict(arguments))
                 or ToolResult(True, "completed", "done")
-            ),
+            )),
             requires_confirmation=True,
         ))
         issuer = AgentOrchestrator(registry)

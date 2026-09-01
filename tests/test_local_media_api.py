@@ -85,9 +85,9 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(created.json()["targets"][0]["library_id"], "movies")
         self.assertEqual(created.json()["targets"][0]["library_name"], "电影")
         self.assertEqual(created.json()["targets"][0]["server_path"], "//NAS/Video/Movies")
-        self.assertEqual(created.json()["stable_seconds"], 0)
-        self.assertFalse(created.json()["scan_enabled"])
-        self.assertEqual(created.json()["scan_interval_minutes"], 10)
+        self.assertNotIn("stable_seconds", created.json())
+        self.assertNotIn("scan_enabled", created.json())
+        self.assertNotIn("scan_interval_minutes", created.json())
         self.assertNotIn("smb_user", created.json())
         self.assertNotIn("has_smb_pass", created.json())
         self.assertNotIn("secret123", created.text)
@@ -125,8 +125,9 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertEqual(updated.json()["name"], "主下载目录")
         self.assertEqual([item["category"] for item in updated.json()["targets"]], ["default"])
         self.assertEqual(updated.json()["targets"][0]["server_path"], "D:/Media")
-        self.assertEqual(updated.json()["stable_seconds"], 0)
-        self.assertFalse(updated.json()["scan_enabled"])
+        self.assertNotIn("stable_seconds", updated.json())
+        self.assertNotIn("scan_enabled", updated.json())
+        self.assertNotIn("scan_interval_minutes", updated.json())
         self.assertNotIn("smb_user", updated.json())
         self.assertNotIn("has_smb_pass", updated.json())
         stored_source = db.get_local_media_source(source_id, owner="admin")
@@ -520,6 +521,40 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
             params={"source_id": source_id, "path": str(self.default_target)},
         )
         self.assertEqual(outside.status_code, 400, outside.text)
+
+    def test_media_item_delete_delegates_to_local_media_service_writer(self):
+        csrf = self.login(); headers = {"X-CSRF-Token": csrf}
+        media_file = self.local_root / "Movie.2026.mkv"
+        media_file.write_bytes(b"movie")
+        source_id = db.create_local_media_source(
+            name="本地下载", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        item = self.client.get("/api/local-media/items").json()["items"][0]
+        service = Mock()
+        service.move_media_item_to_trash.return_value = (
+            self.local_root / ".mediaflux-trash" / "Movie.2026.mkv"
+        )
+
+        with patch(
+            "app.routes.local_media_api.get_local_media_service", return_value=service,
+        ):
+            response = self.client.post(
+                "/api/local-media/items/delete",
+                json={
+                    "source_id": source_id,
+                    "path": item["path"],
+                    "identity": item["identity"],
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"deleted": True, "recoverable": True})
+        service.move_media_item_to_trash.assert_called_once_with(
+            "admin", source_id, item["path"], item["identity"],
+        )
+        self.assertTrue(media_file.exists())
 
     def test_media_item_delete_rejects_changed_snapshot_and_nested_path(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}

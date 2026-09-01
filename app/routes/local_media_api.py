@@ -18,9 +18,7 @@ from app.modules.local_path_mapping import (
 )
 from app.modules.local_media_candidates import (
     candidate_payload,
-    discover_local_media_candidates,
     discover_local_media_directory_candidates,
-    move_candidate_to_trash,
 )
 from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES, LOCAL_MEDIA_CATEGORIES
 from app.modules.media_server_path_mapping import MediaServerPathMapping
@@ -103,8 +101,6 @@ def _source_payload(source) -> dict:
         "id": source.id, "name": source.name, "qb_profile": source.qb_profile,
         "qb_path_prefix": source.qb_path_prefix, "local_root": source.local_root,
         "enabled": source.enabled,
-        # 旧字段保留在响应中兼容历史客户端，但产品链路已取消固定等待与定时扫描。
-        "stable_seconds": 0, "scan_enabled": False, "scan_interval_minutes": 10,
         "media_type": source.media_type, "mode": source.mode,
         "targets": [
             {"id": item.id, "category": item.category, "path": item.path,
@@ -366,8 +362,6 @@ def create_source(request: Request, data: dict | None = Body(default=None)):
             qb_path_prefix=_text(payload, "qb_path_prefix"),
             local_root=local_root,
             enabled=_boolean(payload, "enabled", True),
-            # 保留数据库列以兼容旧数据；新来源不再启用固定等待或目录轮询。
-            stable_seconds=0, scan_enabled=False, scan_interval_minutes=10,
             owner=_OWNER, media_type=_text(payload, "media_type", max_length=16) or "auto",
             mode=_text(payload, "mode", max_length=16) or "move", targets=targets,
         )
@@ -405,8 +399,6 @@ def update_source(source_id: int, request: Request, data: dict | None = Body(def
             smb_user="",
             smb_pass="",
             enabled=_boolean(payload, "enabled", source.enabled) if "enabled" in payload else source.enabled,
-            # 编辑旧来源时同步归一化已废弃的等待/轮询配置，避免隐藏配置继续生效。
-            stable_seconds=0, scan_enabled=False, scan_interval_minutes=10,
             media_type=_text(payload, "media_type", max_length=16) if "media_type" in payload else source.media_type,
             mode=_text(payload, "mode", max_length=16) if "mode" in payload else source.mode,
             targets=effective_targets,
@@ -522,8 +514,9 @@ def delete_media_item(request: Request, data: dict | None = Body(default=None)):
         identity = payload.get("identity")
         if not isinstance(identity, dict):
             raise ValueError("条目快照无效，请刷新后重试")
-        destination = move_candidate_to_trash(
-            source,
+        destination = get_local_media_service().move_media_item_to_trash(
+            _OWNER,
+            source_id,
             _text(payload, "path", required=True),
             identity,
         )

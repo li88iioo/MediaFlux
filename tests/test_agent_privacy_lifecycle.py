@@ -27,7 +27,6 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
             "job": self._digest(b"mediaflux-agent-durable-job:v1\0", owner),
             "workflow": self._digest(b"mediaflux-agent-missing-workflow:v1\0", owner),
             "tg_action": self._digest(b"mediaflux-telegram-agent-action:v1\0", owner),
-            "tg_confirm": self._digest(b"mediaflux-telegram-write-confirmation:v1\0", owner),
             "conversation": self._digest(
                 b"mediaflux-agent-conversation-principal:v1\0", principal
             ),
@@ -82,10 +81,6 @@ class AgentPrivacyLifecycleTests(IsolatedDatabaseTestCase):
             conn.execute(
                 "INSERT INTO telegram_agent_actions(action_id,owner_digest,action_kind,group_id,expires_at,created_at) VALUES(?,?,?,?,?,?)",
                 ("tg_action_privacy_1", digests["tg_action"], "result", "g1", time.time() + 60, now),
-            )
-            conn.execute(
-                "INSERT INTO telegram_write_confirmations(action_id,group_id,owner_digest,decision,operation,expires_at,created_at) VALUES(?,?,?,?,?,?,?)",
-                ("tg_confirm_privacy_1", "g1", digests["tg_confirm"], "yes", "demo", time.time() + 60, now),
             )
             conn.execute(
                 "INSERT INTO agent_conversations(principal_digest,session_id,title,created_at,updated_at) VALUES(?,?,?,?,?)",

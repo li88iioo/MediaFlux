@@ -23,7 +23,7 @@ from app import config, database
 from app.modules import first_run, web_secret
 from app.logger import get_logger
 from app.security import SAFE_METHODS
-from app.web import APP_DIR, csrf_token, render_template, templates
+from app.web import APP_DIR, render_template
 
 logger = get_logger(__name__)
 

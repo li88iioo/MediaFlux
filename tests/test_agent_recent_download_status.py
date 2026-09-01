@@ -134,8 +134,8 @@ def _submission_agent(
             "target": str(arguments.get("target") or ""),
         },
         requires_confirmation=True,
-        confirmation_preparer=prepare_submission,
-        confirmed_handler=confirm_submission,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submission),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_submission),
     ))
     service = AgentOrchestrator(
         registry,

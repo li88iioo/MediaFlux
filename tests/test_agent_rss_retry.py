@@ -156,7 +156,6 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         success = QBittorrentClient("http://qb.internal:8080", api_key="token")
         success._session.post = MagicMock(return_value=_Response(200, "Ok."))
         self.assertEqual(success.add_torrent_detailed(urls="magnet:?xt=test"), TorrentAddResult(True))
-        self.assertTrue(success.add_torrent(urls="magnet:?xt=test"))
 
     def test_qb_login_failure_is_classified_without_response_body_leak(self):
         client = QBittorrentClient("http://qb.internal:8080", username="u", password="secret")

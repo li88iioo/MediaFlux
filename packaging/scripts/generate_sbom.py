@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """从锁定的 Python 依赖清单生成范围明确的 SPDX 2.3 JSON SBOM。"""
 from __future__ import annotations
-import argparse, hashlib, json, os, re
+import argparse, json, os, re
 from datetime import datetime,timezone
 from pathlib import Path
 from typing import Sequence

@@ -31,6 +31,29 @@ class _TreeClient:
     def list_dir(self, file_id):
         return self.tree.get(file_id, [])
 
+    def file_info(self, file_id):
+        for children in self.tree.values():
+            for item in children:
+                if str(item.file_id) == str(file_id):
+                    return item
+        return None
+
+    def get_download_url(self, file_id):
+        return f"https://storage.invalid/{file_id}"
+
+
+def _process_metadata_once(worker, root: str, extensions: str = "jpg") -> bool:
+    with patch(
+        "app.modules.strm_metadata_worker.get_bool", return_value=True
+    ), patch(
+        "app.modules.strm_metadata_worker.get",
+        side_effect=lambda key, default="": {
+            "STRM_ROOT": root,
+            "STRM_METADATA_EXTS": extensions,
+        }.get(key, default),
+    ):
+        return worker._process_one()
+
 
 class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
     @staticmethod
@@ -469,13 +492,13 @@ class P2RecoveryAndRaceTests(IsolatedDatabaseTestCase):
 
 class P2MetadataCancellationTests(IsolatedDatabaseTestCase):
     def test_metadata_cancellation_restores_previous_file_without_failure_ledger(self) -> None:
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+
         source_id = f"meta-cancel-{uuid.uuid4().hex}"
         remote = GuangYaFile("poster-1", "poster.jpg", False, 7, "new-etag", source_id)
-        state = {"stop": False}
 
         class Client(_TreeClient):
-            def get_download_url(self, file_id):
-                return "https://storage.invalid/poster"
+            pass
 
         class Response:
             def __enter__(self):
@@ -489,7 +512,7 @@ class P2MetadataCancellationTests(IsolatedDatabaseTestCase):
 
             def iter_content(self, chunk_size):
                 yield b"new"
-                state["stop"] = True
+                worker._stop_event.set()
                 yield b"data"
 
         with tempfile.TemporaryDirectory() as root:
@@ -502,19 +525,26 @@ class P2MetadataCancellationTests(IsolatedDatabaseTestCase):
                 len(old_payload), remote.name, str(target),
                 f"sha256:{hashlib.sha256(old_payload).hexdigest()}",
             )
+            client = Client({source_id: [remote]})
+            stats = sync_strm(
+                source_id, "http://localhost:1258", root,
+                client=client, metadata_exts={"jpg"},
+            )
+            worker = STRMMetadataWorker()
+            worker._client = client
             with patch("app.modules.strm.requests.get", return_value=Response()):
-                stats = sync_strm(
-                    source_id, "http://localhost:1258", root,
-                    client=Client({source_id: [remote]}), metadata_exts={"jpg"},
-                    should_stop=lambda: state["stop"],
-                )
+                worked = _process_metadata_once(worker, root)
 
-            self.assertTrue(stats["stopped"])
+            self.assertFalse(worked)
+            self.assertEqual(stats["metadata_queued"], 1)
             self.assertEqual(stats["metadata_failed"], 0)
             self.assertEqual(target.read_bytes(), old_payload)
             row = db.list_strm_index(f"guangya-meta:{source_id}")[0]
             self.assertEqual(row["etag"], "old-etag")
             self.assertEqual(db.list_strm_failures(status="open"), [])
+            self.assertEqual(
+                db.list_strm_metadata_queue()[0]["status"], "retry_wait"
+            )
 
 
 class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
@@ -591,6 +621,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
 
     def test_full_metadata_changed_after_backup_is_not_overwritten_by_rollback(self) -> None:
         import app.modules.strm as strm_module
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
 
         source_id = f"meta-race-{uuid.uuid4().hex}"
         source_key = f"guangya-meta:{source_id}"
@@ -632,19 +663,32 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
                     changed_once["done"] = True
                 return backup
 
-            with patch("app.modules.strm._copy_backup", side_effect=copy_then_modify), patch(
-                "app.modules.strm.requests.get", return_value=Response()
-            ):
-                stats = sync_strm(
-                    source_id, "http://localhost:1258", root,
-                    client=Client({source_id: [remote]}), metadata_exts={"jpg"},
-                )
+            client = Client({source_id: [remote]})
+            stats = sync_strm(
+                source_id, "http://localhost:1258", root,
+                client=client, metadata_exts={"jpg"},
+            )
+            worker = STRMMetadataWorker()
+            worker._client = client
+            with patch(
+                "app.modules.strm._copy_backup", side_effect=copy_then_modify
+            ), patch("app.modules.strm.requests.get", return_value=Response()):
+                worked = _process_metadata_once(worker, root)
 
+            self.assertTrue(worked)
             self.assertEqual(stats["metadata_generated"], 0)
-            self.assertEqual(stats["metadata_failed"], 1)
+            self.assertEqual(stats["metadata_queued"], 1)
+            self.assertEqual(stats["metadata_failed"], 0)
             self.assertEqual(target.read_bytes(), b"user-during-download")
             row = db.list_strm_index(source_key)[0]
             self.assertEqual(row["etag"], "etag-1")
+            self.assertEqual(
+                db.list_strm_metadata_queue()[0]["status"], "retry_wait"
+            )
+            failures = db.list_strm_failures(
+                status="open", source_id=source_id, action="metadata"
+            )
+            self.assertEqual(len(failures), 1)
 
     def test_invalid_cleanup_rechecks_ownership_immediately_before_delete(self) -> None:
         import app.modules.strm as strm_module

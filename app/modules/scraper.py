@@ -62,7 +62,6 @@ from app.modules.recognition.extractors.deterministic import (
     _valid_unlabeled_episode,
 )
 from app.modules.recognition.extractors.guessit_adapter import (
-    _guessit_cached,
     _guessit_episode_is_untrusted,
     _guessit_info,
     _position_number,
@@ -71,7 +70,6 @@ from app.modules.recognition.extractors.guessit_adapter import (
 from app.repositories.recognition import get_tmdb_lock, upsert_tmdb_lock
 from app.modules.recognition.resolver import (
     _explicit_tmdb_id_from_path,
-    _has_explicit_tmdb_marker,
     _resolve_explicit_tmdb_marker,
     _source_year_matches_tmdb,
     _strict_non_negative_int,
@@ -86,7 +84,6 @@ from app.modules.recognition_policy import (
 )
 from app.modules.special_media import (
     is_special_directory_name,
-    special_media_position,
     strip_special_media_markers,
 )
 from app.modules.episode_mapping import (

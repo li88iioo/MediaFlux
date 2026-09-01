@@ -24,9 +24,7 @@ from collections import deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import (
     FIRST_COMPLETED,
-    CancelledError,
     ThreadPoolExecutor,
-    as_completed,
     wait,
 )
 from pathlib import Path
@@ -292,7 +290,6 @@ DEFAULT_METADATA_EXTS = {
 STRM_SUBDIR = "光鸭云盘"
 MAX_PATH_COMPONENT_BYTES = 255
 MAX_RELATIVE_PATH_BYTES = 3072
-MAX_METADATA_WORKERS = 4
 DEFAULT_SCAN_WORKERS = 15
 MAX_SCAN_WORKERS = 32
 DEFAULT_VERIFY_WORKERS = 8
@@ -1087,14 +1084,6 @@ def _install_video_candidate(
         raise
 
 
-def _video_install_result(value: object, expected: Path) -> tuple[int, str]:
-    """兼容旧测试替身，并统一安装结果中的清理数与已知指纹。"""
-    if isinstance(value, tuple) and len(value) == 2:
-        return int(value[0] or 0), str(value[1] or "")
-    fingerprint = _content_fingerprint(expected) if expected.is_file() else ""
-    return int(value or 0), fingerprint
-
-
 def _video_generation_is_update(
     file_id: object,
     expected: Path,
@@ -1296,22 +1285,6 @@ def commit_strm_metadata_job(
     }
 
 
-def process_strm_metadata_job(
-    job: dict[str, object],
-    strm_root: str,
-    *,
-    client: Optional[GuangYaClient] = None,
-    should_stop: Callable[[], bool] | None = None,
-) -> dict[str, object]:
-    """兼容入口：准备下载后立即提交。后台 worker 会在两阶段之间释放写锁。"""
-    prepared = prepare_strm_metadata_job(
-        job, strm_root, client=client, should_stop=should_stop
-    )
-    return commit_strm_metadata_job(
-        job, prepared, strm_root, should_stop=should_stop
-    )
-
-
 def _remove_indexed_item(
     source_key: str,
     file_id: str,
@@ -1507,7 +1480,6 @@ def _sync_strm_incremental_impl(
     skip_threshold_mb: int = 0,
     rel_prefix: str = "",
     metadata_exts: Optional[set[str]] = None,
-    defer_metadata: bool = False,
     source_name: str = "",
     on_progress=None,
     should_stop: Callable[[], bool] | None = None,
@@ -1638,12 +1610,9 @@ def _sync_strm_incremental_impl(
                     is_update = _video_generation_is_update(
                         file.file_id, expected, video_by_id
                     )
-                    install_result = _install_video_candidate(
+                    cleaned, installed_fingerprint = _install_video_candidate(
                         file, rel_dir, expected, base_url, strm_root, video_key,
                         video_by_id, video_by_path,
-                    )
-                    cleaned, installed_fingerprint = _video_install_result(
-                        install_result, expected
                     )
                     stats["cleaned"] += cleaned
                     _update_video_index_snapshot(
@@ -1663,7 +1632,7 @@ def _sync_strm_incremental_impl(
                 if current and _metadata_state_matches(current, file, expected):
                     stats["metadata_skipped"] += 1
                     pending_resolutions["metadata"].add(file_id)
-                elif defer_metadata:
+                else:
                     queued = db.enqueue_strm_metadata_jobs([
                         _metadata_queue_payload(
                             file, rel_dir, strm_root,
@@ -1676,20 +1645,6 @@ def _sync_strm_incremental_impl(
                         stats["metadata_queue_failed"] += 1
                     else:
                         stats["metadata_queued"] += 1
-                else:
-                    url = str(client.get_download_url(file_id) or "")
-                    if not url:
-                        raise RuntimeError("无法获取元数据下载直链")
-                    stats["metadata_cleaned"] += _install_metadata_candidate(
-                        file, rel_dir, expected, strm_root, metadata_key,
-                        list(metadata_by_id.values()), url, client=client,
-                    )
-                    _update_video_index_snapshot(
-                        metadata_by_id, metadata_by_path, file, expected
-                    )
-                    stats["metadata_generated"] += 1
-                    _track_change(stats, "metadata", expected, strm_root)
-                    pending_resolutions["metadata"].add(file_id)
         except Exception as exc:
             label = str(change.get("name") or file_id)
             logger.warning("STRM 精准增量失败 %s: %s", label, exc)
@@ -1719,7 +1674,7 @@ def _sync_strm_incremental_impl(
                 source_key = metadata_key if kind == "metadata" else video_key
                 by_id = metadata_by_id if kind == "metadata" else video_by_id
                 by_path = metadata_by_path if kind == "metadata" else video_by_path
-                if kind == "metadata" and defer_metadata:
+                if kind == "metadata":
                     db.cancel_strm_metadata_job(
                         source_dir_id, file_id,
                         reason="精准增量确认远端元数据已删除",
@@ -1764,7 +1719,6 @@ def sync_strm_incremental(
     skip_threshold_mb: int = 0,
     rel_prefix: str = "",
     metadata_exts: Optional[set[str]] = None,
-    defer_metadata: bool = False,
     source_name: str = "",
     on_progress=None,
     should_stop: Callable[[], bool] | None = None,
@@ -1781,7 +1735,6 @@ def sync_strm_incremental(
             skip_threshold_mb=skip_threshold_mb,
             rel_prefix=rel_prefix,
             metadata_exts=metadata_exts,
-            defer_metadata=defer_metadata,
             source_name=source_name,
             on_progress=on_progress,
             should_stop=should_stop,
@@ -1797,11 +1750,9 @@ def _sync_strm_impl(
     skip_threshold_mb: int = 0,
     rel_prefix: str = "",
     metadata_exts: Optional[set[str]] = None,
-    defer_metadata: bool = False,
     clean_invalid: bool = True,
     clean_empty_dirs: bool = True,
     deferred_cleanup_actions: list[Callable[[], None]] | None = None,
-    metadata_workers: int = MAX_METADATA_WORKERS,
     scan_workers: int | None = None,
     verify_workers: int | None = None,
     source_name: str = "",
@@ -1814,7 +1765,6 @@ def _sync_strm_impl(
     exts = video_exts or DEFAULT_VIDEO_EXTS
     metadata = metadata_exts or set()
     threshold_bytes = skip_threshold_mb * 1024 * 1024
-    worker_count = max(1, min(int(metadata_workers or 1), MAX_METADATA_WORKERS))
     scan_worker_count = max(
         1,
         min(
@@ -1867,6 +1817,7 @@ def _sync_strm_impl(
     progress = _BoundedProgress(on_progress)
     seen_ids: set[str] = set()
     metadata_seen_ids: set[str] = set()
+    pending_metadata_targets: set[str] = set()
     scan_errors = 0
     consistency_errors = 0
     pending_resolutions = {"generate": set(), "metadata": set()}
@@ -2246,12 +2197,9 @@ def _sync_strm_impl(
                     is_update = _video_generation_is_update(
                         file.file_id, expected, existing_by_id
                     )
-                    install_result = _install_video_candidate(
+                    cleaned, installed_fingerprint = _install_video_candidate(
                         file, rel_dir, expected, base_url, strm_root, source_key,
                         existing_by_id, existing_by_path,
-                    )
-                    cleaned, installed_fingerprint = _video_install_result(
-                        install_result, expected
                     )
                     stats["cleaned"] += cleaned
                     seen_ids.add(str(file.file_id))
@@ -2303,7 +2251,6 @@ def _sync_strm_impl(
     )
 
     metadata_started = time.monotonic()
-    metadata_jobs: list[dict] = []
     metadata_progress_total = len(metadata_candidates)
     metadata_progress_completed = 0
     if metadata:
@@ -2312,11 +2259,11 @@ def _sync_strm_impl(
         metadata_rows_by_id = {
             str(row["file_id"]): row for row in existing_metadata_rows
         }
-        rows_by_path: dict[str, list] = {}
-        for row in existing_metadata_rows:
-            rows_by_path.setdefault(str(row["strm_path"] or ""), []).append(row)
-
-        if defer_metadata and metadata_candidates:
+        planned_metadata_targets = {
+            target_text: str(candidate[0].file_id)
+            for target_text, candidate in metadata_candidates.items()
+        }
+        if metadata_candidates:
             progress.emit("metadata", 0, metadata_progress_total, "排队伴随元数据")
             queue_batch: list[dict[str, object]] = []
             queue_files: list[tuple[GuangYaFile, str, Path]] = []
@@ -2368,8 +2315,67 @@ def _sync_strm_impl(
                 file, rel_dir, duplicate_count = metadata_candidates[target_text]
                 stats["metadata_skipped"] += duplicate_count
                 expected = Path(target_text)
-                current = metadata_rows_by_id.get(str(file.file_id))
-                metadata_seen_ids.add(str(file.file_id))
+                file_id = str(file.file_id)
+                current = metadata_rows_by_id.get(file_id)
+                metadata_seen_ids.add(file_id)
+                previous_path = _safe_indexed_path(
+                    current["strm_path"] if current else "", strm_root
+                )
+                previous_target_owner = (
+                    planned_metadata_targets.get(str(previous_path))
+                    if previous_path and previous_path != expected
+                    else None
+                )
+                preflight_error: Exception | None = None
+                if previous_target_owner and previous_target_owner != file_id:
+                    preflight_error = RuntimeError(
+                        "检测到元数据路径交叉改名，已为避免覆盖而跳过"
+                    )
+                else:
+                    try:
+                        target_owners = [
+                            row for row in existing_metadata_rows
+                            if str(row["strm_path"] or "") == str(expected)
+                        ]
+                        _require_owned_file(expected, target_owners, "排队元数据覆盖")
+                        if previous_path and previous_path != expected:
+                            _require_owned_file(
+                                previous_path,
+                                [current] if current is not None else [],
+                                "排队元数据迁移",
+                            )
+                    except _STRMOwnershipError as exc:
+                        # 明知本地文件已由用户修改时不应继续下载并让后台队列
+                        # 永久重试；扫描阶段只做所有权预检，不执行第二套写入。
+                        preflight_error = exc
+                if preflight_error is not None:
+                    stats["metadata_failed"] += 1
+                    consistency_errors += 1
+                    _append_error_sample(
+                        stats, "排队元数据", file.name, preflight_error
+                    )
+                    _record_failure(
+                        source_id=source_dir_id,
+                        source_name=display_source_name,
+                        file=file,
+                        action="metadata",
+                        rel_dir=rel_dir,
+                        target=expected,
+                        strm_root=strm_root,
+                        error=preflight_error,
+                    )
+                    append_change(
+                        stats,
+                        relative_change(
+                            "failed", expected, strm_root, error=preflight_error
+                        ),
+                    )
+                    metadata_progress_completed += 1
+                    progress.emit(
+                        "metadata", metadata_progress_completed,
+                        metadata_progress_total, "排队伴随元数据",
+                    )
+                    continue
                 if current and _metadata_state_matches(current, file, expected):
                     stats["metadata_skipped"] += 1
                     pending_resolutions["metadata"].add(str(file.file_id))
@@ -2386,291 +2392,10 @@ def _sync_strm_impl(
                     force=True,
                 ))
                 queue_files.append((file, rel_dir, expected))
+                pending_metadata_targets.add(str(expected))
                 if len(queue_batch) >= 500:
                     flush_metadata_queue_batch()
             flush_metadata_queue_batch()
-            # 下方保留旧同步下载实现供显式 defer_metadata=False 的内部调用和回归测试；
-            # 生产调度器启用延迟模式时不再进入网络下载阶段。
-            metadata_candidates = {}
-
-        for target_text in sorted(metadata_candidates):
-            if stop_requested("metadata-prepare"):
-                _flush_failure_resolutions(
-                    stats, source_dir_id, pending_resolutions, "metadata"
-                )
-                stats["metadata_elapsed_seconds"] = round(
-                    time.monotonic() - metadata_started, 3
-                )
-                return stats
-            file, rel_dir, duplicate_count = metadata_candidates[target_text]
-            stats["metadata_skipped"] += duplicate_count
-            expected = Path(target_text)
-            path_rows = rows_by_path.get(str(expected), [])
-            current = metadata_rows_by_id.get(str(file.file_id))
-            try:
-                if current and _metadata_state_matches(current, file, expected):
-                    metadata_seen_ids.add(str(file.file_id))
-                    stats["metadata_skipped"] += 1
-                    pending_resolutions["metadata"].add(str(file.file_id))
-                    metadata_progress_completed += 1
-                    progress.emit("metadata", metadata_progress_completed, metadata_progress_total, "同步元数据")
-                    continue
-                previous_path = _safe_indexed_path(
-                    current["strm_path"] if current else "", strm_root
-                )
-                _require_owned_file(expected, path_rows, "覆盖元数据")
-                if previous_path and previous_path != expected:
-                    _require_owned_file(previous_path, [current], "删除旧元数据")
-                backup = _copy_backup(expected)
-                if previous_path == expected:
-                    previous_path = None
-                previous_backup = _copy_backup(previous_path) if previous_path else None
-                metadata_jobs.append({
-                    "file": file,
-                    "rel_dir": rel_dir,
-                    "target": expected,
-                    "url": "",  # 延迟到执行批次由协调线程获取，避免预处理单次阻塞
-                    "backup": backup,
-                    "previous_path": previous_path,
-                    "previous_backup": previous_backup,
-                    "current": _row_snapshot(current) if current else None,
-                    "target_owners": [_row_snapshot(row) for row in path_rows],
-                    "conflicts": [
-                        _row_snapshot(row) for row in path_rows
-                        if str(row["file_id"]) != str(file.file_id)
-                    ],
-                    "installed_fingerprint": "",
-                    "previous_deleted": False,
-                })
-            except Exception as exc:
-                logger.debug("准备元数据下载失败 file=%s type=%s", redact_sensitive_text(file.name)[:160], type(exc).__name__)
-                stats["metadata_failed"] += 1
-                consistency_errors += 1
-                _append_error_sample(stats, "准备元数据", file.name, exc)
-                _record_failure(
-                    source_id=source_dir_id, source_name=display_source_name, file=file,
-                    action="metadata", rel_dir=rel_dir, target=expected,
-                    strm_root=strm_root, error=exc,
-                )
-                metadata_progress_completed += 1
-                progress.emit("metadata", metadata_progress_completed, metadata_progress_total, "同步元数据")
-
-    if metadata_jobs:
-        # 两个远端文件若在同一轮互换本地目标路径，并行覆盖/删除会互相
-        # 破坏。该情况宁可显式失败，保留原文件与索引，等待下轮稳定后重试。
-        target_owners = {job["target"]: str(job["file"].file_id) for job in metadata_jobs}
-        safe_metadata_jobs: list[dict] = []
-        for job in metadata_jobs:
-            previous_path = job["previous_path"]
-            owner = target_owners.get(previous_path) if previous_path else None
-            if owner and owner != str(job["file"].file_id):
-                exc = RuntimeError("检测到元数据路径交叉改名，已为避免覆盖而跳过")
-                _discard_backup(job["backup"])
-                _discard_backup(job["previous_backup"])
-                stats["metadata_failed"] += 1
-                consistency_errors += 1
-                _append_error_sample(stats, "同步元数据", job["file"].name, exc)
-                _record_failure(
-                    source_id=source_dir_id, source_name=display_source_name,
-                    file=job["file"], action="metadata", rel_dir=job["rel_dir"],
-                    target=job["target"], strm_root=strm_root, error=exc,
-                )
-                append_change(
-                    stats, relative_change("failed", job["target"], strm_root, error=exc)
-                )
-                metadata_progress_completed += 1
-                progress.emit(
-                    "metadata", metadata_progress_completed, metadata_progress_total,
-                    "同步元数据",
-                )
-            else:
-                safe_metadata_jobs.append(job)
-        metadata_jobs = safe_metadata_jobs
-
-    if metadata_jobs:
-        with ThreadPoolExecutor(
-            max_workers=min(worker_count, len(metadata_jobs)),
-            thread_name_prefix="strm-metadata",
-        ) as executor:
-            batch_size = max(1, worker_count)
-            for batch_start in range(0, len(metadata_jobs), batch_size):
-                if stop_requested("metadata"):
-                    for pending_job in metadata_jobs[batch_start:]:
-                        _discard_backup(pending_job["backup"])
-                        _discard_backup(pending_job["previous_backup"])
-                    break
-                metadata_batch = metadata_jobs[batch_start:batch_start + batch_size]
-                runnable_jobs: list[dict] = []
-                for job in metadata_batch:
-                    if stop_requested("metadata"):
-                        _discard_backup(job["backup"])
-                        _discard_backup(job["previous_backup"])
-                        continue
-                    try:
-                        url = str(client.get_download_url(job["file"].file_id) or "") if client else ""
-                        if not url:
-                            raise RuntimeError("无法获取元数据下载直链")
-                        job["url"] = url
-                        runnable_jobs.append(job)
-                    except Exception as exc:
-                        logger.debug("获取元数据下载直链失败 file=%s type=%s", redact_sensitive_text(job["file"].name)[:160], type(exc).__name__)
-                        _discard_backup(job["backup"])
-                        _discard_backup(job["previous_backup"])
-                        stats["metadata_failed"] += 1
-                        consistency_errors += 1
-                        _append_error_sample(stats, "准备元数据", job["file"].name, exc)
-                        _record_failure(
-                            source_id=source_dir_id, source_name=display_source_name,
-                            file=job["file"], action="metadata", rel_dir=job["rel_dir"],
-                            target=job["target"], strm_root=strm_root, error=exc,
-                        )
-                        append_change(
-                            stats, relative_change("failed", job["target"], strm_root, error=exc)
-                        )
-                        metadata_progress_completed += 1
-                        progress.emit(
-                            "metadata", metadata_progress_completed, metadata_progress_total,
-                            "同步元数据",
-                        )
-
-                if not runnable_jobs:
-                    continue
-
-                futures = {
-                    executor.submit(
-                        download_metadata,
-                        job["file"],
-                        job["rel_dir"],
-                        strm_root,
-                        client,
-                        download_url=job["url"],
-                        should_stop=should_stop,
-                        before_replace=lambda target, owners=tuple(job["target_owners"]): (
-                            _require_owned_file(target, owners, "覆盖元数据")
-                        ),
-                        on_replaced=lambda _target, fingerprint, state=job: state.__setitem__(
-                            "installed_fingerprint", fingerprint
-                        ),
-                    ): job
-                    for job in runnable_jobs
-                }
-                for future in as_completed(futures):
-                    job = futures[future]
-                    file = job["file"]
-                    target = job["target"]
-                    try:
-                        future.result()
-                        index_changed = False
-                        try:
-                            db.upsert_strm_index(
-                                metadata_source_key, file.file_id, file.etag, file.size,
-                                file.name, str(target), job["installed_fingerprint"],
-                                conflicting_file_ids=tuple(
-                                    row["file_id"] for row in job["conflicts"]
-                                ),
-                            )
-                            index_changed = True
-                            previous_path = job["previous_path"]
-                            if previous_path:
-                                job["previous_deleted"] = _delete_owned_file(
-                                    previous_path, [job["current"]], "删除旧元数据"
-                                )
-                                if job["previous_deleted"]:
-                                    stats["metadata_cleaned"] = int(
-                                        stats.get("metadata_cleaned", 0) or 0
-                                    ) + 1
-                            _discard_backup(job["backup"])
-                            _discard_backup(job["previous_backup"])
-                        except Exception:
-                            _restore_installed_file(
-                                target, job["backup"], job["installed_fingerprint"],
-                                "元数据",
-                            )
-                            previous_path = job["previous_path"]
-                            if previous_path and job["previous_deleted"]:
-                                _restore_deleted_file(
-                                    previous_path, job["previous_backup"], "旧元数据"
-                                )
-                            else:
-                                _discard_backup(job["previous_backup"])
-                            _rollback_index(
-                                metadata_source_key,
-                                str(file.file_id),
-                                job["current"],
-                                job["conflicts"],
-                                index_changed,
-                            )
-                            raise
-                        metadata_seen_ids.add(str(file.file_id))
-                        stats["metadata_generated"] += 1
-                        pending_resolutions["metadata"].add(str(file.file_id))
-                        _track_change(stats, "metadata", target, strm_root)
-                        if stop_requested("metadata"):
-                            for pending in futures:
-                                pending.cancel()
-                    except (_STRMStopped, CancelledError):
-                        try:
-                            _restore_installed_file(
-                                target, job["backup"], job["installed_fingerprint"],
-                                "元数据",
-                            )
-                            previous_path = job["previous_path"]
-                            if previous_path and job["previous_deleted"]:
-                                _restore_deleted_file(
-                                    previous_path, job["previous_backup"], "旧元数据"
-                                )
-                            else:
-                                _discard_backup(job["previous_backup"])
-                        except Exception as restore_exc:
-                            logger.error("恢复已取消元数据文件失败 type=%s", type(restore_exc).__name__)
-                        stats["stopped"] = True
-                        stats["stop_stage"] = "metadata"
-                        stats["clean_skipped"] = True
-                        for pending in futures:
-                            pending.cancel()
-                    except Exception as exc:
-                        try:
-                            _restore_installed_file(
-                                target, job["backup"], job["installed_fingerprint"],
-                                "元数据",
-                            )
-                            previous_path = job["previous_path"]
-                            if previous_path and job["previous_deleted"]:
-                                _restore_deleted_file(
-                                    previous_path, job["previous_backup"], "旧元数据"
-                                )
-                            else:
-                                _discard_backup(job["previous_backup"])
-                        except Exception as restore_exc:
-                            logger.error("恢复元数据旧文件失败 type=%s", type(restore_exc).__name__)
-                        logger.debug("下载元数据失败 file=%s type=%s", redact_sensitive_text(file.name)[:160], type(exc).__name__)
-                        stats["metadata_failed"] += 1
-                        consistency_errors += 1
-                        _append_error_sample(stats, "下载元数据", file.name, exc)
-                        _record_failure(
-                            source_id=source_dir_id, source_name=display_source_name, file=file,
-                            action="metadata", rel_dir=job["rel_dir"], target=target,
-                            strm_root=strm_root, error=exc,
-                        )
-                        append_change(
-                            stats, relative_change("failed", target, strm_root, error=exc)
-                        )
-                    metadata_progress_completed += 1
-                    progress.emit("metadata", metadata_progress_completed, metadata_progress_total, "同步元数据")
-
-                if stats["stopped"]:
-                    for pending_job in metadata_jobs[batch_start + len(metadata_batch):]:
-                        _discard_backup(pending_job["backup"])
-                        _discard_backup(pending_job["previous_backup"])
-                        metadata_progress_completed += 1
-                        progress.emit(
-                            "metadata",
-                            metadata_progress_completed,
-                            metadata_progress_total,
-                            "同步元数据",
-                        )
-                    break
-
     _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, "metadata")
     stats["metadata_elapsed_seconds"] = round(time.monotonic() - metadata_started, 3)
     if stats["stopped"] or stop_requested("cleanup"):
@@ -2701,7 +2426,7 @@ def _sync_strm_impl(
                 action_started = time.monotonic()
                 removed_dir_paths: set[str] = set()
                 metadata_queue_cleanup_ready = True
-                if metadata and defer_metadata:
+                if metadata:
                     try:
                         stats["metadata_queue_cancelled"] += db.cancel_stale_strm_metadata_jobs(
                             source_dir_id, metadata_seen_ids
@@ -2733,10 +2458,21 @@ def _sync_strm_impl(
                     _track_change(stats, "removed", removed_path, strm_root)
                 removed_dir_paths.update(cleanup.get("removed_dir_paths", []))
                 if metadata and metadata_queue_cleanup_ready:
+                    # 新 file_id 正在后台替换同一路径时，旧索引仍是当前磁盘文件
+                    # 的唯一所有者。必须保留到 worker 原子提交新文件；否则本轮
+                    # 清理会先删除旧文件，使下载/索引失败失去可回滚内容。
+                    metadata_cleanup_ids = set(metadata_seen_ids)
+                    if pending_metadata_targets:
+                        metadata_cleanup_ids.update(
+                            str(row["file_id"])
+                            for row in existing_metadata_rows
+                            if str(row["strm_path"] or "")
+                            in pending_metadata_targets
+                        )
                     metadata_cleanup = clean_invalid_strm(
                         strm_root,
                         source_key=metadata_source_key,
-                        valid_ids=metadata_seen_ids,
+                        valid_ids=metadata_cleanup_ids,
                         clean_empty_dirs=False,
                         should_stop=should_stop,
                     )
@@ -2803,11 +2539,9 @@ def sync_strm(
     skip_threshold_mb: int = 0,
     rel_prefix: str = "",
     metadata_exts: Optional[set[str]] = None,
-    defer_metadata: bool = False,
     clean_invalid: bool = True,
     clean_empty_dirs: bool = True,
     deferred_cleanup_actions: list[Callable[[], None]] | None = None,
-    metadata_workers: int = MAX_METADATA_WORKERS,
     scan_workers: int | None = None,
     verify_workers: int | None = None,
     source_name: str = "",
@@ -2825,11 +2559,9 @@ def sync_strm(
             skip_threshold_mb=skip_threshold_mb,
             rel_prefix=rel_prefix,
             metadata_exts=metadata_exts,
-            defer_metadata=defer_metadata,
             clean_invalid=clean_invalid,
             clean_empty_dirs=clean_empty_dirs,
             deferred_cleanup_actions=deferred_cleanup_actions,
-            metadata_workers=metadata_workers,
             scan_workers=scan_workers,
             verify_workers=verify_workers,
             source_name=source_name,
@@ -3129,12 +2861,9 @@ def _process_claimed_strm_failures(
                         maps = _build_video_index_maps(db.list_strm_index(source_key))
                         video_index_maps[source_key] = maps
                     existing_by_id, existing_by_path = maps
-                    install_result = _install_video_candidate(
+                    _cleaned, installed_fingerprint = _install_video_candidate(
                         file, rel_dir, target, base_url, strm_root, source_key,
                         existing_by_id, existing_by_path,
-                    )
-                    _cleaned, installed_fingerprint = _video_install_result(
-                        install_result, target
                     )
                     _update_video_index_snapshot(
                         existing_by_id, existing_by_path, file, target,

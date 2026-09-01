@@ -9,6 +9,7 @@ from unittest import mock
 
 from app.agent import guangya_cleanup_actions as actions
 from app.agent.models import RiskLevel, ToolContext
+from app.agent.orchestrator import AgentOrchestrator
 from app.agent.registry import AgentToolError
 from app.agent.tools import build_tool_registry
 from app.clients.guangya import GuangYaFile
@@ -362,7 +363,11 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
     def test_agent_cleanup_validators_cover_full_frozen_plan_range(self):
         self.assertEqual(
             actions.guangya_cleanup_preview_arguments({}),
-            {"max_candidates": 500},
+            {"max_candidates": 500, "scope": "all"},
+        )
+        self.assertEqual(
+            actions.guangya_cleanup_preview_arguments({"scope": "empty_only"}),
+            {"max_candidates": 500, "scope": "empty_only"},
         )
         self.assertEqual(
             actions.guangya_cleanup_classify_arguments({
@@ -464,6 +469,7 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
     def test_registry_exposes_preview_and_confirmed_cleanup(self):
         registry = build_tool_registry()
         capabilities = {item["name"]: item for item in registry.capabilities()}
+        self.assertNotIn("guangya.organize.clean_empty", capabilities)
         self.assertEqual(
             capabilities["guangya.organize.cleanup.preview"]["risk"],
             RiskLevel.READ.value,
@@ -479,6 +485,102 @@ class GuangYaResidualCleanupTests(unittest.TestCase):
         self.assertTrue(
             capabilities["guangya.organize.cleanup.execute"]["requires_confirmation"]
         )
+
+    def test_empty_only_cleanup_uses_canonical_exact_frozen_plan(self):
+        client = FakeCleanupClient()
+        service = AgentOrchestrator(build_tool_registry())
+        with mock.patch.object(actions, "GuangYaClient", return_value=client):
+            prepared = service.prepare(
+                "guangya.organize.cleanup.execute",
+                {},
+                owner="owner",
+                _cleanup_scope="empty_only",
+            )
+
+        self.assertEqual(
+            prepared["tool_call"]["name"],
+            "guangya.organize.cleanup.execute",
+        )
+        self.assertEqual(prepared["result"]["data"]["scope"], "empty_only")
+        self.assertEqual(prepared["result"]["data"]["empty_dir_count"], 1)
+        self.assertEqual(prepared["result"]["data"]["candidate_count"], 0)
+        flow = actions._flow("owner")
+        self.assertIsNotNone(flow)
+        self.assertRegex(flow.request_binding, r"^[0-9a-f]{64}$")
+        plan = cleanup.load_cleanup_plan(
+            flow.plan_id,
+            owner="owner",
+            expected_fingerprint=flow.fingerprint,
+        )
+        self.assertEqual(plan["stats"]["undecided_count"], 0)
+        self.assertEqual(plan["stats"]["kept_count"], 1)
+        self.assertEqual(plan["residuals"], [])
+        self.assertEqual(plan["empties"][0]["root"]["file_id"], "empty")
+        self.assertEqual(plan["empties"][0]["root"]["etag"], "e1")
+        with self.assertRaisesRegex(AgentToolError, "不接受残留候选复核"):
+            actions.classify_guangya_cleanup_candidates(
+                {"decisions": [{"candidate_number": 1, "action": "quarantine"}]},
+                ToolContext(owner="owner", session_id="session"),
+            )
+
+        # 预览后新出现的空目录不在冻结计划中，执行不能动态扩大范围。
+        client.directories["source"].append(
+            GuangYaFile(
+                "late-empty", "稍后出现", True,
+                parent_id="source", etag="late", updated_at=99,
+            )
+        )
+        client.directories["late-empty"] = []
+        cleanup.confirm_cleanup_plan(
+            flow.plan_id, owner="owner", expected_fingerprint=flow.fingerprint
+        )
+        result = cleanup.execute_cleanup_plan(
+            {
+                "version": 1,
+                "plan_id": flow.plan_id,
+                "plan_fingerprint": flow.fingerprint,
+                "owner_digest": "owner-digest",
+                "credential_generation": 13,
+            },
+            client_factory=lambda: client,
+        )
+        self.assertEqual(result["stats"]["empty_deleted"], 1)
+        self.assertIsNone(client.file_info("empty"))
+        self.assertIsNotNone(client.file_info("late-empty"))
+        self.assertIsNotNone(client.file_info("residual"))
+
+    def test_empty_only_cleanup_rejects_flow_replaced_before_ticket_issue(self):
+        client = FakeCleanupClient()
+        service = AgentOrchestrator(build_tool_registry())
+        original_prepare = service.registry.prepare_confirmation
+        owner = "owner-race"
+
+        def replace_flow_before_prepare(name, arguments, *, context=None):
+            actions.preview_guangya_cleanup(
+                {"max_candidates": 500, "scope": "empty_only"},
+                ToolContext(owner=owner, request_id="replacement-request"),
+            )
+            return original_prepare(name, arguments, context=context)
+
+        with (
+            mock.patch.object(actions, "GuangYaClient", return_value=client),
+            mock.patch.object(
+                service.registry,
+                "prepare_confirmation",
+                side_effect=replace_flow_before_prepare,
+            ),
+            self.assertRaises(AgentToolError) as stale,
+        ):
+            service.prepare(
+                "guangya.organize.cleanup.execute",
+                {},
+                owner=owner,
+                request_id="original-request",
+                _cleanup_scope="empty_only",
+            )
+
+        self.assertEqual(stale.exception.code, "confirmation_stale")
+        self.assertEqual(service.confirmation_store.list_active_tickets(owner=owner), [])
 
     def test_user_keep_decision_overrides_previous_quarantine_selection(self):
         client = FakeCleanupClient()

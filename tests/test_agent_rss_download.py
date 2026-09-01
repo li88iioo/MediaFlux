@@ -109,7 +109,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         self._entry(gy_sub, 90)
         db.update_rss_entry_status(ids[0], "downloaded")
 
-        with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent") as add:
+        with patch("app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed") as add:
             result, _context = prepare_rss_pending_download({"limit": 2})
         self.assertTrue(result.ok)
         self.assertEqual(result.data["selected_count"], 2)
@@ -381,7 +381,11 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         with patch("app.clients.qbittorrent.QBittorrentClient._parse_add_result", return_value=False), patch(
             "app.clients.qbittorrent.logger.warning"
         ) as warning:
-            self.assertFalse(client.add_torrent(urls="magnet:?xt=urn:btih:PRIVATESECRET"))
+            self.assertFalse(
+                client.add_torrent_detailed(
+                    urls="magnet:?xt=urn:btih:PRIVATESECRET"
+                ).ok
+            )
         warning.assert_called_once_with("qB 添加任务失败: 请求被拒绝 status=%s", 400)
         rendered = repr(warning.call_args)
         self.assertNotIn("PRIVATESECRET", rendered)

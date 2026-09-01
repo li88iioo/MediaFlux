@@ -13,7 +13,7 @@ from app import config
 from app.indexers.models import IndexerMediaSearchRequest
 from app.indexers.runtime import build_indexer_service
 from app.logger import get_logger
-from app.modules.indexer_download import download_indexer_result_public
+from app.indexers.downloads import download_indexer_result_public
 
 logger = get_logger(__name__)
 

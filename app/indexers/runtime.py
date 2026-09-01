@@ -393,9 +393,6 @@ def build_indexer_service() -> IndexerService:
     )
 
 
-# 兼容既有测试与内部调用；新代码使用公开名称。
-_build_service = build_indexer_service
-
 
 def get_indexer_service() -> IndexerService:
     global _service

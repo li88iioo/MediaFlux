@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import unittest
 from unittest.mock import patch
 
@@ -62,13 +61,13 @@ def _registry(*, calls=None, fail_download=False) -> ToolRegistry:
         parameters={"type": "object", "properties": {}},
         validator=lambda arguments: dict(arguments),
         requires_confirmation=True,
-        confirmation_preparer=lambda arguments: (
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
             ToolResult(True, "preview", "preview"),
             "feature-state",
-        ),
-        confirmed_handler=lambda arguments, _expected_context: ToolResult(
+        )),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: ToolResult(
             True, "ok", "changed"
-        ),
+        )),
     ))
     return registry
 

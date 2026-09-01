@@ -66,10 +66,6 @@ def _close_scraper(scraper: object | None) -> None:
         logger.warning("关闭 TMDB Scraper 失败 type=%s", type(exc).__name__)
 
 
-def _safe_name(name: str) -> str:
-    return re.sub(r'[\\/:*?"<>|]', "_", name or "")
-
-
 def _safe_ascii_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name or "").strip("._")
 

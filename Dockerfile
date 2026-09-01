@@ -70,7 +70,7 @@ RUN mkdir -p /app/db/cache /app/db/logs /data/strm \
 EXPOSE 1258
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:1258/readyz', timeout=3)" >/dev/null 2>&1
 
 # 入口初始化 MediaFlux 自有目录；默认兼容 NAS 权限，也支持显式 PUID/PGID 降权。
 # 非 root 模式只在首次/UID 变化/显式请求时递归迁移自有数据，不扫描业务媒体挂载。

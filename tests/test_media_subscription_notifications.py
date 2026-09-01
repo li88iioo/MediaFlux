@@ -332,10 +332,10 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
                 retry_after_seconds=120
             ),
         ):
-            # 旧订阅 outbox 只负责可靠移交；Telegram 重试由统一 outbox 接管。
+            # 订阅事务 outbox 只负责可靠移交；Telegram 重试由统一 outbox 接管。
             self.assertTrue(drain_media_subscription_notifications())
-        legacy_row = list_notification_outbox()[0]
-        self.assertEqual(legacy_row["status"], "sent")
+        transaction_row = list_notification_outbox()[0]
+        self.assertEqual(transaction_row["status"], "sent")
         with db.get_conn() as conn:
             row = dict(conn.execute(
                 "SELECT * FROM telegram_notification_outbox"
@@ -347,36 +347,20 @@ class MediaSubscriptionNotificationTests(IsolatedDatabaseTestCase):
         updated = datetime.strptime(row["updated_at"], "%Y-%m-%d %H:%M:%S")
         self.assertGreaterEqual((next_at - updated).total_seconds(), 120)
 
-    def test_scheduler_drain_keeps_outboxes_isolated(self) -> None:
+    def test_scheduler_drains_subscription_transaction_outbox(self) -> None:
         from app.modules.scheduler import STRMScheduler
 
-        with (
-            patch(
-                "app.repositories.organize_notifications.count_pending_organize_notifications",
-                return_value=1,
-            ),
-            patch(
-                "app.modules.organize_notification_outbox.drain_organize_notifications",
-                side_effect=RuntimeError("organize failed"),
-            ),
-            patch(
-                "app.modules.media_subscription_notifications.drain_media_subscription_notifications"
-            ) as media,
-        ):
+        with patch(
+            "app.modules.media_subscription_notifications.drain_media_subscription_notifications"
+        ) as media:
             STRMScheduler._drain_notification_outbox()
         media.assert_called_once_with(limit=20)
 
-    def test_scheduler_recovers_both_notification_queues(self) -> None:
+    def test_scheduler_recovers_subscription_transaction_outbox(self) -> None:
         from app.modules.scheduler import STRMScheduler
 
-        with (
-            patch(
-                "app.modules.organize_notification_outbox.recover_organize_notifications"
-            ) as organize,
-            patch(
-                "app.modules.media_subscription_notifications.recover_media_subscription_notifications"
-            ) as media,
-        ):
+        with patch(
+            "app.modules.media_subscription_notifications.recover_media_subscription_notifications"
+        ) as media:
             STRMScheduler._recover_notification_outbox()
-        organize.assert_called_once_with()
         media.assert_called_once_with()

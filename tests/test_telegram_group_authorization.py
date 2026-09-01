@@ -97,7 +97,6 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             command_text = {
                 "sync_gy": "/sync_gy",
                 "organize": "/organize",
-                "organize_gy": "/organize_gy",
                 "rss_refresh": "/rss_refresh 1",
                 "rss_dl": "/rss_dl 1",
             }
@@ -123,7 +122,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             document_handler(document_message)
 
         denied = [reply[1] for reply in bot.replies]
-        self.assertEqual(denied, ["你无权在此群组执行该操作"] * 6)
+        self.assertEqual(denied, ["你无权在此群组执行该操作"] * 5)
 
     def test_group_member_cannot_submit_plain_download_link(self):
         from app.bot import handlers

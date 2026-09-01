@@ -195,13 +195,15 @@ def _check_rate_limit(request: Request, scope: str, *, limit: int, cost: int = 1
 
 
 def _prepare_rate_limit(tool_name: str) -> int:
+    tool_name = str(tool_name or "").strip()
     return {
         "config.set_feature_state": 4,
         "config.set_indexer_sites": 4,
         "config.set_safe_policy": 4,
         "library.set_patrol_policy": 4,
         "library.trigger_patrol_now": 2,
-        "guangya.organize.clean_empty": 4,
+        "guangya.organize.cleanup.execute": 3,
+        "guangya.rename.execute": 3,
         "guangya.organize.set_schedule_policy": 4,
         "guangya.directory_scrape.run": 3,
         "guangya.organize.run_once": 4,
@@ -1158,8 +1160,8 @@ def query(request: Request, data: Any = Body(default=None)):
         elif organize_clean_empty_request:
             _check_rate_limit(
                 request,
-                "action:prepare:guangya.organize.clean_empty",
-                limit=4,
+                f"action:prepare:{"guangya.organize.cleanup.execute"}",
+                limit=_prepare_rate_limit("guangya.organize.cleanup.execute"),
             )
         elif organize_request:
             _check_rate_limit(request, "query:organize", limit=4)
@@ -1350,6 +1352,7 @@ def invoke_tool(request: Request, tool_name: str, data: Any = Body(default=None)
     if not isinstance(arguments, dict):
         return api_error("arguments 必须是 JSON 对象", 400)
     try:
+        tool_name = str(tool_name or "").strip()
         owner = _agent_owner(request, data)
         service = get_agent_service()
         if not service.has_tool(tool_name):
@@ -1537,6 +1540,7 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
     if not isinstance(arguments, dict):
         return api_error("arguments 必须是 JSON 对象", 400)
     try:
+        tool_name = str(tool_name or "").strip()
         owner = _agent_owner(request, data)
         session_key = (
             _session_id(data.get("session_id")) if "session_id" in data else None
@@ -1565,7 +1569,9 @@ def prepare_action(request: Request, tool_name: str, data: Any = Body(default=No
             }
             if confirmation_epoch is not None:
                 prepare_kwargs["expected_owner_generation"] = confirmation_epoch
-            response = service.prepare(tool_name, arguments, **prepare_kwargs)
+            response = service.prepare(
+                tool_name, arguments, **prepare_kwargs
+            )
             try:
                 with agent_runtime_admission(
                     expected_generation=runtime_generation

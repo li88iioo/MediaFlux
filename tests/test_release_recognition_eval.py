@@ -198,8 +198,9 @@ class ReleaseParserCacheTests(unittest.TestCase):
     def test_guessit_result_is_reused_without_sharing_top_level_mutation(self):
         import guessit as guessit_module
         from app.modules import scraper as scraper_module
+        from app.modules.recognition.extractors import guessit_adapter
 
-        scraper_module._guessit_cached.cache_clear()
+        guessit_adapter._guessit_cached.cache_clear()
         release_name = "[CacheProbe] Stable.Show.S02E03.1080p.WEB-DL.mkv"
         with patch.object(
             guessit_module, "guessit", wraps=guessit_module.guessit,
@@ -213,7 +214,7 @@ class ReleaseParserCacheTests(unittest.TestCase):
         self.assertNotEqual(
             scraper_module._guessit_info(release_name).get("title"), "mutated",
         )
-        self.assertEqual(scraper_module._guessit_cached.cache_info().hits, 2)
+        self.assertEqual(guessit_adapter._guessit_cached.cache_info().hits, 2)
 
 
 if __name__ == "__main__":

@@ -13,7 +13,6 @@ from urllib.request import urlopen
 
 import uvicorn
 
-from app.build_metadata import PACKAGE_TYPE as EMBEDDED_PACKAGE_TYPE
 from app.defaults import DEFAULT_WEB_PORT
 from app.runtime_paths import RuntimePaths, configure_runtime_paths, get_runtime_paths
 from app.version import BuildInfo

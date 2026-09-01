@@ -36,6 +36,17 @@ class _TreeClient:
 
 
 class _MetadataClient(_TreeClient):
+    def file_info(self, file_id: str) -> GuangYaFile | None:
+        return next(
+            (
+                item
+                for values in self.tree.values()
+                for item in values
+                if str(item.file_id) == str(file_id)
+            ),
+            None,
+        )
+
     def get_download_url(self, file_id: str) -> str:
         return f"https://storage.invalid/{file_id}?signature=secret"
 
@@ -268,7 +279,7 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
         stats = {"moved": 1, "failed": 1, "scan_errors": []}
         rules = OrganizeRules(link_strm=True)
         with patch.object(Organizer, "_post_organize_link") as post_link, patch.object(
-            Organizer, "_notify_result"
+            Organizer, "_publish_or_update_task_summary"
         ):
             Organizer.trigger_post_actions(stats, rules)
 
@@ -279,7 +290,7 @@ class OrganizeRobustnessTests(IsolatedDatabaseTestCase):
         stats = {"moved": 1, "failed": 0, "scan_errors": [], "audit_failures": 1}
         rules = OrganizeRules(link_strm=True)
         with patch.object(Organizer, "_post_organize_link") as post_link, patch.object(
-            Organizer, "_notify_result"
+            Organizer, "_publish_or_update_task_summary"
         ):
             Organizer.trigger_post_actions(stats, rules)
 
@@ -442,19 +453,39 @@ class StrmRobustnessTests(IsolatedDatabaseTestCase):
                     str(old_path),
                     f"sha256:{hashlib.sha256(b'old').hexdigest()}",
                 )
-                with patch("app.modules.strm.requests.get", return_value=_Response(b"newdata")):
-                    result = sync_strm(
-                        source_id,
-                        "http://media.invalid",
-                        root,
-                        client=_MetadataClient({source_id: [file]}),
-                        metadata_exts={"nfo"},
-                        clean_invalid=False,
-                    )
+                client = _MetadataClient({source_id: [file]})
+                result = sync_strm(
+                    source_id,
+                    "http://media.invalid",
+                    root,
+                    client=client,
+                    metadata_exts={"nfo"},
+                    clean_invalid=False,
+                )
+                from app.modules.strm_metadata_worker import STRMMetadataWorker
+
+                worker = STRMMetadataWorker()
+                worker._client = client
+                with patch(
+                    "app.modules.strm_metadata_worker.get_bool", return_value=True
+                ), patch(
+                    "app.modules.strm_metadata_worker.get",
+                    side_effect=lambda key, default="": {
+                        "STRM_ROOT": root,
+                        "STRM_METADATA_EXTS": "nfo",
+                    }.get(key, default),
+                ), patch(
+                    "app.modules.strm.requests.get",
+                    return_value=_Response(b"newdata"),
+                ):
+                    self.assertTrue(worker._process_one())
 
                 new_path = Path(root) / STRM_SUBDIR / "Renamed.nfo"
-                self.assertEqual(result["metadata_generated"], 1)
-                self.assertEqual(result["metadata_cleaned"], 1)
+                self.assertEqual(result["metadata_generated"], 0)
+                self.assertEqual(result["metadata_queued"], 1)
+                self.assertEqual(
+                    db.list_strm_metadata_queue()[0]["status"], "completed"
+                )
                 self.assertFalse(old_path.exists())
                 self.assertEqual(new_path.read_bytes(), b"newdata")
                 self.assertEqual(Path(db.list_strm_index(source_key)[0]["strm_path"]), new_path)

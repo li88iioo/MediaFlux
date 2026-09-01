@@ -5,7 +5,17 @@ import threading
 import time
 from typing import TYPE_CHECKING, Callable
 
+from app import database as db
+from app.clients.guangya import GuangYaFile
+from app.logger import get_logger
+from app.modules.directory_scrape_errors import safe_organize_failure
+from app.modules.organize_delete_audit import (
+    DeleteCandidate,
+    execute_recycle_bin_delete,
+    record_blocked_delete,
+)
 from app.modules.organize_runtime import OrganizeTaskRuntime
+from app.modules.scraper import MatchResult
 from app.modules.organize_postprocess import (
     companion_target_name,
     media_notification_item,
@@ -16,8 +26,10 @@ from app.modules.organize_postprocess import (
 )
 
 if TYPE_CHECKING:
-    from app.clients.guangya import GuangYaFile
     from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
+
+
+logger = get_logger(__name__)
 
 
 def _release_parse_diagnostic(match) -> dict | None:
@@ -41,19 +53,6 @@ def execute_organize_plans(
     operation_token: str = "",
     task_runtime: OrganizeTaskRuntime | None = None,
 ) -> None:
-    # 延迟读取 organize 模块的兼容绑定：既避免循环导入，也保留现有
-    # 测试/插件对 app.modules.organize 下审计、删除和日志符号的 patch 契约。
-    from app.modules import organize as organize_module
-
-    DeleteCandidate = organize_module.DeleteCandidate
-    GuangYaFile = organize_module.GuangYaFile
-    MatchResult = organize_module.MatchResult
-    db = organize_module.db
-    execute_recycle_bin_delete = organize_module.execute_recycle_bin_delete
-    logger = organize_module.logger
-    record_blocked_delete = organize_module.record_blocked_delete
-    _safe_organize_failure = organize_module._safe_organize_failure
-
     operation_token = str(operation_token or "").strip()
 
     def write_organize_audit(log_args, log_kwargs, items):
@@ -564,7 +563,7 @@ def execute_organize_plans(
                     except Exception as rollback_exc:
                         rollback_incomplete = True
                         companion_rollback_errors[str(item.file_id)] = (
-                            _safe_organize_failure(rollback_exc)
+                            safe_organize_failure(rollback_exc)
                         )
                         logger.error(
                             "回滚伴随文件失败 file=%s type=%s",
@@ -869,7 +868,7 @@ def execute_organize_plans(
         except Exception as e:
             if target_id:
                 runtime.invalidate_inventory(target_id)
-            failure_message = _safe_organize_failure(e)
+            failure_message = safe_organize_failure(e)
             logger.error(
                 "文件整理失败 file=%s type=%s",
                 p.original_name, type(e).__name__,

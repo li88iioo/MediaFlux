@@ -82,7 +82,7 @@ class LocalMediaCleanupTests(unittest.TestCase):
             for name, data in files.items():
                 (root / name).write_bytes(data)
             snapshots = [LocalFilesystemAdapter(root).snapshot(root / name) for name in files]
-            cleanup, retained = classify_cleanup_items(snapshots, primary_video_count=1)
+            cleanup, retained = classify_cleanup_items(snapshots)
             self.assertEqual(
                 {item.snapshot.path.name for item in cleanup},
                 {"下载必看.txt", "site.url", "download.mkv.!qB", "Thumbs.db", "empty.dat"},

@@ -10,7 +10,7 @@ from app.modules.agent_download_verification_notifications import (
     build_download_verification_event,
     dump_download_verification_payload,
     load_download_verification_payload,
-    notify_download_verification_terminal,
+    notify_download_verification_terminal_result,
 )
 from app.modules.telegram_notification_center import NotificationPublishResult
 from app.notifier import render_event
@@ -99,7 +99,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
         ), patch(
             "app.modules.telegram_notification_center.publish_notification_event"
         ) as sender:
-            sent = notify_download_verification_terminal(
+            sent = notify_download_verification_terminal_result(
                 owner="tg:v1:100\x1f200",
                 chat_id="100",
                 title="The Show",
@@ -110,7 +110,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
                 attempts=1,
             )
 
-        self.assertFalse(sent)
+        self.assertFalse(sent.ok)
         sender.assert_not_called()
 
     def test_enabled_notification_calls_sender(self):
@@ -130,7 +130,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
             "app.modules.telegram_notification_center.publish_notification_event",
             return_value=NotificationPublishResult(True, delivered=True, status="sent"),
         ) as publisher:
-            sent = notify_download_verification_terminal(
+            sent = notify_download_verification_terminal_result(
                 owner="tg:v1:100\x1f200",
                 chat_id="100",
                 title="The Show",
@@ -141,7 +141,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
                 attempts=1,
             )
 
-        self.assertTrue(sent)
+        self.assertTrue(sent.ok)
         publisher.assert_called_once()
         logical_key = publisher.call_args.args[0]
         self.assertTrue(logical_key.startswith("agent-download-verification:"))
@@ -175,7 +175,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
             ), patch(
                 "app.modules.telegram_notification_center.publish_notification_event"
             ) as sender:
-                sent = notify_download_verification_terminal(
+                sent = notify_download_verification_terminal_result(
                     owner="tg:v1:100\x1f200",
                     chat_id="100",
                     title="The Show",
@@ -186,7 +186,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
                     attempts=1,
                 )
 
-            self.assertFalse(sent)
+            self.assertFalse(sent.ok)
             sender.assert_not_called()
 
     def test_invalid_or_missing_route_never_uses_global_sender(self):
@@ -196,7 +196,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
         ), patch(
             "app.modules.telegram_notification_center.publish_notification_event"
         ) as sender:
-            sent = notify_download_verification_terminal(
+            sent = notify_download_verification_terminal_result(
                 owner="web:v1:abc",
                 chat_id="",
                 title="The Show",
@@ -206,7 +206,7 @@ class DownloadVerificationNotificationTests(unittest.TestCase):
                 result="visible",
                 attempts=1,
             )
-        self.assertFalse(sent)
+        self.assertFalse(sent.ok)
         sender.assert_not_called()
 
     def test_notification_switch_is_accepted_by_config_api(self):

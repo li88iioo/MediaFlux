@@ -975,6 +975,10 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             "app.bot.handlers._start_organize_local", return_value=True,
         ) as start_local:
             handlers._register_commands(bot, telebot)
+            self.assertFalse(any(
+                filters.get("commands") == ["organize_gy"]
+                for filters, _handler in bot.message_handlers
+            ))
             command = next(
                 handler for filters, handler in bot.message_handlers
                 if filters.get("commands") == ["organize"]
@@ -1043,7 +1047,7 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             "app.bot.handlers._notify_local_organize_confirmations",
             side_effect=lambda *args, **kwargs: order.append("local-confirmations") or 1,
         ) as notify_local_confirmations, patch(
-            "app.bot.handlers.send",
+            "app.bot.handlers.send_event_result",
         ) as send:
             handlers._organize_running = True
             handlers._local_organize_running = True
@@ -1140,7 +1144,7 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
             7, result, owner="admin", chat_id="-100",
         )
 
-    def test_sync_and_organize_commands_require_owner_bound_confirmation(self):
+    def test_sync_command_requires_owner_bound_confirmation(self):
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
         )
@@ -1148,31 +1152,19 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         reset_telegram_write_confirmation_store_for_tests()
         bot = self.AsyncFakeBot()
         telebot = self._telebot_types()
-        values = {
-            "TG_CHAT_ID": "100",
-            "GY_ORGANIZE_TARGET_DIR": "target-id",
-        }
+        values = {"TG_CHAT_ID": "100"}
         with patch(
             "app.bot.handlers.get",
             side_effect=lambda key, default="": values.get(key, default),
         ), patch(
             "app.bot.handlers._maintenance_task_busy", return_value=False
         ), patch(
-            "app.bot.handlers._configured_organize_sources",
-            return_value=[{"id": "source-id", "name": "动画"}],
-        ), patch(
             "app.bot.handlers._start_sync_gy", return_value=True
-        ) as start_sync, patch(
-            "app.bot.handlers._start_organize_gy", return_value=True
-        ) as start_organize:
+        ) as start_sync:
             handlers._register_commands(bot, telebot)
             sync_handler = next(
                 handler for filters, handler in bot.message_handlers
                 if filters.get("commands") == ["sync_gy"]
-            )
-            organize_handler = next(
-                handler for filters, handler in bot.message_handlers
-                if filters.get("commands") == ["organize_gy"]
             )
             confirmation_handler = next(
                 handler for filters, handler in bot.callback_handlers
@@ -1182,33 +1174,24 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
                 text="/sync_gy", chat=SimpleNamespace(id=100),
                 from_user=SimpleNamespace(id=9), message_id=1,
             )
-            organize_message = SimpleNamespace(
-                text="/organize_gy", chat=SimpleNamespace(id=100),
-                from_user=SimpleNamespace(id=9), message_id=2,
-            )
             sync_handler(sync_message)
-            organize_handler(organize_message)
             start_sync.assert_not_called()
-            start_organize.assert_not_called()
             self.assertIn("确认同步光鸭 STRM", bot.replies[0][1])
-            self.assertIn("确认执行光鸭整理", bot.replies[1][1])
 
-            for index, expected_start in ((0, start_sync), (1, start_organize)):
-                callback_data = bot.replies[index][2]["reply_markup"].buttons[0].callback_data
-                callback_message = SimpleNamespace(
-                    chat=SimpleNamespace(id=100), message_id=10 + index,
-                )
-                confirmation_handler(SimpleNamespace(
-                    id=f"confirm-{index}", data=callback_data,
-                    from_user=SimpleNamespace(id=9), message=callback_message,
-                ))
-                expected_start.assert_called_once_with(bot, telebot, callback_message)
+            callback_data = bot.replies[0][2]["reply_markup"].buttons[0].callback_data
+            callback_message = SimpleNamespace(
+                chat=SimpleNamespace(id=100), message_id=10,
+            )
+            confirmation_handler(SimpleNamespace(
+                id="confirm-sync", data=callback_data,
+                from_user=SimpleNamespace(id=9), message=callback_message,
+            ))
+            start_sync.assert_called_once_with(bot, telebot, callback_message)
 
             sealed = [row for row in bot.edits if "已确认" in row[2]]
-            self.assertEqual(len(sealed), 2)
+            self.assertEqual(len(sealed), 1)
             self.assertTrue(all(row[3].get("reply_markup") is None for row in sealed))
             self.assertTrue(any("STRM 同步已确认" in row[2] for row in sealed))
-            self.assertTrue(any("光鸭整理已确认" in row[2] for row in sealed))
 
     def test_sync_confirmation_cancel_never_starts_task(self):
         from app.modules.telegram_write_confirmations import (
@@ -1375,6 +1358,6 @@ class RSSRefreshSurfaceTests(IsolatedDatabaseTestCase):
         ), patch(
             "app.bot.handlers.get", return_value=""
         ), patch("app.bot.handlers._task_lock", fake_lock):
-            self.assertFalse(handlers._start_organize_gy(bot, telebot, message))
+            self.assertFalse(handlers._start_guangya_organize(bot, telebot, message))
         fake_lock.acquire.assert_not_called()
         self.assertIn("未配置整理源目录或目标目录", bot.replies[-1][1])

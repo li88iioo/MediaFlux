@@ -25,7 +25,6 @@ from app.logger import get_logger, log_throttled
 from app.modules.naming import sanitize_name
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
-from app.notifier import NotificationEvent
 
 logger = get_logger(__name__)
 
@@ -698,18 +697,15 @@ class DownloadTracker:
         db.update_download_request(
             int(row["id"]),
             organize_started=-1, organize_status="skipped", organize_error="",
-            organize_finished_at=db.now(), strm_status="skipped", strm_error="",
+            organize_finished_at=db.now(), organize_next_retry_at=None,
+            strm_status="skipped", strm_error="",
             strm_finished_at=db.now(), error="",
             gy_staging_cleanup_status="retained", gy_staging_cleanup_error=message,
         )
         logger.warning("光鸭下载暂存目录已保留 request=%s reason=%s", int(row["id"]), message)
 
     def _finalize_staging_without_organize(self, row) -> bool:
-        """未配置自动入库时，把稳定的 MF 暂存目录安全收口到用户目标。
-
-        单个顶层对象直接提升到目标目录；多个顶层对象保留资源边界，但把
-        ``MF-*`` 重命名为用户可读的发布名。冲突或身份变化时不移动、不覆盖。
-        """
+        """通过统一光鸭 Writer 收口未配置自动入库的隔离目录。"""
         if not int(self._row_value(row, "gy_isolated", 0) or 0):
             return False
         request_id = int(row["id"])
@@ -723,18 +719,70 @@ class DownloadTracker:
             )
             return True
 
-        client = GuangYaClient()
-        try:
-            return self._finalize_staging_without_organize_with_client(
-                row,
-                client,
-                request_id=request_id,
-                staging_id=staging_id,
-                parent_id=parent_id,
-                expected_name=expected_name,
+        if not db.claim_download_request_staging_finalize(
+            request_id,
+            staging_id=staging_id,
+            parent_id=parent_id,
+            staging_name=expected_name,
+        ):
+            logger.info(
+                "跳过已失效、未到重试时间或已被认领的暂存目录收口 request=%s",
+                request_id,
             )
-        finally:
-            close_guangya_client(client)
+            return True
+
+        def finalize() -> dict:
+            current = db.get_download_request(request_id)
+            if current is None:
+                return {"ok": True, "stats": {"skipped": 1}}
+            if (
+                not int(self._row_value(current, "gy_isolated", 0) or 0)
+                or str(self._row_value(current, "gy_target_dir", "") or "") != staging_id
+                or str(self._row_value(current, "gy_staging_parent_dir", "") or "0") != parent_id
+                or str(self._row_value(current, "gy_staging_name", "") or "") != expected_name
+            ):
+                logger.info(
+                    "光鸭下载暂存目录已由其他任务收口 request=%s",
+                    request_id,
+                )
+                return {"ok": True, "stats": {"skipped": 1}}
+            client = GuangYaClient()
+            try:
+                handled = self._finalize_staging_without_organize_with_client(
+                    current,
+                    client,
+                    request_id=request_id,
+                    staging_id=staging_id,
+                    parent_id=parent_id,
+                    expected_name=expected_name,
+                )
+                return {
+                    "ok": bool(handled),
+                    "request_id": request_id,
+                    "stats": {"finalized": 1 if handled else 0},
+                }
+            finally:
+                close_guangya_client(client)
+
+        result = get_organize_manager().start_operation(
+            "收口光鸭下载目录",
+            expected_name,
+            finalize,
+            queue_if_busy=False,
+            dedupe_key=f"download-staging-finalize:{request_id}:{staging_id}",
+        )
+        if not result.get("ok"):
+            retry_at = (datetime.now() + timedelta(seconds=5)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            db.update_download_request(
+                request_id,
+                organize_started=0,
+                organize_status="queued",
+                organize_error=str(result.get("error") or "等待网盘 Writer")[:500],
+                organize_next_retry_at=retry_at,
+            )
+        return True
 
     def _finalize_staging_without_organize_with_client(
         self,
@@ -801,10 +849,28 @@ class DownloadTracker:
                         row, "下载内容已移入目标目录，但 Provider 不支持安全删除空暂存目录"
                     )
                     return True
-                client.delete_empty_directory(
-                    staging_id,
-                    expected_etag=str(latest.etag or ""),
-                    expected_updated_at=int(latest.updated_at or 0),
+                from app.modules.organize_delete_audit import (
+                    DeleteCandidate,
+                    execute_recycle_bin_delete,
+                )
+
+                execute_recycle_bin_delete(
+                    client,
+                    trigger="download_staging_finalize",
+                    reason="下载内容已安全提升，清理已复核为空的隔离暂存目录",
+                    candidate=DeleteCandidate(
+                        file_id=staging_id,
+                        name=str(latest.name or expected_name),
+                        parent_id=str(latest.parent_id or parent_id),
+                        size=max(0, int(latest.size or 0)),
+                        gcid=str(latest.etag or ""),
+                    ),
+                    safe_failure_message="隔离暂存目录清理失败，目录已保留",
+                    delete_operation=lambda: client.delete_empty_directory(
+                        staging_id,
+                        expected_etag=str(latest.etag or ""),
+                        expected_updated_at=int(latest.updated_at or 0),
+                    ),
                 )
             except Exception as exc:
                 self._retain_staging_without_organize(
@@ -820,7 +886,8 @@ class DownloadTracker:
                 gy_isolated=0, gy_staging_cleanup_status="completed",
                 gy_staging_cleanup_error="",
                 organize_started=-1, organize_status="skipped", organize_error="",
-                organize_finished_at=db.now(), strm_status="skipped", strm_error="",
+                organize_finished_at=db.now(), organize_next_retry_at=None,
+                strm_status="skipped", strm_error="",
                 strm_finished_at=db.now(), error="",
             )
             logger.info(
@@ -859,7 +926,8 @@ class DownloadTracker:
             gy_isolated=0, gy_staging_name=final_name,
             gy_staging_cleanup_status="completed", gy_staging_cleanup_error="",
             organize_started=-1, organize_status="skipped", organize_error="",
-            organize_finished_at=db.now(), strm_status="skipped", strm_error="",
+            organize_finished_at=db.now(), organize_next_retry_at=None,
+            strm_status="skipped", strm_error="",
             strm_finished_at=db.now(), error="",
         )
         logger.info(
@@ -970,7 +1038,7 @@ class DownloadTracker:
 
     @staticmethod
     def _notify_completion(row, qb_status: str, gy_status: str, updates: dict) -> None:
-        """把旧下载终态 outbox 收口到统一下载事务消息。"""
+        """领取下载终态投递租约，并更新唯一的下载事务消息。"""
         delivery_status = str(
             updates.get("notification_delivery_status")
             or DownloadTracker._row_value(row, "notification_delivery_status", "")
@@ -983,50 +1051,6 @@ class DownloadTracker:
             or ""
         )
         request_id = int(DownloadTracker._row_value(row, "id", 0) or 0)
-        if not delivery_status and not request_id:
-            # 兼容旧插件/测试直接调用：没有持久请求时仍返回一条简单终态。
-            if event_status not in {"completed", "failed", "manual_review"}:
-                return
-            fields = [("任务", DownloadTracker._row_value(row, "title", "") or "未命名任务")]
-            if qb_status:
-                fields.append(("qBittorrent", DownloadTracker._label(qb_status)))
-            if gy_status:
-                fields.append(("光鸭云盘", DownloadTracker._label(gy_status)))
-            from app.modules.telegram_notification_center import publish_notification_event
-            from app.modules.telegram_notification_policy import (
-                NotificationImportance, NotificationTopic,
-            )
-
-            chat_id = str(DownloadTracker._row_value(row, "chat_id", "") or "")
-            digest = hashlib.sha256(
-                json.dumps(
-                    [fields, event_status, chat_id],
-                    ensure_ascii=False,
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()[:24]
-            publish_notification_event(
-                f"download-compat:{digest}",
-                NotificationEvent(
-                    "下载任务需要人工核对"
-                    if event_status == "manual_review"
-                    else "📥 下载任务状态更新",
-                    fields=tuple(fields),
-                    footer=(
-                        "请勿重复提交；可在 Web 下载任务中继续核对。"
-                        if event_status == "manual_review" else ""
-                    ),
-                    layout="relaxed",
-                ),
-                topic=NotificationTopic.DOWNLOAD,
-                importance=(
-                    NotificationImportance.ERROR
-                    if event_status in {"failed", "manual_review"}
-                    else NotificationImportance.RESULT
-                ),
-                chat_id=chat_id,
-            )
-            return
         if (
             delivery_status not in {"pending", "retry_wait", "sending"}
             or event_status not in {"completed", "failed", "manual_review"}

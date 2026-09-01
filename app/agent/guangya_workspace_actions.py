@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 import logging
-import re
 import threading
 import time
 from typing import Any

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from app.modules.local_path_mapping import PathMappingError, assert_within
+from app.modules.local_path_mapping import assert_within
 from app.modules.organize import METADATA_EXTS, VIDEO_EXTS
 from app.modules.subtitle_identity import plan_subtitle_companions
 

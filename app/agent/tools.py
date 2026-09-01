@@ -378,15 +378,11 @@ from app.agent.guangya_cleanup_actions import (
     preview_guangya_cleanup,
 )
 from app.agent.guangya_rename_actions import (
-    execute_guangya_change_plan_confirmed,
-    execute_guangya_media_hygiene_confirmed,
     execute_guangya_rename_confirmed,
     guangya_change_plan_preview_arguments,
     guangya_media_hygiene_preview_arguments,
     guangya_rename_execute_arguments,
     guangya_rename_preview_arguments,
-    prepare_guangya_change_plan_confirmation,
-    prepare_guangya_media_hygiene_confirmation,
     prepare_guangya_rename_confirmation,
     preview_guangya_change_plan,
     preview_guangya_media_hygiene,
@@ -408,9 +404,7 @@ from app.agent.guangya_directory_scrape_actions import (
     search_directory_scrape,
 )
 from app.agent.organize_actions import (
-    clean_empty_guangya_organize_sources_confirmed,
     preview_guangya_organize,
-    prepare_guangya_organize_clean_empty,
     prepare_guangya_organize_run_once,
     prepare_guangya_organize_stop,
     run_guangya_organize_once_confirmed,
@@ -1451,8 +1445,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=local_media_source_trigger_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_local_media_source_trigger_enabled_confirmed,
-        confirmation_preparer=prepare_set_local_media_source_trigger_enabled,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_local_media_source_trigger_enabled_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_local_media_source_trigger_enabled),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1473,8 +1467,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=local_media_scan_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_scan_local_media_sources,
-        confirmed_handler=scan_local_media_sources_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_scan_local_media_sources),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(scan_local_media_sources_confirmed),
         llm_confirmation=True,
         llm_domains=("local_media", "organize"),
         llm_source_kind="system_state",
@@ -1649,8 +1643,8 @@ def build_tool_registry() -> ToolRegistry:
         parameters=download_task_parameters,
         validator=download_task_arguments,
         requires_confirmation=True,
-        confirmed_handler=pause_download_task_confirmed,
-        confirmation_preparer=prepare_pause_download_task,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(pause_download_task_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_pause_download_task),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1660,8 +1654,8 @@ def build_tool_registry() -> ToolRegistry:
         parameters=download_task_parameters,
         validator=download_task_arguments,
         requires_confirmation=True,
-        confirmed_handler=resume_download_task_confirmed,
-        confirmation_preparer=prepare_resume_download_task,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(resume_download_task_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_resume_download_task),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1671,8 +1665,8 @@ def build_tool_registry() -> ToolRegistry:
         parameters=download_task_parameters,
         validator=download_task_arguments,
         requires_confirmation=True,
-        confirmed_handler=delete_download_task_confirmed,
-        confirmation_preparer=prepare_delete_download_task,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(delete_download_task_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_delete_download_task),
         llm_confirmation=True,
         llm_examples=(
             "删除下载器中名称完全匹配的任务，但保留文件",
@@ -1697,8 +1691,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=download_retry_submission_arguments,
         requires_confirmation=True,
-        confirmed_handler=retry_download_submission_confirmed,
-        confirmation_preparer=prepare_retry_download_submission,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(retry_download_submission_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_retry_download_submission),
         llm_confirmation=True,
         llm_examples=(
             "重新提交下载待处理记录 3 到光鸭",
@@ -1764,8 +1758,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_subscription_enabled_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_rss_subscription_enabled_confirmed,
-        confirmation_preparer=prepare_set_rss_subscription_enabled,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_rss_subscription_enabled_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_rss_subscription_enabled),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1783,8 +1777,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_refresh_interval_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_rss_refresh_interval_confirmed,
-        confirmation_preparer=prepare_set_rss_refresh_interval,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_rss_refresh_interval_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_rss_refresh_interval),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -1801,8 +1795,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_delete_subscription_arguments,
         requires_confirmation=True,
-        confirmed_handler=delete_rss_subscription_confirmed,
-        confirmation_preparer=prepare_delete_rss_subscription,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(delete_rss_subscription_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_delete_rss_subscription),
         llm_confirmation=True,
         llm_examples=(
             "删除 RSS 订阅 2",
@@ -1902,8 +1896,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_subscription_policy_update_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_media_subscription_policy_confirmed,
-        confirmation_preparer=prepare_set_media_subscription_policy,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_media_subscription_policy_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_media_subscription_policy),
         llm_confirmation=True,
         llm_examples=(
             "把媒体订阅 1 的下载目标改为两边",
@@ -1928,8 +1922,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_subscription_create_arguments,
         requires_confirmation=True,
-        confirmed_handler=create_media_subscription_confirmed,
-        confirmation_preparer=prepare_create_media_subscription,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(create_media_subscription_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_create_media_subscription),
         llm_confirmation=True,
         llm_examples=(
             "订阅这个 TMDB 剧集",
@@ -1951,8 +1945,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_subscription_delete_arguments,
         requires_confirmation=True,
-        confirmed_handler=delete_media_subscription_confirmed,
-        confirmation_preparer=prepare_delete_media_subscription,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(delete_media_subscription_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_delete_media_subscription),
         llm_confirmation=True,
         llm_examples=(
             "删除媒体追更订阅 2",
@@ -1974,8 +1968,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_subscription_enabled_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_media_subscription_enabled_confirmed,
-        confirmation_preparer=prepare_set_media_subscription_enabled,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_media_subscription_enabled_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_media_subscription_enabled),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2156,8 +2150,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_mark_entries_arguments,
         requires_confirmation=True,
-        confirmed_handler=mark_rss_entries_confirmed,
-        confirmation_preparer=prepare_mark_rss_entries,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(mark_rss_entries_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_mark_rss_entries),
         llm_confirmation=True,
         llm_examples=("把 RSS 条目 12 标记为已处理", "把 RSS 条目 12 和 13 恢复为未处理"),
     ))
@@ -2178,8 +2172,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_submit_entries_arguments,
         requires_confirmation=True,
-        confirmed_handler=submit_rss_entries_confirmed,
-        confirmation_preparer=prepare_submit_rss_entries,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(submit_rss_entries_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submit_rss_entries),
         llm_confirmation=True,
         llm_examples=("下载 RSS 条目 12 到 qB", "把 RSS 条目 12 和 13 提交到 qBittorrent"),
     ))
@@ -2198,8 +2192,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_refresh_subscription_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_rss_subscription_refresh,
-        confirmed_handler=refresh_rss_subscription_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_rss_subscription_refresh),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(refresh_rss_subscription_confirmed),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2233,8 +2227,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_refresh_subscriptions_arguments,
         requires_confirmation=True,
-        confirmed_handler=refresh_rss_subscriptions_confirmed,
-        confirmation_preparer=prepare_rss_subscriptions_refresh,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(refresh_rss_subscriptions_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_rss_subscriptions_refresh),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2255,8 +2249,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_pending_download_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_rss_pending_download,
-        confirmed_handler=submit_pending_rss_to_qb_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_rss_pending_download),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(submit_pending_rss_to_qb_confirmed),
         llm_confirmation=True,
         llm_examples=(
             "把最近 10 条 RSS 待处理内容提交到 qB",
@@ -2281,8 +2275,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=rss_failure_retry_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_rss_failure_retry,
-        confirmed_handler=retry_failed_rss_to_qb_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_rss_failure_retry),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(retry_failed_rss_to_qb_confirmed),
         llm_confirmation=True,
         llm_examples=(
             "重试 RSS 失败条目",
@@ -2375,8 +2369,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_proxy_enabled_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_set_media_proxy_instance_enabled,
-        confirmed_handler=set_media_proxy_instance_enabled_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_media_proxy_instance_enabled),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_media_proxy_instance_enabled_confirmed),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2393,8 +2387,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_proxy_restart_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_restart_media_proxy_instance,
-        confirmed_handler=restart_media_proxy_instance_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_restart_media_proxy_instance),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(restart_media_proxy_instance_confirmed),
         llm_confirmation=True,
         llm_domains=("playback",),
         llm_source_kind="system_state",
@@ -2424,8 +2418,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=recognition_rule_enabled_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_set_recognition_rule_enabled,
-        confirmed_handler=set_recognition_rule_enabled_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_set_recognition_rule_enabled),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_recognition_rule_enabled_confirmed),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2462,8 +2456,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=indexer_sites_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_indexer_sites_confirmation,
-        confirmed_handler=set_indexer_sites_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_indexer_sites_confirmation),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_indexer_sites_confirmed),
         post_write_verifier=verify_indexer_sites_write,
         llm_confirmation=True,
     ))
@@ -2474,8 +2468,8 @@ def build_tool_registry() -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         validator=telegram_test_arguments,
         requires_confirmation=True,
-        confirmed_handler=send_telegram_test_notification_confirmed,
-        confirmation_preparer=prepare_telegram_test_notification,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(send_telegram_test_notification_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_telegram_test_notification),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2508,8 +2502,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=safe_policy_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_safe_policy_confirmed,
-        confirmation_preparer=prepare_safe_policy_confirmation,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_safe_policy_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_safe_policy_confirmation),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2534,8 +2528,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=feature_state_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_feature_state_confirmation,
-        confirmed_handler=set_feature_state_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_feature_state_confirmation),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_feature_state_confirmed),
         post_write_verifier=verify_feature_state_write,
         llm_confirmation=True,
     ))
@@ -2603,8 +2597,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=strm_failure_retry_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_strm_failure_retry,
-        confirmed_handler=retry_strm_failure_records_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_strm_failure_retry),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(retry_strm_failure_records_confirmed),
         llm_confirmation=True,
         llm_examples=(
             "重试 STRM 失败项",
@@ -2633,8 +2627,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=strm_run_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_strm_run_once,
-        confirmed_handler=run_strm_once_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_strm_run_once),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(run_strm_once_confirmed),
         llm_confirmation=True,
         llm_domains=("strm",),
         llm_source_kind="system_state",
@@ -2689,8 +2683,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=strm_schedule_policy_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_strm_schedule_policy_confirmed,
-        confirmation_preparer=prepare_strm_schedule_policy_confirmation,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_strm_schedule_policy_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_strm_schedule_policy_confirmation),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2729,8 +2723,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=guangya_organize_schedule_policy_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_guangya_organize_schedule_policy_confirmed,
-        confirmation_preparer=prepare_guangya_organize_schedule_policy_confirmation,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_guangya_organize_schedule_policy_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_guangya_organize_schedule_policy_confirmation),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -2794,6 +2788,9 @@ def build_tool_registry() -> ToolRegistry:
             "properties": {
                 "max_candidates": {
                     "type": "integer", "minimum": 1, "maximum": 500, "default": 500
+                },
+                "scope": {
+                    "type": "string", "enum": ["all", "empty_only"], "default": "all"
                 },
             },
             "additionalProperties": False,
@@ -2968,28 +2965,6 @@ def build_tool_registry() -> ToolRegistry:
         ),
     ))
     registry.register(ToolSpec(
-        name="guangya.change_plan.execute",
-        description=(
-            "在用户确认后执行最近一次声明式光鸭改名冻结计划。不能接收新的对象引用或名称；"
-            "写前和写后均重新验证，按预览配置决定是否触发 STRM 全量核对。"
-        ),
-        risk=RiskLevel.DANGER,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        validator=guangya_rename_execute_arguments,
-        requires_confirmation=True,
-        context_confirmation_preparer=prepare_guangya_change_plan_confirmation,
-        context_confirmed_handler=execute_guangya_change_plan_confirmed,
-        llm_confirmation=True,
-        llm_domains=("cloud_files", "media_naming", "strm"),
-        llm_source_kind="guangya_declarative_plan",
-        llm_freshness="live",
-        llm_parallel_safe=False,
-        llm_examples=(
-            "确认执行刚才根据目录观察生成的改名计划",
-            "按预览应用这些文件名修改并刷新 STRM",
-        ),
-    ))
-    registry.register(ToolSpec(
         name="guangya.media_hygiene.preview",
         description=(
             "只读扫描一个精确光鸭目录中的媒体名称污染。当前策略重点移除网址/域名品牌，"
@@ -3020,28 +2995,6 @@ def build_tool_registry() -> ToolRegistry:
             "帮我清理光鸭 a 目录里媒体文件名中的网站垃圾信息",
             "整理这个 NSFW 目录的番号、视频名和字幕名",
             "把 (xxx.com)-番号.mp4 这类污染名称统一清理并刷新 STRM",
-        ),
-    ))
-    registry.register(ToolSpec(
-        name="guangya.media_hygiene.execute",
-        description=(
-            "在用户确认后执行最近一次媒体名称卫生冻结计划。只应用已排除冲突的目录、"
-            "视频和唯一关联伴随文件名称映射；成功改名后自动触发 STRM 全量核对。"
-        ),
-        risk=RiskLevel.DANGER,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        validator=guangya_rename_execute_arguments,
-        requires_confirmation=True,
-        context_confirmation_preparer=prepare_guangya_media_hygiene_confirmation,
-        context_confirmed_handler=execute_guangya_media_hygiene_confirmed,
-        llm_confirmation=True,
-        llm_domains=("cloud_files", "media_naming", "adult_media", "strm"),
-        llm_source_kind="guangya_rename_plan",
-        llm_freshness="live",
-        llm_parallel_safe=False,
-        llm_examples=(
-            "确认执行刚才的 NSFW 名称清理计划",
-            "按预览清理网站污染标题并刷新 STRM",
         ),
     ))
     registry.register(ToolSpec(
@@ -3090,8 +3043,9 @@ def build_tool_registry() -> ToolRegistry:
     registry.register(ToolSpec(
         name="guangya.rename.execute",
         description=(
-            "在用户确认后执行当前会话最近冻结的光鸭重命名计划；不接受文件 ID、路径或"
-            "名称参数，执行前复核凭据、快照和目标冲突，写后按 file_id 验证真实名称。"
+            "在用户确认后执行当前会话最近冻结的光鸭重命名计划，包括常规改名、媒体名称"
+            "清理和声明式改名；不接受文件 ID、路径或名称参数，执行前复核凭据、快照和"
+            "目标冲突，写后按 file_id 验证真实名称。"
         ),
         risk=RiskLevel.DANGER,
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
@@ -3100,12 +3054,13 @@ def build_tool_registry() -> ToolRegistry:
         context_confirmation_preparer=prepare_guangya_rename_confirmation,
         context_confirmed_handler=execute_guangya_rename_confirmed,
         llm_confirmation=True,
-        llm_domains=("cloud_files", "organize", "media_naming"),
+        llm_domains=("cloud_files", "organize", "media_naming", "adult_media", "strm"),
         llm_source_kind="frozen_write_plan",
         llm_parallel_safe=False,
         llm_examples=(
             "执行刚才的光鸭重命名预览",
             "确认应用刚才去除码率的计划",
+            "确认执行刚才的媒体名称清理或声明式改名计划",
         ),
     ))
 
@@ -3221,8 +3176,8 @@ def build_tool_registry() -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         validator=_no_arguments,
         requires_confirmation=True,
-        confirmed_handler=run_guangya_organize_once_confirmed,
-        confirmation_preparer=prepare_guangya_organize_run_once,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(run_guangya_organize_once_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_guangya_organize_run_once),
         llm_confirmation=True,
         llm_examples=(
             "执行一次光鸭整理",
@@ -3236,27 +3191,12 @@ def build_tool_registry() -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         validator=_no_arguments,
         requires_confirmation=True,
-        confirmed_handler=stop_guangya_organize_confirmed,
-        confirmation_preparer=prepare_guangya_organize_stop,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(stop_guangya_organize_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_guangya_organize_stop),
         llm_confirmation=True,
         llm_examples=(
             "停止当前光鸭整理",
             "取消正在运行的光鸭整理任务",
-        ),
-    ))
-    registry.register(ToolSpec(
-        name="guangya.organize.clean_empty",
-        description="预检并在用户确认后清理全部已配置光鸭整理来源中的空子目录。",
-        risk=RiskLevel.DANGER,
-        parameters={"type": "object", "properties": {}, "additionalProperties": False},
-        validator=_no_arguments,
-        requires_confirmation=True,
-        confirmed_handler=clean_empty_guangya_organize_sources_confirmed,
-        confirmation_preparer=prepare_guangya_organize_clean_empty,
-        llm_confirmation=True,
-        llm_examples=(
-            "清理光鸭整理来源中的空目录",
-            "删除光鸭整理产生的空目录",
         ),
     ))
     registry.register(ToolSpec(
@@ -3466,8 +3406,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=add_watchlist_arguments,
         requires_confirmation=True,
-        confirmed_handler=add_watchlist_confirmed,
-        confirmation_preparer=prepare_add_watchlist,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(add_watchlist_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_add_watchlist),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -3482,8 +3422,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=remove_watchlist_arguments,
         requires_confirmation=True,
-        confirmed_handler=remove_watchlist_confirmed,
-        confirmation_preparer=prepare_remove_watchlist,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(remove_watchlist_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_remove_watchlist),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -3624,8 +3564,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=indexer_submit_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_submit_resource,
-        confirmed_handler=submit_resource_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submit_resource),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(submit_resource_confirmed),
     ))
     registry.register(ToolSpec(
         name="indexer.submit_resource_batch",
@@ -3647,8 +3587,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=indexer_submit_batch_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_submit_resource_batch,
-        confirmed_handler=submit_resource_batch_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_submit_resource_batch),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(submit_resource_batch_confirmed),
     ))
     registry.register(ToolSpec(
         name="workspace.briefing",
@@ -3890,8 +3830,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=media_library_refresh_arguments,
         requires_confirmation=True,
-        confirmation_preparer=prepare_refresh_media_library,
-        confirmed_handler=refresh_media_library_confirmed,
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_refresh_media_library),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(refresh_media_library_confirmed),
         llm_confirmation=True,
         llm_domains=("library",),
         llm_source_kind="local_library",
@@ -4014,8 +3954,8 @@ def build_tool_registry() -> ToolRegistry:
         },
         validator=patrol_policy_arguments,
         requires_confirmation=True,
-        confirmed_handler=set_patrol_policy_confirmed,
-        confirmation_preparer=prepare_patrol_policy_confirmation,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(set_patrol_policy_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_patrol_policy_confirmation),
         llm_confirmation=True,
     ))
 
@@ -4026,8 +3966,8 @@ def build_tool_registry() -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         validator=patrol_trigger_arguments,
         requires_confirmation=True,
-        confirmed_handler=trigger_patrol_now_confirmed,
-        confirmation_preparer=prepare_trigger_patrol_now,
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(trigger_patrol_now_confirmed),
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_trigger_patrol_now),
         llm_confirmation=True,
         llm_examples=("按当前策略立即巡检媒体库", "现在执行一次自动缺集巡检"),
     ))

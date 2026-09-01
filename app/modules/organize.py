@@ -56,6 +56,7 @@ from app.modules.directory_scrape_errors import (
     DirectoryScrapePublicError,
     DirectoryScrapeStateError,
     public_error_message,
+    safe_organize_failure,
 )
 from app.modules.naming import (
     MOVIE_DEFAULT,
@@ -70,9 +71,6 @@ from app.modules.naming import (
 from app.modules.scraper import (
     MatchResult,
     TMDBScraper,
-    _explicit_tmdb_id_from_path,
-    _has_explicit_tmdb_marker,
-    _resolve_explicit_tmdb_marker,
     extract_recognition_context,
     has_unresolved_candidate_title_remainder,
     has_unresolved_season_hint,
@@ -80,6 +78,10 @@ from app.modules.scraper import (
     infer_tmdb_season_from_title_evidence,
     parse_release_position,
     verified_automatic_identity_proof,
+)
+from app.modules.recognition.resolver import (
+    _has_explicit_tmdb_marker,
+    _resolve_explicit_tmdb_marker,
 )
 from app.modules.subtitle_identity import plan_subtitle_companions
 from app.modules.special_media import (
@@ -131,7 +133,6 @@ from app.modules.organize_postprocess import (
 from app.modules.organize_delete_audit import (
     DeleteCandidate,
     execute_recycle_bin_delete,
-    record_blocked_delete,
 )
 
 logger = get_logger(__name__)
@@ -327,7 +328,6 @@ def _directory_episode_identity_hint(filename: str, parent_context: str) -> str:
     return compatible[0][1]
 
 
-_ORGANIZE_FAILURE_MESSAGE = "文件整理失败，请稍后重试"
 
 _DIRECTORY_PACKAGE_IDENTITY_PROOF_KEY = "verified_directory_package_identity_proof"
 _DIRECTORY_PACKAGE_IDENTITY_ACCEPTED_KEY = (
@@ -412,11 +412,6 @@ def automatic_match_requires_confirmation(
             return True
     return False
 
-
-def _safe_organize_failure(exc: Exception) -> str:
-    if isinstance(exc, DirectoryScrapePublicError):
-        return public_error_message(exc)
-    return _ORGANIZE_FAILURE_MESSAGE
 
 
 def _format_scan_summary(stats: dict) -> str:
@@ -866,24 +861,6 @@ def organize_rules_snapshot_matches(snapshot: object, current_rules: OrganizeRul
     }
     return normalized == organize_rules_snapshot(current_rules)
 
-
-class _LeasedNsfwRecognizerProxy:
-    """兼容旧调用面，并把每次识别器方法调用纳入 lease 生命周期。"""
-
-    def __init__(self, organizer: "Organizer", rules: OrganizeRules) -> None:
-        self._organizer = organizer
-        self._rules = copy.deepcopy(rules)
-
-    def __getattr__(self, name: str):
-        def invoke(*args, **kwargs):
-            with self._organizer._nsfw_recognizer_lease(self._rules) as recognizer:
-                if recognizer is None:
-                    raise RuntimeError("MetaTube 识别器不可用或正在关闭")
-                return getattr(recognizer, name)(*args, **kwargs)
-
-        return invoke
-
-
 class Organizer:
     def __init__(
         self, client: GuangYaClient = None, scraper: TMDBScraper = None, *,
@@ -1173,18 +1150,6 @@ class Organizer:
 
         self._nsfw_recognizers[key] = recognizer
         return recognizer, []
-
-    def _nsfw_recognizer(self, rules: OrganizeRules):
-        """兼容纠错链路：实际方法调用仍通过 lease 保护底层识别器。"""
-        with self._nsfw_lock:
-            if (
-                self._closed
-                or self._closing
-                or not rules.nsfw_enabled
-                or not str(rules.nsfw_metatube_endpoint or "").strip()
-            ):
-                return None
-        return _LeasedNsfwRecognizerProxy(self, rules)
 
     @contextmanager
     def _nsfw_recognizer_lease(self, rules: OrganizeRules):
@@ -2657,7 +2622,7 @@ class Organizer:
                 "skipped": True,
                 "error": "整理存在失败项且没有已确认的变更清单，已停止 STRM 同步",
             }
-        self._notify_result(stats, rules, source_name=source_name)
+        self._publish_or_update_task_summary(stats, rules, source_name=source_name)
 
     # ===== 整理主流程 =====
     def organize(self, source_dir_id: str, rules: OrganizeRules,
@@ -3129,7 +3094,7 @@ class Organizer:
                         stats["source_groups"] = list(rows.values())
                         stats["current_source_group"] = ""
                         raise prepared.error
-                    error = _safe_organize_failure(prepared.error)
+                    error = safe_organize_failure(prepared.error)
                     group_stats["failed"] = (
                         int(group_stats.get("failed", 0) or 0) or 1
                     )
@@ -3192,7 +3157,7 @@ class Organizer:
                         stats["current_source_group"] = ""
                         raise
                     except Exception as exc:
-                        error = _safe_organize_failure(exc)
+                        error = safe_organize_failure(exc)
                         group_stats["failed"] = (
                             int(group_stats.get("failed", 0) or 0) or 1
                         )
@@ -3429,7 +3394,7 @@ class Organizer:
                 raise
             except Exception as exc:
                 # 组间失败隔离：当前组停止剩余危险写入，后续组继续执行。
-                error = _safe_organize_failure(exc)
+                error = safe_organize_failure(exc)
                 group_stats["failed"] = int(group_stats.get("failed", 0) or 0) or 1
                 logger.exception(
                     "媒体组整理失败 source=%s group=%s",
@@ -3547,7 +3512,7 @@ class Organizer:
                 "error": "整理存在失败项且没有已确认的变更清单，已停止 STRM 同步",
             }
         if notify_result:
-            Organizer._notify_result(
+            Organizer._publish_or_update_task_summary(
                 stats, rules, source_name=source_name, chat_id=chat_id
             )
 
@@ -3866,7 +3831,7 @@ class Organizer:
                 stats.get("task_id") or stats.get("operation_token") or ""
             ).strip() or f"directory-{time.time_ns()}"
             # 目录刮削的首次汇总与随后 STRM 状态必须复用同一个线程。
-            # 写回 stats 后，trigger_post_actions() 的兼容汇总不会再生成 legacy-*。
+            # 写回 stats 后，trigger_post_actions() 会继续更新同一事务线程。
             stats["task_id"] = task_id
             groups, notification_stats = Organizer._notification_projection(stats)
             unsafe_partial = bool(
@@ -3921,9 +3886,8 @@ class Organizer:
 
             task_id = str(stats.get("task_id") or "").strip()
             if not task_id:
-                # 兼容旧插件直接调用；同一 stats 被重复调用时仍复用线程。
-                task_id = f"legacy-{time.time_ns()}"
-                stats["task_id"] = task_id
+                logger.error("整理任务汇总缺少 task_id，已拒绝创建不可追踪通知线程")
+                return False
             strm_status, refresh_status = Organizer._notification_downstream_labels(
                 stats
             )
@@ -4134,9 +4098,9 @@ class Organizer:
             return False
 
     @staticmethod
-    def _notify_result(stats: dict, rules: OrganizeRules,
+    def _publish_or_update_task_summary(stats: dict, rules: OrganizeRules,
                        source_name: str = "", chat_id: str = "") -> None:
-        """兼容旧插件的汇总入口；统一转入整理事务消息。"""
+        """发布或原位更新整理汇总；候选卡由独立通知步骤负责。"""
         if not rules.notify_enabled or not rules.library_notify:
             return
         try:
@@ -4147,7 +4111,7 @@ class Organizer:
 
             task_id = str(stats.get("task_id") or "").strip()
             if not task_id:
-                task_id = f"legacy-{time.time_ns()}"
+                task_id = f"adhoc-{time.time_ns()}"
                 stats["task_id"] = task_id
             strm_status, media_refresh = Organizer._notification_downstream_labels(
                 stats
@@ -5172,9 +5136,9 @@ class Organizer:
                 error="检测到小数集号但无法建立稳定的特别篇顺序，请手动指定目标集数",
             )
         if match is None and type(self.scraper) is TMDBScraper:
-            recognizer = self._nsfw_recognizer(rules)
-            if recognizer is not None:
-                match = recognizer.match(match_name, parent_path)
+            with self._nsfw_recognizer_lease(rules) as recognizer:
+                if recognizer is not None:
+                    match = recognizer.match(match_name, parent_path)
         if (
             match is None
             and rules.nsfw_exclusive

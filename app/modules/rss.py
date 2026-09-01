@@ -19,15 +19,14 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import unquote, urljoin, urlsplit
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 import feedparser
 import httpx
 
 from app import database as db
-from app.config import get, get_bool, get_many
+from app.config import get, get_many
 from app.logger import get_logger
 from app.modules.media_identity import build_media_key, parse_episode_label
 from app.indexers.providers.base import magnet_infohash
@@ -1378,14 +1377,6 @@ class RSSEngine:
         }
 
     # ===== 推送实现 =====
-    def _push_qb(
-        self, torrent_url: str, save_path: str = "", *, client=None
-    ) -> bool:
-        """兼容旧调用者的布尔接口，并允许复用提交前 qB 快照客户端。"""
-        return self._push_qb_detailed(
-            torrent_url, save_path=save_path, client=client
-        ).ok
-
     def _push_qb_detailed(
         self, torrent_url: str, save_path: str = "", *, client=None
     ):
@@ -1398,15 +1389,12 @@ class RSSEngine:
         category = get("RSS_QB_CATEGORY", "")
         save_path = save_path or get("RSS_QB_SAVE_PATH", "")
         try:
-            detailed = getattr(c, "add_torrent_detailed", None)
-            if callable(detailed):
-                return detailed(
-                    urls=torrent_url, save_path=save_path, category=category
-                )
-            ok = bool(c.add_torrent(
+            result = c.add_torrent_detailed(
                 urls=torrent_url, save_path=save_path, category=category
-            ))
-            return TorrentAddResult(ok, "" if ok else "qb_rejected", False)
+            )
+            if not isinstance(result, TorrentAddResult):
+                return TorrentAddResult(False, "qb_invalid_result", False)
+            return result
         finally:
             if owned:
                 close_qbittorrent_client(c)

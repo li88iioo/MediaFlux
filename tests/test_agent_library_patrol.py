@@ -113,13 +113,13 @@ class LibraryPatrolContractTests(unittest.TestCase):
             parameters={},
             validator=_identity,
             requires_confirmation=True,
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(True, "confirmation_required", "confirm", data=arguments),
                 "ctx",
-            ),
-            confirmed_handler=lambda arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _context: ToolResult(
                 True, "completed", "started", data=arguments
-            ),
+            )),
         ))
         agent = AgentOrchestrator(registry)
 

@@ -43,6 +43,13 @@ jobs:
           python -m pip install --require-hashes -r requirements-release-runtime.lock
           python -m pip check
 
+      - name: Validate Python and JavaScript syntax
+        run: |
+          python -m compileall -q app packaging tests
+          while IFS= read -r -d '' file; do
+            node --check "$file"
+          done < <(find app/static/js -type f -name '*.js' ! -name '*.min.js' -print0)
+
       - name: Run tests
         env:
           PYTHONUNBUFFERED: "1"
@@ -51,8 +58,72 @@ jobs:
           MEDIAFLUX_DISABLE_FILE_LOGGING: "1"
         run: python -m unittest discover -s tests -t . -p "test_*.py" -v
 
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-release-runtime.lock
+
+      - name: Install browser test dependencies
+        run: |
+          python -m pip install --require-hashes -r requirements-release-runtime.lock
+          python -m pip install "playwright==1.62.0"
+          python -c 'from importlib.metadata import version; assert version("playwright") == "1.62.0"'
+          python -m pip check
+
+      - name: Verify system Chrome or Chromium
+        run: |
+          set -euo pipefail
+          browser_path="$(
+            command -v google-chrome ||
+            command -v google-chrome-stable ||
+            command -v chromium ||
+            command -v chromium-browser ||
+            true
+          )"
+          if [[ -z "$browser_path" ]]; then
+            echo "Chrome/Chromium is required for browser regression tests" >&2
+            exit 1
+          fi
+          "$browser_path" --version
+
+      - name: Run real browser regression tests without skips
+        env:
+          PYTHONUNBUFFERED: "1"
+          MEDIAFLUX_TESTING: "1"
+          MEDIAFLUX_TEST_MODE: "1"
+          MEDIAFLUX_DISABLE_FILE_LOGGING: "1"
+        run: |
+          python - <<'PY'
+          import unittest
+
+          modules = (
+              "tests.test_agent_browser",
+              "tests.test_guangya_directory_scrape_browser",
+              "tests.test_guangya_directory_scrape_ui",
+              "tests.test_media_profile_in_place_ui",
+              "tests.test_navigation_discovery_ui",
+              "tests.test_window_viewport_inset",
+          )
+          suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          if result.skipped:
+              for test, reason in result.skipped:
+                  print(f"Browser test skipped: {test}: {reason}")
+          raise SystemExit(
+              0 if result.wasSuccessful() and not result.skipped else 1
+          )
+          PY
+
   smoke:
-    needs: test
+    needs: [test, browser]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -84,7 +155,7 @@ jobs:
             --volume "$RUNNER_TEMP/mediaflux-strm:/data/strm" \
             mediaflux:smoke
           for attempt in $(seq 1 30); do
-            if curl --fail --silent --show-error http://127.0.0.1:1258/readyz >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:1258/readyz >/dev/null 2>&1; then
               docker exec mediaflux-smoke python mediaflux.py version --json > "$RUNNER_TEMP/docker-version.json"
               jq -e --arg sha "$SOURCE_SHA" \
                 '.version == "0.0.0-ci" and .package == "docker" and .commit == $sha' \
@@ -143,6 +214,32 @@ jobs:
                   "INSERT INTO settings_kv(key,value,updated_at) VALUES(?,?,?)",
                   ("docker_upgrade_sentinel", "preserved", "2026-08-25"),
               )
+              legacy_organize_key = "organize-summary:docker-upgrade:100"
+              legacy_organize_body = (
+                  "<b>✅ 光鸭整理完成</b>\n"
+                  "- <b>结果：</b> 已移动 1 · 失败 0\n"
+                  "<blockquote>升级迁移测试 &amp; 安全正文</blockquote>"
+              )
+              connection.execute(
+                  "INSERT INTO organize_notification_outbox("
+                  "idempotency_key,chat_id,body,image_url,status,attempts,"
+                  "lease_generation,next_attempt_at,last_error,sent_at,"
+                  "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (
+                      legacy_organize_key,
+                      "100",
+                      legacy_organize_body,
+                      "poster.jpg",
+                      "retry_wait",
+                      2,
+                      3,
+                      "2026-09-01 12:02:00",
+                      "temporary",
+                      None,
+                      "2026-09-01 12:00:00",
+                      "2026-09-01 12:01:00",
+                  ),
+              )
               connection.execute("PRAGMA user_version=1")
               connection.commit()
           finally:
@@ -158,8 +255,10 @@ jobs:
             --volume "$RUNNER_TEMP/mediaflux-v014-strm:/data/strm" \
             mediaflux:smoke
           for attempt in $(seq 1 30); do
-            if curl --fail --silent --show-error http://127.0.0.1:1259/readyz >/dev/null; then
+            if curl --fail --silent http://127.0.0.1:1259/readyz >/dev/null 2>&1; then
               docker exec -i mediaflux-v014-upgrade python - <<'PY'
+          import hashlib
+          import json
           import sqlite3
 
           from app.database import SCHEMA_VERSION
@@ -174,11 +273,46 @@ jobs:
                   "SELECT 1 FROM sqlite_master WHERE type='table' "
                   "AND name='strm_metadata_refresh_outbox'"
               ).fetchone()
+              legacy_organize_table = connection.execute(
+                  "SELECT 1 FROM sqlite_master WHERE type='table' "
+                  "AND name='organize_notification_outbox'"
+              ).fetchone()
+              legacy_event_key = "retired-organize:" + hashlib.sha256(
+                  b"organize-summary:docker-upgrade:100"
+              ).hexdigest()
+              legacy_notification = connection.execute(
+                  "SELECT topic,importance,chat_id,event_json,revision,"
+                  "delivered_revision,status,attempts,lease_generation,"
+                  "next_attempt_at,last_error,sent_at "
+                  "FROM telegram_notification_outbox WHERE event_key=?",
+                  (legacy_event_key,),
+              ).fetchone()
               integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
               foreign_keys = connection.execute("PRAGMA foreign_key_check").fetchall()
               assert version == SCHEMA_VERSION, (version, SCHEMA_VERSION)
               assert sentinel == ("preserved",), sentinel
               assert outbox == (1,), outbox
+              assert legacy_organize_table is None, legacy_organize_table
+              assert legacy_notification is not None, legacy_notification
+              assert legacy_notification[:3] == ("organize", "result", "100")
+              event = json.loads(legacy_notification[3])
+              assert event["title"] == "✅ 光鸭整理完成", event
+              assert event["lines"] == [
+                  "- 结果： 已移动 1 · 失败 0",
+                  "升级迁移测试 & 安全正文",
+              ], event
+              assert event["image_url"] == "poster.jpg", event
+              assert "<" not in event["title"] + "\n".join(event["lines"]), event
+              assert legacy_notification[4:] == (
+                  1,
+                  0,
+                  "retry_wait",
+                  2,
+                  3,
+                  "2026-09-01 12:02:00",
+                  "temporary",
+                  None,
+              ), legacy_notification
               assert integrity == "ok", integrity
               assert foreign_keys == [], foreign_keys
           finally:
@@ -212,7 +346,7 @@ jobs:
           docker rm --force mediaflux-v014-upgrade >/dev/null 2>&1 || true
 
   build:
-    # 普通 main 只执行 test + amd64 smoke；多架构候选与发布仅由版本标签触发。
+    # PR/main/tag 均通过 test + browser + amd64 smoke；多架构发布仅由版本标签触发。
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [test, smoke]
     runs-on: ubuntu-latest

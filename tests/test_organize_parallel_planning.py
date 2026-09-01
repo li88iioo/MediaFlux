@@ -448,6 +448,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         planning_peak = 0
         writer_active = 0
         writer_peak = 0
+        writer_order: list[str] = []
         organize_kwargs: list[dict] = []
 
         class _FakeOrganizer:
@@ -487,7 +488,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
                         for index in range(expected_source_workers)
                     }:
                         barrier.wait(timeout=2)
-                    time.sleep(0.01)
+                    time.sleep(0.03 if source_id == "source-a" else 0.005)
                 finally:
                     with state_lock:
                         planning_active -= 1
@@ -501,6 +502,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
                     with state_lock:
                         writer_active += 1
                         writer_peak = max(writer_peak, writer_active)
+                        writer_order.append(source_id)
                     try:
                         time.sleep(0.01)
                     finally:
@@ -542,6 +544,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
             return_value=None,
         ):
             manager._run("parallel-task", 0, sources, rules)
+        manager._test_writer_order = writer_order
         return manager, planning_peak, writer_peak, organize_kwargs
 
     def test_two_sources_share_budget_and_single_writer(self):
@@ -571,7 +574,12 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
             kwargs[0]["planning_executor"], kwargs[1]["planning_executor"],
         )
         self.assertIsNotNone(kwargs[0]["planning_executor"])
-        self.assertIs(kwargs[0]["execution_lock"], kwargs[1]["execution_lock"])
+        self.assertIsNot(kwargs[0]["execution_lock"], kwargs[1]["execution_lock"])
+        self.assertIs(
+            kwargs[0]["execution_lock"]._coordinator,
+            kwargs[1]["execution_lock"]._coordinator,
+        )
+        self.assertEqual(manager._test_writer_order, ["source-a", "source-b"])
 
     def test_short_sources_release_the_shared_pool_to_the_remaining_source(self):
         manager, planning_peak, writer_peak, kwargs = self._run_manager(

@@ -13,7 +13,10 @@ from app.clients.guangya import (
 )
 from app.logger import get_logger
 from app.modules.directory_scrape_errors import (
+    DirectoryScrapeConflictError,
+    DirectoryScrapeGoneError,
     DirectoryScrapePublicError,
+    DirectoryScrapeStateError,
     public_error_message,
 )
 from app.modules.scheduler import get_scheduler
@@ -220,6 +223,8 @@ def list_dirs(request: Request, parent_id: str = "0"):
                     and f.name.rsplit(".", 1)[-1].lower() in video_exts
                 ),
                 "size": f.size,
+                "etag": f.etag,
+                "parent_id": f.parent_id,
                 "created_at": f.created_at,
                 "updated_at": f.updated_at,
                 "mime_type": f.mime_type,
@@ -239,29 +244,89 @@ def list_dirs(request: Request, parent_id: str = "0"):
 
 @router.post("/delete-item")
 def delete_item(request: Request, data: dict | None = Body(default=None)):
-    """直接删除一个光鸭目录项；恢复由光鸭回收站负责。"""
+    """把已确认的目录项删除提交到统一光鸭 Writer。"""
     require_api_login(request)
-    raw_id = (data or {}).get("file_id")
+    payload = data or {}
+    raw_id = payload.get("file_id")
     if not isinstance(raw_id, str) or not raw_id.strip():
         return JSONResponse({"error": "请选择需要删除的项目"}, status_code=400)
     file_id = raw_id.strip()
     if file_id == "0":
         return JSONResponse({"error": "不能删除光鸭根目录"}, status_code=400)
 
-    client = GuangYaClient()
+    expected_name = str(payload.get("expected_name") or "").strip()
+    expected_parent_id = str(payload.get("expected_parent_id") or "").strip()
+    expected_etag = str(payload.get("expected_etag") or "").strip()
+    expected_is_dir = payload.get("expected_is_dir")
+    if expected_is_dir is not None and not isinstance(expected_is_dir, bool):
+        return JSONResponse({"error": "删除项目类型无效"}, status_code=400)
     try:
-        if not client.logged_in:
-            return JSONResponse({"error": "光鸭未登录"}, status_code=503)
-        item = client.file_info(file_id)
-        if item is None:
-            return JSONResponse({"error": "项目不存在"}, status_code=404)
-        client.delete([file_id])
-        return {"ok": True, "file_id": file_id, "is_dir": bool(item.is_dir)}
-    except Exception as exc:
-        logger.error("光鸭删除项目失败: %s", type(exc).__name__)
-        return JSONResponse({"error": "光鸭删除项目失败"}, status_code=500)
-    finally:
-        close_guangya_client(client)
+        expected_updated_at = max(0, int(payload.get("expected_updated_at") or 0))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "删除项目版本无效"}, status_code=400)
+
+    def execute_delete() -> dict:
+        from app.modules.organize_delete_audit import (
+            DeleteCandidate,
+            execute_recycle_bin_delete,
+        )
+
+        client = GuangYaClient()
+        try:
+            if not client.logged_in:
+                raise DirectoryScrapeStateError("光鸭未登录，请重新登录后再试")
+            item = client.file_info(file_id)
+            if item is None:
+                raise DirectoryScrapeGoneError("项目已不存在，请刷新目录")
+            if expected_name and item.name != expected_name:
+                raise DirectoryScrapeConflictError("项目名称已变化，请刷新后重新确认")
+            if expected_parent_id and item.parent_id != expected_parent_id:
+                raise DirectoryScrapeConflictError("项目所在目录已变化，请刷新后重新确认")
+            if expected_is_dir is not None and bool(item.is_dir) is not expected_is_dir:
+                raise DirectoryScrapeConflictError("项目类型已变化，请刷新后重新确认")
+            if expected_etag and str(item.etag or "") != expected_etag:
+                raise DirectoryScrapeConflictError("项目版本已变化，请刷新后重新确认")
+            if expected_updated_at and int(item.updated_at or 0) != expected_updated_at:
+                raise DirectoryScrapeConflictError("项目更新时间已变化，请刷新后重新确认")
+            candidate = DeleteCandidate(
+                file_id=file_id,
+                name=item.name,
+                parent_id=item.parent_id,
+                size=max(0, int(item.size or 0)),
+                gcid=str(item.etag or ""),
+            )
+            audit = execute_recycle_bin_delete(
+                client,
+                trigger="web_direct_delete",
+                reason="用户已在 Web 目录浏览中确认移入回收站",
+                candidate=candidate,
+                safe_failure_message="光鸭删除项目失败，请稍后重试",
+            )
+            return {
+                "ok": True,
+                "file_id": file_id,
+                "is_dir": bool(item.is_dir),
+                "audit_id": int(audit.get("audit_id") or 0),
+                "stats": {"deleted": 1},
+            }
+        finally:
+            close_guangya_client(client)
+
+    from app.modules.organize_tasks import get_organize_manager
+
+    result = get_organize_manager().start_operation(
+        "删除光鸭目录项",
+        expected_name or file_id,
+        execute_delete,
+        queue_if_busy=False,
+        dedupe_key=f"guangya-direct-delete:{file_id}",
+    )
+    if not result.get("ok"):
+        return JSONResponse(
+            {"error": str(result.get("error") or "网盘整理任务正在运行")},
+            status_code=409,
+        )
+    return JSONResponse(result, status_code=202)
 
 
 def _normalize_sources(data: dict) -> list[dict[str, str]]:
@@ -277,66 +342,24 @@ def _normalize_sources(data: dict) -> list[dict[str, str]]:
 
 # ===== 网盘整理 =====
 def _build_rules(data: dict):
-    """以已保存配置为基线构建一次整理使用的规则快照。
+    """从已保存配置构建一次整理规则快照。
 
-    Web 执行页只负责选择来源与目标；规则页保存的配置同时供 Web、TG、
-    定时整理与本地媒体整理读取。保留 ``rules`` 覆盖参数用于兼容旧调用方，
-    但只接受 OrganizeRules 已声明字段并按字段类型收敛。
+    Web 执行入口只选择来源与目标；规则唯一由设置页持久化，禁止请求体
+    临时覆盖，确保 Web、Telegram、定时任务与本地媒体读取同一权威配置。
     """
-    from dataclasses import replace
+    from app.modules.organize import OrganizeRules
 
-    from app.modules.organize import OrganizeRules, enforce_fixed_organize_rules
-
+    # 旧版页面会固定携带 ``rules: {}``。空对象没有覆盖语义，可以安全
+    # 视作未提供；任何非空值仍然拒绝，避免重新形成请求级第二套规则权威。
+    request_rules = data.get("rules")
+    if request_rules not in (None, {}):
+        raise ValueError("不支持请求级 rules 覆盖，请先在整理规则页保存配置")
     target_dir_id = str(
         data.get("target_dir_id")
         or config.get("GY_ORGANIZE_TARGET_DIR", "0")
         or "0"
     ).strip()
-    rules = OrganizeRules.from_config(target_dir_id=target_dir_id)
-    raw_overrides = data.get("rules")
-    if raw_overrides is None:
-        return rules
-    if not isinstance(raw_overrides, dict):
-        raise ValueError("rules 必须是 JSON 对象")
-
-    fields = OrganizeRules.__dataclass_fields__
-    bool_fields = {
-        key for key, field in fields.items()
-        if field.type == "bool" or isinstance(getattr(rules, key), bool)
-    }
-    int_fields = {
-        key for key, field in fields.items()
-        if field.type == "int" or (
-            isinstance(getattr(rules, key), int)
-            and not isinstance(getattr(rules, key), bool)
-        )
-    }
-    overrides = {}
-    for key, value in raw_overrides.items():
-        if key not in fields or key in {
-            "target_dir_id", "automatic_match_preset", "rename_enabled",
-            "media_info_enabled", "media_probe_enabled", "media_probe_timeout",
-            "movie_dir_template", "movie_template", "tv_template",
-            "show_dir_template", "naming_scope",
-        }:
-            continue
-        if key in bool_fields:
-            if isinstance(value, bool):
-                overrides[key] = value
-            elif isinstance(value, (int, str)):
-                text = str(value).strip().lower()
-                if text in {"1", "true", "yes", "on"}:
-                    overrides[key] = True
-                elif text in {"0", "false", "no", "off", ""}:
-                    overrides[key] = False
-        elif key in int_fields:
-            try:
-                overrides[key] = int(value)
-            except (TypeError, ValueError):
-                continue
-        elif value is not None:
-            overrides[key] = str(value)
-    return enforce_fixed_organize_rules(replace(rules, **overrides))
+    return OrganizeRules.from_config(target_dir_id=target_dir_id)
 
 
 @router.post("/organize/preview")

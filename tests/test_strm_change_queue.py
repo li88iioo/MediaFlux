@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 from app import database as db
 from app.modules.scheduler import STRMScheduler
-from app.notifier import TelegramSendResult
 from app.modules.strm import _record_changed_path, finalize_changed_paths
 from tests.support import IsolatedDatabaseTestCase
 
@@ -620,39 +619,6 @@ class SchedulerChangeQueueIntegrationTests(IsolatedDatabaseTestCase):
 
 class ChangedPathProjectionTests(IsolatedDatabaseTestCase):
     """Task 2.3：变化目录结构化结果。"""
-
-    def test_scheduler_loop_drains_due_notifications(self):
-        """瞬时投递失败后，无需等待下一次整理即可由调度循环补发。"""
-        from app.modules.organize_notification_outbox import (
-            deliver_organize_notification,
-        )
-        from app.repositories.organize_notifications import (
-            count_pending_organize_notifications,
-        )
-
-        with db.get_conn() as conn:
-            conn.execute("DELETE FROM organize_notification_outbox")
-        with patch(
-            "app.notifier.send_result",
-            return_value=TelegramSendResult(
-                ok=False, error="temporary unavailable", status_code=503,
-            ),
-        ):
-            deliver_organize_notification("task:loop", "整理完成", chat_id="1")
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE organize_notification_outbox SET next_attempt_at='2000-01-01 00:00:00'"
-            )
-
-        sent: list[str] = []
-        with patch(
-            "app.notifier.send_result",
-            side_effect=lambda text, chat_id=None: sent.append(text) or TelegramSendResult(ok=True),
-        ):
-            STRMScheduler._drain_notification_outbox()
-
-        self.assertEqual(sent, ["整理完成"])
-        self.assertEqual(count_pending_organize_notifications(), 0)
 
     def test_changed_paths_dedupe_and_expose_parent_directories(self):
         stats = {

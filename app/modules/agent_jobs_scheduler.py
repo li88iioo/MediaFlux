@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 import json
 import threading
-import time
 from typing import Any, Callable
 
 from app import database as db

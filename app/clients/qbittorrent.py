@@ -183,16 +183,6 @@ class QBittorrentClient:
         resp.raise_for_status()
         return resp
 
-    def add_torrent(self, urls: str = "", save_path: str = "",
-                    category: str = "", torrents: Optional[bytes] = None) -> bool:
-        """兼容旧调用者的布尔接口。"""
-        return self.add_torrent_detailed(
-            urls=urls,
-            save_path=save_path,
-            category=category,
-            torrents=torrents,
-        ).ok
-
     def add_torrent_detailed(self, urls: str = "", save_path: str = "",
                              category: str = "",
                              torrents: Optional[bytes] = None) -> TorrentAddResult:

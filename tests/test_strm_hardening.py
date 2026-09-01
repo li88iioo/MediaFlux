@@ -6,7 +6,6 @@ import threading
 import time
 import unittest
 import uuid
-from concurrent.futures import ThreadPoolExecutor as RealThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
@@ -17,12 +16,12 @@ from app.modules import strm as strm_module
 from tests.support import IsolatedDatabaseTestCase
 
 from app.modules.strm import (
-    MAX_METADATA_WORKERS,
     STRM_SUBDIR,
     generate_strm,
     safe_path_component,
     sync_strm,
 )
+from app.modules.strm_metadata_worker import STRMMetadataWorker
 
 
 class _TreeClient:
@@ -34,6 +33,20 @@ class _TreeClient:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def file_info(self, file_id):
+        expected = str(file_id)
+        for entries in self.tree.values():
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if str(entry.file_id) == expected:
+                    return entry
+        return None
+
+    @staticmethod
+    def get_download_url(file_id):
+        return f"https://download.invalid/{file_id}"
 
 
 class _Response:
@@ -62,64 +75,40 @@ class _Response:
         yield from self.chunks if self.chunks is not None else (self.payload,)
 
 
-class _ConcurrencyTracker:
-    def __init__(self):
-        self.active = 0
-        self.maximum = 0
-        self.lock = threading.Lock()
-
-    def enter(self):
-        with self.lock:
-            self.active += 1
-            self.maximum = max(self.maximum, self.active)
-
-    def exit(self):
-        with self.lock:
-            self.active -= 1
-
-
-class _SubmissionTracker:
-    def __init__(self):
-        self.outstanding = 0
-        self.maximum = 0
-        self.lock = threading.Lock()
-
-    def submitted(self):
-        with self.lock:
-            self.outstanding += 1
-            self.maximum = max(self.maximum, self.outstanding)
-
-    def completed(self, _future):
-        with self.lock:
-            self.outstanding -= 1
-
-
-class _TrackingExecutor:
-    def __init__(self, tracker: _SubmissionTracker, *args, **kwargs):
-        self._tracker = tracker
-        self._executor = RealThreadPoolExecutor(*args, **kwargs)
-
-    def __enter__(self):
-        self._executor.__enter__()
-        return self
-
-    def __exit__(self, *args):
-        return self._executor.__exit__(*args)
-
-    def submit(self, *args, **kwargs):
-        future = self._executor.submit(*args, **kwargs)
-        self._tracker.submitted()
-        future.add_done_callback(self._tracker.completed)
-        return future
-
-
 def _cleanup_source_indexes(source_id: str) -> None:
     for source_key in (f"guangya:{source_id}", f"guangya-meta:{source_id}"):
         rows = db.list_strm_index(source_key)
         db.delete_strm_index_ids(source_key, [row["file_id"] for row in rows])
 
 
+def _drain_metadata_jobs(client, root: str, metadata_exts: set[str]) -> int:
+    """用正式持久队列 worker 完成本测试已排队的元数据。"""
+    worker = STRMMetadataWorker()
+    worker._client = client
+    processed = 0
+    values = {
+        "STRM_ROOT": root,
+        "STRM_METADATA_EXTS": ",".join(sorted(metadata_exts)),
+    }
+    with patch(
+        "app.modules.strm_metadata_worker.get_bool", return_value=True
+    ), patch(
+        "app.modules.strm_metadata_worker.get",
+        side_effect=lambda key, default="": values.get(key, default),
+    ), patch.object(worker, "_flush_media_refresh"):
+        while worker._process_one():
+            processed += 1
+            if processed > 1000:
+                raise AssertionError("STRM 元数据测试队列未能收敛")
+    return processed
+
+
 class StrmHardeningTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM strm_metadata_queue")
+            conn.execute("DELETE FROM strm_metadata_refresh_outbox")
     def test_standard_strm_name_matches_sidecar_basename(self):
         video = GuangYaFile("video", "Show.S01E01.mkv", False, 100, "etag")
         sidecar = GuangYaFile("nfo", "Show.S01E01.nfo", False, 10, "meta")
@@ -233,7 +222,6 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         dangerous_dir = GuangYaFile("dir-1", "../危险\\目录", True, parent_id=source_id)
         video = GuangYaFile("video-1", "片名/正片.mkv", False, 100, "etag", "dir-1")
         client = _TreeClient({source_id: [dangerous_dir], "dir-1": [video]})
-        source_key = f"guangya:{source_id}"
         try:
             with tempfile.TemporaryDirectory() as root:
                 result = sync_strm(source_id, "http://example", root, client=client)
@@ -336,36 +324,6 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         finally:
             _cleanup_source_indexes(source_id)
 
-    def test_metadata_downloads_use_bounded_workers_and_atomic_replace(self):
-        source_id = f"source-{uuid.uuid4().hex}"
-        files = [
-            GuangYaFile(f"meta-{index}", f"poster-{index}.jpg", False, 8, f"e{index}", source_id)
-            for index in range(6)
-        ]
-        client = _TreeClient({source_id: files})
-        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
-        tracker = _ConcurrencyTracker()
-
-        def fake_get(url, stream, timeout):
-            return _Response(b"metadata", tracker)
-
-        try:
-            with tempfile.TemporaryDirectory() as root, patch("app.modules.strm.requests.get", side_effect=fake_get):
-                result = sync_strm(
-                    source_id,
-                    "http://example",
-                    root,
-                    client=client,
-                    metadata_exts={"jpg"},
-                    metadata_workers=99,
-                )
-                self.assertEqual(result["metadata_generated"], 6)
-                self.assertGreater(tracker.maximum, 1)
-                self.assertLessEqual(tracker.maximum, MAX_METADATA_WORKERS)
-                self.assertFalse(list((Path(root) / STRM_SUBDIR).rglob("*.part")))
-        finally:
-            _cleanup_source_indexes(source_id)
-
     def test_metadata_download_rejects_declared_and_streamed_oversize_payloads(self):
         file = GuangYaFile("meta", "poster.jpg", False, 4, "etag", "root")
         cases = (
@@ -416,39 +374,6 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 )
             self.assertFalse(list(Path(root).rglob("*.part")))
 
-    def test_metadata_submission_window_is_bounded_by_worker_count(self):
-        source_id = f"source-{uuid.uuid4().hex}"
-        files = [
-            GuangYaFile(f"meta-{index}", f"poster-{index}.jpg", False, 8, f"e{index}", source_id)
-            for index in range(6)
-        ]
-        client = _TreeClient({source_id: files})
-        client.get_download_url = lambda file_id: f"https://download.invalid/{file_id}"
-        submission_tracker = _SubmissionTracker()
-
-        def fake_get(url, stream, timeout):
-            return _Response(b"metadata", _ConcurrencyTracker())
-
-        def executor_factory(*args, **kwargs):
-            return _TrackingExecutor(submission_tracker, *args, **kwargs)
-
-        try:
-            with tempfile.TemporaryDirectory() as root, \
-                    patch("app.modules.strm.requests.get", side_effect=fake_get), \
-                    patch("app.modules.strm.ThreadPoolExecutor", new=executor_factory):
-                result = sync_strm(
-                    source_id,
-                    "http://example",
-                    root,
-                    client=client,
-                    metadata_exts={"jpg"},
-                    metadata_workers=2,
-                )
-                self.assertEqual(result["metadata_generated"], 6)
-                self.assertLessEqual(submission_tracker.maximum, 2)
-        finally:
-            _cleanup_source_indexes(source_id)
-
     def test_index_and_cleanup_database_calls_stay_on_coordinator_thread(self):
         source_id = f"source-{uuid.uuid4().hex}"
         source_key = f"guangya:{source_id}"
@@ -483,7 +408,6 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     root,
                     client=client,
                     metadata_exts={"nfo"},
-                    metadata_workers=2,
                 )
             self.assertTrue(call_threads)
             self.assertEqual(set(call_threads), {coordinator})
@@ -784,7 +708,6 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(literal, "Movie_Cut.mkv.strm")
 
         source_id = f"source-{uuid.uuid4().hex}"
-        source_key = f"guangya:{source_id}"
         client = _TreeClient({
             source_id: [
                 GuangYaFile("dir-a", "Season\\Cut", True, parent_id=source_id),
@@ -825,8 +748,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
+                self.assertEqual(first["metadata_queued"], 1)
+                self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
                 target = Path(root) / STRM_SUBDIR / "poster.jpg"
-                self.assertEqual(first["metadata_generated"], 1)
                 self.assertEqual(target.read_bytes(), b"old-data")
 
                 tree[source_id] = [
@@ -836,8 +760,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
+                self.assertEqual(second["metadata_queued"], 1)
+                self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
 
-                self.assertEqual(second["metadata_generated"], 1)
                 self.assertEqual(second["metadata_skipped"], 0)
                 self.assertEqual(target.read_bytes(), b"new-data")
                 rows = db.list_strm_index(source_key)
@@ -869,6 +794,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
+                self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
                 target = Path(root) / STRM_SUBDIR / "poster.jpg"
                 old_text = target.read_bytes()
                 tree[source_id] = [
@@ -887,13 +813,18 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                         source_id, "http://example", root, client=client,
                         metadata_exts={"jpg"},
                     )
+                    self.assertEqual(result["metadata_queued"], 1)
+                    self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
 
-                self.assertEqual(result["metadata_failed"], 1)
-                self.assertTrue(result["clean_skipped"])
                 self.assertTrue(target.exists())
                 self.assertEqual(target.read_bytes(), old_text)
                 rows = db.list_strm_index(source_key)
                 self.assertEqual([row["file_id"] for row in rows], ["meta-old"])
+                queue = [
+                    dict(row) for row in db.list_strm_metadata_queue()
+                    if row["file_id"] == "meta-new"
+                ]
+                self.assertEqual(queue[0]["status"], "retry_wait")
         finally:
             _cleanup_source_indexes(source_id)
 
@@ -915,8 +846,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
+                self.assertEqual(enabled["metadata_queued"], 1)
+                self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
                 target = Path(root) / STRM_SUBDIR / "poster.jpg"
-                self.assertEqual(enabled["metadata_generated"], 1)
                 self.assertTrue(target.exists())
 
                 disabled = sync_strm(
@@ -955,6 +887,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
+                self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
                 video_path = Path(root) / STRM_SUBDIR / "Movie.strm"
                 metadata_path = Path(root) / STRM_SUBDIR / "poster.jpg"
                 tree[source_id] = []
@@ -995,6 +928,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     source_id, "http://example", root, client=client,
                     metadata_exts={"jpg"},
                 )
+                self.assertEqual(_drain_metadata_jobs(client, root, {"jpg"}), 1)
                 video_path = Path(root) / STRM_SUBDIR / "Movie.strm"
                 metadata_path = Path(root) / STRM_SUBDIR / "poster.jpg"
                 tree[source_id] = [
@@ -1054,44 +988,6 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     [row["file_id"] for row in rows],
                     ["legacy-meta", "stale-video"],
                 )
-        finally:
-            _cleanup_source_indexes(source_id)
-
-    def test_metadata_urls_are_resolved_on_coordinator_before_http_workers(self):
-        """worker 只能做 HTTP 下载，不能共享 GuangYaClient 获取签名 URL。"""
-        source_id = f"source-{uuid.uuid4().hex}"
-        files = [
-            GuangYaFile(f"meta-{index}", f"image-{index}.jpg", False, 4, f"e{index}", source_id)
-            for index in range(4)
-        ]
-        client = _TreeClient({source_id: files})
-        coordinator = threading.get_ident()
-        url_threads = []
-        http_threads = []
-
-        def get_download_url(file_id):
-            url_threads.append(threading.get_ident())
-            return f"https://download.invalid/{file_id}"
-
-        def fake_get(url, stream, timeout):
-            http_threads.append(threading.get_ident())
-            time.sleep(0.02)
-            return _Response(b"data")
-
-        client.get_download_url = get_download_url
-        try:
-            with tempfile.TemporaryDirectory() as root, patch(
-                "app.modules.strm.requests.get", side_effect=fake_get
-            ):
-                result = sync_strm(
-                    source_id, "http://example", root, client=client,
-                    metadata_exts={"jpg"}, metadata_workers=4,
-                )
-
-            self.assertEqual(result["metadata_generated"], 4)
-            self.assertEqual(set(url_threads), {coordinator})
-            self.assertTrue(http_threads)
-            self.assertNotIn(coordinator, set(http_threads))
         finally:
             _cleanup_source_indexes(source_id)
 

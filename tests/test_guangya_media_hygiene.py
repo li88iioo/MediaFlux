@@ -9,6 +9,8 @@ from unittest import mock
 
 from app.agent import guangya_rename_actions as actions
 from app.agent.models import RiskLevel, ToolContext
+from app.agent.orchestrator import AgentOrchestrator
+from app.agent.registry import AgentToolError
 from app.agent.tools import build_tool_registry
 from app.clients.guangya import GuangYaFile
 from app.modules import guangya_media_hygiene as hygiene
@@ -164,7 +166,7 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
         self.assertEqual(preview.data["mode"], "media_hygiene")
         self.assertIn("STRM", " ".join(confirmation.data["effects"]))
 
-    def test_hygiene_execute_alias_rejects_ordinary_rename_flow(self):
+    def test_canonical_execute_accepts_ordinary_rename_flow(self):
         client = FakeHygieneClient()
         context = ToolContext(owner="owner", session_id="session")
         with mock.patch.object(actions, "GuangYaClient", return_value=client):
@@ -179,8 +181,11 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
                 },
                 context,
             )
-        with self.assertRaisesRegex(Exception, "媒体名称清理预览"):
-            actions.prepare_guangya_media_hygiene_confirmation({}, context)
+            confirmation, _fingerprint = actions.prepare_guangya_rename_confirmation(
+                {}, context
+            )
+        self.assertEqual(confirmation.status, "confirmation_required")
+        self.assertEqual(confirmation.data["mode"], "replace_text")
 
     def test_durable_hygiene_execution_triggers_full_strm(self):
         scheduler = mock.Mock()
@@ -233,10 +238,35 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
             )
         }
         self.assertIn("guangya.media_hygiene.preview", llm)
-        self.assertIn("guangya.media_hygiene.execute", llm)
         self.assertIn("guangya.rename.execute", llm)
+        self.assertNotIn("guangya.media_hygiene.execute", capabilities)
         self.assertTrue(
-            capabilities["guangya.media_hygiene.execute"]["requires_confirmation"]
+            capabilities["guangya.rename.execute"]["requires_confirmation"]
+        )
+
+    def test_media_hygiene_preview_uses_only_canonical_execute(self):
+        client = FakeHygieneClient()
+        service = AgentOrchestrator(build_tool_registry())
+        with mock.patch.object(actions, "GuangYaClient", return_value=client):
+            preview = service.invoke(
+                "guangya.media_hygiene.preview",
+                {"path": "/NSFW", "recursive": True, "limit": 100},
+                owner="owner",
+            )
+            with self.assertRaises(AgentToolError) as removed:
+                service.prepare(
+                    "guangya.media_hygiene.execute", {}, owner="owner"
+                )
+            prepared = service.prepare(
+                "guangya.rename.execute", {}, owner="owner"
+            )
+
+        self.assertEqual(removed.exception.code, "tool_not_found")
+        self.assertEqual(preview["result"]["status"], "ready")
+        self.assertEqual(prepared["tool_call"]["name"], "guangya.rename.execute")
+        self.assertEqual(
+            prepared["action_plan"]["title"],
+            "执行光鸭重命名",
         )
 
 

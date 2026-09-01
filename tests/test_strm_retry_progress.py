@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import re
 import subprocess
 import tempfile
 import textwrap
@@ -122,6 +121,8 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 pass
 
     def test_generation_and_metadata_failures_are_redacted_and_persisted(self):
+        from app.modules.strm_metadata_worker import STRMMetadataWorker
+
         source_id = "source-ledger"
         tree = {
             source_id: [
@@ -153,9 +154,22 @@ class StrmFailureLedgerTests(IsolatedDatabaseTestCase):
                 metadata_exts={"nfo"},
                 source_name="主媒体",
             )
+            worker = STRMMetadataWorker()
+            worker._client = client
+            with patch(
+                "app.modules.strm_metadata_worker.get_bool", return_value=True
+            ), patch(
+                "app.modules.strm_metadata_worker.get",
+                side_effect=lambda key, default="": {
+                    "STRM_ROOT": root,
+                    "STRM_METADATA_EXTS": "nfo",
+                }.get(key, default),
+            ), patch.object(worker, "_flush_media_refresh"):
+                self.assertTrue(worker._process_one())
 
         self.assertEqual(result["failed"], 1)
-        self.assertEqual(result["metadata_failed"], 1)
+        self.assertEqual(result["metadata_queued"], 1)
+        self.assertEqual(result["metadata_failed"], 0)
         rows = db.list_strm_failures(status="open", limit=20)
         self.assertEqual({row["action"] for row in rows}, {"generate", "metadata"})
         self.assertEqual({row["file_id"] for row in rows}, {"video-1", "meta-1"})
@@ -620,8 +634,8 @@ class StrmFailureApiUiTests(IsolatedDatabaseTestCase):
         from tests.test_strm_index_diagnostics import _api_client
 
         f1 = self._failure("source-a", "file-1", "generate")
-        f2 = self._failure("source-a", "file-2", "generate")
-        f3 = self._failure("source-b", "file-3", "metadata")
+        self._failure("source-a", "file-2", "generate")
+        self._failure("source-b", "file-3", "metadata")
         with tempfile.TemporaryDirectory() as root:
             with _api_client(Path(root)) as (client, csrf):
                 # Clear f1 by id
@@ -1354,7 +1368,7 @@ class StrmRetryBatchAndSchedulerSafetyTests(IsolatedDatabaseTestCase):
         client = _TreeClient({"source-batch": files})
         progress_events = []
         with tempfile.TemporaryDirectory() as root, patch(
-            "app.modules.strm._install_video_candidate", return_value=None
+            "app.modules.strm._install_video_candidate", return_value=(0, "")
         ), patch("app.modules.strm._update_video_index_snapshot", return_value=None):
             result = strm_module.retry_all_strm_failures(
                 "source-batch", "generate", "web",
@@ -1386,7 +1400,7 @@ class StrmRetryBatchAndSchedulerSafetyTests(IsolatedDatabaseTestCase):
         with tempfile.TemporaryDirectory() as root, patch(
             "app.modules.strm._scan_limits", return_value=(10, 1, 10000, 30.0)
         ), patch(
-            "app.modules.strm._install_video_candidate", return_value=None
+            "app.modules.strm._install_video_candidate", return_value=(0, "")
         ), patch("app.modules.strm._update_video_index_snapshot", return_value=None):
             result = strm_module.retry_all_strm_failures(
                 "source-batch", "generate", "web",

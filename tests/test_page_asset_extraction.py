@@ -5,6 +5,28 @@ from pathlib import Path
 
 
 class PageAssetExtractionTests(unittest.TestCase):
+    def test_templates_use_route_generated_static_urls_and_one_shared_css_version(self) -> None:
+        templates = {
+            path.name: path.read_text(encoding="utf-8")
+            for path in Path("app/templates").glob("*.html")
+        }
+        for name, source in templates.items():
+            with self.subTest(template=name):
+                self.assertNotRegex(source, r'(?:src|href)=["\']/static/')
+
+        rss = templates["rss.html"]
+        self.assertIn(
+            "{{ url_for('static', path='js') }}/subscriptions.js?v=20260831a",
+            rss,
+        )
+        versions = set()
+        marker = "path='css/dashboard-workbench.css') }}?v="
+        for name in ("dashboard.html", "global_search.html", "media_recent.html"):
+            source = templates[name]
+            self.assertIn(marker, source)
+            versions.add(source.split(marker, 1)[1].split('"', 1)[0].split("'", 1)[0])
+        self.assertEqual(versions, {"20260820a"})
+
     def test_large_page_scripts_are_cacheable_classic_assets(self) -> None:
         targets = {
             "organize.html": "organize.js",

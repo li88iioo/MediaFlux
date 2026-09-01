@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 import unittest
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -51,13 +51,13 @@ class AgentCoreTests(unittest.TestCase):
             parameters={},
             validator=_identity,
             requires_confirmation=True,
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "preview"),
                 "write-test",
-            ),
-            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _expected_context: ToolResult(
                 True, "success", "done"
-            ),
+            )),
         ))
         with self.assertRaises(AgentToolError) as blocked:
             registry.execute("write.test", {})

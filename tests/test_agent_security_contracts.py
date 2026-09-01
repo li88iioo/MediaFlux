@@ -48,13 +48,13 @@ class AgentSecurityContractTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda arguments: {"enabled": bool(arguments["enabled"])},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(True, "confirmation_required", "等待确认"),
                 f"feature-state:{arguments['enabled']}",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: ToolResult(
                 True, "changed", "已修改"
-            ),
+            )),
             requires_confirmation=True,
             llm_confirmation=True,
         ))

@@ -36,9 +36,9 @@ class _QBClient:
     def list_torrents(self):
         return [SimpleNamespace(hash=value) for value in sorted(self.hashes)]
 
-    def add_torrent(self, *, urls, save_path="", category=""):
+    def add_torrent_detailed(self, *, urls, save_path="", category=""):
         self.added.append(urls)
-        return True
+        return TorrentAddResult(True)
 
 
 class RSSQBDedupeTests(unittest.TestCase):
@@ -129,7 +129,7 @@ class RSSQBDedupeTests(unittest.TestCase):
         self.assertEqual(result["failure_count"], 1)
         self.assertIn("避免重复", result["failed"][0]["error"])
         claim.assert_not_called()
-        client.add_torrent.assert_not_called()
+        client.add_torrent_detailed.assert_not_called()
 
     @patch("app.modules.rss.db.add_download_log")
     @patch("app.modules.rss.db.finalize_rss_qb_download", return_value=True)

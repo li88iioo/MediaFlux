@@ -8,13 +8,13 @@
 """
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import threading
 from datetime import datetime
 from pathlib import Path
 from time import monotonic
-from typing import Optional
+from typing import Callable, Optional
 
 from croniter import croniter
 
@@ -112,6 +112,19 @@ def _refresh_notification_label(refresh: dict) -> str:
     return " / ".join(labels)
 
 
+def _run_notification_side_effect(label: str, action: Callable[[], None]) -> None:
+    """通知是业务终态后的附属效果，失败不得反向改写 STRM 结果。"""
+    try:
+        action()
+    except Exception as exc:
+        logger.error(
+            "STRM 通知副作用失败 stage=%s type=%s",
+            label,
+            type(exc).__name__,
+            exc_info=True,
+        )
+
+
 def _publish_linked_notification_threads(
     options: dict[str, object],
     *,
@@ -125,9 +138,11 @@ def _publish_linked_notification_threads(
         from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 
         for request_id in _request_ids(options):
-            accepted = bool(publish_download_lifecycle(
-                request_id, media_refresh=media_refresh,
-            )) or accepted
+            accepted = bool(
+                publish_download_lifecycle(
+                    request_id, media_refresh=media_refresh,
+                )
+            ) or accepted
     except Exception as exc:
         logger.warning(
             "STRM 更新下载事务通知失败 type=%s", type(exc).__name__
@@ -143,15 +158,17 @@ def _publish_linked_notification_threads(
             task_id = str(ref.get("task_id") or "").strip()
             if not task_id:
                 continue
-            accepted = bool(update_organize_lifecycle_downstream(
-                task_id,
-                chat_id=str(ref.get("chat_id") or ""),
-                strm_status=strm_status,
-                media_refresh=media_refresh,
-                partial=partial,
-                error=error,
-                topic_enabled=bool(ref.get("topic_enabled", True)),
-            )) or accepted
+            accepted = bool(
+                update_organize_lifecycle_downstream(
+                    task_id,
+                    chat_id=str(ref.get("chat_id") or ""),
+                    strm_status=strm_status,
+                    media_refresh=media_refresh,
+                    partial=partial,
+                    error=error,
+                    topic_enabled=bool(ref.get("topic_enabled", True)),
+                )
+            ) or accepted
     except Exception as exc:
         logger.warning(
             "STRM 更新整理事务通知失败 type=%s", type(exc).__name__
@@ -167,14 +184,16 @@ def _publish_linked_notification_threads(
             token = str(ref.get("token") or "").strip()
             if not token:
                 continue
-            accepted = bool(update_confirmation_lifecycle_downstream(
-                token,
-                chat_id=str(ref.get("chat_id") or ""),
-                strm_status=strm_status,
-                media_refresh=media_refresh,
-                partial=partial,
-                error=error,
-            )) or accepted
+            accepted = bool(
+                update_confirmation_lifecycle_downstream(
+                    token,
+                    chat_id=str(ref.get("chat_id") or ""),
+                    strm_status=strm_status,
+                    media_refresh=media_refresh,
+                    partial=partial,
+                    error=error,
+                )
+            ) or accepted
     except Exception as exc:
         logger.warning(
             "STRM 更新人工确认事务通知失败 type=%s", type(exc).__name__
@@ -333,15 +352,7 @@ class STRMScheduler:
 
     @staticmethod
     def _recover_notification_outbox() -> None:
-        """恢复上次进程中断遗留的通知 lease，避免结果永久卡住。"""
-        try:
-            from app.modules.organize_notification_outbox import (
-                recover_organize_notifications,
-            )
-
-            recover_organize_notifications()
-        except Exception:
-            logger.exception("恢复整理通知投递队列失败")
+        """恢复订阅事务 outbox；Telegram 投递队列由统一通知中心恢复。"""
         try:
             from app.modules.media_subscription_notifications import (
                 recover_media_subscription_notifications,
@@ -1156,23 +1167,7 @@ class STRMScheduler:
 
     @staticmethod
     def _drain_notification_outbox() -> None:
-        """周期补发到期通知；各 outbox 相互隔离，单类失败不阻塞另一类。"""
-        try:
-            from app.repositories.organize_notifications import (
-                count_pending_organize_notifications,
-            )
-
-            if count_pending_organize_notifications():
-                from app.modules.organize_notification_outbox import (
-                    drain_organize_notifications,
-                )
-
-                drain_organize_notifications()
-        except Exception as exc:
-            log_throttled(
-                logger, logging.WARNING, f"organize-outbox:{type(exc).__name__}",
-                "整理通知补发检查失败 type=%s", type(exc).__name__,
-            )
+        """把到期订阅事务事件可靠移交给统一 Telegram 通知中心。"""
         try:
             from app.modules.media_subscription_notifications import (
                 drain_media_subscription_notifications,
@@ -1284,7 +1279,6 @@ class STRMScheduler:
                 skip_threshold_mb=threshold,
                 rel_prefix=str(source.get("rel_prefix") or ""),
                 metadata_exts=metadata_exts,
-                defer_metadata=True,
                 source_name=source["name"],
                 on_progress=source_progress,
                 should_stop=self._stop_event.is_set,
@@ -1364,7 +1358,6 @@ class STRMScheduler:
                 skip_threshold_mb=threshold,
                 rel_prefix=str(source.get("rel_prefix") or ""),
                 metadata_exts=metadata_exts,
-                defer_metadata=True,
                 clean_invalid=False,
                 clean_empty_dirs=False,
                 deferred_cleanup_actions=source_cleanup_actions,
@@ -1842,6 +1835,17 @@ class STRMScheduler:
                     strm_error=("STRM 同步部分完成，请查看运行记录" if partial else ""),
                     strm_finished_at=db.now(),
                 )
+            # 先结算业务状态和变化目标，再发布通知。通知 outbox 短暂故障
+            # 不能把已经成功落盘的 STRM 反向改写成失败并触发重复执行。
+            if lease_heartbeat:
+                lease_heartbeat.stop()
+                lease_heartbeat = None
+            self._settle_change_targets(
+                claimed_targets,
+                "failed" if partial else "completed",
+                error="STRM 同步部分完成，等待重试" if partial else "",
+                empty_retry_delay=1.0,
+            )
             refresh_label = _refresh_notification_label(media_refresh)
             _publish_linked_notification_threads(
                 options,
@@ -1851,10 +1855,26 @@ class STRMScheduler:
                 error=("STRM 同步部分完成，请查看 Web 运行记录" if partial else ""),
             )
             if not _has_linked_notification_thread(options):
-                self._notify_success(
-                    stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
-                    run_id=run_id,
-                    notify_override=options.get("notify_override"),
+                _run_notification_side_effect(
+                    "summary",
+                    lambda: self._notify_success(
+                        stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
+                        run_id=run_id,
+                        notify_override=options.get("notify_override"),
+                        chat_ids=list(options.get("chat_ids") or []),
+                        uses_default_notification_scope=options.get(
+                            "uses_default_notification_scope"
+                        ),
+                        has_silent_notification_scope=bool(
+                            options.get("has_silent_notification_scope")
+                        ),
+                    ),
+                )
+            _run_notification_side_effect(
+                "details",
+                lambda: self._notify_details(
+                    stats, trigger_type, run_id=run_id,
+                    enabled_override=options.get("detail_notify_override"),
                     chat_ids=list(options.get("chat_ids") or []),
                     uses_default_notification_scope=options.get(
                         "uses_default_notification_scope"
@@ -1862,32 +1882,12 @@ class STRMScheduler:
                     has_silent_notification_scope=bool(
                         options.get("has_silent_notification_scope")
                     ),
-                )
-            self._notify_details(
-                stats, trigger_type, run_id=run_id,
-                enabled_override=options.get("detail_notify_override"),
-                chat_ids=list(options.get("chat_ids") or []),
-                uses_default_notification_scope=options.get(
-                    "uses_default_notification_scope"
-                ),
-                has_silent_notification_scope=bool(
-                    options.get("has_silent_notification_scope")
                 ),
             )
             logger.info(
                 "STRM 任务%s trigger=%s mode=%s fallback=%s elapsed=%ss",
                 "部分完成" if partial else "完成", trigger_type, mode,
                 fallback_used, elapsed,
-            )
-            # 部分完成意味着仍有目标未落盘，必须按失败重试而不是标记完成。
-            if lease_heartbeat:
-                lease_heartbeat.stop()
-                lease_heartbeat = None
-            self._settle_change_targets(
-                claimed_targets,
-                "failed" if partial else "completed",
-                error="STRM 同步部分完成，等待重试" if partial else "",
-                empty_retry_delay=1.0,
             )
             return {"ok": True, "partial": partial, **result}
         except Exception as exc:
@@ -1920,17 +1920,20 @@ class STRMScheduler:
                 empty_retry_delay=60.0,
             )
             if not _has_linked_notification_thread(options):
-                self._notify_failure(
-                    error_text,
-                    trigger_type,
-                    run_id=run_id,
-                    notify_override=options.get("notify_override"),
-                    chat_ids=list(options.get("chat_ids") or []),
-                    uses_default_notification_scope=options.get(
-                        "uses_default_notification_scope"
-                    ),
-                    has_silent_notification_scope=bool(
-                        options.get("has_silent_notification_scope")
+                _run_notification_side_effect(
+                    "failure",
+                    lambda: self._notify_failure(
+                        error_text,
+                        trigger_type,
+                        run_id=run_id,
+                        notify_override=options.get("notify_override"),
+                        chat_ids=list(options.get("chat_ids") or []),
+                        uses_default_notification_scope=options.get(
+                            "uses_default_notification_scope"
+                        ),
+                        has_silent_notification_scope=bool(
+                            options.get("has_silent_notification_scope")
+                        ),
                     ),
                 )
             return {"ok": False, "error": error_text}

@@ -33,7 +33,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM local_media_sources")
 
     @staticmethod
-    def _source(*, owner: str = "admin", enabled: int = 1, scan_enabled: int = 0,
+    def _source(*, owner: str = "admin", enabled: int = 1,
                 mode: str = "move", suffix: str = "one") -> int:
         return db.create_local_media_source(
             name=f"SECRET_SOURCE_{suffix}",
@@ -41,7 +41,6 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             qb_path_prefix=f"/remote/SECRET_{suffix}",
             local_root=f"/private/SECRET_{suffix}",
             enabled=enabled,
-            scan_enabled=scan_enabled,
             owner=owner,
             mode=mode,
         )
@@ -74,7 +73,7 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             local_media_diagnosis_arguments({"path": "/private"})
 
     def test_database_summary_is_owner_scoped_and_classifies_states(self):
-        source = self._source(scan_enabled=1)
+        source = self._source()
         db.upsert_local_library_target(source, "movie", "/library/SECRET", owner="admin")
         self._task(source, "waiting_stable", trigger="qb_completed", suffix="waiting")
         self._task(source, "recognizing", trigger="scan", suffix="active")
@@ -91,7 +90,6 @@ class LocalMediaDiagnosisUnitTests(IsolatedDatabaseTestCase):
             "total": 1,
             "enabled": 1,
             "disabled": 0,
-            "scan_enabled": 1,
             "move_mode": 1,
             "preview_only_mode": 0,
             "enabled_without_targets": 0,

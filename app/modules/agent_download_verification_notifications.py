@@ -175,12 +175,3 @@ def notify_download_verification_terminal_result(
         error="" if outcome else str(outcome.status or "DeliveryFailed"),
         status_code=0 if outcome else 503,
     )
-
-
-def notify_download_verification_terminal(
-    *, owner: str, chat_id: str, request_id: int = 0, **payload
-) -> bool:
-    """兼容既有调用者与测试替身的布尔接口。"""
-    return bool(notify_download_verification_terminal_result(
-        owner=owner, chat_id=chat_id, request_id=request_id, **payload,
-    ).ok)

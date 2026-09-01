@@ -37,10 +37,6 @@ def _is_japanese(value: str) -> bool:
     return bool(_JAPANESE_KANA.search(value))
 
 
-def _is_chinese(value: str) -> bool:
-    return bool(_HAN.search(value)) and not _is_japanese(value)
-
-
 def _is_latin(value: str) -> bool:
     return bool(_LATIN.search(value)) and not _HAN.search(value) and not _is_japanese(value)
 

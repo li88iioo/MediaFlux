@@ -9,7 +9,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -23,7 +23,7 @@ from app.indexers.models import (
     ResolvedDownload,
 )
 from app.main import create_app
-from app.modules import indexer_download
+from app.indexers import downloads as indexer_download
 from app.routes import indexers_api
 
 
@@ -168,12 +168,12 @@ class IndexerAPITests(unittest.TestCase):
 
         first_run._reset_startup_state_for_tests()
         self.request_lookup_patch = patch(
-            "app.modules.indexer_download.db.get_download_request_by_request_key",
+            "app.indexers.downloads.db.get_download_request_by_request_key",
             return_value=None,
         )
         self.request_lookup_patch.start()
         self.request_alias_lookup_patch = patch(
-            "app.modules.indexer_download.db.get_download_request_by_request_keys",
+            "app.indexers.downloads.db.get_download_request_by_request_keys",
             return_value=None,
         )
         self.request_alias_lookup_patch.start()
@@ -306,9 +306,9 @@ class IndexerAPITests(unittest.TestCase):
             "id": 7, "status": "completed", "qb_status": "completed", "gy_status": "failed",
         }
         item = SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:" + "a" * 40, torrent_data=None)
-        with patch("app.modules.indexer_download.db.get_download_request_by_request_key", return_value=existing), patch(
-            "app.modules.indexer_download.create_request", return_value={"id": 8, "created": True}
-        ) as create, patch("app.modules.indexer_download.dispatch_request", return_value={"ok": True}) as dispatch:
+        with patch("app.indexers.downloads.db.get_download_request_by_request_key", return_value=existing), patch(
+            "app.indexers.downloads.create_request", return_value={"id": 8, "created": True}
+        ) as create, patch("app.indexers.downloads.dispatch_request", return_value={"ok": True}) as dispatch:
             created, request_id, _result = indexer_download._persist_and_dispatch(
                 item,
                 "indexer:nyaa",
@@ -338,14 +338,14 @@ class IndexerAPITests(unittest.TestCase):
             torrent_data=None,
         )
         with patch(
-            "app.modules.indexer_download.db.get_download_request_by_request_key",
+            "app.indexers.downloads.db.get_download_request_by_request_key",
             return_value=existing,
         ), patch(
-            "app.modules.indexer_download.dispatch_missing_targets"
+            "app.indexers.downloads.dispatch_missing_targets"
         ) as append, patch(
-            "app.modules.indexer_download.create_request"
+            "app.indexers.downloads.create_request"
         ) as create, patch(
-            "app.modules.indexer_download.dispatch_request"
+            "app.indexers.downloads.dispatch_request"
         ) as dispatch:
             created, request_id, result = indexer_download._persist_and_dispatch(
                 item, "indexer:nyaa", "guangya"
@@ -377,13 +377,13 @@ class IndexerAPITests(unittest.TestCase):
             "both": {"enabled": False, "reason": ""},
         }
         with patch(
-            "app.modules.indexer_download.db.get_download_request_by_request_key",
+            "app.indexers.downloads.db.get_download_request_by_request_key",
             return_value=existing,
         ), patch(
-            "app.modules.indexer_download.download_resubmit_capabilities",
+            "app.indexers.downloads.download_resubmit_capabilities",
             return_value=capabilities,
-        ), patch("app.modules.indexer_download.create_request") as create, patch(
-            "app.modules.indexer_download.dispatch_request"
+        ), patch("app.indexers.downloads.create_request") as create, patch(
+            "app.indexers.downloads.dispatch_request"
         ) as dispatch:
             created, request_id, result = indexer_download._persist_and_dispatch(
                 item, "indexer:nyaa", "guangya"
@@ -412,13 +412,13 @@ class IndexerAPITests(unittest.TestCase):
             torrent_data=None,
         )
         with patch(
-            "app.modules.indexer_download.db.get_download_request_by_request_key",
+            "app.indexers.downloads.db.get_download_request_by_request_key",
             return_value=existing,
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 8, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={"ok": True},
         ) as dispatch:
             created, request_id, _result = indexer_download._persist_and_dispatch(
@@ -556,9 +556,9 @@ class IndexerAPITests(unittest.TestCase):
         headers = self.authenticate()
         service = FakeIndexerService()
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
-             patch("app.modules.indexer_download.normalize_download_url", return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)) as normalize, \
-             patch("app.modules.indexer_download.create_request", return_value={"id": 31, "created": True}) as create, \
-             patch("app.modules.indexer_download.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}) as dispatch:
+             patch("app.indexers.downloads.normalize_download_url", return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)) as normalize, \
+             patch("app.indexers.downloads.create_request", return_value={"id": 31, "created": True}) as create, \
+             patch("app.indexers.downloads.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}) as dispatch:
             response = self.client.post(
                 "/api/indexers/download",
                 json={"result_id": "opaque-result", "target": "qb"},
@@ -578,13 +578,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -619,7 +619,7 @@ class IndexerAPITests(unittest.TestCase):
             "resubmit_target": "guangya",
         }
         with patch(
-            "app.routes.indexers_api._download_result",
+            "app.routes.indexers_api.download_indexer_result",
             new=AsyncMock(return_value=item),
         ):
             response = self.client.post(
@@ -670,13 +670,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -713,13 +713,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": False,
                 "status": "failed",
@@ -753,13 +753,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": False,
                 "status": "failed",
@@ -790,13 +790,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": False,
                 "status": "submitted",
@@ -830,7 +830,7 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(
                 kind="magnet",
                 title="Demo",
@@ -838,10 +838,10 @@ class IndexerAPITests(unittest.TestCase):
                 torrent_data=None,
             ),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -882,9 +882,9 @@ class IndexerAPITests(unittest.TestCase):
         )
         item = SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
-             patch("app.modules.indexer_download.torrent_download_input", return_value=item) as torrent_input, \
-             patch("app.modules.indexer_download.create_request", return_value={"id": 41, "created": True}), \
-             patch("app.modules.indexer_download.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["guangya"], "failed": []}):
+             patch("app.indexers.downloads.torrent_download_input", return_value=item) as torrent_input, \
+             patch("app.indexers.downloads.create_request", return_value={"id": 41, "created": True}), \
+             patch("app.indexers.downloads.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["guangya"], "failed": []}):
             response = self.client.post(
                 "/api/indexers/download",
                 json={"result_id": "opaque-result", "target": "guangya"},
@@ -900,9 +900,9 @@ class IndexerAPITests(unittest.TestCase):
         service = FakeIndexerService(resolved)
         item = SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
-             patch("app.modules.indexer_download.torrent_download_input", return_value=item) as torrent_input, \
-             patch("app.modules.indexer_download.create_request", return_value={"id": 42, "created": True}), \
-             patch("app.modules.indexer_download.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}):
+             patch("app.indexers.downloads.torrent_download_input", return_value=item) as torrent_input, \
+             patch("app.indexers.downloads.create_request", return_value={"id": 42, "created": True}), \
+             patch("app.indexers.downloads.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}):
             response = self.client.post(
                 "/api/indexers/download",
                 json={"result_id": "opaque-result", "target": "qb"},
@@ -919,12 +919,12 @@ class IndexerAPITests(unittest.TestCase):
         service = FakeIndexerService(resolved)
         service.adapter.http.max_response_bytes = 8
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
-             patch("app.modules.indexer_download.torrent_download_input") as torrent_input, \
+             patch("app.indexers.downloads.torrent_download_input") as torrent_input, \
              patch(
-                 "app.modules.indexer_download.create_request",
+                 "app.indexers.downloads.create_request",
                  return_value={"id": 43, "created": True},
              ) as create, patch(
-                 "app.modules.indexer_download.dispatch_request",
+                 "app.indexers.downloads.dispatch_request",
                  return_value={"ok": True},
              ):
             response = self.client.post(
@@ -959,13 +959,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -1003,13 +1003,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -1043,7 +1043,7 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(
                 kind="magnet",
                 title="Demo",
@@ -1051,10 +1051,10 @@ class IndexerAPITests(unittest.TestCase):
                 torrent_data=None,
             ),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": False,
                 "status": "submitted",
@@ -1109,13 +1109,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -1164,19 +1164,19 @@ class IndexerAPITests(unittest.TestCase):
             ticker_task = asyncio.create_task(ticker())
             try:
                 with patch(
-                    "app.modules.indexer_download.normalize_download_url",
+                    "app.indexers.downloads.normalize_download_url",
                     return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
                 ), patch(
-                    "app.modules.indexer_download.db.get_download_request_by_request_key",
+                    "app.indexers.downloads.db.get_download_request_by_request_key",
                     return_value=None,
                 ), patch(
-                    "app.modules.indexer_download.create_request",
+                    "app.indexers.downloads.create_request",
                     return_value={"id": 31, "created": True},
                 ), patch(
-                    "app.modules.indexer_download.dispatch_request",
+                    "app.indexers.downloads.dispatch_request",
                     side_effect=blocking_dispatch,
                 ):
-                    result = await indexers_api._download_result(service, "opaque-result", "qb")
+                    result = await indexers_api.download_indexer_result(service, "opaque-result", "qb")
             finally:
                 await ticker_task
             return result
@@ -1218,18 +1218,18 @@ class IndexerAPITests(unittest.TestCase):
         async def scenario():
             async def run_batch(prefix):
                 return await asyncio.gather(*(
-                    indexers_api._download_result_public(service, f"{prefix}-{index}", "qb")
+                    indexers_api.download_indexer_result_public(service, f"{prefix}-{index}", "qb")
                     for index in range(4)
                 ))
 
             with patch(
-                "app.modules.indexer_download.normalize_download_url",
+                "app.indexers.downloads.normalize_download_url",
                 return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
             ), patch(
-                "app.modules.indexer_download.create_request",
+                "app.indexers.downloads.create_request",
                 side_effect=lambda *args, **kwargs: {"id": next(request_ids), "created": True},
             ), patch(
-                "app.modules.indexer_download.dispatch_request",
+                "app.indexers.downloads.dispatch_request",
                 side_effect=dispatch,
             ):
                 return await asyncio.gather(run_batch("first"), run_batch("second"))
@@ -1272,13 +1272,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": True,
                 "status": "submitted",
@@ -1306,13 +1306,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             side_effect=[
                 {
                     "ok": True,
@@ -1400,13 +1400,13 @@ class IndexerAPITests(unittest.TestCase):
             "app.routes.indexers_api.get_indexer_service",
             return_value=service,
         ), patch(
-            "app.modules.indexer_download.normalize_download_url",
+            "app.indexers.downloads.normalize_download_url",
             return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
-            "app.modules.indexer_download.create_request",
+            "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
         ), patch(
-            "app.modules.indexer_download.dispatch_request",
+            "app.indexers.downloads.dispatch_request",
             return_value={
                 "ok": False,
                 "status": "failed",

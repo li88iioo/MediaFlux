@@ -497,17 +497,21 @@ def build_offline_agent_eval_registry() -> ToolRegistry:
             parameters={"type": "object"},
             validator=_identity,
             requires_confirmation=True,
-            confirmation_preparer=lambda arguments, name=tool_name: (
-                ToolResult(
-                    True,
-                    "confirmation_required",
-                    name,
-                    data=dict(arguments),
-                ),
-                f"offline-eval:{name}:{arguments!r}",
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(
+                lambda arguments, name=tool_name: (
+                    ToolResult(
+                        True,
+                        "confirmation_required",
+                        name,
+                        data=dict(arguments),
+                    ),
+                    f"offline-eval:{name}:{arguments!r}",
+                )
             ),
-            confirmed_handler=lambda _arguments, _expected_context, name=tool_name: (
-                ToolResult(True, "changed", name)
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(
+                lambda _arguments, _expected_context, name=tool_name: (
+                    ToolResult(True, "changed", name)
+                )
             ),
         ))
     return registry

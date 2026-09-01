@@ -168,6 +168,173 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         self.assertEqual(peak, 1)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
 
+    def test_move_media_item_to_trash_waits_for_pipeline_writer(self):
+        state_lock = threading.Lock()
+        writer_entered = threading.Event()
+        release_writer = threading.Event()
+        trash_finished = threading.Event()
+        errors: list[BaseException] = []
+
+        class HoldingWriterService(LocalMediaService):
+            def _execute_task_under_writer(
+                self, owner: str, task_id: int, *, qb_client=None,
+            ):
+                del self, owner, qb_client
+                writer_entered.set()
+                release_writer.wait(timeout=2)
+                return {"status": "completed", "task_id": task_id}
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            source_root.mkdir()
+            media_file = source_root / "Movie.2026.mkv"
+            media_file.write_bytes(b"movie")
+            info = media_file.lstat()
+            identity = {
+                "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
+                "device": info.st_dev,
+                "inode": info.st_ino,
+            }
+            source_id = db.create_local_media_source(
+                name="trash-writer-source", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), owner="admin",
+            )
+            holder = HoldingWriterService(
+                scraper=FakeScraper(MatchResult(
+                    tmdb_id="1", title="Movie", year="2026",
+                    media_type="movie", confidence=1.0,
+                ))
+            )
+            mover = LocalMediaService(
+                scraper=FakeScraper(MatchResult(
+                    tmdb_id="1", title="Movie", year="2026",
+                    media_type="movie", confidence=1.0,
+                ))
+            )
+
+            def hold_writer() -> None:
+                try:
+                    holder.execute_task("admin", 1)
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    with state_lock:
+                        errors.append(exc)
+
+            def move_to_trash() -> None:
+                try:
+                    mover.move_media_item_to_trash(
+                        "admin", source_id, media_file, identity,
+                    )
+                except BaseException as exc:  # pragma: no cover - asserted below
+                    with state_lock:
+                        errors.append(exc)
+                finally:
+                    trash_finished.set()
+
+            holder_thread = threading.Thread(target=hold_writer)
+            trash_thread = threading.Thread(target=move_to_trash)
+            try:
+                holder_thread.start()
+                self.assertTrue(writer_entered.wait(timeout=1))
+                trash_thread.start()
+                self.assertFalse(trash_finished.wait(timeout=0.05))
+                self.assertTrue(media_file.exists())
+                release_writer.set()
+                holder_thread.join(timeout=2)
+                trash_thread.join(timeout=2)
+            finally:
+                release_writer.set()
+                holder_thread.join(timeout=2)
+                trash_thread.join(timeout=2)
+                holder.close()
+                mover.close()
+
+            self.assertEqual(errors, [])
+            self.assertFalse(media_file.exists())
+            self.assertEqual(len(list((source_root / ".mediaflux-trash").iterdir())), 1)
+            self.assertTrue(all(not thread.is_alive() for thread in (holder_thread, trash_thread)))
+
+    def test_move_media_item_to_trash_rejects_all_active_path_overlaps(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            source_root.mkdir()
+            source_id = db.create_local_media_source(
+                name="trash-overlap-source", qb_profile="", qb_path_prefix="",
+                local_root=str(source_root), owner="admin",
+            )
+            service = LocalMediaService(
+                scraper=FakeScraper(MatchResult(
+                    tmdb_id="1", title="Movie", year="2026",
+                    media_type="movie", confidence=1.0,
+                ))
+            )
+            try:
+                for relation in ("equal", "ancestor", "descendant"):
+                    with self.subTest(relation=relation):
+                        selected = source_root / f"Show-{relation}"
+                        selected.mkdir()
+                        episode = selected / "S01E01.mkv"
+                        episode.write_bytes(b"episode")
+                        info = selected.lstat()
+                        identity = {
+                            "size": info.st_size,
+                            "mtime_ns": info.st_mtime_ns,
+                            "device": info.st_dev,
+                            "inode": info.st_ino,
+                        }
+                        task_path = {
+                            "equal": selected,
+                            "ancestor": source_root,
+                            "descendant": episode,
+                        }[relation]
+                        task_id = db.create_local_media_task(
+                            source_id, "", str(task_path), owner="admin", trigger="manual",
+                        )
+                        db.update_local_media_task(
+                            task_id, owner="admin", status="requires_manual",
+                        )
+                        with self.assertRaisesRegex(
+                            LocalMediaServiceError, "未完成的本地媒体任务路径重叠",
+                        ):
+                            service.move_media_item_to_trash(
+                                "admin", source_id, selected, identity,
+                            )
+                        self.assertTrue(selected.exists())
+                        db.update_local_media_task(
+                            task_id, owner="admin", status="failed",
+                        )
+
+                selected = source_root / "Independent"
+                selected.mkdir()
+                (selected / "Movie.mkv").write_bytes(b"movie")
+                sibling = source_root / "Other.mkv"
+                sibling.write_bytes(b"other")
+                sibling_task = db.create_local_media_task(
+                    source_id, "", str(sibling), owner="admin", trigger="manual",
+                )
+                info = selected.lstat()
+                destination = service.move_media_item_to_trash(
+                    "admin",
+                    source_id,
+                    selected,
+                    {
+                        "size": info.st_size,
+                        "mtime_ns": info.st_mtime_ns,
+                        "device": info.st_dev,
+                        "inode": info.st_ino,
+                    },
+                )
+                self.assertFalse(selected.exists())
+                self.assertTrue(destination.exists())
+                self.assertEqual(
+                    db.get_local_media_task(sibling_task, owner="admin").status,
+                    "waiting_stable",
+                )
+            finally:
+                service.close()
+
     def test_warmed_tasks_recheck_latest_target_inventory_before_each_commit(self):
         from app.modules.organize import OrganizeRules
 

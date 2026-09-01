@@ -11,6 +11,8 @@ from unittest import mock
 from app.agent import guangya_rename_actions as rename_actions
 from app.agent import guangya_workspace_actions as workspace_actions
 from app.agent.models import RiskLevel, ToolContext
+from app.agent.orchestrator import AgentOrchestrator
+from app.agent.registry import AgentToolError
 from app.agent.result_projection import project_agent_response_for_llm
 from app.agent.tools import build_tool_registry
 from app.clients.guangya import GuangYaFile
@@ -265,9 +267,7 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
         context = ToolContext(owner="owner", session_id="session")
         with mock.patch.object(rename_actions, "GuangYaClient", return_value=client):
             rename_actions.preview_guangya_change_plan(arguments, context)
-            confirmation, fingerprint = (
-                rename_actions.prepare_guangya_change_plan_confirmation({}, context)
-            )
+            service = AgentOrchestrator(build_tool_registry())
             manager = mock.Mock()
             manager.start_durable_operation.return_value = {
                 "ok": True, "task_id": "a" * 32,
@@ -276,11 +276,19 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
             with mock.patch(
                 "app.modules.organize_tasks.get_organize_manager", return_value=manager
             ):
-                accepted = rename_actions.execute_guangya_change_plan_confirmed(
-                    {}, fingerprint, context
+                with self.assertRaises(AgentToolError) as removed:
+                    service.prepare(
+                        "guangya.change_plan.execute", {}, owner="owner"
+                    )
+                self.assertEqual(removed.exception.code, "tool_not_found")
+                prepared = service.prepare(
+                    "guangya.rename.execute", {}, owner="owner"
                 )
-        self.assertEqual(confirmation.status, "confirmation_required")
-        self.assertEqual(accepted.status, "accepted")
+                accepted = service.confirm(
+                    prepared["action_plan"]["plan_id"], owner="owner"
+                )
+        self.assertEqual(prepared["tool_call"]["name"], "guangya.rename.execute")
+        self.assertEqual(accepted["result"]["status"], "accepted")
         self.assertEqual(
             manager.start_durable_operation.call_args.kwargs["job_kind"],
             "agent_guangya_rename",
@@ -452,12 +460,11 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
         self.assertEqual(
             capabilities["guangya.change_plan.preview"]["risk"], RiskLevel.READ.value
         )
+        self.assertNotIn("guangya.change_plan.execute", capabilities)
         self.assertEqual(
-            capabilities["guangya.change_plan.execute"]["risk"], RiskLevel.DANGER.value
+            capabilities["guangya.rename.execute"]["risk"], RiskLevel.DANGER.value
         )
-        self.assertTrue(
-            capabilities["guangya.change_plan.execute"]["requires_confirmation"]
-        )
+        self.assertTrue(capabilities["guangya.rename.execute"]["requires_confirmation"])
 
 
 if __name__ == "__main__":

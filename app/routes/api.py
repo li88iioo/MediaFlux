@@ -938,11 +938,11 @@ def get_config(request: Request):
     # 旧版整单降级开关已停用；即使数据库仍有历史值也不再暴露给前端。
     items.pop("OFFLINE_MAGNET_UNVERIFIED_FALLBACK", None)
     # 离线选择固定为仅视频；历史音频/附件扩展名在展示与执行时都会被剔除。
-    from app.modules.offline import DEFAULT_MEDIA_EXTS_CSV, normalize_video_extensions
+    from app.modules.offline import DEFAULT_VIDEO_EXTS_CSV, normalize_video_extensions
 
     items["OFFLINE_ALLOWED_EXTS"] = ",".join(
         normalize_video_extensions(str(items.get("OFFLINE_ALLOWED_EXTS") or ""))
-    ) or DEFAULT_MEDIA_EXTS_CSV
+    ) or DEFAULT_VIDEO_EXTS_CSV
     for key in managed_fields:
         items[key] = config.get(key, _AGENT_SETTINGS_DEFAULTS.get(key, ""))
     redacted = redact_config(items)
@@ -1292,15 +1292,15 @@ def save_config(request: Request, data: Any = Body(default=None)):
     updates = dict(web_updates)
     if "OFFLINE_ALLOWED_EXTS" in data:
         try:
-            from app.modules.offline import DEFAULT_MEDIA_EXTS
+            from app.modules.offline import DEFAULT_VIDEO_EXTS
 
             normalized_exts = _normalize_organize_extensions(
                 data.get("OFFLINE_ALLOWED_EXTS"),
-                defaults=DEFAULT_MEDIA_EXTS,
+                defaults=DEFAULT_VIDEO_EXTS,
                 label="离线允许扩展名",
             )
             unsupported = [
-                item for item in normalized_exts.split(",") if item not in DEFAULT_MEDIA_EXTS
+                item for item in normalized_exts.split(",") if item not in DEFAULT_VIDEO_EXTS
             ]
             if unsupported:
                 raise ValueError(

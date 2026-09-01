@@ -14,6 +14,8 @@ from __future__ import annotations
 import json
 import hashlib
 import hmac
+import html
+from html.parser import HTMLParser
 import os
 import re
 import sqlite3
@@ -38,7 +40,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 16
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
     "上次进程在本地媒体写操作期间中断"
@@ -250,27 +252,6 @@ CREATE TABLE IF NOT EXISTS organize_confirmation_delivery_outbox (
 );
 CREATE INDEX IF NOT EXISTS idx_organize_confirmation_delivery_due
     ON organize_confirmation_delivery_outbox(status, next_attempt_at, id);
-
--- 整理任务汇总/媒体卡的持久化投递队列。带按钮的待确认卡继续走
--- organize_confirmation_delivery_outbox，避免两套队列重复投递同一张卡。
-CREATE TABLE IF NOT EXISTS organize_notification_outbox (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    idempotency_key TEXT NOT NULL UNIQUE,
-    chat_id TEXT NOT NULL DEFAULT '',
-    body TEXT NOT NULL,
-    image_url TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(status IN ('pending','sending','retry_wait','sent','failed')),
-    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
-    lease_generation INTEGER NOT NULL DEFAULT 0 CHECK(lease_generation >= 0),
-    next_attempt_at TEXT NOT NULL,
-    last_error TEXT NOT NULL DEFAULT '',
-    sent_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_organize_notification_outbox_due
-    ON organize_notification_outbox(status, next_attempt_at, id);
 
 CREATE TABLE IF NOT EXISTS telegram_notification_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1190,7 +1171,7 @@ CREATE TABLE IF NOT EXISTS local_media_sources (
     smb_user TEXT DEFAULT '',
     smb_pass TEXT DEFAULT '',
     enabled INTEGER NOT NULL DEFAULT 1,
-    stable_seconds INTEGER NOT NULL DEFAULT 300,
+    stable_seconds INTEGER NOT NULL DEFAULT 0,
     scan_enabled INTEGER NOT NULL DEFAULT 0,
     scan_interval_minutes INTEGER NOT NULL DEFAULT 10,
     media_type TEXT NOT NULL DEFAULT 'auto',
@@ -1493,23 +1474,6 @@ CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_owner_expiry
     ON telegram_agent_actions(owner_digest, expires_at);
 CREATE INDEX IF NOT EXISTS idx_telegram_agent_actions_expiry
     ON telegram_agent_actions(expires_at);
-
-CREATE TABLE IF NOT EXISTS telegram_write_confirmations (
-    action_id TEXT PRIMARY KEY,
-    group_id TEXT NOT NULL,
-    owner_digest TEXT NOT NULL,
-    decision TEXT NOT NULL,
-    operation TEXT NOT NULL,
-    value_json TEXT NOT NULL DEFAULT '{}',
-    expires_at REAL NOT NULL,
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_telegram_write_confirmations_group
-    ON telegram_write_confirmations(group_id);
-CREATE INDEX IF NOT EXISTS idx_telegram_write_confirmations_owner_expiry
-    ON telegram_write_confirmations(owner_digest, expires_at);
-CREATE INDEX IF NOT EXISTS idx_telegram_write_confirmations_expiry
-    ON telegram_write_confirmations(expires_at);
 
 CREATE TABLE IF NOT EXISTS agent_missing_media_workflows (
     workflow_id TEXT PRIMARY KEY,
@@ -2416,6 +2380,159 @@ def _migrate_organize_confirmation_rollup_v14(
     )
 
 
+class _LegacyTelegramHTMLTextExtractor(HTMLParser):
+    """把旧队列中已渲染的 Telegram HTML 收敛为安全纯文本。"""
+
+    _BLOCK_TAGS = frozenset({"blockquote", "div", "p", "pre"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def _newline(self) -> None:
+        if self.parts and not self.parts[-1].endswith("\n"):
+            self.parts.append("\n")
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del attrs
+        if tag.casefold() == "br":
+            self._newline()
+        elif tag.casefold() in self._BLOCK_TAGS:
+            self._newline()
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.casefold() in self._BLOCK_TAGS:
+            self._newline()
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(str(data or ""))
+
+    def text(self) -> str:
+        return "".join(self.parts).replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _legacy_organize_notification_event(body: object, image_url: object) -> str:
+    """将旧的已渲染正文转换为统一通知事件，避免标签二次转义。"""
+    raw = str(body or "")
+    parser = _LegacyTelegramHTMLTextExtractor()
+    try:
+        parser.feed(raw)
+        parser.close()
+        plain = parser.text()
+    except Exception:
+        # HTMLParser 对常规 Telegram 标记不会失败；损坏输入仍按纯文本保留。
+        plain = html.unescape(re.sub(r"<[^>]*>", "", raw))
+    lines = [line.strip() for line in plain.splitlines() if line.strip()]
+    had_markup = bool(re.search(r"<\s*/?\s*[a-zA-Z][^>]*>", raw))
+    title = "整理结果"
+    if had_markup and lines:
+        title = lines.pop(0)
+    payload = {
+        "title": title,
+        "fields": [],
+        "lines": lines if had_markup else ([plain.strip()] if plain.strip() else []),
+        "image_url": str(image_url or ""),
+        "footer": "",
+        "actions": [],
+        "layout": "default",
+        "field_emojis": True,
+        "state": "",
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _migrate_retire_organize_notification_outbox_v15(
+    conn: sqlite3.Connection,
+) -> None:
+    """把整理汇总旧队列迁入统一 Telegram outbox 后移除旧表。"""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='organize_notification_outbox'"
+    ).fetchone()
+    if exists is None:
+        return
+
+    _migrate_telegram_notification_outbox_v12(conn)
+    rows = conn.execute(
+        "SELECT idempotency_key,chat_id,body,image_url,status,attempts,"
+        "lease_generation,next_attempt_at,last_error,sent_at,created_at,updated_at "
+        "FROM organize_notification_outbox ORDER BY id"
+    ).fetchall()
+    planned: list[tuple[sqlite3.Row | tuple, str]] = []
+    for row in rows:
+        idempotency_key = str(row[0] or "").strip()
+        digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+        event_key = f"retired-organize:{digest}"
+        if conn.execute(
+            "SELECT 1 FROM telegram_notification_outbox WHERE event_key=?",
+            (event_key,),
+        ).fetchone() is not None:
+            raise sqlite3.IntegrityError(
+                "统一 Telegram outbox 已存在旧整理通知迁移键；已保留源表等待人工核验"
+            )
+        planned.append((row, event_key))
+
+    inserted = 0
+    for row, event_key in planned:
+        status = str(row[4] or "pending")
+        canonical_status = {
+            "pending": "pending",
+            "retry_wait": "retry_wait",
+            "sending": "outcome_unknown",
+            "sent": "sent",
+            "failed": "failed",
+        }.get(status, "failed")
+        last_error = str(row[8] or "")
+        if status == "sending" and not last_error:
+            last_error = "DeliveryOutcomeUnknown"
+        event_json = _legacy_organize_notification_event(row[2], row[3])
+        result = conn.execute(
+            "INSERT INTO telegram_notification_outbox("
+            "event_key,thread_key,topic,importance,chat_id,event_json,message_id,"
+            "revision,delivered_revision,status,attempts,lease_generation,"
+            "next_attempt_at,last_error,sent_at,created_at,updated_at"
+            ") VALUES(?,'','organize','result',?,?,NULL,1,?,?,?, ?,?,?,?,?,?)",
+            (
+                event_key,
+                str(row[1] or ""),
+                event_json,
+                1 if canonical_status == "sent" else 0,
+                canonical_status,
+                max(0, int(row[5] or 0)),
+                max(0, int(row[6] or 0)),
+                str(row[7] or row[11] or row[10] or now()),
+                last_error,
+                row[9],
+                str(row[10] or now()),
+                str(row[11] or row[10] or now()),
+            ),
+        )
+        if result.rowcount != 1:
+            raise sqlite3.IntegrityError(
+                "旧整理通知迁移写入数量异常；已保留源表"
+            )
+        inserted += 1
+    if inserted != len(rows):
+        raise sqlite3.IntegrityError(
+            "旧整理通知迁移数量不一致；已保留源表"
+        )
+    conn.execute("DROP TABLE organize_notification_outbox")
+
+
+def _migrate_retire_telegram_write_confirmations_v16(
+    conn: sqlite3.Connection,
+) -> None:
+    """移除已并入统一 Agent confirmation store 的短期 Telegram 票据表。
+
+    旧票据有效期仅五分钟，且 owner 只保存不可逆摘要，无法安全重建 canonical
+    owner。升级时 fail closed 使旧按钮失效，用户重新发起即可，避免保留第二套
+    确认状态机和长期 schema 墓碑。
+    """
+    conn.execute("DROP TABLE IF EXISTS telegram_write_confirmations")
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2431,6 +2548,8 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     11: _migrate_telegram_notification_outbox_v12,
     12: _migrate_media_subscription_notification_outbox_v13,
     13: _migrate_organize_confirmation_rollup_v14,
+    14: _migrate_retire_organize_notification_outbox_v15,
+    15: _migrate_retire_telegram_write_confirmations_v16,
 }
 
 
@@ -2625,11 +2744,15 @@ def init_db() -> None:
             _prepare_schema_migration(conn, database_existed=database_existed)
             # 未打版本的早期数据库也可能已有 v1 约束表；补列与重建必须作为
             # 一个原子步骤完成，避免退出后留下半迁移 schema。
-            def prepare_legacy_schema(connection: sqlite3.Connection) -> None:
+            def prepare_schema_baseline(connection: sqlite3.Connection) -> None:
                 _sync_missing_schema_columns(connection)
                 _migrate_agent_session_context_v2(connection)
+                # 未打版本的早期数据库不会进入正式迁移链；仍需同步清除
+                # 已被统一 Telegram 通知中心取代的旧整理通知队列。
+                _migrate_retire_organize_notification_outbox_v15(connection)
+                _migrate_retire_telegram_write_confirmations_v16(connection)
 
-            _run_schema_savepoint(conn, operation=prepare_legacy_schema)
+            _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
                 conn,
                 operation=lambda connection: _execute_schema_script(connection, _SCHEMA),
@@ -2644,6 +2767,13 @@ def init_db() -> None:
             conn.execute(
                 "UPDATE local_media_sources SET smb_user='',smb_pass='' "
                 "WHERE COALESCE(smb_user,'')<>'' OR COALESCE(smb_pass,'')<>''"
+            )
+            # 固定等待与目录定时轮询已从产品链路移除；旧列仅作为 schema 墓碑，
+            # 启动时统一归零，防止旧配置被误认为仍会生效。
+            conn.execute(
+                "UPDATE local_media_sources SET stable_seconds=0,scan_enabled=0,"
+                "scan_interval_minutes=10 WHERE stable_seconds<>0 OR scan_enabled<>0 "
+                "OR scan_interval_minutes<>10"
             )
             # 播放诊断保留期在启动时也执行，避免长期无新播放时旧媒体标识滞留。
             conn.execute(
@@ -2676,10 +2806,6 @@ def init_db() -> None:
             )
             conn.execute(
                 "DELETE FROM telegram_agent_actions WHERE expires_at<=?",
-                (time.time(),),
-            )
-            conn.execute(
-                "DELETE FROM telegram_write_confirmations WHERE expires_at<=?",
                 (time.time(),),
             )
             timestamp = now()
@@ -3013,8 +3139,8 @@ def now() -> str:
 
 
 # ===== Agent 网页搜索每日额度 =====
-# 兼容门面：调用方继续使用 app.database.*，事务实现按业务域拆分。
-from app.repositories.agent_web_search import (  # noqa: E402
+# 统一数据访问门面：调用方使用 app.database.*，事务实现按业务域唯一归属。
+from app.repositories.agent_web_search import (  # noqa: E402,F401
     _validate_agent_web_search_usage_date,
     clear_agent_web_search_cache,
     get_agent_web_search_cache,
@@ -3026,8 +3152,8 @@ from app.repositories.agent_web_search import (  # noqa: E402
 
 
 # ===== 媒体探测缓存 =====
-# 兼容门面：调用方继续使用 app.database.*；批量读取保持单连接契约。
-from app.repositories.media_probe import (  # noqa: E402, F401
+# 统一数据访问门面：批量读取保持单连接契约。
+from app.repositories.media_probe import (  # noqa: E402,F401
     get_media_probe_cache,
     get_media_probe_cache_many,
     prune_media_probe_cache,
@@ -3037,7 +3163,7 @@ from app.repositories.media_probe import (  # noqa: E402, F401
 
 
 # ===== 整理后媒体规格补全队列 =====
-from app.repositories.organize_probe import (  # noqa: E402
+from app.repositories.organize_probe import (  # noqa: E402,F401
     cancel_organize_probe_job,
     claim_due_organize_probe_jobs,
     commit_organize_probe_rename,
@@ -3051,8 +3177,8 @@ from app.repositories.organize_probe import (  # noqa: E402
 
 
 # ===== Emby / Jellyfin 多实例媒体反代 =====
-# 兼容门面：调用方继续使用 app.database.*；schema/连接仍由本模块持有。
-from app.repositories.media_proxy import (  # noqa: E402
+# 统一数据访问门面：schema/连接仍由本模块持有。
+from app.repositories.media_proxy import (  # noqa: E402,F401
     add_media_proxy_binding,
     add_media_proxy_instance,
     clear_media_proxy_playback_records,
@@ -3833,10 +3959,6 @@ def recover_interrupted_organize_operations() -> dict[str, int]:
     return {"logs": logs, "steps": steps, "delete_audits": audits}
 
 
-def update_organize_log_status(log_id: int, status: str) -> None:
-    """兼容旧调用；新写操作优先使用原子认领和 update_organize_log。"""
-    update_organize_log(log_id, status=status)
-
 
 def clear_organize_logs() -> dict[str, int]:
     """清理可安全删除的光鸭与本地整理记录，不触碰任何媒体文件。"""
@@ -3926,8 +4048,8 @@ def count_logs_by_status(table: str = "organize_log") -> dict:
 
 
 # ===== TMDB 映射锁 =====
-# 兼容门面：管理 API 继续使用 app.database.*；识别业务通过 Repository 访问。
-from app.repositories.recognition import (  # noqa: E402
+# 统一数据访问门面：管理 API 与识别业务共享同一 Repository 实现。
+from app.repositories.recognition import (  # noqa: E402,F401
     delete_tmdb_lock,
     get_tmdb_lock,
     list_tmdb_locks,
@@ -3936,12 +4058,13 @@ from app.repositories.recognition import (  # noqa: E402
 
 
 # ===== 下载日志与统一下载请求 =====
-# 兼容门面：调用方继续使用 app.database.*；连接状态与迁移仍由本模块持有。
-from app.repositories.download_requests import (  # noqa: E402
+# 统一数据访问门面：Repository 复用本模块持有的连接状态与迁移。
+from app.repositories.download_requests import (  # noqa: E402,F401
     _DOWNLOAD_ATTENTION_WHERE,
     add_download_log,
     bind_media_download_admission_request,
     bind_pending_download_request_owner,
+    bind_download_request_guangya_staging,
     claim_failed_share_transfer_request,
     clear_download_request_attention,
     clear_download_request_attentions,
@@ -3962,8 +4085,8 @@ from app.repositories.download_requests import (  # noqa: E402
 
 
 # ===== Agent 下载结果自动复核 =====
-# 兼容门面：终态与通知发件箱仍保持单事务写入。
-from app.repositories.agent_download_verification import (  # noqa: E402
+# 统一数据访问门面：终态与通知发件箱保持单事务写入。
+from app.repositories.agent_download_verification import (  # noqa: E402,F401
     claim_due_agent_download_verification,
     claim_due_agent_download_verification_notification,
     complete_agent_download_verification_notification,
@@ -4115,7 +4238,6 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
         "jobs": digest(b"mediaflux-agent-durable-job:v1\0", normalized_owner),
         "workflows": digest(b"mediaflux-agent-missing-workflow:v1\0", normalized_owner),
         "telegram_actions": digest(b"mediaflux-telegram-agent-action:v1\0", normalized_owner),
-        "telegram_confirmations": digest(b"mediaflux-telegram-write-confirmation:v1\0", normalized_owner),
         "conversations": digest(
             b"mediaflux-agent-conversation-principal:v1\0", normalized_principal
         ),
@@ -4133,7 +4255,6 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
             ("jobs", "agent_jobs", "owner_digest"),
             ("workflows", "agent_missing_media_workflows", "owner_digest"),
             ("telegram_actions", "telegram_agent_actions", "owner_digest"),
-            ("telegram_confirmations", "telegram_write_confirmations", "owner_digest"),
             ("conversations", "agent_conversations", "principal_digest"),
             ("conversation_epochs", "agent_conversation_epochs", "principal_digest"),
         ):
@@ -4190,8 +4311,8 @@ def maintain_sqlite_database(*, incremental_pages: int = 200) -> dict[str, int |
 
 
 # ===== Agent 媒体库巡检 =====
-# 兼容门面：巡检结果、版本与通知发件箱保持单事务一致性。
-from app.repositories.agent_library_patrol import (  # noqa: E402
+# 统一数据访问门面：巡检结果、版本与通知发件箱保持单事务一致性。
+from app.repositories.agent_library_patrol import (  # noqa: E402,F401
     cancel_agent_library_patrol_lease,
     claim_due_agent_library_patrol,
     claim_due_agent_library_patrol_notification,
@@ -4211,7 +4332,7 @@ from app.repositories.agent_library_patrol import (  # noqa: E402
 
 
 # ===== Agent owner 隔离的可恢复长任务 =====
-from app.repositories.agent_jobs import (  # noqa: E402
+from app.repositories.agent_jobs import (  # noqa: E402,F401
     cancel_agent_job,
     claim_due_agent_job,
     complete_agent_job,
@@ -4230,19 +4351,21 @@ from app.repositories.agent_jobs import (  # noqa: E402
 
 
 # ===== 下载请求认领与本地入库状态 =====
-from app.repositories.download_requests import (  # noqa: E402
+from app.repositories.download_requests import (  # noqa: E402,F401
     claim_download_request,
     claim_download_request_notification,
     claim_download_request_organize,
+    claim_download_request_staging_finalize,
     claim_download_request_targets,
     get_download_request_by_request_key,
     get_download_request_by_request_keys,
     link_download_request_to_local_media_task,
     list_active_download_requests,
+    list_protected_guangya_staging_ids,
     mark_download_request_local_media_failed,
     mark_download_request_local_media_skipped,
     finalize_download_request_notification,
-    finalize_download_request_submission,  # noqa: F401 - database compatibility facade
+    finalize_download_request_submission,  # noqa: F401 - unified database facade
     renew_download_request_notification_lease,
     recover_stale_submitting_download_requests,
     update_download_request,
@@ -4252,8 +4375,8 @@ from app.repositories.download_requests import (  # noqa: E402
 
 
 # ===== RSS 订阅、条目状态机与诊断 =====
-# 兼容门面：schema/migration 留在 init_db，调用方继续使用 app.database.*。
-from app.repositories.rss import (  # noqa: E402
+# 统一数据访问门面：schema/migration 由 init_db 集中持有。
+from app.repositories.rss import (  # noqa: E402,F401
     add_rss_entry,
     add_rss_entry_with_media,
     add_rss_subscription,
@@ -4294,7 +4417,7 @@ from app.repositories.rss import (  # noqa: E402
 
 # ===== 媒体订阅、候选资源与下载准入 =====
 # 独立于 RSS schema；统一订阅中心只在应用层聚合。
-from app.repositories.media_subscriptions import (  # noqa: E402
+from app.repositories.media_subscriptions import (  # noqa: E402,F401
     add_media_subscription,
     add_media_subscription_run,
     begin_media_download_dispatch,
@@ -4332,8 +4455,8 @@ from app.repositories.media_subscriptions import (  # noqa: E402
 
 
 # ===== STRM 索引 =====
-# 兼容门面：调用方继续使用 app.database.*；核心索引 CRUD 按业务域拆分。
-from app.repositories.strm import (  # noqa: E402
+# 统一数据访问门面：核心索引 CRUD 按业务域拆分并共享同一实现。
+from app.repositories.strm import (  # noqa: E402,F401
     cancel_stale_strm_metadata_jobs,
     cancel_retired_strm_metadata_jobs,
     cancel_strm_metadata_job,
@@ -5352,51 +5475,65 @@ def cancel_organize_confirmation(
     return cancelled
 
 
-def expire_queued_organize_confirmations() -> int:
-    """兼容旧调用：用户已点击的 queued 项不再受候选窗口限制。"""
-    return 0
 
-
-def expire_pending_organize_confirmations(
+def list_due_pending_organize_confirmations(
     *, token: str = "", limit: int = 100
 ) -> list[sqlite3.Row]:
-    """原子失效到期但从未被用户选择的候选，并返回真实终态行。"""
+    """列出到期但尚未选择的候选；终态与回执由单条原子接口提交。"""
     timestamp = now()
     resolved_limit = max(1, min(int(limit or 100), 500))
     with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
         params: list[object] = [timestamp]
         token_clause = ""
         if str(token or "").strip():
             token_clause = " AND token=?"
             params.append(str(token or "").strip())
         params.append(resolved_limit)
-        rows = conn.execute(
-            "SELECT id FROM organize_confirmations WHERE status='pending' "
+        return conn.execute(
+            "SELECT * FROM organize_confirmations WHERE status='pending' "
             "AND expires_at<=?" + token_clause + " ORDER BY expires_at ASC,id ASC LIMIT ?",
             params,
         ).fetchall()
-        ids = [int(row["id"]) for row in rows]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        conn.execute(
+
+
+def expire_organize_confirmation_with_delivery(
+    token: str,
+    *,
+    event_json: str,
+    chat_id: str,
+    message_id: int | None,
+) -> sqlite3.Row | None:
+    """原子失效一张到期候选卡，并写入统一通知中心的事务桥。"""
+    timestamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cursor = conn.execute(
             "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
             "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
             "completed_at=?,rollup_applied=0,updated_at=? "
-            f"WHERE id IN ({placeholders}) AND status='pending'",
+            "WHERE token=? AND status='pending' AND expires_at<=?",
             (
                 json.dumps({"resolution": "expired"}, ensure_ascii=False),
                 timestamp,
                 timestamp,
-                *ids,
+                str(token or ""),
+                timestamp,
             ),
         )
+        if cursor.rowcount != 1:
+            return None
+        _enqueue_organize_confirmation_delivery(
+            conn,
+            token=token,
+            event_json=event_json,
+            chat_id=chat_id,
+            message_id=message_id,
+            timestamp=timestamp,
+        )
         return conn.execute(
-            f"SELECT * FROM organize_confirmations WHERE id IN ({placeholders}) "
-            "AND status='expired' ORDER BY id ASC",
-            ids,
-        ).fetchall()
+            "SELECT * FROM organize_confirmations WHERE token=?",
+            (str(token or ""),),
+        ).fetchone()
 
 
 def get_next_queued_organize_confirmation() -> sqlite3.Row | None:
@@ -6161,8 +6298,8 @@ def get_agent_persistent_health_summary() -> dict[str, dict[str, object]]:
 
 
 # ===== 媒体探索缓存、跨来源映射与收藏 =====
-# 兼容门面：外部调用和测试继续使用 app.database.*；实现已按业务域拆分。
-from app.repositories.discovery import (  # noqa: E402, F401
+# 统一数据访问门面：外部调用与测试共享按业务域拆分的单一实现。
+from app.repositories.discovery import (  # noqa: E402,F401
     add_media_watchlist,
     confirm_media_external_id_if_unchanged,
     delete_media_watchlist,
@@ -6187,13 +6324,140 @@ def _local_media_owner(owner: str) -> str:
     return value
 
 
+_LOCAL_MEDIA_TERMINAL_TASK_STATUSES = frozenset({"completed", "failed"})
+
+
+def _canonical_local_media_content_path(value: object) -> str:
+    from app.modules.local_media_models import canonical_local_media_content_path
+
+    return canonical_local_media_content_path(str(value or ""))
+
+
+def _active_local_media_task_for_path(
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    owner: str,
+    content_path: str,
+) -> sqlite3.Row | None:
+    """按规范路径查找唯一活动任务，并拒绝祖先/后代范围重叠。"""
+    from app.modules.local_media_models import local_media_paths_overlap
+
+    rows = conn.execute(
+        "SELECT id,source_id,qb_hash,content_path,trigger,status,operation_token "
+        "FROM local_media_tasks "
+        "WHERE owner=? AND status NOT IN ('completed','failed') "
+        "ORDER BY id",
+        (owner,),
+    ).fetchall()
+    exact_matches: list[sqlite3.Row] = []
+    overlapping_matches: list[sqlite3.Row] = []
+    for row in rows:
+        try:
+            candidate_path = _canonical_local_media_content_path(row["content_path"])
+        except ValueError:
+            continue
+        if candidate_path == content_path:
+            exact_matches.append(row)
+        elif local_media_paths_overlap(candidate_path, content_path):
+            overlapping_matches.append(row)
+    if len(exact_matches) > 1:
+        raise RuntimeError("同一路径存在多个活动本地媒体任务，请先完成或清理旧任务")
+    if exact_matches and overlapping_matches:
+        raise RuntimeError("同一路径范围存在多个活动本地媒体任务，请先完成或清理旧任务")
+    if not exact_matches:
+        if overlapping_matches:
+            raise ValueError("该路径与未完成的本地媒体任务范围重叠")
+        return None
+    match = exact_matches[0]
+    if int(match["source_id"] or 0) != int(source_id):
+        raise ValueError("该路径已有其他本地媒体来源的活动任务")
+    return match
+
+
+def _local_media_source_has_active_task(
+    conn: sqlite3.Connection, *, source_id: int, owner: str,
+) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM local_media_tasks WHERE source_id=? AND owner=? "
+        "AND status NOT IN ('completed','failed') LIMIT 1",
+        (int(source_id), owner),
+    ).fetchone() is not None
+
+
+def _local_media_target_signature(rows: Iterable[sqlite3.Row | dict[str, object]]) -> tuple:
+    fields = ("category", "path", "provider", "library_id", "library_name", "server_path")
+    return tuple(sorted(tuple(str(row[field] or "") for field in fields) for row in rows))
+
+
+def _latest_terminal_local_media_task_for_path(
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    owner: str,
+    content_path: str,
+) -> sqlite3.Row | None:
+    """返回同来源同规范路径最近的终态任务，供显式重试复用。"""
+    rows = conn.execute(
+        "SELECT id,source_id,qb_hash,content_path,trigger,status,operation_token "
+        "FROM local_media_tasks WHERE source_id=? AND owner=? "
+        "AND status IN ('completed','failed') ORDER BY id DESC",
+        (int(source_id), owner),
+    ).fetchall()
+    for row in rows:
+        try:
+            candidate_path = _canonical_local_media_content_path(row["content_path"])
+        except ValueError:
+            continue
+        if candidate_path == content_path:
+            return row
+    return None
+
+
+def _normalize_local_media_task_path(
+    conn: sqlite3.Connection, row: sqlite3.Row, content_path: str
+) -> None:
+    if str(row["content_path"] or "") == content_path:
+        return
+    conn.execute(
+        "UPDATE local_media_tasks SET content_path=?,updated_at=? WHERE id=?",
+        (content_path, now(), int(row["id"])),
+    )
+
+
+def _bind_qb_hash_to_active_local_media_task(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    qb_hash: str,
+    content_path: str,
+    *,
+    previous_hash_task_id: int | None = None,
+) -> int:
+    """给既有活动任务补充 qB 绑定，不重置识别或人工确认状态。"""
+    current_hash = str(row["qb_hash"] or "").strip().lower()
+    if current_hash and current_hash != qb_hash:
+        raise ValueError("同一路径的活动任务已绑定其他 qB 任务")
+    task_id = int(row["id"] or 0)
+    if previous_hash_task_id is not None and int(previous_hash_task_id) != task_id:
+        conn.execute(
+            "UPDATE local_media_tasks SET qb_hash=NULL,updated_at=? "
+            "WHERE id=? AND status IN ('completed','failed')",
+            (now(), int(previous_hash_task_id)),
+        )
+    conn.execute(
+        "UPDATE local_media_tasks SET qb_hash=?,content_path=?,updated_at=? WHERE id=?",
+        (qb_hash, content_path, now(), task_id),
+    )
+    return task_id
+
+
 def create_local_media_source(
     name: str,
     qb_profile: str,
     qb_path_prefix: str,
     local_root: str,
     enabled: int = 1,
-    stable_seconds: int = 300,
+    stable_seconds: int = 0,
     scan_enabled: int = 0,
     scan_interval_minutes: int = 10,
     *,
@@ -6224,8 +6488,7 @@ def create_local_media_source(
             (
                 safe_owner, safe_name, str(qb_profile or ""), str(qb_path_prefix or ""), safe_root,
                 "", "",
-                1 if enabled else 0, max(0, int(stable_seconds)), 1 if scan_enabled else 0,
-                max(1, int(scan_interval_minutes)), safe_media_type, safe_mode,
+                1 if enabled else 0, 0, 0, 10, safe_media_type, safe_mode,
                 timestamp, timestamp,
             ),
         )
@@ -6234,10 +6497,11 @@ def create_local_media_source(
 
 def save_local_media_source_bundle(
     *, source_id: int | None = None, name: str, qb_profile: str, qb_path_prefix: str,
-    local_root: str, enabled: bool, stable_seconds: int, scan_enabled: bool,
-    scan_interval_minutes: int, media_type: str, mode: str,
+    local_root: str, enabled: bool, media_type: str, mode: str,
     targets: list[dict[str, str]] | None, owner: str = "admin",
     smb_user: str = "", smb_pass: str = "",
+    stable_seconds: int | None = None, scan_enabled: bool | None = None,
+    scan_interval_minutes: int | None = None,
 ) -> int:
     """在单个事务内保存来源与全部分类目标。"""
     from app.modules.local_media_models import LOCAL_MEDIA_CATEGORIES
@@ -6296,13 +6560,53 @@ def save_local_media_source_bundle(
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (safe_owner, safe_name, str(qb_profile or "").strip(), str(qb_path_prefix or "").strip(),
                  safe_root, "", "",
-                 1 if enabled else 0, max(0, int(stable_seconds)),
-                 1 if scan_enabled else 0, max(1, int(scan_interval_minutes)),
+                 1 if enabled else 0, 0, 0, 10,
                  safe_media_type, safe_mode, timestamp, timestamp),
             )
             saved_id = int(cur.lastrowid)
         else:
             saved_id = int(source_id)
+            current = conn.execute(
+                "SELECT name,qb_profile,qb_path_prefix,local_root,enabled,media_type,mode "
+                "FROM local_media_sources WHERE id=? AND owner=?",
+                (saved_id, safe_owner),
+            ).fetchone()
+            if current is None:
+                raise LookupError("本地媒体来源不存在")
+            requested_operational = (
+                str(qb_profile or "").strip(),
+                str(qb_path_prefix or "").strip(),
+                safe_root,
+                1 if enabled else 0,
+                safe_media_type,
+                safe_mode,
+            )
+            current_operational = (
+                str(current["qb_profile"] or ""),
+                str(current["qb_path_prefix"] or ""),
+                str(current["local_root"] or ""),
+                int(current["enabled"] or 0),
+                str(current["media_type"] or "auto"),
+                str(current["mode"] or "move"),
+            )
+            targets_changed = False
+            if normalized_targets is not None:
+                current_targets = conn.execute(
+                    "SELECT category,path,provider,library_id,library_name,server_path "
+                    "FROM local_library_targets WHERE source_id=? AND owner=?",
+                    (saved_id, safe_owner),
+                ).fetchall()
+                targets_changed = (
+                    _local_media_target_signature(current_targets)
+                    != _local_media_target_signature(normalized_targets)
+                )
+            if (
+                (requested_operational != current_operational or targets_changed)
+                and _local_media_source_has_active_task(
+                    conn, source_id=saved_id, owner=safe_owner,
+                )
+            ):
+                raise ValueError("来源仍有未完成任务，不能修改运行配置")
             cur = conn.execute(
                 "UPDATE local_media_sources SET name=?,qb_profile=?,qb_path_prefix=?,local_root=?,"
                 "smb_user=?,smb_pass=?,"
@@ -6310,8 +6614,7 @@ def save_local_media_source_bundle(
                 "WHERE id=? AND owner=?",
                 (safe_name, str(qb_profile or "").strip(), str(qb_path_prefix or "").strip(),
                  safe_root, "", "",
-                 1 if enabled else 0, max(0, int(stable_seconds)),
-                 1 if scan_enabled else 0, max(1, int(scan_interval_minutes)),
+                 1 if enabled else 0, 0, 0, 10,
                  safe_media_type, safe_mode, timestamp, saved_id, safe_owner),
             )
             if cur.rowcount != 1:
@@ -6504,12 +6807,10 @@ def create_local_media_task(
 
     safe_owner = _local_media_owner(owner)
     safe_trigger = str(trigger or "").strip().lower()
-    safe_path = str(content_path or "").strip()
+    safe_path = _canonical_local_media_content_path(content_path)
     normalized_hash = str(qb_hash or "").strip().lower() or None
     if safe_trigger not in LOCAL_MEDIA_TRIGGERS:
         raise ValueError("不支持的本地媒体任务触发方式")
-    if not safe_path:
-        raise ValueError("本地媒体任务路径不能为空")
     timestamp = now()
     token = str(operation_token or uuid.uuid4().hex)
     with get_conn() as conn:
@@ -6520,27 +6821,66 @@ def create_local_media_task(
         ).fetchone()
         if not source:
             raise LookupError("本地媒体来源不存在")
+
+        active = _active_local_media_task_for_path(
+            conn,
+            source_id=int(source_id),
+            owner=safe_owner,
+            content_path=safe_path,
+        )
+        hash_task = None
         if normalized_hash:
-            existing = conn.execute(
-                "SELECT id,content_path FROM local_media_tasks WHERE source_id=? AND qb_hash=? AND owner=?",
+            hash_task = conn.execute(
+                "SELECT id,source_id,qb_hash,content_path,trigger,status,operation_token "
+                "FROM local_media_tasks WHERE source_id=? AND qb_hash=? AND owner=?",
                 (int(source_id), normalized_hash, safe_owner),
             ).fetchone()
-            if existing:
-                if str(existing["content_path"]) != safe_path:
+
+        if hash_task is not None:
+            task_id = int(hash_task["id"])
+            terminal = str(hash_task["status"] or "") in _LOCAL_MEDIA_TERMINAL_TASK_STATUSES
+            if terminal:
+                if active is not None:
+                    return _bind_qb_hash_to_active_local_media_task(
+                        conn,
+                        active,
+                        normalized_hash,
+                        safe_path,
+                        previous_hash_task_id=task_id,
+                    )
+                if _canonical_local_media_content_path(hash_task["content_path"]) != safe_path:
                     raise ValueError("相同 qB 任务对应的内容路径不一致")
-                return int(existing["id"])
-        else:
-            existing = conn.execute(
-                "SELECT id FROM local_media_tasks WHERE source_id=? AND content_path=? AND owner=? "
-                "AND status NOT IN ('completed','failed') ORDER BY id DESC LIMIT 1",
-                (int(source_id), safe_path, safe_owner),
-            ).fetchone()
-            if existing:
-                return int(existing["id"])
+                _normalize_local_media_task_path(conn, hash_task, safe_path)
+                return task_id
+
+            if _canonical_local_media_content_path(hash_task["content_path"]) != safe_path:
+                raise ValueError("相同 qB 任务对应的内容路径不一致")
+            if active is not None and int(active["id"]) != task_id:
+                raise RuntimeError("同一路径存在多个活动本地媒体任务，请先完成或清理旧任务")
+            _normalize_local_media_task_path(conn, hash_task, safe_path)
+            return task_id
+
+        if active is not None:
+            if normalized_hash:
+                return _bind_qb_hash_to_active_local_media_task(
+                    conn, active, normalized_hash, safe_path
+                )
+            _normalize_local_media_task_path(conn, active, safe_path)
+            return int(active["id"])
+
         cur = conn.execute(
             "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
             "operation_token,created_at,updated_at) VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
-            (safe_owner, int(source_id), normalized_hash, safe_path, safe_trigger, token, timestamp, timestamp),
+            (
+                safe_owner,
+                int(source_id),
+                normalized_hash,
+                safe_path,
+                safe_trigger,
+                token,
+                timestamp,
+                timestamp,
+            ),
         )
         return int(cur.lastrowid)
 
@@ -6555,17 +6895,15 @@ def create_and_link_qb_local_media_task(
 ) -> tuple[int, bool]:
     """原子创建/复用 qB 本地整理任务并绑定下载请求。
 
+    规范化内容路径是活动任务的唯一准入身份；qB hash 只补充下载绑定。
     返回 ``(task_id, restarted)``。新下载请求命中同 hash 的旧终态任务时，
-    会开启新的 attempt；已经绑定到该任务的请求只复用当前状态，避免跟踪器
-    在任务完成后再次把它重置为等待态。
+    会开启新的 attempt；已经绑定到该任务的请求只复用当前状态。
     """
     import uuid
 
     safe_owner = _local_media_owner(owner)
-    safe_path = str(content_path or "").strip()
+    safe_path = _canonical_local_media_content_path(content_path)
     normalized_hash = str(qb_hash or "").strip().lower()
-    if not safe_path:
-        raise ValueError("本地媒体任务路径不能为空")
     if not normalized_hash:
         raise ValueError("qB 任务标识不能为空")
 
@@ -6589,40 +6927,69 @@ def create_and_link_qb_local_media_task(
         if not source:
             raise LookupError("本地媒体来源不存在")
 
-        existing = conn.execute(
-            "SELECT id,content_path,status FROM local_media_tasks "
-            "WHERE source_id=? AND qb_hash=? AND owner=?",
+        active = _active_local_media_task_for_path(
+            conn,
+            source_id=int(source_id),
+            owner=safe_owner,
+            content_path=safe_path,
+        )
+        hash_task = conn.execute(
+            "SELECT id,source_id,qb_hash,content_path,trigger,status,operation_token "
+            "FROM local_media_tasks WHERE source_id=? AND qb_hash=? AND owner=?",
             (int(source_id), normalized_hash, safe_owner),
         ).fetchone()
         restarted = False
-        if existing is None:
-            cur = conn.execute(
-                "INSERT INTO local_media_tasks("
-                "owner,source_id,qb_hash,content_path,trigger,status,operation_token,created_at,updated_at"
-                ") VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
-                (
-                    safe_owner,
-                    int(source_id),
+
+        if hash_task is None:
+            if active is not None:
+                task_id = _bind_qb_hash_to_active_local_media_task(
+                    conn, active, normalized_hash, safe_path
+                )
+            else:
+                cur = conn.execute(
+                    "INSERT INTO local_media_tasks("
+                    "owner,source_id,qb_hash,content_path,trigger,status,operation_token,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
+                    (
+                        safe_owner,
+                        int(source_id),
+                        normalized_hash,
+                        safe_path,
+                        "qb_completed",
+                        uuid.uuid4().hex,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                task_id = int(cur.lastrowid)
+        else:
+            task_id = int(hash_task["id"])
+            existing_target = f"local-media-task:{task_id}"
+            already_linked = str(request_row["local_import_target"] or "") == existing_target
+            terminal = str(hash_task["status"] or "") in _LOCAL_MEDIA_TERMINAL_TASK_STATUSES
+            hash_path = _canonical_local_media_content_path(hash_task["content_path"])
+
+            if not terminal:
+                if hash_path != safe_path:
+                    raise ValueError("相同 qB 任务对应的内容路径不一致")
+                if active is not None and int(active["id"]) != task_id:
+                    raise RuntimeError("同一路径存在多个活动本地媒体任务，请先完成或清理旧任务")
+                _normalize_local_media_task_path(conn, hash_task, safe_path)
+            elif already_linked:
+                if hash_path != safe_path:
+                    raise ValueError("相同 qB 任务对应的内容路径不一致")
+                if active is not None:
+                    raise RuntimeError("同一路径存在新的活动任务，请刷新下载请求状态")
+                _normalize_local_media_task_path(conn, hash_task, safe_path)
+            elif active is not None:
+                task_id = _bind_qb_hash_to_active_local_media_task(
+                    conn,
+                    active,
                     normalized_hash,
                     safe_path,
-                    "qb_completed",
-                    uuid.uuid4().hex,
-                    timestamp,
-                    timestamp,
-                ),
-            )
-            task_id = int(cur.lastrowid)
-        else:
-            task_id = int(existing["id"])
-            target = f"local-media-task:{task_id}"
-            already_linked = str(request_row["local_import_target"] or "") == target
-            terminal = str(existing["status"] or "") in {
-                "completed", "failed", "requires_manual",
-            }
-            path_changed = str(existing["content_path"] or "") != safe_path
-            if path_changed and (already_linked or not terminal):
-                raise ValueError("相同 qB 任务对应的内容路径不一致")
-            if not already_linked and terminal:
+                    previous_hash_task_id=int(hash_task["id"]),
+                )
+            else:
                 conn.execute(
                     "UPDATE local_media_tasks SET content_path=?,trigger='qb_completed',"
                     "status='waiting_stable',stable_since='',snapshot_digest='',rules_snapshot='',"
@@ -6653,7 +7020,6 @@ def create_and_link_qb_local_media_task(
         if cur.rowcount != 1:
             raise ValueError("下载请求的本地入库状态已变化")
         return task_id, restarted
-
 
 def list_download_requests_for_local_media_task(task_id: int) -> list[sqlite3.Row]:
     """返回绑定到同一本地整理任务的下载事务。"""
@@ -6839,7 +7205,6 @@ def get_local_media_diagnostic_summary(*, owner: str = "admin") -> dict[str, dic
             "SELECT COUNT(*) AS total,"
             "SUM(CASE WHEN enabled=1 THEN 1 ELSE 0 END) AS enabled,"
             "SUM(CASE WHEN enabled=1 THEN 0 ELSE 1 END) AS disabled,"
-            "SUM(CASE WHEN enabled=1 AND scan_enabled=1 THEN 1 ELSE 0 END) AS scan_enabled,"
             "SUM(CASE WHEN mode='move' THEN 1 ELSE 0 END) AS move_mode,"
             "SUM(CASE WHEN mode='preview_only' THEN 1 ELSE 0 END) AS preview_only_mode,"
             "SUM(CASE WHEN enabled=1 AND NOT EXISTS ("
@@ -6869,7 +7234,7 @@ def get_local_media_diagnostic_summary(*, owner: str = "admin") -> dict[str, dic
 
     return {
         "sources": counts(source_row, (
-            "total", "enabled", "disabled", "scan_enabled", "move_mode",
+            "total", "enabled", "disabled", "move_mode",
             "preview_only_mode", "enabled_without_targets",
         )),
         "tasks": counts(task_row, (
@@ -6959,15 +7324,13 @@ def prepare_manual_local_media_task(
     import uuid
 
     safe_owner = _local_media_owner(owner)
-    safe_path = str(content_path or "").strip()
+    safe_path = _canonical_local_media_content_path(content_path)
     normalized_type = str(media_type or "").strip().lower()
     from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
     raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
     if raw_numbering_mode not in NUMBERING_MODES:
         raise ValueError("剧集编号模式无效")
     normalized_numbering_mode = normalize_numbering_mode(raw_numbering_mode)
-    if not safe_path:
-        raise ValueError("本地媒体任务路径不能为空")
     if normalized_type and normalized_type not in {"movie", "tv"}:
         raise ValueError("媒体类型必须是 movie 或 tv")
     if season_override is not None:
@@ -6993,19 +7356,30 @@ def prepare_manual_local_media_task(
         ).fetchone()
         if not source:
             raise LookupError("本地媒体来源不存在")
-        existing = conn.execute(
-            "SELECT id,status FROM local_media_tasks WHERE source_id=? AND content_path=? AND owner=? "
-            "ORDER BY id DESC LIMIT 1", (int(source_id), safe_path, safe_owner),
-        ).fetchone()
+        active = _active_local_media_task_for_path(
+            conn,
+            source_id=int(source_id),
+            owner=safe_owner,
+            content_path=safe_path,
+        )
+        if active is not None and active["status"] != "requires_manual":
+            raise ValueError("该目录已有任务正在处理中")
+        existing = active or _latest_terminal_local_media_task_for_path(
+            conn,
+            source_id=int(source_id),
+            owner=safe_owner,
+            content_path=safe_path,
+        )
         if existing and existing["status"] in {"failed", "requires_manual"}:
             task_id = int(existing["id"])
             cur = conn.execute(
-                "UPDATE local_media_tasks SET status='waiting_stable',stable_since='',snapshot_digest='',"
+                "UPDATE local_media_tasks SET content_path=?,status='waiting_stable',"
+                "stable_since='',snapshot_digest='',"
                 "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
                 "season_override=?,episode_override=?,numbering_mode=?,title='',year='',"
                 "operation_token=?,error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
-                (str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
+                (safe_path, str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
                  season_override, episode_override, normalized_numbering_mode,
                  token, timestamp, task_id, safe_owner),
             )
@@ -7016,8 +7390,6 @@ def prepare_manual_local_media_task(
                 (task_id,),
             )
             return task_id
-        if existing and existing["status"] != "completed":
-            raise ValueError("该目录已有任务正在处理中")
         cur = conn.execute(
             "INSERT INTO local_media_tasks(owner,source_id,qb_hash,content_path,trigger,status,"
             "operation_token,rules_snapshot,tmdb_id,media_type,season_override,episode_override,"
@@ -7119,11 +7491,13 @@ def claim_local_media_confirmation_task(
 def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> bool:
     from app.modules.local_media_models import LOCAL_TASK_STATUSES
 
+    if "content_path" in fields:
+        raise ValueError("本地媒体任务路径只能通过原子准入接口设置")
     allowed = {
         "status", "stable_since", "snapshot_digest", "rules_snapshot", "recognition_summary",
         "tmdb_id", "media_type",
         "season_override", "episode_override", "numbering_mode", "title", "year",
-        "error", "warning", "completed_at", "content_path",
+        "error", "warning", "completed_at",
     }
     sets: list[str] = []
     params: list[object] = []
@@ -7268,11 +7642,9 @@ def list_local_media_operation_steps(task_id: int, *, owner: str = "admin") -> l
 
 def update_local_media_source(source_id: int, *, owner: str = "admin", **fields) -> bool:
     allowed = {
-        "name", "qb_profile", "qb_path_prefix", "local_root", "enabled", "stable_seconds",
-        "scan_enabled", "scan_interval_minutes", "media_type", "mode",
+        "name", "qb_profile", "qb_path_prefix", "local_root", "enabled", "media_type", "mode",
     }
-    sets: list[str] = []
-    params: list[object] = []
+    normalized_fields: list[tuple[str, object]] = []
     for key, value in fields.items():
         if key not in allowed:
             continue
@@ -7280,23 +7652,37 @@ def update_local_media_source(source_id: int, *, owner: str = "admin", **fields)
             raise ValueError("本地媒体来源仅支持 move 或 preview_only")
         if key == "media_type" and value not in {"auto", "movie", "tv", "nsfw"}:
             raise ValueError("本地媒体来源类型必须是 auto、movie、tv 或 nsfw")
-        if key in {"enabled", "scan_enabled"}:
+        if key == "enabled":
             value = 1 if value else 0
-        elif key == "stable_seconds":
-            value = max(0, int(value))
-        elif key == "scan_interval_minutes":
-            value = max(1, int(value))
         else:
             value = str(value or "").strip()
         if key in {"name", "local_root"} and not value:
             raise ValueError("本地媒体来源名称和路径不能为空")
-        sets.append(f"{key}=?")
-        params.append(value)
-    if not sets:
+        normalized_fields.append((key, value))
+    if not normalized_fields:
         return False
+    sets = [f"{key}=?" for key, _value in normalized_fields]
+    params = [value for _key, value in normalized_fields]
     sets.append("updated_at=?")
-    params.extend([now(), int(source_id), _local_media_owner(owner)])
+    safe_owner = _local_media_owner(owner)
+    params.extend([now(), int(source_id), safe_owner])
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT name,qb_profile,qb_path_prefix,local_root,enabled,media_type,mode "
+            "FROM local_media_sources WHERE id=? AND owner=?",
+            (int(source_id), safe_owner),
+        ).fetchone()
+        if current is None:
+            return False
+        operational_changed = any(
+            key != "name" and current[key] != value
+            for key, value in normalized_fields
+        )
+        if operational_changed and _local_media_source_has_active_task(
+            conn, source_id=int(source_id), owner=safe_owner,
+        ):
+            raise ValueError("来源仍有未完成任务，不能修改运行配置")
         cur = conn.execute(
             f"UPDATE local_media_sources SET {', '.join(sets)} WHERE id=? AND owner=?", params
         )
@@ -7306,12 +7692,10 @@ def update_local_media_source(source_id: int, *, owner: str = "admin", **fields)
 def delete_local_media_source(source_id: int, *, owner: str = "admin") -> bool:
     safe_owner = _local_media_owner(owner)
     with get_conn() as conn:
-        active = conn.execute(
-            "SELECT 1 FROM local_media_tasks WHERE source_id=? AND owner=? "
-            "AND status NOT IN ('completed','failed') LIMIT 1",
-            (int(source_id), safe_owner),
-        ).fetchone()
-        if active:
+        conn.execute("BEGIN IMMEDIATE")
+        if _local_media_source_has_active_task(
+            conn, source_id=int(source_id), owner=safe_owner,
+        ):
             raise ValueError("来源仍有未完成任务，不能删除")
         cur = conn.execute(
             "DELETE FROM local_media_sources WHERE id=? AND owner=?", (int(source_id), safe_owner)

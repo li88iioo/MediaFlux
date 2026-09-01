@@ -165,17 +165,17 @@ class AgentActionPlanTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(
                     True,
                     "confirmation_required",
                     "预检通过：将执行测试操作",
                 ),
                 "write-demo",
-            ),
-            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _expected_context: ToolResult(
                 True, "accepted", "测试操作已执行"
-            ),
+            )),
             requires_confirmation=True,
             llm_confirmation=True,
         ))
@@ -220,13 +220,13 @@ class AgentActionPlanTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "预检通过"),
                 "write-failed",
-            ),
-            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _expected_context: ToolResult(
                 False, "conflict", "测试操作未执行"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -255,13 +255,13 @@ class AgentActionPlanTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={"type": "object", "additionalProperties": False},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "预检通过"),
                 "write-demo",
-            ),
-            confirmed_handler=lambda _arguments, _expected_context: (
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _expected_context: (
                 calls.append("executed") or ToolResult(True, "accepted", "done")
-            ),
+            )),
             requires_confirmation=True,
             llm_confirmation=True,
         ))

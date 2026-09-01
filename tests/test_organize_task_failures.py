@@ -10,6 +10,7 @@ from time import monotonic, sleep, time
 from unittest.mock import MagicMock, patch
 
 from app.clients.guangya import GuangYaClient
+from app.notifier import TelegramSendResult
 from app.modules.organize import (
     OrganizeContext,
     OrganizePlan,
@@ -291,7 +292,10 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.threading.Thread", _SwitchDefaultCredentialThread
         ), patch("app.modules.organize_tasks.db.add_task_run", return_value=80), patch(
             "app.modules.organize_tasks.db.finish_task_run"
-        ) as finish, patch("app.notifier.send_event", return_value=True):
+        ) as finish, patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True),
+        ):
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
                 OrganizeRules(target_dir_id="target"),
@@ -320,7 +324,10 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.threading.Thread", _SwitchCredentialThread
         ), patch("app.modules.organize_tasks.db.add_task_run", return_value=79), patch(
             "app.modules.organize_tasks.db.finish_task_run"
-        ) as finish, patch("app.notifier.send_event", return_value=True):
+        ) as finish, patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=TelegramSendResult(ok=True),
+        ):
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
                 OrganizeRules(target_dir_id="target"),
@@ -397,7 +404,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
                 ), patch(
                     "app.modules.organize_tasks.db.finish_task_run"
                 ), patch(
-                    "app.notifier.send_event", return_value=True
+                    "app.modules.telegram_notification_center.send_event_result",
+                    return_value=TelegramSendResult(ok=True),
                 ):
                     result = manager.start(
                         [
@@ -429,6 +437,9 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
         ), patch("app.modules.organize_tasks.db.add_task_run", return_value=78), patch(
             "app.modules.organize_tasks.db.finish_task_run"
+        ), patch(
+            "app.modules.organize_tasks.db.list_protected_guangya_staging_ids",
+            return_value={"active-download-staging"},
         ):
             result = manager.start(
                 sources,
@@ -440,7 +451,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         for call in organizer.organize.call_args_list:
             self.assertEqual(
                 call.kwargs["protected_source_ids"],
-                {"source-a", "source-b"},
+                {"source-a", "source-b", "active-download-staging"},
             )
 
     def test_shutdown_rejects_new_tasks(self):

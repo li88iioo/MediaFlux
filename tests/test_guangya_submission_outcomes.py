@@ -101,6 +101,57 @@ class GuangYaSubmissionOutcomeTests(unittest.TestCase):
         self.assertEqual(result["task_id"], "gy-task")
         self.assertEqual(submit.call_args.kwargs["torrent_data"], torrent_data)
 
+    def test_staging_is_persisted_before_offline_provider_submission(self):
+        row = self._request_row(96)
+
+        def submit_side_effect(*_args, **kwargs):
+            kwargs["on_staging_created"]({
+                "id": "stage-96",
+                "parent_id": "parent",
+                "parent_name": "下载",
+                "name": "MF-96-Partial-Batch",
+            })
+            return {"ok": True, "task_ids": ["gy-task"]}
+
+        with patch(
+            "app.modules.download_dispatcher.submit_offline",
+            side_effect=submit_side_effect,
+        ), patch(
+            "app.database.bind_download_request_guangya_staging",
+            return_value=True,
+        ) as bind:
+            result = _submit_guangya(row)
+
+        self.assertTrue(result["ok"])
+        bind.assert_called_once_with(
+            96,
+            staging_id="stage-96",
+            parent_id="parent",
+            staging_name="MF-96-Partial-Batch",
+            target_name="下载 / MF-96-Partial-Batch",
+        )
+
+    def test_staging_persistence_rejection_stops_offline_submission(self):
+        row = self._request_row(97)
+
+        def submit_side_effect(*_args, **kwargs):
+            kwargs["on_staging_created"]({
+                "id": "stage-97",
+                "parent_id": "parent",
+                "parent_name": "下载",
+                "name": "MF-97-Partial-Batch",
+            })
+
+        with patch(
+            "app.modules.download_dispatcher.submit_offline",
+            side_effect=submit_side_effect,
+        ), patch(
+            "app.database.bind_download_request_guangya_staging",
+            return_value=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "请求已失效"):
+                _submit_guangya(row)
+
     def test_public_failure_distinguishes_torrent_from_magnet_resolution(self):
         summary = public_dispatch_summary({
             "ok": False,

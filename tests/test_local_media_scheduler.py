@@ -562,7 +562,7 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 name="preview", qb_profile="", qb_path_prefix="", local_root=str(source),
                 scan_enabled=True, stable_seconds=0, mode="preview_only", owner="admin",
             )
-            scheduler = LocalMediaScheduler(service=FakeService(), clock=lambda: 100.0)
+            scheduler = LocalMediaScheduler(service=FakeService())
             self.assertEqual(scheduler.run_once(), 0)
             self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
@@ -595,9 +595,8 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 local_root=str(source_root), enabled=False, scan_enabled=True,
                 scan_interval_minutes=10, stable_seconds=300, owner="admin",
             )
-            scheduler = LocalMediaScheduler(service=FakeService(), clock=lambda: 100.0)
+            scheduler = LocalMediaScheduler(service=FakeService())
 
-            self.assertEqual(scheduler._enqueue_scan_candidates(), 0)
             self.assertEqual(scheduler.run_once(), 0)
             self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
@@ -1035,9 +1034,21 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             parent_task = db.create_local_media_task(
                 source_id, "", str(root), owner="admin", trigger="manual",
             )
-            child_task = db.create_local_media_task(
-                source_id, "", str(child), owner="admin", trigger="manual",
-            )
+            # Public admission rejects overlapping paths. Insert one legacy row
+            # directly to prove the scheduler still serializes pre-upgrade data.
+            timestamp = db.now()
+            with db.get_conn() as conn:
+                cursor = conn.execute(
+                    "INSERT INTO local_media_tasks("
+                    "owner,source_id,qb_hash,content_path,trigger,status,"
+                    "operation_token,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,'waiting_stable',?,?,?)",
+                    (
+                        "admin", source_id, None, str(child), "manual",
+                        "legacy-overlap-child", timestamp, timestamp,
+                    ),
+                )
+                child_task = int(cursor.lastrowid)
             service = PlanningService()
             scheduler = LocalMediaScheduler(service=service)
 

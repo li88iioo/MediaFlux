@@ -256,7 +256,7 @@ class LocalMediaSourceAgentControlTests(IsolatedDatabaseTestCase):
             {"source_number": 1, "trigger": "qb_completed", "enabled": False},
             owner="owner",
         )
-        db.update_local_media_source(self.source_one, stable_seconds=301)
+        db.update_local_media_source(self.source_one, media_type="movie")
         stale = service.confirm(
             prepared["action_plan"]["plan_id"], owner="owner"
         )

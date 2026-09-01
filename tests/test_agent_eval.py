@@ -377,7 +377,7 @@ class AgentEvalNativeToolE2ETests(unittest.TestCase):
                 "enabled": bool(arguments["enabled"]),
             },
             requires_confirmation=True,
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(
                     True,
                     "confirmation_required",
@@ -385,11 +385,11 @@ class AgentEvalNativeToolE2ETests(unittest.TestCase):
                     data=dict(arguments),
                 ),
                 f"feature-state:{arguments['feature']}:{arguments['enabled']}",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: (
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
                 calls.append(dict(arguments))
                 or ToolResult(True, "changed", "已修改")
-            ),
+            )),
             llm_confirmation=True,
         ))
         return registry

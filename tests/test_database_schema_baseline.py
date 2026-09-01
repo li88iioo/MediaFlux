@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -15,6 +16,43 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    @staticmethod
+    def _create_legacy_organize_notification_outbox(
+        conn: sqlite3.Connection,
+    ) -> None:
+        conn.executescript(
+            "CREATE TABLE organize_notification_outbox ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "idempotency_key TEXT NOT NULL UNIQUE,chat_id TEXT NOT NULL DEFAULT '',"
+            "body TEXT NOT NULL,image_url TEXT NOT NULL DEFAULT '',"
+            "status TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,"
+            "lease_generation INTEGER NOT NULL DEFAULT 0,next_attempt_at TEXT NOT NULL,"
+            "last_error TEXT NOT NULL DEFAULT '',sent_at TEXT,created_at TEXT NOT NULL,"
+            "updated_at TEXT NOT NULL);"
+        )
+
+    @staticmethod
+    def _insert_legacy_organize_notification(
+        conn: sqlite3.Connection,
+        *,
+        key: str,
+        status: str = "pending",
+        body: str = "整理完成",
+        last_error: str = "",
+        sent_at: str | None = None,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO organize_notification_outbox("
+            "idempotency_key,chat_id,body,image_url,status,attempts,lease_generation,"
+            "next_attempt_at,last_error,sent_at,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                key, "100", body, "poster.jpg", status, 2, 3,
+                "2026-09-01 12:00:00", last_error, sent_at,
+                "2026-09-01 11:00:00", "2026-09-01 11:30:00",
+            ),
+        )
+
     def test_v12_subscription_notification_outbox_migrates_inconclusive(self) -> None:
         conn = sqlite3.connect(":memory:")
         try:
@@ -97,6 +135,154 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertIn("idx_organize_confirmations_organize_task", indexes)
         self.assertEqual(preserved, ("keep-me", "", 0))
 
+    def test_v15_organize_notification_outbox_moves_to_unified_queue(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            self._create_legacy_organize_notification_outbox(conn)
+            self._insert_legacy_organize_notification(
+                conn, key="organize-summary:task-1:100",
+                status="retry_wait", last_error="temporary",
+            )
+
+            db._migrate_retire_organize_notification_outbox_v15(conn)
+
+            old_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='organize_notification_outbox'"
+            ).fetchone()
+            row = conn.execute(
+                "SELECT topic,importance,chat_id,event_json,status,attempts,"
+                "lease_generation,last_error FROM telegram_notification_outbox"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertIsNone(old_table)
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row[:3], ("organize", "result", "100"))
+        event = json.loads(row[3])
+        self.assertEqual(event["lines"], ["整理完成"])
+        self.assertEqual(event["image_url"], "poster.jpg")
+        self.assertEqual(row[4:], ("retry_wait", 2, 3, "temporary"))
+
+    def test_v15_organize_notification_status_mapping_is_complete(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            self._create_legacy_organize_notification_outbox(conn)
+            for status in ("pending", "retry_wait", "sending", "sent", "failed"):
+                self._insert_legacy_organize_notification(
+                    conn, key=f"status:{status}", status=status,
+                    sent_at=("2026-09-01 12:01:00" if status == "sent" else None),
+                )
+            db._migrate_retire_organize_notification_outbox_v15(conn)
+            rows = conn.execute(
+                "SELECT status,delivered_revision,last_error "
+                "FROM telegram_notification_outbox ORDER BY id"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        self.assertEqual(
+            [row[0] for row in rows],
+            ["pending", "retry_wait", "outcome_unknown", "sent", "failed"],
+        )
+        self.assertEqual([row[1] for row in rows], [0, 0, 0, 1, 0])
+        self.assertEqual(rows[2][2], "DeliveryOutcomeUnknown")
+
+    def test_v15_organize_notification_html_becomes_safe_event_text(self) -> None:
+        from app.modules.telegram_notification_center import (
+            deserialize_notification_event,
+        )
+        from app.notifier import render_event
+
+        conn = sqlite3.connect(":memory:")
+        try:
+            self._create_legacy_organize_notification_outbox(conn)
+            self._insert_legacy_organize_notification(
+                conn, key="html",
+                body=(
+                    "<b>✅ 光鸭整理完成</b>\n"
+                    "- <b>结果：</b> 1 个 &amp; 安全"
+                ),
+            )
+            db._migrate_retire_organize_notification_outbox_v15(conn)
+            payload = conn.execute(
+                "SELECT event_json FROM telegram_notification_outbox"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        event = deserialize_notification_event(payload)
+        self.assertEqual(event.title, "✅ 光鸭整理完成")
+        self.assertEqual(event.lines, ("- 结果： 1 个 & 安全",))
+        rendered = render_event(event)
+        self.assertNotIn("&lt;b&gt;", rendered)
+        self.assertIn("1 个 &amp; 安全", rendered)
+
+    def test_v15_organize_notification_key_collision_preserves_source(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            self._create_legacy_organize_notification_outbox(conn)
+            key = "collision"
+            self._insert_legacy_organize_notification(conn, key=key)
+            db._migrate_telegram_notification_outbox_v12(conn)
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            conn.execute(
+                "INSERT INTO telegram_notification_outbox("
+                "event_key,event_json,next_attempt_at,created_at,updated_at"
+                ") VALUES(?,?,?,?,?)",
+                (
+                    f"retired-organize:{digest}", "{}",
+                    "2026-09-01 12:00:00", "2026-09-01 11:00:00",
+                    "2026-09-01 11:00:00",
+                ),
+            )
+
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "保留源表"):
+                db._migrate_retire_organize_notification_outbox_v15(conn)
+
+            old_count = conn.execute(
+                "SELECT COUNT(*) FROM organize_notification_outbox"
+            ).fetchone()[0]
+            target_count = conn.execute(
+                "SELECT COUNT(*) FROM telegram_notification_outbox"
+            ).fetchone()[0]
+            old_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='organize_notification_outbox'"
+            ).fetchone()
+        finally:
+            conn.close()
+
+        self.assertEqual(old_count, 1)
+        self.assertEqual(target_count, 1)
+        self.assertEqual(old_table, (1,))
+
+    def test_v16_retires_independent_telegram_write_confirmation_table(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                "CREATE TABLE telegram_write_confirmations ("
+                "action_id TEXT PRIMARY KEY,group_id TEXT NOT NULL,"
+                "owner_digest TEXT NOT NULL,decision TEXT NOT NULL,"
+                "operation TEXT NOT NULL,value_json TEXT NOT NULL DEFAULT '{}',"
+                "expires_at REAL NOT NULL,created_at TEXT NOT NULL);"
+                "INSERT INTO telegram_write_confirmations("
+                "action_id,group_id,owner_digest,decision,operation,expires_at,created_at"
+                ") VALUES('old','group','digest','confirm','rss_refresh',1,'now');"
+            )
+
+            db._migrate_retire_telegram_write_confirmations_v16(conn)
+
+            retired = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' "
+                "AND name='telegram_write_confirmations'"
+            ).fetchone()
+            self.assertIsNone(retired)
+        finally:
+            conn.close()
+
     def test_fresh_database_contains_complete_v10_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -146,6 +332,9 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             }
 
         self.assertEqual(version, db.SCHEMA_VERSION)
+        self.assertNotIn("organize_notification_outbox", schema_objects)
+        self.assertNotIn("telegram_write_confirmations", schema_objects)
+        self.assertIn("telegram_notification_outbox", schema_objects)
         self.assertIn("rules_snapshot", task_columns)
         self.assertIn("recognition_summary", task_columns)
         self.assertIn("server_path", target_columns)

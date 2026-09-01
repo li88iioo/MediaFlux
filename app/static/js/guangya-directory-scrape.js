@@ -1072,10 +1072,34 @@
         const task = matchesTask(status) ? status : history;
         if (!task) return false;
         if (task.status === 'running') {
-            setRowState(row, action, 'running', '目录刮削任务执行中');
+            setRowState(
+                row,
+                action,
+                'running',
+                entry.kind === 'delete' ? `正在删除${entry.itemLabel}` : '目录刮削任务执行中',
+            );
             return false;
         }
         if (['completed', 'partial'].includes(task.status)) {
+            if (entry.kind === 'delete') {
+                setRowState(row, action, 'done', `${entry.itemLabel}已删除`);
+                try {
+                    await refreshTaskParent(entry.parentId);
+                } catch (_error) {
+                    await window.appAlert?.({
+                        type: 'warning',
+                        title: `${entry.itemLabel}已删除，但目录刷新失败`,
+                        message: '请手动刷新当前目录确认最新内容。',
+                    });
+                    return true;
+                }
+                await window.appAlert?.({
+                    type: 'success',
+                    title: `${entry.itemLabel}已删除`,
+                    message: `${entry.itemName} 已移入光鸭回收站。`,
+                });
+                return true;
+            }
             const stats = task.result?.stats || {};
             const failures = countTaskFailures(stats);
             const pending = Number(stats.pending_confirmation || 0);
@@ -1107,7 +1131,11 @@
             return true;
         }
         if (['failed', 'stopped'].includes(task.status)) {
-            throw new Error(task.error || task.message || '目录刮削未完成');
+            throw new Error(
+                task.error
+                || task.message
+                || (entry.kind === 'delete' ? `${entry.itemLabel}删除未完成` : '目录刮削未完成')
+            );
         }
         return false;
     }
@@ -1130,7 +1158,7 @@
                     const finished = await applyTaskPollStatus(entry, status);
                     if (finished) {
                         taskPollEntries.delete(taskId);
-                        refreshParents.add(entry.parentId);
+                        if (entry.kind !== 'delete') refreshParents.add(entry.parentId);
                     }
                     else if (entry.attempts >= TASK_POLL_MAX_ATTEMPTS) {
                         setRowState(
@@ -1143,7 +1171,11 @@
                     }
                 } catch (error) {
                     setRowState(entry.row, entry.action, 'error', error.message);
-                    window.appAlert?.({type: 'error', title: '目录刮削失败', message: error.message});
+                    window.appAlert?.({
+                        type: 'error',
+                        title: entry.kind === 'delete' ? `${entry.itemLabel}删除失败` : '目录刮削失败',
+                        message: error.message,
+                    });
                     taskPollEntries.delete(taskId);
                 }
             }
@@ -1172,11 +1204,16 @@
         }
     }
 
-    function pollTask(taskId, directory, row, action, parentId) {
+    function pollTask(taskId, directory, row, action, parentId, options = {}) {
         const normalizedTaskId = String(taskId || '');
         if (!normalizedTaskId) return;
         if (action?.dataset?.state !== 'queued') {
-            setRowState(row, action, 'running', '目录刮削任务执行中');
+            setRowState(
+                row,
+                action,
+                'running',
+                options.kind === 'delete' ? `正在删除${options.itemLabel || '项目'}` : '目录刮削任务执行中',
+            );
         }
         const current = taskPollEntries.get(normalizedTaskId);
         taskPollEntries.set(normalizedTaskId, {
@@ -1185,6 +1222,9 @@
             row,
             action,
             parentId,
+            kind: options.kind || current?.kind || 'scrape',
+            itemLabel: options.itemLabel || current?.itemLabel || '项目',
+            itemName: options.itemName || current?.itemName || directory?.name || '',
             attempts: current?.attempts || 0,
         });
         scheduleTaskPoll();
@@ -1310,10 +1350,23 @@
             const response = await fetch('/api/guangya/delete-item', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({file_id: item.file_id}),
+                body: JSON.stringify({
+                    file_id: item.file_id,
+                    expected_name: item.name,
+                    expected_parent_id: item.parent_id || parentId,
+                    expected_is_dir: isDirectory,
+                    expected_etag: item.etag || '',
+                    expected_updated_at: Number(item.updated_at || 0),
+                }),
             });
             const data = await response.json();
             if (!response.ok) throw new Error(data.error || '光鸭删除项目失败');
+            if (!data.task_id) throw new Error('删除任务未返回有效编号');
+            pollTask(data.task_id, item, row, action, parentId, {
+                kind: 'delete',
+                itemLabel,
+                itemName: item.name,
+            });
         } catch (error) {
             action.disabled = false;
             setRowState(row, action, 'error', error.message);
@@ -1322,27 +1375,7 @@
                 title: `${itemLabel}删除失败`,
                 message: error.message,
             });
-            return;
         }
-
-        setRowState(row, action, 'done', `${itemLabel}已删除`);
-        if (window.gyNavigator?.state?.().id === parentId) {
-            try {
-                await window.gyNavigator.reload();
-            } catch (_error) {
-                await window.appAlert?.({
-                    type: 'warning',
-                    title: `${itemLabel}已删除，但目录刷新失败`,
-                    message: '请手动刷新当前目录确认最新内容。',
-                });
-                return;
-            }
-        }
-        await window.appAlert?.({
-            type: 'success',
-            title: `${itemLabel}已删除`,
-            message: `${item.name} 已移入光鸭回收站。`,
-        });
     }
 
     menu.addEventListener('click', (event) => {

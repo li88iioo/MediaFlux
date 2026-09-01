@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -319,13 +319,13 @@ class WorkspaceNextActionsRoutingTests(IsolatedDatabaseTestCase):
             parameters={},
             validator=lambda arguments: dict(arguments),
             requires_confirmation=True,
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(True, "ready", "preview"),
                 "danger-write-preview",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: ToolResult(
                 True, "success", "should-not-run"
-            ),
+            )),
         ))
         agent = AgentOrchestrator(registry)
         resolution = {

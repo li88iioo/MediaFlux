@@ -21,8 +21,8 @@ from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.indexers.downloads import (
     DownloadRequestCreationError,
     InvalidDownloadData,
-    download_result,
-    download_result_public,
+    download_indexer_result,
+    download_indexer_result_public,
 )
 from app.indexers.errors import IndexerError, IndexerValidationError
 from app.indexers.models import IndexerMediaSearchRequest
@@ -501,7 +501,7 @@ def _submit_resource(
     service = service or get_indexer_service()
     try:
         result = run_indexer_awaitable_sync(
-            download_result(
+            download_indexer_result(
                 service,
                 arguments["result_id"],
                 arguments["target"],
@@ -758,7 +758,7 @@ def _submit_resource_batch(
         return list(
             await asyncio.gather(
                 *(
-                    download_result_public(
+                    download_indexer_result_public(
                         service,
                         result_id,
                         arguments["target"],

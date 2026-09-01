@@ -47,23 +47,131 @@ class _ImmediateThread:
         return False
 
 
-class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
+def _immediate_operation_manager() -> SimpleNamespace:
+    def start_operation(_operation, _reference, callback, **_kwargs):
+        callback()
+        return {"ok": True, "task_id": "operation-task"}
 
-    def test_web_rules_override_cannot_lower_saved_automatic_match_policy(self):
+    return SimpleNamespace(start_operation=Mock(side_effect=start_operation))
+
+
+class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
+    def test_download_staging_identity_is_bound_before_provider_write(self):
+        request_id, created = db.create_download_request(
+            "staging-bind-before-provider",
+            "magnet",
+            title="Bound staging",
+            source_value="magnet:?xt=urn:btih:" + "a" * 40,
+        )
+        self.assertTrue(created)
+        db.update_download_request(
+            request_id,
+            targets="guangya",
+            status="submitting",
+            gy_status="submitting",
+        )
+
+        self.assertTrue(db.bind_download_request_guangya_staging(
+            request_id,
+            staging_id="stage-bound",
+            parent_id="parent",
+            staging_name="MF-stage-bound",
+            target_name="下载 / MF-stage-bound",
+        ))
+        row = db.get_download_request(request_id)
+        self.assertEqual(row["gy_target_dir"], "stage-bound")
+        self.assertEqual(row["gy_staging_parent_dir"], "parent")
+        self.assertEqual(row["gy_staging_cleanup_status"], "pending")
+
+        db.update_download_request(request_id, status="cancelled", gy_status="cancelled")
+        self.assertFalse(db.bind_download_request_guangya_staging(
+            request_id,
+            staging_id="stage-late",
+            parent_id="parent",
+            staging_name="MF-stage-late",
+            target_name="下载 / MF-stage-late",
+        ))
+
+    def test_staging_finalize_claim_is_identity_bound_and_leased(self):
+        request_id, _ = db.create_download_request(
+            "staging-finalize-lease",
+            "magnet",
+            title="Finalize staging",
+            source_value="magnet:?xt=urn:btih:" + "b" * 40,
+        )
+        db.update_download_request(
+            request_id,
+            targets="guangya",
+            status="completed",
+            gy_status="completed",
+            gy_isolated=1,
+            gy_target_dir="stage-finalize",
+            gy_staging_parent_dir="parent",
+            gy_staging_name="MF-stage-finalize",
+            gy_staging_cleanup_status="pending",
+        )
+
+        self.assertTrue(db.claim_download_request_staging_finalize(
+            request_id,
+            staging_id="stage-finalize",
+            parent_id="parent",
+            staging_name="MF-stage-finalize",
+        ))
+        self.assertFalse(db.claim_download_request_staging_finalize(
+            request_id,
+            staging_id="stage-finalize",
+            parent_id="parent",
+            staging_name="MF-stage-finalize",
+        ))
+        self.assertFalse(db.claim_download_request_staging_finalize(
+            request_id,
+            staging_id="wrong-stage",
+            parent_id="parent",
+            staging_name="MF-stage-finalize",
+        ))
+
+    def test_active_isolated_download_staging_is_globally_protected(self):
+        protected_id, _ = db.create_download_request(
+            "protected-download-staging",
+            "magnet",
+            source_value="magnet:?xt=urn:btih:" + "c" * 40,
+        )
+        completed_id, _ = db.create_download_request(
+            "completed-download-staging",
+            "magnet",
+            source_value="magnet:?xt=urn:btih:" + "d" * 40,
+        )
+        db.update_download_request(
+            protected_id,
+            gy_isolated=1,
+            gy_target_dir="stage-protected",
+            gy_staging_cleanup_status="retained",
+        )
+        db.update_download_request(
+            completed_id,
+            gy_isolated=1,
+            gy_target_dir="stage-cleaned",
+            gy_staging_cleanup_status="completed",
+        )
+
+        self.assertEqual(
+            db.list_protected_guangya_staging_ids(),
+            {"stage-protected"},
+        )
+
+
+    def test_web_rules_override_is_rejected_instead_of_creating_second_authority(self):
         from app.routes.guangya_api import _build_rules
 
-        with patch("app.modules.organize.get") as get_config:
-            get_config.side_effect = lambda key, default="": (
-                "conservative"
-                if key == "GY_ORGANIZE_AUTOMATIC_MATCH_PRESET"
-                else default
-            )
-            rules = _build_rules({
+        # 旧页面固定发送的空对象不构成覆盖，仍读取唯一的持久化配置。
+        rules = _build_rules({"target_dir_id": "target", "rules": {}})
+        self.assertEqual(rules.target_dir_id, "target")
+
+        with self.assertRaisesRegex(ValueError, "不支持请求级 rules 覆盖"):
+            _build_rules({
                 "target_dir_id": "target",
                 "rules": {"automatic_match_preset": "aggressive"},
             })
-
-        self.assertEqual(rules.automatic_match_preset, "conservative")
 
     def test_empty_directory_cleanup_requires_explicit_safe_capability(self):
         delete_empty = Mock()
@@ -283,10 +391,15 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             supports_guarded_empty_directory_delete=True,
             delete_empty_directory=Mock(return_value=True),
         )
+        manager = _immediate_operation_manager()
         with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch(
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
-        ), patch.object(db, "update_download_request") as update:
+        ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
+            db, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(db, "get_download_request", return_value=row), patch.object(
+            db, "update_download_request"
+        ) as update:
             tracker._start_organize(row)
 
         client.move.assert_called_once_with(["video"], "parent")
@@ -297,6 +410,8 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(update.call_args.kwargs["gy_isolated"], 0)
         self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "completed")
         self.assertEqual(update.call_args.kwargs["organize_status"], "skipped")
+        self.assertIsNone(update.call_args.kwargs["organize_next_retry_at"])
+        self.assertFalse(manager.start_operation.call_args.kwargs["queue_if_busy"])
 
     def test_tracker_renames_multi_item_staging_to_release_name_without_flattening(self):
         tracker = DownloadTracker()
@@ -323,10 +438,15 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             move=Mock(return_value=True),
             rename=Mock(return_value=True),
         )
+        manager = _immediate_operation_manager()
         with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch(
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
-        ), patch.object(db, "update_download_request") as update:
+        ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
+            db, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(db, "get_download_request", return_value=row), patch.object(
+            db, "update_download_request"
+        ) as update:
             tracker._start_organize(row)
 
         client.move.assert_not_called()
@@ -335,6 +455,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         self.assertEqual(update.call_args.kwargs["gy_target_name"], "Show Release")
         self.assertEqual(update.call_args.kwargs["gy_isolated"], 0)
         self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "completed")
+        self.assertIsNone(update.call_args.kwargs["organize_next_retry_at"])
 
     def test_tracker_retains_staging_when_final_target_name_conflicts(self):
         tracker = DownloadTracker()
@@ -358,16 +479,70 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             list_dir=Mock(side_effect=[children, [staging, conflict]]),
             move=Mock(), rename=Mock(),
         )
+        manager = _immediate_operation_manager()
         with patch("app.modules.download_tracker.GuangYaClient", return_value=client), patch(
             "app.modules.download_tracker.get",
             side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
-        ), patch.object(db, "update_download_request") as update:
+        ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
+            db, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(db, "get_download_request", return_value=row), patch.object(
+            db, "update_download_request"
+        ) as update:
             tracker._start_organize(row)
 
         client.move.assert_not_called()
         client.rename.assert_not_called()
         self.assertEqual(update.call_args.kwargs["gy_staging_cleanup_status"], "retained")
         self.assertIn("同名资源目录", update.call_args.kwargs["gy_staging_cleanup_error"])
+
+    def test_tracker_releases_staging_finalize_lease_when_writer_is_busy(self):
+        tracker = DownloadTracker()
+        row = {
+            "id": 77, "title": "Busy", "chat_id": "",
+            "gy_target_dir": "staging", "gy_target_name": "MF staging",
+            "gy_isolated": 1, "gy_staging_parent_dir": "parent",
+            "gy_staging_name": "MF-77-Busy",
+        }
+        manager = SimpleNamespace(
+            start_operation=Mock(return_value={"ok": False, "error": "网盘整理任务正在运行"})
+        )
+        with patch(
+            "app.modules.download_tracker.get",
+            side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
+        ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
+            db, "claim_download_request_staging_finalize", return_value=True,
+        ), patch("app.modules.download_tracker.GuangYaClient") as client_cls, patch.object(
+            db, "update_download_request"
+        ) as update:
+            tracker._start_organize(row)
+
+        client_cls.assert_not_called()
+        self.assertEqual(update.call_args.kwargs["organize_status"], "queued")
+        self.assertIn("正在运行", update.call_args.kwargs["organize_error"])
+        self.assertIsNotNone(update.call_args.kwargs["organize_next_retry_at"])
+
+    def test_tracker_does_not_write_stale_staging_snapshot(self):
+        tracker = DownloadTracker()
+        row = {
+            "id": 78, "title": "Stale", "chat_id": "",
+            "gy_target_dir": "staging", "gy_target_name": "MF staging",
+            "gy_isolated": 1, "gy_staging_parent_dir": "parent",
+            "gy_staging_name": "MF-78-Stale",
+        }
+        current = {**row, "gy_target_dir": "already-finalized", "gy_isolated": 0}
+        manager = _immediate_operation_manager()
+        with patch(
+            "app.modules.download_tracker.get",
+            side_effect=lambda key, default="": "" if key == "GY_ORGANIZE_TARGET_DIR" else default,
+        ), patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch.object(
+            db, "claim_download_request_staging_finalize", return_value=True,
+        ), patch.object(db, "get_download_request", return_value=current), patch(
+            "app.modules.download_tracker.GuangYaClient"
+        ) as client_cls, patch.object(db, "update_download_request") as update:
+            tracker._start_organize(row)
+
+        client_cls.assert_not_called()
+        update.assert_not_called()
 
     def test_tracker_respects_organize_backoff_while_other_backend_is_downloading(self):
         tracker = DownloadTracker()

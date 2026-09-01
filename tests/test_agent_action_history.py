@@ -360,19 +360,20 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         self.assertNotIn("private-library", serialized)
         self.assertNotIn("private-server", serialized)
 
-    def test_clean_empty_history_keeps_only_aggregate_counts(self):
+    def test_canonical_cleanup_history_keeps_only_safe_counts(self):
         record_confirmed_result(
             owner=OWNER,
-            tool_name="guangya.organize.clean_empty",
+            tool_name="guangya.organize.cleanup.execute",
             risk=RiskLevel.DANGER,
             result=ToolResult(
                 ok=True,
                 status="completed",
                 summary="raw secret-source /private/path",
                 data={
-                    "cleaned": 4,
-                    "failed": 1,
-                    "source_count": 2,
+                    "empty_dir_count": 4,
+                    "residual_dir_count": 1,
+                    "selected_count": 3,
+                    "kept_count": 2,
                     "sources": [{"id": "secret-source", "path": "/private/path"}],
                 },
             ),
@@ -381,14 +382,54 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         row = db.list_agent_action_history(
             owner_digest=action_history_owner_digest(OWNER), limit=1
         )[0]
-        self.assertEqual(row["tool_name"], "guangya.organize.clean_empty")
+        self.assertEqual(row["tool_name"], "guangya.organize.cleanup.execute")
         self.assertEqual(
             json.loads(row["safe_details"]),
-            {"cleaned": 4, "failed": 1, "source_count": 2},
+            {
+                "empty_dir_count": 4,
+                "kept_count": 2,
+                "residual_dir_count": 1,
+                "selected_count": 3,
+            },
         )
         serialized = json.dumps(dict(row), ensure_ascii=False)
         self.assertNotIn("secret-source", serialized)
         self.assertNotIn("/private/path", serialized)
+
+    def test_canonical_rename_history_keeps_one_tool_identity(self):
+        record_confirmed_result(
+            owner=OWNER,
+            tool_name="guangya.rename.execute",
+            risk=RiskLevel.DANGER,
+            result=ToolResult(
+                ok=True,
+                status="accepted",
+                summary="queued",
+                data={
+                    "queued": True,
+                    "queue_position": 1,
+                    "replayed": False,
+                    "rename_count": 3,
+                    "requires_manual": False,
+                },
+            ),
+            elapsed_ms=5,
+        )
+
+        rows = db.list_agent_action_history(
+            owner_digest=action_history_owner_digest(OWNER), limit=1
+        )
+        self.assertEqual({row["tool_name"] for row in rows}, {"guangya.rename.execute"})
+        self.assertEqual(
+            json.loads(rows[0]["safe_details"]),
+            {
+                "queue_position": 1,
+                "queued": True,
+                "rename_count": 3,
+                "replayed": False,
+                "requires_manual": False,
+            },
+        )
 
     def test_confirm_records_success_stale_and_replay_only_once(self):
         context = {"value": "one"}
@@ -424,8 +465,8 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {},
-            confirmation_preparer=prepare_run_once,
-            confirmed_handler=confirm_run_once,
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_run_once),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_run_once),
             requires_confirmation=True,
         ))
         store = ConfirmationStore(token_factory=lambda: "ticket-1234567890abcdef")
@@ -470,14 +511,14 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(True, "confirmation_required", "preview"),
                 "strm-run-once",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: (
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
                 calls.append("executed")
                 or ToolResult(True, "accepted", "done")
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -506,11 +547,11 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda arguments: {},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(True, "confirmation_required", "preview"),
                 "strm-run-once",
-            ),
-            confirmed_handler=interrupt,
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(interrupt),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(

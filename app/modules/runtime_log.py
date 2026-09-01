@@ -388,18 +388,3 @@ def read_stream_chunk(
         tuple(events), cursor, stream_id, reset_reason, start,
         checkpoint, reset_checkpoint, generation,
     )
-
-
-def read_from_offset(
-    offset: int,
-    *,
-    expected_stream_id: str = "",
-    max_bytes: int = _MAX_STREAM_READ_BYTES,
-) -> tuple[list[str], int, bool]:
-    """兼容旧调用方：返回可见行、下一游标和是否发生重定位。"""
-    chunk = read_stream_chunk(
-        offset,
-        expected_stream_id=expected_stream_id,
-        max_bytes=max_bytes,
-    )
-    return [event.line for event in chunk.events], chunk.offset, bool(chunk.reset_reason)

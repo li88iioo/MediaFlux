@@ -10,7 +10,7 @@ from app.modules.agent_library_patrol_notifications import (
     build_patrol_result_fingerprint,
     load_patrol_notification_payload,
     serialize_patrol_notification_payload,
-    send_library_patrol_notification,
+    send_library_patrol_notification_result,
 )
 from app.modules.telegram_notification_center import NotificationPublishResult
 from app.modules.telegram_notification_policy import NotificationImportance
@@ -119,7 +119,7 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
                 or NotificationPublishResult(True, delivered=True, status="sent")
             ),
         ):
-            self.assertTrue(send_library_patrol_notification(_projection()))
+            self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
         self.assertEqual(captured[0].actions, ())
 
     def test_delivery_keeps_actions_for_configured_telegram_agent(self):
@@ -139,7 +139,7 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
                 or NotificationPublishResult(True, delivered=True, status="sent")
             ),
         ):
-            self.assertTrue(send_library_patrol_notification(_projection()))
+            self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
         self.assertEqual(
             [action.callback_data for action in captured[0].actions],
             ["agp:summary", "agp:resources"],
@@ -180,8 +180,8 @@ class AgentLibraryPatrolNotificationTests(unittest.TestCase):
             "app.modules.telegram_notification_center.publish_notification_event",
             side_effect=publish,
         ):
-            self.assertTrue(send_library_patrol_notification(_projection()))
-            self.assertTrue(send_library_patrol_notification(recovered))
+            self.assertTrue(send_library_patrol_notification_result(_projection()).ok)
+            self.assertTrue(send_library_patrol_notification_result(recovered).ok)
 
         self.assertEqual(captured, [
             NotificationImportance.ACTION,

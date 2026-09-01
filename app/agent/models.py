@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from functools import wraps
 from typing import Any, Callable
 
 
@@ -66,12 +67,13 @@ class ToolContext:
     owner: str = ""
     session_id: str = ""
     request_id: str = ""
+    confirmation_bootstrap: bool = False
 
 
 ContextualToolHandler = Callable[[dict[str, Any], ToolContext], ToolResult]
-ConfirmedToolHandler = Callable[[dict[str, Any], str], ToolResult]
+ContextFreeConfirmedToolHandler = Callable[[dict[str, Any], str], ToolResult]
 ContextualConfirmedToolHandler = Callable[[dict[str, Any], str, ToolContext], ToolResult]
-ConfirmationPreparer = Callable[[dict[str, Any]], tuple[ToolResult, str]]
+ContextFreeConfirmationPreparer = Callable[[dict[str, Any]], tuple[ToolResult, str]]
 ContextualConfirmationPreparer = Callable[
     [dict[str, Any], ToolContext], tuple[ToolResult, str]
 ]
@@ -86,8 +88,6 @@ class ToolSpec:
     validator: ArgumentsValidator
     handler: ToolHandler | None = None
     requires_confirmation: bool = False
-    confirmed_handler: ConfirmedToolHandler | None = None
-    confirmation_preparer: ConfirmationPreparer | None = None
     context_handler: ContextualToolHandler | None = None
     context_confirmation_preparer: ContextualConfirmationPreparer | None = None
     context_confirmed_handler: ContextualConfirmedToolHandler | None = None
@@ -109,6 +109,36 @@ class ToolSpec:
     llm_parallel_safe: bool = True
     # 只用于模型候选召回与能力说明，不参与权限、风险、确认或限流判定。
     llm_examples: tuple[str, ...] = ()
+
+    @staticmethod
+    def context_free_confirmation_preparer(
+        handler: ContextFreeConfirmationPreparer,
+    ) -> ContextualConfirmationPreparer:
+        """把无需调用身份的预检函数绑定到唯一的上下文确认协议。"""
+
+        @wraps(handler)
+        def adapted(
+            arguments: dict[str, Any], _context: ToolContext,
+        ) -> tuple[ToolResult, str]:
+            return handler(arguments)
+
+        return adapted
+
+    @staticmethod
+    def context_free_confirmed_handler(
+        handler: ContextFreeConfirmedToolHandler,
+    ) -> ContextualConfirmedToolHandler:
+        """把无需调用身份的执行函数绑定到唯一的上下文确认协议。"""
+
+        @wraps(handler)
+        def adapted(
+            arguments: dict[str, Any],
+            expected_context: str,
+            _context: ToolContext,
+        ) -> ToolResult:
+            return handler(arguments, expected_context)
+
+        return adapted
 
     def public_dict(self) -> dict[str, Any]:
         return {

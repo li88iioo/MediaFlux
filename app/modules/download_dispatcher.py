@@ -1220,6 +1220,19 @@ def _submit_qb(row) -> dict[str, Any]:
 
 def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") -> dict[str, Any]:
     torrent_data = row["torrent_data"] if row["kind"] == "torrent" else None
+
+    def persist_staging(snapshot: dict) -> None:
+        parent_name = str(snapshot.get("parent_name") or target_dir_name or "指定目标目录")
+        staging_name = str(snapshot.get("name") or "")
+        if not db.bind_download_request_guangya_staging(
+            int(row["id"]),
+            staging_id=str(snapshot.get("id") or ""),
+            parent_id=str(snapshot.get("parent_id") or "0"),
+            staging_name=staging_name,
+            target_name=f"{parent_name} / {staging_name}" if parent_name else staging_name,
+        ):
+            raise RuntimeError("下载请求已失效，拒绝绑定隔离目录")
+
     result = submit_offline(
         str(row["source_value"] or ""),
         title=str(row["title"] or ""),
@@ -1228,6 +1241,7 @@ def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") 
         isolate_task=True,
         task_key=str(row["id"]),
         torrent_data=torrent_data,
+        on_staging_created=persist_staging,
     )
     task_ids = [str(item) for item in (result.get("task_ids") or []) if str(item)]
     return {**result, "task_id": task_ids[0] if task_ids else ""}

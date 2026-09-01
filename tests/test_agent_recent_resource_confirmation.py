@@ -464,8 +464,8 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                 "target": str(arguments.get("target") or ""),
             },
             requires_confirmation=True,
-            confirmation_preparer=prepare_single_submit,
-            confirmed_handler=confirm_single_submit,
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_single_submit),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_single_submit),
         ))
         def prepare_batch_submit(arguments: dict) -> tuple[ToolResult, str]:
             return (
@@ -521,8 +521,8 @@ class RecentResourceConfirmationTests(unittest.TestCase):
                 "target": str(arguments.get("target") or ""),
             },
             requires_confirmation=True,
-            confirmation_preparer=prepare_batch_submit,
-            confirmed_handler=confirm_batch_submit,
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_batch_submit),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirm_batch_submit),
         ))
         service = AgentOrchestrator(
             registry,

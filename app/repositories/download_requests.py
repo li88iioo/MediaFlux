@@ -724,6 +724,40 @@ def claim_download_request_targets(request_id: int, targets: str) -> tuple[str, 
         return tuple(missing)
 
 
+def bind_download_request_guangya_staging(
+    request_id: int,
+    *,
+    staging_id: str,
+    parent_id: str,
+    staging_name: str,
+    target_name: str,
+) -> bool:
+    """在离线 Provider 接收任务前原子绑定隔离目录身份。"""
+    safe_staging_id = str(staging_id or "").strip()
+    safe_parent_id = str(parent_id or "0").strip() or "0"
+    safe_staging_name = str(staging_name or "").strip()
+    if not safe_staging_id or not safe_staging_name:
+        return False
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE download_requests SET gy_target_dir=?,gy_target_name=?,gy_isolated=1,"
+            "gy_staging_parent_dir=?,gy_staging_name=?,"
+            "gy_staging_cleanup_status='pending',gy_staging_cleanup_error='',updated_at=? "
+            "WHERE id=? AND gy_status='submitting' "
+            "AND status NOT IN ('completed','failed','cancelled','resubmitted')",
+            (
+                safe_staging_id,
+                str(target_name or safe_staging_name),
+                safe_parent_id,
+                safe_staging_name,
+                now(),
+                int(request_id),
+            ),
+        )
+        return cur.rowcount == 1
+
+
 def claim_download_request(request_id: int, targets: str) -> bool:
     """原子认领待选择请求，防 callback 重放和并发重复提交。"""
     qb_status = "submitting" if targets in {"qb", "both"} else ""
@@ -758,6 +792,77 @@ def claim_download_request_organize(request_id: int) -> bool:
             (now(), int(request_id)),
         )
         return cur.rowcount == 1
+
+
+def claim_download_request_staging_finalize(
+    request_id: int,
+    *,
+    staging_id: str,
+    parent_id: str,
+    staging_name: str,
+    lease_seconds: int = 30,
+) -> bool:
+    """原子领取未配置自动整理时的隔离目录收口。
+
+    该阶段仍由下载跟踪器负责重试，因此不把 ``organize_started`` 置为 1；
+    使用 ``organize_next_retry_at`` 作为短租约，既阻止并发 Worker 重复提交，
+    又允许进程在启动 Writer 后异常退出时自动恢复。
+    """
+    safe_staging_id = str(staging_id or "").strip()
+    safe_parent_id = str(parent_id or "0").strip() or "0"
+    safe_staging_name = str(staging_name or "").strip()
+    if not safe_staging_id or not safe_staging_name:
+        return False
+    ttl = max(5, min(int(lease_seconds or 30), 300))
+    timestamp = now()
+    retry_at = (
+        datetime.now() + timedelta(seconds=ttl)
+    ).strftime("%Y-%m-%d %H:%M:%S")
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE download_requests SET organize_status='queued',organize_error='',"
+            "organize_next_retry_at=?,updated_at=? WHERE id=? "
+            "AND targets IN ('guangya','both') AND gy_status='completed' "
+            "AND status IN ('submitted','downloading','completed','manual_review') "
+            "AND organize_started=0 AND gy_isolated=1 "
+            "AND gy_target_dir=? AND COALESCE(NULLIF(gy_staging_parent_dir,''),'0')=? "
+            "AND gy_staging_name=? "
+            "AND (organize_next_retry_at IS NULL OR organize_next_retry_at='' "
+            "OR organize_next_retry_at<=datetime('now','localtime')) "
+            "AND COALESCE(organize_status,'') NOT IN ('resubmitted','cleared') "
+            "AND COALESCE(attention_cleared_at,'')=''",
+            (
+                retry_at,
+                timestamp,
+                int(request_id),
+                safe_staging_id,
+                safe_parent_id,
+                safe_staging_name,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def list_protected_guangya_staging_ids() -> set[str]:
+    """返回仍可能被下载后端写入或等待人工收口的隔离目录。"""
+    with get_conn() as conn:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_requests'"
+        ).fetchone()
+        if table_exists is None:
+            # 仅初始化前或无数据库的纯单元测试会进入；此时不存在可保护记录。
+            return set()
+        rows = conn.execute(
+            "SELECT DISTINCT gy_target_dir FROM download_requests "
+            "WHERE gy_isolated=1 AND TRIM(COALESCE(gy_target_dir,'')) NOT IN ('','0') "
+            "AND COALESCE(gy_staging_cleanup_status,'')!='completed'"
+        ).fetchall()
+    return {
+        str(row["gy_target_dir"] or "").strip()
+        for row in rows
+        if str(row["gy_target_dir"] or "").strip()
+    }
 
 
 _DOWNLOAD_REQUEST_UPDATE_FIELDS = {

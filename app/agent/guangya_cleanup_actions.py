@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hmac
 import logging
 import re
 import threading
@@ -37,6 +38,7 @@ _CONTEXT_TYPE = "guangya_cleanup"
 _TTL_SECONDS = 15 * 60.0
 _REVIEW_BATCH_SIZE = 16
 _MAX_FROZEN_CANDIDATES = 500
+_CLEANUP_SCOPES = {"all", "empty_only"}
 _PLAN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _PREVIEW_KEYS = (
@@ -54,6 +56,7 @@ class _Flow:
     plan_id: str
     fingerprint: str
     preview_safe: dict[str, Any]
+    request_binding: str = ""
     updated_at: float = 0.0
     generation: int = 0
     revision: int = 0
@@ -93,6 +96,9 @@ def _safe_preview(value: Any) -> dict[str, Any] | None:
     raw_reviews = value.get("review_summaries") or []
     if not isinstance(raw_samples, list) or not isinstance(raw_reviews, list):
         return None
+    scope = str(value.get("scope") or "all").strip().casefold()
+    if scope not in _CLEANUP_SCOPES:
+        return None
     samples = []
     for raw in raw_samples[:5]:
         sample = sanitize_public_text(raw, limit=255)
@@ -107,8 +113,9 @@ def _safe_preview(value: Any) -> dict[str, Any] | None:
         **counts,
         "sample_directories": samples,
         "review_summaries": review_summaries,
+        "scope": scope,
         "cloud_write": False,
-        "quarantine_instead_of_delete": True,
+        "quarantine_instead_of_delete": scope != "empty_only",
     }
 
 
@@ -117,6 +124,7 @@ def _payload(flow: _Flow) -> dict[str, Any]:
         "plan_id": flow.plan_id,
         "fingerprint": flow.fingerprint,
         "preview_safe": dict(flow.preview_safe),
+        "request_binding": flow.request_binding,
     }
 
 
@@ -130,15 +138,18 @@ def _from_payload(
     plan_id = str(payload.get("plan_id") or "")
     fingerprint = str(payload.get("fingerprint") or "")
     preview = _safe_preview(payload.get("preview_safe"))
+    request_binding = str(payload.get("request_binding") or "")
     if (
         not _PLAN_ID_RE.fullmatch(plan_id)
         or not _FINGERPRINT_RE.fullmatch(fingerprint)
+        or (request_binding and not _FINGERPRINT_RE.fullmatch(request_binding))
         or preview is None
     ):
         return None
     return _Flow(
         owner=owner, plan_id=plan_id, fingerprint=fingerprint,
-        preview_safe=preview, updated_at=time.monotonic(),
+        preview_safe=preview, request_binding=request_binding,
+        updated_at=time.monotonic(),
         generation=max(0, int(generation or 0)), revision=max(0, int(revision or 0)),
     )
 
@@ -243,6 +254,33 @@ def _flow(owner: str) -> _Flow | None:
         return current
 
 
+def _request_binding(context: ToolContext) -> str:
+    request_id = str(context.request_id or "").strip()
+    if not request_id:
+        return ""
+    return confirmation_context_fingerprint(
+        {"owner": context.owner, "request_id": request_id},
+        domain="guangya-cleanup-request-binding",
+    )
+
+
+def validate_empty_only_cleanup_confirmation_binding(context: ToolContext) -> None:
+    """确认一键空目录流程在出票前仍指向刚冻结的同一计划。"""
+    flow = _flow(context.owner)
+    expected = _request_binding(context)
+    if (
+        flow is None
+        or str(flow.preview_safe.get("scope") or "all") != "empty_only"
+        or not flow.request_binding
+        or not expected
+        or not hmac.compare_digest(flow.request_binding, expected)
+    ):
+        raise AgentToolError(
+            "空目录冻结计划已被更新请求取代，请重新预检",
+            code="confirmation_stale",
+        )
+
+
 def _consume(flow: _Flow) -> bool:
     if _repository is not None:
         try:
@@ -295,8 +333,11 @@ def _configured_cleanup_sources() -> list[dict[str, str]]:
 def guangya_cleanup_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("残留清理参数必须是对象")
-    if set(arguments) - {"max_candidates"}:
+    if set(arguments) - {"max_candidates", "scope"}:
         raise AgentToolError("残留清理包含不支持的参数")
+    scope = str(arguments.get("scope") or "all").strip().casefold()
+    if scope not in _CLEANUP_SCOPES:
+        raise AgentToolError("scope 只能是 all 或 empty_only")
     try:
         maximum = int(arguments.get("max_candidates", _MAX_FROZEN_CANDIDATES))
     except (TypeError, ValueError, OverflowError) as exc:
@@ -305,7 +346,7 @@ def guangya_cleanup_preview_arguments(arguments: dict[str, Any]) -> dict[str, An
         raise AgentToolError(
             f"max_candidates 必须在 1 到 {_MAX_FROZEN_CANDIDATES} 之间"
         )
-    return {"max_candidates": maximum}
+    return {"max_candidates": maximum, "scope": scope}
 
 
 def guangya_cleanup_classify_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -346,7 +387,7 @@ def guangya_cleanup_execute_arguments(arguments: dict[str, Any]) -> dict[str, An
     return {}
 
 
-def _projection(plan: dict[str, Any]) -> dict[str, Any]:
+def _projection(plan: dict[str, Any], *, scope: str = "all") -> dict[str, Any]:
     stats = plan.get("stats") if isinstance(plan.get("stats"), dict) else {}
     samples = [
         sample for sample in (
@@ -394,13 +435,56 @@ def _projection(plan: dict[str, Any]) -> dict[str, Any]:
         review_summaries.append(
             f"#{number} [{state}] 目录「{directory_name}」；文件：{files}{suffix}"
         )
+    counts = {key: max(0, int(stats.get(key) or 0)) for key in _PREVIEW_KEYS}
+    if scope == "empty_only":
+        # empty-only 的非空候选在私有计划中被硬标记为 keep，仅用于确保它们
+        # 绝不会进入执行清单；公开工作流不再暴露一套额外复核状态机。
+        for key in (
+            "candidate_count", "reviewed_count", "selected_count", "kept_count",
+            "undecided_count", "deferred_candidate_count", "residual_dir_count",
+            "quarantine_file_count",
+        ):
+            counts[key] = 0
+        review_summaries = []
     return {
-        **{key: max(0, int(stats.get(key) or 0)) for key in _PREVIEW_KEYS},
+        **counts,
         "sample_directories": samples,
         "review_summaries": review_summaries,
+        "scope": scope,
         "cloud_write": False,
-        "quarantine_instead_of_delete": True,
+        "quarantine_instead_of_delete": scope != "empty_only",
     }
+
+
+def _freeze_empty_only_plan(
+    plan: dict[str, Any], *, owner: str,
+) -> dict[str, Any]:
+    """把同一 canonical 计划中的全部非空候选硬否决，只留下精确空目录快照。"""
+    decisions = [
+        {
+            "candidate_number": int(candidate.get("candidate_number") or 0),
+            "action": "keep",
+            "reason": "本次仅清理冻结的真空目录",
+        }
+        for candidate in list(plan.get("candidates") or [])
+        if isinstance(candidate, dict)
+        and int(candidate.get("candidate_number") or 0) > 0
+    ]
+    if not decisions:
+        return plan
+    original_plan_id = str(plan.get("plan_id") or "")
+    try:
+        revised = revise_cleanup_plan(
+            original_plan_id,
+            owner=owner,
+            expected_fingerprint=str(plan.get("fingerprint") or ""),
+            decisions=decisions,
+        )
+    except Exception:
+        discard_cleanup_plan(original_plan_id)
+        raise
+    discard_cleanup_plan(original_plan_id)
+    return revised
 
 
 def preview_guangya_cleanup(
@@ -410,21 +494,35 @@ def preview_guangya_cleanup(
         raise AgentToolError("残留清理需要已登录会话", code="precondition_failed")
     previous, guard = _begin_update(context.owner)
     sources = _configured_cleanup_sources()
+    scope = str(arguments.get("scope") or "all")
+    build_maximum = 1 if scope == "empty_only" else int(arguments["max_candidates"])
     client = GuangYaClient()
     try:
         if not client.logged_in:
             raise AgentToolError("光鸭账号尚未连接", code="precondition_failed")
-        plan = build_cleanup_plan(client, owner=context.owner, sources=sources, **arguments)
+        plan = build_cleanup_plan(
+            client,
+            owner=context.owner,
+            sources=sources,
+            max_candidates=build_maximum,
+        )
+        if scope == "empty_only":
+            plan = _freeze_empty_only_plan(plan, owner=context.owner)
     except AgentToolError:
         raise
     except Exception as exc:
         raise _public_error(exc) from exc
     finally:
         client.close()
-    preview = _projection(plan)
+    preview = _projection(plan, scope=scope)
     flow = _Flow(
         owner=context.owner, plan_id=str(plan["plan_id"]),
         fingerprint=str(plan["fingerprint"]), preview_safe=preview,
+        request_binding=(
+            _request_binding(context)
+            if scope == "empty_only" and context.confirmation_bootstrap
+            else ""
+        ),
         generation=guard.generation, revision=guard.revision,
     )
     if not _save(flow):
@@ -435,6 +533,30 @@ def preview_guangya_cleanup(
     empty_count = int(preview["empty_dir_count"])
     candidate_count = int(preview["candidate_count"])
     total = empty_count + candidate_count
+    if scope == "empty_only":
+        deferred_empty_count = int(preview["deferred_empty_dir_count"])
+        return ToolResult(
+            True,
+            "ready" if empty_count else "no_changes",
+            (
+                f"已冻结 {empty_count} 个可安全回收的真空目录"
+                + (
+                    f"；另有 {deferred_empty_count} 个空目录超出本轮冻结上限"
+                    if deferred_empty_count else ""
+                )
+                if empty_count else "整理来源中没有可安全回收的真空目录"
+            ),
+            data=preview,
+            evidence=[Evidence(
+                "guangya_snapshot",
+                "已冻结每个真空目录的 file_id、父目录、名称、版本标识与更新时间；非空目录已硬标记为保留，不会进入执行清单。",
+                _now(),
+            )],
+            suggestions=(
+                ["如冻结数量符合预期，可以确认执行；确认后仍会逐项复核目录版本与空状态。"]
+                if empty_count else ["含文件或缺少可验证版本信息的目录均已保留。"]
+            ),
+        )
     return ToolResult(
         True,
         "selection_required" if candidate_count else ("ready" if total else "no_changes"),
@@ -473,6 +595,11 @@ def classify_guangya_cleanup_candidates(
     previous, guard = _begin_update(context.owner)
     if previous is None:
         raise AgentToolError("最近残留清理预览不存在或已过期", code="precondition_failed")
+    if str(previous.preview_safe.get("scope") or "all") == "empty_only":
+        raise AgentToolError(
+            "仅空目录清理计划不接受残留候选复核，请重新生成完整清理预览",
+            code="precondition_failed",
+        )
     try:
         revised = revise_cleanup_plan(
             previous.plan_id,
@@ -482,7 +609,9 @@ def classify_guangya_cleanup_candidates(
         )
     except Exception as exc:
         raise _public_error(exc) from exc
-    preview = _projection(revised)
+    preview = _projection(
+        revised, scope=str(previous.preview_safe.get("scope") or "all")
+    )
     flow = _Flow(
         owner=context.owner,
         plan_id=str(revised["plan_id"]),
@@ -533,6 +662,8 @@ def _confirmation_fingerprint(flow: _Flow, plan: dict[str, Any]) -> str:
         "residual_dir_count": int(flow.preview_safe.get("residual_dir_count") or 0),
         "selected_count": int(flow.preview_safe.get("selected_count") or 0),
         "kept_count": int(flow.preview_safe.get("kept_count") or 0),
+        "scope": str(flow.preview_safe.get("scope") or "all"),
+        "request_binding": flow.request_binding,
     }, domain="guangya-cleanup-confirmation")
 
 
@@ -542,6 +673,13 @@ def prepare_guangya_cleanup_confirmation(
     flow = _flow(context.owner)
     if flow is None:
         raise AgentToolError("最近残留清理预览不存在或已过期", code="precondition_failed")
+    if flow.request_binding and not hmac.compare_digest(
+        flow.request_binding, _request_binding(context)
+    ):
+        raise AgentToolError(
+            "空目录冻结计划已被更新请求取代，请重新预检",
+            code="confirmation_stale",
+        )
     try:
         plan = load_cleanup_plan(
             flow.plan_id, owner=context.owner, expected_fingerprint=flow.fingerprint
@@ -560,6 +698,7 @@ def prepare_guangya_cleanup_confirmation(
     empty_count = int(flow.preview_safe.get("empty_dir_count") or 0)
     residual_count = int(flow.preview_safe.get("residual_dir_count") or 0)
     undecided_count = int(flow.preview_safe.get("undecided_count") or 0)
+    scope = str(flow.preview_safe.get("scope") or "all")
     if undecided_count > 0:
         raise AgentToolError(
             f"仍有 {undecided_count} 个残留候选尚未逐项复核",
@@ -570,12 +709,20 @@ def prepare_guangya_cleanup_confirmation(
     return ToolResult(
         True,
         "confirmation_required",
-        f"确认后将处理 {empty_count + residual_count} 个光鸭整理残留目录",
+        (
+            f"确认后将回收 {empty_count} 个已冻结的光鸭真空目录"
+            if scope == "empty_only"
+            else f"确认后将处理 {empty_count + residual_count} 个光鸭整理残留目录"
+        ),
         data={**flow.preview_safe, "effects": [
             "整理来源根目录永远不会被删除或移动。",
             "真空目录会在版本与空目录双重复核后移入光鸭回收站。",
-            "仅逐项标记为隔离的非空残留目录会整体移入 /MediaFlux隔离/整理残留 的独立批次，不会永久删除。",
-            "逐项标记为保留的目录是硬否决；任何视频、媒体元数据、字幕、压缩包、种子、未知文件或快照变化也会阻止对应目录进入计划。",
+            *(
+                [] if scope == "empty_only" else [
+                    "仅逐项标记为隔离的非空残留目录会整体移入 /MediaFlux隔离/整理残留 的独立批次，不会永久删除。",
+                    "逐项标记为保留的目录是硬否决；任何视频、媒体元数据、字幕、压缩包、种子、未知文件或快照变化也会阻止对应目录进入计划。",
+                ]
+            ),
             "执行明细保存在私有审计清单中，公开状态只返回聚合计数。",
         ]},
         evidence=[Evidence(
@@ -644,6 +791,7 @@ def execute_guangya_cleanup_confirmed(
             "residual_dir_count": int(flow.preview_safe.get("residual_dir_count") or 0),
             "selected_count": int(flow.preview_safe.get("selected_count") or 0),
             "kept_count": int(flow.preview_safe.get("kept_count") or 0),
+            "scope": str(flow.preview_safe.get("scope") or "all"),
             "requires_manual": not consumed,
         },
         evidence=[Evidence(

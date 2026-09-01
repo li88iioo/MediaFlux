@@ -661,16 +661,14 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             allowed_tools=(
                 "guangya.directory.inspect",
                 "guangya.media_hygiene.preview",
-                "guangya.media_hygiene.execute",
                 "guangya.rename.preview",
                 "guangya.rename.execute",
                 "guangya.change_plan.preview",
-                "guangya.change_plan.execute",
             ),
             max_provider_requests=5,
             max_tool_rounds=4,
             max_tool_calls=5,
-            max_capabilities=7,
+            max_capabilities=5,
             parallel_reads=False,
             completion_rule="先检查对象并生成冻结改名计划；优先使用专用高置信清理，无法表达时才使用声明式计划，执行前必须确认。",
         )

@@ -62,7 +62,7 @@ class TestStrmRoundCleanup:
         assert all(call.kwargs["clean_empty_dirs"] is False for call in sync.call_args_list)
         assert all(call.kwargs["clean_invalid"] is False for call in sync.call_args_list)
         assert all(isinstance(call.kwargs["deferred_cleanup_actions"], list) for call in sync.call_args_list)
-        assert all(call.kwargs["defer_metadata"] is True for call in sync.call_args_list)
+        assert all("defer_metadata" not in call.kwargs for call in sync.call_args_list)
 
 
     def test_full_round_defers_destructive_cleanup_until_every_source_scan_is_safe(self):

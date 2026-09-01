@@ -5,7 +5,7 @@ import asyncio
 import re
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -23,7 +23,7 @@ from app.agent.rate_limit import agent_rate_limiter
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.tools import build_tool_registry
-from app.indexers.downloads import download_result
+from app.indexers.downloads import download_indexer_result
 from app.indexers.errors import IndexerResultExpired
 from app.indexers.models import (
     AggregatedIndexerResult,
@@ -310,7 +310,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         })
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions.download_result", dispatch):
+        ), patch("app.agent.indexer_actions.download_indexer_result", dispatch):
             result = _submit_resource({"result_id": _RESULT_ID, "target": "both"})
 
         self.assertTrue(result.ok)
@@ -353,7 +353,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             ), patch(
                 "app.agent.indexer_actions.get_indexer_service", return_value=service
             ), patch(
-                "app.agent.indexer_actions.download_result",
+                "app.agent.indexer_actions.download_indexer_result",
                 AsyncMock(return_value={**payload, "error": "private backend detail"}),
             ):
                 result = _submit_resource({"result_id": _RESULT_ID, "target": "qb"})
@@ -366,7 +366,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         ), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch(
-            "app.agent.indexer_actions.download_result",
+            "app.agent.indexer_actions.download_indexer_result",
             AsyncMock(side_effect=RuntimeError("secret internal error")),
         ):
             internal = _submit_resource({"result_id": _RESULT_ID, "target": "qb"})
@@ -390,7 +390,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         })
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions.download_result", dispatch):
+        ), patch("app.agent.indexer_actions.download_indexer_result", dispatch):
             result = _submit_resource({"result_id": _RESULT_ID, "target": "guangya"})
 
         self.assertFalse(result.ok)
@@ -417,7 +417,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         result_ids = [_RESULT_ID, "opaque-result-5678"]
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
-        ), patch("app.agent.indexer_actions.download_result_public", dispatch):
+        ), patch("app.agent.indexer_actions.download_indexer_result_public", dispatch):
             result = _submit_resource_batch({"result_ids": result_ids, "target": "guangya"})
 
         self.assertFalse(result.ok)
@@ -431,21 +431,29 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         item = _resource_item(download_kinds=("magnet",))
         service = FakeDownloadService(item)
         normalized = object()
-        normalize = Mock(return_value=normalized)
-        create = Mock(return_value={"id": 7, "created": True})
-        dispatch = Mock(return_value={"duplicate": False, "succeeded": ["qb"], "failed": []})
-
-        result = asyncio.run(download_result(
-            service,
-            _RESULT_ID,
-            "qb",
-            normalize=normalize,
-            create=create,
-            dispatch=dispatch,
-        ))
+        with patch(
+            "app.indexers.downloads.normalize_download_url",
+            return_value=normalized,
+        ) as normalize, patch(
+            "app.indexers.downloads.request_keys",
+            return_value=("req:key",),
+        ), patch(
+            "app.indexers.downloads.db.get_download_request_by_request_key",
+            return_value=None,
+        ), patch(
+            "app.indexers.downloads.db.get_download_request_by_request_keys",
+            return_value=None,
+        ), patch(
+            "app.indexers.downloads.create_request",
+            return_value={"id": 7, "created": True},
+        ) as create, patch(
+            "app.indexers.downloads.dispatch_request",
+            return_value={"status": "submitted", "succeeded": ["qb"], "failed": []},
+        ) as dispatch:
+            result = asyncio.run(download_indexer_result(service, _RESULT_ID, "qb"))
 
         normalize.assert_called_once_with(_SECRET_MAGNET)
-        create.assert_called_once_with(normalized, "", "", origin="indexer:nyaa")
+        create.assert_called_once_with(normalized, "", "", origin="indexer:nyaa", user_id="")
         dispatch.assert_called_once_with(7, "qb")
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "submitted")
@@ -454,20 +462,33 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         item = _resource_item(download_kinds=("magnet",))
         service = FakeDownloadService(item)
         normalized = object()
-        create = Mock(return_value={"id": 8, "created": True})
-        dispatch = Mock(return_value={"duplicate": False, "succeeded": ["qb"], "failed": []})
+        with patch(
+            "app.indexers.downloads.normalize_download_url",
+            return_value=normalized,
+        ), patch(
+            "app.indexers.downloads.request_keys",
+            return_value=("req:key",),
+        ), patch(
+            "app.indexers.downloads.db.get_download_request_by_request_key",
+            return_value=None,
+        ), patch(
+            "app.indexers.downloads.db.get_download_request_by_request_keys",
+            return_value=None,
+        ), patch(
+            "app.indexers.downloads.create_request",
+            return_value={"id": 8, "created": True},
+        ) as create, patch(
+            "app.indexers.downloads.dispatch_request",
+            return_value={"status": "submitted", "succeeded": ["qb"], "failed": []},
+        ):
+            result = asyncio.run(download_indexer_result(
+                service,
+                _RESULT_ID,
+                "qb",
+                origin_namespace="agent",
+            ))
 
-        result = asyncio.run(download_result(
-            service,
-            _RESULT_ID,
-            "qb",
-            origin_namespace="agent",
-            normalize=Mock(return_value=normalized),
-            create=create,
-            dispatch=dispatch,
-        ))
-
-        create.assert_called_once_with(normalized, "", "", origin="agent:nyaa")
+        create.assert_called_once_with(normalized, "", "", origin="agent:nyaa", user_id="")
         self.assertTrue(result["ok"])
 
     def test_natural_language_resource_search_does_not_replace_library_search(self):
@@ -589,7 +610,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}), patch(
-            "app.agent.indexer_actions.download_result", dispatch
+            "app.agent.indexer_actions.download_indexer_result", dispatch
         ):
             searched = self.client.post(
                 "/api/agent/tools/indexer.search_resources",
@@ -679,7 +700,7 @@ class AgentIndexerActionAPITests(IsolatedDatabaseTestCase):
         with patch("app.agent.indexer_actions.config.get_bool", return_value=True), patch(
             "app.agent.indexer_actions.get_indexer_service", return_value=service
         ), patch("app.agent.indexer_actions._target_readiness", return_value={"qb": True}), patch(
-            "app.agent.indexer_actions.download_result", dispatch
+            "app.agent.indexer_actions.download_indexer_result", dispatch
         ):
             searched = self.client.post(
                 "/api/agent/tools/indexer.search_resources",

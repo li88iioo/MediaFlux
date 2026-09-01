@@ -52,6 +52,59 @@ from app.modules.directory_scrape_errors import (
 logger = get_logger(__name__)
 
 
+class _OrderedSourceWriteCoordinator:
+    """允许来源并行规划，但按配置顺序提交云盘写入。"""
+
+    def __init__(self, source_count: int):
+        self._condition = threading.Condition()
+        self._writer = threading.Lock()
+        self._next_index = 0
+        self._completed: set[int] = set()
+        self._source_count = max(0, int(source_count))
+
+    def gate(self, source_index: int) -> "_OrderedSourceWriteGate":
+        return _OrderedSourceWriteGate(self, int(source_index))
+
+    def acquire(self, source_index: int) -> None:
+        with self._condition:
+            while source_index != self._next_index:
+                self._condition.wait()
+        self._writer.acquire()
+
+    def release(self) -> None:
+        self._writer.release()
+
+    def complete(self, source_index: int) -> None:
+        with self._condition:
+            self._completed.add(int(source_index))
+            while (
+                self._next_index < self._source_count
+                and self._next_index in self._completed
+            ):
+                self._next_index += 1
+            self._condition.notify_all()
+
+
+class _OrderedSourceWriteGate:
+    def __init__(self, coordinator: _OrderedSourceWriteCoordinator, source_index: int):
+        self._coordinator = coordinator
+        self._source_index = int(source_index)
+
+    def acquire(self) -> bool:
+        self._coordinator.acquire(self._source_index)
+        return True
+
+    def release(self) -> None:
+        self._coordinator.release()
+
+    def __enter__(self) -> "_OrderedSourceWriteGate":
+        self.acquire()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.release()
+
+
 def _merge_source_stats(aggregate: dict[str, object], stats: dict[str, Any]) -> None:
     """稳定合并单来源统计，供串行与并行调度复用。"""
     for key, value in stats.items():
@@ -166,8 +219,26 @@ def _protected_organize_root_ids(rules: OrganizeRules) -> tuple[set[str], str]:
     )
     protected = {"0", str(rules.target_dir_id or "").strip()}
     protected.update(str(item.get("id") or "").strip() for item in sources)
+    try:
+        protected.update(db.list_protected_guangya_staging_ids())
+    except Exception as exc:
+        logger.warning(
+            "读取活动下载隔离目录保护集失败 type=%s", type(exc).__name__
+        )
+        error = error or "无法读取活动下载隔离目录，已停止删除型清理"
     protected.discard("")
     return protected, error
+
+
+def _protected_source_ids(sources: list[dict[str, str]]) -> set[str]:
+    """合并本轮来源与所有活动下载隔离目录，阻止跨任务误删。"""
+    protected = {
+        str(source.get("id") or "").strip()
+        for source in sources
+        if str(source.get("id") or "").strip()
+    }
+    protected.update(db.list_protected_guangya_staging_ids())
+    return protected
 
 
 def _cleanup_manual_source_root(
@@ -736,11 +807,14 @@ class OrganizeTaskManager:
                 total = 0
                 details = []
                 organizer = Organizer(client=client) if client is not None else Organizer()
-                protected_source_ids = {
-                    str(source.get("id") or "").strip()
-                    for source in sources
-                    if str(source.get("id") or "").strip()
-                }
+                try:
+                    protected_source_ids = _protected_source_ids(sources)
+                except Exception as exc:
+                    logger.warning(
+                        "读取活动下载隔离目录保护集失败 type=%s",
+                        type(exc).__name__,
+                    )
+                    return {"ok": False, "error": "无法读取活动下载隔离目录，已停止空目录清理"}
                 for source in sources:
                     try:
                         report = organizer.clean_empty_dirs(
@@ -1287,8 +1361,8 @@ class OrganizeTaskManager:
         return None
 
     def _operation_queue_payload_locked(self) -> dict[str, Any]:
-        # 通用 Web 状态只展开本进程 legacy 队列；owner 隔离的 Agent durable
-        # 队列仅暴露聚合数量，详情必须通过 owner-bound GY 编号查询。
+        # 通用 Web 状态只展开请求期回调队列；owner 隔离的持久队列仅暴露
+        # 聚合数量，详情必须通过 owner-bound GY 编号查询。
         items = [
             {
                 "id": str(item.get("id") or ""),
@@ -1565,11 +1639,7 @@ class OrganizeTaskManager:
             if not _credential_snapshot_is_current(client, expected_credential_generation):
                 raise RuntimeError("光鸭登录凭据已变化，已拒绝执行整理")
             organizer = Organizer(client=client) if client is not None else Organizer()
-            protected_source_ids = {
-                str(source.get("id") or "").strip()
-                for source in sources
-                if str(source.get("id") or "").strip()
-            }
+            protected_source_ids = _protected_source_ids(sources)
             worker_budget = resolve_organize_workers()
             source_worker_count = min(worker_budget, max(1, len(sources)))
             source_rules = [
@@ -1603,7 +1673,10 @@ class OrganizeTaskManager:
             # ffprobe 自身另有进程级槽位门，因此每个规划任务可看到完整预算，
             # 总并发仍不会超过 MEDIAFLUX_MEDIA_PROBE_WORKERS。
             source_probe_worker_budget = probe_worker_budget
-            execution_gate = threading.Lock() if source_worker_count > 1 else None
+            execution_order = (
+                _OrderedSourceWriteCoordinator(len(sources))
+                if source_worker_count > 1 else None
+            )
             task_runtime = OrganizeTaskRuntime()
             source_runtime_lock = threading.Lock()
             source_runtime = [
@@ -1681,11 +1754,14 @@ class OrganizeTaskManager:
                 local_organizer = source_organizer
                 owns_local_organizer = False
                 source_name = str(source.get("name") or source.get("id") or "")
-                if self._cancel_event.is_set():
-                    _publish_source_runtime(index, status="stopped")
-                    return index, source, None, None
-                _publish_source_runtime(index, status="running")
+                source_execution_gate = (
+                    execution_order.gate(index) if execution_order is not None else None
+                )
                 try:
+                    if self._cancel_event.is_set():
+                        _publish_source_runtime(index, status="stopped")
+                        return index, source, None, None
+                    _publish_source_runtime(index, status="running")
                     if local_organizer is None:
                         # 共享线程安全的光鸭连接池，各来源持有独立 scraper/cache，
                         # 杜绝识别上下文在 worker 间串扰。
@@ -1714,11 +1790,12 @@ class OrganizeTaskManager:
                         planning_workers=group_worker_budget,
                         media_probe_workers=source_probe_worker_budget,
                         planning_executor=shared_planning_executor,
-                        execution_lock=execution_gate,
+                        execution_lock=source_execution_gate,
                         task_runtime=task_runtime,
                     )
                     cleanup_context = (
-                        execution_gate if execution_gate is not None else nullcontext()
+                        source_execution_gate
+                        if source_execution_gate is not None else nullcontext()
                     )
                     with cleanup_context:
                         _cleanup_manual_source_root(
@@ -1738,6 +1815,8 @@ class OrganizeTaskManager:
                     _publish_source_runtime(index, status="failed")
                     return index, source, None, exc
                 finally:
+                    if execution_order is not None:
+                        execution_order.complete(index)
                     if owns_local_organizer and local_organizer is not None:
                         try:
                             local_organizer.close()

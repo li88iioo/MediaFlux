@@ -6,7 +6,6 @@ Token 或会话 ID 时静默降级为日志；配置热更新由 ``app.bot.resta
 """
 from __future__ import annotations
 
-import hashlib
 import html
 import logging
 import os
@@ -673,10 +672,6 @@ def render_event(event: NotificationEvent) -> str:
     return "\n".join(body)
 
 
-def format_event(title: str, *lines: object) -> str:
-    """兼容旧调用的统一 HTML 事件消息。"""
-    return render_event(NotificationEvent(title=title, lines=lines))
-
 
 def _tag_transition(stack: list[tuple[str, str]], token: str) -> list[tuple[str, str]]:
     """返回消费一个 HTML 标签后的开放标签栈。"""
@@ -809,14 +804,6 @@ def _event_markup(event: NotificationEvent):
     except Exception as exc:
         logger.warning("Telegram 操作按钮构造失败 type=%s", type(exc).__name__)
         return None
-
-
-def _send_text(bot, target: str, text: str, *, reply_markup=None) -> bool:
-    chunks = split_message(text)
-    for index, chunk in enumerate(chunks):
-        kwargs = {"reply_markup": reply_markup} if reply_markup is not None and index == len(chunks) - 1 else {}
-        bot.send_message(target, chunk, **kwargs)
-    return True
 
 
 def _partial_delivery(
@@ -977,10 +964,6 @@ def send_result(
         return result
 
 
-def send(text: str, chat_id: Optional[str] = None) -> bool:
-    """兼容旧调用方的布尔发送接口。"""
-    return send_result(text, chat_id=chat_id).ok
-
 
 def _telegram_message_is_unchanged(exc: Exception) -> bool:
     """Telegram 已是目标内容时，视为幂等编辑成功。"""
@@ -1093,12 +1076,6 @@ def edit_event_result(
     return result
 
 
-def edit_event(
-    event: NotificationEvent, *, chat_id: str, message_id: int | str
-) -> bool:
-    """兼容既有调用者的布尔编辑接口。"""
-    return bool(edit_event_result(event, chat_id=chat_id, message_id=message_id).ok)
-
 
 def send_event_result(
     event: NotificationEvent, chat_id: Optional[str] = None,
@@ -1183,10 +1160,6 @@ def send_event_result(
         return result
 
 
-def send_event(event: NotificationEvent, chat_id: Optional[str] = None) -> bool:
-    """兼容既有调用者的布尔接口。"""
-    return bool(send_event_result(event, chat_id=chat_id).ok)
-
 
 def notify_gcid_import_started(*, task_id: int, file_count: int, total_size: int,
                                retry: bool = False) -> None:
@@ -1254,60 +1227,6 @@ def notify_gcid_import_finished(*, task_id: int, status: str, success_count: int
             NotificationImportance.RESULT
             if normalized == "success" else NotificationImportance.ERROR
         ),
-    )
-
-
-def _publish_legacy_notification(
-    logical_prefix: str,
-    event: NotificationEvent,
-    *,
-    topic: str,
-) -> None:
-    """兼容旧插件入口，但禁止绕过统一策略与可靠 outbox。"""
-    from app.modules.telegram_notification_center import publish_notification_event
-    from app.modules.telegram_notification_policy import NotificationImportance
-
-    digest = hashlib.sha256(
-        render_event(event).encode("utf-8")
-    ).hexdigest()[:24]
-    publish_notification_event(
-        f"legacy-{logical_prefix}:{digest}",
-        event,
-        topic=topic,
-        importance=NotificationImportance.RESULT,
-    )
-
-
-def notify_organize_done(summary: str) -> None:
-    _publish_legacy_notification(
-        "organize",
-        NotificationEvent(
-            "光鸭整理完成", lines=(summary,), layout="relaxed",
-        ),
-        topic="organize",
-    )
-
-
-def notify_strm_done(summary: str) -> None:
-    _publish_legacy_notification(
-        "strm",
-        NotificationEvent(
-            "STRM 同步完成", lines=(summary,), layout="relaxed",
-        ),
-        topic="strm",
-    )
-
-
-def notify_download(source: str, title: str, path: str) -> None:
-    safe_name = str(path or "").strip().replace("\\", "/").rsplit("/", 1)[-1]
-    _publish_legacy_notification(
-        "download",
-        NotificationEvent(
-            "下载完成",
-            fields=(("来源", source), ("任务", title), ("文件", safe_name)),
-            layout="relaxed",
-        ),
-        topic="download",
     )
 
 

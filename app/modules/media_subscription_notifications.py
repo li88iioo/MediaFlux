@@ -1,4 +1,4 @@
-"""媒体订阅通知 outbox 的幂等投递与恢复。"""
+"""媒体订阅事务 outbox 到统一 Telegram 通知中心的可靠移交。"""
 from __future__ import annotations
 
 from app.agent.result_projection import sanitize_public_text
@@ -80,7 +80,7 @@ def _event(item: dict) -> NotificationEvent:
 
 
 def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
-    """把旧订阅 outbox 转交统一通知中心；旧记录只在接纳后确认。"""
+    """移交订阅事务事件；领域记录只在统一通知中心接纳后确认。"""
     recover_notifications()
     claimed = claim_due_notifications(limit=limit)
     if not claimed:
@@ -111,7 +111,7 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
                 else NotificationImportance.RESULT
             ),
         )
-        # 全局开关或通知等级主动抑制都属于已执行的消费策略；旧 outbox
+        # 全局开关或通知等级主动抑制都属于已执行的消费策略；事务 outbox
         # 不应把同一条被策略拒绝的结果反复移交和重试。
         accepted = (
             bool(outcome)

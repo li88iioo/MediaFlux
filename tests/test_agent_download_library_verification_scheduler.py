@@ -19,9 +19,6 @@ from app.agent.recent_download_submissions import (
 from app.modules.agent_download_verification_scheduler import (
     DownloadLibraryVerificationScheduler,
 )
-from app.modules.agent_download_verification_notifications import (
-    dump_download_verification_payload,
-)
 from app.notifier import TelegramSendResult
 from tests.support import IsolatedDatabaseTestCase
 
@@ -557,7 +554,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         notifier.assert_not_called()
 
     def test_stop_during_failed_notification_releases_without_retry_budget(self):
-        request_id = self._request("stop-during-notify", owner=_TG_OWNER)
+        self._request("stop-during-notify", owner=_TG_OWNER)
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
         )
@@ -707,7 +704,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         scheduler.run_once()
         self.clock.value = datetime(2026, 8, 3, 12, 0, 31)
         with patch("app.config.get_bool", return_value=False), patch(
-            "app.modules.agent_download_verification_scheduler.notify_download_verification_terminal"
+            "app.modules.agent_download_verification_scheduler.notify_download_verification_terminal_result"
         ) as notifier:
             self.assertEqual(scheduler.run_once(), 1)
 
@@ -745,7 +742,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         self.assertEqual(queued[0]["last_error_type"], "InvalidRoute")
         notifier.assert_not_called()
     def test_stale_sending_notification_is_discarded_after_unknown_delivery(self):
-        request_id = self._request("notify-restart-auto-verify", owner=_TG_OWNER)
+        self._request("notify-restart-auto-verify", owner=_TG_OWNER)
         job = db.claim_due_agent_download_verification(
             current_time="2026-08-03 12:00:00"
         )

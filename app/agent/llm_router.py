@@ -2415,7 +2415,7 @@ async def _execute_native_tool_turn(
 def _append_native_synthesis_instruction(
     protocol: str, history: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
-    """证据齐备后显式要求生成结论，兼容仍会沿用历史工具名的 Provider。"""
+    """证据齐备后显式要求生成结论，适配各 Provider 的工具续写行为。"""
     text = (
         "本轮必需数据源已经全部成功返回。停止检索，不要再次调用任何工具；"
         "请仅根据已有结果直接回答用户，并清楚区分已上线、已定档与待确认信息。"

@@ -1,8 +1,10 @@
 """本地媒体自动整理的持久化模型与状态约束。"""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
-from typing import Literal, Mapping, Any
+from pathlib import Path
+from typing import Any, Literal, Mapping
 
 LocalTaskStatus = Literal[
     "waiting_stable",
@@ -48,6 +50,31 @@ LOCAL_MEDIA_CATEGORIES: frozenset[str] = frozenset(
 LOCAL_MEDIA_TRIGGERS: frozenset[str] = frozenset({"qb_completed", "scan", "manual"})
 
 
+def canonical_local_media_content_path(value: str | Path) -> str:
+    """返回跨入口一致的本地媒体任务路径身份。
+
+    任务准入和调度路径锁必须使用同一套规则；新任务只保存这个规范值，
+    旧数据库中的非规范路径则在再次准入时按此规则比较。
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("本地媒体任务路径不能为空")
+    if "\x00" in raw:
+        raise ValueError("本地媒体任务路径包含非法字符")
+    try:
+        resolved = Path(raw).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("本地媒体任务路径无法规范化") from exc
+    return os.path.normcase(os.path.normpath(str(resolved)))
+
+
+def local_media_paths_overlap(first: str | Path, second: str | Path) -> bool:
+    """判断两个本地媒体任务路径是否覆盖同一文件树范围。"""
+    left = Path(canonical_local_media_content_path(first))
+    right = Path(canonical_local_media_content_path(second))
+    return left == right or left in right.parents or right in left.parents
+
+
 def _value(row: Mapping[str, Any], key: str, default: Any = "") -> Any:
     try:
         value = row[key]
@@ -82,7 +109,7 @@ class LocalMediaSource:
             qb_profile=str(_value(row, "qb_profile")),
             qb_path_prefix=str(_value(row, "qb_path_prefix")),
             local_root=str(row["local_root"]), enabled=bool(row["enabled"]),
-            stable_seconds=int(_value(row, "stable_seconds", 300)),
+            stable_seconds=int(_value(row, "stable_seconds", 0)),
             scan_enabled=bool(_value(row, "scan_enabled", 0)),
             scan_interval_minutes=int(_value(row, "scan_interval_minutes", 10)),
             media_type=str(_value(row, "media_type", "auto")),

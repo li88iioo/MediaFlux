@@ -43,7 +43,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "app.indexers.runtime.build_default_registry", return_value=registry,
         ):
-            service = runtime._build_service()
+            service = runtime.build_indexer_service()
 
         self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "sukebei"}))
 
@@ -65,7 +65,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "app.indexers.runtime.build_default_registry",
             return_value=registry,
         ) as build:
-            service = runtime._build_service()
+            service = runtime.build_indexer_service()
 
         build.assert_called_once_with(
             user_agent="MediaFlux/Test",
@@ -90,7 +90,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "app.indexers.runtime.build_default_registry",
             return_value=registry,
         ):
-            service = runtime._build_service()
+            service = runtime.build_indexer_service()
 
         self.assertEqual(
             service.enabled_site_ids,
@@ -115,7 +115,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "app.indexers.runtime.build_default_registry",
             return_value=registry,
         ):
-            service = runtime._build_service()
+            service = runtime.build_indexer_service()
 
         self.assertEqual(service.enabled_site_ids, frozenset({"nyaa"}))
 

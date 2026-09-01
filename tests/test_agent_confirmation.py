@@ -14,7 +14,7 @@ from app.agent.confirmation_contract import (
     sanitize_confirmation_contract,
 )
 from app.agent.feature_gate import AgentRuntimeDisabled
-from app.agent.models import RiskLevel, ToolResult, ToolSpec
+from app.agent.models import RiskLevel, ToolContext, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
     _QUERY_CONFIRMATION_EPOCH,
@@ -551,6 +551,67 @@ class ConfirmationStoreTests(unittest.TestCase):
 
 
 class ConfirmedToolRegistryTests(unittest.TestCase):
+    def test_removed_guangya_execute_names_are_not_runtime_tools(self):
+        service = AgentOrchestrator(build_tool_registry())
+        for removed_name in (
+            "guangya.change_plan.execute",
+            "guangya.media_hygiene.execute",
+            "guangya.organize.clean_empty",
+        ):
+            with self.subTest(removed_name=removed_name):
+                self.assertFalse(service.has_tool(removed_name))
+                with self.assertRaises(AgentToolError) as missing:
+                    service.prepare(removed_name, {}, owner="owner")
+                self.assertEqual(missing.exception.code, "tool_not_found")
+
+    def test_context_free_handlers_bind_to_canonical_confirmation_protocol(self):
+        calls: list[tuple[str, dict, str]] = []
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.context_free_confirmation",
+            description="context-free confirmation",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda arguments: dict(arguments),
+            requires_confirmation=True,
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
+                calls.append(("prepare", dict(arguments), ""))
+                or ToolResult(True, "preview", "ready"),
+                "frozen-context",
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, expected_context: (
+                calls.append(("execute", dict(arguments), expected_context))
+                or ToolResult(True, "completed", "done")
+            )),
+        ))
+
+        stored = registry._tools["write.context_free_confirmation"]
+        self.assertIsNotNone(stored.context_confirmation_preparer)
+        self.assertIsNotNone(stored.context_confirmed_handler)
+
+        _spec, normalized, fingerprint, _preview, _elapsed = (
+            registry.prepare_confirmation(
+                "write.context_free_confirmation",
+                {"value": 1},
+                context=ToolContext(owner="owner", request_id="request"),
+            )
+        )
+        result, _elapsed = registry.execute_confirmed(
+            "write.context_free_confirmation",
+            normalized,
+            expected_context=fingerprint,
+            context=ToolContext(owner="owner", request_id="request"),
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            calls,
+            [
+                ("prepare", {"value": 1}, ""),
+                ("execute", {"value": 1}, "frozen-context"),
+            ],
+        )
+
     def test_registry_rejects_duplicate_direct_handler_modes(self):
         registry = ToolRegistry()
         with self.assertRaisesRegex(ValueError, "duplicate direct handler modes"):
@@ -576,9 +637,9 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 parameters={},
                 validator=lambda arguments: dict(arguments),
                 requires_confirmation=True,
-                confirmed_handler=lambda _arguments, _context: ToolResult(
+                context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                     True, "completed", "done"
-                ),
+                )),
             ))
 
     def test_registry_requires_explicit_confirmed_handler_for_canonical_preparer(self):
@@ -591,46 +652,21 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 parameters={},
                 validator=lambda arguments: dict(arguments),
                 requires_confirmation=True,
-                confirmation_preparer=lambda _arguments: (
+                context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                     ToolResult(True, "confirmation_required", "preview"),
                     "fingerprint",
-                ),
+                )),
             ))
 
     def test_confirmation_preparers_reject_invalid_outputs_without_issuing_ticket(self):
         preview = ToolResult(True, "confirmation_required", "preview")
         cases = (
-            ("plain_result", False, (object(), "fingerprint")),
-            ("plain_fingerprint", False, (preview, object())),
-            ("context_result", True, (object(), "fingerprint")),
-            ("context_fingerprint", True, (preview, object())),
+            ("result", (object(), "fingerprint")),
+            ("fingerprint", (preview, object())),
         )
-        for name, contextual, prepared_output in cases:
+        for name, prepared_output in cases:
             with self.subTest(name=name):
                 registry = ToolRegistry()
-                handler_kwargs = (
-                    {
-                        "context_confirmation_preparer": (
-                            lambda _arguments, _context, output=prepared_output: output
-                        ),
-                        "context_confirmed_handler": (
-                            lambda _arguments, _fingerprint, _context: ToolResult(
-                                True, "completed", "done"
-                            )
-                        ),
-                    }
-                    if contextual
-                    else {
-                        "confirmation_preparer": (
-                            lambda _arguments, output=prepared_output: output
-                        ),
-                        "confirmed_handler": (
-                            lambda _arguments, _fingerprint: ToolResult(
-                                True, "completed", "done"
-                            )
-                        ),
-                    }
-                )
                 registry.register(ToolSpec(
                     name=f"write.invalid-preparer-{name}",
                     description="test",
@@ -638,7 +674,14 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                     parameters={},
                     validator=lambda _arguments: {},
                     requires_confirmation=True,
-                    **handler_kwargs,
+                    context_confirmation_preparer=(
+                        lambda _arguments, _context, output=prepared_output: output
+                    ),
+                    context_confirmed_handler=(
+                        lambda _arguments, _fingerprint, _context: ToolResult(
+                            True, "completed", "done"
+                        )
+                    ),
                 ))
                 service = AgentOrchestrator(
                     registry,
@@ -659,64 +702,45 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 )
 
     def test_invalid_confirmed_handler_result_fails_closed_after_single_claim(self):
-        for contextual in (False, True):
-            with self.subTest(contextual=contextual):
-                registry = ToolRegistry()
-                handler_kwargs = (
-                    {
-                        "context_confirmation_preparer": (
-                            lambda _arguments, _context: (
-                                ToolResult(True, "confirmation_required", "preview"),
-                                "context-fingerprint",
-                            )
-                        ),
-                        "context_confirmed_handler": (
-                            lambda _arguments, _fingerprint, _context: {"ok": True}
-                        ),
-                    }
-                    if contextual
-                    else {
-                        "confirmation_preparer": lambda _arguments: (
-                            ToolResult(True, "confirmation_required", "preview"),
-                            "context-fingerprint",
-                        ),
-                        "confirmed_handler": (
-                            lambda _arguments, _fingerprint: {"ok": True}
-                        ),
-                    }
+        registry = ToolRegistry()
+        registry.register(ToolSpec(
+            name="write.invalid-confirmed",
+            description="test",
+            risk=RiskLevel.WRITE,
+            parameters={},
+            validator=lambda _arguments: {},
+            requires_confirmation=True,
+            context_confirmation_preparer=(
+                lambda _arguments, _context: (
+                    ToolResult(True, "confirmation_required", "preview"),
+                    "context-fingerprint",
                 )
-                registry.register(ToolSpec(
-                    name=f"write.invalid-confirmed-{int(contextual)}",
-                    description="test",
-                    risk=RiskLevel.WRITE,
-                    parameters={},
-                    validator=lambda _arguments: {},
-                    requires_confirmation=True,
-                    **handler_kwargs,
-                ))
-                service = AgentOrchestrator(
-                    registry,
-                    ConfirmationStore(
-                        token_factory=lambda: "ticket-invalid-confirmed-1234"
-                    ),
-                )
-                prepared = service.prepare(
-                    f"write.invalid-confirmed-{int(contextual)}",
-                    {},
-                    owner="owner-a",
-                )
+            ),
+            context_confirmed_handler=(
+                lambda _arguments, _fingerprint, _context: {"ok": True}
+            ),
+        ))
+        service = AgentOrchestrator(
+            registry,
+            ConfirmationStore(
+                token_factory=lambda: "ticket-invalid-confirmed-1234"
+            ),
+        )
+        prepared = service.prepare(
+            "write.invalid-confirmed", {}, owner="owner-a"
+        )
 
-                response = service.confirm(
-                    prepared["action_plan"]["plan_id"], owner="owner-a"
-                )
+        response = service.confirm(
+            prepared["action_plan"]["plan_id"], owner="owner-a"
+        )
 
-                self.assertFalse(response["result"]["ok"])
-                self.assertEqual(response["result"]["status"], "unavailable")
-                self.assertEqual(response["action_plan"]["status"], "failed")
-                with self.assertRaises(AgentToolError):
-                    service.confirm(
-                        prepared["action_plan"]["plan_id"], owner="owner-a"
-                    )
+        self.assertFalse(response["result"]["ok"])
+        self.assertEqual(response["result"]["status"], "unavailable")
+        self.assertEqual(response["action_plan"]["status"], "failed")
+        with self.assertRaises(AgentToolError):
+            service.confirm(
+                prepared["action_plan"]["plan_id"], owner="owner-a"
+            )
 
     def test_orchestrator_prepare_returns_stable_human_action_plan(self):
         registry = ToolRegistry()
@@ -729,17 +753,17 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 "feature": str(arguments.get("feature") or "discovery"),
                 "enabled": bool(arguments.get("enabled")),
             },
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(
                     True,
                     "confirmation_required",
                     "预检通过：保存后会更新功能状态。",
                 ),
                 "feature-state",
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "completed", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -784,13 +808,13 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda arguments: {"value": str(arguments.get("value", "")).strip()},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(
                     True, "confirmation_required", "preview", data=arguments
                 ),
                 context["value"],
-            ),
-            confirmed_handler=confirmed,
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirmed),
             requires_confirmation=True,
         ))
 
@@ -828,12 +852,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda arguments: {"value": str(arguments.get("value", "")).strip()},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "preview", "preview"), "verify"
-            ),
-            confirmed_handler=lambda arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _context: ToolResult(
                 True, "completed", "done", data={"value": arguments["value"]}
-            ),
+            )),
             requires_confirmation=True,
             post_write_verifier=verifier,
         ))
@@ -854,12 +878,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "preview", "preview"), "verify-failure"
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "completed", "write completed"
-            ),
+            )),
             requires_confirmation=True,
             post_write_verifier=lambda _arguments, _result: (_ for _ in ()).throw(
                 OSError("must-not-leak")
@@ -891,10 +915,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "preview", "preview"), "bound-context"
-            ),
-            confirmed_handler=confirmed,
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(confirmed),
             requires_confirmation=True,
         ))
 
@@ -924,10 +948,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=prepare_confirmation,
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_confirmation),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -969,10 +993,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=prepare_confirmation,
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_confirmation),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -1013,12 +1037,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "preview"), "epoch"
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -1072,12 +1096,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "preview"), "epoch"
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -1121,12 +1145,12 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.WRITE,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "preview"), "epoch"
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -1177,15 +1201,15 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda arguments: {"value": str(arguments["value"])},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(
                     True, "confirmation_required", f"preview {arguments['value']}"
                 ),
                 f"single-plan:{arguments['value']}",
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -1224,15 +1248,15 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                 "additionalProperties": False,
             },
             validator=lambda arguments: {"value": str(arguments["value"])},
-            confirmation_preparer=lambda arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
                 ToolResult(
                     True, "confirmation_required", f"preview {arguments['value']}"
                 ),
                 f"replacement-plan:{arguments['value']}",
-            ),
-            confirmed_handler=lambda _arguments, _context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _context: ToolResult(
                 True, "accepted", "done"
-            ),
+            )),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(
@@ -1280,10 +1304,10 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
             risk=RiskLevel.DANGER,
             parameters={},
             validator=lambda _arguments: {},
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "preview"), "failed"
-            ),
-            confirmed_handler=failed_handler,
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(failed_handler),
             requires_confirmation=True,
         ))
         service = AgentOrchestrator(

@@ -1449,10 +1449,6 @@ def _enabled(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _agent_llm_enabled() -> bool:
-    return _enabled(get("AGENT_LLM_ENABLED", "0"))
-
-
 def _allowed_user_ids() -> set[str]:
     raw = str(get("TG_AGENT_ALLOWED_USER_IDS", "") or "")
     return {

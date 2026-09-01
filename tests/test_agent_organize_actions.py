@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
+from app.agent import guangya_cleanup_actions
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.agent.orchestrator import (
     AgentOrchestrator,
@@ -18,8 +19,6 @@ from app.agent.orchestrator import (
 )
 from app.agent.organize_actions import (
     _configured_sources,
-    clean_empty_guangya_organize_sources_confirmed,
-    prepare_guangya_organize_clean_empty,
     prepare_guangya_organize_run_once,
     prepare_guangya_organize_stop,
     preview_guangya_organize,
@@ -40,6 +39,15 @@ def _no_arguments(arguments):
     if arguments:
         raise AgentToolError("不接受参数")
     return {}
+
+
+def _cleanup_preview_arguments(arguments):
+    if set(arguments) - {"max_candidates", "scope"}:
+        raise AgentToolError("不支持参数")
+    return {
+        "max_candidates": int(arguments.get("max_candidates", 500)),
+        "scope": str(arguments.get("scope") or "all"),
+    }
 
 
 def _preview_plan(title: str = "安全标题", action: str = "move"):
@@ -155,101 +163,6 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         for context in (first, rules_changed, credential_changed):
             self.assertNotIn("secret", context)
             self.assertRegex(context, r"^[0-9a-f]{64}$")
-
-    def test_clean_empty_context_tracks_exact_source_snapshot(self):
-        current = [{"id": "secret-source-one", "name": "Secret One"}]
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            side_effect=lambda: list(current),
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=SimpleNamespace(
-                logged_in=True,
-                credential_generation=7,
-            ),
-        ), patch(
-            "app.agent.organize_actions._preview_guangya_organize_clean_empty_sources",
-            return_value=ToolResult(True, "preview", "preview"),
-        ):
-            _preview, first = prepare_guangya_organize_clean_empty({})
-            _preview, repeated = prepare_guangya_organize_clean_empty({})
-            self.assertEqual(first, repeated)
-            current.append({"id": "secret-source-two", "name": "Secret Two"})
-            _preview, second = prepare_guangya_organize_clean_empty({})
-
-        self.assertNotEqual(first, second)
-        self.assertRegex(first, r"^[0-9a-f]{64}$")
-        self.assertRegex(second, r"^[0-9a-f]{64}$")
-        self.assertNotIn("secret-source-one", first)
-        self.assertNotIn("Secret One", first)
-
-    def test_clean_empty_preview_and_execution_return_only_safe_counts(self):
-        sources = [{"id": "secret-source-id", "name": "Secret Source"}]
-        manager = Mock()
-        manager.task_status.return_value = {"status": "idle"}
-        manager.clean_empty.return_value = {
-            "ok": True,
-            "cleaned": 3,
-            "sources": [{**sources[0], "cleaned": 3}],
-        }
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            preview, context = prepare_guangya_organize_clean_empty({})
-            completed = clean_empty_guangya_organize_sources_confirmed({}, context)
-
-        self.assertTrue(preview.ok)
-        self.assertEqual(preview.data, {"source_count": 1})
-        self.assertTrue(completed.ok)
-        self.assertEqual(completed.status, "completed")
-        self.assertEqual(
-            completed.data,
-            {"cleaned": 3, "failed": 0, "source_count": 1},
-        )
-        manager.clean_empty.assert_called_once()
-        self.assertEqual(manager.clean_empty.call_args.args, (sources,))
-        self.assertTrue(manager.clean_empty.call_args.kwargs["client"].logged_in)
-        serialized = str(preview.to_dict()) + str(completed.to_dict())
-        self.assertNotIn("secret-source-id", serialized)
-        self.assertNotIn("Secret Source", serialized)
-
-    def test_clean_empty_partial_result_is_not_reported_as_complete(self):
-        sources = [{"id": "secret-source-id", "name": "Secret Source"}]
-        manager = Mock()
-        manager.clean_empty.return_value = {
-            "ok": True,
-            "partial": True,
-            "cleaned": 1,
-            "scan_failures": 2,
-            "delete_failures": 1,
-        }
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            _preview, context = prepare_guangya_organize_clean_empty({})
-            result = clean_empty_guangya_organize_sources_confirmed({}, context)
-
-        self.assertTrue(result.ok)
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(
-            result.data,
-            {"cleaned": 1, "failed": 3, "source_count": 1},
-        )
-        self.assertNotIn("secret-source-id", str(result.to_dict()))
 
     def test_clean_empty_core_and_manager_preserve_failure_counts(self):
         client = Mock()
@@ -440,148 +353,6 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
             {"cleaned": 0, "delete_failures": 1, "scan_failures": 0},
         )
         client.delete_empty_directory.assert_not_called()
-
-    def test_clean_empty_confirm_rejects_source_change_after_preflight(self):
-        original_sources = [{"id": "source-old", "name": "Old Source"}]
-        current_sources = list(original_sources)
-        replacement_sources = [{"id": "source-new", "name": "New Source"}]
-        calls = 0
-
-        def configured_sources():
-            nonlocal calls
-            calls += 1
-            return list(current_sources)
-
-        manager = Mock()
-        manager.task_status.return_value = {"status": "idle"}
-        manager.clean_empty.return_value = {
-            "ok": True,
-            "cleaned": 1,
-            "scan_failures": 0,
-            "delete_failures": 0,
-        }
-        service = AgentOrchestrator(build_tool_registry())
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            side_effect=configured_sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            prepared = service.prepare(
-                "guangya.organize.clean_empty",
-                {},
-                owner="owner-a",
-            )
-            current_sources = list(replacement_sources)
-            with self.assertRaises(AgentToolError) as stale:
-                service.confirm(
-                    prepared["action_plan"]["plan_id"],
-                    owner="owner-a",
-                )
-
-        self.assertEqual(stale.exception.code, "confirmation_stale")
-        manager.clean_empty.assert_not_called()
-        self.assertEqual(calls, 2)
-
-    def test_clean_empty_confirmation_rejects_credential_generation_change(self):
-        sources = [{"id": "source", "name": "Source"}]
-        manager = Mock()
-        manager.task_status.return_value = {"status": "idle"}
-        service = AgentOrchestrator(build_tool_registry())
-        clients = [
-            _atomic_clean_client(credential_generation=1),
-            _atomic_clean_client(credential_generation=2),
-        ]
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            side_effect=clients,
-        ):
-            prepared = service.prepare(
-                "guangya.organize.clean_empty",
-                {},
-                owner="owner-a",
-            )
-            with self.assertRaises(AgentToolError) as stale:
-                service.confirm(
-                    prepared["action_plan"]["plan_id"],
-                    owner="owner-a",
-                )
-
-        self.assertEqual(stale.exception.code, "confirmation_stale")
-        manager.clean_empty.assert_not_called()
-
-    def test_clean_empty_explicit_empty_config_is_rejected(self):
-        values = {
-            "GY_ORGANIZE_SOURCE_DIRS": "[]",
-        }
-        manager = Mock()
-        service = AgentOrchestrator(build_tool_registry())
-        with patch(
-            "app.agent.organize_actions.config.get",
-            side_effect=lambda key, default="": values.get(key, default),
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ):
-            with self.assertRaises(AgentToolError) as blocked:
-                service.prepare(
-                    "guangya.organize.clean_empty",
-                    {},
-                    owner="owner-a",
-                )
-
-        self.assertEqual(blocked.exception.code, "precondition_failed")
-        manager.clean_empty.assert_not_called()
-
-    def test_clean_empty_preview_rejects_missing_login_and_running_task(self):
-        manager = Mock()
-        sources = [{"id": "source", "name": "Source"}]
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=[],
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            missing, _context = prepare_guangya_organize_clean_empty({})
-        manager.task_status.return_value = {"status": "running"}
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            running, _context = prepare_guangya_organize_clean_empty({})
-        manager.task_status.return_value = {"status": "idle"}
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=SimpleNamespace(logged_in=False),
-        ):
-            logged_out, _context = prepare_guangya_organize_clean_empty({})
-
-        self.assertEqual(missing.status, "not_configured")
-        self.assertEqual(running.status, "conflict")
-        self.assertEqual(logged_out.status, "not_configured")
 
     def test_preview_is_dry_run_bounded_and_sanitized(self):
         sources = [{"id": "secret-source-id", "name": "Secret Source"}]
@@ -838,13 +609,18 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         self.assertTrue(capabilities["guangya.organize.run_once"]["requires_confirmation"])
         self.assertEqual(capabilities["guangya.organize.stop"]["risk"], "danger")
         self.assertTrue(capabilities["guangya.organize.stop"]["requires_confirmation"])
-        self.assertEqual(capabilities["guangya.organize.clean_empty"]["risk"], "danger")
-        self.assertTrue(capabilities["guangya.organize.clean_empty"]["requires_confirmation"])
+        self.assertNotIn("guangya.organize.clean_empty", capabilities)
+        self.assertEqual(
+            capabilities["guangya.organize.cleanup.execute"]["risk"], "danger"
+        )
+        self.assertTrue(
+            capabilities["guangya.organize.cleanup.execute"]["requires_confirmation"]
+        )
         with self.assertRaises(AgentToolError) as blocked:
             registry.execute("guangya.organize.run_once", {})
         self.assertEqual(blocked.exception.code, "confirmation_required")
         with self.assertRaises(AgentToolError) as clean_blocked:
-            registry.execute("guangya.organize.clean_empty", {})
+            registry.execute("guangya.organize.cleanup.execute", {})
         self.assertEqual(clean_blocked.exception.code, "confirmation_required")
 
     def test_stop_preview_and_confirmation_are_bound_to_current_task(self):
@@ -997,14 +773,14 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
             parameters={},
             validator=_no_arguments,
             requires_confirmation=True,
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "preview", "确认后执行"),
                 "stable-context",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: (
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
                 self.calls.append(("run", dict(arguments)))
                 or ToolResult(True, "accepted", "done")
-            ),
+            )),
         ))
         registry.register(ToolSpec(
             name="guangya.organize.stop",
@@ -1013,11 +789,11 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
             parameters={},
             validator=_no_arguments,
             requires_confirmation=True,
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "preview", "确认后停止"),
                 "stable-stop-context",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: (
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
                 self.calls.append(("stop", dict(arguments)))
                 or ToolResult(
                     True,
@@ -1025,28 +801,39 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
                     "stopping",
                     data={"requested": True},
                 )
+            )),
+        ))
+        registry.register(ToolSpec(
+            name="guangya.organize.cleanup.preview",
+            description="cleanup preview",
+            risk=RiskLevel.READ,
+            parameters={},
+            validator=_cleanup_preview_arguments,
+            handler=lambda arguments: (
+                self.calls.append(("cleanup_preview", dict(arguments)))
+                or ToolResult(True, "ready", "empty-only ready")
             ),
         ))
         registry.register(ToolSpec(
-            name="guangya.organize.clean_empty",
-            description="clean empty",
+            name="guangya.organize.cleanup.execute",
+            description="cleanup execute",
             risk=RiskLevel.DANGER,
             parameters={},
             validator=_no_arguments,
             requires_confirmation=True,
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "preview", "确认后清理"),
                 "stable-clean-context",
-            ),
-            confirmed_handler=lambda arguments, _expected_context: (
-                self.calls.append(("clean_empty", dict(arguments)))
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
+                self.calls.append(("cleanup_execute", dict(arguments)))
                 or ToolResult(
                     True,
-                    "completed",
-                    "cleaned",
-                    data={"cleaned": 1},
+                    "accepted",
+                    "queued",
+                    data={"empty_dir_count": 1},
                 )
-            ),
+            )),
         ))
         self.service = AgentOrchestrator(registry)
 
@@ -1086,19 +873,28 @@ class GuangYaOrganizeRoutingTests(unittest.TestCase):
 
         clean_anonymous = self.service.query("清理光鸭整理源空目录")
         self.assertEqual(clean_anonymous["result"]["status"], "unsupported")
-        clean_prepared = self.service.query("清理光鸭整理源空目录", owner="owner-a")
+        with patch(
+            "app.agent.orchestrator.validate_empty_only_cleanup_confirmation_binding"
+        ):
+            clean_prepared = self.service.query(
+                "清理光鸭整理源空目录", owner="owner-a"
+            )
         self.assertEqual(clean_prepared["mode"], "confirmation_required")
         self.assertEqual(
             clean_prepared["tool_call"]["name"],
-            "guangya.organize.clean_empty",
+            "guangya.organize.cleanup.execute",
         )
-        self.assertNotIn(("clean_empty", {}), self.calls)
+        self.assertIn(
+            ("cleanup_preview", {"max_candidates": 500, "scope": "empty_only"}),
+            self.calls,
+        )
+        self.assertNotIn(("cleanup_execute", {}), self.calls)
         clean_confirmed = self.service.confirm(
             clean_prepared["action_plan"]["plan_id"],
             owner="owner-a",
         )
-        self.assertEqual(clean_confirmed["result"]["status"], "completed")
-        self.assertIn(("clean_empty", {}), self.calls)
+        self.assertEqual(clean_confirmed["result"]["status"], "accepted")
+        self.assertIn(("cleanup_execute", {}), self.calls)
 
     def test_run_intent_is_conservative(self):
         self.assertTrue(is_guangya_organize_run_message("立即整理光鸭云盘"))
@@ -1203,6 +999,102 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             ),
         )
 
+    def test_removed_cleanup_alias_is_unknown_and_canonical_tool_uses_rate_budget(self):
+        csrf = self.login()
+        headers = {"X-CSRF-Token": csrf}
+        client = SimpleNamespace(
+            logged_in=True,
+            credential_generation=7,
+            close=Mock(),
+        )
+        plan = {
+            "plan_id": "a" * 32,
+            "fingerprint": "b" * 64,
+            "credential_generation": 7,
+            "stats": {"source_count": 1, "empty_dir_count": 1},
+            "samples": ["安全空目录"],
+            "candidates": [],
+            "candidate_decisions": {},
+            "residuals": [],
+            "empties": [{
+                "root": {
+                    "file_id": "private-empty-id",
+                    "parent_id": "private-source-id",
+                    "name": "安全空目录",
+                    "is_dir": True,
+                    "size": 0,
+                    "etag": "version-1",
+                    "updated_at": 1,
+                },
+                "depth": 1,
+            }],
+        }
+        payload = {
+            "session_id": "test_session_identifier_0001",
+            "arguments": {},
+        }
+        with (
+            patch.object(
+                guangya_cleanup_actions,
+                "_configured_cleanup_sources",
+                return_value=[{"id": "private-source-id", "name": "Private Source"}],
+            ),
+            patch.object(
+                guangya_cleanup_actions, "GuangYaClient", return_value=client
+            ),
+            patch.object(
+                guangya_cleanup_actions, "build_cleanup_plan", return_value=plan
+            ),
+            patch.object(
+                guangya_cleanup_actions, "load_cleanup_plan", return_value=plan
+            ),
+        ):
+            preview = self.client.post(
+                "/api/agent/tools/guangya.organize.cleanup.preview",
+                headers=headers,
+                json={
+                    "session_id": payload["session_id"],
+                    "arguments": {"scope": "empty_only"},
+                },
+            )
+            self.assertEqual(preview.status_code, 200, preview.text)
+            self.assertEqual(preview.json()["result"]["data"]["scope"], "empty_only")
+
+            for _ in range(3):
+                prepared = self.client.post(
+                    "/api/agent/actions/guangya.organize.cleanup.execute/prepare",
+                    headers=headers,
+                    json=payload,
+                )
+                self.assertEqual(prepared.status_code, 200, prepared.text)
+                self.assertEqual(
+                    prepared.json()["tool_call"]["name"],
+                    "guangya.organize.cleanup.execute",
+                )
+
+            limited = self.client.post(
+                "/api/agent/actions/guangya.organize.cleanup.execute/prepare",
+                headers=headers,
+                json=payload,
+            )
+            removed_prepare = self.client.post(
+                "/api/agent/actions/guangya.organize.clean_empty/prepare",
+                headers=headers,
+                json=payload,
+            )
+            direct = self.client.post(
+                "/api/agent/tools/guangya.organize.clean_empty",
+                headers=headers,
+                json=payload,
+            )
+
+        self.assertEqual(limited.status_code, 429, limited.text)
+        self.assertEqual(removed_prepare.status_code, 404, removed_prepare.text)
+        self.assertEqual(direct.status_code, 404, direct.text)
+        combined = prepared.text + limited.text + removed_prepare.text + direct.text
+        self.assertNotIn("private-empty-id", combined)
+        self.assertNotIn("private-source-id", combined)
+
     def test_query_prepare_confirm_replay_and_direct_execution_gate(self):
         csrf = self.login()
         headers = {"X-CSRF-Token": csrf}
@@ -1276,132 +1168,6 @@ class GuangYaOrganizeActionAPITests(IsolatedDatabaseTestCase):
             "/private/path",
         ):
             self.assertNotIn(secret, combined)
-
-    def test_clean_empty_query_confirm_replay_and_source_change_gate(self):
-        csrf = self.login()
-        headers = {"X-CSRF-Token": csrf}
-        current = {
-            "sources": [{"id": "secret-source-id", "name": "Secret Source"}],
-        }
-        manager = Mock()
-        manager.task_status.return_value = {"status": "idle"}
-        manager.clean_empty.return_value = {
-            "ok": True,
-            "cleaned": 2,
-            "sources": [{**current["sources"][0], "cleaned": 2}],
-        }
-
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            side_effect=lambda: list(current["sources"]),
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            prepared = self.client.post(
-                "/api/agent/query",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "message": "清理光鸭整理源空目录"},
-            )
-            self.assertEqual(prepared.status_code, 200, prepared.text)
-            self.assertEqual(prepared.json()["mode"], "confirmation_required")
-            self.assertEqual(
-                prepared.json()["tool_call"]["name"],
-                "guangya.organize.clean_empty",
-            )
-            confirmation_id = prepared.json()["action_plan"]["plan_id"]
-            manager.clean_empty.assert_not_called()
-
-            direct = self.client.post(
-                "/api/agent/tools/guangya.organize.clean_empty",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {}},
-            )
-            self.assertEqual(direct.status_code, 409, direct.text)
-            manager.clean_empty.assert_not_called()
-
-            confirmed = self.client.post(
-                "/api/agent/actions/confirm",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
-            )
-            self.assertEqual(confirmed.status_code, 200, confirmed.text)
-            self.assertEqual(confirmed.json()["result"]["status"], "completed")
-            self.assertEqual(
-                confirmed.json()["result"]["data"],
-                {"cleaned": 2, "failed": 0, "source_count": 1},
-            )
-            manager.clean_empty.assert_called_once()
-            self.assertEqual(manager.clean_empty.call_args.args, (current["sources"],))
-            self.assertTrue(manager.clean_empty.call_args.kwargs["client"].logged_in)
-
-            replay = self.client.post(
-                "/api/agent/actions/confirm",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
-            )
-            self.assertEqual(replay.status_code, 409, replay.text)
-            self.assertEqual(manager.clean_empty.call_count, 1)
-
-            stale_prepare = self.client.post(
-                "/api/agent/actions/guangya.organize.clean_empty/prepare",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {}},
-            )
-            self.assertEqual(stale_prepare.status_code, 200, stale_prepare.text)
-            current["sources"] = [
-                {"id": "secret-source-two", "name": "Secret Source Two"},
-            ]
-            stale = self.client.post(
-                "/api/agent/actions/confirm",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001",
-                    "plan_id": stale_prepare.json()["action_plan"]["plan_id"]
-                },
-            )
-            self.assertEqual(stale.status_code, 409, stale.text)
-            self.assertEqual(manager.clean_empty.call_count, 1)
-
-        combined = prepared.text + direct.text + confirmed.text + replay.text + stale.text
-        for secret in ("secret-source-id", "Secret Source", "secret-source-two"):
-            self.assertNotIn(secret, combined)
-
-    def test_clean_empty_query_and_prepare_share_one_rate_limit_budget(self):
-        csrf = self.login()
-        headers = {"X-CSRF-Token": csrf}
-        sources = [{"id": "source", "name": "Source"}]
-        manager = Mock()
-        manager.task_status.return_value = {"status": "idle"}
-
-        with patch(
-            "app.agent.organize_actions._configured_sources",
-            return_value=sources,
-        ), patch(
-            "app.agent.organize_actions.get_organize_manager",
-            return_value=manager,
-        ), patch(
-            "app.agent.organize_actions.GuangYaClient",
-            return_value=_atomic_clean_client(),
-        ):
-            for _ in range(4):
-                response = self.client.post(
-                    "/api/agent/query",
-                    headers=headers,
-                    json={"session_id": "test_session_identifier_0001", "message": "清理光鸭整理源空目录"},
-                )
-                self.assertEqual(response.status_code, 200, response.text)
-
-            limited = self.client.post(
-                "/api/agent/actions/guangya.organize.clean_empty/prepare",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {}},
-            )
-
-        self.assertEqual(limited.status_code, 429, limited.text)
-        self.assertEqual(limited.json()["error"], "Agent 请求过于频繁，请稍后重试")
 
     def test_stop_query_prepare_confirm_replay_and_stale_task_gate(self):
         csrf = self.login()

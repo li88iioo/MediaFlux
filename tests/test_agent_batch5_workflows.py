@@ -17,8 +17,6 @@ from app.agent.discovery_mapping_actions import (
     configure_discovery_mapping_context,
     confirm_discovery_mapping_confirmed,
     discovery_confirm_mapping_arguments,
-    discovery_detail_arguments,
-    discovery_mapping_candidates_arguments,
     get_discovery_detail,
     get_discovery_mapping_candidates,
     prepare_confirm_discovery_mapping,
@@ -26,10 +24,7 @@ from app.agent.discovery_mapping_actions import (
 from app.agent.guangya_directory_scrape_actions import (
     _flows,
     configure_directory_scrape_context,
-    directory_scrape_inspect_arguments,
-    directory_scrape_preview_arguments,
     directory_scrape_run_arguments,
-    directory_scrape_search_arguments,
     execute_durable_directory_scrape_job,
     inspect_directory_scrape,
     prepare_run_directory_scrape,
@@ -1202,7 +1197,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
                 parameters={"type": "object"},
                 validator=identity,
                 requires_confirmation=True,
-                confirmation_preparer=lambda arguments, tool_name=tool_name: (
+                context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments, tool_name=tool_name: (
                     ToolResult(
                         True,
                         "confirmation_required",
@@ -1210,10 +1205,10 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
                         data=dict(arguments),
                     ),
                     f"rate-test:{tool_name}:{arguments!r}",
-                ),
-                confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+                )),
+                context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _expected_context: ToolResult(
                     True, "completed", "done"
-                ),
+                )),
             ))
         agent = AgentOrchestrator(registry, confirmation_store=ConfirmationStore())
         cases = (
@@ -1288,13 +1283,13 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             parameters={"type": "object", "properties": {}, "additionalProperties": False},
             validator=lambda _arguments: {},
             requires_confirmation=True,
-            confirmation_preparer=lambda _arguments: (
+            context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda _arguments: (
                 ToolResult(True, "confirmation_required", "preview"),
                 "patrol-now",
-            ),
-            confirmed_handler=lambda _arguments, _expected_context: ToolResult(
+            )),
+            context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda _arguments, _expected_context: ToolResult(
                 True, "accepted", "queued"
-            ),
+            )),
         ))
         agent = AgentOrchestrator(registry, confirmation_store=ConfirmationStore())
         identity = "patrol-shared-real-budget"

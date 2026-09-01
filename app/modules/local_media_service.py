@@ -24,6 +24,11 @@ from app.modules.directory_scrape import DirectoryScrapeService, FixedMatchScrap
 from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
 from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
 from app.modules.local_move_transaction import LocalMoveTransaction, MoveTransactionResult
+from app.modules.local_media_candidates import move_candidate_to_trash
+from app.modules.local_media_models import (
+    canonical_local_media_content_path,
+    local_media_paths_overlap,
+)
 from app.modules.process_lock import CrossProcessLock
 from app.modules.local_path_mapping import (
     assert_within,
@@ -61,7 +66,6 @@ from app.modules.media_server_path_mapping import (
     configured_media_server_refresh_options,
 )
 from app.modules.scraper import MatchResult, TMDBScraper
-from app.config import get, get_bool
 from app.logger import get_logger
 from app.modules.special_media import (
     is_special_media_name,
@@ -1753,6 +1757,44 @@ class LocalMediaService:
         finally:
             if inspection_id:
                 self.inspections.discard(owner, inspection_id)
+
+    @staticmethod
+    def _assert_no_active_task_path_overlap(owner: str, selected_path: Path) -> None:
+        with db.get_conn() as conn:
+            rows = conn.execute(
+                "SELECT id,content_path FROM local_media_tasks "
+                "WHERE owner=? AND status NOT IN ('completed','failed') ORDER BY id",
+                (str(owner or "").strip(),),
+            ).fetchall()
+        for row in rows:
+            try:
+                task_path = Path(canonical_local_media_content_path(row["content_path"]))
+            except ValueError:
+                continue
+            if local_media_paths_overlap(selected_path, task_path):
+                raise LocalMediaServiceError(
+                    "该条目与未完成的本地媒体任务路径重叠，请先完成或清理相关任务"
+                )
+
+    @_local_media_operation
+    def move_media_item_to_trash(
+        self,
+        owner: str,
+        source_id: int,
+        path: Path | str,
+        expected_identity: dict[str, Any],
+    ) -> Path:
+        """在统一本地媒体 Writer 内把一级媒体条目移入可恢复回收区。"""
+        with _local_media_write_lease():
+            source = db.get_local_media_source(int(source_id), owner=owner)
+            if source is None:
+                raise LocalMediaServiceError("本地媒体来源不存在")
+            root = require_container_absolute_path(source.local_root, label="来源目录")
+            selected = assert_within(Path(path), root)
+            if selected == root or selected.parent != root:
+                raise LocalMediaServiceError("仅允许删除来源根目录下的一级媒体条目")
+            self._assert_no_active_task_path_overlap(owner, selected)
+            return move_candidate_to_trash(source, selected, expected_identity)
 
     @_local_media_operation
     def execute_task(self, owner: str, task_id: int, *, qb_client=None) -> dict[str, Any]:

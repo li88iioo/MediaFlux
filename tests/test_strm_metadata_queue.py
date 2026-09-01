@@ -327,7 +327,6 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
                 root,
                 client=client,
                 metadata_exts={"nfo"},
-                defer_metadata=True,
             )
 
             self.assertEqual(result["generated"], 1)

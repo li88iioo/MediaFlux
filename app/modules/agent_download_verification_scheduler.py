@@ -30,7 +30,6 @@ from app.notifier import TelegramSendResult
 from app.modules.agent_download_verification_notifications import (
     dump_download_verification_payload,
     load_download_verification_payload,
-    notify_download_verification_terminal,
     notify_download_verification_terminal_result,
 )
 

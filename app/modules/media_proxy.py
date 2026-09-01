@@ -3225,11 +3225,6 @@ def _authorization_device_ids(value: Any) -> list[str]:
     return values
 
 
-def _authorization_device_id(value: Any) -> str:
-    values = _authorization_device_ids(value)
-    return values[0] if values else ""
-
-
 def _request_device_ids(request: Any) -> list[str]:
     values = _request_query_values(request, "DeviceId")
     for key in ("X-Emby-Device-Id", "X-Jellyfin-Device-Id"):
@@ -3599,10 +3594,6 @@ def _playback_source_signature(
         f"{_normalized_media_identifier(source_id)}\0{token}"
     ).encode("utf-8")
     return hmac.new(_AUTH_SCOPE_SECRET, payload, hashlib.sha256).hexdigest()[:48]
-
-
-def _request_auth_scope(request: Any) -> str:
-    return _auth_scope_fingerprint(_request_auth_credential(request))
 
 
 def _media_browser_authorization(credential: str) -> str:
@@ -4193,11 +4184,6 @@ def _authorization_tokens(value: str) -> list[str]:
         if token:
             tokens.append(token)
     return tokens
-
-
-def _authorization_token(value: str) -> str:
-    tokens = _authorization_tokens(value)
-    return tokens[0] if tokens else ""
 
 
 async def _client_is_authorized(
@@ -5184,12 +5170,9 @@ def create_proxy_app(
                 str(instance["upstream_url"]),
                 "/" + str(path).lstrip("/"),
             )
-            logical = httpx.URL(pinned.logical_url)
-            scheme = "wss" if logical.scheme == "https" else "ws"
-            target = str(logical.copy_with(scheme=scheme))
-            query = _sanitized_query_string(websocket) if hasattr(websocket, "query_params") else websocket.url.query
-            if query:
-                target = f"{target}?{query}"
+            target = _websocket_upstream_url(
+                str(instance["upstream_url"]), websocket, path
+            )
             connector = TCPConnector(
                 resolver=_PinnedResolver(pinned.sni_hostname, pinned.addresses),
                 use_dns_cache=True,

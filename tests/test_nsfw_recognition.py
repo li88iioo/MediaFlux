@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import tempfile
+from contextlib import nullcontext
 import threading
 import time
 import unittest
@@ -31,7 +32,6 @@ from app.modules.nsfw import (
     extract_nsfw_identifier,
     extract_nsfw_multipart,
     extract_nsfw_part_index,
-    normalize_code,
     validate_category_name,
 )
 from app.modules.organize import (
@@ -638,7 +638,7 @@ class NsfwOrganizerTests(unittest.TestCase):
             nsfw_metatube_endpoint="http://127.0.0.1:8080",
         )
 
-        with patch.object(organizer, "_nsfw_recognizer", return_value=recognizer):
+        with patch.object(organizer, "_nsfw_recognizer_lease", return_value=nullcontext(recognizer)):
             match = organizer._resolve_plan_match(
                 GuangYaFile("f1", "SSIS-001.mp4", False, 1, "e", "p1"),
                 rules,
@@ -778,10 +778,11 @@ class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
         with patch(
             "app.modules.organize_correction.OrganizeRules.from_config",
             return_value=self._rules(),
-        ), patch.object(service.organizer, "_nsfw_recognizer", return_value=recognizer):
+        ), patch.object(
+            service.organizer, "_nsfw_recognizer_lease",
+            return_value=nullcontext(recognizer),
+        ):
             candidates = service.search_candidates(log_id, "SSIS-001")
-            with self.assertRaisesRegex(ValueError, "只允许使用 MetaTube"):
-                service.search_tmdb(log_id, "SSIS-001")
 
         recognizer.candidates.assert_called_once_with("SSIS-001")
         scraper.search_candidates.assert_not_called()
@@ -797,7 +798,10 @@ class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
         with patch(
             "app.modules.organize_correction.OrganizeRules.from_config",
             return_value=self._rules(),
-        ), patch.object(service.organizer, "_nsfw_recognizer", return_value=recognizer):
+        ), patch.object(
+            service.organizer, "_nsfw_recognizer_lease",
+            return_value=nullcontext(recognizer),
+        ):
             candidates = service.search_candidates(log_id, "hhd800.com@SSIS-001.mp4")
 
         self.assertEqual(candidates[0]["provider"], "clean_title")
@@ -841,7 +845,10 @@ class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
         with patch(
             "app.modules.organize_correction.OrganizeRules.from_config",
             return_value=self._rules(),
-        ), patch.object(service.organizer, "_nsfw_recognizer", return_value=recognizer):
+        ), patch.object(
+            service.organizer, "_nsfw_recognizer_lease",
+            return_value=nullcontext(recognizer),
+        ):
             preview = service.preview_reorganize(
                 log_id, "", "movie", provider="metatube",
                 external_id="javbus:ssis001",
@@ -868,7 +875,10 @@ class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
         with patch(
             "app.modules.organize_correction.OrganizeRules.from_config",
             return_value=self._rules(),
-        ), patch.object(service.organizer, "_nsfw_recognizer", return_value=recognizer), \
+        ), patch.object(
+            service.organizer, "_nsfw_recognizer_lease",
+            return_value=nullcontext(recognizer),
+        ), \
                 self.assertRaisesRegex(ValueError, "候选番号与原文件不一致"):
             service.preview_reorganize(
                 log_id, "", "movie", provider="metatube",
@@ -924,7 +934,8 @@ class NsfwLocalIntegrationTests(IsolatedDatabaseTestCase):
                 nsfw_category_name="成人内容",
             )
             with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules), patch.object(
-                service.organizer, "_nsfw_recognizer", return_value=recognizer
+                service.organizer, "_nsfw_recognizer_lease",
+                return_value=nullcontext(recognizer),
             ):
                 preview = service.preview("admin", inspection["inspection_id"])
 

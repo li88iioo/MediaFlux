@@ -362,33 +362,6 @@ def organize_recognition_search(log_id: int, request: Request,
         service.close()
 
 
-@router.post("/organize/{log_id}/tmdb/search")
-def organize_tmdb_search(log_id: int, request: Request,
-                         data: dict | None = Body(default=None)):
-    require_api_login(request)
-    data = data or {}
-    media_type = str(data.get("media_type") or "").strip()
-    if media_type and media_type not in {"movie", "tv"}:
-        return api_error("media_type 仅支持 movie 或 tv", 400)
-    service = OrganizeCorrectionService()
-    try:
-        return {
-            "candidates": service.search_tmdb(
-                log_id, str(data.get("query") or "").strip(),
-                str(data.get("year") or "").strip(), media_type,
-            )
-        }
-    except LookupError as exc:
-        return api_error(str(exc), 404)
-    except ValueError as exc:
-        return api_error(str(exc), 400)
-    except Exception as exc:
-        logger.error("整理日志 TMDB 搜索失败 log=%s type=%s", log_id, type(exc).__name__)
-        return api_error(str(exc), 502)
-    finally:
-        service.close()
-
-
 def _optional_position(data: dict, key: str, *, minimum: int) -> int | None:
     raw = data.get(key)
     if raw is None or str(raw).strip() == "":

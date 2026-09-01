@@ -90,7 +90,10 @@ class GCIDImportAPITests(InitializedWebTestCase):
             "ENV_WEB_PASSWORD": "123456",
         })
         self.env_patch.start()
-        self.enterContext(patch("app.notifier.send_event", return_value=True))
+        self.enterContext(patch(
+            "app.modules.telegram_notification_center.send_event_result",
+            return_value=notifier.TelegramSendResult(ok=True),
+        ))
         reset = getattr(gcid_import, "reset_runtime_state", None)
         if reset:
             reset()

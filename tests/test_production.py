@@ -34,7 +34,6 @@ from app.modules.download_dispatcher import (
     create_request,
     dispatch_request,
     normalize_download_url,
-    parse_torrent_metadata,
     request_key,
     request_keys,
     torrent_download_input,
@@ -64,7 +63,6 @@ from app.modules.runtime_log import (
     clear_logs,
     log_generation,
     log_identity,
-    read_from_offset,
     read_last_lines,
     read_stream_chunk,
 )
@@ -83,6 +81,16 @@ from tests.support import (
     release_parse_fields,
     release_parse_result,
 )
+
+
+def _visible_runtime_chunk(offset: int, *, max_bytes: int | None = None):
+    kwargs = {} if max_bytes is None else {"max_bytes": max_bytes}
+    chunk = read_stream_chunk(offset, **kwargs)
+    return (
+        [event.line for event in chunk.events],
+        chunk.offset,
+        bool(chunk.reset_reason),
+    )
 
 
 def _parse_fields(parser, filename: str, parent_path: str = "") -> dict[str, object]:
@@ -2748,8 +2756,10 @@ class TelegramBotTests(unittest.TestCase):
         ) as constructor:
             self.assertIs(notifier.get_bot(), bot)
             self.assertIs(notifier.get_bot(), bot)
-            message = notifier.format_event("任务", "<unsafe>")
-            self.assertTrue(notifier.send(message))
+            message = notifier.render_event(
+                notifier.NotificationEvent("任务", lines=("<unsafe>",))
+            )
+            self.assertTrue(notifier.send_result(message).ok)
         constructor.assert_called_once_with("token", parse_mode="HTML")
         self.assertIn("&lt;unsafe&gt;", message)
         bot.send_message.assert_called_once_with("100", message)
@@ -3400,14 +3410,14 @@ class SecurityTests(InitializedWebTestCase):
                     read_last_lines(2),
                     ["GET https://api.telegram.org/bot123456:********/getMe", "three"],
                 )
-                lines, offset, rotated = read_from_offset(0)
+                lines, offset, rotated = _visible_runtime_chunk(0)
                 self.assertEqual(
                     lines,
                     ["one", "GET https://api.telegram.org/bot123456:********/getMe", "three"],
                 )
                 self.assertFalse(rotated)
                 path.write_text("new\n", encoding="utf-8")
-                next_lines, _, rotated = read_from_offset(offset)
+                next_lines, _, rotated = _visible_runtime_chunk(offset)
                 self.assertTrue(rotated)
                 self.assertEqual(next_lines, ["new"])
 
@@ -3517,7 +3527,7 @@ class SecurityTests(InitializedWebTestCase):
             )
             expected_size = path.stat().st_size
             with patch("app.modules.runtime_log.APP_LOG", path):
-                lines, offset, reset = read_from_offset(0, max_bytes=4096)
+                lines, offset, reset = _visible_runtime_chunk(0, max_bytes=4096)
 
         self.assertTrue(reset)
         self.assertEqual(offset, expected_size)
@@ -3662,13 +3672,13 @@ class SecurityTests(InitializedWebTestCase):
             )
             with patch("app.modules.runtime_log.APP_LOG", path):
                 self.assertEqual(read_last_lines(10), [before, expected_summary, after])
-                lines, _, rotated = read_from_offset(0)
+                lines, _, rotated = _visible_runtime_chunk(0)
                 self.assertFalse(rotated)
                 self.assertEqual(lines, [before, expected_summary, after])
 
                 raw = path.read_bytes()
                 middle = raw.index(b"connectionpool.py") + 6
-                lines, _, reset = read_from_offset(middle)
+                lines, _, reset = _visible_runtime_chunk(middle)
                 self.assertTrue(reset)
                 self.assertEqual(lines, [after])
 
@@ -3682,13 +3692,13 @@ class SecurityTests(InitializedWebTestCase):
                 encoding="utf-8",
             )
             with patch("app.modules.runtime_log.APP_LOG", path):
-                first, offset, _ = read_from_offset(0)
+                first, offset, _ = _visible_runtime_chunk(0)
                 self.assertEqual(first, [before])
                 with path.open("a", encoding="utf-8") as handle:
                     handle.write('  File "requests.py", line 1\n')
                     handle.write("requests.exceptions.ConnectTimeout: timed out\n")
                     handle.write("2026-08-01 00:00:02.000 | INFO    | app.worker | recovered\n")
-                second, _, rotated = read_from_offset(offset)
+                second, _, rotated = _visible_runtime_chunk(offset)
                 self.assertFalse(rotated)
                 self.assertEqual(
                     second,
@@ -3700,12 +3710,12 @@ class SecurityTests(InitializedWebTestCase):
             path = Path(tmp) / "app.log"
             path.write_bytes(b"2026-08-01 00:00:00.000 | INFO    | app.worker | partial")
             with patch("app.modules.runtime_log.APP_LOG", path):
-                first, offset, _ = read_from_offset(0)
+                first, offset, _ = _visible_runtime_chunk(0)
                 self.assertEqual(first, [])
                 self.assertEqual(offset, 0)
                 with path.open("ab") as handle:
                     handle.write(b" complete\n")
-                second, new_offset, _ = read_from_offset(offset)
+                second, new_offset, _ = _visible_runtime_chunk(offset)
                 self.assertEqual(
                     second,
                     ["2026-08-01 00:00:00.000 | INFO    | app.worker | partial complete"],
@@ -4174,12 +4184,13 @@ class SecurityTests(InitializedWebTestCase):
         login = self.client.get("/login")
         self._authenticated()
         settings = self.client.get("/settings")
-        for name in ("img/mediaflux-logo.svg", "img/mediaflux-mark.svg", "favicon.svg"):
+        for name in ("img/mediaflux-logo.svg", "favicon.svg"):
             asset = root / "static" / name
             self.assertTrue(asset.is_file(), name)
             source = asset.read_text(encoding="utf-8")
             self.assertIn("<svg", source)
             self.assertNotIn("linearGradient", source)
+        self.assertFalse((root / "static/img/mediaflux-mark.svg").exists())
         for html in (login.text, settings.text):
             self.assertIn('rel="icon" type="image/svg+xml"', html)
             self.assertIn('/static/favicon.svg', html)

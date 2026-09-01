@@ -115,7 +115,7 @@ def _confirmation_registry(*, calls=None) -> ToolRegistry:
             "enabled": bool(arguments["enabled"]),
         },
         requires_confirmation=True,
-        confirmation_preparer=lambda arguments: (
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
             ToolResult(
                 True,
                 "confirmation_required",
@@ -123,10 +123,10 @@ def _confirmation_registry(*, calls=None) -> ToolRegistry:
                 data=dict(arguments),
             ),
             f"feature-state:{arguments['feature']}:{arguments['enabled']}",
-        ),
-        confirmed_handler=lambda arguments, _expected_context: (
+        )),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: (
             calls.append(dict(arguments)) or ToolResult(True, "changed", "已修改")
-        ),
+        )),
         llm_confirmation=True,
     ))
     registry.register(ToolSpec(
@@ -136,13 +136,13 @@ def _confirmation_registry(*, calls=None) -> ToolRegistry:
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
         validator=lambda arguments: {},
         requires_confirmation=True,
-        confirmation_preparer=lambda arguments: (
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
             ToolResult(True, "confirmation_required", "preview"),
             "demo-low-write",
-        ),
-        confirmed_handler=lambda arguments, _expected_context: ToolResult(
+        )),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: ToolResult(
             True, "changed", "changed"
-        ),
+        )),
     ))
     registry.register(ToolSpec(
         name="workspace.health",
@@ -269,13 +269,13 @@ def _read_registry(*, calls=None) -> ToolRegistry:
         parameters={"type": "object", "properties": {}},
         validator=_identity,
         requires_confirmation=True,
-        confirmation_preparer=lambda arguments: (
+        context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(lambda arguments: (
             ToolResult(True, "preview", "preview"),
             "feature-state",
-        ),
-        confirmed_handler=lambda arguments, _expected_context: ToolResult(
+        )),
+        context_confirmed_handler=ToolSpec.context_free_confirmed_handler(lambda arguments, _expected_context: ToolResult(
             True, "ok", "changed"
-        ),
+        )),
     ))
     registry.register(ToolSpec(
         name="demo.read",
@@ -491,7 +491,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
             "strm.run_once",
             "guangya.organize.run_once",
             "guangya.organize.stop",
-            "guangya.organize.clean_empty",
+            "guangya.organize.cleanup.execute",
         }.issubset(confirmation_tools))
         self.assertIn("agent.cancel_pending_action", read_tools)
         self.assertNotIn("indexer.submit_resource", confirmation_tools)

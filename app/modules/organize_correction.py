@@ -317,10 +317,10 @@ class OrganizeCorrectionService:
         query = (query or detail.get("title") or detail.get("original_name") or "").strip()
         rules = self._rules_for_source_scope(str(detail.get("source_dir_id") or ""))
         if rules.nsfw_exclusive:
-            recognizer = self.organizer._nsfw_recognizer(rules)
-            if recognizer is None:
-                raise ValueError("成人来源未配置可用的 MetaTube 服务")
-            candidates = recognizer.candidates(query)
+            with self.organizer._nsfw_recognizer_lease(rules) as recognizer:
+                if recognizer is None:
+                    raise ValueError("成人来源未配置可用的 MetaTube 服务")
+                candidates = recognizer.candidates(query)
             if candidates:
                 return [self._candidate_dict(item) for item in candidates]
             seed = (
@@ -335,14 +335,6 @@ class OrganizeCorrectionService:
         )
         candidates = self.scraper.search_candidates(query, year, media_type)
         return [self._candidate_dict(item) for item in candidates]
-
-    def search_tmdb(self, log_id: int, query: str = "", year: str = "",
-                    media_type: str = "") -> list[dict]:
-        """兼容旧 API；成人来源必须走 provider-aware 搜索，禁止回退 TMDB。"""
-        detail = self.detail(log_id)
-        if bool((detail.get("recognition") or {}).get("nsfw_only")):
-            raise ValueError("成人番号专用来源只允许使用 MetaTube 精确识别")
-        return self.search_candidates(log_id, query, year, media_type)
 
     @staticmethod
     def _candidate_dict(item: Candidate) -> dict:
@@ -422,10 +414,10 @@ class OrganizeCorrectionService:
                     provider="clean_title", external_id=resolved_code,
                     metadata=metadata, status="matched", locked=True,
                 )
-            recognizer = self.organizer._nsfw_recognizer(effective_rules)
-            if recognizer is None:
-                raise ValueError("成人来源未配置可用的 MetaTube 服务")
-            result, detail = recognizer.resolve(str(external_id).strip())
+            with self.organizer._nsfw_recognizer_lease(effective_rules) as recognizer:
+                if recognizer is None:
+                    raise ValueError("成人来源未配置可用的 MetaTube 服务")
+                result, detail = recognizer.resolve(str(external_id).strip())
             resolved_code = normalize_code(str(detail.get("number") or ""))
             if not resolved_code or resolved_code not in source_codes:
                 raise ValueError("MetaTube 候选番号与原文件不一致，请重新搜索")

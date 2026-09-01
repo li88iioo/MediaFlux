@@ -281,6 +281,25 @@ class ConfirmationStore:
             self._tickets[confirmation_id] = ticket
             return _copy_ticket(ticket)
 
+    def ticket_owner_match(
+        self, *, owner: str, confirmation_id: str
+    ) -> bool | None:
+        """判断有效票据是否属于 owner；不存在/过期返回 ``None``，且不消费。"""
+        owner_key = str(owner or "").strip()
+        ticket_id = normalize_action_plan_id(confirmation_id)
+        if not owner_key or not ticket_id:
+            return None
+        now = self._clock()
+        with self._lock:
+            self._prune_locked(now)
+            ticket = self._tickets.get(ticket_id)
+            if ticket is None:
+                return None
+            current = self._owner_generations.get(ticket.owner)
+            if current is None or ticket.owner_generation != current[0]:
+                return None
+            return secrets.compare_digest(ticket.owner, owner_key)
+
     def claim_and_rotate_owner(
         self, *, owner: str, confirmation_id: str, record_execution: bool = False,
         execution_risk_for: Callable[[str], Any] | None = None,
@@ -731,6 +750,52 @@ class SQLiteConfirmationStore(ConfirmationStore):
             followup_context=normalized_followup,
             confirmation_contract=normalized_contract,
         )
+
+    def ticket_owner_match(
+        self, *, owner: str, confirmation_id: str
+    ) -> bool | None:
+        """跨 Worker 判断有效票据归属，不读取动作内容也不消费票据。"""
+        from app import database as db
+
+        owner_key = str(owner or "").strip()
+        ticket_id = normalize_action_plan_id(confirmation_id)
+        if not owner_key or not ticket_id:
+            return None
+        requested_digest = self._owner_digest(owner_key)
+        now = self._clock()
+        with db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._ensure_schema(conn)
+            self._prune(conn, now)
+            row = conn.execute(
+                "SELECT owner_digest,owner_generation,expires_at "
+                "FROM agent_confirmations WHERE confirmation_id=?",
+                (ticket_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                ticket_digest = str(row["owner_digest"] or "")
+                ticket_generation = _stored_owner_generation(
+                    row["owner_generation"]
+                )
+                expires_at = float(row["expires_at"])
+            except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+                return None
+            epoch = conn.execute(
+                "SELECT generation FROM agent_confirmation_epochs "
+                "WHERE owner_digest=?",
+                (ticket_digest,),
+            ).fetchone()
+            if epoch is None or expires_at <= now:
+                return None
+            try:
+                epoch_generation = _stored_owner_generation(epoch["generation"])
+            except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+                return None
+            if ticket_generation != epoch_generation:
+                return None
+            return secrets.compare_digest(ticket_digest, requested_digest)
 
     def claim_and_rotate_owner(
         self, *, owner: str, confirmation_id: str, record_execution: bool = False,

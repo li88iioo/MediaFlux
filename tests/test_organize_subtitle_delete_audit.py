@@ -616,7 +616,7 @@ class DirectoryScrapeOrganizerSecretPersistenceTests(IsolatedDatabaseTestCase):
         stats = self._stats()
 
         with patch.object(organizer, "_ensure_dir_chain", return_value="target"), \
-                self.assertLogs("app.modules.organize", level="ERROR") as captured:
+                self.assertLogs("app.modules.organize_execution", level="ERROR") as captured:
             execute_organize_plans(organizer,
                 [self._plan("move-failure")],
                 OrganizeRules(target_dir_id="archive"),
@@ -669,7 +669,7 @@ class DirectoryScrapeOrganizerSecretPersistenceTests(IsolatedDatabaseTestCase):
         stats = self._stats()
 
         with patch.object(organizer, "_ensure_dir_chain", return_value="target"), \
-                self.assertLogs("app.modules.organize", level="ERROR") as captured:
+                self.assertLogs("app.modules.organize_execution", level="ERROR") as captured:
             execute_organize_plans(organizer,
                 [self._plan()],
                 OrganizeRules(target_dir_id="archive", rename_enabled=True),
@@ -737,7 +737,7 @@ class DirectoryScrapeOrganizerSecretPersistenceTests(IsolatedDatabaseTestCase):
         with patch.object(organizer, "_ensure_dir_chain", return_value="target"), patch.object(
             organizer, "_resolve_variant_conflict",
             return_value=(existing, "replace", "同版本新文件胜出"),
-        ), self.assertLogs("app.modules.organize", level="ERROR") as captured:
+        ), self.assertLogs("app.modules.organize_execution", level="ERROR") as captured:
             execute_organize_plans(organizer,
                 [incoming],
                 OrganizeRules(

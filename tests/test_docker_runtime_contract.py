@@ -111,6 +111,10 @@ class DockerRuntimeContractTests(unittest.TestCase):
 
     def test_healthcheck_uses_fixed_container_port_and_readiness(self) -> None:
         self.assertIn("127.0.0.1:1258/readyz", self.dockerfile)
+        self.assertIn(
+            "127.0.0.1:1258/readyz', timeout=3)\" >/dev/null 2>&1",
+            self.dockerfile,
+        )
         self.assertNotIn("/healthz", self.dockerfile)
         self.assertNotIn("flask_port", self.dockerfile)
         self.assertNotIn("healthcheck", self.compose["services"]["mediaflux"])
@@ -209,6 +213,96 @@ class DockerRuntimeContractTests(unittest.TestCase):
             self.assertIn("MEDIAFLUX_FIX_STRM_PERMISSIONS", text)
         self.assertIn("入口脚本**永不递归改权**", deploy)
         self.assertIn("不要同时配置 Compose 的 `user:`", deploy)
+
+    def test_operator_docs_match_health_backup_and_release_runtime_contracts(self) -> None:
+        readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        deploy = (self.ROOT / "docs" / "部署指南.md").read_text(encoding="utf-8")
+        faq = (self.ROOT / "docs" / "常见问题.md").read_text(encoding="utf-8")
+        config_reference = (self.ROOT / "docs" / "配置参考.md").read_text(encoding="utf-8")
+        development = (self.ROOT / "docs" / "开发文档.md").read_text(encoding="utf-8")
+
+        self.assertNotIn("curl -I ", faq)
+        self.assertGreaterEqual(faq.count("curl -fsS "), 2)
+        self.assertNotIn("mediaflux.py backup list", deploy)
+        self.assertIn("ls -lah /app/db/backups", deploy)
+        self.assertIn("Pull Request、`main` 推送与 `v<SemVer>` 标签", development)
+        self.assertIn("Playwright 1.62.0", development)
+        self.assertIn("二者通过后执行 amd64 容器运行", development)
+        self.assertIn("仅 `v<SemVer>` 标签继续构建", development)
+        self.assertNotIn("支持定时扫描或下载完成自动触发", readme)
+        self.assertNotIn("qB 完成触发与定时扫描独立开关", config_reference)
+
+    def test_browser_gate_covers_every_playwright_module_without_skips(self) -> None:
+        workflow = yaml.safe_load(self.workflow)
+        jobs = workflow["jobs"]
+        browser = jobs["browser"]
+        browser_runs = "\n".join(
+            str(step.get("run", "")) for step in browser["steps"]
+        )
+        playwright_modules = {
+            f"tests.{path.stem}"
+            for path in (self.ROOT / "tests").glob("test_*.py")
+            if re.search(
+                r"(?m)^\s*from playwright\.sync_api import ",
+                path.read_text(encoding="utf-8"),
+            )
+        }
+        self.assertEqual(
+            playwright_modules,
+            {
+                "tests.test_agent_browser",
+                "tests.test_guangya_directory_scrape_browser",
+                "tests.test_guangya_directory_scrape_ui",
+                "tests.test_media_profile_in_place_ui",
+                "tests.test_navigation_discovery_ui",
+                "tests.test_window_viewport_inset",
+            },
+        )
+        self.assertNotIn("needs", browser)
+        self.assertIn('python -m pip install "playwright==1.62.0"', browser_runs)
+        self.assertIn('version("playwright") == "1.62.0"', browser_runs)
+        for executable in (
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ):
+            with self.subTest(executable=executable):
+                self.assertIn(f"command -v {executable}", browser_runs)
+        for module in playwright_modules:
+            with self.subTest(module=module):
+                self.assertIn(f'"{module}"', browser_runs)
+        self.assertIn("if result.skipped:", browser_runs)
+        self.assertIn(
+            "result.wasSuccessful() and not result.skipped",
+            browser_runs,
+        )
+        self.assertEqual(jobs["smoke"]["needs"], ["test", "browser"])
+        self.assertEqual(
+            jobs["build"]["needs"],
+            ["test", "smoke"],
+        )
+
+    def test_v014_upgrade_smoke_retires_legacy_organize_outbox_safely(self) -> None:
+        for value in (
+            'legacy_organize_key = "organize-summary:docker-upgrade:100"',
+            '"<b>✅ 光鸭整理完成</b>\\n"',
+            '"<blockquote>升级迁移测试 &amp; 安全正文</blockquote>"',
+            'AND name=\'organize_notification_outbox\'',
+            'legacy_organize_table is None',
+            '"FROM telegram_notification_outbox WHERE event_key=?"',
+            'event["title"] == "✅ 光鸭整理完成"',
+            '"升级迁移测试 & 安全正文"',
+            'assert "<" not in event["title"]',
+            '"retry_wait",\n                  2,\n                  3,',
+        ):
+            with self.subTest(value=value):
+                self.assertIn(value, self.workflow)
+
+    def test_obsolete_package_type_generator_is_removed(self) -> None:
+        self.assertFalse(
+            (self.ROOT / "packaging" / "scripts" / "generate_package_type.py").exists()
+        )
 
     def test_production_deployment_requires_no_env_file(self) -> None:
         self.assertFalse((self.ROOT / ".env.example").exists())

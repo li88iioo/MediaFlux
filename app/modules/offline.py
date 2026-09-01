@@ -24,9 +24,7 @@ DEFAULT_VIDEO_EXTS = (
     "mkv", "mp4", "ts", "m2ts", "mts", "iso", "avi", "mov", "m4v",
     "webm", "mpeg", "mpg", "wmv", "flv", "vob", "tp", "f4v", "rm", "rmvb",
 )
-# 保留旧常量名作为内部兼容别名；其语义从本版起就是“仅视频”。
-DEFAULT_MEDIA_EXTS = DEFAULT_VIDEO_EXTS
-DEFAULT_MEDIA_EXTS_CSV = ",".join(DEFAULT_VIDEO_EXTS)
+DEFAULT_VIDEO_EXTS_CSV = ",".join(DEFAULT_VIDEO_EXTS)
 _DEFAULT_VIDEO_EXT_SET = frozenset(DEFAULT_VIDEO_EXTS)
 
 
@@ -341,14 +339,75 @@ def _offline_staging_name(title: str, task_key: str) -> str:
 
 
 def _remove_empty_staging(
-    client: GuangYaClient, directory_id: str
+    client: GuangYaClient,
+    directory_id: str,
+    *,
+    expected_parent_id: str = "",
+    expected_name: str = "",
 ) -> tuple[str, str]:
     if not directory_id:
         return "", ""
     try:
+        info = client.file_info(directory_id)
+        if info is None:
+            return "completed", ""
+        if not bool(getattr(info, "is_dir", False)):
+            return "retained", "隔离目标已不再是目录，未自动删除"
+        actual_parent = str(getattr(info, "parent_id", "") or "0")
+        actual_name = str(getattr(info, "name", "") or "")
+        if expected_parent_id and actual_parent != str(expected_parent_id):
+            return "retained", "隔离目录父级已变化，未自动删除"
+        if expected_name and actual_name != str(expected_name):
+            return "retained", "隔离目录名称已变化，未自动删除"
         if client.list_dir(directory_id):
             return "retained", "临时目录仍包含文件，未自动删除"
-        client.delete([directory_id])
+        expected_etag = str(getattr(info, "etag", "") or "")
+        try:
+            expected_updated_at = max(
+                0, int(getattr(info, "updated_at", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            expected_updated_at = 0
+        delete_empty = getattr(client, "delete_empty_directory", None)
+        supports_guarded = getattr(
+            client, "supports_guarded_empty_directory_delete", None
+        )
+        if supports_guarded is None:
+            supports_guarded = getattr(
+                client, "supports_atomic_empty_directory_delete", None
+            )
+        if (
+            not callable(delete_empty)
+            or supports_guarded is False
+            or (not expected_etag and not expected_updated_at)
+        ):
+            return (
+                "retained",
+                "Provider 不支持带版本与空目录复核的回收站删除，隔离目录已保留",
+            )
+        from app.modules.organize_delete_audit import (
+            DeleteCandidate,
+            execute_recycle_bin_delete,
+        )
+
+        execute_recycle_bin_delete(
+            client,
+            trigger="offline_staging_rollback",
+            reason="离线任务明确未受理，清理已复核为空的隔离暂存目录",
+            candidate=DeleteCandidate(
+                file_id=str(directory_id),
+                name=actual_name or str(expected_name or "下载隔离目录"),
+                parent_id=actual_parent,
+                size=max(0, int(getattr(info, "size", 0) or 0)),
+                gcid=expected_etag,
+            ),
+            safe_failure_message="离线隔离暂存目录清理失败，目录已保留",
+            delete_operation=lambda: delete_empty(
+                str(directory_id),
+                expected_etag=expected_etag,
+                expected_updated_at=expected_updated_at,
+            ),
+        )
         return "completed", ""
     except Exception as exc:
         logger.warning("光鸭临时下载目录清理失败 id=%s type=%s", directory_id, type(exc).__name__)
@@ -358,7 +417,8 @@ def _remove_empty_staging(
 def submit_offline(url: str, title: str = "", client: GuangYaClient | None = None,
                    target_dir_id: str = "", target_dir_name: str = "", *,
                    isolate_task: bool = False, task_key: str = "",
-                   torrent_data: bytes | None = None) -> dict:
+                   torrent_data: bytes | None = None,
+                   on_staging_created: Callable[[dict], None] | None = None) -> dict:
     """按正式离线规则提交任务。
 
     自动入口先解析文件树并强制应用仅视频扩展名、排除词和最小体积。
@@ -448,6 +508,38 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 f"{decision.target_dir_name} / {staging_name}",
                 "使用任务隔离目录", decision.matched_keyword,
             )
+            if on_staging_created is not None:
+                staging_snapshot = {
+                    "id": staging_id,
+                    "parent_id": str(decision.target_dir_id or "0"),
+                    "parent_name": str(decision.target_dir_name or ""),
+                    "name": staging_name,
+                    "isolated": True,
+                }
+                try:
+                    on_staging_created(dict(staging_snapshot))
+                except Exception as exc:
+                    cleanup_status, cleanup_error = _remove_empty_staging(
+                        client,
+                        staging_id,
+                        expected_parent_id=str(decision.target_dir_id or "0"),
+                        expected_name=staging_name,
+                    )
+                    logger.warning(
+                        "持久化光鸭隔离目录失败 task=%s type=%s",
+                        str(task_key or ""),
+                        type(exc).__name__,
+                    )
+                    return {
+                        "ok": False,
+                        "decision": effective.as_dict(),
+                        "staging": {
+                            **staging_snapshot,
+                            "cleanup_status": cleanup_status,
+                            "cleanup_error": cleanup_error,
+                        },
+                        "error": "持久化任务隔离目录失败，未提交离线任务",
+                    }
 
         try:
             if choices:
@@ -465,7 +557,10 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 # 服务端可能已受理请求，必须保留目录供 tracker 与人工核验。
                 if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
                     staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
-                        client, staging_id
+                        client,
+                        staging_id,
+                        expected_parent_id=str(decision.target_dir_id or "0"),
+                        expected_name=staging_name,
                     )
                 elif not ok and staging_id:
                     staging_cleanup_status = "retained"
@@ -520,7 +615,10 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 create_error = ""
             if not ok and not outcome_unknown and not tracking_incomplete:
                 staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
-                    client, staging_id
+                    client,
+                    staging_id,
+                    expected_parent_id=str(decision.target_dir_id or "0"),
+                    expected_name=staging_name,
                 )
             elif not ok and staging_id:
                 staging_cleanup_status = "retained"
@@ -756,7 +854,7 @@ def rules_summary(rules: OfflineRules | None = None) -> dict:
         },
         "exclude_keywords": list(rules.exclude_keywords),
         "min_file_mb": rules.min_file_mb,
-        "allowed_exts": list(rules.allowed_exts or sorted(DEFAULT_MEDIA_EXTS)),
+        "allowed_exts": list(rules.allowed_exts or sorted(DEFAULT_VIDEO_EXTS)),
         "file_filter_enforced": True,
         "file_filter_note": "资源预解析后按扩展名、最小体积和排除词生成默认选集，可在提交前调整。",
     }
@@ -764,7 +862,7 @@ def rules_summary(rules: OfflineRules | None = None) -> dict:
 
 def build_offline_file_choices(files: list[dict], rules: OfflineRules) -> list[dict]:
     """为归一化文件列表补充默认选择、锁定状态和排除原因。"""
-    allowed_exts = set(rules.allowed_exts or DEFAULT_MEDIA_EXTS)
+    allowed_exts = set(rules.allowed_exts or DEFAULT_VIDEO_EXTS)
     minimum_size = max(0, rules.min_file_mb) * 1024 * 1024
     choices: list[dict] = []
     for source in files:
