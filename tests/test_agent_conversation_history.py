@@ -571,7 +571,10 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
                 "data": {
                     "query": "庆余年",
                     "items": [],
-                    "pending_subscription": {"season": 2},
+                    "pending_subscription": {
+                        "season": 2,
+                        "check_interval_minutes": 10080,
+                    },
                 },
                 "suggestions": ["订阅第 2 个的第 2 季"],
             },
@@ -585,7 +588,10 @@ class AgentConversationHistoryRepositoryTests(IsolatedDatabaseTestCase):
         context = self.repository.get_llm_context(
             principal="browser-principal-a", session_id=SESSION_A
         )
-        self.assertEqual(context[-1]["pending_subscription"], {"season": 2})
+        self.assertEqual(
+            context[-1]["pending_subscription"],
+            {"season": 2, "check_interval_minutes": 10080},
+        )
 
     def test_media_context_preserves_stable_ids_and_uses_later_valid_coordinates(self):
         response = {

@@ -412,12 +412,14 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 "external_id": "999",
                 "media_type": "tv",
                 "season": 2,
+                "check_interval_minutes": 10080,
             }),
             {
                 "provider": "tmdb",
                 "external_id": "999",
                 "media_type": "tv",
                 "season": 2,
+                "check_interval_minutes": 10080,
             },
         )
         self.assertEqual(
@@ -431,6 +433,16 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 "media_type": "movie",
                 "season": 2,
             })
+        for invalid_interval in (True, 60, 4321, "10080"):
+            with self.subTest(invalid_interval=invalid_interval), self.assertRaises(
+                AgentToolError
+            ):
+                media_subscription_create_arguments({
+                    "provider": "tmdb",
+                    "external_id": "999",
+                    "media_type": "tv",
+                    "check_interval_minutes": invalid_interval,
+                })
 
         tools = {item["name"]: item for item in get_agent_service().capabilities()["tools"]}
         self.assertEqual(tools["media.subscription_summaries"]["risk"], "read")
@@ -495,8 +507,28 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             {"query": "庆余年", "season": 2, "contextual": False},
         )
         self.assertEqual(
+            media_subscription_title_request(
+                "帮我给光阴之外 创建一个每周刷新的订阅"
+            ),
+            {
+                "query": "光阴之外",
+                "season": None,
+                "contextual": False,
+                "check_interval_minutes": 10080,
+            },
+        )
+        self.assertEqual(
             media_subscription_candidate_request("订阅第 2 个的第 3 季"),
             {"position": 2, "season": 3, "contextual": False},
+        )
+        self.assertEqual(
+            media_subscription_candidate_request("订阅第 2 个，每周检查"),
+            {
+                "position": 2,
+                "season": None,
+                "contextual": False,
+                "check_interval_minutes": 10080,
+            },
         )
         self.assertEqual(
             media_subscription_title_request("订阅这部剧"),
@@ -850,6 +882,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             "external_id": "999",
             "media_type": "tv",
             "season": 2,
+            "check_interval_minutes": 10080,
         }
 
         with patch(
@@ -879,10 +912,14 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
 
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["data"]["season"], 2)
+        self.assertEqual(
+            confirmed["result"]["data"]["check_interval_minutes"], 10080
+        )
         row = self._subscription_by_identity("999", "tv")
         self.assertIsNotNone(row)
         self.assertEqual(json.loads(row["seasons_json"]), [2])
         self.assertEqual(row["monitor_mode"], "selected")
+        self.assertEqual(row["check_interval_minutes"], 10080)
         scheduler.reload.assert_called_once_with()
 
     def test_delete_subscription_soft_deletes_and_cancels_pending_work(self) -> None:
@@ -1004,6 +1041,85 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             routed["result"]["data"]["pending_subscription"], {"season": 2}
         )
         self.assertIn("订阅第 2 个的第 2 季", routed["result"]["suggestions"][0])
+
+    def test_orchestrator_creates_weekly_subscription_from_natural_language(self) -> None:
+        service = get_agent_service()
+        fake_search = {
+            "request_id": "search-weekly-subscription",
+            "mode": "read_only",
+            "tool_call": {
+                "name": "discovery.search",
+                "arguments": {"query": "光阴之外", "limit": 20},
+            },
+            "result": ToolResult(
+                True,
+                "completed",
+                "找到候选",
+                data={"query": "光阴之外", "items": []},
+            ).to_dict(),
+        }
+        with patch.object(
+            service, "_invoke_query_read", return_value=fake_search
+        ) as search:
+            routed = service.query(
+                "帮我给光阴之外 创建一个每周刷新的订阅", owner="owner"
+            )
+        search.assert_called_once_with(
+            "discovery.search", {"query": "光阴之外", "limit": 20}, owner="owner"
+        )
+        self.assertEqual(
+            routed["result"]["data"]["pending_subscription"],
+            {"check_interval_minutes": 10080},
+        )
+        self.assertIn("每周检查", routed["result"]["suggestions"][0])
+
+        service.recent_discovery_store.capture(
+            owner="owner",
+            result=ToolResult(
+                True,
+                "completed",
+                "找到 1 个结果",
+                data={
+                    "query": "光阴之外",
+                    "items": [{
+                        "provider": "tmdb",
+                        "external_id": "285993",
+                        "media_type": "tv",
+                        "title": "光阴之外",
+                        "year": "2026",
+                    }],
+                },
+            ),
+        )
+        discovery = Mock()
+        discovery.get_detail.return_value = MediaCard(
+            provider="tmdb",
+            external_id="285993",
+            media_type="tv",
+            title="光阴之外",
+            year="2026",
+        )
+        with patch(
+            "app.agent.media_subscription_actions.get_discovery_service",
+            return_value=discovery,
+        ):
+            selected = service.query(
+                "订阅第 1 个",
+                owner="owner",
+                conversation_context=[{
+                    "role": "assistant",
+                    "text": "已找到候选，请选择准确条目。",
+                    "tool_name": "discovery.search",
+                    "pending_subscription": {"check_interval_minutes": 10080},
+                }],
+            )
+        self.assertEqual(selected["mode"], "confirmation_required")
+        self.assertEqual(
+            selected["confirmation"]["tool"], "media.create_subscription"
+        )
+        self.assertEqual(
+            selected["result"]["data"]["check_interval_minutes"], 10080
+        )
 
     def test_orchestrator_prepares_exact_write_and_refuses_bulk_write(self) -> None:
         service = get_agent_service()

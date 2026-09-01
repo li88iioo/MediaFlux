@@ -873,12 +873,30 @@ class SQLiteAgentConversationHistoryRepository:
 
     @staticmethod
     def _validated_pending_subscription(value: Any) -> dict[str, int] | None:
-        if not isinstance(value, dict) or set(value) != {"season"}:
+        if not isinstance(value, dict) or not value or not set(value).issubset({
+            "season", "check_interval_minutes",
+        }):
             return None
+        result: dict[str, int] = {}
         season = value.get("season")
-        if isinstance(season, bool) or not isinstance(season, int) or not 1 <= season <= 100:
-            return None
-        return {"season": season}
+        if season is not None:
+            if (
+                isinstance(season, bool)
+                or not isinstance(season, int)
+                or not 1 <= season <= 100
+            ):
+                return None
+            result["season"] = season
+        check_interval_minutes = value.get("check_interval_minutes")
+        if check_interval_minutes is not None:
+            if (
+                isinstance(check_interval_minutes, bool)
+                or not isinstance(check_interval_minutes, int)
+                or check_interval_minutes not in {4320, 10080}
+            ):
+                return None
+            result["check_interval_minutes"] = check_interval_minutes
+        return result or None
 
     def _context_entry_from_row(
         self,

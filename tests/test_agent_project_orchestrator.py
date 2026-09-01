@@ -112,6 +112,17 @@ class AgentObjectiveContractTests(unittest.TestCase):
             "media_recommendation",
         )
 
+    def test_postfix_media_subscription_creation_uses_creation_contract(self) -> None:
+        objective = infer_agent_objective(
+            "帮我给光阴之外 创建一个每周刷新的订阅"
+        )
+
+        self.assertEqual(objective.task_kind, "media_subscription_create")
+        self.assertEqual(
+            objective.allowed_tools,
+            ("discovery.search", "media.create_subscription"),
+        )
+
     def test_release_status_uses_only_explicitly_requested_sources(self) -> None:
         message = "辐射第二季跟三体第二季都上线了吗"
         objective = infer_agent_objective(message)

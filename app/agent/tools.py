@@ -2173,6 +2173,11 @@ def build_tool_registry(
                 "external_id": {"type": "string", "minLength": 1, "maxLength": 180},
                 "media_type": {"type": "string", "enum": ["movie", "tv"]},
                 "season": {"type": "integer", "minimum": 1, "maximum": 100},
+                "check_interval_minutes": {
+                    "type": "integer",
+                    "enum": [4320, 10080],
+                    "description": "检查周期：4320 为每 3 天，10080 为每 7 天。",
+                },
             },
             "additionalProperties": False,
         },
@@ -2185,6 +2190,7 @@ def build_tool_registry(
             "订阅这个 TMDB 剧集",
             "为这部剧创建媒体追更",
             "只追更这部剧第 2 季",
+            "为光阴之外创建一个每周检查的追更订阅",
         ),
     ))
     registry.register(ToolSpec(

@@ -189,7 +189,14 @@ _DOWNLOAD_STATUS_RE: Final[re.Pattern[str]] = re.compile(
 )
 _RSS_SCOPE_RE: Final[re.Pattern[str]] = re.compile(r"(?:rss|mikan|订阅源)", re.IGNORECASE)
 _MEDIA_SUBSCRIPTION_SCOPE_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?:媒体追更|追更订阅|媒体订阅|(?:我的)?追更)|^(?:订阅|追更|加入追更|创建订阅).+",
+    r"(?:媒体追更|追更订阅|媒体订阅|(?:我的)?追更)|"
+    r"^(?:订阅|追更|加入追更|添加追更|创建订阅).+|"
+    r"(?:给|为).{1,80}(?:创建|添加|新建|建立).{0,24}(?:追更|媒体|影视)?订阅",
+    re.IGNORECASE,
+)
+_MEDIA_SUBSCRIPTION_CREATE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^(?:请\s*)?(?:帮我\s*)?(?:(?:订阅|追更|加入追更|添加追更|创建订阅).+|"
+    r"(?:给|为).{1,80}(?:创建|添加|新建|建立).{0,24}(?:追更|媒体|影视)?订阅)",
     re.IGNORECASE,
 )
 _CALENDAR_SCOPE_RE: Final[re.Pattern[str]] = re.compile(
@@ -976,9 +983,7 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
         )
 
     if _MEDIA_SUBSCRIPTION_SCOPE_RE.search(text):
-        creating_subscription = bool(re.match(
-            r"^(?:订阅|追更|加入追更|添加追更|创建订阅)", text, re.IGNORECASE
-        ))
+        creating_subscription = bool(_MEDIA_SUBSCRIPTION_CREATE_RE.search(text))
         if creating_subscription:
             return AgentObjectiveContract(
                 task_kind="media_subscription_create",

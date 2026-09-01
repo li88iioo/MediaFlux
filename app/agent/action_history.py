@@ -102,7 +102,8 @@ _SAFE_FIELDS = {
     },
     "rss.delete_subscription": {"operation", "affected", "deleted_entries", "runtime_refreshed"},
     "media.create_subscription": {
-        "operation", "subscription_number", "affected", "created", "season", "runtime_refreshed",
+        "operation", "subscription_number", "affected", "created", "season",
+        "check_interval_minutes", "runtime_refreshed",
     },
     "media.delete_subscription": {
         "operation", "subscription_number", "affected", "expired_candidates",

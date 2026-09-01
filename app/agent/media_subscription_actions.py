@@ -33,6 +33,7 @@ _UPDATE_ITEM_TIMEOUT_SECONDS = 25.0
 _CREATE_TIMEOUT_SECONDS = 35.0
 _ALLOWED_PROVIDERS = frozenset({"tmdb", "douban", "bangumi"})
 _ALLOWED_MEDIA_TYPES = frozenset({"movie", "tv"})
+_ALLOWED_CHECK_INTERVALS = frozenset({4320, 10080})
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
 _MAX_SAFE_ID = 2_147_483_647
 
@@ -116,9 +117,12 @@ def _subscription_identity(
 def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
-    if not set(arguments).issubset({"provider", "external_id", "media_type", "season"}):
+    if not set(arguments).issubset({
+        "provider", "external_id", "media_type", "season", "check_interval_minutes",
+    }):
         raise AgentToolError(
-            "media.create_subscription 只接受 provider、external_id、media_type 和可选 season 参数"
+            "media.create_subscription 只接受 provider、external_id、media_type、"
+            "可选 season 和 check_interval_minutes 参数"
         )
     if not {"provider", "external_id", "media_type"}.issubset(arguments):
         raise AgentToolError("创建媒体订阅需要精确来源、媒体 ID 和媒体类型")
@@ -133,6 +137,13 @@ def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, 
             raise AgentToolError("season 必须是 1 到 100 的整数")
         if media_type != "tv":
             raise AgentToolError("电影订阅不支持季度筛选")
+    check_interval_minutes = arguments.get("check_interval_minutes")
+    if check_interval_minutes is not None and (
+        isinstance(check_interval_minutes, bool)
+        or not isinstance(check_interval_minutes, int)
+        or check_interval_minutes not in _ALLOWED_CHECK_INTERVALS
+    ):
+        raise AgentToolError("check_interval_minutes 仅支持 4320（每 3 天）或 10080（每 7 天）")
     normalized = {
         "provider": provider,
         "external_id": external_id,
@@ -140,6 +151,8 @@ def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, 
     }
     if season is not None:
         normalized["season"] = int(season)
+    if check_interval_minutes is not None:
+        normalized["check_interval_minutes"] = int(check_interval_minutes)
     return normalized
 
 
@@ -590,6 +603,7 @@ def prepare_create_media_subscription(
     external_id = str(arguments["external_id"])
     media_type = str(arguments["media_type"])
     season = arguments.get("season")
+    check_interval_minutes = int(arguments.get("check_interval_minutes") or 4320)
     tmdb_id = _resolved_tmdb_id(provider, external_id, media_type)
     snapshot = _create_snapshot(tmdb_id, media_type)
     if snapshot.get("exists") and not snapshot.get("deleted_at"):
@@ -621,6 +635,7 @@ def prepare_create_media_subscription(
         "media_type": media_type,
         "tmdb_id": tmdb_id,
         "season": int(season) if season is not None else None,
+        "check_interval_minutes": check_interval_minutes,
         "snapshot": snapshot,
     }
     return ToolResult(
@@ -634,10 +649,13 @@ def prepare_create_media_subscription(
             "media_type": _media_type_label(media_type),
             "monitor_scope": season_label,
             "season": int(season) if season is not None else None,
+            "check_interval_minutes": check_interval_minutes,
+            "check_interval": "每 7 天" if check_interval_minutes == 10080 else "每 3 天",
             "affected": 1,
             "effects": [
                 "确认后只会创建或恢复本地追更订阅，不会立即下载资源。",
-                "新订阅默认由下一次后台调度检查缺失内容，候选下载仍需按策略确认。",
+                f"新订阅将按{'每 7 天' if check_interval_minutes == 10080 else '每 3 天'}"
+                "检查缺失内容，候选下载仍需按策略确认。",
             ],
         },
         evidence=[Evidence(
@@ -666,6 +684,8 @@ def create_media_subscription_confirmed(
             str(context.get("media_type") or ""),
         )
         or arguments.get("season") != context.get("season")
+        or int(arguments.get("check_interval_minutes") or 4320)
+        != int(context.get("check_interval_minutes") or 4320)
     ):
         raise AgentToolError("确认上下文与目标不一致", code="confirmation_invalid")
     tmdb_id = _resolved_tmdb_id(*identity)
@@ -685,6 +705,7 @@ def create_media_subscription_confirmed(
             error="确认快照已失效。",
         )
     season = arguments.get("season")
+    check_interval_minutes = int(arguments.get("check_interval_minutes") or 4320)
     payload: dict[str, Any] = {
         "provider": identity[0],
         "external_id": identity[1],
@@ -695,7 +716,7 @@ def create_media_subscription_confirmed(
         "include_specials": False,
         "action": "confirm",
         "download_target": "guangya",
-        "check_interval_minutes": 4320,
+        "check_interval_minutes": check_interval_minutes,
         "enabled": True,
     }
     try:
@@ -740,6 +761,8 @@ def create_media_subscription_confirmed(
             "title": _safe_title(subscription.get("title"), fallback="该媒体"),
             "media_type": _media_type_label(identity[2]),
             "season": int(season) if season is not None else None,
+            "check_interval_minutes": check_interval_minutes,
+            "check_interval": "每 7 天" if check_interval_minutes == 10080 else "每 3 天",
             "affected": 1,
             "created": created,
             "runtime_refreshed": runtime_refreshed,

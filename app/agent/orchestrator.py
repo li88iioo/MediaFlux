@@ -1766,6 +1766,26 @@ _MEDIA_SUBSCRIPTION_CREATE_ACTIONS = ("订阅", "追更", "加入追更", "添�
 _MEDIA_SUBSCRIPTION_CONTEXT_REFERENCES = (
     "它", "这个", "这部", "这部剧", "这个剧", "这部电影", "这个电影",
 )
+_MEDIA_SUBSCRIPTION_POSTFIX_CREATE_RE = re.compile(
+    r"^(?:请\s*)?(?:帮我\s*)?(?:给|为)\s*(?P<title>.+?)\s*"
+    r"(?:创建|添加|新建|建立)\s*(?:一个|一条)?\s*"
+    r"(?:(?:每(?:周|星期|礼拜|\s*[三七37]\s*天)(?:一次)?\s*"
+    r"(?:刷新|检查|巡检|更新)?\s*)的?\s*)?"
+    r"(?:(?:媒体|影视|追更|追番|追剧)\s*)?订阅(?:一下)?[.!。！]?$",
+    re.IGNORECASE,
+)
+
+
+def _media_subscription_check_interval(message: str) -> int | None:
+    """把产品支持的自然语言检查周期归一为分钟。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    if re.search(r"每\s*(?:周|星期|礼拜)(?:\s*一次)?", normalized) or re.search(
+        r"每\s*(?:7|七)\s*天(?:\s*一次)?", normalized
+    ):
+        return 10080
+    if re.search(r"每\s*(?:3|三)\s*天(?:\s*一次)?", normalized):
+        return 4320
+    return None
 
 
 def _has_media_subscription_scope(message: str) -> bool:
@@ -2116,11 +2136,15 @@ def media_subscription_candidate_request(message: str) -> dict[str, Any] | None:
         return None
     if season is not None and not 1 <= season <= 100:
         return None
-    return {
+    request = {
         "position": position,
         "season": season,
         "contextual": has_context_reference,
     }
+    check_interval_minutes = _media_subscription_check_interval(normalized)
+    if check_interval_minutes is not None:
+        request["check_interval_minutes"] = check_interval_minutes
+    return request
 
 
 def media_subscription_title_request(message: str) -> dict[str, Any] | None:
@@ -2138,19 +2162,43 @@ def media_subscription_title_request(message: str) -> dict[str, Any] | None:
     if season is not None and not 1 <= season <= 100:
         return None
     title_match = _MEDIA_RATING_QUOTED_TITLE_RE.search(str(message or ""))
+    check_interval_minutes = _media_subscription_check_interval(normalized)
     if title_match is not None:
         query = " ".join(title_match.group(1).split()).strip()[:120]
-        return {"query": query, "season": season, "contextual": False} if query else None
+        if not query:
+            return None
+        request: dict[str, Any] = {
+            "query": query,
+            "season": season,
+            "contextual": False,
+        }
+        if check_interval_minutes is not None:
+            request["check_interval_minutes"] = check_interval_minutes
+        return request
+    postfix_match = _MEDIA_SUBSCRIPTION_POSTFIX_CREATE_RE.fullmatch(
+        unicodedata.normalize("NFKC", str(message or "")).strip()
+    )
+    if postfix_match is not None:
+        query = " ".join(postfix_match.group("title").split()).strip(" ，,：:")[:120]
+        if not query:
+            return None
+        request = {"query": query, "season": season, "contextual": False}
+        if check_interval_minutes is not None:
+            request["check_interval_minutes"] = check_interval_minutes
+        return request
     if any(token in normalized for token in _MEDIA_SUBSCRIPTION_CONTEXT_REFERENCES) or (
         season is not None and re.fullmatch(r"(?:请(?:帮我)?\s*)?(?:订阅|追更)\s*第\s*\d{1,3}\s*季[。！!]?", normalized)
     ):
-        return {"query": "", "season": season, "contextual": True}
+        request = {"query": "", "season": season, "contextual": True}
+        if check_interval_minutes is not None:
+            request["check_interval_minutes"] = check_interval_minutes
+        return request
     return None
 
 
-def _latest_pending_subscription_season(
+def _latest_pending_subscription_options(
     conversation_context: list[dict[str, Any]] | None,
-) -> int | None:
+) -> dict[str, int]:
     for item in reversed(conversation_context or []):
         if not isinstance(item, dict) or str(item.get("role") or "").casefold() not in {
             "assistant", "summary"
@@ -2158,17 +2206,27 @@ def _latest_pending_subscription_season(
             continue
         pending = item.get("pending_subscription")
         if isinstance(pending, dict):
+            result: dict[str, int] = {}
             season = pending.get("season")
             if (
                 isinstance(season, int)
                 and not isinstance(season, bool)
                 and 1 <= season <= 100
             ):
-                return season
+                result["season"] = season
+            check_interval_minutes = pending.get("check_interval_minutes")
+            if (
+                isinstance(check_interval_minutes, int)
+                and not isinstance(check_interval_minutes, bool)
+                and check_interval_minutes in {4320, 10080}
+            ):
+                result["check_interval_minutes"] = check_interval_minutes
+            if result:
+                return result
         tool_name = str(item.get("tool_name") or "").strip()
         if tool_name and tool_name != "discovery.search":
-            return None
-    return None
+            return {}
+    return {}
 
 
 def _select_recent_subscription_candidate(
@@ -8160,8 +8218,18 @@ class AgentOrchestrator:
                     [f"例如：订阅第 2 个{suffix}。"],
                 )
             season = subscription_request.get("season")
+            pending_subscription = _latest_pending_subscription_options(
+                conversation_context
+            )
             if season is None:
-                season = _latest_pending_subscription_season(conversation_context)
+                season = pending_subscription.get("season")
+            check_interval_minutes = subscription_request.get(
+                "check_interval_minutes"
+            )
+            if check_interval_minutes is None:
+                check_interval_minutes = pending_subscription.get(
+                    "check_interval_minutes"
+                )
             if season is not None and str(candidate.get("media_type") or "") != "tv":
                 return self._clarification_response(
                     "电影订阅不支持按季度筛选。",
@@ -8174,6 +8242,8 @@ class AgentOrchestrator:
             }
             if isinstance(season, int):
                 arguments["season"] = season
+            if isinstance(check_interval_minutes, int):
+                arguments["check_interval_minutes"] = check_interval_minutes
             return self.prepare(
                 "media.create_subscription", arguments, owner=owner
             )
@@ -8687,15 +8757,37 @@ class AgentOrchestrator:
                 data = result.get("data")
                 if isinstance(data, dict):
                     season = media_create_request.get("season")
+                    check_interval_minutes = media_create_request.get(
+                        "check_interval_minutes"
+                    )
+                    pending_subscription: dict[str, int] = {}
                     if isinstance(season, int):
-                        data["pending_subscription"] = {"season": season}
+                        pending_subscription["season"] = season
+                    if isinstance(check_interval_minutes, int):
+                        pending_subscription["check_interval_minutes"] = (
+                            check_interval_minutes
+                        )
+                    if pending_subscription:
+                        data["pending_subscription"] = pending_subscription
                 suggestions = result.get("suggestions")
                 if not isinstance(suggestions, list):
                     suggestions = []
                     result["suggestions"] = suggestions
                 season = media_create_request.get("season")
                 suffix = f"的第 {season} 季" if isinstance(season, int) else ""
-                prompt = f"从结果中选择一个，例如：订阅第 2 个{suffix}。"
+                check_interval_minutes = media_create_request.get(
+                    "check_interval_minutes"
+                )
+                interval_suffix = (
+                    "，每周检查"
+                    if check_interval_minutes == 10080
+                    else "，每 3 天检查"
+                    if check_interval_minutes == 4320
+                    else ""
+                )
+                prompt = (
+                    f"从结果中选择一个，例如：订阅第 2 个{suffix}{interval_suffix}。"
+                )
                 if prompt not in suggestions:
                     suggestions.insert(0, prompt)
                     del suggestions[4:]

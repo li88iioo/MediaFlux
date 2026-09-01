@@ -57,6 +57,7 @@
 {"case_id":"route-media-count-arabic","category":"read","domain":"media_subscription","evaluator":"route_tool","message":"我的媒体订阅当前不是订阅了3个媒体吗","expected":{"tool_name":"media.subscription_summaries","arguments":{}}}
 {"case_id":"route-discovery-recommend-not-subscription","category":"read","domain":"discovery","evaluator":"route_tool","message":"推荐几部追剧","expected":{"tool_name":"discovery.recommend","arguments":{"provider":"tmdb","media_type":"tv","page":1,"limit":10}}}
 {"case_id":"route-media-list","category":"read","domain":"media_subscription","evaluator":"route_tool","message":"列出全部媒体追更订阅","expected":{"tool_name":"media.subscription_summaries","arguments":{}}}
+{"case_id":"route-media-create-weekly-title","category":"write","domain":"media_subscription","evaluator":"route_tool","message":"帮我给光阴之外 创建一个每周刷新的订阅","expected":{"tool_name":"discovery.search","arguments":{"query":"光阴之外","limit":20}},"notes":"创建订阅先锁定媒体身份，并在后续确认链路保留每周检查周期"}
 {"case_id":"route-media-detail","category":"argument_validation","domain":"media_subscription","evaluator":"route_tool","message":"查看媒体订阅 12","expected":{"tool_name":"media.get_subscription_summary","arguments":{"subscription_id":12}}}
 {"case_id":"route-download-diagnose","category":"read","domain":"downloads","evaluator":"route_tool","message":"下载队列诊断","expected":{"tool_name":"downloads.diagnose_queue","arguments":{}}}
 {"case_id":"route-automation-diagnose","category":"read","domain":"automation","evaluator":"route_tool","message":"检查自动化链路是否异常","expected":{"tool_name":"automation.diagnose_pipeline","arguments":{}}}
