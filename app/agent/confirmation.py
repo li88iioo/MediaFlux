@@ -338,6 +338,7 @@ class ConfirmationStore:
                         else RiskLevel.WRITE
                     ),
                     confirmation_contract=ticket.confirmation_contract,
+                    action_arguments=ticket.arguments,
                 )
             self._owner_generations[owner_key] = (generation, now)
             for key, active in list(self._tickets.items()):
@@ -859,6 +860,7 @@ class SQLiteConfirmationStore(ConfirmationStore):
                         else RiskLevel.WRITE
                     ),
                     confirmation_contract=claimed_ticket.confirmation_contract,
+                    action_arguments=claimed_ticket.arguments,
                     connection=conn,
                 )
             self._rotate_owner_state(

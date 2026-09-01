@@ -51,6 +51,20 @@ class ProviderArtifactStore:
         with self._lock:
             self._items.clear()
 
+    def clear_owner(self, *, owner: str) -> int:
+        """清除 owner 的全部短期对象引用。"""
+        owner_key = str(owner or "").strip()
+        if not owner_key:
+            return 0
+        with self._lock:
+            refs = [
+                ref for ref, item in self._items.items()
+                if item.owner == owner_key
+            ]
+            for ref in refs:
+                self._items.pop(ref, None)
+        return len(refs)
+
     def _prune_locked(self, now: float) -> None:
         expired = [key for key, item in self._items.items() if item.expires_at <= now]
         for key in expired:

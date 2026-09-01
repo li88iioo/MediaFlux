@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
 import re
 import threading
 import unittest
@@ -216,6 +217,34 @@ class SQLiteConfirmationStoreTests(IsolatedDatabaseTestCase):
                 store.claim_and_rotate_owner(
                     owner="owner-a", confirmation_id=ticket.confirmation_id
                 )
+
+    def test_provider_confirmation_claim_audit_keeps_safe_plan_reference(self) -> None:
+        plan_ref = "PP-" + "B" * 24
+        store = SQLiteConfirmationStore(
+            token_factory=lambda: "provider-plan-audit-ticket-1234"
+        )
+        ticket = store.issue(
+            owner="owner-a",
+            tool_name="provider.change.execute",
+            arguments={"plan_ref": plan_ref},
+        )
+
+        claimed = store.claim_and_rotate_owner(
+            owner="owner-a",
+            confirmation_id=ticket.confirmation_id,
+            record_execution=True,
+            execution_risk_for=lambda _tool_name: RiskLevel.WRITE,
+        )
+
+        self.assertEqual(claimed.arguments["plan_ref"], plan_ref)
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT safe_details FROM agent_action_history "
+                "WHERE confirmation_id=?",
+                (f"{ticket.confirmation_id}-{ticket.owner_generation}",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(json.loads(str(row["safe_details"])), {"plan_ref": plan_ref})
 
     def test_concurrent_claim_is_atomic_across_store_instances(self) -> None:
         issuer = SQLiteConfirmationStore(

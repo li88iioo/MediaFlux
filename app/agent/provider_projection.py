@@ -1,20 +1,48 @@
 """Provider 原始响应的有界安全投影。"""
+
 from __future__ import annotations
 
 import math
 from typing import Any
 
-from app.agent.result_projection import sanitize_public_text
+from app.agent.result_projection import (
+    sanitize_public_text,
+    sanitize_untrusted_filename,
+)
 
-_SENSITIVE_KEYS = frozenset({
-    "path", "save_path", "content_path", "url", "web_url", "image_url",
-    "token", "api_key", "authorization", "cookie", "password", "username",
-    "tracker", "magnet", "hash", "device_id", "headers", "response_headers",
-})
+_SENSITIVE_KEYS = frozenset(
+    {
+        "path",
+        "save_path",
+        "content_path",
+        "url",
+        "web_url",
+        "image_url",
+        "token",
+        "api_key",
+        "authorization",
+        "cookie",
+        "password",
+        "username",
+        "tracker",
+        "magnet",
+        "hash",
+        "device_id",
+        "headers",
+        "response_headers",
+    }
+)
 
 
 def _safe_key(value: Any) -> str:
     return str(value or "").strip()[:64]
+
+
+def _project_filename(value: str) -> str:
+    """仅为明确的 name 字段保留 dotted filename；路径仍按普通文本拒绝。"""
+    if "/" in value or "\\" in value:
+        return sanitize_public_text(value, limit=500)
+    return sanitize_untrusted_filename(value, limit=500)
 
 
 def project_provider_value(
@@ -47,11 +75,14 @@ def project_provider_value(
             key = _safe_key(raw_key)
             if not key or key.casefold() in _SENSITIVE_KEYS:
                 continue
-            projected[key] = project_provider_value(
-                raw_value,
-                depth=depth + 1,
-                max_depth=max_depth,
-                max_items=max_items,
-            )
+            if key.casefold() == "name" and isinstance(raw_value, str):
+                projected[key] = _project_filename(raw_value)
+            else:
+                projected[key] = project_provider_value(
+                    raw_value,
+                    depth=depth + 1,
+                    max_depth=max_depth,
+                    max_items=max_items,
+                )
         return projected
     return sanitize_public_text(value, limit=160)

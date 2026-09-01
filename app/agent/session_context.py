@@ -149,9 +149,7 @@ class AgentSessionContextRepository(Protocol):
         guard: AgentContextWriteGuard,
     ) -> bool: ...
 
-    def invalidate_owner(
-        self, *, owner: str, context_types: tuple[str, ...]
-    ) -> int: ...
+    def invalidate_owner(self, *, owner: str) -> int: ...
 
     def invalidate_context(self, *, owner: str, context_type: str) -> int: ...
 
@@ -399,14 +397,10 @@ class SQLiteAgentSessionContextRepository:
                 return True
             return False
 
-    def invalidate_owner(
-        self, *, owner: str, context_types: tuple[str, ...],
-    ) -> int:
-        """原子推进指定上下文世代并删除 owner 的全部持久化上下文。"""
+    def invalidate_owner(self, *, owner: str) -> int:
+        """原子推进 owner 的全部工作流世代并删除所有持久化上下文。"""
         owner_digest = self._owner_digest(owner)
-        normalized_types = tuple(dict.fromkeys(
-            self._context_type(value, allow_download=False) for value in context_types
-        ))
+        normalized_types = tuple(sorted(_CONTEXT_TYPES - {"download_submission"}))
         now = float(self._clock())
         with db.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")

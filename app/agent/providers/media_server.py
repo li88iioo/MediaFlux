@@ -1,9 +1,11 @@
 """复用现有 Jellyfin/Emby client 的 Provider transport。"""
+
 from __future__ import annotations
 
 import re
 from typing import Any
 
+from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.provider_models import (
     ProviderGatewayError,
     ProviderPayload,
@@ -32,9 +34,11 @@ class MediaServerProviderTransport:
     def _client(profile: MediaServerProfile):
         if profile.server_type == "jellyfin":
             from app.clients.jellyfin import JellyfinClient
+
             client = JellyfinClient(profile.url, profile.credential, timeout=10)
         elif profile.server_type == "emby":
             from app.clients.emby import EmbyClient
+
             client = EmbyClient(profile.url, profile.credential, timeout=10)
         else:
             raise ProviderGatewayError(
@@ -54,13 +58,33 @@ class MediaServerProviderTransport:
                 state = "incomplete"
             else:
                 state = "disabled"
-            views.append(ProviderProfileView(
-                profile_ref=profile.source,
-                provider=self.provider,
-                label=profile.label,
-                state=state,
-            ))
+            views.append(
+                ProviderProfileView(
+                    profile_ref=profile.source,
+                    provider=self.provider,
+                    label=profile.label,
+                    state=state,
+                )
+            )
         return views
+
+    def profile_revision(self, profile_ref: str) -> str:
+        profile = self._profile(profile_ref)
+        return self._profile_revision_from_profile(profile)
+
+    @staticmethod
+    def _profile_revision_from_profile(profile: MediaServerProfile) -> str:
+        return confirmation_context_fingerprint(
+            {
+                "profile_ref": profile.source,
+                "server_type": profile.server_type,
+                "url": profile.url.rstrip("/"),
+                "credential": profile.credential,
+                "user_id": profile.user_id,
+                "enabled": profile.enabled,
+            },
+            domain="provider-profile-revision",
+        )
 
     @staticmethod
     def _media_item(item: MediaItem) -> dict[str, Any]:
@@ -111,7 +135,9 @@ class MediaServerProviderTransport:
                             "__object_id": str(folder.get("id") or ""),
                             "__object_kind": "media_library",
                             "name": str(folder.get("name") or ""),
-                            "collection_type": str(folder.get("collection_type") or "mixed"),
+                            "collection_type": str(
+                                folder.get("collection_type") or "mixed"
+                            ),
                         }
                         for folder in folders
                         if str(folder.get("id") or "").strip()
@@ -207,7 +233,11 @@ class MediaServerProviderTransport:
             label = str(target.get("name") or "选中媒体库")
             return ProviderPayload(
                 summary=f"将精准刷新 {label}",
-                data={"target": target, "scope": "library", "refresh_mode": "incremental"},
+                data={
+                    "target": target,
+                    "scope": "library",
+                    "refresh_mode": "incremental",
+                },
                 source=f"{profile.server_type}_api",
             )
         if operation == "media.item.refresh":
@@ -218,12 +248,30 @@ class MediaServerProviderTransport:
                 data={"target": target, "scope": "item", "refresh_mode": "incremental"},
                 source=f"{profile.server_type}_api",
             )
-        raise ProviderGatewayError("媒体服务器写操作未实现", code="operation_not_allowed")
+        raise ProviderGatewayError(
+            "媒体服务器写操作未实现", code="operation_not_allowed"
+        )
 
     def execute_write(
-        self, profile_ref: str, operation: str, arguments: dict[str, Any]
+        self,
+        profile_ref: str,
+        operation: str,
+        arguments: dict[str, Any],
+        *,
+        expected_profile_revision: str,
     ) -> ProviderPayload:
+        # MediaServerProfile 是 frozen 配置快照；revision 校验与 client 构造
+        # 必须复用同一个对象，避免并发改配后写到另一上游。
         profile = self._profile(profile_ref)
+        current_revision = self._profile_revision_from_profile(profile)
+        if (
+            not expected_profile_revision
+            or current_revision != expected_profile_revision
+        ):
+            raise ProviderGatewayError(
+                "媒体服务器配置已变化，请重新预检",
+                code="confirmation_stale",
+            )
         if not profile.enabled or not profile.configured:
             raise ProviderGatewayError(
                 "媒体服务器尚未启用或配置不完整", code="provider_not_configured"
@@ -240,22 +288,32 @@ class MediaServerProviderTransport:
             )
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target_id):
             raise ProviderGatewayError("刷新目标已失效", code="confirmation_stale")
+        external_write_possible = False
         try:
             with self._client(profile) as client:
+                # refresh_library 的客户端契约会把部分网络异常折叠为 False；
+                # 进入调用后只能保守认为请求可能已被上游接收。
+                external_write_possible = True
                 accepted = bool(client.refresh_library(target_id))
         except ProviderGatewayError:
             raise
         except TimeoutError as exc:
             raise ProviderGatewayError(
-                "媒体服务器刷新请求超时", code="upstream_timeout"
+                "媒体服务器刷新请求超时",
+                code="upstream_timeout",
+                external_write_possible=external_write_possible,
             ) from exc
         except Exception as exc:
             raise ProviderGatewayError(
-                "媒体服务器刷新请求失败", code="provider_write_failed"
+                "媒体服务器刷新请求失败",
+                code="provider_write_failed",
+                external_write_possible=external_write_possible,
             ) from exc
         if not accepted:
             raise ProviderGatewayError(
-                "媒体服务器未接受精准刷新请求", code="provider_write_failed"
+                "媒体服务器未接受精准刷新请求",
+                code="provider_write_failed",
+                external_write_possible=True,
             )
         return ProviderPayload(
             summary="媒体服务器已接受精准刷新请求",

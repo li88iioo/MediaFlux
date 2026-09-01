@@ -11,7 +11,7 @@ from app import database as db
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
 from app.logger import get_logger
-from app.modules.rss import rss_subscription_refresh_revision
+from app.modules.rss import rss_subscription_refresh_revision, validate_rss_source_urls
 from app.modules.rss_subscription_config import (
     RSSSubscriptionConfigError,
     normalize_rss_subscription_create,
@@ -60,6 +60,30 @@ _RSS_INTERNAL_CREATE_KEYS = _RSS_CONFIG_KEYS | {
 }
 
 
+def _agent_urls(value: Any, *, allow_normalized: bool) -> str:
+    if isinstance(value, list):
+        raw_urls = value
+    elif allow_normalized and isinstance(value, str):
+        raw_urls = [line.strip() for line in value.splitlines() if line.strip()]
+    else:
+        raise AgentToolError("urls 必须包含 1 到 8 个订阅地址")
+    if not 1 <= len(raw_urls) <= 8:
+        raise AgentToolError("urls 必须包含 1 到 8 个订阅地址")
+    normalized_urls: list[str] = []
+    for raw_url in raw_urls:
+        if (
+            not isinstance(raw_url, str)
+            or not raw_url.strip()
+            or len(raw_url.strip()) > 1000
+        ):
+            raise AgentToolError("每个 RSS 订阅地址必须是长度不超过 1000 的非空字符串")
+        normalized_urls.append(raw_url.strip())
+    try:
+        return validate_rss_source_urls("\n".join(normalized_urls))
+    except ValueError as exc:
+        raise AgentToolError(str(exc)) from exc
+
+
 def _agent_config_payload(arguments: dict[str, Any], *, create: bool) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
@@ -91,17 +115,12 @@ def _agent_config_payload(arguments: dict[str, Any], *, create: bool) -> dict[st
         for key in ("enabled", "skip_existing_episodes"):
             if key in payload and payload[key] in (0, 1):
                 payload[key] = bool(payload[key])
+        payload["urls"] = _agent_urls(payload.get("urls"), allow_normalized=True)
         return payload
     if "urls" in payload:
-        urls = payload["urls"]
-        if not isinstance(urls, list) or not 1 <= len(urls) <= 8:
-            raise AgentToolError("urls 必须包含 1 到 8 个订阅地址")
-        normalized_urls: list[str] = []
-        for value in urls:
-            if not isinstance(value, str) or not value.strip() or len(value.strip()) > 1000:
-                raise AgentToolError("每个 RSS 订阅地址必须是长度不超过 1000 的非空字符串")
-            normalized_urls.append(value.strip())
-        payload["urls"] = "\n".join(normalized_urls)
+        payload["urls"] = _agent_urls(
+            payload["urls"], allow_normalized=not create
+        )
     return payload
 
 
@@ -360,40 +379,50 @@ def _confirmed_config_update(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:
     subscription_id = int(arguments["subscription_id"])
-    current = db.get_rss_subscription(subscription_id)
-    if current is None:
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="RSS 订阅已不存在，请重新检查",
-            error="确认快照已失效。",
-        )
-    payload = {key: value for key, value in arguments.items() if key != "subscription_id"}
-    try:
-        fields = normalize_rss_subscription_update(
-            payload,
-            current=current,
-            allow_target_paths=False,
-        )
-    except RSSSubscriptionConfigError as exc:
-        raise AgentToolError(str(exc)) from exc
-    fields = _changed_config_fields(current, fields)
-    if not fields:
-        raise AgentToolError("RSS 订阅配置没有变化", code="precondition_failed")
-    context = {
-        "operation": "update",
-        "subscription_id": subscription_id,
-        "revision": _config_revision(current),
-        "fields": fields,
+    payload = {
+        key: value for key, value in arguments.items() if key != "subscription_id"
     }
-    if not secrets.compare_digest(_fingerprint(context), str(expected_context or "")):
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="RSS 订阅配置已变化，请重新预检",
-            error="确认快照已失效。",
-        )
-    db.update_rss_subscription(subscription_id, fields)
+    with db.get_conn() as conn:
+        # revision 校验、主表更新和媒体绑定更新必须共享一个写事务，
+        # 避免确认通过后再被并发 Web/API 配置覆盖。
+        conn.execute("BEGIN IMMEDIATE")
+        current = db.get_rss_subscription(subscription_id, connection=conn)
+        if current is None:
+            return ToolResult(
+                ok=False,
+                status="conflict",
+                summary="RSS 订阅已不存在，请重新检查",
+                error="确认快照已失效。",
+            )
+        try:
+            fields = normalize_rss_subscription_update(
+                payload,
+                current=current,
+                allow_target_paths=False,
+            )
+        except RSSSubscriptionConfigError as exc:
+            raise AgentToolError(str(exc)) from exc
+        fields = _changed_config_fields(current, fields)
+        if not fields:
+            raise AgentToolError(
+                "RSS 订阅配置没有变化", code="precondition_failed"
+            )
+        context = {
+            "operation": "update",
+            "subscription_id": subscription_id,
+            "revision": _config_revision(current),
+            "fields": fields,
+        }
+        if not secrets.compare_digest(
+            _fingerprint(context), str(expected_context or "")
+        ):
+            return ToolResult(
+                ok=False,
+                status="conflict",
+                summary="RSS 订阅配置已变化，请重新预检",
+                error="确认快照已失效。",
+            )
+        db.update_rss_subscription(subscription_id, fields, connection=conn)
     runtime_refreshed = _reload_scheduler()
     return ToolResult(
         ok=True,

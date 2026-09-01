@@ -121,11 +121,16 @@ def get_rss_stats() -> dict[str, int]:
     }
 
 
-def get_rss_subscription(sub_id: int) -> sqlite3.Row | None:
-    with get_conn() as conn:
-        return conn.execute(
+def get_rss_subscription(
+    sub_id: int, *, connection: sqlite3.Connection | None = None
+) -> sqlite3.Row | None:
+    """读取订阅及媒体绑定；传入连接时加入调用方现有事务。"""
+    if connection is not None:
+        return connection.execute(
             _rss_subscription_select() + " WHERE i.id=?", (sub_id,)
         ).fetchone()
+    with get_conn() as conn:
+        return get_rss_subscription(sub_id, connection=conn)
 
 
 def find_rss_subscriptions_by_normalized_name(
@@ -155,54 +160,83 @@ def find_rss_subscriptions_by_normalized_name(
     return matches
 
 
-def update_rss_subscription(sub_id: int, fields: dict) -> None:
+def _update_rss_subscription_in_connection(
+    conn: sqlite3.Connection,
+    sub_id: int,
+    fields: dict,
+    *,
+    timestamp: str,
+) -> None:
+    base_allowed = {
+        "name", "enabled", "refresh_cron", "refresh_interval_minutes",
+        "last_refreshed_at", "urls", "parser", "exclude_keywords", "action",
+        "download_method", "qb_save_path", "gy_target_dir", "gy_target_dir_name",
+    }
+    binding_keys = {
+        "media_tmdb_id", "media_default_season", "skip_existing_episodes",
+    }
+    sets: list[str] = []
+    vals: list[object] = []
+    for key, value in fields.items():
+        if key in base_allowed:
+            sets.append(f"{key}=?")
+            vals.append(value)
+    if sets:
+        sets.append("updated_at=?")
+        vals.extend([timestamp, sub_id])
+        conn.execute(f"UPDATE rss_items SET {', '.join(sets)} WHERE id=?", vals)
+
+    if binding_keys & fields.keys():
+        current = conn.execute(
+            "SELECT tmdb_id,default_season,skip_existing_episodes "
+            "FROM rss_media_bindings WHERE rss_item_id=?", (sub_id,),
+        ).fetchone()
+        raw_tmdb_id = str(fields.get(
+            "media_tmdb_id", current["tmdb_id"] if current else ""
+        ) or "").strip()
+        tmdb_id = normalize_tmdb_id(raw_tmdb_id) if raw_tmdb_id else ""
+        default_season = int(fields.get(
+            "media_default_season", current["default_season"] if current else 1
+        ) or 0)
+        if not 0 <= default_season <= 100:
+            raise ValueError("默认季号必须在 0 到 100 之间")
+        skip_existing = 1 if fields.get(
+            "skip_existing_episodes",
+            current["skip_existing_episodes"] if current else 0,
+        ) else 0
+        if not tmdb_id:
+            conn.execute(
+                "DELETE FROM rss_media_bindings WHERE rss_item_id=?", (sub_id,)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO rss_media_bindings(rss_item_id,tmdb_id,default_season,"
+                "skip_existing_episodes,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(rss_item_id) DO UPDATE SET tmdb_id=excluded.tmdb_id,"
+                "default_season=excluded.default_season,"
+                "skip_existing_episodes=excluded.skip_existing_episodes,"
+                "updated_at=excluded.updated_at",
+                (sub_id, tmdb_id, default_season, skip_existing, timestamp, timestamp),
+            )
+
+
+def update_rss_subscription(
+    sub_id: int,
+    fields: dict,
+    *,
+    connection: sqlite3.Connection | None = None,
+) -> None:
+    """原子更新订阅；传入连接时复用调用方的事务与写锁。"""
     if not fields:
         return
-    base_allowed = {"name", "enabled", "refresh_cron", "refresh_interval_minutes",
-                    "last_refreshed_at", "urls", "parser", "exclude_keywords", "action",
-                    "download_method", "qb_save_path", "gy_target_dir", "gy_target_dir_name"}
-    binding_keys = {"media_tmdb_id", "media_default_season", "skip_existing_episodes"}
     timestamp = now()
+    if connection is not None:
+        _update_rss_subscription_in_connection(
+            connection, sub_id, fields, timestamp=timestamp
+        )
+        return
     with get_conn() as conn:
-        sets, vals = [], []
-        for key, value in fields.items():
-            if key in base_allowed:
-                sets.append(f"{key}=?")
-                vals.append(value)
-        if sets:
-            sets.append("updated_at=?")
-            vals.extend([timestamp, sub_id])
-            conn.execute(f"UPDATE rss_items SET {', '.join(sets)} WHERE id=?", vals)
-
-        if binding_keys & fields.keys():
-            current = conn.execute(
-                "SELECT tmdb_id,default_season,skip_existing_episodes "
-                "FROM rss_media_bindings WHERE rss_item_id=?", (sub_id,),
-            ).fetchone()
-            raw_tmdb_id = str(fields.get(
-                "media_tmdb_id", current["tmdb_id"] if current else ""
-            ) or "").strip()
-            tmdb_id = normalize_tmdb_id(raw_tmdb_id) if raw_tmdb_id else ""
-            default_season = int(fields.get(
-                "media_default_season", current["default_season"] if current else 1
-            ) or 0)
-            if not 0 <= default_season <= 100:
-                raise ValueError("默认季号必须在 0 到 100 之间")
-            skip_existing = 1 if fields.get(
-                "skip_existing_episodes", current["skip_existing_episodes"] if current else 0
-            ) else 0
-            if not tmdb_id:
-                conn.execute("DELETE FROM rss_media_bindings WHERE rss_item_id=?", (sub_id,))
-            else:
-                conn.execute(
-                    "INSERT INTO rss_media_bindings(rss_item_id,tmdb_id,default_season,"
-                    "skip_existing_episodes,created_at,updated_at) VALUES(?,?,?,?,?,?) "
-                    "ON CONFLICT(rss_item_id) DO UPDATE SET tmdb_id=excluded.tmdb_id,"
-                    "default_season=excluded.default_season,"
-                    "skip_existing_episodes=excluded.skip_existing_episodes,"
-                    "updated_at=excluded.updated_at",
-                    (sub_id, tmdb_id, default_season, skip_existing, timestamp, timestamp),
-                )
+        _update_rss_subscription_in_connection(conn, sub_id, fields, timestamp=timestamp)
 
 
 def delete_rss_subscription(sub_id: int) -> None:

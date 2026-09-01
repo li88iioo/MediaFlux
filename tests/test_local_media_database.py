@@ -6,6 +6,7 @@ import unittest
 
 from app import database as db
 from app.modules.local_media_models import LocalMediaSource, LocalMediaTask
+from app.modules.process_lock import CrossProcessLock
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -777,6 +778,41 @@ class LocalMediaDatabaseTests(IsolatedDatabaseTestCase):
             "waiting_stable",
         )
         self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
+
+    def test_init_db_defers_local_recovery_until_pipeline_writer_releases(self):
+        source_id = db.create_local_media_source(
+            name="live-writer", qb_profile="", qb_path_prefix="",
+            local_root="/tmp/live-writer", owner="admin",
+        )
+        task_id = db.create_local_media_task(
+            source_id, "a" * 40, "/tmp/live-writer/Movie.mkv", owner="admin",
+        )
+        task = db.get_local_media_task(task_id, owner="admin")
+        step_id = db.add_local_media_operation_step(
+            task_id, task.operation_token, 0, "move", owner="admin",
+        )
+        db.update_local_media_task(task_id, owner="admin", status="moving")
+        db.update_local_media_operation_step(step_id, "running")
+        live_writer = CrossProcessLock(
+            "local-media-pipeline-write", directory=db.resolve_db_path().parent,
+        )
+        self.assertTrue(live_writer.acquire(blocking=False))
+        try:
+            db.init_db()
+            active = db.get_local_media_task(task_id, owner="admin")
+            active_steps = db.list_local_media_operation_steps(task_id, owner="admin")
+            self.assertEqual(active.status, "moving")
+            self.assertEqual(active_steps[0]["status"], "running")
+        finally:
+            live_writer.release()
+
+        # 下一次启动检查能够拿到 writer，才把真正的 orphan 收束为人工核验。
+        db.init_db()
+        recovered = db.get_local_media_task(task_id, owner="admin")
+        recovered_steps = db.list_local_media_operation_steps(task_id, owner="admin")
+        self.assertEqual(recovered.status, "requires_manual")
+        self.assertTrue(db.is_interrupted_local_media_write_error(recovered.error))
+        self.assertEqual(recovered_steps[0]["status"], "failed")
 
     def test_init_db_keeps_all_postwrite_interruptions_for_manual_review(self):
         source_id = db.create_local_media_source(

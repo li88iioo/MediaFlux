@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-import re
 import unittest
 
 try:
@@ -544,6 +543,7 @@ class AgentBrowserTests(unittest.TestCase):
                 "status": "partial",
                 "summary": "已核验第 2 季并搜索部分缺集资源",
                 "data": {
+                    "search_id": "rs_season_resource_0001",
                     "verification": {
                         "title": "示例剧", "season": 2, "as_of": "2026-08-03",
                         "verified_missing": True,
@@ -593,6 +593,7 @@ class AgentBrowserTests(unittest.TestCase):
                 "source_type": "resource_candidates",
                 "positions": [1],
                 "target": "qb",
+                "search_id": "rs_season_resource_0001",
             },
         })
         self.assertFalse(any(call["url"].endswith("/actions/confirm") for call in calls))
@@ -768,6 +769,7 @@ class AgentBrowserTests(unittest.TestCase):
             "result": {
                 "ok": True, "status": "success", "summary": "找到 1 项资源",
                 "data": {
+                    "search_id": "rs_indexer_resource_0001",
                     "query": "黑镜", "returned": 1, "sites_attempted": ["nyaa"],
                     "sites_succeeded": ["nyaa"], "partial": False, "cached": False, "has_more": False,
                     "items": [{
@@ -810,9 +812,37 @@ class AgentBrowserTests(unittest.TestCase):
         })
         self.page.locator("#agentPrompt").fill("搜索《黑镜》的资源")
         self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
-        action = self.page.locator('[data-agent-target="qb"]')
+        action = self.page.locator('[data-agent-target="qb"]').first
         action.wait_for()
         self.assertIn("Black Mirror", self.page.locator(".agent-search-group").inner_text())
+        self._set_query_response({
+            "request_id": "search-test-newer",
+            "mode": "tool_result",
+            "tool_call": {"name": "indexer.search_resources", "elapsed_ms": 20},
+            "result": {
+                "ok": True, "status": "success", "summary": "找到 1 项新资源",
+                "data": {
+                    "search_id": "rs_indexer_resource_0002",
+                    "query": "黑镜 新版", "returned": 1,
+                    "sites_attempted": ["nyaa"], "sites_succeeded": ["nyaa"],
+                    "partial": False, "cached": False, "has_more": False,
+                    "items": [{
+                        "position": 1,
+                        "result_id": "result_newer_resource_12345",
+                        "site_id": "nyaa", "site_name": "Nyaa",
+                        "title": "Black Mirror Newer Candidate", "size_text": "2.0 GB",
+                        "seeders": 12, "download_state": "resolvable",
+                        "download_kinds": ["magnet"],
+                    }],
+                },
+                "evidence": [], "suggestions": [],
+            },
+        })
+        self.page.locator("#agentPrompt").fill("再搜索一次")
+        self.page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        self.page.wait_for_function(
+            "document.querySelectorAll('.agent-search-group').length === 2"
+        )
         action.click()
         self.page.locator(".agent-confirmation-card").wait_for()
         self.assertIn("行动计划", self.page.locator(".agent-confirmation-head").inner_text())
@@ -833,6 +863,7 @@ class AgentBrowserTests(unittest.TestCase):
                 "source_type": "resource_candidates",
                 "positions": [1],
                 "target": "qb",
+                "search_id": "rs_indexer_resource_0001",
             },
         })
         self.assertFalse(any(call["url"].endswith("/ingest.submit") for call in calls))
@@ -867,6 +898,7 @@ class AgentBrowserTests(unittest.TestCase):
             "result": {
                 "ok": True, "status": "success", "summary": "找到 1 项资源",
                 "data": {
+                    "search_id": "rs_abort_resource_0001",
                     "query": "黑镜", "returned": 1, "sites_attempted": ["nyaa"],
                     "sites_succeeded": ["nyaa"], "partial": False, "cached": False,
                     "has_more": False,
@@ -1420,6 +1452,7 @@ class AgentBrowserTests(unittest.TestCase):
             "result": {
                 "ok": True, "status": "success", "summary": "找到 1 项资源",
                 "data": {
+                    "search_id": "rs_mobile_resource_0001",
                     "query": "黑镜", "returned": 1, "sites_attempted": ["nyaa"],
                     "sites_succeeded": ["nyaa"], "partial": False, "cached": False, "has_more": False,
                     "items": [{

@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.modules.process_lock import CrossProcessLock
+from app.modules.qb_control import qb_control_write_lease
 
 
 def _try_lock(directory: str, queue) -> None:
@@ -30,6 +31,16 @@ class CrossProcessLockTests(unittest.TestCase):
                 first.release()
             self.assertTrue(second.acquire(blocking=False))
             second.release()
+
+    def test_qb_control_lease_blocks_same_cross_process_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            shared = CrossProcessLock("qb-control-write", directory=temp_dir)
+            contender = CrossProcessLock("qb-control-write", directory=temp_dir)
+            with patch("app.modules.qb_control._QB_CONTROL_WRITE_LOCK", shared):
+                with qb_control_write_lease():
+                    self.assertFalse(contender.acquire(blocking=False))
+                self.assertTrue(contender.acquire(blocking=False))
+                contender.release()
 
     def test_lock_can_be_released_by_worker_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

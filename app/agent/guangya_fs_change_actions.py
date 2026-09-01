@@ -36,8 +36,10 @@ from app.modules.guangya_workspace import (
     valid_observation_ref,
 )
 from app.repositories.organize_operation_jobs import (
+    get_organize_operation_job,
     organize_operation_owner_digest,
     organize_operation_public_ref,
+    organize_operation_queue_position,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +81,15 @@ def reset_guangya_fs_change_context_for_tests() -> None:
     with _lock:
         _flows.clear()
     _repository = None
+
+
+def clear_guangya_fs_change_context(*, owner: str) -> None:
+    """清除 owner 的内存缓存；SQLite epoch 是唯一有效性权威。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return
+    with _lock:
+        _flows.pop(owner_key, None)
 
 
 def _safe_preview(value: object) -> dict[str, Any] | None:
@@ -227,6 +238,9 @@ def _flow(owner: str) -> _Flow | None:
                     return flow
         except Exception as exc:  # noqa: BLE001 - 上下文读取失败按无预览处理
             logger.warning("Agent 光鸭变更上下文读取失败 type=%s", type(exc).__name__)
+        with _lock:
+            _flows.pop(owner_key, None)
+        return None
     with _lock:
         current = _flows.get(owner_key)
         if current is None or time.monotonic() - current.updated_at > _TTL_SECONDS:
@@ -406,13 +420,15 @@ def preview_guangya_fs_change(
         revision=guard.revision,
     )
     if not _save(flow):
-        discard_fs_change_plan(flow.plan_id)
+        discard_fs_change_plan(flow.plan_id, preview_only=True)
         raise AgentToolError(
             "光鸭变更预览已被更新请求取代，请重新生成",
             code="precondition_failed",
         )
     if previous is not None and previous.plan_id != flow.plan_id:
-        discard_fs_change_plan(previous.plan_id)
+        # 旧 flow 可能已被另一请求确认并成功入队；只能清理仍处于 previewed
+        # 的孤立预览，绝不能删除 queued/running 的冻结执行凭据。
+        discard_fs_change_plan(previous.plan_id, preview_only=True)
     return ToolResult(
         True,
         "ready",
@@ -543,10 +559,44 @@ def execute_guangya_fs_change_confirmed(
     except Exception as exc:
         raise _public_error(exc) from exc
     if not task.get("ok"):
-        raise AgentToolError(
-            "光鸭操作队列当前不可用，变更预览已保留，请稍后重新确认",
-            code="precondition_failed",
-        )
+        # enqueue 已在数据库事务提交前把 job_id 写入计划。即使当前进程在
+        # 随后的即时 claim/dispatcher 启动阶段报错，另一个进程仍可能已领取
+        # 同一持久任务；此时不能误导用户重提一份重复远端写入。
+        try:
+            persisted = load_fs_change_plan(
+                flow.plan_id,
+                owner=context.owner,
+                expected_fingerprint=flow.fingerprint,
+            )
+            persisted_job_id = str(persisted.get("job_id") or "")
+            row = (
+                get_organize_operation_job(persisted_job_id)
+                if _PLAN_ID_RE.fullmatch(persisted_job_id)
+                else None
+            )
+        except Exception as exc:
+            raise AgentToolError(
+                "光鸭操作队列状态当前不可用，请稍后查询任务状态",
+                code="unavailable",
+            ) from exc
+        persisted_status = str(row["status"] or "") if row is not None else ""
+        if persisted_status in {"pending", "running"}:
+            task = {
+                "ok": True,
+                "task_id": persisted_job_id,
+                "queued": persisted_status == "pending",
+                "queue_position": (
+                    organize_operation_queue_position(persisted_job_id)
+                    if persisted_status == "pending"
+                    else 0
+                ),
+                "replayed": True,
+            }
+        else:
+            raise AgentToolError(
+                "光鸭操作未能可靠入队，请重新生成预览后重试",
+                code="precondition_failed",
+            )
     consumed = _consume(flow)
     internal_id = str(task.get("task_id") or "")
     operation_ref = (

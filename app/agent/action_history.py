@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import hashlib
 import hmac
 import json
+import re
 from typing import Any
 
 from app import database as db
@@ -74,7 +75,7 @@ _SAFE_FIELDS = {
     },
     "provider.change.execute": {
         "provider", "operation", "status", "affected", "accepted",
-        "delete_files", "global_refresh",
+        "delete_files", "global_refresh", "plan_ref",
     },
     "rss.mark_entries": {"affected", "processed"},
     "rss.submit_entries_to_qb": {
@@ -307,6 +308,10 @@ def _safe_details(tool_name: str, data: dict[str, Any] | None) -> dict[str, Any]
             normalized = str(value or "").strip().lower()
             if normalized in _ENUM_FIELDS[key]:
                 projected[key] = normalized
+        elif key == "plan_ref":
+            normalized = str(value or "").strip().upper()
+            if re.fullmatch(r"PP-[0-9A-F]{24}", normalized):
+                projected[key] = normalized
     return projected
 
 
@@ -437,6 +442,7 @@ def record_confirmation_claimed(
     tool_name: str,
     risk: RiskLevel,
     confirmation_contract: dict[str, Any] | None = None,
+    action_arguments: dict[str, Any] | None = None,
     connection: Any = None,
 ) -> None:
     """在消费确认票据的同一事务中先持久化执行中状态。"""
@@ -451,7 +457,7 @@ def record_confirmation_claimed(
         summary=_safe_summary(safe_tool, "executing"),
         safe_details=_audit_details(
             tool_name,
-            {},
+            action_arguments,
             confirmation_contract,
         ),
         started_at=started_at,
@@ -496,6 +502,7 @@ def record_confirmation_interrupted(
                 confirmation_id,
                 owner_generation,
             ),
+            finalize_only=True,
         )
     except Exception as exc:
         logger.warning(
@@ -531,6 +538,7 @@ def record_confirmed_result(*, owner: str, tool_name: str, risk: RiskLevel,
                 if confirmation_id
                 else ""
             ),
+            finalize_only=bool(confirmation_id),
         )
     except Exception as exc:
         logger.warning("Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__)
@@ -563,6 +571,7 @@ def record_confirmation_error(*, owner: str, tool_name: str, risk: RiskLevel,
                 if confirmation_id
                 else ""
             ),
+            finalize_only=bool(confirmation_id),
         )
     except Exception as exc:
         logger.warning("Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__)

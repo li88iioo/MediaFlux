@@ -1,6 +1,7 @@
 """RSS 订阅配置的唯一规范化与调度唤醒入口。"""
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from typing import Any
 
@@ -68,10 +69,15 @@ def _bool(value: Any, *, field: str) -> bool:
 def _integer(value: Any, *, field: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool):
         raise RSSSubscriptionConfigError(f"{field} 必须是整数")
-    try:
-        result = int(value)
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise RSSSubscriptionConfigError(f"{field} 必须是整数") from exc
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        try:
+            result = int(value.strip())
+        except (ValueError, OverflowError) as exc:  # pragma: no cover - 正则已约束格式
+            raise RSSSubscriptionConfigError(f"{field} 必须是整数") from exc
+    else:
+        raise RSSSubscriptionConfigError(f"{field} 必须是整数")
     if not minimum <= result <= maximum:
         raise RSSSubscriptionConfigError(f"{field} 必须在 {minimum} 到 {maximum} 之间")
     return result

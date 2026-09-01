@@ -18,6 +18,7 @@ from app.modules.guangya_workspace import (
     create_directory_observation,
     create_path_observation,
     discard_observation,
+    discard_owner_observations,
     load_directory_observation,
     observation_page,
     valid_observation_ref,
@@ -58,6 +59,16 @@ def reset_guangya_workspace_context_for_tests() -> None:
     with _lock:
         _flows.clear()
     _repository = None
+
+
+def clear_guangya_workspace_context(*, owner: str) -> int:
+    """清除 owner 的缓存与全部短期观察引用。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return 0
+    with _lock:
+        _flows.pop(owner_key, None)
+    return discard_owner_observations(owner_key)
 
 
 def _begin(owner: str) -> AgentContextWriteGuard:
@@ -144,6 +155,9 @@ def latest_guangya_observation_ref(owner: str) -> str:
                     return ref
         except Exception as exc:
             logger.warning("Agent 光鸭观察上下文读取失败 type=%s", type(exc).__name__)
+        with _lock:
+            _flows.pop(owner, None)
+        return ""
     with _lock:
         flow = _flows.get(owner)
         if flow and time.monotonic() - flow.updated_at <= _TTL_SECONDS:

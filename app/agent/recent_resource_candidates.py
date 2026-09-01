@@ -27,9 +27,27 @@ _CONTEXT_TYPE = "resource_candidates"
 logger = logging.getLogger(__name__)
 
 
-def safe_resource_snapshot(result: ToolResult) -> dict[str, Any]:
+def new_resource_search_id() -> str:
+    """签发不可猜测的公开搜索快照标识。"""
+    return f"rs_{secrets.token_urlsafe(16)}"
+
+
+def normalize_resource_search_id(value: Any) -> str:
+    """仅接受本服务签发的搜索快照标识；空值表示未指定。"""
+    search_id = str(value or "").strip()
+    return search_id if _SEARCH_ID_PATTERN.fullmatch(search_id) else ""
+
+
+def safe_resource_snapshot(
+    result: ToolResult, *, search_id: str
+) -> dict[str, Any]:
     """返回与持久候选仓相同的脱敏快照，供单次请求内按序号续接。"""
-    return deepcopy(_safe_snapshot(result))
+    snapshot = deepcopy(_safe_snapshot(result))
+    normalized_search_id = normalize_resource_search_id(search_id)
+    if not normalized_search_id:
+        raise ValueError("invalid resource search id")
+    snapshot["search_id"] = normalized_search_id
+    return snapshot
 
 
 class RecentResourceCandidateStore:
@@ -55,13 +73,14 @@ class RecentResourceCandidateStore:
         self._owner_locks = tuple(threading.RLock() for _ in range(64))
         self._entries: OrderedDict[str, list[tuple[float, dict[str, Any]]]] = OrderedDict()
 
-    def capture(self, *, owner: str, result: ToolResult) -> str:
+    def capture(
+        self, *, owner: str, result: ToolResult, search_id: str = ""
+    ) -> str:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return ""
-        snapshot = _safe_snapshot(result)
-        search_id = f"rs_{secrets.token_urlsafe(16)}"
-        snapshot["search_id"] = search_id
+        effective_search_id = search_id or new_resource_search_id()
+        snapshot = safe_resource_snapshot(result, search_id=effective_search_id)
         with self._owner_lock(owner_key):
             now = self._clock()
             with self._lock:
@@ -73,28 +92,19 @@ class RecentResourceCandidateStore:
                     self._entries.popitem(last=False)
             if self._repository is not None:
                 try:
-                    append_snapshot = getattr(self._repository, "append_snapshot", None)
-                    if callable(append_snapshot):
-                        append_snapshot(
-                            owner=owner_key,
-                            context_type=_CONTEXT_TYPE,
-                            payload=snapshot,
-                            expires_at=self._wall_clock() + self.ttl_seconds,
-                            max_items=self.max_snapshots_per_owner,
-                        )
-                    else:
-                        self._repository.replace_latest(
-                            owner=owner_key,
-                            context_type=_CONTEXT_TYPE,
-                            payload=snapshot,
-                            expires_at=self._wall_clock() + self.ttl_seconds,
-                        )
+                    self._repository.append_snapshot(
+                        owner=owner_key,
+                        context_type=_CONTEXT_TYPE,
+                        payload=snapshot,
+                        expires_at=self._wall_clock() + self.ttl_seconds,
+                        max_items=self.max_snapshots_per_owner,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Agent 资源候选上下文持久化失败 type=%s",
                         type(exc).__name__,
                     )
-        return search_id
+        return effective_search_id
 
     def get(self, *, owner: str, search_id: str = "") -> dict[str, Any] | None:
         owner_key = str(owner or "").strip()
@@ -154,21 +164,12 @@ class RecentResourceCandidateStore:
             return None
         wall_now = self._wall_clock()
         try:
-            list_snapshots = getattr(self._repository, "list_snapshots", None)
-            if callable(list_snapshots):
-                persisted_items = list_snapshots(
-                    owner=owner_key,
-                    context_type=_CONTEXT_TYPE,
-                    now=wall_now,
-                    limit=self.max_snapshots_per_owner,
-                )
-            else:
-                latest = self._repository.get_latest(
-                    owner=owner_key,
-                    context_type=_CONTEXT_TYPE,
-                    now=wall_now,
-                )
-                persisted_items = (latest,) if latest is not None else ()
+            persisted_items = self._repository.list_snapshots(
+                owner=owner_key,
+                context_type=_CONTEXT_TYPE,
+                now=wall_now,
+                limit=self.max_snapshots_per_owner,
+            )
         except Exception as exc:
             logger.warning(
                 "Agent 资源候选上下文恢复失败 type=%s", type(exc).__name__
@@ -204,13 +205,15 @@ def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
     if isinstance(generic_items, list):
         candidates: list[dict[str, Any]] = []
         seen_result_ids: set[str] = set()
-        for raw in generic_items[:_MAX_CANDIDATES]:
+        for raw in generic_items:
             projected = _safe_generic_candidate(raw)
             if not projected or projected["result_id"] in seen_result_ids:
                 continue
             seen_result_ids.add(projected["result_id"])
             projected["position"] = len(candidates) + 1
             candidates.append(projected)
+            if len(candidates) >= _MAX_CANDIDATES:
+                break
         return {
             "search_status": _safe_text(str(result.status or ""), 40),
             "candidates": candidates,
@@ -396,32 +399,29 @@ def _safe_candidate(
     }
 
 
-_GENERIC_PERSISTED_KEYS_V1 = frozenset({
+_GENERIC_PERSISTED_KEYS = frozenset({
     "position", "result_id", "title", "site_id", "site_name", "size_text",
     "download_state", "_verification_context",
-})
-_GENERIC_PERSISTED_KEYS = _GENERIC_PERSISTED_KEYS_V1 | frozenset({
     "download_kinds", "media_title", "episode_label", "subscription_number",
 })
-_EPISODIC_PERSISTED_KEYS_V1 = frozenset({
+_EPISODIC_PERSISTED_KEYS = frozenset({
     "position", "season", "episode", "episode_label", "result_id", "title",
     "site_id", "site_name", "rank", "score", "confidence", "match",
     "download_state", "_verification_context",
-})
-_EPISODIC_PERSISTED_KEYS = _EPISODIC_PERSISTED_KEYS_V1 | frozenset({
     "reasons", "warnings", "tags",
 })
 
 
 def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
     """严格验证持久化资源候选投影，拒绝额外字段或被篡改的句柄。"""
-    if not isinstance(value, dict) or set(value) not in (
-        {"search_status", "candidates"},
-        {"search_id", "search_status", "candidates"},
-    ):
+    if not isinstance(value, dict) or set(value) != {
+        "search_id",
+        "search_status",
+        "candidates",
+    }:
         return None
-    search_id = str(value.get("search_id") or "").strip()
-    if search_id and not _SEARCH_ID_PATTERN.fullmatch(search_id):
+    search_id = normalize_resource_search_id(value.get("search_id"))
+    if not search_id:
         return None
     search_status = _safe_text(value.get("search_status"), 40)
     raw_candidates = value.get("candidates")
@@ -437,23 +437,18 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
         if not isinstance(raw, dict):
             return None
         keys = frozenset(raw)
-        if keys in {_GENERIC_PERSISTED_KEYS_V1, _GENERIC_PERSISTED_KEYS}:
+        if keys == _GENERIC_PERSISTED_KEYS:
             result_id = str(raw.get("result_id") or "").strip()
             projected = _safe_generic_candidate(
                 raw,
-                require_download_kinds=keys != _GENERIC_PERSISTED_KEYS_V1,
+                require_download_kinds=True,
             )
             if projected is None:
                 return None
             projected["position"] = expected_position
-            comparable = (
-                {key: projected[key] for key in _GENERIC_PERSISTED_KEYS_V1}
-                if keys == _GENERIC_PERSISTED_KEYS_V1
-                else projected
-            )
-            if raw != comparable:
+            if raw != projected:
                 return None
-        elif keys in {_EPISODIC_PERSISTED_KEYS_V1, _EPISODIC_PERSISTED_KEYS}:
+        elif keys == _EPISODIC_PERSISTED_KEYS:
             season = _safe_positive_int(raw.get("season"), maximum=100)
             episode = _safe_positive_int(raw.get("episode"), maximum=1000)
             if season is None or episode is None:
@@ -483,12 +478,7 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
             if projected is None:
                 return None
             projected["position"] = expected_position
-            comparable = (
-                {key: projected[key] for key in _EPISODIC_PERSISTED_KEYS_V1}
-                if keys == _EPISODIC_PERSISTED_KEYS_V1
-                else projected
-            )
-            if raw != comparable:
+            if raw != projected:
                 return None
             result_id = projected["result_id"]
         else:
@@ -497,10 +487,11 @@ def validate_safe_resource_snapshot(value: Any) -> dict[str, Any] | None:
             return None
         seen_result_ids.add(result_id)
         candidates.append(projected)
-    result = {"search_status": search_status, "candidates": candidates}
-    if search_id:
-        result["search_id"] = search_id
-    return result
+    return {
+        "search_id": search_id,
+        "search_status": search_status,
+        "candidates": candidates,
+    }
 
 
 def public_candidate_projection(value: Any) -> dict[str, Any]:

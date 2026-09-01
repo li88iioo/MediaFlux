@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import time
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from app.agent.registry import AgentToolError
@@ -22,6 +23,8 @@ _MAX_JSON_BYTES = 65_536
 _MAX_SUMMARY_LENGTH = 240
 _MAX_ERROR_CODE_LENGTH = 80
 _MAX_HISTORY_PER_PRINCIPAL = 64
+_MAX_TERMINAL_HISTORY_GLOBAL = 4_096
+_TERMINAL_RETENTION_SECONDS = 30 * 24 * 60 * 60
 
 
 def _database() -> ModuleType:
@@ -36,6 +39,24 @@ def get_conn():
 
 def now() -> str:
     return _database().now()
+
+
+def recover_orphaned_provider_plans_under_writer_lease() -> int:
+    """收束所有已失去执行者的 running 计划。
+
+    调用方必须已经持有全局 ``agent-provider-write`` lease。该约束保证当前
+    不存在仍可能完成这些计划的存活 writer，因此不会把真实运行中的动作误判
+    为中断。
+    """
+    stamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return int(
+            _database().recover_interrupted_provider_plans(
+                conn,
+                timestamp=stamp,
+            )
+        )
 
 
 def _digest(value: str, *, domain: bytes, required: bool = True) -> str:
@@ -124,6 +145,15 @@ def _internal_row(row: Any) -> dict[str, Any]:
 
 
 def _trim_history(conn: Any, *, owner_digest: str, session_digest: str) -> None:
+    cutoff = (
+        datetime.now().astimezone()
+        - timedelta(seconds=_TERMINAL_RETENTION_SECONDS)
+    ).strftime("%Y-%m-%d %H:%M:%S.%f")
+    conn.execute(
+        "DELETE FROM agent_provider_plans WHERE status IN "
+        "('succeeded','failed','stale','outcome_unknown') AND updated_at<?",
+        (cutoff,),
+    )
     rows = conn.execute(
         "SELECT plan_id FROM agent_provider_plans "
         "WHERE owner_digest=? AND session_digest=? "
@@ -140,6 +170,52 @@ def _trim_history(conn: Any, *, owner_digest: str, session_digest: str) -> None:
                 for row in rows
             ],
         )
+    overflow = conn.execute(
+        "SELECT plan_id FROM agent_provider_plans WHERE status IN "
+        "('succeeded','failed','stale','outcome_unknown') "
+        "ORDER BY updated_at DESC,plan_id DESC LIMIT -1 OFFSET ?",
+        (_MAX_TERMINAL_HISTORY_GLOBAL,),
+    ).fetchall()
+    if overflow:
+        conn.executemany(
+            "DELETE FROM agent_provider_plans WHERE plan_id=?",
+            [(str(row["plan_id"]),) for row in overflow],
+        )
+
+
+def invalidate_provider_plans_for_owner(*, owner: str) -> dict[str, int]:
+    """撤销 owner 的短期 Provider 状态；运行中计划仅脱敏后等待执行者收尾。"""
+    owner_digest = _digest(
+        owner, domain=b"mediaflux-agent-provider-plan-owner:v1"
+    )
+    stamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='agent_provider_plans'"
+        ).fetchone()
+        if table_exists is None:
+            # 独立工具测试、首次迁移前或降级数据库中没有 Provider 状态，
+            # 等价于当前 owner 没有可撤销计划，不能因此阻断整段会话重置。
+            return {"scrubbed_running": 0, "deleted": 0}
+        running = conn.execute(
+            "UPDATE agent_provider_plans SET "
+            "owner_digest=lower(hex(randomblob(32))),"
+            "session_digest=lower(hex(randomblob(32))),provider='',profile_ref='',"
+            "operation='',risk='write',arguments_json='{}',target_snapshot_json='{}',"
+            "result_json='{}',context_fingerprint='',summary='',"
+            "error_code='session_reset_pending',updated_at=? "
+            "WHERE owner_digest=? AND status='running'",
+            (stamp, owner_digest),
+        )
+        removed = conn.execute(
+            "DELETE FROM agent_provider_plans WHERE owner_digest=? AND status<>'running'",
+            (owner_digest,),
+        )
+    scrubbed = max(0, int(running.rowcount or 0))
+    deleted = max(0, int(removed.rowcount or 0))
+    return {"scrubbed_running": scrubbed, "deleted": deleted}
 
 
 def create_provider_plan(
@@ -321,19 +397,32 @@ def finish_provider_plan(
     if normalized_status not in _TERMINAL_STATUSES:
         raise ValueError("Provider 写计划终态无效")
     stamp = now()
+    serialized_result = _json_object(result, field="result")
     safe_summary = " ".join(str(summary or "").split())[:_MAX_SUMMARY_LENGTH]
     safe_error = re.sub(r"[^A-Za-z0-9_.-]", "", str(error_code or ""))[
         :_MAX_ERROR_CODE_LENGTH
     ]
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT context_fingerprint FROM agent_provider_plans "
+            "WHERE plan_id=? AND status='running'",
+            (normalized,),
+        ).fetchone()
+        privacy_purged = current is not None and not str(
+            current["context_fingerprint"] or ""
+        )
+        persisted_result = "{}" if privacy_purged else serialized_result
+        persisted_summary = "" if privacy_purged else safe_summary
+        persisted_error = "privacy_purge_pending" if privacy_purged else safe_error
         updated = conn.execute(
             "UPDATE agent_provider_plans SET status=?,result_json=?,summary=?,"
             "error_code=?,finished_at=?,updated_at=? WHERE plan_id=? AND status='running'",
             (
                 normalized_status,
-                _json_object(result, field="result"),
-                safe_summary,
-                safe_error,
+                persisted_result,
+                persisted_summary,
+                persisted_error,
                 stamp,
                 stamp,
                 normalized,
@@ -341,3 +430,8 @@ def finish_provider_plan(
         ).rowcount
         if updated != 1:
             raise AgentToolError("Provider 写计划状态已变化", code="outcome_unknown")
+        conn.execute(
+            "DELETE FROM agent_provider_plans "
+            "WHERE plan_id=? AND context_fingerprint=''",
+            (normalized,),
+        )

@@ -55,8 +55,13 @@ from app.agent.local_media_task_actions import clear_local_media_agent_context
 from app.agent.discovery_mapping_actions import clear_discovery_mapping_context
 from app.agent.guangya_directory_scrape_actions import clear_directory_scrape_context
 from app.agent.guangya_cleanup_actions import (
+    clear_guangya_cleanup_context,
     validate_empty_only_cleanup_confirmation_binding,
 )
+from app.agent.guangya_fs_change_actions import clear_guangya_fs_change_context
+from app.agent.guangya_rename_actions import clear_guangya_rename_context
+from app.agent.guangya_workspace_actions import clear_guangya_workspace_context
+from app.agent.provider_actions import clear_provider_session_state
 from app.agent.indexer_config_actions import current_indexer_site_ids
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.modules.download_dispatcher import extract_download_url, route_download_url
@@ -85,6 +90,7 @@ from app.agent.recent_patrol import RecentPatrolStore
 from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOperationStore
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
+    new_resource_search_id,
     public_candidate_projection,
     safe_resource_snapshot,
 )
@@ -101,8 +107,6 @@ from app.agent.recent_download_submissions import (
 from app.agent.episode_audit import invalidate_episode_audit_cache
 from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.progress_events import emit_agent_progress
-from app.agent.provider_actions import get_provider_gateway
-from app.agent.provider_models import ProviderGatewayError
 from app.agent.rate_limit import allow_agent_tool
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.rss_reference import resolve_rss_subscription_name
@@ -138,14 +142,14 @@ _QUERY_TOOL_RATE_IDENTITY: ContextVar[str] = ContextVar(
 class _NativeResourceCapture:
     """暂存原生工具循环中的资源结果，等待本轮语义角色确定。"""
 
-    results: list[ToolResult] = field(default_factory=list)
+    results: list[tuple[ToolResult, str]] = field(default_factory=list)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
-    def add(self, result: ToolResult) -> None:
+    def add(self, result: ToolResult, *, search_id: str) -> None:
         with self._lock:
-            self.results.append(deepcopy(result))
+            self.results.append((deepcopy(result), str(search_id or "")))
 
-    def latest(self) -> ToolResult | None:
+    def latest(self) -> tuple[ToolResult, str] | None:
         with self._lock:
             return deepcopy(self.results[-1]) if self.results else None
 
@@ -475,14 +479,26 @@ def _safe_media_context(value: Any) -> dict[str, Any]:
     media_type = str(value.get("media_type") or "").strip().lower()
     if media_type in {"movie", "tv"}:
         result["media_type"] = media_type
-    for field, maximum_digits in (("tmdb_id", 10), ("bangumi_id", 10), ("douban_id", 20)):
-        identifier = str(value.get(field) or "").strip()
-        if identifier.isascii() and identifier.isdigit() and 1 <= len(identifier) <= maximum_digits:
-            result[field] = identifier
-    for field, maximum in (("season", 100), ("episode", 1000)):
-        coordinate = value.get(field)
-        if isinstance(coordinate, int) and not isinstance(coordinate, bool) and 1 <= coordinate <= maximum:
-            result[field] = coordinate
+    for identifier_field, maximum_digits in (
+        ("tmdb_id", 10),
+        ("bangumi_id", 10),
+        ("douban_id", 20),
+    ):
+        identifier = str(value.get(identifier_field) or "").strip()
+        if (
+            identifier.isascii()
+            and identifier.isdigit()
+            and 1 <= len(identifier) <= maximum_digits
+        ):
+            result[identifier_field] = identifier
+    for coordinate_field, maximum in (("season", 100), ("episode", 1000)):
+        coordinate = value.get(coordinate_field)
+        if (
+            isinstance(coordinate, int)
+            and not isinstance(coordinate, bool)
+            and 1 <= coordinate <= maximum
+        ):
+            result[coordinate_field] = coordinate
     case_stage = normalize_media_case_stage(value.get("case_stage"))
     if case_stage:
         result["case_stage"] = case_stage
@@ -3588,10 +3604,16 @@ def discovery_watchlist_subscription_request(
         *_DISCOVERY_WATCHLIST_SCOPES, "收藏",
     )):
         return None
-    if not any(token in normalized for token in (
+    direct_conversion = any(token in normalized for token in (
         "转为订阅", "转成订阅", "变成订阅", "加入追更",
         "添加追更", "创建追更", "转为追更", "转成追更",
-    )):
+    ))
+    scheduled_conversion = bool(re.search(
+        r"(?:转为|转成|变成)\s*每\s*"
+        r"(?:周|星期|礼拜|(?:3|三|7|七)\s*天)(?:\s*一次)?\s*订阅",
+        normalized,
+    ))
+    if not direct_conversion and not scheduled_conversion:
         return None
     matched = re.search(
         r"(?:探索收藏|影视收藏|发现收藏|收藏)(?:编号)?\s*([0-9]{1,9})(?:\s*号)?",
@@ -3606,6 +3628,9 @@ def discovery_watchlist_subscription_request(
         if not 1 <= season <= 100:
             return None
         request["season"] = season
+    check_interval_minutes = _media_subscription_check_interval(normalized)
+    if check_interval_minutes is not None:
+        request["check_interval_minutes"] = check_interval_minutes
     return request
 
 
@@ -5932,11 +5957,6 @@ class AgentOrchestrator:
             try:
                 persisted = self.session_context_repository.invalidate_owner(
                     owner=owner_key,
-                    context_types=(
-                        "discovery_mapping",
-                        "directory_scrape",
-                        "local_media_tasks",
-                    ),
                 )
             except Exception as exc:
                 logger.warning("Agent 会话持久化上下文清理失败 type=%s", type(exc).__name__)
@@ -5952,10 +5972,24 @@ class AgentOrchestrator:
         )
         clear_discovery_mapping_context(owner=owner_key, delete_persisted=False)
         clear_directory_scrape_context(owner=owner_key, delete_persisted=False)
+        clear_guangya_rename_context(owner=owner_key)
+        clear_guangya_cleanup_context(owner=owner_key)
+        clear_guangya_fs_change_context(owner=owner_key)
+        discarded_observations = clear_guangya_workspace_context(owner=owner_key)
+        try:
+            provider_state = clear_provider_session_state(owner=owner_key)
+        except Exception as exc:
+            logger.warning(
+                "Agent 会话 Provider 状态清理失败 type=%s", type(exc).__name__
+            )
+            raise AgentToolError("会话重置暂时无法完成，请稍后重试") from exc
         return {
             "reset": True,
             "revoked_confirmations": revoked,
             "deleted_contexts": persisted,
+            "discarded_observations": discarded_observations,
+            "deleted_provider_artifacts": provider_state["artifacts"],
+            "invalidated_provider_plans": provider_state["plans"],
         }
 
     def _active_action_plan_context(self, *, owner: str) -> str:
@@ -6129,12 +6163,22 @@ class AgentOrchestrator:
             state_result = deepcopy(result)
             state_arguments = deepcopy(normalized_arguments)
             native_resource_capture = _NATIVE_RESOURCE_CAPTURE.get()
-            resource_snapshot = safe_resource_snapshot(state_result)
-            if resource_snapshot.get("candidates"):
+            stages_resource_candidates = (
+                self.registry.stages_resource_candidates_for(tool_name)
+            )
+            resource_search_id = ""
+            if stages_resource_candidates:
+                resource_search_id = new_resource_search_id()
+                resource_snapshot = safe_resource_snapshot(
+                    state_result,
+                    search_id=resource_search_id,
+                )
                 stage_agent_resource_candidates(
                     owner=owner,
                     snapshot=resource_snapshot,
                 )
+                if isinstance(result.data, dict):
+                    result.data["search_id"] = resource_search_id
 
             def commit_followup_state() -> None:
                 if tool_name in {
@@ -6152,16 +6196,19 @@ class AgentOrchestrator:
                     self.recent_patrol_store.capture(
                         owner=owner, result=state_result
                     )
-                if (
-                    self.registry.stages_resource_candidates_for(tool_name)
-                ):
+                if stages_resource_candidates:
                     if native_resource_capture is not None:
                         # 原生只读循环可能只把资源索引当作旁证；等最终响应契约
                         # 明确候选是主输出后，才允许激活跨轮下载上下文。
-                        native_resource_capture.add(state_result)
+                        native_resource_capture.add(
+                            state_result,
+                            search_id=resource_search_id,
+                        )
                     else:
                         self.recent_resource_store.capture(
-                            owner=owner, result=state_result
+                            owner=owner,
+                            result=state_result,
+                            search_id=resource_search_id,
                         )
                 if tool_name in {"discovery.search", "discovery.recommend"}:
                     self.recent_discovery_store.capture(
@@ -7210,6 +7257,13 @@ class AgentOrchestrator:
                 )
         return None
 
+    def _confirmation_execution_risk(self, tool_name: str) -> RiskLevel:
+        """为已签发票据提供稳定审计风险，不恢复已移除的旧工具。"""
+        normalized = str(tool_name or "").strip()
+        if not self.registry.has(normalized):
+            return RiskLevel.WRITE
+        return self.registry.risk_for(normalized)
+
     def confirm(
         self, confirmation_id: str, *, owner: str, request_id: str = "",
         session_id: str = "",
@@ -7222,15 +7276,20 @@ class AgentOrchestrator:
                 owner=owner,
                 confirmation_id=confirmation_id,
                 record_execution=self.record_actions,
-                execution_risk_for=self.registry.risk_for,
+                execution_risk_for=self._confirmation_execution_risk,
             )
             self._reconcile_missing_confirmations(owner, ())
         except AgentToolError:
             agent_metrics.record_confirmation("invalid")
             raise
         agent_metrics.record_confirmation("claimed")
-        risk = self.registry.risk_for(ticket.tool_name)
+        risk = self._confirmation_execution_risk(ticket.tool_name)
         try:
+            if not self.registry.has(ticket.tool_name):
+                raise AgentToolError(
+                    "确认请求来自已升级的旧能力，请重新发起",
+                    code="confirmation_stale",
+                )
             result, elapsed_ms = self.registry.execute_confirmed(
                 ticket.tool_name,
                 ticket.arguments,
@@ -8261,10 +8320,13 @@ class AgentOrchestrator:
             # 原生认知链中的候选工具先作为证据暂存；只有本轮最终明确为
             # 资源搜索展示，才激活最新一份安全候选供后续选择。
             def commit_primary_resource_candidates() -> None:
-                latest_resource_result = native_resource_capture.latest()
-                if latest_resource_result is not None:
+                latest_resource_capture = native_resource_capture.latest()
+                if latest_resource_capture is not None:
+                    latest_resource_result, latest_search_id = latest_resource_capture
                     self.recent_resource_store.capture(
-                        owner=owner, result=latest_resource_result
+                        owner=owner,
+                        result=latest_resource_result,
+                        search_id=latest_search_id,
                     )
 
             commit_or_defer_agent_state(commit_primary_resource_candidates)
@@ -8338,6 +8400,11 @@ class AgentOrchestrator:
             }
             if isinstance(season, int):
                 arguments["season"] = season
+            check_interval_minutes = watchlist_subscription_request.get(
+                "check_interval_minutes"
+            )
+            if isinstance(check_interval_minutes, int):
+                arguments["check_interval_minutes"] = check_interval_minutes
             return self.prepare(
                 "media.create_subscription", arguments, owner=owner
             )
@@ -8697,33 +8764,78 @@ class AgentOrchestrator:
         self, *, operation: str, task_name: str, owner: str
     ) -> dict[str, Any]:
         """把确定性 qB 控制请求收敛到唯一 Provider 写计划链。"""
-        gateway = get_provider_gateway()
-        profiles = [
-            profile
-            for profile in gateway.profiles("qbittorrent")
-            if profile.state == "online"
-        ]
-        if len(profiles) != 1:
-            return self._response(
-                "provider.capabilities",
-                {},
-                ToolResult(
-                    False,
-                    "provider_not_configured",
-                    "qBittorrent 当前未配置或不可用",
-                    suggestions=["请先在设置中完成 qBittorrent 配置。"],
-                    error="无法确定唯一可用的 qBittorrent 配置。",
-                ),
-                0,
+        trace_context = current_tool_context(owner=owner)
+        stage_tool = "provider.capabilities"
+
+        def execute_registered_read(
+            tool_name: str, arguments: dict[str, Any]
+        ) -> tuple[ToolResult, int]:
+            nonlocal stage_tool
+            stage_tool = tool_name
+            self._reserve_query_tool_budget(tool_name)
+            return self.registry.execute(
+                tool_name,
+                arguments,
+                context=trace_context,
             )
-        context = ToolContext(owner=owner)
+
         try:
-            query = gateway.query(
-                profile_ref=profiles[0].profile_ref,
-                operation="qb.torrents.info",
-                arguments={"query": task_name, "limit": 100},
-                context=context,
+            capabilities, capabilities_elapsed_ms = execute_registered_read(
+                "provider.capabilities",
+                {
+                    "provider": "qbittorrent",
+                    "intent": operation,
+                    "limit": 24,
+                },
             )
+            if not capabilities.ok:
+                return self._response(
+                    "provider.capabilities",
+                    {"provider": "qbittorrent"},
+                    capabilities,
+                    capabilities_elapsed_ms,
+                )
+            raw_profiles = capabilities.data.get("profiles")
+            profiles = (
+                [
+                    profile
+                    for profile in raw_profiles
+                    if isinstance(profile, dict)
+                    and str(profile.get("state") or "").strip() == "online"
+                    and str(profile.get("profile_ref") or "").strip()
+                ]
+                if isinstance(raw_profiles, list)
+                else []
+            )
+            if len(profiles) != 1:
+                return self._response(
+                    "provider.capabilities",
+                    {"provider": "qbittorrent"},
+                    ToolResult(
+                        False,
+                        "provider_not_configured",
+                        "qBittorrent 当前未配置或不可用",
+                        suggestions=["请先在设置中完成 qBittorrent 配置。"],
+                        error="无法确定唯一可用的 qBittorrent 配置。",
+                    ),
+                    capabilities_elapsed_ms,
+                )
+            profile_ref = str(profiles[0]["profile_ref"])
+            query_arguments = {
+                "profile_ref": profile_ref,
+                "operation": "qb.torrents.info",
+                "arguments": {"query": task_name, "limit": 100},
+            }
+            query, query_elapsed_ms = execute_registered_read(
+                "provider.query", query_arguments
+            )
+            if not query.ok:
+                return self._response(
+                    "provider.query",
+                    {"operation": "qb.torrents.info"},
+                    query,
+                    query_elapsed_ms,
+                )
             candidates = query.data.get("torrents")
             if not isinstance(candidates, list):
                 candidates = []
@@ -8755,23 +8867,29 @@ class AgentOrchestrator:
                         suggestions=["请先查看下载队列，再引用唯一候选执行操作。"],
                         error="Agent 不会猜测或批量处理同名下载任务。",
                     ),
-                    0,
+                    query_elapsed_ms,
                 )
             torrent_ref = str(matches[0].get("object_ref") or "")
-            preview = gateway.preview_change(
-                profile_ref=profiles[0].profile_ref,
-                operation=operation,
-                arguments={"torrent_refs": [torrent_ref]},
-                context=context,
+            preview_arguments = {
+                "profile_ref": profile_ref,
+                "operation": operation,
+                "arguments": {"torrent_refs": [torrent_ref]},
+            }
+            preview, preview_elapsed_ms = execute_registered_read(
+                "provider.change.preview", preview_arguments
             )
-            return self.prepare(
-                "provider.change.execute",
-                {"plan_ref": str(preview.data.get("plan_ref") or "")},
-                owner=owner,
-            )
-        except ProviderGatewayError as exc:
+            if not preview.ok:
+                return self._response(
+                    "provider.change.preview",
+                    {"operation": operation},
+                    preview,
+                    preview_elapsed_ms,
+                )
+        except AgentToolError as exc:
+            if exc.code == "rate_limited":
+                raise
             return self._response(
-                "provider.change.preview",
+                stage_tool,
                 {"operation": operation},
                 ToolResult(
                     False,
@@ -8781,6 +8899,13 @@ class AgentOrchestrator:
                 ),
                 0,
             )
+        return self.prepare(
+            "provider.change.execute",
+            {"plan_ref": str(preview.data.get("plan_ref") or "")},
+            owner=owner,
+            request_id=trace_context.request_id,
+            session_id=trace_context.session_id,
+        )
 
     def _handle_download_and_media_subscription_requests(
         self,

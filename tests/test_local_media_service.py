@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -167,6 +168,151 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
         self.assertEqual(entries, 2)
         self.assertEqual(peak, 1)
         self.assertTrue(all(not thread.is_alive() for thread in threads))
+
+    def test_qb_state_transitions_use_shared_qb_writer_lease(self):
+        from app.modules.organize import OrganizeRules
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "qb-downloads"
+            target_root = root / "movies"
+            source_root.mkdir()
+            target_root.mkdir()
+            movie = source_root / "Movie.2026.mkv"
+            movie.write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "movie")
+            task_id = db.create_local_media_task(
+                source_id, "f" * 40, str(movie), owner="admin", trigger="qb_completed",
+            )
+            self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="1", title="Movie", year="2026",
+                media_type="movie", confidence=1.0,
+            )))
+            state = {"leased": False, "entries": 0}
+
+            @contextmanager
+            def lease():
+                self.assertFalse(state["leased"])
+                state["leased"] = True
+                state["entries"] += 1
+                try:
+                    yield
+                finally:
+                    state["leased"] = False
+
+            class QBClient:
+                def pause_torrents(inner_self, torrent_hash):
+                    del inner_self
+                    self.assertTrue(state["leased"])
+                    self.assertEqual(torrent_hash, "f" * 40)
+                    self.assertEqual(
+                        db.get_local_media_task(task_id, owner="admin").status,
+                        "moving",
+                    )
+
+                def delete_torrents(inner_self, torrent_hash, *, delete_files):
+                    del inner_self
+                    self.assertTrue(state["leased"])
+                    self.assertEqual((torrent_hash, delete_files), ("f" * 40, False))
+                    self.assertEqual(
+                        db.get_local_media_task(task_id, owner="admin").status,
+                        "verifying",
+                    )
+
+            rules = OrganizeRules(
+                region_split=False, year_split=False, naming_scope="both",
+                clean_empty=False, conflict_strategy=1, emby_refresh=False,
+            )
+            try:
+                with patch(
+                    "app.modules.local_media_service.OrganizeRules.from_config",
+                    return_value=rules,
+                ), patch(
+                    "app.modules.local_media_service.qb_control_write_lease",
+                    side_effect=lease,
+                ):
+                    result = service.execute_task(
+                        "admin", task_id, qb_client=QBClient(),
+                    )
+            finally:
+                service.close()
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(state["entries"], 2)
+        self.assertFalse(state["leased"])
+
+    def test_qb_resume_after_precommit_failure_uses_shared_writer_lease(self):
+        from app.modules.organize import OrganizeRules
+
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "qb-failed-downloads"
+            target_root = root / "movies"
+            source_root.mkdir()
+            target_root.mkdir()
+            movie = source_root / "Movie.2026.mkv"
+            movie.write_bytes(b"video")
+            source_id = self._source(source_root, target_root, "movie")
+            task_id = db.create_local_media_task(
+                source_id, "9" * 40, str(movie), owner="admin", trigger="qb_completed",
+            )
+            self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+            service = LocalMediaService(scraper=FakeScraper(MatchResult(
+                tmdb_id="1", title="Movie", year="2026",
+                media_type="movie", confidence=1.0,
+            )))
+            state = {"leased": False, "calls": []}
+
+            @contextmanager
+            def lease():
+                self.assertFalse(state["leased"])
+                state["leased"] = True
+                try:
+                    yield
+                finally:
+                    state["leased"] = False
+
+            class QBClient:
+                def pause_torrents(inner_self, torrent_hash):
+                    del inner_self
+                    self.assertTrue(state["leased"])
+                    state["calls"].append(("pause", torrent_hash))
+
+                def resume_torrents(inner_self, torrent_hash):
+                    del inner_self
+                    self.assertTrue(state["leased"])
+                    state["calls"].append(("resume", torrent_hash))
+
+            rules = OrganizeRules(
+                region_split=False, year_split=False, naming_scope="both",
+                clean_empty=False, conflict_strategy=1, emby_refresh=False,
+            )
+            try:
+                with patch(
+                    "app.modules.local_media_service.OrganizeRules.from_config",
+                    return_value=rules,
+                ), patch(
+                    "app.modules.local_media_service.qb_control_write_lease",
+                    side_effect=lease,
+                ), patch(
+                    "app.modules.local_media_service.LocalMoveTransaction.execute",
+                    side_effect=RuntimeError("move failed"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "move failed"):
+                        service.execute_task("admin", task_id, qb_client=QBClient())
+            finally:
+                service.close()
+
+        self.assertEqual(state["calls"], [
+            ("pause", "9" * 40),
+            ("resume", "9" * 40),
+        ])
+        self.assertFalse(state["leased"])
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status,
+            "failed",
+        )
 
     def test_move_media_item_to_trash_waits_for_pipeline_writer(self):
         state_lock = threading.Lock()

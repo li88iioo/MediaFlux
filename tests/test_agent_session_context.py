@@ -2,12 +2,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import re
-import sqlite3
-import tempfile
 import threading
-import unittest
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -298,10 +294,7 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             guard=scrape,
         )
         self.assertIsNotNone(scrape_stored)
-        self.assertEqual(self.repository.invalidate_owner(
-            owner=owner,
-            context_types=("discovery_mapping", "directory_scrape"),
-        ), 1)
+        self.assertEqual(self.repository.invalidate_owner(owner=owner), 1)
         self.assertIsNone(self.repository.get_latest(
             owner=owner, context_type="directory_scrape", now=1_000.0,
         ))
@@ -312,6 +305,40 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             expires_at=1_100.0,
             guard=scrape_stored,
         ))
+
+    def test_owner_invalidation_advances_every_guarded_context_type(self):
+        owner = "all-context-reset-owner"
+        context_types = (
+            "patrol",
+            "resource_candidates",
+            "discovery_candidates",
+            "read_operation",
+            "local_media_tasks",
+            "discovery_mapping",
+            "directory_scrape",
+            "guangya_rename",
+            "guangya_cleanup",
+            "guangya_workspace",
+            "guangya_fs_change",
+        )
+        guards = {
+            context_type: self.repository.begin_context(
+                owner=owner, context_type=context_type
+            )
+            for context_type in context_types
+        }
+
+        self.repository.invalidate_owner(owner=owner)
+
+        for context_type, guard in guards.items():
+            with self.subTest(context_type=context_type):
+                self.assertIsNone(self.repository.replace_latest_guarded(
+                    owner=owner,
+                    context_type=context_type,
+                    payload={"safe": context_type},
+                    expires_at=1_100.0,
+                    guard=guard,
+                ))
 
     def test_guarded_update_preserves_snapshot_and_rejects_stale_writer(self):
         owner = "guarded-update-owner"
@@ -386,9 +413,7 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
         stale = self.repository.begin_context(
             owner=owner, context_type="discovery_mapping"
         )
-        self.repository.invalidate_owner(
-            owner=owner, context_types=("discovery_mapping",)
-        )
+        self.repository.invalidate_owner(owner=owner)
         self.wall[0] += 3_601.0
         current = self.repository.begin_context(
             owner=owner, context_type="discovery_mapping"
@@ -693,7 +718,7 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
             repository=self.repository, wall_clock=lambda: self.wall[0]
         ).get(owner="session-b"))
 
-    def test_generic_resource_candidates_restore_current_and_legacy_snapshots(self):
+    def test_generic_resource_candidates_restore_current_snapshots(self):
         monotonic = [20.0]
         store = RecentResourceCandidateStore(
             repository=self.repository,
@@ -710,35 +735,6 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
         self.assertEqual(restored["candidates"][0]["download_kinds"], ["magnet"])
         self.assertEqual(restored["candidates"][0]["media_title"], "Example")
         self.assertNotIn("magnet:?", repr(restored))
-
-        legacy = {
-            "search_status": "success",
-            "candidates": [{
-                "position": 1,
-                "result_id": "legacy-resource-0001",
-                "title": "Legacy.S01E01.1080p",
-                "site_id": "nyaa",
-                "site_name": "Nyaa",
-                "size_text": "800 MiB",
-                "download_state": "ready",
-                "_verification_context": None,
-            }],
-        }
-        self.repository.replace_latest(
-            owner="session-legacy",
-            context_type="resource_candidates",
-            payload=legacy,
-            expires_at=self.wall[0] + 600,
-        )
-        restored_legacy = RecentResourceCandidateStore(
-            repository=self.repository,
-            clock=lambda: monotonic[0],
-            wall_clock=lambda: self.wall[0],
-        ).get(owner="session-legacy")
-        self.assertEqual(
-            restored_legacy["candidates"][0]["result_id"],
-            "legacy-resource-0001",
-        )
 
     def test_candidate_snapshots_support_search_id_reselection_after_restart(self):
         monotonic = [20.0]

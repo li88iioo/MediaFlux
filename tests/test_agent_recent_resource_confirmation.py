@@ -189,6 +189,26 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
             store.get(owner="session-a")["candidates"][0]["_verification_context"]
         )
 
+    def test_exact_search_id_keeps_older_snapshot_addressable(self):
+        store = RecentResourceCandidateStore()
+        first_search_id = store.capture(
+            owner="session-a",
+            result=_generic_result(_candidate("resource-first-0001", title="First")),
+        )
+        second_search_id = store.capture(
+            owner="session-a",
+            result=_generic_result(_candidate("resource-second-001", title="Second")),
+        )
+
+        self.assertEqual(store.get(owner="session-a")["search_id"], second_search_id)
+        self.assertEqual(
+            store.get(owner="session-a", search_id=first_search_id)["candidates"][0]["title"],
+            "First",
+        )
+        self.assertIsNone(
+            store.get(owner="session-a", search_id="rs_missing_snapshot_0001")
+        )
+
     def test_new_empty_search_replaces_old_candidates(self):
         store = RecentResourceCandidateStore()
         store.capture(owner="session-a", result=_single_result(_candidate("resource-result-0001")))
@@ -224,7 +244,39 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         self.assertNotIn("magnet:", repr(snapshot))
         self.assertNotIn("secret.example", repr(snapshot))
 
-    def test_generic_candidate_snapshot_supports_current_and_legacy_persistence(self):
+    def test_generic_projection_collects_first_twelve_actionable_items(self):
+        store = RecentResourceCandidateStore()
+        unavailable = []
+        for index in range(12):
+            candidate = _candidate(
+                f"unavailable-resource-{index:04d}",
+                title=f"Unavailable {index}",
+            )
+            candidate["download_state"] = "unavailable"
+            unavailable.append(candidate)
+        actionable = [
+            _candidate(
+                f"actionable-resource-{index:04d}",
+                title=f"Actionable {index}",
+            )
+            for index in range(13)
+        ]
+
+        store.capture(
+            owner="session-a",
+            result=_generic_result(*unavailable, *actionable),
+        )
+
+        candidates = store.get(owner="session-a")["candidates"]
+        self.assertEqual(len(candidates), 12)
+        self.assertEqual(candidates[0]["title"], "Actionable 0")
+        self.assertEqual(candidates[-1]["title"], "Actionable 11")
+        self.assertEqual(
+            [candidate["position"] for candidate in candidates],
+            list(range(1, 13)),
+        )
+
+    def test_generic_candidate_snapshot_requires_current_single_format(self):
         store = RecentResourceCandidateStore()
         store.capture(
             owner="session-a",
@@ -236,23 +288,9 @@ class RecentResourceCandidateStoreTests(unittest.TestCase):
         self.assertEqual(snapshot["candidates"][0]["download_kinds"], ["magnet"])
         self.assertEqual(validate_safe_resource_snapshot(snapshot), snapshot)
 
-        legacy = {
-            "search_status": snapshot["search_status"],
-            "candidates": [{
-                key: value
-                for key, value in snapshot["candidates"][0].items()
-                if key not in {
-                    "download_kinds", "media_title", "episode_label",
-                    "subscription_number",
-                }
-            }],
-        }
-        validated_legacy = validate_safe_resource_snapshot(legacy)
-        self.assertIsNotNone(validated_legacy)
-        self.assertEqual(
-            validated_legacy["candidates"][0]["result_id"],
-            "generic-resource-0001",
-        )
+        missing_search_id = dict(snapshot)
+        missing_search_id.pop("search_id")
+        self.assertIsNone(validate_safe_resource_snapshot(missing_search_id))
 
         missing_capability = {
             **snapshot,
@@ -618,7 +656,9 @@ class RecentResourceConfirmationTests(unittest.TestCase):
             searched = service.invoke(
                 "indexer.search_resources", {"title": "示例剧"}, owner="session-a"
             )
-            result_id = searched["result"]["data"]["items"][0]["result_id"]
+            search_id = searched["result"]["data"]["search_id"]
+            staged = active_agent_resource_candidates(owner="session-a")
+            self.assertEqual(staged["search_id"], search_id)
             prepared = service.prepare(
                 "ingest.submit",
                 {"source_type": "resource_candidates", "positions": [1], "target": "qb"},

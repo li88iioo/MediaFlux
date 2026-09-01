@@ -13,10 +13,19 @@ ProviderValidator = Callable[[dict[str, Any]], dict[str, Any]]
 class ProviderGatewayError(RuntimeError):
     """可安全投影到 Agent 响应的 Provider 失败。"""
 
-    def __init__(self, message: str, *, code: str = "provider_unavailable"):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "provider_unavailable",
+        external_write_possible: bool = False,
+    ):
         super().__init__(message)
         self.safe_message = str(message or "Provider 当前不可用")
         self.code = str(code or "provider_unavailable")
+        # Transport 只有在真实外部写请求可能已发出时才设置该标记。
+        # Gateway 据此区分可安全失败与必须人工核对的结果未知。
+        self.external_write_possible = bool(external_write_possible)
 
 
 @dataclass(frozen=True, slots=True)

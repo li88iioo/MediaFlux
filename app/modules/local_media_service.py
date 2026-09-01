@@ -30,6 +30,7 @@ from app.modules.local_media_models import (
     local_media_paths_overlap,
 )
 from app.modules.process_lock import CrossProcessLock
+from app.modules.qb_control import qb_control_write_lease
 from app.modules.local_path_mapping import (
     assert_within,
     require_container_absolute_path,
@@ -1893,9 +1894,15 @@ class LocalMediaService:
                     "media_refresh_status": "skipped", "media": preview.get("matches", []),
                 }
             if task.qb_hash and qb_client is not None:
-                qb_client.pause_torrents(task.qb_hash)
-                paused = True
-            db.update_local_media_task(task_id, owner=owner, status="moving")
+                # 锁序固定：本地媒体 pipeline writer（外层）-> qB writer。
+                # moving 状态与真实暂停请求同属一个 qB 临界区；Web 恢复/删除
+                # 在获取 lease 后会看到 moving 并拒绝，消除检查/调用间竞态。
+                with qb_control_write_lease():
+                    db.update_local_media_task(task_id, owner=owner, status="moving")
+                    qb_client.pause_torrents(task.qb_hash)
+                    paused = True
+            else:
+                db.update_local_media_task(task_id, owner=owner, status="moving")
             executable_plans = [item for item in preview["_move_plans"] if item.action != "skip"]
             skipped_plans = [item for item in preview["_move_plans"] if item.action == "skip"]
             if executable_plans:
@@ -1918,9 +1925,10 @@ class LocalMediaService:
             qb_cleanup_pending = False
             if task.qb_hash and qb_client is not None:
                 try:
-                    qb_client.delete_torrents(task.qb_hash, delete_files=False)
-                    qb_task_retired = True
-                    cleanup_allowed = True
+                    with qb_control_write_lease():
+                        qb_client.delete_torrents(task.qb_hash, delete_files=False)
+                        qb_task_retired = True
+                        cleanup_allowed = True
                 except Exception:
                     qb_cleanup_pending = True
                     warnings.append(
@@ -1987,7 +1995,8 @@ class LocalMediaService:
                 raise LocalMediaPostMoveError(diagnostic) from exc
             if paused and task.qb_hash and qb_client is not None:
                 try:
-                    qb_client.resume_torrents(task.qb_hash)
+                    with qb_control_write_lease():
+                        qb_client.resume_torrents(task.qb_hash)
                 except Exception as resume_exc:
                     exc = LocalMediaServiceError(f"{exc}；qB 恢复失败: {resume_exc}")
             try:

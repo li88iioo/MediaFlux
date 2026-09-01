@@ -86,6 +86,15 @@ def reset_guangya_cleanup_context_for_tests() -> None:
     _repository = None
 
 
+def clear_guangya_cleanup_context(*, owner: str) -> None:
+    """清除 owner 的内存缓存；SQLite epoch 是唯一有效性权威。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return
+    with _lock:
+        _flows.pop(owner_key, None)
+
+
 def _safe_preview(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None

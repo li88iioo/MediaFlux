@@ -19,6 +19,12 @@ from app.modules.download_dispatcher import (
     download_resubmit_capabilities,
     resubmit_download_request,
 )
+from app.modules.qb_control import (
+    QBControlConflict,
+    QBControlSafetyUnavailable,
+    assert_qb_control_allowed,
+    qb_control_write_lease,
+)
 from app.web import api_error, api_response, require_api_login
 
 logger = get_logger(__name__)
@@ -606,21 +612,29 @@ def qb_action(action: str, request: Request, data: dict | None = Body(default=No
     joined_hashes = "|".join(hashes)
     client = None
     try:
-        client = _qb()
-        if client is None:
-            return api_error("未连接到 qBittorrent", 400)
-        if action == "pause":
-            client.pause_torrents(joined_hashes)
-        elif action == "resume":
-            client.resume_torrents(joined_hashes)
-        else:
-            # 下载页删除始终只移除 qB 任务，不允许客户端请求删除媒体文件。
-            client.delete_torrents(joined_hashes, delete_files=False)
+        # 安全检查与真实 qB 写请求必须共享同一个跨进程 lease，避免检查后、
+        # 请求前本地整理刚好进入文件提交阶段。
+        with qb_control_write_lease():
+            assert_qb_control_allowed(hashes, operation=action)
+            client = _qb()
+            if client is None:
+                return api_error("未连接到 qBittorrent", 400)
+            if action == "pause":
+                client.pause_torrents(joined_hashes)
+            elif action == "resume":
+                client.resume_torrents(joined_hashes)
+            else:
+                # 下载页删除始终只移除 qB 任务，不允许客户端请求删除媒体文件。
+                client.delete_torrents(joined_hashes, delete_files=False)
         return api_response({
             "success": True,
             "action": action,
             "accepted": len(hashes),
         })
+    except QBControlSafetyUnavailable as exc:
+        return api_error(str(exc), 503)
+    except QBControlConflict as exc:
+        return api_error(str(exc), 409)
     except Exception as exc:
         logger.error("qB 任务操作失败 action=%s type=%s", action, type(exc).__name__)
         return api_error("连接失败，请检查地址、认证信息和网络", 502)

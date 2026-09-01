@@ -1,18 +1,37 @@
 """复用现有 QBittorrentClient 的 Provider transport。"""
+
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from typing import Any
 
 from app import config
+from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.provider_models import (
     ProviderGatewayError,
     ProviderPayload,
     ProviderProfileView,
 )
 from app.clients.qbittorrent import QBittorrentClient, close_qbittorrent_client
+from app.modules.qb_control import (
+    QBControlConflict,
+    QBControlSafetyUnavailable,
+    assert_qb_control_allowed,
+    qb_control_write_lease,
+)
 
 _PROFILE_REF = "configured:qbittorrent"
+_PAUSED_STATES = frozenset(
+    {
+        "paused",
+        "pauseddl",
+        "pausedup",
+        "stopped",
+        "stoppeddl",
+        "stoppedup",
+    }
+)
 
 
 class QBittorrentProviderTransport:
@@ -34,19 +53,49 @@ class QBittorrentProviderTransport:
                 )
             )
         )
-        return [ProviderProfileView(
-            profile_ref=_PROFILE_REF,
-            provider=self.provider,
-            label="qBittorrent",
-            state="online" if configured else "incomplete",
-        )]
+        return [
+            ProviderProfileView(
+                profile_ref=_PROFILE_REF,
+                provider=self.provider,
+                label="qBittorrent",
+                state="online" if configured else "incomplete",
+            )
+        ]
 
-    def _client(self, profile_ref: str) -> QBittorrentClient:
+    def profile_revision(self, profile_ref: str) -> str:
+        values = dict(self._settings())
+        return self._profile_revision_from_settings(profile_ref, values)
+
+    @staticmethod
+    def _profile_revision_from_settings(
+        profile_ref: str, values: Mapping[str, Any]
+    ) -> str:
         if profile_ref != _PROFILE_REF:
             raise ProviderGatewayError(
                 "qBittorrent profile 不存在", code="provider_not_configured"
             )
-        values = self._settings()
+        return confirmation_context_fingerprint(
+            {
+                "profile_ref": _PROFILE_REF,
+                "url": str(values.get("QB_URL") or "").strip().rstrip("/"),
+                "username": str(values.get("QB_USERNAME") or "").strip(),
+                "password": str(values.get("QB_PASSWORD") or ""),
+                "api_key": str(values.get("QB_API_KEY") or "").strip(),
+            },
+            domain="provider-profile-revision",
+        )
+
+    def _client(self, profile_ref: str) -> QBittorrentClient:
+        return self._client_from_settings(profile_ref, dict(self._settings()))
+
+    @staticmethod
+    def _client_from_settings(
+        profile_ref: str, values: Mapping[str, Any]
+    ) -> QBittorrentClient:
+        if profile_ref != _PROFILE_REF:
+            raise ProviderGatewayError(
+                "qBittorrent profile 不存在", code="provider_not_configured"
+            )
         url = str(values.get("QB_URL") or "").strip()
         username = str(values.get("QB_USERNAME") or "").strip()
         password = str(values.get("QB_PASSWORD") or "")
@@ -103,7 +152,8 @@ class QBittorrentProviderTransport:
                 query = " ".join(str(arguments.get("query") or "").split()).casefold()
                 if query:
                     tasks = [
-                        task for task in tasks
+                        task
+                        for task in tasks
                         if query in " ".join(str(task.name or "").split()).casefold()
                     ]
                 limit = int(arguments.get("limit", 20))
@@ -113,9 +163,9 @@ class QBittorrentProviderTransport:
                         "__object_kind": "qb_torrent",
                         "name": str(task.name or ""),
                         "state": str(task.state or ""),
-                        "progress": float(task.progress or 0),
+                        "progress_percent": round(float(task.progress or 0) * 100, 2),
                         "size": int(task.size or 0),
-                        "downloaded": int(task.downloaded or 0),
+                        "downloaded_bytes": int(task.downloaded or 0),
                         "download_speed": int(task.dlspeed or 0),
                         "upload_speed": int(task.upspeed or 0),
                         "eta": int(task.eta or 0),
@@ -143,7 +193,7 @@ class QBittorrentProviderTransport:
                         "index": int(item.index),
                         "name": str(item.name or ""),
                         "size": int(item.size or 0),
-                        "progress": float(item.progress or 0),
+                        "progress_percent": round(float(item.progress or 0) * 100, 2),
                     }
                     for item in files[:limit]
                 ]
@@ -165,10 +215,14 @@ class QBittorrentProviderTransport:
             ) from exc
         finally:
             close_qbittorrent_client(client)
-        raise ProviderGatewayError("qBittorrent 操作未实现", code="operation_not_allowed")
+        raise ProviderGatewayError(
+            "qBittorrent 操作未实现", code="operation_not_allowed"
+        )
 
     @staticmethod
-    def _selected_tasks(client: QBittorrentClient, hashes: list[str]) -> tuple[list[Any], list[str]]:
+    def _selected_tasks(
+        client: QBittorrentClient, hashes: list[str]
+    ) -> tuple[list[Any], list[str]]:
         wanted = {str(value or "").strip().casefold() for value in hashes if value}
         if not wanted or any(
             not re.fullmatch(r"[0-9a-f]{40,64}", value) for value in wanted
@@ -194,7 +248,9 @@ class QBittorrentProviderTransport:
             "qb.torrents.resume",
             "qb.torrents.delete_task",
         }:
-            raise ProviderGatewayError("qBittorrent 写操作未实现", code="operation_not_allowed")
+            raise ProviderGatewayError(
+                "qBittorrent 写操作未实现", code="operation_not_allowed"
+            )
         hashes = [str(value) for value in arguments.get("torrent_refs") or []]
         client: QBittorrentClient | None = None
         try:
@@ -205,6 +261,21 @@ class QBittorrentProviderTransport:
                     "部分 qBittorrent 任务已不存在，请重新查询",
                     code="confirmation_stale",
                 )
+            try:
+                assert_qb_control_allowed(
+                    hashes,
+                    operation={
+                        "qb.torrents.pause": "pause",
+                        "qb.torrents.resume": "resume",
+                        "qb.torrents.delete_task": "delete",
+                    }[operation],
+                )
+            except QBControlSafetyUnavailable as exc:
+                raise ProviderGatewayError(
+                    str(exc), code="provider_unavailable"
+                ) from exc
+            except QBControlConflict as exc:
+                raise ProviderGatewayError(str(exc), code="provider_conflict") from exc
             targets = [
                 {
                     "name": str(task.name or ""),
@@ -238,43 +309,114 @@ class QBittorrentProviderTransport:
             close_qbittorrent_client(client)
 
     def execute_write(
-        self, profile_ref: str, operation: str, arguments: dict[str, Any]
+        self,
+        profile_ref: str,
+        operation: str,
+        arguments: dict[str, Any],
+        *,
+        expected_profile_revision: str,
     ) -> ProviderPayload:
         if operation not in {
             "qb.torrents.pause",
             "qb.torrents.resume",
             "qb.torrents.delete_task",
         }:
-            raise ProviderGatewayError("qBittorrent 写操作未实现", code="operation_not_allowed")
+            raise ProviderGatewayError(
+                "qBittorrent 写操作未实现", code="operation_not_allowed"
+            )
         hashes = [str(value) for value in arguments.get("torrent_refs") or []]
         client: QBittorrentClient | None = None
+        external_write_possible = False
         try:
-            client = self._client(profile_ref)
-            selected, missing = self._selected_tasks(client, hashes)
-            if missing:
+            # revision 校验与 client 构造必须共享同一份配置快照，避免校验 A
+            # 却因并发配置更新把写请求发往 B。
+            settings_snapshot = dict(self._settings())
+            current_revision = self._profile_revision_from_settings(
+                profile_ref, settings_snapshot
+            )
+            if (
+                not expected_profile_revision
+                or current_revision != expected_profile_revision
+            ):
                 raise ProviderGatewayError(
-                    "部分 qBittorrent 任务已不存在，请重新预检",
+                    "qBittorrent 配置已变化，请重新预检",
                     code="confirmation_stale",
                 )
-            joined = "|".join(hashes)
-            if operation == "qb.torrents.pause":
-                accepted = bool(client.pause_torrents(joined))
-                action = "暂停"
-            elif operation == "qb.torrents.resume":
-                accepted = bool(client.resume_torrents(joined))
-                action = "恢复"
-            else:
-                accepted = bool(client.delete_torrents(joined, delete_files=False))
-                action = "移除"
-            if not accepted:
+            try:
+                with qb_control_write_lease():
+                    client = self._client_from_settings(profile_ref, settings_snapshot)
+                    selected, missing = self._selected_tasks(client, hashes)
+                    if missing:
+                        raise ProviderGatewayError(
+                            "部分 qBittorrent 任务已不存在，请重新预检",
+                            code="confirmation_stale",
+                        )
+                    assert_qb_control_allowed(
+                        hashes,
+                        operation={
+                            "qb.torrents.pause": "pause",
+                            "qb.torrents.resume": "resume",
+                            "qb.torrents.delete_task": "delete",
+                        }[operation],
+                    )
+                    joined = "|".join(hashes)
+                    # 从这里开始，客户端可能已经向 qBittorrent 发出真实写请求；
+                    # 超时、断连和写后核验失败都必须收束为结果未知。
+                    external_write_possible = True
+                    if operation == "qb.torrents.pause":
+                        accepted = bool(client.pause_torrents(joined))
+                        action = "暂停"
+                    elif operation == "qb.torrents.resume":
+                        accepted = bool(client.resume_torrents(joined))
+                        action = "恢复"
+                    else:
+                        accepted = bool(
+                            client.delete_torrents(joined, delete_files=False)
+                        )
+                        action = "移除"
+                    if not accepted:
+                        raise ProviderGatewayError(
+                            "qBittorrent 未接受写操作",
+                            code="provider_write_failed",
+                            external_write_possible=True,
+                        )
+                    after, after_missing = self._selected_tasks(client, hashes)
+            except QBControlSafetyUnavailable as exc:
                 raise ProviderGatewayError(
-                    "qBittorrent 未接受写操作", code="provider_write_failed"
-                )
-            after, after_missing = self._selected_tasks(client, hashes)
+                    str(exc),
+                    code="provider_unavailable",
+                    external_write_possible=external_write_possible,
+                ) from exc
+            except QBControlConflict as exc:
+                raise ProviderGatewayError(
+                    str(exc),
+                    code="provider_conflict",
+                    external_write_possible=external_write_possible,
+                ) from exc
             if operation == "qb.torrents.delete_task":
-                verification = "verified" if len(after_missing) == len(hashes) else "pending"
+                verification = (
+                    "verified" if len(after_missing) == len(hashes) else "pending"
+                )
+            elif after_missing:
+                verification = "partial"
+            elif operation == "qb.torrents.pause":
+                verification = (
+                    "verified"
+                    if all(
+                        str(task.state or "").casefold() in _PAUSED_STATES
+                        for task in after
+                    )
+                    else "pending"
+                )
             else:
-                verification = "verified" if not after_missing else "partial"
+                verification = (
+                    "verified"
+                    if all(
+                        str(task.state or "").casefold() not in _PAUSED_STATES
+                        for task in after
+                    )
+                    else "pending"
+                )
             return ProviderPayload(
                 summary=f"qBittorrent 已接受 {len(selected)} 个任务的{action}操作",
                 data={
@@ -290,7 +432,9 @@ class QBittorrentProviderTransport:
             raise
         except Exception as exc:
             raise ProviderGatewayError(
-                "qBittorrent 写操作失败", code="provider_write_failed"
+                "qBittorrent 写操作失败",
+                code="provider_write_failed",
+                external_write_possible=external_write_possible,
             ) from exc
         finally:
             close_qbittorrent_client(client)

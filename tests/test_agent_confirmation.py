@@ -564,6 +564,27 @@ class ConfirmedToolRegistryTests(unittest.TestCase):
                     service.prepare(removed_name, {}, owner="owner")
                 self.assertEqual(missing.exception.code, "tool_not_found")
 
+    def test_retired_tool_ticket_is_consumed_as_stale_without_restoring_alias(self):
+        store = ConfirmationStore(
+            token_factory=lambda: "ticket-retired-tool-00000001"
+        )
+        ticket = store.issue(
+            owner="owner",
+            tool_name="guangya.change_plan.execute",
+            arguments={},
+            context_fingerprint="retired-context",
+        )
+        service = AgentOrchestrator(
+            build_tool_registry(), confirmation_store=store
+        )
+
+        with self.assertRaises(AgentToolError) as stale:
+            service.confirm(ticket.confirmation_id, owner="owner")
+
+        self.assertEqual(stale.exception.code, "confirmation_stale")
+        self.assertFalse(service.has_tool("guangya.change_plan.execute"))
+        self.assertEqual(store.list_active_tickets(owner="owner"), [])
+
     def test_context_free_handlers_bind_to_canonical_confirmation_protocol(self):
         calls: list[tuple[str, dict, str]] = []
         registry = ToolRegistry()

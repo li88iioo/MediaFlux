@@ -5,12 +5,14 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,11 @@ from app.modules.guangya_workspace import (
     resolve_workspace_path,
     valid_object_handle,
 )
+from app.modules.organize_delete_audit import (
+    DeleteCandidate,
+    execute_recycle_bin_delete,
+)
+from app.modules.process_lock import CrossProcessLock
 from app.modules.web_secret import get_web_secret
 from app.private_files import protect_private_file
 from app.repositories.organize_operation_jobs import organize_operation_owner_digest
@@ -36,7 +43,14 @@ _MAX_PLAN_BYTES = 2 * 1024 * 1024
 _MAX_PLANS = 32
 _MAX_PLANS_PER_OWNER = 4
 _SAFE_PLAN_ID = re.compile(r"^[0-9a-f]{32}$")
+_SAFE_JOB_ID = re.compile(r"^[0-9a-f]{32}$")
 _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_ACTIVE_PLAN_STATUSES = frozenset({"confirmed", "queued", "running"})
+_TERMINAL_PLAN_STATUSES = frozenset(
+    {"completed", "partial", "failed", "cancelled", "manual_review"}
+)
+
+logger = logging.getLogger(__name__)
 
 
 class GuangYaFSChangeError(RuntimeError):
@@ -53,6 +67,23 @@ def _now_iso() -> str:
 
 def _directory() -> Path:
     return Path(PATHS.data_dir) / "agent-guangya-fs-change"
+
+
+@contextmanager
+def _plan_state_lock() -> Iterator[None]:
+    """串行化计划文件的状态转换与清理。
+
+    计划文件本身通过 ``os.replace`` 保证单次写入原子，但读取后再写回仍需
+    跨进程互斥，否则确认、队列绑定、执行领取与 GC 会发生 lost update。
+    锁放在计划目录内，使测试替换目录时也不会触碰真实数据库目录。
+    """
+    lock = CrossProcessLock("guangya-fs-change-state", directory=_directory())
+    if not lock.acquire():  # blocking=True 理论上只会返回 True
+        raise GuangYaFSChangeError("光鸭变更计划当前正被其他进程更新")
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def _ensure_private_directory(path: Path) -> None:
@@ -207,6 +238,50 @@ def _owner_digest(owner: str) -> str:
     return organize_operation_owner_digest(owner_key)
 
 
+def _validate_plan_identity(
+    payload: dict[str, Any],
+    *,
+    owner: str | None = None,
+    owner_digest: str = "",
+    expected_fingerprint: str = "",
+) -> None:
+    expected_owner = _owner_digest(owner) if owner is not None else str(owner_digest or "")
+    if expected_owner and not hmac.compare_digest(
+        str(payload.get("owner_digest") or ""), expected_owner
+    ):
+        raise GuangYaFSChangeError("光鸭变更计划不属于当前会话")
+    if expected_fingerprint and not hmac.compare_digest(
+        str(payload.get("fingerprint") or ""), str(expected_fingerprint or "")
+    ):
+        raise GuangYaFSChangeStale("光鸭变更计划已变化，请重新预览")
+
+
+def _validate_plan_lifetime(
+    payload: dict[str, Any], *, require_confirmed: bool = False
+) -> None:
+    status = str(payload.get("status") or "")
+    current = time.time()
+    if require_confirmed:
+        if status not in {"confirmed", "queued", "running"}:
+            raise GuangYaFSChangeStale("光鸭变更计划已执行或不再可执行")
+        # 一旦持久任务已绑定，队列自身的 expires_at/lease 才是执行准入依据；
+        # 不能让用户已经确认并成功入队的任务再次受 15 分钟票据限制。
+        if status == "confirmed" and (
+            float(payload.get("confirmed_at_epoch") or 0) <= 0
+            or float(payload.get("execute_until_epoch") or 0) <= current
+        ):
+            raise GuangYaFSChangeStale("光鸭变更确认已过期，请重新预览")
+        return
+    if status == "previewed":
+        if float(payload.get("expires_at_epoch") or 0) <= current:
+            raise GuangYaFSChangeStale("光鸭变更预览已过期，请重新生成")
+    elif (
+        status == "confirmed"
+        and float(payload.get("execute_until_epoch") or 0) <= current
+    ):
+        raise GuangYaFSChangeStale("光鸭变更确认已过期，请重新预览")
+
+
 def load_fs_change_plan(
     plan_id: str,
     *,
@@ -215,109 +290,296 @@ def load_fs_change_plan(
     require_confirmed: bool = False,
 ) -> dict[str, Any]:
     payload = _read(plan_id)
-    if owner is not None and not hmac.compare_digest(
-        str(payload.get("owner_digest") or ""), _owner_digest(owner)
-    ):
-        raise GuangYaFSChangeError("光鸭变更计划不属于当前会话")
-    fingerprint = str(payload.get("fingerprint") or "")
-    if expected_fingerprint and not hmac.compare_digest(
-        fingerprint, str(expected_fingerprint or "")
-    ):
-        raise GuangYaFSChangeStale("光鸭变更计划已变化，请重新预览")
-    now_epoch = time.time()
-    if require_confirmed:
-        if str(payload.get("status") or "") not in {"confirmed", "running"}:
-            raise GuangYaFSChangeStale("光鸭变更计划已执行或不再可执行")
-        if (
-            float(payload.get("confirmed_at_epoch") or 0) <= 0
-            or float(payload.get("execute_until_epoch") or 0) <= now_epoch
-        ):
-            raise GuangYaFSChangeStale("光鸭变更确认已过期，请重新预览")
-    elif float(payload.get("expires_at_epoch") or 0) <= now_epoch:
-        raise GuangYaFSChangeStale("光鸭变更预览已过期，请重新生成")
+    _validate_plan_identity(
+        payload, owner=owner, expected_fingerprint=expected_fingerprint
+    )
+    _validate_plan_lifetime(payload, require_confirmed=require_confirmed)
     return payload
 
 
 def confirm_fs_change_plan(
     plan_id: str, *, owner: str, expected_fingerprint: str
 ) -> dict[str, Any]:
-    payload = load_fs_change_plan(
-        plan_id, owner=owner, expected_fingerprint=expected_fingerprint
-    )
-    if str(payload.get("status") or "") not in {"previewed", "confirmed"}:
-        raise GuangYaFSChangeStale("光鸭变更计划已进入执行阶段，请重新预览")
-    current = time.time()
-    payload["confirmed_at"] = _now_iso()
-    payload["confirmed_at_epoch"] = current
-    payload["execute_until_epoch"] = current + _EXECUTE_TTL_SECONDS
-    payload["status"] = "confirmed"
-    _atomic_write(payload)
-    return payload
+    with _plan_state_lock():
+        payload = _read(plan_id)
+        _validate_plan_identity(
+            payload, owner=owner, expected_fingerprint=expected_fingerprint
+        )
+        _validate_plan_lifetime(payload)
+        if str(payload.get("status") or "") not in {"previewed", "confirmed"}:
+            raise GuangYaFSChangeStale(
+                "光鸭变更计划已进入执行阶段，请重新预览"
+            )
+        current = time.time()
+        payload["confirmed_at"] = _now_iso()
+        payload["confirmed_at_epoch"] = current
+        payload["execute_until_epoch"] = current + _EXECUTE_TTL_SECONDS
+        payload["status"] = "confirmed"
+        payload["updated_at"] = _now_iso()
+        _atomic_write(payload)
+        return payload
 
 
-def discard_fs_change_plan(plan_id: str) -> None:
-    try:
-        for path in (_plan_path(plan_id), _journal_path(plan_id)):
+def bind_fs_change_plan_job(
+    plan_id: str,
+    *,
+    owner_digest: str,
+    expected_fingerprint: str,
+    job_id: str,
+    queue_until_epoch: float,
+) -> dict[str, Any]:
+    """把已确认计划原子绑定到唯一持久任务。
+
+    此函数由队列仓储在 SQLite 写事务提交前调用。其他进程在事务提交前看不
+    到任务，因此不会出现任务先领取、计划仍停留在 ``confirmed`` 的窗口。
+    """
+    safe_job_id = str(job_id or "").strip().casefold()
+    if not _SAFE_JOB_ID.fullmatch(safe_job_id):
+        raise GuangYaFSChangeError("光鸭变更任务编号无效")
+    safe_queue_until = float(queue_until_epoch or 0)
+    if safe_queue_until <= time.time():
+        raise GuangYaFSChangeStale("光鸭变更任务已过期，请重新预览")
+    with _plan_state_lock():
+        payload = _read(plan_id)
+        _validate_plan_identity(
+            payload,
+            owner_digest=owner_digest,
+            expected_fingerprint=expected_fingerprint,
+        )
+        status = str(payload.get("status") or "")
+        bound_job_id = str(payload.get("job_id") or "")
+        if status == "confirmed":
+            _validate_plan_lifetime(payload, require_confirmed=True)
+        elif status in {"queued", "running"}:
+            if not bound_job_id or not hmac.compare_digest(bound_job_id, safe_job_id):
+                raise GuangYaFSChangeStale("光鸭变更计划已绑定其他任务")
+        else:
+            raise GuangYaFSChangeStale("光鸭变更计划已执行或不再可排队")
+        payload["status"] = "running" if status == "running" else "queued"
+        payload["job_id"] = safe_job_id
+        payload["queued_at"] = str(payload.get("queued_at") or _now_iso())
+        payload["queue_until_epoch"] = max(
+            safe_queue_until, float(payload.get("queue_until_epoch") or 0)
+        )
+        payload["updated_at"] = _now_iso()
+        _atomic_write(payload)
+        return payload
+
+
+def finalize_fs_change_plan_job(
+    plan_id: str,
+    *,
+    expected_fingerprint: str,
+    job_id: str,
+    queue_status: str,
+    audit_failures: int = 0,
+    error_code: str = "",
+) -> dict[str, Any]:
+    """把持久队列终态投影回冻结计划，避免遗留永久 queued/running。"""
+    safe_job_id = str(job_id or "").strip().casefold()
+    safe_queue_status = str(queue_status or "").strip().casefold()
+    if not _SAFE_JOB_ID.fullmatch(safe_job_id):
+        raise GuangYaFSChangeError("光鸭变更任务编号无效")
+    if safe_queue_status not in _TERMINAL_PLAN_STATUSES:
+        raise GuangYaFSChangeError("光鸭变更任务终态无效")
+    with _plan_state_lock():
+        payload = _read(plan_id)
+        _validate_plan_identity(
+            payload, expected_fingerprint=expected_fingerprint
+        )
+        current_status = str(payload.get("status") or "")
+        bound_job_id = str(payload.get("job_id") or "")
+        if bound_job_id and not hmac.compare_digest(bound_job_id, safe_job_id):
+            raise GuangYaFSChangeStale("光鸭变更计划任务绑定已变化")
+        if current_status in _TERMINAL_PLAN_STATUSES:
+            return payload
+        if current_status not in {"queued", "running"}:
+            raise GuangYaFSChangeStale("光鸭变更计划状态已变化")
+        # running 说明 provider 写入窗口已经打开；若执行器没能先写入自己的
+        # 终态，队列无论收到 failed/partial/completed 都只能标人工核验。
+        if (
+            current_status == "running"
+            or safe_queue_status in {"completed", "partial", "manual_review"}
+            or max(0, int(audit_failures or 0)) > 0
+        ):
+            plan_status = "manual_review"
+        else:
+            plan_status = safe_queue_status
+        execution = (
+            dict(payload.get("execution"))
+            if isinstance(payload.get("execution"), dict)
+            else {}
+        )
+        execution.update(
+            {
+                "queue_status": safe_queue_status,
+                "queue_error_code": str(error_code or "")[:80],
+                "finished_at": str(execution.get("finished_at") or _now_iso()),
+            }
+        )
+        payload["status"] = plan_status
+        payload["job_id"] = safe_job_id
+        payload["execution"] = execution
+        payload["updated_at"] = _now_iso()
+        _atomic_write(payload)
+        return payload
+
+
+def _discard_fs_change_plan_unlocked(plan_id: str) -> bool:
+    removed = False
+    for path in (_plan_path(plan_id), _journal_path(plan_id)):
+        try:
             if path.is_file() and not path.is_symlink():
                 path.unlink()
+                removed = True
+        except FileNotFoundError:
+            continue
+    return removed
+
+
+def discard_fs_change_plan(plan_id: str, *, preview_only: bool = False) -> bool:
+    """删除计划；预览替换路径只能清理尚未确认的旧预览。"""
+    try:
+        with _plan_state_lock():
+            if preview_only:
+                try:
+                    payload = _read(plan_id)
+                except GuangYaFSChangeError:
+                    return False
+                if str(payload.get("status") or "") != "previewed":
+                    return False
+            return _discard_fs_change_plan_unlocked(plan_id)
     except (OSError, GuangYaFSChangeError):
-        return
+        return False
 
 
-def maintain_fs_change_plans(*, preserve_plan_id: str = "") -> dict[str, int]:
+def _plan_is_expired(payload: dict[str, Any], current_epoch: float) -> bool:
+    status = str(payload.get("status") or "")
+    # running 是已经打开远端写窗口的执行凭据，必须等待队列恢复显式收束。
+    # queued 尚未产生 Provider 副作用；其持久队列 TTL 到期后任务本身已不可领取，
+    # 因而可安全清理，也能回收“计划已绑定、SQLite 提交前硬崩溃”的孤立文件。
+    # 此处只读计划自身的 queue_until_epoch，不访问数据库，继续保持固定锁序。
+    if status == "running":
+        return False
+    if status == "queued":
+        queue_until = float(
+            payload.get("queue_until_epoch")
+            or payload.get("execute_until_epoch")
+            or 0
+        )
+        return queue_until > 0 and queue_until <= current_epoch
+    if status == "confirmed":
+        return float(payload.get("execute_until_epoch") or 0) <= current_epoch
+    return max(
+        float(payload.get("expires_at_epoch") or 0),
+        float(payload.get("execute_until_epoch") or 0),
+    ) <= current_epoch
+
+
+def _maintain_fs_change_plans_unlocked(
+    *, preserve_plan_id: str = ""
+) -> dict[str, int]:
     directory = _directory()
     if not directory.exists() or directory.is_symlink():
-        return {"removed": 0, "remaining": 0}
+        return {
+            "removed": 0,
+            "remaining": 0,
+            "owner_remaining": 0,
+            "capacity_exceeded": 0,
+        }
     preserved = str(preserve_plan_id or "").strip().casefold()
     current = time.time()
-    rows: list[tuple[float, str, str]] = []
+    rows: list[dict[str, Any]] = []
     removed = 0
     for path in directory.glob("*.json"):
         try:
             payload = _read(path.stem)
-            expiry = max(
-                float(payload.get("expires_at_epoch") or 0),
-                float(payload.get("execute_until_epoch") or 0),
-            )
-            if expiry <= current:
-                discard_fs_change_plan(path.stem)
+            if _plan_is_expired(payload, current):
+                _discard_fs_change_plan_unlocked(path.stem)
                 removed += 1
                 continue
+            status = str(payload.get("status") or "")
             rows.append(
-                (
-                    float(payload.get("created_at_epoch") or path.stat().st_mtime),
-                    path.stem,
-                    str(payload.get("owner_digest") or ""),
-                )
+                {
+                    "created": float(
+                        payload.get("created_at_epoch") or path.stat().st_mtime
+                    ),
+                    "plan_id": path.stem,
+                    "owner_digest": str(payload.get("owner_digest") or ""),
+                    "status": status,
+                    "removable": status not in _ACTIVE_PLAN_STATUSES,
+                }
             )
         except (OSError, GuangYaFSChangeError, TypeError, ValueError):
-            discard_fs_change_plan(path.stem)
+            try:
+                _discard_fs_change_plan_unlocked(path.stem)
+            except (OSError, GuangYaFSChangeError):
+                pass
             removed += 1
-    rows.sort()
+    rows.sort(key=lambda row: (float(row["created"]), str(row["plan_id"])))
 
-    def remove(row: tuple[float, str, str]) -> None:
+    def remove(row: dict[str, Any]) -> None:
         nonlocal removed
-        discard_fs_change_plan(row[1])
+        _discard_fs_change_plan_unlocked(str(row["plan_id"]))
         try:
             rows.remove(row)
         except ValueError:
             return
         removed += 1
 
-    for owner_digest in {row[2] for row in rows if row[2]}:
-        owner_rows = [row for row in rows if row[2] == owner_digest]
+    for digest in {str(row["owner_digest"]) for row in rows if row["owner_digest"]}:
+        owner_rows = [row for row in rows if row["owner_digest"] == digest]
         while len(owner_rows) > _MAX_PLANS_PER_OWNER:
-            victim = next((row for row in owner_rows if row[1] != preserved), None)
+            victim = next(
+                (
+                    row
+                    for row in owner_rows
+                    if row["plan_id"] != preserved and bool(row["removable"])
+                ),
+                None,
+            )
             if victim is None:
                 break
             remove(victim)
             owner_rows.remove(victim)
     while len(rows) > _MAX_PLANS:
-        victim = next((row for row in rows if row[1] != preserved), None)
+        victim = next(
+            (
+                row
+                for row in rows
+                if row["plan_id"] != preserved and bool(row["removable"])
+            ),
+            None,
+        )
         if victim is None:
             break
         remove(victim)
-    return {"removed": removed, "remaining": len(rows)}
+    preserved_row = next(
+        (row for row in rows if row["plan_id"] == preserved), None
+    )
+    preserved_owner = (
+        str(preserved_row["owner_digest"]) if preserved_row is not None else ""
+    )
+    owner_remaining = sum(
+        1 for row in rows if preserved_owner and row["owner_digest"] == preserved_owner
+    )
+    capacity_exceeded = int(
+        len(rows) > _MAX_PLANS
+        or bool(preserved_owner and owner_remaining > _MAX_PLANS_PER_OWNER)
+    )
+    return {
+        "removed": removed,
+        "remaining": len(rows),
+        "owner_remaining": owner_remaining,
+        "capacity_exceeded": capacity_exceeded,
+    }
+
+
+def maintain_fs_change_plans(*, preserve_plan_id: str = "") -> dict[str, int]:
+    with _plan_state_lock():
+        return _maintain_fs_change_plans_unlocked(
+            preserve_plan_id=preserve_plan_id
+        )
 
 
 def _normalize_path(value: object, *, allow_root: bool = True) -> str:
@@ -592,10 +854,14 @@ def build_fs_change_plan(
         "execution": {},
     }
     plan["fingerprint"] = _fingerprint(plan)
-    _atomic_write(plan)
-    maintain_fs_change_plans(preserve_plan_id=str(plan["plan_id"]))
-    if not _plan_path(str(plan["plan_id"])).exists():
-        raise GuangYaFSChangeError("光鸭变更计划容量已满，请稍后重试")
+    with _plan_state_lock():
+        _atomic_write(plan)
+        maintained = _maintain_fs_change_plans_unlocked(
+            preserve_plan_id=str(plan["plan_id"])
+        )
+        if int(maintained.get("capacity_exceeded") or 0) > 0:
+            _discard_fs_change_plan_unlocked(str(plan["plan_id"]))
+            raise GuangYaFSChangeError("光鸭变更计划容量已满，请稍后重试")
     return plan
 
 
@@ -711,13 +977,71 @@ def _verify_after(
 
 
 def update_fs_change_plan_execution(
-    plan_id: str, *, status: str, execution: dict[str, Any]
-) -> None:
-    payload = _read(plan_id)
-    payload["status"] = str(status)
-    payload["execution"] = dict(execution)
-    payload["updated_at"] = _now_iso()
-    _atomic_write(payload)
+    plan_id: str,
+    *,
+    status: str,
+    execution: dict[str, Any],
+    expected_statuses: set[str] | frozenset[str] | None = None,
+    expected_job_id: str = "",
+) -> dict[str, Any]:
+    """在跨进程锁内执行带前置状态/job_id 的文件级 CAS。"""
+    safe_status = str(status or "").strip().casefold()
+    if safe_status not in {
+        "confirmed",
+        "queued",
+        "running",
+        *_TERMINAL_PLAN_STATUSES,
+    }:
+        raise GuangYaFSChangeError("光鸭变更计划目标状态无效")
+    with _plan_state_lock():
+        payload = _read(plan_id)
+        current_status = str(payload.get("status") or "")
+        if expected_statuses is not None and current_status not in expected_statuses:
+            raise GuangYaFSChangeStale("光鸭变更计划状态已变化，请勿重复执行")
+        safe_job_id = str(expected_job_id or "").strip().casefold()
+        if safe_job_id and (
+            not _SAFE_JOB_ID.fullmatch(safe_job_id)
+            or not hmac.compare_digest(
+                str(payload.get("job_id") or ""), safe_job_id
+            )
+        ):
+            raise GuangYaFSChangeStale("光鸭变更计划任务绑定已变化")
+        payload["status"] = safe_status
+        payload["execution"] = dict(execution)
+        payload["updated_at"] = _now_iso()
+        _atomic_write(payload)
+        return payload
+
+
+def _claim_fs_change_plan_execution(
+    plan_id: str,
+    *,
+    job_id: str,
+    started_at: str,
+    stats: dict[str, int],
+) -> dict[str, Any]:
+    safe_job_id = str(job_id or "").strip().casefold()
+    if not _SAFE_JOB_ID.fullmatch(safe_job_id):
+        raise GuangYaFSChangeError("光鸭变更任务编号无效")
+    return update_fs_change_plan_execution(
+        plan_id,
+        status="running",
+        execution={"started_at": started_at, **stats},
+        expected_statuses={"queued"},
+        expected_job_id=safe_job_id,
+    )
+
+
+def _operation_stat_key(operation: str) -> str:
+    try:
+        return {
+            "rename": "renamed",
+            "move": "moved",
+            "trash": "trashed",
+            "create_directory": "created",
+        }[operation]
+    except KeyError as exc:
+        raise GuangYaFSChangeError("光鸭变更计划包含未知操作") from exc
 
 
 def execute_fs_change_plan(
@@ -730,11 +1054,19 @@ def execute_fs_change_plan(
         raise GuangYaFSChangeError("光鸭变更任务参数无效")
     plan_id = str(payload.get("plan_id") or "")
     expected_fingerprint = str(payload.get("plan_fingerprint") or "")
+    job_id = str(payload.get("job_id") or "").strip().casefold()
+    if not _SAFE_JOB_ID.fullmatch(job_id):
+        raise GuangYaFSChangeError("光鸭变更任务编号无效")
     plan = load_fs_change_plan(
         plan_id,
         expected_fingerprint=expected_fingerprint,
         require_confirmed=True,
     )
+    if (
+        str(plan.get("status") or "") != "queued"
+        or not hmac.compare_digest(str(plan.get("job_id") or ""), job_id)
+    ):
+        raise GuangYaFSChangeStale("光鸭变更计划任务绑定已变化")
     if not hmac.compare_digest(
         str(plan.get("owner_digest") or ""), str(payload.get("owner_digest") or "")
     ):
@@ -750,8 +1082,10 @@ def execute_fs_change_plan(
         "failed": 0,
         "verification_failed": 0,
         "precondition_failed": 0,
+        "audit_failures": 0,
     }
     started_at = _now_iso()
+    persistence_uncertain = False
     try:
         if (
             not client.logged_in
@@ -765,14 +1099,17 @@ def execute_fs_change_plan(
             if cancel_check is not None:
                 cancel_check()
             _preflight_operation(client, item)
-        update_fs_change_plan_execution(
-            plan_id,
-            status="running",
-            execution={"started_at": started_at, **stats},
-        )
+        # 预检日志先于 running CAS 写入；若日志介质不可用，此时尚未产生任何
+        # provider 副作用，可以安全失败而不会制造“远端已写、本地 failed”。
         _append_journal(
             plan_id,
             {"action": "preflight", "status": "completed", "total": len(operations)},
+        )
+        _claim_fs_change_plan_execution(
+            plan_id,
+            job_id=job_id,
+            started_at=started_at,
+            stats=stats,
         )
         for index, item in enumerate(operations, start=1):
             if cancel_check is not None:
@@ -782,8 +1119,11 @@ def execute_fs_change_plan(
             created_id = ""
             error_type = ""
             provider_code = ""
+            provider_write_started = False
+            stat_key = _operation_stat_key(op)
             try:
                 _preflight_operation(client, item)
+                provider_write_started = True
                 if op == "rename":
                     client.rename(
                         str(source.get("file_id") or ""), str(item["new_name"])
@@ -794,22 +1134,28 @@ def execute_fs_change_plan(
                         str(item.get("target_id") or "0"),
                     )
                 elif op == "trash":
-                    client.delete([str(source.get("file_id") or "")])
+                    execute_recycle_bin_delete(
+                        client,
+                        trigger="agent_guangya_fs_change",
+                        reason="Agent 已确认的光鸭文件变更计划",
+                        candidate=DeleteCandidate(
+                            file_id=str(source.get("file_id") or ""),
+                            name=str(source.get("name") or ""),
+                            parent_id=str(source.get("parent_id") or "0"),
+                            size=max(0, int(source.get("size") or 0)),
+                            gcid=str(source.get("etag") or ""),
+                        ),
+                        safe_failure_message="光鸭对象移入回收站失败",
+                    )
                 elif op == "create_directory":
                     created_id = client.create_dir(
                         str(item["name"]), str(item.get("parent_id") or "0")
                     )
-                else:
+                else:  # _operation_stat_key 已阻止未知操作
                     raise GuangYaFSChangeError("光鸭变更计划包含未知操作")
                 if not _verify_after(client, item, created_id):
                     stats["verification_failed"] += 1
                     raise GuangYaFSChangeError("写入后的云端状态校验失败")
-                stat_key = {
-                    "rename": "renamed",
-                    "move": "moved",
-                    "trash": "trashed",
-                    "create_directory": "created",
-                }[op]
                 stats[stat_key] += 1
                 status = "completed"
             except GuangYaFSChangeStale as exc:
@@ -822,25 +1168,52 @@ def execute_fs_change_plan(
                 provider_code = str(exc.code or "")
                 stats["failed"] += 1
                 status = "failed"
-            except Exception as exc:  # noqa: BLE001 - 单项失败需记录后继续其余冻结操作
+            except Exception as exc:  # noqa: BLE001 - 单项失败需收束为可审计部分完成
                 error_type = type(exc).__name__
-                stats["failed"] += 1
-                status = "failed"
-            _append_journal(
-                plan_id,
-                {
-                    "action": op,
-                    "index": index,
-                    "file_id": str(source.get("file_id") or created_id),
-                    "status": status,
-                    "error_type": error_type,
-                    "provider_code": provider_code,
-                },
-            )
+                # provider 可能在连接中断前已经接受写入。若冻结后置条件成立，
+                # 则不能再把它算成“失败后可重试”；trash 同时标记审计缺口。
+                applied = False
+                if provider_write_started:
+                    try:
+                        applied = _verify_after(client, item, created_id)
+                    except Exception:  # noqa: BLE001 - 后置核验失败即保持未知
+                        applied = False
+                if applied:
+                    stats[stat_key] += 1
+                    status = "completed"
+                    if op == "trash":
+                        stats["audit_failures"] += 1
+                        persistence_uncertain = True
+                else:
+                    stats["failed"] += 1
+                    status = "failed"
+            try:
+                _append_journal(
+                    plan_id,
+                    {
+                        "action": op,
+                        "index": index,
+                        "file_id": str(source.get("file_id") or created_id),
+                        "status": status,
+                        "error_type": error_type,
+                        "provider_code": provider_code,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - 远端写后不得抛成普通 failed
+                logger.error(
+                    "光鸭变更远端写入后日志持久化失败 plan=%s index=%s type=%s",
+                    plan_id,
+                    index,
+                    type(exc).__name__,
+                )
+                stats["audit_failures"] += 1
+                persistence_uncertain = True
+                # 日志介质失效后停止追加写入，避免扩大无法可靠追溯的副作用面。
+                break
         successful = (
             stats["renamed"] + stats["moved"] + stats["trashed"] + stats["created"]
         )
-        partial = stats["failed"] > 0
+        partial = stats["failed"] > 0 or persistence_uncertain
         if bool(plan.get("trigger_strm")) and successful > 0:
             try:
                 from app.modules.scheduler import get_scheduler
@@ -856,12 +1229,58 @@ def execute_fs_change_plan(
                 stats["strm_trigger_failed"] = 1
                 partial = True
         finished_at = _now_iso()
-        final_status = "partial" if partial else "completed"
-        update_fs_change_plan_execution(
-            plan_id,
-            status=final_status,
-            execution={"started_at": started_at, "finished_at": finished_at, **stats},
+        final_status = (
+            "manual_review"
+            if persistence_uncertain
+            else "partial" if partial else "completed"
         )
-        return {"partial": partial, "stats": stats}
+        try:
+            _append_journal(
+                plan_id,
+                {
+                    "action": "finalize",
+                    "status": final_status,
+                    "successful": successful,
+                    "failed": stats["failed"],
+                    "audit_failures": stats["audit_failures"],
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - 队列必须返回 partial/manual review
+            logger.error(
+                "光鸭变更终态日志持久化失败 plan=%s type=%s",
+                plan_id,
+                type(exc).__name__,
+            )
+            stats["audit_failures"] += 1
+            persistence_uncertain = True
+            partial = True
+            final_status = "manual_review"
+        try:
+            update_fs_change_plan_execution(
+                plan_id,
+                status=final_status,
+                execution={"started_at": started_at, "finished_at": finished_at, **stats},
+                expected_statuses={"running"},
+                expected_job_id=job_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - 远端已写，返回 partial 而非可重试 failed
+            logger.error(
+                "光鸭变更终态计划持久化失败 plan=%s type=%s",
+                plan_id,
+                type(exc).__name__,
+            )
+            stats["audit_failures"] += 1
+            persistence_uncertain = True
+            partial = True
+        return {
+            "partial": partial or persistence_uncertain,
+            "requires_manual": persistence_uncertain,
+            "stats": stats,
+        }
     finally:
-        client.close()
+        try:
+            client.close()
+        except Exception as exc:  # noqa: BLE001 - 关闭资源失败不能覆盖远端执行结果
+            logger.warning(
+                "关闭光鸭文件变更客户端失败 type=%s", type(exc).__name__
+            )

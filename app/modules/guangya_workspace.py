@@ -161,6 +161,31 @@ def discard_observation(value: object) -> None:
         return
 
 
+def discard_owner_observations(owner: str) -> int:
+    """删除指定 Agent owner 的全部短期观察，阻止旧引用在 reset 后复用。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return 0
+    owner_digest = organize_operation_owner_digest(owner_key)
+    directory = _directory()
+    if not directory.exists() or directory.is_symlink():
+        return 0
+    removed = 0
+    for path in tuple(directory.glob("*.json")):
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+            payload = _read(path.stem)
+            if hmac.compare_digest(
+                str(payload.get("owner_digest") or ""), owner_digest
+            ):
+                path.unlink()
+                removed += 1
+        except (OSError, GuangYaWorkspaceError):
+            continue
+    return removed
+
+
 def maintain_workspace_observations(
     *, preserve_plan_id: str = "",
 ) -> dict[str, int]:

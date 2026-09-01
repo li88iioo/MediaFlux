@@ -4,11 +4,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 import sqlite3
 import time
-from datetime import datetime, timedelta
 import uuid
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 from app.modules.web_secret import get_web_secret
@@ -41,6 +42,8 @@ _ALLOWED_RESULT_STATS = {
     "quarantined", "empty_deleted", "verification_failed",
     "precondition_failed", "trashed", "created",
 }
+
+logger = logging.getLogger(__name__)
 
 
 class OrganizeOperationQueueFullError(RuntimeError):
@@ -184,8 +187,80 @@ def verify_organize_operation_payload(row: dict[str, Any] | sqlite3.Row) -> bool
     return bool(actual) and hmac.compare_digest(actual, expected)
 
 
+def _fs_change_job_payload(
+    row: dict[str, Any] | sqlite3.Row,
+) -> dict[str, Any] | None:
+    if str(row["job_kind"] or "") != "agent_guangya_fs_change":
+        return None
+    if not verify_organize_operation_payload(row):
+        raise ValueError("光鸭文件变更任务参数完整性校验失败")
+    try:
+        payload = json.loads(str(row["payload_json"] or "{}"))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("光鸭文件变更任务参数损坏") from exc
+    if not isinstance(payload, dict):
+        raise TypeError("光鸭文件变更任务参数损坏")
+    return payload
+
+
+def _bind_fs_change_plan_to_job(row: dict[str, Any] | sqlite3.Row) -> None:
+    """在任务事务提交前，把通用 FS 计划绑定到数据库生成的 job_id。"""
+    payload = _fs_change_job_payload(row)
+    if payload is None:
+        return
+    from app.modules.guangya_fs_change import bind_fs_change_plan_job
+
+    bind_fs_change_plan_job(
+        str(payload.get("plan_id") or ""),
+        owner_digest=str(row["owner_digest"] or ""),
+        expected_fingerprint=str(payload.get("plan_fingerprint") or ""),
+        job_id=str(row["job_id"] or ""),
+        queue_until_epoch=float(row["expires_at"] or 0),
+    )
+
+
+def _sync_fs_change_plan_terminal(
+    row: dict[str, Any] | sqlite3.Row,
+    *,
+    status: str,
+    result: dict[str, Any] | None = None,
+    error_code: str = "",
+) -> None:
+    """尽力把数据库终态同步到计划文件；失败不得回滚真实队列终态。"""
+    try:
+        payload = _fs_change_job_payload(row)
+        if payload is None:
+            return
+        from app.modules.guangya_fs_change import finalize_fs_change_plan_job
+
+        stats = result.get("stats") if isinstance(result, dict) else {}
+        finalize_fs_change_plan_job(
+            str(payload.get("plan_id") or ""),
+            expected_fingerprint=str(payload.get("plan_fingerprint") or ""),
+            job_id=str(row["job_id"] or ""),
+            queue_status=status,
+            audit_failures=(
+                max(0, int(stats.get("audit_failures") or 0))
+                if isinstance(stats, dict)
+                else 0
+            ),
+            error_code=error_code,
+        )
+    except Exception as exc:  # noqa: BLE001 - SQLite 终态仍是权威恢复边界
+        logger.warning(
+            "同步光鸭文件变更计划终态失败 job=%s status=%s type=%s",
+            str(row["job_id"] or ""),
+            status,
+            type(exc).__name__,
+        )
+
+
 def _expire_pending(conn: sqlite3.Connection, current_epoch: float) -> int:
     timestamp = now()
+    expired_rows = conn.execute(
+        "SELECT * FROM organize_operation_jobs WHERE status='pending' AND expires_at<=?",
+        (float(current_epoch),),
+    ).fetchall()
     cur = conn.execute(
         "UPDATE organize_operation_jobs SET status='cancelled',payload_json='{}',"
         "payload_auth='',error_code='QueueExpired',error='排队确认已过期，请重新预检',"
@@ -193,6 +268,12 @@ def _expire_pending(conn: sqlite3.Connection, current_epoch: float) -> int:
         "WHERE status='pending' AND expires_at<=?",
         (timestamp, timestamp, float(current_epoch)),
     )
+    for row in expired_rows:
+        _sync_fs_change_plan_terminal(
+            row,
+            status="cancelled",
+            error_code="QueueExpired",
+        )
     conn.execute(
         "DELETE FROM organize_operation_jobs WHERE purged_at IS NOT NULL "
         "AND status<>'running'"
@@ -264,7 +345,12 @@ def enqueue_organize_operation_job(
     safe_id = _safe_job_id(job_id or uuid.uuid4().hex)
     safe_operation = _safe_text(operation or "操作", limit=80) or "操作"
     safe_reference = _safe_text(reference, limit=240)
-    safe_payload = _safe_json(payload, field="光鸭操作任务参数")
+    payload_to_store = dict(payload)
+    if safe_kind == "agent_guangya_fs_change":
+        # job_id 必须进入签名后的私有 payload，使执行器能够对计划状态做
+        # queued(job_id) -> running(job_id) 的 CAS，而不是只靠易竞态的文件状态。
+        payload_to_store["job_id"] = safe_id
+    safe_payload = _safe_json(payload_to_store, field="光鸭操作任务参数")
     digest = organize_operation_dedupe_digest(owner_digest, dedupe_key)
     auth = _payload_auth(
         job_id=safe_id,
@@ -286,6 +372,7 @@ def enqueue_organize_operation_job(
             (owner_digest, digest),
         ).fetchone()
         if existing is not None:
+            _bind_fs_change_plan_to_job(existing)
             return existing, True
         owner_active = conn.execute(
             "SELECT COUNT(*) AS total FROM organize_operation_jobs "
@@ -320,6 +407,7 @@ def enqueue_organize_operation_job(
                 (owner_digest, digest),
             ).fetchone()
             if existing is not None:
+                _bind_fs_change_plan_to_job(existing)
                 return existing, True
             raise
         _trim_terminal_history(conn, owner_digest)
@@ -328,6 +416,7 @@ def enqueue_organize_operation_job(
         ).fetchone()
         if row is None:
             raise sqlite3.DatabaseError("光鸭操作任务写入后不可见")
+        _bind_fs_change_plan_to_job(row)
         return row, False
 
 
@@ -421,8 +510,9 @@ def finish_organize_operation_job(
     safe_status = str(status or "").strip().lower()
     if safe_status not in _TERMINAL_STATUSES:
         raise ValueError("光鸭操作任务终态无效")
+    safe_result_payload = sanitize_organize_operation_result(result or {})
     safe_result = _safe_json(
-        sanitize_organize_operation_result(result or {}),
+        safe_result_payload,
         field="光鸭操作任务结果",
     )
     safe_error_code = re.sub(r"[^A-Za-z0-9_.-]", "", str(error_code or ""))[:80]
@@ -431,7 +521,7 @@ def finish_organize_operation_job(
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT owner_digest,purged_at FROM organize_operation_jobs WHERE job_id=? "
+            "SELECT * FROM organize_operation_jobs WHERE job_id=? "
             "AND status='running' AND lease_generation=?",
             (safe_id, max(0, int(expected_lease_generation))),
         ).fetchone()
@@ -448,6 +538,12 @@ def finish_organize_operation_job(
         )
         if cur.rowcount != 1:
             return False
+        _sync_fs_change_plan_terminal(
+            row,
+            status=safe_status,
+            result=safe_result_payload,
+            error_code=safe_error_code,
+        )
         if row["purged_at"] is not None:
             conn.execute("DELETE FROM organize_operation_jobs WHERE job_id=?", (safe_id,))
         else:
@@ -462,15 +558,31 @@ def fail_pending_organize_operation_job(
     safe_id = _safe_job_id(job_id)
     timestamp = now()
     with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM organize_operation_jobs WHERE job_id=? AND status='pending'",
+            (safe_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        safe_error_code = re.sub(
+            r"[^A-Za-z0-9_.-]", "", str(error_code or "")
+        )[:80]
         cur = conn.execute(
             "UPDATE organize_operation_jobs SET status='failed',reference='',payload_json='{}',"
             "payload_auth='',error_code=?,error=?,finished_at=?,updated_at=? "
             "WHERE job_id=? AND status='pending'",
             (
-                re.sub(r"[^A-Za-z0-9_.-]", "", str(error_code or ""))[:80],
+                safe_error_code,
                 _safe_text(error, limit=500), timestamp, timestamp, safe_id,
             ),
         )
+        if cur.rowcount == 1:
+            _sync_fs_change_plan_terminal(
+                row,
+                status="failed",
+                error_code=safe_error_code,
+            )
         return cur.rowcount == 1
 
 
@@ -492,6 +604,10 @@ def recover_orphaned_organize_operation_jobs() -> int:
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        fs_change_rows = conn.execute(
+            "SELECT * FROM organize_operation_jobs "
+            "WHERE status='running' AND job_kind='agent_guangya_fs_change'"
+        ).fetchall()
         cancelled = conn.execute(
             "UPDATE organize_operation_jobs SET status='cancelled',lease_generation=lease_generation+1,"
             "reference='',payload_json='{}',payload_auth='',error_code='PrivacyPurgeCancelled',"
@@ -509,6 +625,12 @@ def recover_orphaned_organize_operation_jobs() -> int:
             "WHERE status='running'",
             (timestamp, timestamp),
         )
+        for row in fs_change_rows:
+            _sync_fs_change_plan_terminal(
+                row,
+                status="manual_review",
+                error_code="WorkerExitedUnknownOutcome",
+            )
         conn.execute(
             "DELETE FROM organize_operation_jobs WHERE purged_at IS NOT NULL "
             "AND status<>'running'"

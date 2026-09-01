@@ -996,14 +996,21 @@
         return wrapper;
     }
 
-    function createResourceActions(item) {
+    function validResourceSearchId(value) {
+        const searchId = String(value || '').trim();
+        return /^rs_[A-Za-z0-9_-]{16,64}$/.test(searchId) ? searchId : '';
+    }
+
+    function createResourceActions(item, searchIdValue) {
         const position = Number(item?.position);
-        if (!Number.isInteger(position) || position < 1 || position > 12) return null;
+        const searchId = validResourceSearchId(searchIdValue);
+        if (!searchId || !Number.isInteger(position) || position < 1 || position > 12) return null;
         const actions = node('div', 'agent-resource-actions');
         [['qb', 'qBittorrent', 'download'], ['guangya', '光鸭', 'cloud-download']].forEach(([target, label, iconName]) => {
             const button = node('button', 'agent-resource-action', label);
             button.type = 'button';
             button.dataset.agentResourcePosition = String(position);
+            button.dataset.agentResourceSearchId = searchId;
             button.dataset.agentTarget = target;
             button.append(icon(iconName));
             actions.append(button);
@@ -1021,7 +1028,7 @@
         return [item?.media_type, item?.year, item?.series_name, season, episode].filter(Boolean).join(' · ');
     }
 
-    function renderSearchItem(item, source) {
+    function renderSearchItem(item, source, searchId = '') {
         const row = node('article', 'agent-search-item');
         const copy = node('div', 'agent-search-item-copy');
         copy.append(node('strong', '', searchItemTitle(item)));
@@ -1042,7 +1049,7 @@
         if (description) copy.append(node('p', '', description));
         row.append(copy);
         if (source === 'indexer') {
-            const actions = createResourceActions(item);
+            const actions = createResourceActions(item, searchId);
             if (actions) row.append(actions);
         } else if (item?.rating !== null && item?.rating !== undefined && item?.rating !== '') {
             row.append(node('span', 'agent-search-score', String(item.rating)));
@@ -1050,7 +1057,7 @@
         return row;
     }
 
-    function renderSearchGroup({source, title, status = 'success', items = [], returned, truncated = false}) {
+    function renderSearchGroup({source, title, status = 'success', items = [], returned, truncated = false, searchId = ''}) {
         const section = node('section', 'agent-search-group');
         const head = node('header', 'agent-search-group-head');
         const identity = node('div', 'agent-search-group-identity');
@@ -1064,7 +1071,7 @@
         section.append(head);
         if (Array.isArray(items) && items.length) {
             const list = node('div', 'agent-search-list');
-            items.slice(0, MAX_RENDERED_ITEMS).forEach((item) => list.append(renderSearchItem(item, source)));
+            items.slice(0, MAX_RENDERED_ITEMS).forEach((item) => list.append(renderSearchItem(item, source, searchId)));
             if (items.length > MAX_RENDERED_ITEMS || truncated) {
                 list.append(node('div', 'agent-search-more', `当前展开 ${Math.min(items.length, MAX_RENDERED_ITEMS)} 项，更多结果未展示`));
             }
@@ -1097,7 +1104,7 @@
         return section;
     }
 
-    function renderIndexerSearch(data, verification = null, resultStatus = 'success') {
+    function renderIndexerSearch(data, verification = null, resultStatus = 'success', searchId = '') {
         if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
         const wrapper = node('div', 'agent-search-report');
         if (verification) {
@@ -1122,6 +1129,7 @@
         wrapper.append(renderSearchGroup({
             source: 'indexer', title: '多站资源', status: resultStatus,
             items: Array.isArray(data.items) ? data.items : [], returned: data.returned, truncated: Boolean(data.has_more),
+            searchId: searchId || data.search_id,
         }));
         const errors = renderSearchErrors(data.errors);
         if (errors) wrapper.append(errors);
@@ -1201,7 +1209,7 @@
 
     function renderUnifiedSearch(toolName, data, result = {}) {
         if (!data || typeof data !== 'object' || Array.isArray(data)) return null;
-        if (toolName === 'indexer.search_resources') return renderIndexerSearch(data, null, result.status);
+        if (toolName === 'indexer.search_resources') return renderIndexerSearch(data, null, result.status, data.search_id);
         const wrapper = node('div', 'agent-search-report');
         const summary = node('div', 'agent-search-summary');
         summary.append(
@@ -1248,7 +1256,7 @@
         const hasSearchContract = data.search && typeof data.search === 'object'
             && Array.isArray(data.search.items)
             && (Array.isArray(data.search.sites_attempted) || Object.hasOwn(data.search, 'returned'));
-        if (hasSearchContract) return renderIndexerSearch(data.search, data.verification, result.status);
+        if (hasSearchContract) return renderIndexerSearch(data.search, data.verification, result.status, data.search_id);
         const wrapper = node('div', 'agent-search-report');
         const verification = data.verification;
         const verify = node('section', 'agent-verification');
@@ -1332,6 +1340,7 @@
                 items,
                 returned: items.length,
                 truncated: Boolean(search.has_more),
+                searchId: data.search_id,
             });
             group.classList.add('agent-season-resource-group');
             const errors = renderSearchErrors(search.errors);
@@ -2548,8 +2557,9 @@
 
     async function prepareResourceSubmission(button) {
         const position = Number(button?.dataset.agentResourcePosition);
+        const searchId = validResourceSearchId(button?.dataset.agentResourceSearchId);
         const target = String(button?.dataset.agentTarget || '');
-        if (!Number.isInteger(position) || position < 1 || position > 12 || !['qb', 'guangya'].includes(target)) return;
+        if (!searchId || !Number.isInteger(position) || position < 1 || position > 12 || !['qb', 'guangya'].includes(target)) return;
         if (requestInFlight || confirmationInFlight || sessionResetInFlight) return;
         const generation = conversationGeneration;
         const requestSessionId = agentSessionId;
@@ -2562,11 +2572,12 @@
         button.setAttribute('aria-busy', 'true');
         const pending = appendPendingMessage();
         const startedAt = performance.now();
+        let stale = false;
         try {
             const payload = await fetchJSON('/api/agent/actions/ingest.submit/prepare', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(sessionPayload({arguments: {source_type: 'resource_candidates', positions: [position], target}}, requestSessionId)),
+                body: JSON.stringify(sessionPayload({arguments: {source_type: 'resource_candidates', positions: [position], target, search_id: searchId}}, requestSessionId)),
                 signal: controller.signal,
             });
             await sleep(Math.max(0, MIN_PENDING_MS - (performance.now() - startedAt)));
@@ -2578,13 +2589,15 @@
         } catch (error) {
             if (error?.name === 'AbortError' || generation !== conversationGeneration) return;
             await sleep(Math.max(0, MIN_PENDING_MS - (performance.now() - startedAt)));
+            stale = error?.status === 409;
             appendRequestError(error, pending);
         } finally {
             if (generation === conversationGeneration) {
                 if (activeController === controller) activeController = null;
                 setBusy(false);
                 if (button.isConnected) {
-                    button.disabled = false;
+                    button.disabled = stale;
+                    button.classList.toggle('is-stale', stale);
                     button.setAttribute('aria-busy', 'false');
                 }
             }

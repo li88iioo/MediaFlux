@@ -2868,11 +2868,88 @@ def _sync_missing_schema_columns(conn: sqlite3.Connection) -> None:
         mem.close()
 
 
+def recover_interrupted_provider_plans(
+    conn: sqlite3.Connection, *, timestamp: str
+) -> int:
+    """在调用方已独占 Provider writer 时同步收束失去执行者的计划与审计。"""
+    running_plan_ids = {
+        str(row["plan_id"] or "")
+        for row in conn.execute(
+            "SELECT plan_id FROM agent_provider_plans WHERE status='running'"
+        ).fetchall()
+    }
+    recovered = conn.execute(
+        "UPDATE agent_provider_plans SET status='outcome_unknown',"
+        "summary='进程中断，执行结果需要人工核对',"
+        "error_code='execution_interrupted',finished_at=?,updated_at=? "
+        "WHERE status='running'",
+        (timestamp, timestamp),
+    ).rowcount
+    if running_plan_ids:
+        history_ids: list[int] = []
+        for row in conn.execute(
+            "SELECT id,safe_details FROM agent_action_history "
+            "WHERE tool_name='provider.change.execute' AND status='executing'"
+        ).fetchall():
+            try:
+                details = json.loads(str(row["safe_details"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(details, dict)
+                and str(details.get("plan_ref") or "").strip().upper()
+                in running_plan_ids
+            ):
+                history_ids.append(int(row["id"]))
+        if history_ids:
+            conn.executemany(
+                "UPDATE agent_action_history SET status='outcome_unknown',ok=0,"
+                "summary='Provider 原生写计划执行：结果待核对',"
+                "error_code='execution_interrupted',finished_at=?,elapsed_ms=0 "
+                "WHERE id=? AND status='executing'",
+                [(timestamp, history_id) for history_id in history_ids],
+            )
+    # 隐私清理已抹除上下文的运行计划只为等待旧 writer 收束；确认已无存活
+    # 执行者后直接删除，避免重新保留主体数据。
+    conn.execute("DELETE FROM agent_provider_plans WHERE context_fingerprint=''")
+    return max(0, int(recovered or 0))
+
+
+def _recover_interrupted_provider_plans_on_startup(
+    conn: sqlite3.Connection, *, timestamp: str
+) -> None:
+    """启动时仅在没有存活 Provider writer 时执行一次非阻塞恢复。"""
+    from app.modules.process_lock import CrossProcessLock
+
+    recovery_lock = CrossProcessLock(
+        "agent-provider-write", directory=resolve_db_path().parent
+    )
+    if not recovery_lock.acquire(blocking=False):
+        return
+    try:
+        recover_interrupted_provider_plans(conn, timestamp=timestamp)
+    finally:
+        recovery_lock.release()
+
+
+def _try_acquire_local_media_recovery_lock():
+    """仅在没有存活本地媒体 writer 时返回启动恢复 lease。"""
+    from app.modules.process_lock import CrossProcessLock
+
+    recovery_lock = CrossProcessLock(
+        "local-media-pipeline-write", directory=resolve_db_path().parent
+    )
+    if not recovery_lock.acquire(blocking=False):
+        return None
+    return recovery_lock
+
+
 def init_db() -> None:
     """初始化首个正式数据库基线，并恢复上次异常中断的运行状态。"""
     with _lock:
         database_existed = resolve_db_path().exists()
         conn = _connect()
+        local_media_recovery_lock = None
         try:
             _prepare_schema_migration(conn, database_existed=database_existed)
             # 未打版本的早期数据库也可能已有 v1 约束表；补列与重建必须作为
@@ -3079,31 +3156,37 @@ def init_db() -> None:
                 "updated_at=?,resolved_at=NULL WHERE status='retrying'",
                 (timestamp,),
             )
-            conn.execute(
-                "UPDATE local_media_tasks SET status='failed',"
-                "error=CASE WHEN COALESCE(error,'')='' THEN ? ELSE error END,"
-                "completed_at=COALESCE(completed_at,?),updated_at=? "
-                "WHERE status IN ('recognizing','planned')",
-                (_LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR, timestamp, timestamp),
-            )
-            conn.execute(
-                "UPDATE local_media_tasks SET status='requires_manual',"
-                "error=CASE WHEN COALESCE(error,'')='' THEN ? "
-                "ELSE ? || '；原错误：' || substr(error,1,350) END,"
-                "completed_at=NULL,updated_at=? "
-                "WHERE status IN ('moving','verifying','refreshing','rolling_back')",
-                (
-                    f"{LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX}，文件及 qB 状态需人工核验",
-                    LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX,
-                    timestamp,
-                ),
-            )
-            conn.execute(
-                "UPDATE local_media_operation_steps SET status='failed',"
-                "error=CASE WHEN COALESCE(error,'')='' THEN '进程中断，步骤结果需要人工核验' ELSE error END,"
-                "finished_at=COALESCE(finished_at,?) WHERE status='running'",
-                (timestamp,),
-            )
+            # 启动恢复只能做一次 non-blocking writer 探测。另一个进程仍在
+            # 整理时绝不能把它的活任务误判为 orphan；拿到锁后一直持有到本次
+            # 初始化事务提交/回滚，避免恢复尚未提交时新 writer 抢先进入。
+            local_media_recovery_lock = _try_acquire_local_media_recovery_lock()
+            if local_media_recovery_lock is not None:
+                conn.execute(
+                    "UPDATE local_media_tasks SET status='failed',"
+                    "error=CASE WHEN COALESCE(error,'')='' THEN ? ELSE error END,"
+                    "completed_at=COALESCE(completed_at,?),updated_at=? "
+                    "WHERE status IN ('recognizing','planned')",
+                    (_LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR, timestamp, timestamp),
+                )
+                conn.execute(
+                    "UPDATE local_media_tasks SET status='requires_manual',"
+                    "error=CASE WHEN COALESCE(error,'')='' THEN ? "
+                    "ELSE ? || '；原错误：' || substr(error,1,350) END,"
+                    "completed_at=NULL,updated_at=? "
+                    "WHERE status IN ('moving','verifying','refreshing','rolling_back')",
+                    (
+                        f"{LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX}，文件及 qB 状态需人工核验",
+                        LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX,
+                        timestamp,
+                    ),
+                )
+                conn.execute(
+                    "UPDATE local_media_operation_steps SET status='failed',"
+                    "error=CASE WHEN COALESCE(error,'')='' THEN "
+                    "'进程中断，步骤结果需要人工核验' ELSE error END,"
+                    "finished_at=COALESCE(finished_at,?) WHERE status='running'",
+                    (timestamp,),
+                )
             conn.execute(
                 "UPDATE download_requests SET organize_started=-1,organize_status='failed',"
                 "organize_error=CASE WHEN COALESCE(organize_error,'')='' "
@@ -3212,15 +3295,11 @@ def init_db() -> None:
                 "UPDATE agent_action_history SET status='outcome_unknown',ok=0,"
                 "summary='Agent 受确认动作：结果待核对',"
                 "error_code='execution_interrupted',finished_at=?,elapsed_ms=0 "
-                "WHERE status='executing'",
+                "WHERE status='executing' AND tool_name<>'provider.change.execute'",
                 (timestamp,),
             )
-            conn.execute(
-                "UPDATE agent_provider_plans SET status='outcome_unknown',"
-                "summary='进程中断，执行结果需要人工核对',"
-                "error_code='execution_interrupted',finished_at=?,updated_at=? "
-                "WHERE status='running'",
-                (timestamp, timestamp),
+            _recover_interrupted_provider_plans_on_startup(
+                conn, timestamp=timestamp
             )
             conn.execute(
                 "UPDATE agent_provider_plans SET status='stale',"
@@ -3243,8 +3322,12 @@ def init_db() -> None:
                 )
             raise
         finally:
-            conn.close()
-            _protect_database_files()
+            try:
+                conn.close()
+            finally:
+                if local_media_recovery_lock is not None:
+                    local_media_recovery_lock.release()
+                _protect_database_files()
 
 
 @contextmanager
@@ -4285,6 +4368,7 @@ def purge_expired_agent_task_history(
                 "patrol_notification_outbox": 0,
                 "action_history": 0,
                 "jobs": 0,
+                "provider_plans": 0,
                 "organize_operation_jobs": 0,
                 "missing_media_workflows": 0,
                 "web_search_usage": 0,
@@ -4324,6 +4408,13 @@ def purge_expired_agent_task_history(
             "AND updated_at<? ORDER BY updated_at,job_id LIMIT ?)",
             (cutoff, limit),
         )
+        provider_plans = conn.execute(
+            "DELETE FROM agent_provider_plans WHERE plan_id IN ("
+            "SELECT plan_id FROM agent_provider_plans WHERE status IN "
+            "('succeeded','failed','stale','outcome_unknown') AND updated_at<? "
+            "ORDER BY updated_at,plan_id LIMIT ?)",
+            (cutoff, limit),
+        )
         organize_jobs = conn.execute(
             "DELETE FROM organize_operation_jobs WHERE job_id IN ("
             "SELECT job_id FROM organize_operation_jobs WHERE status IN "
@@ -4357,6 +4448,7 @@ def purge_expired_agent_task_history(
             "patrol_notification_outbox": max(0, int(notifications.rowcount)),
             "action_history": max(0, int(action_history.rowcount)),
             "jobs": max(0, int(jobs.rowcount)),
+            "provider_plans": max(0, int(provider_plans.rowcount)),
             "organize_operation_jobs": max(0, int(organize_jobs.rowcount)),
             "missing_media_workflows": max(0, int(workflows.rowcount)),
             "web_search_usage": max(0, int(web_usage.rowcount)),
@@ -4383,6 +4475,9 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
         "session_context": digest(b"mediaflux-agent-session-context:v1\0", normalized_owner),
         "confirmations": digest(b"mediaflux-agent-confirmation:v1\0", normalized_owner),
         "jobs": digest(b"mediaflux-agent-durable-job:v1\0", normalized_owner),
+        "provider_plans": digest(
+            b"mediaflux-agent-provider-plan-owner:v1\0", normalized_owner
+        ),
         "workflows": digest(b"mediaflux-agent-missing-workflow:v1\0", normalized_owner),
         "telegram_actions": digest(b"mediaflux-telegram-agent-action:v1\0", normalized_owner),
         "conversations": digest(
@@ -4435,6 +4530,25 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
             max(0, int(running.rowcount or 0))
             + max(0, int(removable.rowcount or 0))
         )
+        provider_running = conn.execute(
+            "UPDATE agent_provider_plans SET "
+            "owner_digest=lower(hex(randomblob(32))),"
+            "session_digest=lower(hex(randomblob(32))),provider='',profile_ref='',"
+            "operation='',risk='write',arguments_json='{}',target_snapshot_json='{}',"
+            "result_json='{}',context_fingerprint='',summary='',"
+            "error_code='privacy_purge_pending',updated_at=? "
+            "WHERE owner_digest=? AND status='running'",
+            (purge_time, digests["provider_plans"]),
+        )
+        provider_removable = conn.execute(
+            "DELETE FROM agent_provider_plans WHERE owner_digest=? AND status<>'running'",
+            (digests["provider_plans"],),
+        )
+        scrubbed_provider_plans = max(0, int(provider_running.rowcount or 0))
+        removed_provider_plans = max(0, int(provider_removable.rowcount or 0))
+        deleted["provider_plans_scrubbed_running"] = scrubbed_provider_plans
+        deleted["provider_plans_deleted"] = removed_provider_plans
+        deleted["provider_plans"] = scrubbed_provider_plans + removed_provider_plans
     return deleted
 
 
@@ -6154,7 +6268,7 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
                              safe_details: dict | None = None,
                              error_code: str = "", elapsed_ms: int = 0,
                              started_at: str = "", finished_at: str = "",
-                             confirmation_id: str = "",
+                             confirmation_id: str = "", finalize_only: bool = False,
                              connection: sqlite3.Connection | None = None) -> int:
     """写入一条脱敏 Agent 动作审计；调用方只能传入安全投影。"""
     normalized_owner = str(owner_digest or "").strip().lower()
@@ -6181,6 +6295,8 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
         or not re.fullmatch(r"[A-Za-z0-9_-]+", normalized_confirmation)
     ):
         raise ValueError("Agent 审计确认标识无效")
+    if finalize_only and not normalized_confirmation:
+        raise ValueError("Agent 审计终态更新缺少确认标识")
     details = safe_details or {}
     if not isinstance(details, dict):
         raise ValueError("Agent 审计详情必须是对象")
@@ -6226,6 +6342,10 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
                         history_id,
                     ),
                 )
+            elif finalize_only:
+                # 隐私清理可能已删除 executing 行；迟到终态只能更新已有记录，
+                # 不能在清理成功后重新插入主体数据。
+                return 0
         if history_id <= 0:
             cursor = conn.execute(
                 "INSERT INTO agent_action_history("
@@ -7204,6 +7324,32 @@ def list_local_media_tasks(*, owner: str = "admin", status: str = "", limit: int
     with get_conn() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [LocalMediaTask.from_row(row) for row in rows]
+
+
+def list_local_media_qb_write_conflicts(qb_hashes: list[str]) -> list[sqlite3.Row]:
+    """返回正在修改文件/刷新媒体库的 qB 关联任务，供所有控制入口共用。
+
+    schema 或 SQLite 状态不可用时异常必须上抛，由控制层对 resume/delete
+    失败关闭；这里不能把“无法判断”伪装成“没有冲突”。
+    """
+    normalized = sorted({
+        str(value or "").strip().casefold()
+        for value in qb_hashes
+        if str(value or "").strip()
+    })
+    if not normalized:
+        return []
+    if len(normalized) > 200:
+        raise ValueError("单次最多检查 200 个 qBittorrent 任务")
+    placeholders = ",".join("?" for _ in normalized)
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id,qb_hash,status FROM local_media_tasks "
+            f"WHERE lower(COALESCE(qb_hash,'')) IN ({placeholders}) "
+            "AND status IN ('moving','verifying','refreshing','rolling_back') "
+            "ORDER BY id",
+            normalized,
+        ).fetchall()
 
 
 def list_waiting_local_media_tasks(*, owner: str = "admin", limit: int = 500):

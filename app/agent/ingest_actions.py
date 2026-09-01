@@ -23,7 +23,10 @@ from app.agent.download_actions import download_request_public_summary
 from app.agent.indexer_actions import download_target_readiness
 from app.agent.indexer_candidate_actions import IndexerCandidateActions
 from app.agent.models import Evidence, ToolContext, ToolResult
-from app.agent.recent_resource_candidates import RecentResourceCandidateStore
+from app.agent.recent_resource_candidates import (
+    RecentResourceCandidateStore,
+    normalize_resource_search_id,
+)
 from app.agent.registry import AgentToolError
 from app.logger import redact_sensitive_text
 from app.modules.download_dispatcher import (
@@ -234,7 +237,7 @@ def _positions(
 
 def ingest_submit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"source_type", "target", "positions"}
+        {"source_type", "target", "positions", "search_id"}
     ):
         raise AgentToolError("资源提交参数无效")
     source_type = str(arguments.get("source_type") or "").strip().lower()
@@ -258,7 +261,21 @@ def ingest_submit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         )
         if source_type == "direct_url" and positions:
             raise AgentToolError("直链提交不接受 positions")
-    return {"source_type": source_type, "target": target, "positions": positions}
+    normalized = {
+        "source_type": source_type,
+        "target": target,
+        "positions": positions,
+    }
+    raw_search_id = arguments.get("search_id")
+    if source_type == "resource_candidates":
+        search_id = normalize_resource_search_id(raw_search_id)
+        if raw_search_id not in (None, "") and not search_id:
+            raise AgentToolError("search_id 不是有效的资源搜索快照标识")
+        if search_id:
+            normalized["search_id"] = search_id
+    elif raw_search_id not in (None, ""):
+        raise AgentToolError("只有资源候选提交接受 search_id")
+    return normalized
 
 
 def ingest_status_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -295,8 +312,8 @@ class IngestActions:
         source_type = arguments["source_type"]
         value = arguments["input"]
         if source_type == "resource_candidates":
-            snapshot = self.recent_resource_store.get(owner=owner)
-            candidates = snapshot.get("candidates") if isinstance(snapshot, dict) else None
+            snapshot = self.candidate_actions.current_snapshot(context)
+            candidates = snapshot.get("candidates")
             if not isinstance(candidates, list) or not candidates:
                 raise AgentToolError(
                     "最近资源候选不存在或已过期，请重新搜索",
@@ -321,6 +338,7 @@ class IngestActions:
                 f"最近资源候选共 {len(public_candidates)} 项",
                 data={
                     "source_type": "resource_candidates",
+                    "search_id": snapshot["search_id"],
                     "count": len(public_candidates),
                     "items": public_candidates,
                 },
@@ -450,9 +468,17 @@ class IngestActions:
     @staticmethod
     def _resource_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         positions = list(arguments["positions"])
+        resource_arguments: dict[str, Any] = {
+            "target": arguments["target"],
+        }
+        search_id = normalize_resource_search_id(arguments.get("search_id"))
+        if search_id:
+            resource_arguments["search_id"] = search_id
         if len(positions) == 1:
-            return {"position": positions[0], "target": arguments["target"]}
-        return {"positions": positions, "target": arguments["target"]}
+            resource_arguments["position"] = positions[0]
+        else:
+            resource_arguments["positions"] = positions
+        return resource_arguments
 
     def _snapshot(
         self, arguments: dict[str, Any], context: ToolContext
@@ -488,8 +514,12 @@ class IngestActions:
                 result, inner_context = self.candidate_actions.prepare_one(internal, context)
             else:
                 result, inner_context = self.candidate_actions.prepare_batch(internal, context)
+            # 候选解析器把本轮实际使用的 search_id 写回 internal；这里再冻结进
+            # ToolRegistry 的 normalized 参数，使确认只能回到同一份快照。
+            arguments["search_id"] = internal["search_id"]
             if isinstance(result.data, dict):
                 result.data["source_type"] = "resource_candidates"
+                result.data["search_id"] = internal["search_id"]
             return result, _fingerprint({
                 "source_type": "resource_candidates",
                 "arguments": arguments,
@@ -571,8 +601,13 @@ class IngestActions:
         context: ToolContext,
     ) -> ToolResult:
         if arguments["source_type"] == "resource_candidates":
+            if not normalize_resource_search_id(arguments.get("search_id")):
+                raise AgentToolError(
+                    "资源确认缺少已冻结的搜索快照，请重新选择",
+                    code="confirmation_stale",
+                )
             internal = self._resource_arguments(arguments)
-            # 先重新生成底层上下文，确保最近搜索、结果存储与后端状态均未变化。
+            # 只按 ticket 已冻结的 search_id 重新生成底层上下文；不得回落到 latest。
             if len(arguments["positions"]) == 1:
                 _preview, inner_context = self.candidate_actions.prepare_one(internal, context)
             else:

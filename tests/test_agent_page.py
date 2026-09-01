@@ -231,6 +231,8 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("当前提供前 ${followups.size} 集快捷搜索", source)
         self.assertIn("/api/agent/actions/ingest.submit/prepare", source)
         self.assertIn("dataset.agentResourcePosition", source)
+        self.assertIn("dataset.agentResourceSearchId", source)
+        self.assertIn("search_id: searchId", source)
         self.assertIn("updates_available: '发现缺集'", source)
         self.assertIn("not_supported: '暂不支持'", source)
         self.assertIn("movie_library_presence_with_resource_followup", source)

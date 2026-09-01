@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+from contextlib import contextmanager
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
 from app.config import web_credentials
 from app.main import create_app
+from app.modules.qb_control import QBControlConflict
 from tests.support import InitializedWebTestCase
 
 
@@ -96,7 +99,10 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         client = Mock()
         first = "A" * 40
         second = "b" * 64
-        with patch("app.routes.downloads_api._qb", return_value=client):
+        with patch(
+            "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+            return_value=[],
+        ), patch("app.routes.downloads_api._qb", return_value=client):
             response = self.client.post(
                 "/api/downloads/qb/resume",
                 headers=headers,
@@ -106,6 +112,83 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"success": True, "action": "resume", "accepted": 2})
         client.resume_torrents.assert_called_once_with(f"{first.lower()}|{second}")
+
+    def test_batch_resume_keeps_safety_check_and_qb_call_in_one_lease(self):
+        headers = self._headers()
+        torrent_hash = "c" * 40
+        state = {"leased": False}
+        client = Mock()
+
+        @contextmanager
+        def lease():
+            self.assertFalse(state["leased"])
+            state["leased"] = True
+            try:
+                yield
+            finally:
+                state["leased"] = False
+
+        def check_allowed(hashes, *, operation):
+            self.assertTrue(state["leased"])
+            self.assertEqual((hashes, operation), ([torrent_hash], "resume"))
+
+        def resume(hashes):
+            self.assertTrue(state["leased"])
+            self.assertEqual(hashes, torrent_hash)
+
+        client.resume_torrents.side_effect = resume
+        with patch(
+            "app.routes.downloads_api.qb_control_write_lease", side_effect=lease,
+        ), patch(
+            "app.routes.downloads_api.assert_qb_control_allowed",
+            side_effect=check_allowed,
+        ), patch("app.routes.downloads_api._qb", return_value=client):
+            response = self.client.post(
+                "/api/downloads/qb/resume",
+                headers=headers,
+                json={"hashes": [torrent_hash]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(state["leased"])
+        client.resume_torrents.assert_called_once_with(torrent_hash)
+
+    def test_batch_resume_and_delete_fail_closed_when_safety_state_is_unavailable(self):
+        headers = self._headers()
+        torrent_hash = "d" * 40
+        for action in ("resume", "delete"):
+            with self.subTest(action=action), patch(
+                "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+                side_effect=sqlite3.OperationalError("no such table: local_media_tasks"),
+            ), patch("app.routes.downloads_api._qb") as qb:
+                response = self.client.post(
+                    f"/api/downloads/qb/{action}",
+                    headers=headers,
+                    json={"hashes": [torrent_hash]},
+                )
+
+            self.assertEqual(response.status_code, 503)
+            self.assertIn("安全状态暂不可用", response.json()["error"])
+            qb.assert_not_called()
+
+    def test_batch_pause_is_allowed_without_reading_local_safety_state(self):
+        headers = self._headers()
+        torrent_hash = "e" * 40
+        client = Mock()
+        with patch(
+            "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+        ) as safety_state, patch(
+            "app.routes.downloads_api._qb", return_value=client,
+        ):
+            response = self.client.post(
+                "/api/downloads/qb/pause",
+                headers=headers,
+                json={"hashes": [torrent_hash]},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        safety_state.assert_not_called()
+        client.pause_torrents.assert_called_once_with(torrent_hash)
 
     def test_batch_pause_rejects_non_array_hashes(self):
         headers = self._headers()
@@ -127,7 +210,10 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
         headers = self._headers()
         client = Mock()
         torrent_hash = "3" * 40
-        with patch("app.routes.downloads_api._qb", return_value=client):
+        with patch(
+            "app.modules.qb_control.db.list_local_media_qb_write_conflicts",
+            return_value=[],
+        ), patch("app.routes.downloads_api._qb", return_value=client):
             response = self.client.post(
                 "/api/downloads/qb/delete",
                 headers=headers,
@@ -136,6 +222,23 @@ class DownloadBatchActionApiTests(InitializedWebTestCase):
 
         self.assertEqual(response.status_code, 200)
         client.delete_torrents.assert_called_once_with(torrent_hash, delete_files=False)
+
+    def test_batch_resume_rejects_active_local_media_write(self):
+        headers = self._headers()
+        torrent_hash = "4" * 40
+        with patch(
+            "app.routes.downloads_api.assert_qb_control_allowed",
+            side_effect=QBControlConflict("所选下载任务正在执行本地整理写入"),
+        ), patch("app.routes.downloads_api._qb") as qb:
+            response = self.client.post(
+                "/api/downloads/qb/resume",
+                headers=headers,
+                json={"hashes": [torrent_hash]},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("本地整理", response.json()["error"])
+        qb.assert_not_called()
 
     def test_batch_rejects_invalid_or_excessive_hashes_before_qb_connection(self):
         headers = self._headers()

@@ -12,6 +12,7 @@ from app.agent.provider_operations import build_provider_catalog
 from app.agent.providers.media_server import MediaServerProviderTransport
 from app.agent.providers.qbittorrent import QBittorrentProviderTransport
 from app.agent.registry import AgentToolError
+from app.repositories.agent_provider_plans import invalidate_provider_plans_for_owner
 
 _GATEWAY: ProviderGateway | None = None
 _LOCK = threading.Lock()
@@ -39,6 +40,24 @@ def reset_provider_gateway_for_tests() -> None:
         _GATEWAY = None
 
 
+def clear_provider_session_state(*, owner: str) -> dict[str, int]:
+    """统一撤销 owner 的 Provider artifacts 与短期写计划。"""
+    owner_key = str(owner or "").strip()
+    if not owner_key:
+        return {"artifacts": 0, "plans": 0}
+    with _LOCK:
+        artifacts = (
+            _GATEWAY.artifacts.clear_owner(owner=owner_key)
+            if _GATEWAY is not None
+            else 0
+        )
+    plans = invalidate_provider_plans_for_owner(owner=owner_key)
+    return {
+        "artifacts": artifacts,
+        "plans": int(plans["scrubbed_running"]) + int(plans["deleted"]),
+    }
+
+
 def provider_capabilities_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("Provider 能力参数必须是对象")
@@ -51,10 +70,15 @@ def provider_capabilities_arguments(arguments: dict[str, Any]) -> dict[str, Any]
     intent = str(arguments.get("intent") or "").strip()
     if len(intent) > 160:
         raise AgentToolError("intent 最长 160 个字符")
-    try:
-        limit = int(arguments.get("limit", 12))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise AgentToolError("limit 必须是整数") from exc
+    raw_limit = arguments.get("limit", 12)
+    if isinstance(raw_limit, bool):
+        raise AgentToolError("limit 必须是整数")
+    if isinstance(raw_limit, int):
+        limit = raw_limit
+    elif isinstance(raw_limit, str) and re.fullmatch(r"[+-]?\d+", raw_limit.strip()):
+        limit = int(raw_limit.strip())
+    else:
+        raise AgentToolError("limit 必须是整数")
     if not 1 <= limit <= 24:
         raise AgentToolError("limit 必须在 1 到 24 之间")
     return {"provider": provider, "intent": intent, "limit": limit}

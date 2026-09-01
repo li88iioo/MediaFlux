@@ -154,6 +154,49 @@ def test_gateway_projects_sensitive_fields_and_issues_owner_scoped_refs():
     assert exc_info.value.code == "artifact_expired"
 
 
+def test_artifact_store_clear_owner_keeps_other_owner_isolated():
+    store = ProviderArtifactStore()
+    _first_artifact, first_public = store.put(
+        owner="owner-a",
+        session_id="s1",
+        provider="demo",
+        profile_ref="configured:demo",
+        operation="demo.items.list",
+        data={"items": [{"__object_id": "raw-a", "__object_kind": "movie"}]},
+    )
+    _second_artifact, second_public = store.put(
+        owner="owner-b",
+        session_id="s2",
+        provider="demo",
+        profile_ref="configured:demo",
+        operation="demo.items.list",
+        data={"items": [{"__object_id": "raw-b", "__object_kind": "movie"}]},
+    )
+    first_ref = first_public["items"][0]["object_ref"]
+    second_ref = second_public["items"][0]["object_ref"]
+
+    assert store.clear_owner(owner="owner-a") == 1
+    with pytest.raises(ProviderGatewayError) as expired:
+        store.resolve_object(
+            owner="owner-a",
+            session_id="s1",
+            object_ref=first_ref,
+            provider="demo",
+            profile_ref="configured:demo",
+            expected_kind="movie",
+        )
+    assert expired.value.code == "artifact_expired"
+    raw_id, _snapshot = store.resolve_object(
+        owner="owner-b",
+        session_id="s2",
+        object_ref=second_ref,
+        provider="demo",
+        profile_ref="configured:demo",
+        expected_kind="movie",
+    )
+    assert raw_id == "raw-b"
+
+
 def test_artifact_store_rejects_wrong_kind_and_session():
     store = ProviderArtifactStore()
     _artifact, public = store.put(

@@ -87,10 +87,10 @@ class ProviderCatalog:
                 if score:
                     scored.append((score, spec.operation_id, spec))
             if scored:
-                candidates = [item[2] for item in sorted(
-                    scored, key=lambda item: (-item[0], item[1])
-                )]
-        return sorted(candidates, key=lambda item: item.operation_id)[:max(1, min(limit, 32))]
+                ordered = sorted(scored, key=lambda item: (-item[0], item[1]))
+                return [item[2] for item in ordered][:max(1, min(limit, 32))]
+        ordered = sorted(candidates, key=lambda item: item.operation_id)
+        return ordered[:max(1, min(limit, 32))]
 
     def operations(self) -> Iterable[ProviderOperationSpec]:
         return tuple(self._operations[name] for name in sorted(self._operations))

@@ -19,6 +19,10 @@ from app.agent.rss_subscription_control_actions import (
     rss_update_subscription_arguments,
 )
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
+from app.modules.rss_subscription_config import (
+    RSSSubscriptionConfigError,
+    normalize_rss_subscription_create,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -244,6 +248,90 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         row = db.get_rss_subscription(created_id)
         self.assertEqual(row["name"], "Anime Feed Updated")
         self.assertEqual(int(row["refresh_interval_minutes"]), 60)
+
+    def test_update_urls_validator_is_idempotent_and_confirmation_succeeds(self):
+        arguments = {
+            "subscription_id": self.sid,
+            "urls": ["https://updated.example/rss"],
+        }
+        normalized = rss_update_subscription_arguments(arguments)
+        self.assertEqual(
+            normalized,
+            {
+                "subscription_id": self.sid,
+                "urls": "https://updated.example/rss",
+            },
+        )
+        self.assertEqual(rss_update_subscription_arguments(normalized), normalized)
+
+        service = get_agent_service()
+        with patch("app.modules.rss_scheduler.get_rss_scheduler", return_value=Mock()):
+            prepared = service.prepare(
+                "rss.update_subscription", arguments, owner="owner"
+            )
+            self.assertNotIn(
+                "updated.example", json.dumps(prepared, ensure_ascii=False)
+            )
+            confirmed = service.confirm(
+                prepared["action_plan"]["plan_id"], owner="owner"
+            )
+        self.assertTrue(confirmed["result"]["ok"])
+        self.assertEqual(
+            db.get_rss_subscription(self.sid)["urls"],
+            "https://updated.example/rss",
+        )
+
+    def test_shared_config_integer_fields_reject_lossy_values(self):
+        base = {"name": "Strict Feed", "urls": "https://example.invalid/rss"}
+        for field in ("refresh_interval_minutes", "media_default_season"):
+            for invalid in (True, 1.0, 1.9, "1.0", "1e3", "not-an-integer"):
+                with self.subTest(field=field, invalid=invalid), self.assertRaises(
+                    RSSSubscriptionConfigError
+                ):
+                    normalize_rss_subscription_create({**base, field: invalid})
+
+        normalized = normalize_rss_subscription_create({
+            **base,
+            "refresh_interval_minutes": "45",
+            "media_default_season": "2",
+        })
+        self.assertEqual(normalized["refresh_interval_minutes"], 45)
+        self.assertEqual(normalized["media_default_season"], 2)
+
+    def test_update_confirmation_uses_one_write_transaction_for_revision_and_bindings(self):
+        service = get_agent_service()
+        prepared = service.prepare(
+            "rss.update_subscription",
+            {
+                "subscription_id": self.sid,
+                "name": "Atomic Feed",
+                "media_tmdb_id": "12345",
+                "media_default_season": 2,
+            },
+            owner="owner",
+        )
+        original_update = db.update_rss_subscription
+        observed: list[tuple[bool, bool]] = []
+
+        def update_in_transaction(sub_id, fields, **kwargs):
+            connection = kwargs.get("connection")
+            observed.append((connection is not None, bool(connection.in_transaction)))
+            return original_update(sub_id, fields, **kwargs)
+
+        with patch(
+            "app.agent.rss_subscription_control_actions.db.update_rss_subscription",
+            side_effect=update_in_transaction,
+        ):
+            confirmed = service.confirm(
+                prepared["action_plan"]["plan_id"], owner="owner"
+            )
+
+        self.assertTrue(confirmed["result"]["ok"])
+        self.assertEqual(observed, [(True, True)])
+        current = db.get_rss_subscription(self.sid)
+        self.assertEqual(current["name"], "Atomic Feed")
+        self.assertEqual(current["media_tmdb_id"], "12345")
+        self.assertEqual(current["media_default_season"], 2)
 
     def test_update_confirmation_conflicts_after_subscription_changes(self):
         service = get_agent_service()

@@ -902,9 +902,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         ):
             inspect_directory_scrape({"directory_id": "dir-stale"}, context)
             self.assertIn(owner, _flows)
-            repository.invalidate_owner(
-                owner=owner, context_types=("directory_scrape",),
-            )
+            repository.invalidate_owner(owner=owner)
             with self.assertRaises(AgentToolError) as caught:
                 search_directory_scrape({"media_type": "auto"}, context)
         self.assertEqual(caught.exception.code, "precondition_failed")

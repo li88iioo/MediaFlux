@@ -369,7 +369,10 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             title="收藏剧集",
             year="2026",
         )
+        submitted_payloads: list[dict] = []
+
         async def create_subscription(payload, *, identity_confirmed=False):
+            submitted_payloads.append(dict(payload))
             subscription_id = db.add_media_subscription(
                 provider=payload["provider"],
                 external_id=payload["external_id"],
@@ -379,6 +382,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 year="2026",
                 monitor_mode=payload["monitor_mode"],
                 seasons=payload["seasons"],
+                check_interval_minutes=payload["check_interval_minutes"],
             )
             return {
                 "created": True,
@@ -399,7 +403,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             return_value=True,
         ):
             prepared = agent.query(
-                f"把收藏 {number} 转为订阅第 2 季",
+                f"把收藏 {number} 转成每周订阅第 2 季",
                 owner="owner",
                 present=False,
             )
@@ -417,6 +421,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
                 prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertEqual(confirmed["result"]["status"], "completed")
+        self.assertEqual(submitted_payloads[0]["check_interval_minutes"], 10080)
         with db.get_conn() as conn:
             subscription = conn.execute(
                 "SELECT * FROM media_subscriptions WHERE tmdb_id=? AND media_type=? "
@@ -425,6 +430,7 @@ class AgentDiscoveryWatchlistTests(IsolatedDatabaseTestCase):
             ).fetchone()
         self.assertIsNotNone(subscription)
         self.assertEqual(json.loads(subscription["seasons_json"]), [2])
+        self.assertEqual(int(subscription["check_interval_minutes"]), 10080)
         self.assertNotIn("PRIVATE_POSTER", repr(prepared) + repr(confirmed))
 
     def test_watchlist_natural_language_routes_preserve_read_and_write_boundaries(self) -> None:

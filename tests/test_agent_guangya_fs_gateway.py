@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from copy import deepcopy
 from pathlib import Path
@@ -115,6 +116,7 @@ class GuangYaFSGatewayTests(unittest.TestCase):
         workspace_actions.reset_guangya_workspace_context_for_tests()
         change_actions.reset_guangya_fs_change_context_for_tests()
         self.temp = tempfile.TemporaryDirectory()
+        self._job_sequence = 0
         self.obs_dir = Path(self.temp.name) / "observations"
         self.plan_dir = Path(self.temp.name) / "changes"
         self.patches = [
@@ -172,6 +174,52 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             return workspace_actions.query_guangya_filesystem(
                 arguments, ToolContext(owner="owner", session_id="session")
             )
+
+    def _confirmed_plan(
+        self, client: FakeGatewayClient, operation: dict
+    ) -> dict:
+        observed = self._query(client)
+        entries = {
+            item["object_name"]: item for item in observed.data["entries"]
+        }
+        operation = dict(operation)
+        source_name = str(operation.pop("source_name", ""))
+        if source_name:
+            operation["object_ref"] = entries[source_name]["object_ref"]
+        observation = guangya_workspace.load_directory_observation(
+            observed.data["observation_ref"], owner="owner"
+        )
+        plan = guangya_fs_change.build_fs_change_plan(
+            client,
+            owner="owner",
+            observation=observation,
+            trigger_strm=False,
+            operations=[operation],
+        )
+        guangya_fs_change.confirm_fs_change_plan(
+            plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
+        )
+        return plan
+
+    def _queued_payload(self, plan: dict, *, job_id: str = "") -> dict:
+        if not job_id:
+            self._job_sequence += 1
+            job_id = f"{self._job_sequence:032x}"
+        guangya_fs_change.bind_fs_change_plan_job(
+            plan["plan_id"],
+            owner_digest="digest:owner",
+            expected_fingerprint=plan["fingerprint"],
+            job_id=job_id,
+            queue_until_epoch=10**12,
+        )
+        return {
+            "version": 1,
+            "plan_id": plan["plan_id"],
+            "plan_fingerprint": plan["fingerprint"],
+            "owner_digest": "digest:owner",
+            "credential_generation": 31,
+            "job_id": job_id,
+        }
 
     def test_query_supports_search_stat_and_opaque_refs(self):
         client = FakeGatewayClient()
@@ -240,13 +288,7 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
         )
         result = guangya_fs_change.execute_fs_change_plan(
-            {
-                "version": 1,
-                "plan_id": plan["plan_id"],
-                "plan_fingerprint": plan["fingerprint"],
-                "owner_digest": "digest:owner",
-                "credential_generation": 31,
-            },
+            self._queued_payload(plan),
             client_factory=lambda: client,
         )
         self.assertFalse(result["partial"])
@@ -285,13 +327,7 @@ class GuangYaFSGatewayTests(unittest.TestCase):
         client.directories["source"][2].etag = "changed"
         with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
             guangya_fs_change.execute_fs_change_plan(
-                {
-                    "version": 1,
-                    "plan_id": plan["plan_id"],
-                    "plan_fingerprint": plan["fingerprint"],
-                    "owner_digest": "digest:owner",
-                    "credential_generation": 31,
-                },
+                self._queued_payload(plan),
                 client_factory=lambda: client,
             )
         self.assertIsNotNone(client.file_info("trash"))
@@ -321,13 +357,7 @@ class GuangYaFSGatewayTests(unittest.TestCase):
 
         with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
             guangya_fs_change.execute_fs_change_plan(
-                {
-                    "version": 1,
-                    "plan_id": plan["plan_id"],
-                    "plan_fingerprint": plan["fingerprint"],
-                    "owner_digest": "digest:owner",
-                    "credential_generation": 31,
-                },
+                self._queued_payload(plan),
                 client_factory=lambda: client,
             )
         self.assertIsNotNone(client.file_info("trash"))
@@ -357,16 +387,10 @@ class GuangYaFSGatewayTests(unittest.TestCase):
                 }
             ],
         )
-        payload = {
-            "version": 1,
-            "plan_id": plan["plan_id"],
-            "plan_fingerprint": plan["fingerprint"],
-            "owner_digest": "digest:owner",
-            "credential_generation": 31,
-        }
         guangya_fs_change.confirm_fs_change_plan(
             plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
         )
+        payload = self._queued_payload(plan)
         first = guangya_fs_change.execute_fs_change_plan(
             payload, client_factory=lambda: client
         )
@@ -418,17 +442,228 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
         )
         result = guangya_fs_change.execute_fs_change_plan(
-            {
-                "version": 1,
-                "plan_id": plan["plan_id"],
-                "plan_fingerprint": plan["fingerprint"],
-                "owner_digest": "digest:owner",
-                "credential_generation": 31,
-            },
+            self._queued_payload(plan),
             client_factory=lambda: client,
         )
         self.assertFalse(result["partial"])
         self.assertEqual(result["stats"]["moved"], 2)
+
+    def test_plan_state_cas_allows_only_one_concurrent_execution_claim(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(
+            client,
+            {
+                "op": "rename",
+                "source_name": "广告-ABC.mp4",
+                "new_name": "ABC.mp4",
+            },
+        )
+        payload = self._queued_payload(plan)
+        barrier = threading.Barrier(3)
+        claimed: list[bool] = []
+
+        def claim() -> None:
+            barrier.wait()
+            try:
+                guangya_fs_change.update_fs_change_plan_execution(
+                    plan["plan_id"],
+                    status="running",
+                    execution={"started_at": "now"},
+                    expected_statuses={"queued"},
+                    expected_job_id=payload["job_id"],
+                )
+            except guangya_fs_change.GuangYaFSChangeStale:
+                claimed.append(False)
+            else:
+                claimed.append(True)
+
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertEqual(sorted(claimed), [False, True])
+        self.assertEqual(
+            guangya_fs_change._read(plan["plan_id"])["status"], "running"
+        )
+
+    def test_confirmed_plan_cannot_execute_without_bound_durable_job(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(
+            client,
+            {
+                "op": "rename",
+                "source_name": "广告-ABC.mp4",
+                "new_name": "ABC.mp4",
+            },
+        )
+
+        with self.assertRaises(guangya_fs_change.GuangYaFSChangeError):
+            guangya_fs_change.execute_fs_change_plan(
+                {
+                    "version": 1,
+                    "plan_id": plan["plan_id"],
+                    "plan_fingerprint": plan["fingerprint"],
+                    "owner_digest": "digest:owner",
+                    "credential_generation": 31,
+                },
+                client_factory=lambda: client,
+            )
+
+        self.assertIsNotNone(client.file_info("rename"))
+        self.assertEqual(
+            guangya_fs_change._read(plan["plan_id"])["status"], "confirmed"
+        )
+
+    def test_queued_execution_uses_bound_job_id_after_confirmation_ttl(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(
+            client,
+            {
+                "op": "rename",
+                "source_name": "广告-ABC.mp4",
+                "new_name": "ABC.mp4",
+            },
+        )
+        job_id = "a" * 32
+        guangya_fs_change.bind_fs_change_plan_job(
+            plan["plan_id"],
+            owner_digest="digest:owner",
+            expected_fingerprint=plan["fingerprint"],
+            job_id=job_id,
+            queue_until_epoch=10**12,
+        )
+        queued = guangya_fs_change._read(plan["plan_id"])
+        queued["execute_until_epoch"] = 1
+        guangya_fs_change._atomic_write(queued)
+        base_payload = {
+            "version": 1,
+            "plan_id": plan["plan_id"],
+            "plan_fingerprint": plan["fingerprint"],
+            "owner_digest": "digest:owner",
+            "credential_generation": 31,
+        }
+
+        with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+            guangya_fs_change.execute_fs_change_plan(
+                {**base_payload, "job_id": "b" * 32},
+                client_factory=lambda: client,
+            )
+        self.assertIsNotNone(client.file_info("rename"))
+
+        result = guangya_fs_change.execute_fs_change_plan(
+            {**base_payload, "job_id": job_id},
+            client_factory=lambda: client,
+        )
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["stats"]["renamed"], 1)
+        terminal = guangya_fs_change._read(plan["plan_id"])
+        self.assertEqual(terminal["status"], "completed")
+        self.assertEqual(terminal["job_id"], job_id)
+
+    def test_trash_execution_uses_audited_recycle_bin_writer(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(
+            client, {"op": "trash", "source_name": "垃圾残余"}
+        )
+
+        def audited_delete(audit_client, *, candidate, **_kwargs):
+            audit_client.delete([candidate.file_id])
+            return {"audit_id": 1, "status": "success"}
+
+        with mock.patch.object(
+            guangya_fs_change,
+            "execute_recycle_bin_delete",
+            side_effect=audited_delete,
+        ) as audited:
+            result = guangya_fs_change.execute_fs_change_plan(
+                self._queued_payload(plan),
+                client_factory=lambda: client,
+            )
+
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["stats"]["trashed"], 1)
+        self.assertEqual(audited.call_args.kwargs["candidate"].file_id, "trash")
+        self.assertEqual(
+            audited.call_args.kwargs["trigger"], "agent_guangya_fs_change"
+        )
+
+    def test_journal_failure_after_remote_write_returns_manual_partial(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(
+            client,
+            {
+                "op": "rename",
+                "source_name": "广告-ABC.mp4",
+                "new_name": "ABC.mp4",
+            },
+        )
+        original_append = guangya_fs_change._append_journal
+        calls = 0
+
+        def flaky_append(plan_id, event):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("journal unavailable")
+            return original_append(plan_id, event)
+
+        with mock.patch.object(
+            guangya_fs_change, "_append_journal", side_effect=flaky_append
+        ):
+            result = guangya_fs_change.execute_fs_change_plan(
+                self._queued_payload(plan),
+                client_factory=lambda: client,
+            )
+
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["requires_manual"])
+        self.assertEqual(result["stats"]["renamed"], 1)
+        self.assertGreaterEqual(result["stats"]["audit_failures"], 1)
+        self.assertEqual(
+            guangya_fs_change._read(plan["plan_id"])["status"], "manual_review"
+        )
+
+    def test_terminal_plan_write_failure_does_not_raise_retryable_failure(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(
+            client,
+            {
+                "op": "rename",
+                "source_name": "广告-ABC.mp4",
+                "new_name": "ABC.mp4",
+            },
+        )
+        original_update = guangya_fs_change.update_fs_change_plan_execution
+
+        def flaky_update(plan_id, *, status, execution, **kwargs):
+            if status != "running":
+                raise OSError("plan store unavailable")
+            return original_update(
+                plan_id,
+                status=status,
+                execution=execution,
+                **kwargs,
+            )
+
+        with mock.patch.object(
+            guangya_fs_change,
+            "update_fs_change_plan_execution",
+            side_effect=flaky_update,
+        ):
+            result = guangya_fs_change.execute_fs_change_plan(
+                self._queued_payload(plan),
+                client_factory=lambda: client,
+            )
+
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["requires_manual"])
+        self.assertEqual(result["stats"]["renamed"], 1)
+        self.assertEqual(
+            guangya_fs_change._read(plan["plan_id"])["status"], "running"
+        )
 
     def test_preview_confirmation_queues_durable_job_without_accepting_new_arguments(
         self,
@@ -477,6 +712,111 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             manager.start_durable_operation.call_args.kwargs["job_kind"],
             "agent_guangya_fs_change",
         )
+
+    def test_post_enqueue_manager_error_recovers_the_already_active_job(self):
+        client = FakeGatewayClient()
+        observed = self._query(client)
+        target = next(
+            item
+            for item in observed.data["entries"]
+            if item["object_name"] == "垃圾残余"
+        )
+        arguments = change_actions.guangya_fs_change_preview_arguments(
+            {
+                "operations": [{"op": "trash", "object_ref": target["object_ref"]}],
+                "trigger_strm": False,
+            }
+        )
+        context = ToolContext(owner="owner", session_id="session")
+        with mock.patch.object(change_actions, "GuangYaClient", return_value=client):
+            change_actions.preview_guangya_fs_change(arguments, context)
+            _confirmation, fingerprint = (
+                change_actions.prepare_guangya_fs_change_confirmation({}, context)
+            )
+
+        job_id = "c" * 32
+        manager = mock.Mock()
+
+        def enqueue_then_report_local_error(*_args, **kwargs):
+            payload = kwargs["payload"]
+            guangya_fs_change.bind_fs_change_plan_job(
+                payload["plan_id"],
+                owner_digest=payload["owner_digest"],
+                expected_fingerprint=payload["plan_fingerprint"],
+                job_id=job_id,
+                queue_until_epoch=10**12,
+            )
+            return {"ok": False, "error_code": "durable_queue_claim_failed"}
+
+        manager.start_durable_operation.side_effect = enqueue_then_report_local_error
+        with (
+            mock.patch(
+                "app.modules.organize_tasks.get_organize_manager",
+                return_value=manager,
+            ),
+            mock.patch.object(
+                change_actions,
+                "get_organize_operation_job",
+                return_value={"status": "pending"},
+            ),
+            mock.patch.object(
+                change_actions,
+                "organize_operation_queue_position",
+                return_value=2,
+            ),
+        ):
+            accepted = change_actions.execute_guangya_fs_change_confirmed(
+                {}, fingerprint, context
+            )
+
+        self.assertEqual(accepted.status, "accepted")
+        self.assertTrue(accepted.data["queued"])
+        self.assertTrue(accepted.data["replayed"])
+        self.assertEqual(accepted.data["queue_position"], 2)
+
+    def test_session_clear_discards_owner_observations_only(self):
+        client = FakeGatewayClient()
+        owner_result = self._query(client)
+        arguments = workspace_actions.guangya_fs_query_arguments({
+            "operation": "list",
+            "path": "/source",
+            "page": 1,
+            "page_size": 10,
+            "max_items": 100,
+        })
+        with mock.patch.object(workspace_actions, "GuangYaClient", return_value=client):
+            other_result = workspace_actions.query_guangya_filesystem(
+                arguments, ToolContext(owner="other", session_id="session")
+            )
+
+        removed = workspace_actions.clear_guangya_workspace_context(owner="owner")
+
+        self.assertEqual(removed, 1)
+        with self.assertRaises(guangya_workspace.GuangYaWorkspaceError):
+            guangya_workspace.load_directory_observation(
+                owner_result.data["observation_ref"], owner="owner"
+            )
+        other = guangya_workspace.load_directory_observation(
+            other_result.data["observation_ref"], owner="other"
+        )
+        self.assertEqual(other["owner_digest"], "digest:other")
+
+    def test_persisted_context_is_authoritative_over_stale_memory_cache(self):
+        class EmptyRepository:
+            @staticmethod
+            def get_latest(**_kwargs):
+                return None
+
+        owner = "owner"
+        workspace_actions._flows[owner] = object()  # type: ignore[assignment]
+        change_actions._flows[owner] = object()  # type: ignore[assignment]
+        workspace_actions.configure_guangya_workspace_context(EmptyRepository())
+        change_actions.configure_guangya_fs_change_context(EmptyRepository())
+
+        self.assertEqual(workspace_actions.latest_guangya_observation_ref(owner), "")
+        self.assertIsNone(change_actions._flow(owner))
+        self.assertNotIn(owner, workspace_actions._flows)
+        self.assertNotIn(owner, change_actions._flows)
 
     def test_registry_exposes_read_and_confirmation_bound_write_tools(self):
         registry = build_tool_registry()
