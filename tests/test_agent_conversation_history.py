@@ -5,7 +5,7 @@ import json
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
 
@@ -1481,6 +1481,37 @@ class AgentConversationHistoryApiTests(IsolatedDatabaseTestCase):
         listing = self.client.get("/api/agent/sessions")
         self.assertEqual(listing.status_code, 200, listing.text)
         self.assertEqual(listing.json()["sessions"], [])
+
+    def test_sensitive_rss_url_keeps_only_safe_topic_for_followup(self):
+        csrf = self._login()
+        self.service.query = Mock(return_value={
+            "mode": "confirmed_action",
+            "tool_call": {"name": "rss.create_subscription", "arguments": {}},
+            "result": {
+                "ok": True,
+                "status": "completed",
+                "summary": "RSS 订阅 #2 已创建并核验",
+                "suggestions": [],
+                "data": {"subscription_number": 2, "verified": True},
+            },
+        })
+        source_url = "https://mikanani.me/RSS/Bangumi?bangumiId=3979"
+        with patch(
+            "app.routes.agent_api.get_agent_service", return_value=self.service
+        ):
+            response = self.client.post(
+                "/api/agent/query",
+                headers={"X-CSRF-Token": csrf},
+                json={"message": source_url, "session_id": SESSION_A},
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        detail = self.client.get(f"/api/agent/sessions/{SESSION_A}")
+        self.assertEqual(detail.status_code, 200, detail.text)
+        serialized = json.dumps(detail.json(), ensure_ascii=False)
+        self.assertNotIn("mikanani.me", serialized)
+        self.assertNotIn("bangumiId", serialized)
+        self.assertIn("RSS", serialized)
+        self.assertIn("context_domain", serialized)
 
     def test_session_history_isolated_between_login_sessions(self):
         csrf = self._login()

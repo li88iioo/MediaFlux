@@ -19,7 +19,10 @@ from app.agent.action_plan_id import normalize_action_plan_id
 from app.agent.confirmation import confirmation_reply_intent
 from app.agent.conversation_compaction import schedule_conversation_compaction
 from app.agent.metrics import agent_metrics
-from app.agent.conversation_history import get_agent_conversation_history_repository
+from app.agent.conversation_history import (
+    get_agent_conversation_history_repository,
+    safe_history_retry_message,
+)
 from app.agent.owner_routes import web_agent_owner
 from app.agent.local_media_intents import (
     is_local_media_diagnosis_message,
@@ -484,13 +487,23 @@ def _record_query_history(
     principal = _agent_history_principal(request)
     repository = get_agent_conversation_history_repository()
     try:
-        persisted = repository.append_query_turn(
-            principal=principal,
-            session_id=session_id,
-            message=message,
-            response=response,
-            expected_generation=expected_generation,
-        )
+        try:
+            persisted = repository.append_query_turn(
+                principal=principal,
+                session_id=session_id,
+                message=message,
+                response=response,
+                expected_generation=expected_generation,
+            )
+        except ValueError:
+            safe_message = safe_history_retry_message(response)
+            persisted = bool(safe_message) and repository.append_query_turn(
+                principal=principal,
+                session_id=session_id,
+                message=safe_message,
+                response=response,
+                expected_generation=expected_generation,
+            )
         if persisted:
             schedule_conversation_compaction(
                 principal=principal,

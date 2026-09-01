@@ -1988,6 +1988,8 @@ def _ensure_objective_workflow_coverage(
     """补齐 Provider 原生读写链的固定阶段，避免只召回查询却无法完成确认。"""
     required_by_task = {
         "download_status": ("provider.capabilities", "provider.query"),
+        "qb_realtime_status": ("provider.capabilities", "provider.query"),
+        "media_library_counts": ("provider.capabilities", "provider.query"),
         "download_control": (
             "provider.capabilities",
             "provider.query",
@@ -2730,6 +2732,21 @@ async def _request_native_read_agent(
                         forbidden_names=registry.native_aliases()
                         | frozenset(item["name"] for item in read_tool_capabilities(registry)),
                     )
+                    required_sources = {
+                        str(item).strip()
+                        for item in objective.required_sources
+                        if str(item).strip()
+                    }
+                    if required_sources and not required_sources.issubset(
+                        state.successful_source_kinds
+                    ):
+                        logger.info(
+                            "Agent LLM native event outcome=required_evidence_missing "
+                            "task=%s missing=%s",
+                            objective.task_kind,
+                            ",".join(sorted(required_sources - state.successful_source_kinds)),
+                        )
+                        return state.partial("required_evidence_missing")
                     if answer:
                         return LLMConversationReply(
                             answer=answer,

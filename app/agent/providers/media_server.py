@@ -128,6 +128,24 @@ class MediaServerProviderTransport:
                         },
                         source=f"{profile.server_type}_api",
                     )
+                if operation == "media.items.counts":
+                    raw_counts = client.get_media_counts()
+                    counts = {
+                        key: max(0, int(raw_counts.get(key, 0) or 0))
+                        for key in (
+                            "total_items",
+                            "movie_count",
+                            "series_count",
+                            "episode_count",
+                        )
+                    }
+                    return ProviderPayload(
+                        summary=(
+                            f"{profile.label} 当前共有 {counts['total_items']} 个可播放媒体项"
+                        ),
+                        data={"server_label": profile.label, **counts},
+                        source=f"{profile.server_type}_api",
+                    )
                 if operation == "media.libraries.list":
                     folders = client.list_virtual_folders()
                     libraries = [

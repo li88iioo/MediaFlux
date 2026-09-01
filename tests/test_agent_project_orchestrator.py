@@ -184,6 +184,116 @@ class AgentObjectiveContractTests(unittest.TestCase):
         self.assertIn("web.search", names)
         self.assertNotIn("discovery.add_watchlist", names)
 
+    def test_exact_qb_realtime_and_media_total_use_native_provider_routes(self) -> None:
+        agent = AgentOrchestrator(self.registry)
+        sentinel = {"mode": "read_only", "result": {"ok": True}}
+        with patch.object(
+            agent, "_invoke_default_provider_read", return_value=sentinel
+        ) as invoke:
+            self.assertIs(
+                agent._query_raw(
+                    "qb 实时任务呢", owner="owner", allow_model_routing=False
+                ),
+                sentinel,
+            )
+            self.assertEqual(invoke.call_args.kwargs["provider"], "qbittorrent")
+            self.assertEqual(
+                invoke.call_args.kwargs["operation"], "qb.torrents.info"
+            )
+
+            self.assertIs(
+                agent._query_raw(
+                    "我的媒体库中的媒体总数是多少",
+                    owner="owner",
+                    allow_model_routing=False,
+                ),
+                sentinel,
+            )
+            self.assertEqual(invoke.call_args.kwargs["provider"], "media")
+            self.assertEqual(
+                invoke.call_args.kwargs["operation"], "media.items.counts"
+            )
+
+        series_count = infer_agent_objective(
+            "查看媒体库中《九门》一共有多少集"
+        )
+        self.assertNotEqual(series_count.task_kind, "media_library_counts")
+        self.assertIn(
+            "library.count_series_episodes",
+            self._names("查看媒体库中《九门》一共有多少集"),
+        )
+
+    def test_default_provider_read_preserves_capability_failures(self) -> None:
+        agent = AgentOrchestrator(self.registry)
+        failure = {
+            "mode": "read_only",
+            "tool_call": {
+                "name": "provider.capabilities",
+                "arguments": {"provider": "qbittorrent"},
+                "elapsed_ms": 7,
+            },
+            "result": {
+                "ok": False,
+                "status": "unavailable",
+                "summary": "Provider 能力暂时不可用",
+                "data": {},
+            },
+        }
+        with patch.object(
+            agent, "_invoke_query_read", return_value=failure
+        ) as invoke:
+            result = agent._invoke_default_provider_read(
+                provider="qbittorrent",
+                operation="qb.torrents.info",
+                arguments={"query": "", "limit": 100},
+                intent="读取 qBittorrent 当前实时任务",
+                owner="owner",
+            )
+
+        self.assertIs(result, failure)
+        invoke.assert_called_once()
+
+    def test_recent_guoman_and_year_followup_require_current_evidence(self) -> None:
+        recent = infer_agent_objective("最近有什么推荐的国漫")
+        followup = infer_agent_objective("2026 有新剧吗")
+        self.assertEqual(
+            recent.required_sources, ("metadata_catalog", "public_web")
+        )
+        self.assertEqual(
+            followup.required_sources, ("metadata_catalog", "public_web")
+        )
+        self.assertEqual(
+            set(self._names("最近有什么推荐的国漫")),
+            {"discovery.recommend", "web.search"},
+        )
+
+    def test_year_recommendation_inherits_previous_guoman_scope(self) -> None:
+        agent = AgentOrchestrator(self.registry)
+        sentinel = {"mode": "read_plan", "result": {"ok": True}}
+        context = [{"role": "user", "text": "最近有什么推荐的国漫"}]
+        with patch.object(
+            agent, "_execute_read_plan", return_value=sentinel
+        ) as execute:
+            result = agent._query_raw(
+                "2026 有新剧吗",
+                owner="owner",
+                conversation_context=context,
+                allow_model_routing=False,
+            )
+
+        self.assertIs(result, sentinel)
+        plan = execute.call_args.args[0]
+        discovery = next(
+            step for step in plan.steps if step.tool_name == "discovery.recommend"
+        )
+        web = next(step for step in plan.steps if step.tool_name == "web.search")
+        self.assertEqual(discovery.arguments["year"], "2026")
+        self.assertEqual(discovery.arguments["media_type"], "tv")
+        self.assertEqual(discovery.arguments["region"], "中国大陆")
+        self.assertIn("2026", web.arguments["query"])
+        self.assertIn("中国大陆", web.arguments["query"])
+        self.assertIn("动画剧集", web.arguments["query"])
+
     def test_named_series_update_uses_media_chain_without_cross_domain_tools(self) -> None:
         message = "检查师兄太稳健有没有更新"
         objective = infer_agent_objective(message)

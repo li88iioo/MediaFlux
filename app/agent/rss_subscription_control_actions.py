@@ -350,17 +350,38 @@ def _confirmed_create(arguments: dict[str, Any], expected_context: str) -> ToolR
             summary="RSS 订阅创建失败",
             error=str(exc)[:240],
         )
+    persisted = db.get_rss_subscription(subscription_id)
+    expected_summary = _safe_config_summary(fields)
+    persisted_summary = (
+        _safe_config_summary(dict(persisted)) if persisted is not None else None
+    )
+    if persisted_summary != expected_summary:
+        return ToolResult(
+            ok=False,
+            status="outcome_unknown",
+            summary="RSS 订阅写入结果无法核验",
+            data={
+                "operation": "create",
+                "subscription_number": subscription_id,
+                "affected": 1,
+                "verified": False,
+            },
+            error="数据库写入已返回编号，但读取结果与确认配置不一致；请刷新 RSS 页面核对后再决定是否重试。",
+            suggestions=["先查看 RSS 订阅列表，避免重复创建。"],
+        )
     runtime_refreshed = _reload_scheduler()
     return ToolResult(
         ok=True,
         status="completed",
-        summary="RSS 订阅已创建",
+        summary=f"RSS 订阅 #{subscription_id} 已创建并核验",
         data={
             "operation": "create",
             "subscription_id": subscription_id,
+            "subscription_number": subscription_id,
             "affected": 1,
+            "verified": True,
             "runtime_refreshed": runtime_refreshed,
-            **_safe_config_summary(fields),
+            **persisted_summary,
         },
         evidence=[Evidence(
             "rss_database",

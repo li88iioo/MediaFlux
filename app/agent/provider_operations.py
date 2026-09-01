@@ -22,6 +22,16 @@ def build_provider_catalog() -> ProviderCatalog:
             examples=("查看 Jellyfin 版本", "媒体服务器在线吗"),
         ),
         ProviderOperationSpec(
+            operation_id="media.items.counts",
+            provider="media",
+            description="读取媒体服务器中的可播放媒体总数，以及电影、剧集和单集数量。",
+            risk=RiskLevel.READ,
+            parameters=_EMPTY,
+            result_kind="media_counts",
+            domains=("media_library",),
+            examples=("我的媒体库有多少媒体", "查看 Jellyfin 媒体总数"),
+        ),
+        ProviderOperationSpec(
             operation_id="media.libraries.list",
             provider="media",
             description="列出指定媒体服务器中的媒体库，不返回真实目录路径。",

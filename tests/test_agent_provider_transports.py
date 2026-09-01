@@ -32,6 +32,14 @@ class _FakeMediaClient:
     def server_identity(self):
         return "Dev Jellyfin", "Jellyfin", "12.0.0"
 
+    def get_media_counts(self):
+        return {
+            "total_items": 166,
+            "movie_count": 40,
+            "series_count": 12,
+            "episode_count": 114,
+        }
+
     def list_virtual_folders(self):
         return [
             {
@@ -114,6 +122,17 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
     )
     monkeypatch.setattr(transport, "_client", lambda _profile: _FakeMediaClient())
 
+    counts = transport.execute_read(
+        "configured:jellyfin", "media.items.counts", {}
+    )
+    assert counts.data == {
+        "server_label": "Jellyfin",
+        "total_items": 166,
+        "movie_count": 40,
+        "series_count": 12,
+        "episode_count": 114,
+    }
+
     libraries = transport.execute_read(
         "configured:jellyfin", "media.libraries.list", {}
     )
@@ -156,6 +175,22 @@ def test_qb_transport_reuses_client_and_never_returns_paths(monkeypatch):
     assert task["downloaded_bytes"] == 50
     assert "progress" not in task
     assert "downloaded" not in task
+    assert queue.summary == (
+        "qBittorrent 实时队列共 1 项：进行中 1、排队 0、暂停 0、异常 0、已完成 0、其他 0"
+    )
+    assert queue.data["state_counts"] == {
+        "active": 1,
+        "queued": 0,
+        "paused": 0,
+        "failed": 0,
+        "completed": 0,
+        "other": 0,
+    }
+    assert queue.data["transfer"] == {
+        "connection_status": "connected",
+        "download_speed": 1024,
+        "upload_speed": 0,
+    }
 
     files = transport.execute_read(
         "configured:qbittorrent",

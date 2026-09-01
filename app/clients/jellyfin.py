@@ -493,6 +493,16 @@ class JellyfinClient(MediaServerClient):
         )
         return int(data.get("TotalRecordCount", 0) or 0)
 
+    def get_media_counts(self) -> dict[str, int]:
+        """只读取 Jellyfin 统计接口，避免为一个总数加载整张看板。"""
+        counts = self._media_counts()
+        return {
+            "total_items": max(0, int(self._total_items() or 0)),
+            "movie_count": max(0, int(counts.get("movie_count", 0) or 0)),
+            "series_count": max(0, int(counts.get("series_count", 0) or 0)),
+            "episode_count": max(0, int(counts.get("episode_count", 0) or 0)),
+        }
+
     def _media_counts(self) -> dict[str, int]:
         data = self._request("/Items/Counts", params={"userId": self._user_id()})
         return {

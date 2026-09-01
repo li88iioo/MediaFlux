@@ -27,7 +27,10 @@ from app.agent.action_plan import sanitize_action_plan
 from app.agent.action_plan_id import normalize_action_plan_id
 from app.agent.async_bridge import run_awaitable_sync
 from app.agent.conversation_compaction import schedule_conversation_compaction
-from app.agent.conversation_history import get_agent_conversation_history_repository
+from app.agent.conversation_history import (
+    get_agent_conversation_history_repository,
+    safe_history_retry_message,
+)
 from app.agent.confirmation import confirmation_reply_intent
 from app.agent.feature_gate import (
     AgentRuntimeDisabled,
@@ -2882,8 +2885,9 @@ def _telegram_agent_trace_details(
         isinstance(partial_payload, dict)
         and partial_payload.get("complete") is False
     )
-    projected: list[tuple[str, bool, str]] = []
-    for item in raw_trace[:_MAX_TRACE_ITEMS]:
+    unique_items: list[tuple[str, bool, str]] = []
+    seen_items: set[tuple[str, bool, str]] = set()
+    for item in raw_trace:
         if not isinstance(item, dict):
             continue
         label = _public_text(item.get("label"), limit=70)
@@ -2892,11 +2896,16 @@ def _telegram_agent_trace_details(
         item_ok = item.get("ok") is True
         if attention_only and item_ok:
             continue
-        projected.append((
+        projected_item = (
             label,
             item_ok,
             _public_text(item.get("summary"), limit=150),
-        ))
+        )
+        if projected_item in seen_items:
+            continue
+        seen_items.add(projected_item)
+        unique_items.append(projected_item)
+    projected = unique_items[:_MAX_TRACE_ITEMS]
     if not projected or (len(projected) == 1 and not partial and not attention_only):
         return ""
 
@@ -2906,7 +2915,7 @@ def _telegram_agent_trace_details(
         lines.append(f"• <b>{label}</b> · {'完成' if ok else '需关注'}")
         if summary:
             lines.append(f"  {summary}")
-    remaining = max(0, len(raw_trace) - len(projected))
+    remaining = max(0, len(unique_items) - len(projected))
     if remaining and not attention_only:
         lines.append(f"另有 {remaining} 项已核对。")
     return "\n".join(lines)
@@ -3343,13 +3352,23 @@ def _record_telegram_conversation(
     principal, session_id = _telegram_history_identity(owner)
     repository = get_agent_conversation_history_repository()
     try:
-        persisted = repository.append_query_turn(
-            principal=principal,
-            session_id=session_id,
-            message=message,
-            response=response,
-            expected_generation=generation,
-        )
+        try:
+            persisted = repository.append_query_turn(
+                principal=principal,
+                session_id=session_id,
+                message=message,
+                response=response,
+                expected_generation=generation,
+            )
+        except ValueError:
+            safe_message = safe_history_retry_message(response)
+            persisted = bool(safe_message) and repository.append_query_turn(
+                principal=principal,
+                session_id=session_id,
+                message=safe_message,
+                response=response,
+                expected_generation=generation,
+            )
         if persisted:
             schedule_conversation_compaction(
                 principal=principal,

@@ -1582,6 +1582,40 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         self.assertEqual(text.count("<b>需要留意</b>"), 1)
         self.assertNotIn("<b>检查步骤</b>", text)
 
+    def test_duplicate_tool_trace_warning_is_rendered_once(self):
+        text = render_agent_response({
+            "mode": "conversation",
+            "result": {
+                "ok": False,
+                "status": "partial",
+                "summary": "部分站点暂不可用",
+                "suggestions": [],
+            },
+            "presentation": {
+                "source": "llm",
+                "kind": "narrative",
+                "narrative": "当前没有找到可用资源。",
+            },
+            "agent_partial": {"complete": False},
+            "agent_trace": [
+                {
+                    "label": "多站资源搜索",
+                    "ok": False,
+                    "summary": "找到 0 项可查看资源，部分站点暂不可用",
+                },
+                {
+                    "label": "多站资源搜索",
+                    "ok": False,
+                    "summary": "找到 0 项可查看资源，部分站点暂不可用",
+                },
+            ],
+        })
+
+        self.assertEqual(text.count("<b>多站资源搜索</b>"), 1)
+        self.assertEqual(
+            text.count("找到 0 项可查看资源,部分站点暂不可用"), 1
+        )
+
     def test_partial_narrative_trace_only_lists_unfinished_items(self):
         text = render_agent_response({
             "mode": "read_plan",

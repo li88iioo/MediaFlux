@@ -253,6 +253,15 @@ class MediaServerClient:
         return folders
 
     # ---- 看板数据（统一返回）----
+    def get_media_counts(self) -> dict[str, int]:
+        """读取最小媒体计数；供 Agent 等只需要统计的调用复用。"""
+        return {
+            "total_items": max(0, int(self._total_items() or 0)),
+            "movie_count": 0,
+            "series_count": 0,
+            "episode_count": 0,
+        }
+
     def get_dashboard(self) -> DashboardData:
         """聚合看板数据。任一步失败不影响其余。"""
         data = DashboardData(server_name=self.display_name)

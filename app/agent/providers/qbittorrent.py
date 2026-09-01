@@ -32,6 +32,44 @@ _PAUSED_STATES = frozenset(
         "stoppedup",
     }
 )
+_QB_FAILED_STATES = frozenset({"error", "missingfiles"})
+_QB_QUEUED_STATES = frozenset({"queueddl", "queuedup"})
+_QB_ACTIVE_STATES = frozenset(
+    {
+        "allocating",
+        "checkingdl",
+        "checkingup",
+        "checkingresumedata",
+        "downloading",
+        "forceddl",
+        "forcedmetadl",
+        "metadl",
+        "moving",
+        "stalleddl",
+    }
+)
+_QB_COMPLETE_STATES = frozenset(
+    {"forcedup", "stalledup", "uploading"}
+)
+
+
+def _torrent_state_kind(state: str, progress: float) -> str:
+    normalized = str(state or "").strip().casefold()
+    try:
+        normalized_progress = max(0.0, min(float(progress or 0), 1.0))
+    except (TypeError, ValueError):
+        normalized_progress = 0.0
+    if normalized in _QB_FAILED_STATES:
+        return "failed"
+    if normalized_progress >= 1.0 or normalized in _QB_COMPLETE_STATES:
+        return "completed"
+    if normalized in _PAUSED_STATES:
+        return "paused"
+    if normalized in _QB_QUEUED_STATES:
+        return "queued"
+    if normalized in _QB_ACTIVE_STATES:
+        return "active"
+    return "other"
 
 
 class QBittorrentProviderTransport:
@@ -150,12 +188,23 @@ class QBittorrentProviderTransport:
             if operation == "qb.torrents.info":
                 tasks = client.list_torrents(str(arguments.get("category") or ""))
                 query = " ".join(str(arguments.get("query") or "").split()).casefold()
+                transfer = client.get_transfer_info() if not query else None
                 if query:
                     tasks = [
                         task
                         for task in tasks
                         if query in " ".join(str(task.name or "").split()).casefold()
                     ]
+                counts = {
+                    "active": 0,
+                    "queued": 0,
+                    "paused": 0,
+                    "failed": 0,
+                    "completed": 0,
+                    "other": 0,
+                }
+                for task in tasks:
+                    counts[_torrent_state_kind(task.state, task.progress)] += 1
                 limit = int(arguments.get("limit", 20))
                 items = [
                     {
@@ -175,13 +224,33 @@ class QBittorrentProviderTransport:
                     }
                     for task in tasks[:limit]
                 ]
+                summary = (
+                    f"qBittorrent 实时队列共 {len(tasks)} 项："
+                    f"进行中 {counts['active']}、排队 {counts['queued']}、"
+                    f"暂停 {counts['paused']}、异常 {counts['failed']}、"
+                    f"已完成 {counts['completed']}、其他 {counts['other']}"
+                )
                 return ProviderPayload(
-                    summary=f"qBittorrent 返回 {len(items)} 个下载任务",
+                    summary=summary,
                     data={
                         "torrents": items,
                         "count": len(items),
                         "total": len(tasks),
                         "truncated": len(tasks) > len(items),
+                        "state_counts": counts,
+                        **(
+                            {
+                                "transfer": {
+                                    "connection_status": str(
+                                        transfer.connection_status or ""
+                                    ),
+                                    "download_speed": int(transfer.dl_info_speed or 0),
+                                    "upload_speed": int(transfer.up_info_speed or 0),
+                                }
+                            }
+                            if transfer is not None
+                            else {}
+                        ),
                     },
                     source="qbittorrent_api",
                 )

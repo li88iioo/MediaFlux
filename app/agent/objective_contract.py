@@ -52,10 +52,12 @@ _RELEASE_STATUS_RE: Final[re.Pattern[str]] = re.compile(
 )
 _MEDIA_RECOMMEND_TERMS = (
     r"电影|影片|剧集|电视剧|动画|动漫|综艺|纪录片|美剧|英剧|日剧|韩剧|"
-    r"欧美剧|国产剧|科幻|悬疑|喜剧|动作|恐怖|爱情|番剧"
+    r"欧美剧|国产剧|国漫|国创|国产动画|科幻|悬疑|喜剧|动作|恐怖|爱情|"
+    r"番剧|新剧|新番"
 )
 _RECOMMEND_RE: Final[re.Pattern[str]] = re.compile(
     rf"(?:片荒|有什么好看)|"
+    rf"(?:(?:20[0-9]{{2}}|今年|明年|最近|近期).{{0,16}}(?:有|有哪些|推荐).{{0,8}}(?:新剧|新番|新动画|国漫|国创))|"
     rf"(?:推荐|安利|想看|值得看).{{0,24}}(?:{_MEDIA_RECOMMEND_TERMS})|"
     rf"(?:{_MEDIA_RECOMMEND_TERMS}).{{0,24}}"
     rf"(?:推荐|安利|想看|值得看|有什么好看)",
@@ -185,6 +187,18 @@ _DISCOVERY_METADATA_RE: Final[re.Pattern[str]] = re.compile(
 _DOWNLOAD_STATUS_RE: Final[re.Pattern[str]] = re.compile(
     r"(?:qb|qbittorrent|下载队列|下载任务|光鸭离线|离线任务).{0,30}(?:状态|进度|卡住|异常|失败|正常吗|有哪些|查看)|"
     r"(?:查看|检查|列出|看看).{0,20}(?:下载请求|下载任务|光鸭离线)",
+    re.IGNORECASE,
+)
+_QB_REALTIME_STATUS_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:qb|qbittorrent).{0,16}(?:实时|当前|现在).{0,12}(?:任务|队列|下载|速度|状态)|"
+    r"(?:实时|当前|现在).{0,12}(?:qb|qbittorrent).{0,12}(?:任务|队列|下载|速度|状态)",
+    re.IGNORECASE,
+)
+_MEDIA_LIBRARY_TOTAL_RE: Final[re.Pattern[str]] = re.compile(
+    r"(?:我的|当前|全部)?(?:jellyfin|emby|媒体服务器|媒体库).{0,18}"
+    r"(?:媒体总数|媒体数量|总共有多少(?:个|项)?媒体|一共有多少(?:个|项)?媒体|"
+    r"有多少(?:个|项)?媒体|多少(?:个|项)?媒体)|"
+    r"(?:媒体总数|媒体数量).{0,18}(?:jellyfin|emby|媒体服务器|媒体库)",
     re.IGNORECASE,
 )
 _RSS_SCOPE_RE: Final[re.Pattern[str]] = re.compile(r"(?:rss|mikan|订阅源)", re.IGNORECASE)
@@ -872,6 +886,24 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             ),
         )
 
+    if _QB_REALTIME_STATUS_RE.search(text):
+        return AgentObjectiveContract(
+            task_kind="qb_realtime_status",
+            primary_domains=("downloads",),
+            required_sources=("provider_api",),
+            forbidden_sources=("public_web", "resource_index", "metadata_catalog"),
+            allowed_tools=("provider.capabilities", "provider.query"),
+            max_provider_requests=4,
+            max_tool_rounds=3,
+            max_tool_calls=4,
+            max_capabilities=2,
+            parallel_reads=False,
+            completion_rule=(
+                "只报告 qBittorrent 原生 API 当前返回的任务、进度、速度和连接状态；"
+                "不得用 MediaFlux 历史下载请求代替实时队列。"
+            ),
+        )
+
     if _DOWNLOAD_STATUS_RE.search(text):
         qb_only = not any(marker in text for marker in ("光鸭", "离线"))
         qb_tools = (
@@ -898,6 +930,24 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             completion_rule=(
                 "qB 当前状态必须来自 qBittorrent 原生 API；同时区分光鸭离线、整理和 STRM 阶段，"
                 "不把已离线完成误报为仍在下载。"
+            ),
+        )
+
+    if _MEDIA_LIBRARY_TOTAL_RE.search(text):
+        return AgentObjectiveContract(
+            task_kind="media_library_counts",
+            primary_domains=("media_library",),
+            required_sources=("provider_api",),
+            forbidden_sources=("public_web", "resource_index", "metadata_catalog"),
+            allowed_tools=("provider.capabilities", "provider.query"),
+            max_provider_requests=5,
+            max_tool_rounds=3,
+            max_tool_calls=5,
+            max_capabilities=2,
+            parallel_reads=False,
+            completion_rule=(
+                "从已配置媒体服务器的实时计数接口读取可播放项总数；如有细分，"
+                "同时报告电影、剧集和单集数量，不得使用云盘文件数或本地数据库记录代替。"
             ),
         )
 
@@ -1304,6 +1354,12 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
         time_sensitive = bool(
             any(year >= date.today().year for year in years)
             or any(marker in text for marker in ("今年", "最新", "近期", "即将", "待播"))
+            or re.search(
+                rf"(?:最近|近期).{{0,16}}(?:有|有哪些|推荐).{{0,8}}"
+                rf"(?:新剧|新番|新动画|国漫|国创)",
+                text,
+                re.IGNORECASE,
+            )
         )
         required_sources = (
             ("metadata_catalog", "public_web")
@@ -1327,7 +1383,7 @@ def infer_agent_objective(value: object) -> AgentObjectiveContract:
             completion_rule=(
                 "有明确年份、地区、题材或媒体类型时，必须把限制条件传给受控推荐列表；"
                 "不得把筛选词拼成片名搜索，也不得丢失用户限制。"
-                "时效请求第一轮必须并行取得一个影视元数据目录结果和一个公开网页结果；"
+                "时效请求必须同时取得一个影视元数据目录结果和一个公开网页结果；"
                 "任一必需来源尚未成功前，不得重复调用已经成功的同类来源。"
                 "必须区分已上线、已定档和仍在制作，不得逐部无界搜索。"
             ),

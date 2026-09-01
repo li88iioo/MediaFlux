@@ -81,6 +81,7 @@ def _catalog() -> ProviderCatalog:
 
 def test_default_catalog_contains_media_and_qb_read_operations():
     operations = {item.operation_id for item in build_provider_catalog().operations()}
+    assert "media.items.counts" in operations
     assert "media.libraries.list" in operations
     assert "media.series.episodes" in operations
     assert "qb.torrents.info" in operations

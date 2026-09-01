@@ -849,7 +849,10 @@ _DISCOVERY_SEARCH_TOKENS = (
 )
 _DISCOVERY_SEARCH_VERBS = _RESOURCE_SEARCH_VERBS + ("查", "查询", "查一下")
 _LOCAL_LIBRARY_TOKENS = ("媒体库", "jellyfin", "emby", "我的库", "本地库", "库里")
-_DISCOVERY_RECOMMEND_ANCHORS = ("推荐", "有什么好看的", "看什么", "片荒", "剧荒")
+_DISCOVERY_RECOMMEND_ANCHORS = (
+    "推荐", "有什么好看的", "看什么", "片荒", "剧荒",
+    "有新剧", "有哪些新剧", "有新番", "有哪些新番",
+)
 _DISCOVERY_RECOMMEND_REJECT_TOKENS = _RESOURCE_SEARCH_TOKENS + _LOCAL_LIBRARY_TOKENS
 _RECENT_RESOURCE_REFERENCES = (
     "刚才推荐", "刚刚推荐", "最近推荐", "上次推荐",
@@ -901,7 +904,10 @@ _RECENT_DOWNLOAD_LIBRARY_REJECT_TOKENS = (
     *_RECENT_DOWNLOAD_REJECT_TOKENS,
     "暂停", "恢复", "开始下载", "执行入库", "帮我入库", "帮我补齐",
 )
-_DISCOVERY_TV_TOKENS = ("电视剧", "剧集", "连续剧", "电视节目", "剧荒", "追剧", "追番")
+_DISCOVERY_TV_TOKENS = (
+    "电视剧", "剧集", "连续剧", "电视节目", "剧荒", "追剧", "追番",
+    "国漫", "国创", "国产动画", "番剧", "新剧", "新番",
+)
 _DISCOVERY_MOVIE_TOKENS = ("电影", "影片", "片荒")
 _DISCOVERY_TV_GENRE_RE = re.compile(
     r"(?:科幻|悬疑|犯罪|历史|战争|爱情|奇幻|恐怖|动作|欧美|国产|美|英|日|韩)剧(?:集)?"
@@ -920,6 +926,7 @@ _DISCOVERY_REGION_ALIASES = (
     ("日本", ("日剧", "日本剧")),
     ("韩国", ("韩剧", "韩国剧")),
     ("中国大陆", ("国产剧", "国产")),
+    ("中国大陆", ("国漫", "国创", "国产动画")),
     ("欧美", ("欧美剧",)),
 )
 _DISCOVERY_CONTEXTUAL_RECOMMEND_TOKENS = ("类似", "相似", "同类", "根据", "按照", "基于", "我喜欢", "适合我")
@@ -928,6 +935,18 @@ _BANGUMI_CALENDAR_MARKERS = ("日历", "放送", "每日放送")
 _BANGUMI_TODAY_TOKENS = ("今天", "今日")
 _BANGUMI_WEEK_TOKENS = ("本周", "这周")
 _BANGUMI_CALENDAR_LIST_INTENTS = ("有什么", "有哪些", "哪些", "看什么")
+_QB_REALTIME_STATUS_PATTERN = re.compile(
+    r"(?:qb|qbittorrent).{0,16}(?:实时|当前|现在).{0,12}(?:任务|队列|下载|速度|状态)|"
+    r"(?:实时|当前|现在).{0,12}(?:qb|qbittorrent).{0,12}(?:任务|队列|下载|速度|状态)",
+    re.IGNORECASE,
+)
+_MEDIA_LIBRARY_TOTAL_PATTERN = re.compile(
+    r"(?:我的|当前|全部)?(?:jellyfin|emby|媒体服务器|媒体库).{0,18}"
+    r"(?:媒体总数|媒体数量|总共有多少(?:个|项)?媒体|一共有多少(?:个|项)?媒体|"
+    r"有多少(?:个|项)?媒体|多少(?:个|项)?媒体)|"
+    r"(?:媒体总数|媒体数量).{0,18}(?:jellyfin|emby|媒体服务器|媒体库)",
+    re.IGNORECASE,
+)
 _WEEKDAY_ALIASES = {
     1: ("周一", "星期一", "礼拜一"),
     2: ("周二", "星期二", "礼拜二"),
@@ -2898,7 +2917,7 @@ def indexer_site_change_request(message: str) -> dict[str, Any] | None:
     ordinary_scope = bool(_INDEXER_SITE_ORDINARY_QUALIFIER_PATTERN.search(normalized))
     sensitive_scope = bool(_INDEXER_SITE_SENSITIVE_QUALIFIER_PATTERN.search(normalized))
     has_all_scope = bool(
-        re.search(r"(?:所有|全部).{0,8}(?:资源站点|资源站|站点)", normalized)
+        re.search(r"(?:所有|全部).{0,8}(?:资源站点|资源站|索引站点|索引站(?:搜索)?|站点)", normalized)
         or ordinary_scope
     )
     if has_all_scope:
@@ -4374,6 +4393,47 @@ def _discovery_filtered_recommend_arguments(
     if genre:
         arguments["genre"] = genre
     return arguments
+
+
+def _discovery_recommend_arguments_with_context(
+    message: str,
+    conversation_context: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """为“2026 有新剧吗”这类追问继承上一轮明确的地区/题材限制。"""
+    current = _discovery_filtered_recommend_arguments(message)
+    arguments = dict(current or _discovery_recommend_arguments(message))
+    if not conversation_context:
+        return arguments
+
+    inherited: dict[str, Any] = {}
+    for item in reversed(conversation_context[-10:]):
+        if not isinstance(item, dict) or str(item.get("role") or "") != "user":
+            continue
+        previous_text = str(item.get("text") or "").strip()
+        if not previous_text or not is_discovery_recommend_message(previous_text):
+            continue
+        inherited = dict(
+            _discovery_filtered_recommend_arguments(previous_text)
+            or _discovery_recommend_arguments(previous_text)
+        )
+        break
+    if not inherited:
+        return arguments
+
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    explicit_media_type = any(
+        token in normalized
+        for token in (*_DISCOVERY_TV_TOKENS, *_DISCOVERY_MOVIE_TOKENS)
+    )
+    if not explicit_media_type and inherited.get("media_type") in {"movie", "tv"}:
+        arguments["media_type"] = inherited["media_type"]
+    for key in ("region", "genre"):
+        if not arguments.get(key) and inherited.get(key):
+            arguments[key] = inherited[key]
+    if "豆瓣" not in normalized and inherited.get("provider") in {"tmdb", "douban"}:
+        arguments["provider"] = inherited["provider"]
+    return arguments
+
 
 
 def _extract_discovery_search_query(message: str) -> str:
@@ -7191,9 +7251,19 @@ class AgentOrchestrator:
                 "刚才同时检查了 RSS 与媒体追更。你想手动刷新 RSS，还是重新检查媒体订阅更新？",
                 ["刷新 RSS 订阅。", "检查媒体订阅更新。"],
             )
-        if allow_reads and normalized in {
-            "列出列表", "列出全部", "列出全部列表", "全部列表", "列表", "都有哪些", "有哪些",
-        }:
+        asks_where_created = bool(
+            any(token in normalized for token in (
+                "创建到哪里", "保存到哪里", "订阅在哪", "订阅在哪里",
+                "网页中没有", "网页没有", "网页看不到", "列表里没有",
+            ))
+            or ("刚才" in normalized and "订阅" in normalized and "哪" in normalized)
+        )
+        if allow_reads and (
+            normalized in {
+                "列出列表", "列出全部", "列出全部列表", "全部列表", "列表", "都有哪些", "有哪些",
+            }
+            or asks_where_created
+        ):
             return self._invoke_query_read("rss.subscription_summaries", {}, owner=owner)
         if allow_reads and normalized in {"近24小时下载几次", "近24小时下载了几次", "24小时下载几次"}:
             return self._invoke_query_read("rss.recent_activity", {}, owner=owner)
@@ -8907,6 +8977,126 @@ class AgentOrchestrator:
             session_id=trace_context.session_id,
         )
 
+    def _invoke_default_provider_read(
+        self,
+        *,
+        provider: str,
+        operation: str,
+        arguments: dict[str, Any],
+        intent: str,
+        owner: str,
+        rate_identity: str = "",
+    ) -> dict[str, Any]:
+        """为高频自然语言读取选择在线 profile，不让模型猜内部引用。"""
+        capabilities = self._invoke_query_read(
+            "provider.capabilities",
+            {"provider": provider, "intent": intent, "limit": 24},
+            owner=owner,
+            rate_identity=rate_identity,
+        )
+        capability_result = (
+            capabilities.get("result") if isinstance(capabilities, dict) else None
+        )
+        if (
+            not isinstance(capability_result, dict)
+            or capability_result.get("ok") is not True
+        ):
+            return capabilities
+        capability_data = (
+            capability_result.get("data")
+            if isinstance(capability_result.get("data"), dict)
+            else {}
+        )
+        profiles = [
+            item
+            for item in capability_data.get("profiles", [])
+            if isinstance(item, dict)
+            and str(item.get("state") or "").strip() == "online"
+            and str(item.get("profile_ref") or "").strip()
+        ]
+        if not profiles:
+            return self._response(
+                "provider.query",
+                {"operation": operation},
+                ToolResult(
+                    False,
+                    "provider_not_configured",
+                    "当前没有可用的 Provider 配置",
+                    error="请先检查对应服务的连接与启用状态。",
+                ),
+                int((capabilities.get("tool_call") or {}).get("elapsed_ms") or 0),
+            )
+
+        if provider != "media" and len(profiles) != 1:
+            return self._clarification_response(
+                "找到多个可用配置，无法安全判断要查询哪一个。",
+                ["请在设置中只保留一个启用的 qBittorrent 配置后重试。"],
+            )
+
+        responses: list[dict[str, Any]] = []
+        for profile in profiles:
+            responses.append(
+                self._invoke_query_read(
+                    "provider.query",
+                    {
+                        "profile_ref": str(profile["profile_ref"]),
+                        "operation": operation,
+                        "arguments": dict(arguments),
+                    },
+                    owner=owner,
+                    rate_identity=rate_identity,
+                )
+            )
+        if len(responses) == 1:
+            return responses[0]
+
+        # 多媒体服务器只对计数做可解释聚合；每个节点原始结果仍保留在 servers。
+        if operation != "media.items.counts":
+            return responses[0]
+        servers: list[dict[str, Any]] = []
+        totals = {
+            "total_items": 0,
+            "movie_count": 0,
+            "series_count": 0,
+            "episode_count": 0,
+        }
+        failed = 0
+        elapsed_ms = int((capabilities.get("tool_call") or {}).get("elapsed_ms") or 0)
+        for response in responses:
+            elapsed_ms += int((response.get("tool_call") or {}).get("elapsed_ms") or 0)
+            result = response.get("result") if isinstance(response, dict) else None
+            data = (
+                result.get("data")
+                if isinstance(result, dict) and isinstance(result.get("data"), dict)
+                else {}
+            )
+            if not isinstance(result, dict) or result.get("ok") is not True:
+                failed += 1
+                continue
+            item = {
+                "server_label": str(data.get("server_label") or "媒体服务器")[:80],
+            }
+            for key in totals:
+                value = max(0, int(data.get(key, 0) or 0))
+                item[key] = value
+                totals[key] += value
+            servers.append(item)
+        aggregate = ToolResult(
+            ok=bool(servers) and failed == 0,
+            status="success" if servers and failed == 0 else "partial",
+            summary=(
+                f"{len(servers)} 个媒体服务器共有 {totals['total_items']} 个可播放媒体项"
+                if servers
+                else "媒体服务器计数暂时不可用"
+            ),
+            data={**totals, "server_count": len(servers), "servers": servers},
+            error=("部分媒体服务器未能返回计数。" if failed else ""),
+        )
+        return self._response(
+            "provider.query", {"operation": operation}, aggregate, elapsed_ms
+        )
+
+
     def _handle_download_and_media_subscription_requests(
         self,
         message: str,
@@ -9596,6 +9786,17 @@ class AgentOrchestrator:
             if patrol_followup is not None:
                 return patrol_followup
 
+        rss_location_followup = self._rss_context_followup(
+            message,
+            owner=owner,
+            conversation_context=conversation_context,
+            trusted_context=trusted_conversation_context,
+            allow_reads=True,
+            allow_actions=False,
+        )
+        if rss_location_followup is not None:
+            return rss_location_followup
+
         action_request = is_agent_action_request(message)
         danger_read_question = _is_danger_read_question(message)
         has_resource_continuation = bool(
@@ -9606,6 +9807,19 @@ class AgentOrchestrator:
         has_deterministic_media_subscription_binding = (
             _has_deterministic_media_subscription_binding(message)
         )
+        deterministic_qb_realtime = bool(_QB_REALTIME_STATUS_PATTERN.search(message))
+        deterministic_media_counts = bool(_MEDIA_LIBRARY_TOTAL_PATTERN.search(message))
+        deterministic_indexer_change = (
+            indexer_site_change_request(lower)
+            if "索引站" in lower
+            and any(token in lower for token in ("启用", "开启", "打开", "停用", "禁用", "关闭"))
+            else None
+        )
+        skip_model_for_exact_route = bool(
+            deterministic_qb_realtime
+            or deterministic_media_counts
+            or deterministic_indexer_change is not None
+        )
         # 已认证会话默认由模型先理解当前目标；服务端注册表仍决定工具是只读
         # 执行还是只能生成行动计划。仅保留需要服务端把媒体名称精确绑定到订阅
         # 编号的路径，避免模型猜测对象；其余确定性解析器只作为 Provider 降级。
@@ -9614,6 +9828,7 @@ class AgentOrchestrator:
             allow_model_routing
             and not has_resource_continuation
             and not has_deterministic_media_subscription_binding
+            and not skip_model_for_exact_route
         ):
             model_routing_attempted = True
             model_read = self._query_with_model_tools(
@@ -9640,6 +9855,25 @@ class AgentOrchestrator:
                 danger_read_question and _is_confirmation_response(model_read)
             ):
                 return model_read
+
+        if deterministic_qb_realtime:
+            return self._invoke_default_provider_read(
+                provider="qbittorrent",
+                operation="qb.torrents.info",
+                arguments={"query": "", "limit": 100},
+                intent="读取 qBittorrent 当前实时任务",
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_media_counts:
+            return self._invoke_default_provider_read(
+                provider="media",
+                operation="media.items.counts",
+                arguments={},
+                intent="读取媒体库实时媒体总数",
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
 
         # 信息追问先由原生模型结合工具和安全上下文处理。仅在 Provider 不可用时，
         # 才使用已经持久化的结构化媒体事实或最近候选中的核验关系。
@@ -10177,13 +10411,37 @@ class AgentOrchestrator:
                 ["可以问：推荐几部电影，或豆瓣推荐电视剧。"],
             )
         if is_discovery_recommend_message(lower):
-            filtered_arguments = _discovery_filtered_recommend_arguments(message)
-            if filtered_arguments is not None:
-                return self._invoke_query_read(
-                    "discovery.recommend", filtered_arguments, owner=owner
+            arguments = _discovery_recommend_arguments_with_context(
+                message, conversation_context
+            )
+            if "public_web" in initial_objective.required_sources:
+                web_terms = [
+                    str(arguments.get(key) or "").strip()
+                    for key in ("year", "region", "genre")
+                ]
+                media_label = (
+                    "动画剧集"
+                    if str(arguments.get("media_type") or "") == "tv"
+                    else "电影"
+                )
+                web_query = " ".join(
+                    item for item in (*web_terms, media_label, "定档 上线 最新") if item
+                )[:200]
+                return self._execute_read_plan(
+                    LLMReadPlan(steps=(
+                        LLMToolSelection(
+                            tool_name="discovery.recommend", arguments=arguments
+                        ),
+                        LLMToolSelection(
+                            tool_name="web.search",
+                            arguments={"query": web_query, "max_results": 5},
+                        ),
+                    )),
+                    owner=owner,
+                    rate_identity=query_tool_rate_identity,
                 )
             return self._invoke_query_read(
-                "discovery.recommend", _discovery_recommend_arguments(message), owner=owner
+                "discovery.recommend", arguments, owner=owner
             )
 
         if is_discovery_search_message(lower):

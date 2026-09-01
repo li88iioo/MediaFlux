@@ -60,6 +60,22 @@ _HISTORY_CREDENTIAL_RE = re.compile(
     r")"
 )
 _HISTORY_MULTILINE_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def safe_history_retry_message(response: dict[str, Any]) -> str:
+    """为含 URL 的 RSS 输入保留不可重放的安全会话主题。"""
+    tool_call = response.get("tool_call") if isinstance(response, dict) else None
+    tool_name = (
+        str(tool_call.get("name") or "").strip().casefold()
+        if isinstance(tool_call, dict)
+        else ""
+    )
+    if tool_name.startswith("rss."):
+        return "已提交包含敏感订阅地址的 RSS 受控请求"
+    # 其它敏感输入继续遵守“不落历史”规则。
+    return ""
+
+
 _UNSAFE_OUTPUT_RE = re.compile(
     r"(?ix)(?:"
     r"\b(?:magnet|ed2k)\s*:\s*"
@@ -1162,6 +1178,8 @@ class SQLiteAgentConversationHistoryRepository:
             "suggestions": safe_suggestions,
         }
         context_domain = str(response.get("context_domain") or "").strip()
+        if not context_domain and tool_name.startswith("rss."):
+            context_domain = "rss"
         if context_domain in _SAFE_CONTEXT_DOMAINS:
             projection["context_domain"] = context_domain
         context_domains = response.get("context_domains")

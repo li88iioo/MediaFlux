@@ -288,6 +288,24 @@ class EmbyClient(MediaServerClient):
         )
         return int(data.get("TotalRecordCount", 0) or 0)
 
+    def get_media_counts(self) -> dict[str, int]:
+        """读取兼容节点媒体计数；旧 Emby 不支持 Counts 时保留总项数。"""
+        total_items = max(0, int(self._total_items() or 0))
+        counts: dict = {}
+        try:
+            payload = self._request(
+                "/Items/Counts", params={"userId": self._user_id()}
+            )
+            counts = payload if isinstance(payload, dict) else {}
+        except Exception:
+            counts = {}
+        return {
+            "total_items": total_items,
+            "movie_count": max(0, int(counts.get("MovieCount", 0) or 0)),
+            "series_count": max(0, int(counts.get("SeriesCount", 0) or 0)),
+            "episode_count": max(0, int(counts.get("EpisodeCount", 0) or 0)),
+        }
+
     def _recent_played(self) -> list[MediaItem]:
         uid = self._user_id()
         data = self._request(

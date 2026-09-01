@@ -227,7 +227,12 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
                 prepared["action_plan"]["plan_id"], owner="owner"
             )
         self.assertTrue(created["result"]["ok"])
+        self.assertTrue(created["result"]["data"]["verified"])
+        self.assertIn("已创建并核验", created["result"]["summary"])
         created_id = int(created["result"]["data"]["subscription_id"])
+        self.assertEqual(
+            created["result"]["data"]["subscription_number"], created_id
+        )
         row = db.get_rss_subscription(created_id)
         self.assertEqual(row["name"], "Anime Feed")
         self.assertEqual(row["media_tmdb_id"], "12345")
@@ -248,6 +253,32 @@ class RSSSubscriptionControlTests(IsolatedDatabaseTestCase):
         row = db.get_rss_subscription(created_id)
         self.assertEqual(row["name"], "Anime Feed Updated")
         self.assertEqual(int(row["refresh_interval_minutes"]), 60)
+
+    def test_create_reports_outcome_unknown_when_readback_cannot_verify(self):
+        service = get_agent_service()
+        arguments = {
+            "name": "Readback Feed",
+            "urls": ["https://feed.example/readback.xml"],
+            "action": "subscribe",
+            "enabled": False,
+            "refresh_interval_minutes": 360,
+            "download_method": "qb",
+        }
+        prepared = service.prepare(
+            "rss.create_subscription", arguments, owner="owner"
+        )
+        with patch(
+            "app.agent.rss_subscription_control_actions.db.get_rss_subscription",
+            return_value=None,
+        ):
+            confirmed = service.confirm(
+                prepared["action_plan"]["plan_id"], owner="owner"
+            )
+
+        self.assertFalse(confirmed["result"]["ok"])
+        self.assertEqual(confirmed["result"]["status"], "outcome_unknown")
+        self.assertFalse(confirmed["result"]["data"]["verified"])
+        self.assertIn("避免重复创建", confirmed["result"]["suggestions"][0])
 
     def test_update_urls_validator_is_idempotent_and_confirmation_succeeds(self):
         arguments = {

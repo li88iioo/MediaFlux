@@ -305,6 +305,21 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
         )
         self.assertTrue(all_sites["result"]["data"]["requested_enable_search"])
 
+        exact_indexer = agent.query(
+            "你可以启用全部索引站搜索", owner="owner"
+        )
+        self.assertEqual(exact_indexer["mode"], "confirmation_required")
+        self.assertEqual(
+            exact_indexer["tool_call"]["name"], "config.set_indexer_sites"
+        )
+        self.assertEqual(
+            [
+                site["site_id"]
+                for site in exact_indexer["result"]["data"]["requested_sites"]
+            ],
+            list(DEFAULT_INDEXER_SITE_IDS),
+        )
+
         adult_sites = agent.query("把所有站点包括成人站点都打开", owner="owner")
         self.assertEqual(adult_sites["mode"], "confirmation_required")
         self.assertEqual(
