@@ -98,10 +98,16 @@ class DockerWorkflowTests(unittest.TestCase):
         test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
         self.assertIn("npm ci --ignore-scripts --no-audit --no-fund", test_job)
         self.assertIn("--require-hashes -r requirements-release-runtime.lock", test_job)
-        self.assertLess(test_job.index("npm ci"), test_job.index("unittest discover"))
+        self.assertIn('python -m pip install "pytest==9.1.1"', test_job)
+        self.assertIn('version("pytest") == "9.1.1"', test_job)
+        self.assertLess(test_job.index("npm ci"), test_job.index("python -m pytest tests"))
         self.assertLess(
             test_job.index("requirements-release-runtime.lock"),
-            test_job.index("unittest discover"),
+            test_job.index("python -m pytest tests"),
+        )
+        self.assertLess(
+            test_job.index('version("pytest") == "9.1.1"'),
+            test_job.index("python -m pytest tests"),
         )
 
     def test_full_test_job_has_dependency_free_source_syntax_gate(self) -> None:
@@ -109,7 +115,7 @@ class DockerWorkflowTests(unittest.TestCase):
         self.assertIn("python -m compileall -q app packaging tests", test_job)
         self.assertIn("find app/static/js -type f -name '*.js' ! -name '*.min.js' -print0", test_job)
         self.assertIn('node --check "$file"', test_job)
-        self.assertLess(test_job.index("compileall"), test_job.index("unittest discover"))
+        self.assertLess(test_job.index("compileall"), test_job.index("python -m pytest tests"))
 
     def test_expected_readiness_retries_are_quiet_until_terminal_failure(self) -> None:
         smoke_job = self.text.split("  smoke:", 1)[1].split("  build:", 1)[0]

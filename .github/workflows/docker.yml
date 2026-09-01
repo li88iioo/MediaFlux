@@ -41,6 +41,8 @@ jobs:
         run: |
           npm ci --ignore-scripts --no-audit --no-fund
           python -m pip install --require-hashes -r requirements-release-runtime.lock
+          python -m pip install "pytest==9.1.1"
+          python -c 'from importlib.metadata import version; assert version("pytest") == "9.1.1"'
           python -m pip check
 
       - name: Validate Python and JavaScript syntax
@@ -56,7 +58,7 @@ jobs:
           MEDIAFLUX_TESTING: "1"
           MEDIAFLUX_TEST_MODE: "1"
           MEDIAFLUX_DISABLE_FILE_LOGGING: "1"
-        run: python -m unittest discover -s tests -t . -p "test_*.py" -v
+        run: python -m pytest tests -q
 
   browser:
     runs-on: ubuntu-latest

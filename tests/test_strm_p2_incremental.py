@@ -44,6 +44,17 @@ class _TreeClient:
 
 
 class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
+    def setUp(self) -> None:
+        # 调度器用例必须彼此隔离：失败结算会持久化重试目标并启动延迟 waiter。
+        # 若沿用上一用例的队列，慢速 CI 中 waiter 可能在后续测试期间抢占全局锁。
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM strm_change_queue")
+
+    def _new_scheduler(self) -> STRMScheduler:
+        scheduler = STRMScheduler()
+        self.addCleanup(scheduler.stop, 2.0)
+        return scheduler
+
     @staticmethod
     def _fingerprint(path: Path) -> str:
         return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
@@ -281,7 +292,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual([row["file_id"] for row in rows], ["winner"])
 
     def test_scheduler_routes_trusted_organize_changes_to_incremental(self):
-        scheduler = STRMScheduler()
+        scheduler = self._new_scheduler()
         source = {"id": "source", "name": "来源", "rel_prefix": ""}
         changes = [{
             "source_id": "source", "kind": "video", "action": "upsert",
@@ -316,7 +327,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         full.assert_not_called()
 
     def test_scheduler_rejects_unconfigured_organize_source_without_full_fallback(self):
-        scheduler = STRMScheduler()
+        scheduler = self._new_scheduler()
         configured_source = {"id": "configured", "name": "来源", "rel_prefix": ""}
         changes = [{
             "source_id": "unconfigured", "kind": "video", "action": "upsert",
@@ -349,7 +360,7 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(scheduler.status()["source_runtime"][0]["status"], "failed")
 
     def test_scheduler_falls_back_to_full_in_same_run(self):
-        scheduler = STRMScheduler()
+        scheduler = self._new_scheduler()
         source = {"id": "source", "name": "来源", "rel_prefix": ""}
         changes = [{
             "source_id": "source", "kind": "video", "action": "upsert",
