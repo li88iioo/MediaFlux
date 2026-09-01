@@ -1070,6 +1070,16 @@ class AgentBrowserTests(unittest.TestCase):
         self.assertGreaterEqual(new_session_box["height"], 44)
         self.assertGreaterEqual(confirm_box["height"], 44)
         self.assertGreaterEqual(cancel_box["height"], 44)
+        fact_boxes = [
+            self.page.locator(".agent-confirmation-fact").nth(index).bounding_box()
+            for index in range(3)
+        ]
+        self.assertEqual(len({round(box["x"]) for box in fact_boxes}), 1)
+        self.assertAlmostEqual(confirm_box["y"], cancel_box["y"], delta=1)
+        self.assertLessEqual(
+            self.page.evaluate("document.documentElement.scrollWidth"),
+            self.page.evaluate("document.documentElement.clientWidth"),
+        )
         self.page.evaluate("""() => {
             window.__agentResetGate = new Promise(resolve => { window.__resolveAgentReset = resolve; });
         }""")

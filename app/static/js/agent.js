@@ -2610,6 +2610,7 @@
         const riskLabels = {low_write: '低风险写入', write: '写入操作', danger: '高风险操作'};
         const risk = String(plan.risk || 'write');
         const card = node('section', 'agent-confirmation-card');
+        card.classList.add(`is-risk-${risk}`);
         card.dataset.planId = planId;
         card.dataset.confirmationAction = action;
         const toolName = String(toolCall?.name || '').trim();
@@ -2620,9 +2621,11 @@
             confirmationPrepareActions.set(card, {toolName, arguments: toolArguments});
         }
         const head = node('div', 'agent-confirmation-head');
-        const title = node('div');
+        const heading = node('div', 'agent-confirmation-heading');
+        const title = node('div', 'agent-confirmation-title');
         title.append(node('span', '', '行动计划'), node('strong', '', action));
-        head.append(title, node('span', `agent-confirmation-risk is-${risk}`, riskLabels[risk] || '写入操作'));
+        heading.append(title);
+        head.append(heading, node('span', `agent-confirmation-risk is-${risk}`, riskLabels[risk] || '写入操作'));
         const expires = Number(plan.expires_in || 0);
         const expiryCopy = node('p', 'agent-confirmation-copy');
         const preflightTime = node('span', 'agent-confirmation-preflight-time');
@@ -2640,7 +2643,10 @@
             'agent-confirmation-intro agent-rich-text',
             {promoteFirst: true},
         );
-        if (intro) card.append(intro);
+        if (intro) {
+            intro.classList.add('agent-confirmation-intro');
+            card.append(intro);
+        }
 
         const facts = node('dl', 'agent-confirmation-facts');
         [
@@ -2655,10 +2661,11 @@
             facts.append(row);
         });
         if (facts.childElementCount) card.append(facts);
+        const status = node('div', 'agent-confirmation-status');
         if (plan.preflight_summary) {
             const preflight = node('div', 'agent-confirmation-preflight');
             preflight.append(icon('clipboard-check'), node('span', '', String(plan.preflight_summary)));
-            card.append(preflight);
+            status.append(preflight);
         }
         const preflightAt = String(plan.preflight_at || '').trim();
         if (preflightAt) {
@@ -2668,14 +2675,19 @@
                 : parsed.toLocaleString([], {hour12: false});
             preflightTime.textContent = `预检时间 ${displayTime}`;
         }
-        if (preflightTime.textContent) expiryCopy.append(preflightTime, document.createTextNode(' · '));
-        expiryCopy.append(countdown);
-        card.append(expiryCopy);
+        const timeCopy = node('span', 'agent-confirmation-time-copy');
+        if (preflightTime.textContent) timeCopy.append(preflightTime, document.createTextNode(' · '));
+        timeCopy.append(countdown);
+        expiryCopy.append(icon('clock-3'), timeCopy);
+        status.append(expiryCopy);
+        card.append(status);
         const actions = node('div', 'agent-confirmation-actions');
-        const cancel = node('button', 'agent-confirmation-cancel', '取消');
+        const cancel = node('button', 'agent-confirmation-cancel');
         cancel.type = 'button';
-        const confirm = node('button', 'agent-confirmation-submit', '执行');
+        cancel.append(icon('x'), node('span', '', '取消'));
+        const confirm = node('button', 'agent-confirmation-submit');
         confirm.type = 'button';
+        confirm.append(icon('play'), node('span', '', '执行'));
         confirm.setAttribute('aria-label', `执行行动计划：${action}`);
         cancel.addEventListener('click', async () => {
             if (cancel.disabled || confirmationInFlight || sessionResetInFlight) return;

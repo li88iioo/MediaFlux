@@ -95,8 +95,8 @@ class AgentPageTests(InitializedWebTestCase):
         )
         self.assertEqual(response.text.count("/static/css/agent.css"), 1)
         self.assertEqual(response.text.count("/static/js/agent.js"), 1)
-        self.assertIn("/static/css/agent.css?v=20260829e", response.text)
-        self.assertIn("/static/js/agent.js?v=20260829a", response.text)
+        self.assertIn("/static/css/agent.css?v=20260901b", response.text)
+        self.assertIn("/static/js/agent.js?v=20260901b", response.text)
         self.assertIn('id="agentResumeLatestSession"', response.text)
         self.assertIn("继续上次", response.text)
         self.assertNotRegex(response.text, re.compile(r"(?:API_KEY|PASSWORD|TOKEN)=", re.I))
@@ -387,6 +387,7 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("['如何撤销', plan.reversibility]", source)
         self.assertIn("plan.preflight_summary", source)
         self.assertIn("plan.preflight_at", source)
+        self.assertIn("agent-confirmation-status", source)
         self.assertNotIn("payload?.confirmation", source)
         self.assertIn("'执行'", source)
         self.assertIn("'取消'", source)
@@ -538,8 +539,20 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertNotIn(".agent-evidence", source)
         self.assertIn(".agent-guidance-actions", source)
         self.assertIn(".agent-confirmation-facts", source)
+        self.assertRegex(
+            source,
+            re.compile(
+                r"\.agent-confirmation-fact\s*\{[^}]*"
+                r"grid-template-columns:\s*104px minmax\(0, 1fr\)",
+                re.S,
+            ),
+        )
+        self.assertNotIn(".agent-confirmation-heading-mark", source)
+        self.assertNotIn(".agent-confirmation-fact-mark", source)
+        self.assertIn(".agent-confirmation-status", source)
         self.assertIn(".agent-confirmation-preflight", source)
         self.assertIn(".agent-confirmation-countdown", source)
+        self.assertIn("justify-content: flex-end;", source)
         self.assertRegex(
             source,
             re.compile(r"\.agent-season-resource-groups\s*\{[^}]*display:\s*grid", re.S),
