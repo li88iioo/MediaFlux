@@ -15,6 +15,7 @@ from app.clients.base import (
     Library,
     MediaItem,
     MediaServerClient,
+    close_media_server_client,
     normalize_explicit_media_user_id,
     normalize_playback_progress,
     runtime_ticks_to_minutes,
@@ -77,7 +78,7 @@ class JellyfinClient(MediaServerClient):
             client._cached_user_id = user_id
             return getattr(client, method_name)()
         finally:
-            client.close()
+            close_media_server_client(client)
 
     def get_dashboard(self) -> DashboardData:
         """并行读取互不依赖的 Jellyfin 看板分区。"""

@@ -22,6 +22,7 @@ from app.agent.session_context import (
     AgentContextWriteGuard,
     AgentSessionContextRepository,
 )
+from app.clients.base import close_media_server_client
 from app.agent.state_commit import (
     AgentStateCommitBuffer,
     active_agent_state_commit_buffer,
@@ -1255,66 +1256,74 @@ def _bound_task_scope(task: Any) -> dict[str, Any]:
         provider, profile, refresh_options=refresh_options
     )
     try:
-        folders = client.list_virtual_folders()
+        try:
+            folders = client.list_virtual_folders()
+        except Exception:
+            raise AgentToolError("暂时无法读取绑定媒体库", code="precondition_failed") from None
+        if configured_library_id:
+            matches = [
+                item for item in folders
+                if str(item.get("id") or "").strip() == configured_library_id
+            ]
+            if len(matches) != 1:
+                raise AgentToolError("媒体库绑定已变化，请重新绑定", code="precondition_failed")
+            folder = matches[0]
+            actual_name = str(folder.get("name") or "").strip()
+            if configured_library_name and actual_name.casefold() != configured_library_name.casefold():
+                raise AgentToolError("媒体库名称与绑定不一致，请重新绑定", code="precondition_failed")
+        else:
+            matches = [
+                item for item in folders
+                if str(item.get("name") or "").strip().casefold()
+                == configured_library_name.casefold()
+            ]
+            if len(matches) != 1:
+                raise AgentToolError("媒体库名称无法唯一解析，请重新绑定", code="precondition_failed")
+            folder = matches[0]
+        library_id = str(folder.get("id") or "").strip()
+        if not library_id:
+            raise AgentToolError("媒体库绑定缺少可用标识", code="precondition_failed")
+        try:
+            paths = sorted({
+                MediaServerPathMapping(target.path, target.server_path).apply(str(path))
+                if str(getattr(target, "server_path", "") or "").strip()
+                else str(path)
+                for target, path in resolved
+            })
+        except ValueError:
+            raise AgentToolError(
+                "媒体库服务端路径映射无效，请重新绑定", code="precondition_failed"
+            ) from None
+        server_config_digest = _server_config_digest(
+            provider, profile, refresh_options
+        )
+        binding = {
+            "provider": provider,
+            "server_config_digest": server_config_digest,
+            "library_id": library_id,
+            "library_name": str(folder.get("name") or configured_library_name or "").strip(),
+            "paths_digest": hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest(),
+        }
+        return {
+            "task": task,
+            "client": client,
+            "paths": paths,
+            "binding": binding,
+            "server_label": str(profile.label),
+        }
     except Exception:
-        raise AgentToolError("暂时无法读取绑定媒体库", code="precondition_failed") from None
-    if configured_library_id:
-        matches = [
-            item for item in folders
-            if str(item.get("id") or "").strip() == configured_library_id
-        ]
-        if len(matches) != 1:
-            raise AgentToolError("媒体库绑定已变化，请重新绑定", code="precondition_failed")
-        folder = matches[0]
-        actual_name = str(folder.get("name") or "").strip()
-        if configured_library_name and actual_name.casefold() != configured_library_name.casefold():
-            raise AgentToolError("媒体库名称与绑定不一致，请重新绑定", code="precondition_failed")
-    else:
-        matches = [
-            item for item in folders
-            if str(item.get("name") or "").strip().casefold()
-            == configured_library_name.casefold()
-        ]
-        if len(matches) != 1:
-            raise AgentToolError("媒体库名称无法唯一解析，请重新绑定", code="precondition_failed")
-        folder = matches[0]
-    library_id = str(folder.get("id") or "").strip()
-    if not library_id:
-        raise AgentToolError("媒体库绑定缺少可用标识", code="precondition_failed")
-    try:
-        paths = sorted({
-            MediaServerPathMapping(target.path, target.server_path).apply(str(path))
-            if str(getattr(target, "server_path", "") or "").strip()
-            else str(path)
-            for target, path in resolved
-        })
-    except ValueError:
-        raise AgentToolError(
-            "媒体库服务端路径映射无效，请重新绑定", code="precondition_failed"
-        ) from None
-    server_config_digest = _server_config_digest(
-        provider, profile, refresh_options
-    )
-    binding = {
-        "provider": provider,
-        "server_config_digest": server_config_digest,
-        "library_id": library_id,
-        "library_name": str(folder.get("name") or configured_library_name or "").strip(),
-        "paths_digest": hashlib.sha256("\n".join(paths).encode("utf-8")).hexdigest(),
-    }
-    return {
-        "task": task,
-        "client": client,
-        "paths": paths,
-        "binding": binding,
-        "server_label": str(profile.label),
-    }
+        close_media_server_client(client)
+        raise
 
 
 def _refresh_snapshot(owner: str, task_number: int) -> tuple[dict[str, Any], dict[str, Any]]:
     base, task = _task_snapshot(owner, task_number)
     scope = _bound_task_scope(task)
-    return {**base, "binding": scope["binding"]}, scope
+    try:
+        return {**base, "binding": scope["binding"]}, scope
+    except Exception:
+        close_media_server_client(scope["client"])
+        raise
 
 
 def prepare_refresh_local_media_task_library(
@@ -1323,27 +1332,30 @@ def prepare_refresh_local_media_task_library(
     owner = _require_owner(context)
     task_number = int(arguments["task_number"])
     snapshot, scope = _refresh_snapshot(owner, task_number)
-    return ToolResult(
-        True,
-        "confirmation_required",
-        f"确认后将精准刷新本地媒体任务 {task_number} 的绑定媒体库",
-        data={
-            "task_number": task_number,
-            "server": scope["server_label"],
-            "library": sanitize_public_text(scope["binding"]["library_name"], limit=80),
-            "path_count": len(scope["paths"]),
-            "effects": [
-                "只刷新任务已绑定且重新校验通过的一个媒体服务器和媒体库。",
-                "不会接受或使用用户提供的 URL、路径、服务器 ID 或媒体库内部 ID。",
-                "无法唯一定位时会安全停止，绝不退化为全库刷新。",
-            ],
-        },
-        evidence=[Evidence(
-            "media_server_binding",
-            "已从任务和服务端配置重新解析唯一绑定媒体库；内部路径和媒体库 ID 仅参与确认指纹。",
-            _now(),
-        )],
-    ), _fingerprint(snapshot)
+    try:
+        return ToolResult(
+            True,
+            "confirmation_required",
+            f"确认后将精准刷新本地媒体任务 {task_number} 的绑定媒体库",
+            data={
+                "task_number": task_number,
+                "server": scope["server_label"],
+                "library": sanitize_public_text(scope["binding"]["library_name"], limit=80),
+                "path_count": len(scope["paths"]),
+                "effects": [
+                    "只刷新任务已绑定且重新校验通过的一个媒体服务器和媒体库。",
+                    "不会接受或使用用户提供的 URL、路径、服务器 ID 或媒体库内部 ID。",
+                    "无法唯一定位时会安全停止，绝不退化为全库刷新。",
+                ],
+            },
+            evidence=[Evidence(
+                "media_server_binding",
+                "已从任务和服务端配置重新解析唯一绑定媒体库；内部路径和媒体库 ID 仅参与确认指纹。",
+                _now(),
+            )],
+        ), _fingerprint(snapshot)
+    finally:
+        close_media_server_client(scope["client"])
 
 
 def refresh_local_media_task_library_confirmed(
@@ -1355,72 +1367,75 @@ def refresh_local_media_task_library_confirmed(
         snapshot, scope = _refresh_snapshot(owner, task_number)
     except AgentToolError as exc:
         raise AgentToolError(exc.safe_message, code="confirmation_stale") from None
-    if not secrets.compare_digest(_fingerprint(snapshot), str(expected_context or "")):
-        raise AgentToolError("任务或媒体库绑定已变化，请重新预检", code="confirmation_stale")
-    lease_key = hashlib.sha256(json.dumps(
-        {
-            "operation": "local_media.precise_refresh",
-            "task_id": int(scope["task"].id),
-            "task_version": int(scope["task"].version),
-            "server_config_digest": scope["binding"]["server_config_digest"],
-            "library_id": scope["binding"]["library_id"],
-            "paths_digest": scope["binding"]["paths_digest"],
-        },
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
-    if db.claim_agent_action_lease(lease_key, ttl_seconds=90) is None:
+    try:
+        if not secrets.compare_digest(_fingerprint(snapshot), str(expected_context or "")):
+            raise AgentToolError("任务或媒体库绑定已变化，请重新预检", code="confirmation_stale")
+        lease_key = hashlib.sha256(json.dumps(
+            {
+                "operation": "local_media.precise_refresh",
+                "task_id": int(scope["task"].id),
+                "task_version": int(scope["task"].version),
+                "server_config_digest": scope["binding"]["server_config_digest"],
+                "library_id": scope["binding"]["library_id"],
+                "paths_digest": scope["binding"]["paths_digest"],
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        if db.claim_agent_action_lease(lease_key, ttl_seconds=90) is None:
+            return ToolResult(
+                False,
+                "conflict",
+                "相同的绑定媒体库刷新请求刚刚已提交",
+                data={
+                    "operation": "precise_refresh",
+                    "task_number": task_number,
+                    "refreshed": 0,
+                },
+                error="为避免重复刷新，请稍后核验媒体库可见状态。",
+                suggestions=["可直接核验该任务是否已在绑定媒体库中可见。"],
+            )
+        try:
+            outcome = scope["client"].refresh_for_paths(
+                scope["paths"],
+                allowed_library_ids=(scope["binding"]["library_id"],),
+                allow_library_fallback=False,
+            )
+        except Exception:
+            outcome = None
+        if (
+            not isinstance(outcome, dict)
+            or not outcome.get("ok")
+            or outcome.get("skipped")
+            or outcome.get("scope") != "item"
+        ):
+            return ToolResult(
+                False,
+                "unavailable",
+                "绑定媒体库未完成精准刷新",
+                data={"operation": "precise_refresh", "task_number": task_number, "refreshed": 0},
+                error="媒体服务器未接受精准刷新请求。",
+            )
         return ToolResult(
-            False,
-            "conflict",
-            "相同的绑定媒体库刷新请求刚刚已提交",
+            True,
+            "completed",
+            "绑定媒体库已完成精准刷新请求",
             data={
                 "operation": "precise_refresh",
                 "task_number": task_number,
-                "refreshed": 0,
+                "refreshed": 1,
+                "matched_paths": max(0, int(outcome.get("matched") or 0)),
             },
-            error="为避免重复刷新，请稍后核验媒体库可见状态。",
-            suggestions=["可直接核验该任务是否已在绑定媒体库中可见。"],
+            evidence=[Evidence(
+                "media_server_refresh",
+                "仅向重新校验通过的绑定媒体库提交受限路径刷新；未执行全库刷新。",
+                _now(),
+            )],
+            suggestions=["刷新请求不等于媒体已可见，可继续核验该任务的入库可见状态。"],
         )
-    try:
-        outcome = scope["client"].refresh_for_paths(
-            scope["paths"],
-            allowed_library_ids=(scope["binding"]["library_id"],),
-            allow_library_fallback=False,
-        )
-    except Exception:
-        outcome = None
-    if (
-        not isinstance(outcome, dict)
-        or not outcome.get("ok")
-        or outcome.get("skipped")
-        or outcome.get("scope") != "item"
-    ):
-        return ToolResult(
-            False,
-            "unavailable",
-            "绑定媒体库未完成精准刷新",
-            data={"operation": "precise_refresh", "task_number": task_number, "refreshed": 0},
-            error="媒体服务器未接受精准刷新请求。",
-        )
-    return ToolResult(
-        True,
-        "completed",
-        "绑定媒体库已完成精准刷新请求",
-        data={
-            "operation": "precise_refresh",
-            "task_number": task_number,
-            "refreshed": 1,
-            "matched_paths": max(0, int(outcome.get("matched") or 0)),
-        },
-        evidence=[Evidence(
-            "media_server_refresh",
-            "仅向重新校验通过的绑定媒体库提交受限路径刷新；未执行全库刷新。",
-            _now(),
-        )],
-        suggestions=["刷新请求不等于媒体已可见，可继续核验该任务的入库可见状态。"],
-    )
+    finally:
+        close_media_server_client(scope["client"])
 
 
 def verify_local_media_task_library_visibility(
@@ -1429,76 +1444,79 @@ def verify_local_media_task_library_visibility(
     owner = _require_owner(context)
     task_number = int(arguments["task_number"])
     _snapshot, scope = _refresh_snapshot(owner, task_number)
-    task = scope["task"]
-    tmdb_id = str(task.tmdb_id or "").strip()
-    media_type = str(task.media_type or "").strip().lower()
-    index_status = "inconclusive"
-    reason_code = "identity_unavailable"
-    if tmdb_id.isascii() and tmdb_id.isdigit() and media_type in {"movie", "tv"}:
-        try:
-            if media_type == "movie":
-                visible = scope["client"].has_tmdb_media(
-                    tmdb_id,
-                    "movie",
-                    parent_id=scope["binding"]["library_id"],
-                )
-                index_status = "visible" if visible else "missing"
-                reason_code = "movie_indexed" if visible else "movie_not_indexed"
-            else:
-                search = scope["client"].find_series_candidates_by_tmdb(
-                    tmdb_id,
-                    limit=20,
-                    parent_id=scope["binding"]["library_id"],
-                )
-                candidates = list(search.candidates)
-                if len(candidates) == 1 and not search.truncated:
-                    season = task.season_override
-                    episode = task.episode_override
-                    if season is not None and episode is not None:
-                        inventory = scope["client"].list_series_episode_inventory(
-                            candidates[0].id,
-                            include_specials=int(season) == 0,
-                        )
-                        visible = (int(season), int(episode)) in set(inventory.episodes)
-                        index_status = "visible" if visible else "missing"
-                        reason_code = "episode_indexed" if visible else "episode_not_indexed"
-                    else:
-                        index_status = "inconclusive"
-                        reason_code = "series_indexed_episode_unverified"
-                elif not candidates and not search.truncated:
-                    index_status = "missing"
-                    reason_code = "series_not_indexed"
+    try:
+        task = scope["task"]
+        tmdb_id = str(task.tmdb_id or "").strip()
+        media_type = str(task.media_type or "").strip().lower()
+        index_status = "inconclusive"
+        reason_code = "identity_unavailable"
+        if tmdb_id.isascii() and tmdb_id.isdigit() and media_type in {"movie", "tv"}:
+            try:
+                if media_type == "movie":
+                    visible = scope["client"].has_tmdb_media(
+                        tmdb_id,
+                        "movie",
+                        parent_id=scope["binding"]["library_id"],
+                    )
+                    index_status = "visible" if visible else "missing"
+                    reason_code = "movie_indexed" if visible else "movie_not_indexed"
                 else:
-                    reason_code = "series_mapping_ambiguous"
-        except Exception:
-            index_status = "inconclusive"
-            reason_code = "media_server_unavailable"
-    summary = {
-        "visible": "媒体已在绑定媒体库中可见",
-        "missing": "绑定媒体库中尚未看到该媒体",
-        "inconclusive": "暂时无法确认媒体库可见状态",
-    }[index_status]
-    return ToolResult(
-        index_status == "visible",
-        index_status,
-        summary,
-        data={
-            "task_number": task_number,
-            "title": _safe_title(task.title),
-            "index_status": index_status,
-            "reason_code": reason_code,
-            "server": scope["server_label"],
-            "library": sanitize_public_text(scope["binding"]["library_name"], limit=80),
-            "playback_status": "not_checked",
-            "playback_claim": "not_probed",
-        },
-        evidence=[Evidence(
-            "bound_media_library",
-            "按任务保存的媒体身份在唯一绑定媒体库中查询索引；未读取播放历史，也未发起真实播放探测。",
-            _now(),
-        )],
-        suggestions=[
-            "“库中可见”仅表示媒体服务器已经索引；本次没有证明文件可实际解码或播放。"
-        ],
-        error="媒体库尚未可见或本次核验不确定。" if index_status != "visible" else "",
-    )
+                    search = scope["client"].find_series_candidates_by_tmdb(
+                        tmdb_id,
+                        limit=20,
+                        parent_id=scope["binding"]["library_id"],
+                    )
+                    candidates = list(search.candidates)
+                    if len(candidates) == 1 and not search.truncated:
+                        season = task.season_override
+                        episode = task.episode_override
+                        if season is not None and episode is not None:
+                            inventory = scope["client"].list_series_episode_inventory(
+                                candidates[0].id,
+                                include_specials=int(season) == 0,
+                            )
+                            visible = (int(season), int(episode)) in set(inventory.episodes)
+                            index_status = "visible" if visible else "missing"
+                            reason_code = "episode_indexed" if visible else "episode_not_indexed"
+                        else:
+                            index_status = "inconclusive"
+                            reason_code = "series_indexed_episode_unverified"
+                    elif not candidates and not search.truncated:
+                        index_status = "missing"
+                        reason_code = "series_not_indexed"
+                    else:
+                        reason_code = "series_mapping_ambiguous"
+            except Exception:
+                index_status = "inconclusive"
+                reason_code = "media_server_unavailable"
+        summary = {
+            "visible": "媒体已在绑定媒体库中可见",
+            "missing": "绑定媒体库中尚未看到该媒体",
+            "inconclusive": "暂时无法确认媒体库可见状态",
+        }[index_status]
+        return ToolResult(
+            index_status == "visible",
+            index_status,
+            summary,
+            data={
+                "task_number": task_number,
+                "title": _safe_title(task.title),
+                "index_status": index_status,
+                "reason_code": reason_code,
+                "server": scope["server_label"],
+                "library": sanitize_public_text(scope["binding"]["library_name"], limit=80),
+                "playback_status": "not_checked",
+                "playback_claim": "not_probed",
+            },
+            evidence=[Evidence(
+                "bound_media_library",
+                "按任务保存的媒体身份在唯一绑定媒体库中查询索引；未读取播放历史，也未发起真实播放探测。",
+                _now(),
+            )],
+            suggestions=[
+                "“库中可见”仅表示媒体服务器已经索引；本次没有证明文件可实际解码或播放。"
+            ],
+            error="媒体库尚未可见或本次核验不确定。" if index_status != "visible" else "",
+        )
+    finally:
+        close_media_server_client(scope["client"])

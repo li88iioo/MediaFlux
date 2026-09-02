@@ -10,6 +10,7 @@ import uuid
 from typing import Any
 
 from app import config
+from app.clients.base import close_media_server_client
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.media_server_path_mapping import configured_media_server_refresh_options
 from app.modules.media_server_profiles import list_configured_profiles
@@ -362,12 +363,7 @@ class MediaRefreshCoordinator:
                 type(exc).__name__,
             )
         finally:
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+            close_media_server_client(client)
 
 
 _coordinator = MediaRefreshCoordinator()

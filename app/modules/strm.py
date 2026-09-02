@@ -36,7 +36,7 @@ from urllib3.util import Retry
 
 from app import database as db
 from app.config import get, get_int
-from app.clients.guangya import GuangYaClient, GuangYaFile
+from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.modules.strm_notifications import append_change, relative_change
@@ -55,15 +55,7 @@ def _guangya_client_scope(
         yield runtime_client
     finally:
         if owned_client:
-            close = getattr(runtime_client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception as exc:
-                    logger.warning(
-                        "关闭 STRM 光鸭客户端失败 type=%s",
-                        type(exc).__name__,
-                    )
+            close_guangya_client(runtime_client)
 
 
 def _iter_client_dir(
@@ -1574,7 +1566,7 @@ def _sync_strm_incremental_impl(
     changes: list[dict],
     base_url: str,
     strm_root: str,
-    client: Optional[GuangYaClient] = None,
+    client: GuangYaClient,
     video_exts: Optional[set[str]] = None,
     skip_threshold_mb: int = 0,
     rel_prefix: str = "",
@@ -1583,8 +1575,7 @@ def _sync_strm_incremental_impl(
     on_progress=None,
     should_stop: Callable[[], bool] | None = None,
 ) -> dict:
-    """只处理整理成功的最终对象；不做全量扫描、退役来源或失效清理。"""
-    client = client or GuangYaClient()
+    """只处理整理成功的最终对象；Client 生命周期由公开入口统一管理。"""
     exts = video_exts or DEFAULT_VIDEO_EXTS
     metadata = metadata_exts or set()
     threshold_bytes = skip_threshold_mb * 1024 * 1024
@@ -1884,7 +1875,7 @@ def _sync_strm_impl(
     source_dir_id: str,
     base_url: str,
     strm_root: str,
-    client: Optional[GuangYaClient] = None,
+    client: GuangYaClient,
     video_exts: Optional[set[str]] = None,
     skip_threshold_mb: int = 0,
     rel_prefix: str = "",
@@ -1898,9 +1889,7 @@ def _sync_strm_impl(
     on_progress=None,
     should_stop: Callable[[], bool] | None = None,
 ) -> dict:
-    """递归扫描光鸭目录，为视频生成 STRM。"""
-    if client is None:
-        client = GuangYaClient()
+    """递归扫描光鸭目录，为视频生成 STRM；Client 由公开入口持有。"""
     exts = video_exts or DEFAULT_VIDEO_EXTS
     metadata = metadata_exts or set()
     threshold_bytes = skip_threshold_mb * 1024 * 1024

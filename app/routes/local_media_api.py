@@ -7,6 +7,7 @@ from fastapi import APIRouter, Body, Request
 from fastapi.responses import JSONResponse
 
 from app import database as db
+from app.clients.base import close_media_server_client
 from app.logger import get_logger
 from app.modules.local_directory_browser import VIRTUAL_ROOT, browse_local_directories
 from app.modules.local_path_mapping import (
@@ -334,10 +335,7 @@ def list_media_server_libraries(provider: str, request: Request):
         try:
             return {"provider": normalized, "libraries": client.list_virtual_folders()}
         finally:
-            try:
-                client.close()
-            except Exception as exc:
-                logger.debug("媒体库列表客户端关闭失败 type=%s", type(exc).__name__)
+            close_media_server_client(client)
     except Exception as exc:
         return _safe_error(exc)
 

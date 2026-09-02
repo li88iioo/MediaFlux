@@ -11,6 +11,7 @@ from app.agent.action_history import action_history_owner_digest
 from app.agent.models import Evidence, ToolContext, ToolResult
 from app.agent.registry import AgentToolError
 from app.agent.result_projection import sanitize_public_text
+from app.clients.base import close_media_server_client
 from app.modules.media_server_profiles import list_configured_profiles
 from app.repositories.media_experience import (
     clear_media_preferences,
@@ -181,8 +182,10 @@ def get_continue_watching(arguments: dict[str, Any], context: ToolContext) -> To
             suggestions=["可说：查看 Jellyfin 继续观看。", "可说：查看 Emby 继续观看。"],
         )
     profile = profiles[0]
+    client = None
     try:
-        items = _client(profile).continue_watching(
+        client = _client(profile)
+        items = client.continue_watching(
             profile.user_id, limit=int(arguments["limit"])
         )
     except Exception:
@@ -191,6 +194,8 @@ def get_continue_watching(arguments: dict[str, Any], context: ToolContext) -> To
             data={"server": profile.server_type, "items": []},
             error="媒体服务器未返回可用的继续观看列表。",
         )
+    finally:
+        close_media_server_client(client)
     public_items = []
     for item in items[: int(arguments["limit"])]:
         public_items.append({

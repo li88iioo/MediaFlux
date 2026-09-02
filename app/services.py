@@ -10,7 +10,11 @@ from dataclasses import dataclass
 from typing import Callable
 
 from app import database as db
-from app.clients.base import DashboardData, MediaServerClient
+from app.clients.base import (
+    DashboardData,
+    MediaServerClient,
+    close_media_server_client,
+)
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 from app.config import get, get_bool, get_int
@@ -113,14 +117,31 @@ def _decorate_dashboard(
     return board
 
 
+def _load_dashboard(
+    client: MediaServerClient,
+    *,
+    server_type: str,
+    web_url: str,
+) -> DashboardData:
+    """读取一次看板并确定性释放该请求独占的连接池。"""
+    try:
+        return _decorate_dashboard(
+            client.get_dashboard(),
+            server_type=server_type,
+            web_url=web_url,
+        )
+    finally:
+        close_media_server_client(client)
+
+
 def _dashboard_jobs() -> list[Callable[[], DashboardData]]:
     jobs: list[Callable[[], DashboardData]] = []
     if get_bool("EMBY_ENABLED"):
         url, token = get("EMBY_URL"), get("EMBY_TOKEN")
         if url and token:
             jobs.append(
-                lambda url=url, token=token: _decorate_dashboard(
-                    EmbyClient(url, token).get_dashboard(),
+                lambda url=url, token=token: _load_dashboard(
+                    EmbyClient(url, token),
                     server_type="emby",
                     web_url=url,
                 )
@@ -139,8 +160,8 @@ def _dashboard_jobs() -> list[Callable[[], DashboardData]]:
         url, key = get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")
         if url and key:
             jobs.append(
-                lambda url=url, key=key: _decorate_dashboard(
-                    JellyfinClient(url, key).get_dashboard(),
+                lambda url=url, key=key: _load_dashboard(
+                    JellyfinClient(url, key),
                     server_type="jellyfin",
                     web_url=url,
                 )
@@ -243,15 +264,20 @@ def get_media_server_urls() -> dict[str, str]:
 def _configured_media_sources() -> list[tuple[str, str, str, MediaServerClient]]:
     """构造已完整配置的媒体服务器客户端，不返回凭证。"""
     sources: list[tuple[str, str, str, MediaServerClient]] = []
-    if get_bool("EMBY_ENABLED"):
-        url, token = get("EMBY_URL"), get("EMBY_TOKEN")
-        if url and token:
-            sources.append(("emby", "Emby", url, EmbyClient(url, token)))
-    if get_bool("JELLYFIN_ENABLED"):
-        url, token = get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")
-        if url and token:
-            sources.append(("jellyfin", "Jellyfin", url, JellyfinClient(url, token)))
-    return sources
+    try:
+        if get_bool("EMBY_ENABLED"):
+            url, token = get("EMBY_URL"), get("EMBY_TOKEN")
+            if url and token:
+                sources.append(("emby", "Emby", url, EmbyClient(url, token)))
+        if get_bool("JELLYFIN_ENABLED"):
+            url, token = get("JELLYFIN_URL"), get("JELLYFIN_API_KEY")
+            if url and token:
+                sources.append(("jellyfin", "Jellyfin", url, JellyfinClient(url, token)))
+        return sources
+    except Exception:
+        for _server_type, _server_name, _web_url, client in sources:
+            close_media_server_client(client)
+        raise
 
 
 def _media_source_payload(
@@ -292,17 +318,31 @@ def _run_media_source_jobs(jobs: list[Callable[[], dict]]) -> list[dict]:
         return [future.result() for future in futures]
 
 
+def _run_owned_media_source_job(
+    client: MediaServerClient,
+    loader: Callable[[], dict],
+) -> dict:
+    """执行一次媒体源读取，并在成功、降级或异常后统一释放客户端。"""
+    try:
+        return loader()
+    finally:
+        close_media_server_client(client)
+
+
 def build_recent_media(*, limit: int = 72) -> list[dict]:
     """并发聚合所有已配置媒体服务器的最近入库内容。"""
     normalized_limit = max(1, min(int(limit or 72), 200))
     jobs: list[Callable[[], dict]] = []
     for server_type, server_name, web_url, client in _configured_media_sources():
         jobs.append(
-            lambda server_type=server_type, server_name=server_name, web_url=web_url, client=client: _media_source_payload(
-                server_type,
-                server_name,
-                web_url,
-                lambda: client.recent_media(normalized_limit),
+            lambda server_type=server_type, server_name=server_name, web_url=web_url, client=client: _run_owned_media_source_job(
+                client,
+                lambda: _media_source_payload(
+                    server_type,
+                    server_name,
+                    web_url,
+                    lambda: client.recent_media(normalized_limit),
+                ),
             )
         )
     results = _run_media_source_jobs(jobs)
@@ -321,11 +361,14 @@ def search_media_servers(query: str, *, limit: int = 8) -> list[dict]:
     jobs: list[Callable[[], dict]] = []
     for server_type, server_name, web_url, client in _configured_media_sources():
         jobs.append(
-            lambda server_type=server_type, server_name=server_name, web_url=web_url, client=client: _media_source_payload(
-                server_type,
-                server_name,
-                web_url,
-                lambda: client.search_media(query, normalized_limit),
+            lambda server_type=server_type, server_name=server_name, web_url=web_url, client=client: _run_owned_media_source_job(
+                client,
+                lambda: _media_source_payload(
+                    server_type,
+                    server_name,
+                    web_url,
+                    lambda: client.search_media(query, normalized_limit),
+                ),
             )
         )
     return _run_media_source_jobs(jobs)
@@ -670,127 +713,130 @@ def inspect_library_series_sources(
             "unmapped_count": 0,
             "series": [],
         }
-        if deadline_at is not None and time.monotonic() >= deadline_at:
-            source.update(
-                status="incomplete",
-                truncated=True,
-                batch_remaining=scan_all,
-                deadline_exhausted=True,
-            )
-            results.append(source)
-            continue
         try:
-            search = client.list_library_series(
-                max_series=catalog_cap,
-                page_size=100,
-                deadline_at=deadline_at,
-            )
-            source["series_total"] = int(search.total or 0)
-            source["series_enumerated"] = len(search.candidates)
-            source["catalog_truncated"] = bool(search.truncated)
-            source["truncated"] = bool(search.truncated)
-            candidates = list(search.candidates)
-            if scan_all:
-                mapped = [
-                    candidate for candidate in candidates
-                    if str(candidate.tmdb_id or "").isdigit()
-                    and int(str(candidate.tmdb_id)) > cursor
-                ]
-                mapped.sort(key=lambda candidate: int(str(candidate.tmdb_id)))
-                # 巡检游标按 TMDB 媒体组推进，而不是按媒体服务器条目推进。
-                # 同一剧集可能在多个媒体库或多个版本中重复出现；若按候选条目
-                # 切批，重复 ID 恰好跨越边界时会让 next_tmdb_id 等于当前组，
-                # 审计层因此无法处理该组并最终把它误判为停滞后跳过。
-                mapped_tmdb_ids = list(dict.fromkeys(
-                    str(candidate.tmdb_id) for candidate in mapped
-                ))
-                selected_tmdb_ids = set(mapped_tmdb_ids[:normalized_series])
-                source["batch_remaining"] = len(mapped_tmdb_ids) > normalized_series
-                selected = [
-                    candidate for candidate in mapped
-                    if str(candidate.tmdb_id) in selected_tmdb_ids
-                ]
-                if source["batch_remaining"]:
-                    source["next_tmdb_id"] = mapped_tmdb_ids[normalized_series]
-                source["unmapped_count"] = sum(
-                    not str(candidate.tmdb_id or "").isdigit()
-                    for candidate in candidates
+            if deadline_at is not None and time.monotonic() >= deadline_at:
+                source.update(
+                    status="incomplete",
+                    truncated=True,
+                    batch_remaining=scan_all,
+                    deadline_exhausted=True,
                 )
-            else:
-                selected = candidates
-            for index, candidate in enumerate(selected):
-                if deadline_at is not None and time.monotonic() >= deadline_at:
-                    source.update(
-                        status="incomplete",
-                        truncated=True,
-                        batch_remaining=True,
-                        next_tmdb_id=str(candidate.tmdb_id or ""),
-                        deadline_exhausted=True,
+                results.append(source)
+                continue
+            try:
+                search = client.list_library_series(
+                    max_series=catalog_cap,
+                    page_size=100,
+                    deadline_at=deadline_at,
+                )
+                source["series_total"] = int(search.total or 0)
+                source["series_enumerated"] = len(search.candidates)
+                source["catalog_truncated"] = bool(search.truncated)
+                source["truncated"] = bool(search.truncated)
+                candidates = list(search.candidates)
+                if scan_all:
+                    mapped = [
+                        candidate for candidate in candidates
+                        if str(candidate.tmdb_id or "").isdigit()
+                        and int(str(candidate.tmdb_id)) > cursor
+                    ]
+                    mapped.sort(key=lambda candidate: int(str(candidate.tmdb_id)))
+                    # 巡检游标按 TMDB 媒体组推进，而不是按媒体服务器条目推进。
+                    # 同一剧集可能在多个媒体库或多个版本中重复出现；若按候选条目
+                    # 切批，重复 ID 恰好跨越边界时会让 next_tmdb_id 等于当前组，
+                    # 审计层因此无法处理该组并最终把它误判为停滞后跳过。
+                    mapped_tmdb_ids = list(dict.fromkeys(
+                        str(candidate.tmdb_id) for candidate in mapped
+                    ))
+                    selected_tmdb_ids = set(mapped_tmdb_ids[:normalized_series])
+                    source["batch_remaining"] = len(mapped_tmdb_ids) > normalized_series
+                    selected = [
+                        candidate for candidate in mapped
+                        if str(candidate.tmdb_id) in selected_tmdb_ids
+                    ]
+                    if source["batch_remaining"]:
+                        source["next_tmdb_id"] = mapped_tmdb_ids[normalized_series]
+                    source["unmapped_count"] = sum(
+                        not str(candidate.tmdb_id or "").isdigit()
+                        for candidate in candidates
                     )
-                    break
-                if not candidate.tmdb_id:
-                    # 一次性全库审计仍要读取本地集号，后续才能以严格的标题+年份
-                    # 规则尝试补全映射；后台可续跑批次继续只处理稳定的 TMDB 游标。
-                    source["unmapped_count"] += 1
-                    if scan_all:
-                        continue
-                try:
-                    inventory = client.list_series_episode_inventory(
-                        candidate.id,
-                        max_episodes=normalized_episodes,
-                        page_size=200,
-                        deadline_at=deadline_at,
-                    )
-                except Exception as exc:
-                    deadline_hit = isinstance(exc, TimeoutError) or (
-                        deadline_at is not None and time.monotonic() >= deadline_at
-                    )
-                    logger.warning(
-                        "媒体服务器剧集清单读取失败 server=%s type=%s",
-                        server_type,
-                        type(exc).__name__,
-                    )
-                    source.update(
-                        status="incomplete",
-                        truncated=True,
-                        batch_remaining=(
-                            source["batch_remaining"]
-                            or index + 1 < len(selected)
-                            or bool(candidate.tmdb_id)
-                        ),
-                        next_tmdb_id=str(candidate.tmdb_id or ""),
-                        deadline_exhausted=deadline_hit,
-                    )
-                    break
-                source["series"].append({
-                    "name": candidate.name,
-                    "year": candidate.year,
-                    "tmdb_id": candidate.tmdb_id,
-                    "episodes": list(inventory.episodes),
-                    "local_total": int(inventory.total or 0),
-                    "truncated": bool(inventory.truncated),
-                    "ignored_specials": int(inventory.ignored_specials or 0),
-                    "ignored_unknown": int(inventory.ignored_unknown or 0),
-                })
-                if inventory.truncated:
-                    source["truncated"] = True
-        except Exception as exc:
-            logger.warning(
-                "媒体服务器全库剧集巡检读取失败 server=%s type=%s",
-                server_type,
-                type(exc).__name__,
-            )
-            deadline_hit = isinstance(exc, TimeoutError) or (
-                deadline_at is not None and time.monotonic() >= deadline_at
-            )
-            source.update(
-                status="incomplete" if deadline_hit else "unavailable",
-                truncated=True,
-                catalog_truncated=True,
-                deadline_exhausted=deadline_hit,
-                series=[],
-            )
-        results.append(source)
+                else:
+                    selected = candidates
+                for index, candidate in enumerate(selected):
+                    if deadline_at is not None and time.monotonic() >= deadline_at:
+                        source.update(
+                            status="incomplete",
+                            truncated=True,
+                            batch_remaining=True,
+                            next_tmdb_id=str(candidate.tmdb_id or ""),
+                            deadline_exhausted=True,
+                        )
+                        break
+                    if not candidate.tmdb_id:
+                        # 一次性全库审计仍要读取本地集号，后续才能以严格的标题+年份
+                        # 规则尝试补全映射；后台可续跑批次继续只处理稳定的 TMDB 游标。
+                        source["unmapped_count"] += 1
+                        if scan_all:
+                            continue
+                    try:
+                        inventory = client.list_series_episode_inventory(
+                            candidate.id,
+                            max_episodes=normalized_episodes,
+                            page_size=200,
+                            deadline_at=deadline_at,
+                        )
+                    except Exception as exc:
+                        deadline_hit = isinstance(exc, TimeoutError) or (
+                            deadline_at is not None and time.monotonic() >= deadline_at
+                        )
+                        logger.warning(
+                            "媒体服务器剧集清单读取失败 server=%s type=%s",
+                            server_type,
+                            type(exc).__name__,
+                        )
+                        source.update(
+                            status="incomplete",
+                            truncated=True,
+                            batch_remaining=(
+                                source["batch_remaining"]
+                                or index + 1 < len(selected)
+                                or bool(candidate.tmdb_id)
+                            ),
+                            next_tmdb_id=str(candidate.tmdb_id or ""),
+                            deadline_exhausted=deadline_hit,
+                        )
+                        break
+                    source["series"].append({
+                        "name": candidate.name,
+                        "year": candidate.year,
+                        "tmdb_id": candidate.tmdb_id,
+                        "episodes": list(inventory.episodes),
+                        "local_total": int(inventory.total or 0),
+                        "truncated": bool(inventory.truncated),
+                        "ignored_specials": int(inventory.ignored_specials or 0),
+                        "ignored_unknown": int(inventory.ignored_unknown or 0),
+                    })
+                    if inventory.truncated:
+                        source["truncated"] = True
+            except Exception as exc:
+                logger.warning(
+                    "媒体服务器全库剧集巡检读取失败 server=%s type=%s",
+                    server_type,
+                    type(exc).__name__,
+                )
+                deadline_hit = isinstance(exc, TimeoutError) or (
+                    deadline_at is not None and time.monotonic() >= deadline_at
+                )
+                source.update(
+                    status="incomplete" if deadline_hit else "unavailable",
+                    truncated=True,
+                    catalog_truncated=True,
+                    deadline_exhausted=deadline_hit,
+                    series=[],
+                )
+            results.append(source)
+        finally:
+            close_media_server_client(client)
     return results
 
 
@@ -837,8 +883,11 @@ def inspect_series_episode_inventory_by_tmdb(
     jobs: list[Callable[[], dict]] = []
     for server_type, server_name, _web_url, client in _configured_media_sources():
         jobs.append(
-            lambda server_type=server_type, server_name=server_name, client=client: _strict_series_inventory_source_payload(
-                server_type, server_name, client, tmdb_id, max_episodes, include_specials
+            lambda server_type=server_type, server_name=server_name, client=client: _run_owned_media_source_job(
+                client,
+                lambda: _strict_series_inventory_source_payload(
+                    server_type, server_name, client, tmdb_id, max_episodes, include_specials
+                ),
             )
         )
     return _run_media_source_jobs(jobs)
@@ -856,10 +905,13 @@ def inspect_series_episode_sources(
     jobs: list[Callable[[], dict]] = []
     for server_type, server_name, _web_url, client in _configured_media_sources():
         jobs.append(
-            lambda server_type=server_type, server_name=server_name, client=client: _series_source_payload(
-                server_type, server_name, client, query, tmdb_id, max_episodes,
-                include_specials,
-                library_name,
+            lambda server_type=server_type, server_name=server_name, client=client: _run_owned_media_source_job(
+                client,
+                lambda: _series_source_payload(
+                    server_type, server_name, client, query, tmdb_id, max_episodes,
+                    include_specials,
+                    library_name,
+                ),
             )
         )
     return _run_media_source_jobs(jobs)
@@ -870,8 +922,11 @@ def inspect_media_identity_sources(tmdb_id: str, media_type: str) -> list[dict]:
     jobs: list[Callable[[], dict]] = []
     for server_type, server_name, _web_url, client in _configured_media_sources():
         jobs.append(
-            lambda server_type=server_type, server_name=server_name, client=client: _media_identity_source_payload(
-                server_type, server_name, client, tmdb_id, media_type
+            lambda server_type=server_type, server_name=server_name, client=client: _run_owned_media_source_job(
+                client,
+                lambda: _media_identity_source_payload(
+                    server_type, server_name, client, tmdb_id, media_type
+                ),
             )
         )
     return _run_media_source_jobs(jobs)

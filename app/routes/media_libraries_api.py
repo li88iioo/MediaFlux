@@ -11,6 +11,7 @@ from fastapi import APIRouter, Body, Request
 
 from app import config
 from app import database as db
+from app.clients.base import close_media_server_client
 from app.logger import get_logger
 from app.modules.local_directory_browser import VIRTUAL_ROOT, browse_local_directories
 from app.modules.local_path_mapping import (
@@ -79,16 +80,6 @@ def _client_for(profile: MediaServerProfile):
     raise ValueError("媒体服务器类型无效")
 
 
-def _close_client(client: object | None) -> None:
-    close = getattr(client, "close", None)
-    if not callable(close):
-        return
-    try:
-        close()
-    except Exception as exc:
-        logger.debug("媒体库探测客户端关闭失败 type=%s", type(exc).__name__)
-
-
 def _library_payload(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": str(item.get("id") or "").strip(),
@@ -134,7 +125,7 @@ def _probe_profile(profile: MediaServerProfile) -> tuple[str, list[dict[str, Any
         )
         return profile.server_type, [], "媒体库读取失败，请测试服务器连接"
     finally:
-        _close_client(client)
+        close_media_server_client(client)
 
 
 def _local_sources() -> list[dict[str, Any]]:
@@ -534,7 +525,7 @@ def test_media_library_path(request: Request, data: dict | None = Body(default=N
         )
         return api_error("媒体库读取失败，请先测试服务器连接", 502)
     finally:
-        _close_client(client)
+        close_media_server_client(client)
 
     matches: list[dict[str, Any]] = []
     for library in libraries:

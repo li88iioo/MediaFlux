@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app import database as db
+from app.clients.base import close_media_server_client
 from app.clients.guangya import GuangYaFile
 from app.modules.directory_media import (
     DirectoryInspection,
@@ -1669,12 +1670,7 @@ class LocalMediaService:
             except Exception as exc:
                 warnings.append(f"{profile.label} 刷新失败 {label}: {exc}")
         for client in clients.values():
-            close = getattr(client, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
+            close_media_server_client(client)
         return warnings
 
     @staticmethod

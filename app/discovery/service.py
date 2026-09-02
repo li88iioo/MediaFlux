@@ -36,6 +36,7 @@ from app.discovery.registry import (
 
 _DISCOVERY_CLOSED_MESSAGE = "探索服务已关闭，请重试"
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+_MAX_REFRESH_COOLDOWNS = 512
 logger = get_logger(__name__)
 
 _ERROR_TYPES = {
@@ -308,6 +309,22 @@ class DiscoveryService:
             lookup.last_error or "数据源暂不可用", retry_after=lookup.retry_after
         )
 
+    def _remember_refresh_failure_locked(self, cache_key: str) -> None:
+        """记录短期退避，并限制高基数失败请求占用的常驻内存。"""
+        now = self._refresh_clock()
+        self._refresh_cooldowns = {
+            key: retry_at
+            for key, retry_at in self._refresh_cooldowns.items()
+            if retry_at > now and key != cache_key
+        }
+        while len(self._refresh_cooldowns) >= _MAX_REFRESH_COOLDOWNS:
+            oldest = min(
+                self._refresh_cooldowns,
+                key=self._refresh_cooldowns.__getitem__,
+            )
+            self._refresh_cooldowns.pop(oldest, None)
+        self._refresh_cooldowns[cache_key] = now + self._refresh_cooldown_seconds
+
     def _schedule_refresh(self, cache_key: str, provider: str, category: str,
                           media_type: str, page: int, filters: dict[str, str]) -> None:
         with self._refresh_guard:
@@ -332,9 +349,7 @@ class DiscoveryService:
                         if refreshed:
                             self._refresh_cooldowns.pop(cache_key, None)
                         else:
-                            self._refresh_cooldowns[cache_key] = (
-                                self._refresh_clock() + self._refresh_cooldown_seconds
-                            )
+                            self._remember_refresh_failure_locked(cache_key)
                     self._pending_refreshes.discard(cache_key)
                     self._refresh_guard.notify_all()
 

@@ -145,6 +145,27 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(secret, serialized)
         client.continue_watching.assert_called_once_with("PRIVATE-USER-ID", limit=8)
+        client.close.assert_called_once_with()
+
+        failed_client = Mock()
+        failed_client.continue_watching.side_effect = RuntimeError("provider unavailable")
+        with (
+            patch(
+                "app.agent.media_consumption_actions.list_configured_profiles",
+                return_value=[profile],
+            ),
+            patch(
+                "app.agent.media_consumption_actions._client",
+                return_value=failed_client,
+            ),
+        ):
+            unavailable = service.invoke(
+                "media.continue_watching",
+                {"server": "jellyfin", "limit": 8},
+                owner="owner-a",
+            )
+        self.assertEqual(unavailable["result"]["status"], "unavailable")
+        failed_client.close.assert_called_once_with()
 
         profile_without_user = MediaServerProfile(
             source="configured:jellyfin",

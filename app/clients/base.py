@@ -165,6 +165,37 @@ def _dedupe_texts(values: object) -> list[str]:
     ))
 
 
+def close_media_server_client(client: object | None) -> bool:
+    """尽力释放短生命周期媒体服务器客户端，不让清理异常覆盖业务结果。"""
+    if client is None:
+        return True
+    close = getattr(client, "close", None)
+    if not callable(close):
+        return True
+    try:
+        closed = close()
+    except Exception as exc:
+        log_throttled(
+            logger,
+            logging.WARNING,
+            f"media-server-close:{type(client).__name__}:{type(exc).__name__}",
+            "关闭媒体服务器 HTTP Client 失败 client=%s type=%s",
+            type(client).__name__,
+            type(exc).__name__,
+        )
+        return False
+    if closed is False:
+        log_throttled(
+            logger,
+            logging.WARNING,
+            f"media-server-close-incomplete:{type(client).__name__}",
+            "媒体服务器 HTTP Client 未能完成关闭 client=%s",
+            type(client).__name__,
+        )
+        return False
+    return True
+
+
 class MediaServerClient:
     """媒体服务器客户端基类。"""
 
@@ -194,7 +225,7 @@ class MediaServerClient:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+        close_media_server_client(self)
 
     # ---- 子类实现 ----
     def _headers(self) -> dict[str, str]:

@@ -349,6 +349,32 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
 
+    def test_refresh_validation_failure_closes_media_server_client(self) -> None:
+        self._task(status="completed", bound=True)
+        service = get_agent_service()
+        service.invoke(
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
+        )
+        client = Mock()
+        client.list_virtual_folders.return_value = []
+        with patch(
+            "app.agent.local_media_task_actions.list_configured_profiles",
+            return_value=[self._profile()],
+        ), patch(
+            "app.agent.local_media_task_actions._client_for_provider",
+            return_value=client,
+        ), self.assertRaises(AgentToolError) as raised:
+            service.prepare(
+                "local_media.refresh_task_library",
+                {"task_number": 1},
+                owner="owner-a",
+            )
+
+        self.assertEqual(raised.exception.code, "precondition_failed")
+        client.close.assert_called_once_with()
+
     def test_visibility_distinguishes_indexed_from_playback(self) -> None:
         self._task(status="completed", bound=True, media_type="movie", tmdb_id="12345")
         service = get_agent_service()
@@ -378,6 +404,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         client.has_tmdb_media.assert_called_once_with(
             "12345", "movie", parent_id="private-library-id"
         )
+        client.close.assert_called_once_with()
 
     def test_natural_query_routes_list_and_retry_through_confirmation(self) -> None:
         self._task(status="failed")
@@ -682,6 +709,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
         client.refresh_for_paths.assert_not_called()
+        self.assertEqual(client.close.call_count, 2)
 
     def test_precise_refresh_stales_when_path_mapping_changes(self) -> None:
         self._task(status="completed", bound=True)
@@ -719,6 +747,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 )
         self.assertEqual(stale.exception.code, "confirmation_stale")
         client.refresh_for_paths.assert_not_called()
+        self.assertEqual(client.close.call_count, 2)
 
     def test_tv_visibility_is_inconclusive_without_episode_identity(self) -> None:
         self._task(status="completed", bound=True, media_type="tv", tmdb_id="12345")
@@ -751,6 +780,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         self.assertNotIn("媒体已在绑定媒体库中可见", result["result"]["summary"])
         client.list_series_episode_inventory.assert_not_called()
+        client.close.assert_called_once_with()
 
     def test_two_refresh_tickets_cannot_execute_concurrently(self) -> None:
         self._task(status="completed", bound=True)

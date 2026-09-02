@@ -373,6 +373,18 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertTrue(after_cooldown.stale)
         self.assertEqual(len(submitted), 2)
 
+    def test_failed_refresh_cooldowns_are_bounded(self):
+        with patch.object(self.service, "_refresh_safely", return_value=False):
+            for index in range(600):
+                self.service._schedule_refresh(
+                    f"cache-{index}", "tmdb", "popular", "movie", 1, {},
+                )
+
+        self.assertEqual(len(self.service._refresh_cooldowns), 512)
+        self.assertNotIn("cache-0", self.service._refresh_cooldowns)
+        self.assertIn("cache-599", self.service._refresh_cooldowns)
+        self.assertFalse(self.service._pending_refreshes)
+
     def test_shutdown_does_not_submit_stale_refresh_to_closed_executor(self):
         self.service.list_items("tmdb", "popular", "movie", 1, {})
         self.now += timedelta(seconds=61)
