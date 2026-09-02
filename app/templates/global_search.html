@@ -35,7 +35,7 @@
     {% if top_match %}
     <section class="global-top-hit" data-global-search-section="media">
         <div class="global-top-poster">
-            {% if top_match.image_url %}<img src="{{ top_match.image_url }}" alt="{{ top_match.title }}" loading="eager">{% else %}<span><i data-lucide="film"></i></span>{% endif %}
+            {% if top_match.image_url %}<img src="{{ top_match.image_url }}" alt="{{ top_match.title }}" width="272" height="408" loading="eager" decoding="async" fetchpriority="high">{% else %}<span><i data-lucide="film"></i></span>{% endif %}
             <small>{{ top_match.source_label or top_match.provider|upper }}</small>
         </div>
         <div class="global-top-primary">
@@ -66,7 +66,7 @@
         <div class="global-media-grid">
             {% for item in secondary_media_items %}
             <a class="global-media-card" href="{{ item.url }}"{% if discovery_enabled and not item.is_local %} data-media-profile-link{% endif %} {{ 'target="_blank" rel="noopener"' if item.external else '' }} title="{{ item.title }}">
-                <span class="global-media-poster">{% if item.image_url %}<img src="{{ item.image_url }}" alt="{{ item.title }}" loading="lazy">{% else %}<span><i data-lucide="film"></i></span>{% endif %}<small>{{ item.provider|upper }}</small><em class="global-media-type">{{ item.type_label }}</em>{% if item.is_local %}<b><i data-lucide="server"></i></b>{% endif %}</span>
+                <span class="global-media-poster">{% if item.image_url %}<img src="{{ item.image_url }}" alt="{{ item.title }}" width="320" height="480" loading="lazy" decoding="async" fetchpriority="auto">{% else %}<span><i data-lucide="film"></i></span>{% endif %}<small>{{ item.provider|upper }}</small><em class="global-media-type">{{ item.type_label }}</em>{% if item.is_local %}<b><i data-lucide="server"></i></b>{% endif %}</span>
                 <span class="global-media-copy"><strong>{{ item.title }}</strong><small>{{ item.episode_context or item.original_title or item.subtitle }}</small></span>
                 <span class="global-media-meta"><em>{{ item.year or item.type_label }}</em><b>{% if item.rating %}{{ '%.1f'|format(item.rating) }}{% else %}{{ item.type_label }}{% endif %}</b></span>
             </a>

@@ -185,8 +185,11 @@ class EmbyClient(MediaServerClient):
 
     def _media_item(self, item: dict) -> MediaItem:
         item_id = str(item.get("Id") or "")
-        series_id = str(item.get("SeriesId") or "")
-        image_id = series_id if item.get("Type") == "Episode" and series_id else item_id
+        item_type = str(item.get("Type") or "")
+        raw_series_id = str(item.get("SeriesId") or "")
+        is_episode = item_type.casefold() == "episode"
+        series_id = item_id if item_type.casefold() == "series" else raw_series_id
+        image_id = series_id if is_episode and series_id else item_id
         raw_user_data = item.get("UserData")
         user_data = raw_user_data if isinstance(raw_user_data, dict) else {}
         return MediaItem(
@@ -200,6 +203,8 @@ class EmbyClient(MediaServerClient):
             overview=(item.get("Overview") or "")[:160],
             web_url=self._web_url(item_id),
             series_name=item.get("SeriesName", ""),
+            series_id=series_id,
+            series_web_url=self._web_url(series_id) if series_id else "",
             season_number=item.get("ParentIndexNumber"),
             episode_number=item.get("IndexNumber"),
             last_played=user_data.get("LastPlayedDate", ""),

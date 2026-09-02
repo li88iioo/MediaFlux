@@ -46,7 +46,7 @@
             {% set item = entry.media %}{% set source = entry.source %}
             <a class="media-recent-card" href="{{ item.web_url or source.web_url }}" target="_blank" rel="noopener" title="{{ item.display_name }}">
                 <span class="media-recent-poster">
-                    {% if item.primary_image %}<img src="{{ item.primary_image }}" alt="{{ item.display_name }}" loading="lazy">{% else %}<span><i data-lucide="film"></i></span>{% endif %}
+                    {% if item.primary_image %}<img src="{{ item.primary_image }}" alt="{{ item.display_name }}" width="320" height="480" loading="{{ 'eager' if loop.index <= 2 else 'lazy' }}" decoding="async" fetchpriority="{{ 'high' if loop.index <= 2 else 'auto' }}">{% else %}<span><i data-lucide="film"></i></span>{% endif %}
                     <em class="media-recent-type">{{ '电影' if item.type|lower == 'movie' else '剧集' if item.type|lower in ['series', 'tv'] else '单集' if item.type|lower == 'episode' else item.type }}</em>
                 </span>
                 <span class="media-recent-copy">

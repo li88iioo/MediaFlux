@@ -247,9 +247,11 @@ class JellyfinClient(MediaServerClient):
             return text
 
     def _media_item(self, item: dict, *, played: bool = False) -> MediaItem:
-        item_id = item.get("Id", "")
-        series_id = item.get("SeriesId", "")
-        is_episode = item.get("Type") == "Episode"
+        item_id = str(item.get("Id") or "")
+        item_type = str(item.get("Type") or "")
+        raw_series_id = str(item.get("SeriesId") or "")
+        is_episode = item_type.casefold() == "episode"
+        series_id = item_id if item_type.casefold() == "series" else raw_series_id
         series_image_tag = str(item.get("SeriesPrimaryImageTag") or "").strip()
         if is_episode and series_id and series_image_tag:
             image_id = series_id
@@ -270,6 +272,8 @@ class JellyfinClient(MediaServerClient):
             overview=(item.get("Overview") or "")[:160],
             web_url=self._web_url(item_id),
             series_name=item.get("SeriesName", ""),
+            series_id=series_id,
+            series_web_url=self._web_url(series_id) if series_id else "",
             season_number=item.get("ParentIndexNumber"),
             episode_number=item.get("IndexNumber"),
             last_played=(

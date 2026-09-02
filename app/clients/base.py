@@ -93,6 +93,8 @@ class MediaItem:
     overview: str = ""
     web_url: str = ""
     series_name: str = ""
+    series_id: str = ""
+    series_web_url: str = ""
     season_number: int | None = None
     episode_number: int | None = None
     last_played: str = ""

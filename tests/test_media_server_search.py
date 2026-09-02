@@ -79,6 +79,38 @@ class MediaServerSearchTests(unittest.TestCase):
             item.primary_image,
             f"/media-image/jellyfin/{series_id}?tag=series%2Ftag",
         )
+        self.assertEqual(item.series_id, series_id)
+        self.assertIn(f"details?id={series_id}", item.series_web_url)
+
+    def test_emby_episode_exposes_series_identity_and_link(self):
+        client = EmbyClient("http://emby.example", "token")
+        series_id = "b" * 32
+
+        item = client._media_item({
+            "Id": _ITEM_ID,
+            "Name": "Episode",
+            "Type": "Episode",
+            "SeriesId": series_id,
+            "SeriesName": "Example Series",
+        })
+
+        self.assertEqual(item.series_id, series_id)
+        self.assertIn(f"id={series_id}", item.series_web_url)
+        self.assertEqual(item.primary_image, f"/media-image/emby/{series_id}")
+
+    def test_series_items_use_their_own_identity_as_series_identity(self):
+        for client in (
+            JellyfinClient("http://jellyfin.example", "token"),
+            EmbyClient("http://emby.example", "token"),
+        ):
+            with self.subTest(client=type(client).__name__):
+                item = client._media_item({
+                    "Id": _ITEM_ID,
+                    "Name": "Example Series",
+                    "Type": "Series",
+                })
+                self.assertEqual(item.series_id, _ITEM_ID)
+                self.assertIn(f"id={_ITEM_ID}", item.series_web_url)
 
     def test_emby_search_media_maps_images_and_external_details(self):
         client = EmbyClient("http://emby.example", "token")

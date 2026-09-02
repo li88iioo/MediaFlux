@@ -20,16 +20,35 @@ from tests.support import IsolatedDatabaseTestCase
 
 
 class _IncrementalClient:
-    def __init__(self, files: dict[str, GuangYaFile]):
+    def __init__(
+        self,
+        files: dict[str, GuangYaFile],
+        *,
+        list_error: Exception | None = None,
+        allow_list: bool = False,
+        listed_files: dict[str, GuangYaFile] | None = None,
+    ):
         self.files = files
         self.list_calls = 0
+        self.file_info_calls = 0
+        self.list_error = list_error
+        self.allow_list = allow_list
+        self.listed_files = listed_files
 
     def file_info(self, file_id: str):
+        self.file_info_calls += 1
         return self.files.get(file_id)
 
-    def list_dir(self, _file_id: str):
+    def list_dir(self, file_id: str):
         self.list_calls += 1
-        raise AssertionError("精准增量不应递归扫描目录")
+        if self.list_error is not None:
+            raise self.list_error
+        if not self.allow_list:
+            raise AssertionError("小批量精准增量不应扫描目录")
+        return [
+            file for file in (self.listed_files or self.files).values()
+            if str(file.parent_id or "") == str(file_id)
+        ]
 
     def get_download_url(self, _file_id: str) -> str:
         raise AssertionError("视频增量不应获取元数据直链")
@@ -138,7 +157,191 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(third["updated"], 1)
         self.assertFalse(first["fallback_required"])
         self.assertEqual(client.list_calls, 0)
+        self.assertEqual(client.file_info_calls, 3)
         self.assertEqual(len(generated), 1)
+
+    def test_incremental_upserts_batch_verify_shared_parent_snapshot(self):
+        source_id = "incremental-parent-batch"
+        parent_id = "season-dir"
+        videos = {
+            f"video-{index}": GuangYaFile(
+                f"video-{index}",
+                f"Episode.S01E{index:02d}.mkv",
+                False,
+                1024 + index,
+                f"etag-{index}",
+                parent_id,
+            )
+            for index in range(1, 7)
+        }
+        client = _IncrementalClient(videos, allow_list=True)
+        changes = [{
+            "source_id": source_id,
+            "kind": "video",
+            "action": "upsert",
+            "file_id": video.file_id,
+            "rel_dir": "动漫/示例/Season 01",
+            "name": video.name,
+            "etag": video.etag,
+            "size": video.size,
+            "parent_id": video.parent_id,
+        } for video in videos.values()]
+
+        with tempfile.TemporaryDirectory() as root:
+            stats = sync_strm_incremental(
+                source_id,
+                changes,
+                "http://media.invalid",
+                root,
+                client=client,
+            )
+
+        self.assertFalse(stats["fallback_required"])
+        self.assertEqual(stats["generated"], 6)
+        self.assertEqual(stats["incremental_parent_batches"], 1)
+        self.assertEqual(stats["incremental_parent_batch_files"], 6)
+        self.assertEqual(stats["incremental_parent_batch_fallbacks"], 0)
+        self.assertEqual(stats["incremental_parent_batch_rechecks"], 0)
+        self.assertEqual(stats["incremental_file_info_requests"], 0)
+        self.assertEqual(client.list_calls, 1)
+        self.assertEqual(client.file_info_calls, 0)
+
+    def test_incremental_parent_snapshot_failure_falls_back_to_file_info(self):
+        source_id = "incremental-parent-fallback"
+        parent_id = "season-dir"
+        videos = {
+            f"video-{index}": GuangYaFile(
+                f"video-{index}", f"Episode{index}.mkv", False,
+                1024, f"etag-{index}", parent_id,
+            )
+            for index in range(1, 5)
+        }
+        client = _IncrementalClient(
+            videos,
+            list_error=RuntimeError("temporary list failure"),
+        )
+        changes = [{
+            "source_id": source_id,
+            "kind": "video",
+            "action": "upsert",
+            "file_id": video.file_id,
+            "rel_dir": "剧集/示例/Season 01",
+            "name": video.name,
+            "etag": video.etag,
+            "size": video.size,
+            "parent_id": video.parent_id,
+        } for video in videos.values()]
+
+        with tempfile.TemporaryDirectory() as root:
+            stats = sync_strm_incremental(
+                source_id,
+                changes,
+                "http://media.invalid",
+                root,
+                client=client,
+            )
+
+        self.assertFalse(stats["fallback_required"])
+        self.assertEqual(stats["generated"], 4)
+        self.assertEqual(stats["incremental_parent_batches"], 0)
+        self.assertEqual(stats["incremental_parent_batch_fallbacks"], 1)
+        self.assertEqual(stats["incremental_parent_batch_rechecks"], 0)
+        self.assertEqual(stats["incremental_file_info_requests"], 4)
+        self.assertEqual(client.list_calls, 1)
+        self.assertEqual(client.file_info_calls, 4)
+
+    def test_incremental_parent_snapshot_lag_rechecks_file_info(self):
+        source_id = "incremental-parent-missing"
+        parent_id = "season-dir"
+        videos = {
+            f"video-{index}": GuangYaFile(
+                f"video-{index}", f"Episode{index}.mkv", False,
+                1024, f"etag-{index}", parent_id,
+            )
+            for index in range(1, 5)
+        }
+        listed_files = {
+            file_id: video
+            for file_id, video in videos.items()
+            if file_id != "video-4"
+        }
+        client = _IncrementalClient(
+            videos,
+            allow_list=True,
+            listed_files=listed_files,
+        )
+        changes = [{
+            "source_id": source_id,
+            "kind": "video",
+            "action": "upsert",
+            "file_id": video.file_id,
+            "rel_dir": "剧集/示例/Season 01",
+            "name": video.name,
+            "etag": video.etag,
+            "size": video.size,
+            "parent_id": video.parent_id,
+        } for video in videos.values()]
+
+        with tempfile.TemporaryDirectory() as root:
+            stats = sync_strm_incremental(
+                source_id,
+                changes,
+                "http://media.invalid",
+                root,
+                client=client,
+            )
+
+        self.assertFalse(stats["fallback_required"])
+        self.assertEqual(stats["generated"], 4)
+        self.assertEqual(stats["incremental_parent_batches"], 1)
+        self.assertEqual(stats["incremental_parent_batch_rechecks"], 1)
+        self.assertEqual(stats["incremental_file_info_requests"], 1)
+        self.assertEqual(client.list_calls, 1)
+        self.assertEqual(client.file_info_calls, 1)
+
+    def test_incremental_parent_recheck_still_rejects_missing_remote_file(self):
+        source_id = "incremental-parent-removed"
+        parent_id = "season-dir"
+        remote = {
+            f"video-{index}": GuangYaFile(
+                f"video-{index}", f"Episode{index}.mkv", False,
+                1024, f"etag-{index}", parent_id,
+            )
+            for index in range(1, 4)
+        }
+        removed = GuangYaFile(
+            "video-4", "Episode4.mkv", False, 1024, "etag-4", parent_id
+        )
+        client = _IncrementalClient(remote, allow_list=True)
+        changes = [{
+            "source_id": source_id,
+            "kind": "video",
+            "action": "upsert",
+            "file_id": video.file_id,
+            "rel_dir": "剧集/示例/Season 01",
+            "name": video.name,
+            "etag": video.etag,
+            "size": video.size,
+            "parent_id": video.parent_id,
+        } for video in [*remote.values(), removed]]
+
+        with tempfile.TemporaryDirectory() as root:
+            stats = sync_strm_incremental(
+                source_id,
+                changes,
+                "http://media.invalid",
+                root,
+                client=client,
+            )
+
+        self.assertTrue(stats["fallback_required"])
+        self.assertEqual(stats["failed"], 1)
+        self.assertIn("对象已不存在", stats["fallback_reason"])
+        self.assertEqual(stats["incremental_parent_batches"], 1)
+        self.assertEqual(stats["incremental_parent_batch_rechecks"], 1)
+        self.assertEqual(stats["incremental_file_info_requests"], 1)
+        self.assertEqual(client.list_calls, 1)
+        self.assertEqual(client.file_info_calls, 1)
 
     def test_incremental_upsert_migrates_legacy_double_suffix_path(self):
         source_id = "incremental-double-suffix"

@@ -46,17 +46,77 @@ def _section(key: str, title: str, target_url: str, items: list[dict], error: st
     }
 
 
-_LOCAL_MEDIA_SOURCE_LIMIT = 16
 _MEDIA_SECTION_LIMIT = 16
+_LOCAL_MEDIA_SOURCE_FETCH_LIMIT = _MEDIA_SECTION_LIMIT * 2
 
 
-def _episode_context(item: MediaItem) -> str:
-    parts = [str(item.series_name or "").strip()]
-    if item.season_number is not None:
-        parts.append(f"第 {item.season_number} 季")
-    if item.episode_number is not None:
-        parts.append(f"第 {item.episode_number} 集")
-    return " · ".join(part for part in parts if part)
+def _series_id(item: MediaItem) -> str:
+    item_type = str(item.type or "").casefold()
+    series_id = str(item.series_id or "").strip()
+    if not series_id and item_type in {"series", "tv"}:
+        series_id = str(item.id or "").strip()
+    return series_id
+
+
+def _series_title_key(item: MediaItem) -> str:
+    item_type = str(item.type or "").casefold()
+    title = str(
+        item.series_name if item_type == "episode" else item.display_name
+    ).strip()
+    return "".join(
+        char for char in unicodedata.normalize("NFKC", title).casefold()
+        if char.isalnum()
+    )
+
+
+def _series_identity(item: MediaItem) -> str:
+    series_id = _series_id(item)
+    if series_id:
+        return f"id:{series_id}"
+    title_key = _series_title_key(item)
+    return f"title:{title_key}" if title_key else ""
+
+
+def _local_media_payload(item: MediaItem, source: dict) -> dict | None:
+    """把本地单集提升为剧集卡片，避免搜索结果被多集重复占满。"""
+    item_type = str(item.type or "").casefold()
+    is_episode = item_type == "episode"
+    is_series = is_episode or item_type in {"series", "tv"}
+    title = str(item.series_name if is_episode else item.display_name).strip()
+    if not title:
+        # 没有剧名的孤立 Episode 无法安全归并，宁可不展示错误的单集卡片。
+        return None
+    server_name = str(source.get("server_name", "") or "媒体服务器")
+    provider = str(source.get("server_type", "") or "media").strip().lower()
+    type_label = "剧集" if is_series else _type_label(item.type)
+    return {
+        "title": title,
+        "subtitle": " · ".join(part for part in (server_name, item.year) if part),
+        "meta": type_label,
+        "url": (
+            item.series_web_url if is_episode else item.web_url
+        ) or source.get("web_url", ""),
+        "resource_url": f"/discovery?q={quote_plus(title)}",
+        "image_url": item.primary_image,
+        "external": True,
+        "provider": provider,
+        "source_label": server_name,
+        "type_label": type_label,
+        "year": str(item.year or ""),
+        "is_local": True,
+        "is_episode": False,
+        "series_name": title if is_series else str(item.series_name or ""),
+        "episode_context": "",
+        # 单集简介属于具体分集，折叠成剧集卡片后不能继续冒充整部剧简介。
+        "overview": "" if is_episode else str(item.overview or ""),
+        "original_title": (
+            "" if is_series else (
+                str(item.name or "") if item.name != item.display_name else ""
+            )
+        ),
+        "rating": None,
+        "rating_source": "",
+    }
 
 
 def _row_value(row, key: str, default=""):
@@ -68,45 +128,49 @@ def _row_value(row, key: str, default=""):
 
 
 def _local_section(query: str) -> dict:
-    sources = search_media_servers(query, limit=_LOCAL_MEDIA_SOURCE_LIMIT)
+    sources = search_media_servers(query, limit=_LOCAL_MEDIA_SOURCE_FETCH_LIMIT)
     items: list[dict] = []
     errors = 0
     for source in sources:
         if source.get("error"):
             errors += 1
-        server_name = str(source.get("server_name", "") or "媒体服务器")
-        provider = str(source.get("server_type", "") or "media").strip().lower()
-        for item in source.get("items", []):
-            is_episode = str(item.type or "").casefold() == "episode"
-            episode_context = _episode_context(item) if is_episode else ""
-            title = str(item.name or item.series_name or item.display_name) if is_episode else item.display_name
-            type_label = _type_label(item.type)
-            resource_term = (item.series_name or item.display_name) if is_episode else item.display_name
-            items.append({
-                "title": title,
-                "subtitle": episode_context or " · ".join(
-                    part for part in (server_name, item.year) if part
-                ),
-                "meta": type_label,
-                "url": item.web_url or source.get("web_url", ""),
-                "resource_url": f"/discovery?q={quote_plus(resource_term)}",
-                "image_url": item.primary_image,
-                "external": True,
-                "provider": provider,
-                "source_label": server_name,
-                "type_label": type_label,
-                "year": str(item.year or ""),
-                "is_local": True,
-                "is_episode": is_episode,
-                "series_name": str(item.series_name or ""),
-                "episode_context": episode_context,
-                "overview": str(item.overview or ""),
-                "original_title": episode_context if is_episode else (
-                    str(item.name or "") if item.name != item.display_name else ""
-                ),
-                "rating": None,
-                "rating_source": "",
-            })
+        raw_items = list(source.get("items", []))
+        real_series_ids = {
+            _series_id(item) for item in raw_items
+            if str(item.type or "").casefold() in {"series", "tv"}
+            and _series_id(item)
+        }
+        real_series_titles = {
+            _series_title_key(item) for item in raw_items
+            if str(item.type or "").casefold() in {"series", "tv"}
+            and _series_title_key(item)
+        }
+        source_items: list[dict] = []
+        seen_series: set[str] = set()
+        for item in raw_items:
+            payload = _local_media_payload(item, source)
+            if payload is None:
+                continue
+            item_type = str(item.type or "").casefold()
+            if item_type not in {"episode", "series", "tv"}:
+                source_items.append(payload)
+                continue
+
+            if item_type == "episode":
+                series_id = _series_id(item)
+                title_key = _series_title_key(item)
+                # 若真实 Series 同时返回，只保留它；否则用第一集提升出剧集卡片。
+                if (
+                    (series_id and series_id in real_series_ids)
+                    or (not series_id and title_key in real_series_titles)
+                ):
+                    continue
+            identity = _series_identity(item)
+            if not identity or identity in seen_series:
+                continue
+            seen_series.add(identity)
+            source_items.append(payload)
+        items.extend(source_items)
     error = "该来源暂时不可用" if sources and errors == len(sources) and not items else ""
     return _section(
         "local", "本地媒体", f"/media/recent?q={quote_plus(query)}", items[:_MEDIA_SECTION_LIMIT], error

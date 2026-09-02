@@ -163,6 +163,35 @@ class PagesUiContractTests(unittest.TestCase):
         self.assertIn("grid-template-columns: minmax(0, 1.25fr) minmax(320px, 1fr);", css)
         self.assertIn(".settings-network-card .network-config-grid", css)
 
+    def test_recent_media_mobile_scroll_uses_rendering_containment(self):
+        html = MEDIA_RECENT_HTML.read_text(encoding="utf-8")
+        css = MEDIA_HUB_CSS.read_text(encoding="utf-8")
+
+        self.assertIn('width="320" height="480"', html)
+        self.assertIn('decoding="async"', html)
+        self.assertIn("loading=\"{{ 'eager' if loop.index <= 2 else 'lazy' }}\"", html)
+        self.assertIn("fetchpriority=\"{{ 'high' if loop.index <= 2 else 'auto' }}\"", html)
+        self.assertIn("content-visibility: auto;", css)
+        self.assertIn("contain-intrinsic-size: auto 430px;", css)
+        self.assertIn("contain-intrinsic-size: auto 380px;", css)
+        self.assertIn("@media (hover: none), (pointer: coarse)", css)
+        self.assertIn("box-shadow: none;", css)
+
+    def test_global_search_mobile_scroll_uses_rendering_containment(self):
+        html = GLOBAL_SEARCH_HTML.read_text(encoding="utf-8")
+        css = MEDIA_HUB_CSS.read_text(encoding="utf-8")
+
+        self.assertIn('width="272" height="408"', html)
+        self.assertIn('loading="eager" decoding="async" fetchpriority="high"', html)
+        self.assertIn('width="320" height="480"', html)
+        self.assertIn('loading="lazy" decoding="async" fetchpriority="auto"', html)
+        self.assertIn(".media-hub-page .global-media-card {", css)
+        self.assertIn("content-visibility: auto;", css)
+        self.assertIn(".media-hub-page .global-top-poster > small,", css)
+        self.assertIn("-webkit-backdrop-filter: none;", css)
+        self.assertIn("backdrop-filter: none;", css)
+        self.assertIn(".media-hub-page .global-task-card:hover,", css)
+
     def test_settings_discovery_cards_do_not_inherit_catalog_hover_motion(self):
         css = (ROOT / "app" / "static" / "css" / "settings-agent.css").read_text(encoding="utf-8")
 

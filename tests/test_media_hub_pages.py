@@ -279,16 +279,16 @@ class MediaHubPageContractTests(InitializedWebTestCase):
                         "overview": "保罗踏上复仇之路", "original_title": "Dune: Part Two",
                         "rating": None,
                     }, {
-                        "title": "沙漠之梦",
-                        "subtitle": "沙丘：预言 · 第 1 季 · 第 3 集",
-                        "episode_context": "沙丘：预言 · 第 1 季 · 第 3 集",
-                        "meta": "单集",
-                        "url": "http://media.example:8096/web/index.html#!/details?id=episode-3",
+                        "title": "沙丘：预言",
+                        "subtitle": "家庭 Jellyfin · 2026",
+                        "episode_context": "",
+                        "meta": "剧集",
+                        "url": "http://media.example:8096/web/index.html#!/details?id=series-1",
                         "image_url": "",
                         "external": True,
                         "provider": "jellyfin", "source_label": "家庭 Jellyfin",
-                        "type_label": "单集", "year": "2026", "is_local": True,
-                        "overview": "第三集", "original_title": "沙丘：预言",
+                        "type_label": "剧集", "year": "2026", "is_local": True,
+                        "overview": "沙丘世界的前传故事", "original_title": "",
                         "rating": None,
                     }],
                 },
@@ -326,9 +326,11 @@ class MediaHubPageContractTests(InitializedWebTestCase):
         search.assert_called_once_with("沙丘")
         self.assertIn("沙丘 2", response.text)
         self.assertIn("沙丘订阅", response.text)
-        self.assertIn("沙漠之梦", response.text)
-        self.assertIn("沙丘：预言 · 第 1 季 · 第 3 集", response.text)
-        self.assertIn("单集", response.text)
+        self.assertIn("沙丘：预言", response.text)
+        self.assertIn("家庭 Jellyfin · 2026", response.text)
+        self.assertIn("剧集", response.text)
+        self.assertNotIn("沙漠之梦", response.text)
+        self.assertNotIn("第 3 集", response.text)
         self.assertIn('value="沙丘"', response.text)
         for contract in (
             'class="global-top-hit"',

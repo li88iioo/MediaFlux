@@ -1339,11 +1339,20 @@ def _incremental_rel_dir(rel_dir: str, rel_prefix: str = "") -> str:
     return str(Path(*parts)) if parts else ""
 
 
-def _incremental_remote_file(client, change: dict) -> GuangYaFile:
+_INCREMENTAL_PARENT_BATCH_MIN_FILES = 4
+_INCREMENTAL_PARENT_BATCH_MAX_ITEMS = 5_000
+_INCREMENTAL_PARENT_BATCH_MIN_ITEM_BUDGET = 400
+_REMOTE_FILE_NOT_PREFETCHED = object()
+
+
+def _validate_incremental_remote_file(
+    current: GuangYaFile | None,
+    change: dict,
+) -> GuangYaFile:
+    """验证整理快照仍与远端对象一致。"""
     file_id = str(change.get("file_id") or "").strip()
     if not file_id:
         raise ValueError("STRM 精准增量缺少 file_id")
-    current = client.file_info(file_id)
     if current is None or current.is_dir:
         raise RuntimeError(f"STRM 精准增量对象已不存在：{file_id}")
     expected_name = str(change.get("name") or "")
@@ -1359,6 +1368,96 @@ def _incremental_remote_file(client, change: dict) -> GuangYaFile:
     if expected_parent and str(current.parent_id or "") != expected_parent:
         raise RuntimeError(f"STRM 精准增量对象位置已变化：{file_id}")
     return current
+
+
+def _incremental_remote_file(
+    client,
+    change: dict,
+    *,
+    prefetched: GuangYaFile | None | object = _REMOTE_FILE_NOT_PREFETCHED,
+) -> GuangYaFile:
+    """读取并验证单个远端对象；父目录快照命中时不再逐文件请求。"""
+    file_id = str(change.get("file_id") or "").strip()
+    if not file_id:
+        raise ValueError("STRM 精准增量缺少 file_id")
+    current = (
+        client.file_info(file_id)
+        if prefetched is _REMOTE_FILE_NOT_PREFETCHED
+        else prefetched
+    )
+    return _validate_incremental_remote_file(current, change)
+
+
+def _incremental_parent_snapshots(
+    client,
+    upserts: list[dict],
+    stats: dict,
+    *,
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[dict[str, dict[str, GuangYaFile]], bool]:
+    """按父目录合并远端校验，失败时保守回退逐文件 ``file_info``。
+
+    整理完成后常会一次产生几十个同目录变更。旧实现为每个文件单独请求
+    ``file_info``；目录完整快照可用一次分页读取验证同组对象。根目录和小组
+    仍走原路径，避免为了少量对象读取可能很大的目录。
+    """
+    grouped: dict[str, list[dict]] = {}
+    for change in upserts:
+        parent_id = str(change.get("parent_id") or "").strip()
+        if not parent_id or parent_id == "0":
+            continue
+        grouped.setdefault(parent_id, []).append(change)
+
+    snapshots: dict[str, dict[str, GuangYaFile]] = {}
+    for parent_id, parent_changes in grouped.items():
+        if len(parent_changes) < _INCREMENTAL_PARENT_BATCH_MIN_FILES:
+            continue
+        if should_stop and should_stop():
+            return snapshots, True
+        started = time.monotonic()
+        try:
+            files = list(_iter_client_dir(
+                client,
+                parent_id,
+                should_stop=should_stop,
+                # 小批量变化不应为读取超大目录付出几十页成本；变化越多，
+                # 允许的目录预算越高，最多仍受硬上限约束。
+                max_items=min(
+                    _INCREMENTAL_PARENT_BATCH_MAX_ITEMS,
+                    max(
+                        _INCREMENTAL_PARENT_BATCH_MIN_ITEM_BUDGET,
+                        len(parent_changes) * 8,
+                    ),
+                ),
+            ))
+            if should_stop and should_stop():
+                return snapshots, True
+            snapshots[parent_id] = {
+                str(file.file_id): file
+                for file in files
+                if str(file.file_id or "")
+            }
+            stats["incremental_parent_batches"] += 1
+            stats["incremental_parent_batch_files"] += len(parent_changes)
+        except Exception as exc:
+            # 批量快照只是优化层。目录过大、分页失败或测试替身不支持时，
+            # 继续使用原有逐文件校验，不把优化层故障升级为业务失败。
+            stats["incremental_parent_batch_fallbacks"] += 1
+            logger.debug(
+                "STRM 精准增量父目录批量校验回退 parent=%s files=%s type=%s",
+                parent_id,
+                len(parent_changes),
+                type(exc).__name__,
+            )
+        finally:
+            stats["incremental_parent_batch_elapsed_seconds"] = round(
+                float(stats.get(
+                    "incremental_parent_batch_elapsed_seconds", 0.0
+                ) or 0.0)
+                + time.monotonic() - started,
+                3,
+            )
+    return snapshots, False
 
 
 def _metadata_state_matches(row, file: GuangYaFile, expected: Path) -> bool:
@@ -1504,6 +1603,12 @@ def _sync_strm_incremental_impl(
         "generate_elapsed_seconds": 0.0, "cleanup_elapsed_seconds": 0.0,
         "failure_resolve_batches": 0, "failure_resolve_elapsed_seconds": 0.0,
         "failure_ledger_failed": 0,
+        "incremental_parent_batches": 0,
+        "incremental_parent_batch_files": 0,
+        "incremental_parent_batch_fallbacks": 0,
+        "incremental_parent_batch_rechecks": 0,
+        "incremental_parent_batch_elapsed_seconds": 0.0,
+        "incremental_file_info_requests": 0,
         "error_samples": [], "changes": [], "omitted_count": 0,
         "changed_strm_paths": [], "changed_dirs": [], "changed_paths_omitted": 0,
         "stopped": False, "stop_stage": "", "mode": "incremental",
@@ -1551,6 +1656,20 @@ def _sync_strm_incremental_impl(
     completed = 0
     generate_started = time.monotonic()
     progress.emit("generate", 0, total_work, "精准更新 STRM")
+    parent_snapshots, prefetch_stopped = _incremental_parent_snapshots(
+        client,
+        upserts,
+        stats,
+        should_stop=should_stop,
+    )
+    if prefetch_stopped:
+        stats["stopped"] = True
+        stats["stop_stage"] = "incremental-prefetch"
+        stats["clean_skipped"] = True
+        stats["generate_elapsed_seconds"] = round(
+            time.monotonic() - generate_started, 3
+        )
+        return stats
 
     for change in upserts:
         if stop_requested("incremental"):
@@ -1562,7 +1681,23 @@ def _sync_strm_incremental_impl(
         kind = change["kind"]
         file_id = str(change["file_id"])
         try:
-            file = _incremental_remote_file(client, change)
+            parent_id = str(change.get("parent_id") or "").strip()
+            if parent_id in parent_snapshots:
+                try:
+                    file = _incremental_remote_file(
+                        client,
+                        change,
+                        prefetched=parent_snapshots[parent_id].get(file_id),
+                    )
+                except RuntimeError:
+                    # 光鸭目录分页在移动后可能短暂落后于 file_info。仅对
+                    # 缺失或快照不一致项回查一次，既避免误判又不放宽校验。
+                    stats["incremental_parent_batch_rechecks"] += 1
+                    stats["incremental_file_info_requests"] += 1
+                    file = _incremental_remote_file(client, change)
+            else:
+                stats["incremental_file_info_requests"] += 1
+                file = _incremental_remote_file(client, change)
             rel_dir = _incremental_rel_dir(
                 str(change.get("rel_dir") or ""), rel_prefix
             )
@@ -1702,9 +1837,13 @@ def _sync_strm_incremental_impl(
     )
     progress.emit("complete", 1, 1, "精准同步完成")
     logger.info(
-        "STRM 精准同步完成 dir=%s 视频=%s 生成=%s 元数据=%s 回退=%s",
+        "STRM 精准同步完成 dir=%s 视频=%s 生成=%s 元数据=%s 回退=%s "
+        "目录批次=%s 批量文件=%s 单项复核=%s",
         source_dir_id, stats["total"], stats["generated"],
         stats["metadata_generated"], stats["fallback_required"],
+        stats["incremental_parent_batches"],
+        stats["incremental_parent_batch_files"],
+        stats["incremental_file_info_requests"],
     )
     return stats
 
