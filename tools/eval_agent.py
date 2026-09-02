@@ -16,6 +16,7 @@ import re
 import sys
 from time import monotonic
 from typing import Any, Iterable, Mapping, Sequence
+from unittest.mock import patch
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -540,13 +541,16 @@ def _offline_route_projection(
         trusted_context=trusted_conversation_context,
     )
     if response is None:
-        response = orchestrator._query_raw(
-            message,
-            owner=owner,
-            conversation_context=projected_context,
-            trusted_conversation_context=trusted_conversation_context,
-            allow_model_routing=False,
-        )
+        # 黄金集必须完全离线。生产编排器即使在确定性路由都未命中时
+        # 保留纯对话兜底，这里也不能因此访问外部 LLM Provider。
+        with patch("app.agent.orchestrator.answer_conversation", return_value=None):
+            response = orchestrator._query_raw(
+                message,
+                owner=owner,
+                conversation_context=projected_context,
+                trusted_conversation_context=trusted_conversation_context,
+                allow_model_routing=False,
+            )
     tool_call = response.get("tool_call") if isinstance(response, dict) else None
     if not isinstance(tool_call, dict) or not str(tool_call.get("name") or "").strip():
         return None

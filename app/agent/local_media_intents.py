@@ -22,6 +22,12 @@ _LOCAL_MEDIA_SOURCE_LIST_PATTERN = re.compile(
     r"(?:列表|摘要|状态|配置|情况|概览|汇总)?(?:一下)?[.!。！？]?$",
     re.IGNORECASE,
 )
+_LOCAL_MEDIA_SOURCE_COMPOUND_LIST_PATTERN = re.compile(
+    r"^(?:请(?:帮我)?\s*)?(?:本地媒体|本地整理)\s*"
+    r"(?:配置了|设置了|有)?\s*(?:哪些|什么|几个)\s*(?:媒体)?来源"
+    r"(?:[？?，,。；;].{0,80})?[.!。！？]?$",
+    re.IGNORECASE,
+)
 _LOCAL_MEDIA_SOURCE_CONTROL_PATTERN = re.compile(
     rf"^(?:请(?:帮我)?\s*)?"
     r"(暂停|停用|禁用|关闭|关掉|恢复|启用|开启|打开)\s*"
@@ -73,6 +79,8 @@ def local_media_source_summary_request(message: str) -> dict[str, int] | None:
 def is_local_media_source_summaries_message(message: str) -> bool:
     """判断是否为本地媒体来源列表请求，避免被宽泛诊断路由抢占。"""
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if _LOCAL_MEDIA_SOURCE_COMPOUND_LIST_PATTERN.fullmatch(normalized):
+        return True
     if any(token in normalized for token in _LOCAL_MEDIA_SOURCE_WRITE_TOKENS):
         return False
     return bool(_LOCAL_MEDIA_SOURCE_LIST_PATTERN.fullmatch(normalized))

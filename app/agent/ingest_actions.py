@@ -222,9 +222,11 @@ def ingest_inspect_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def _positions(
     value: Any, *, maximum: int, required: bool
 ) -> list[int]:
-    if value is None and not required:
-        return []
-    if not isinstance(value, list) or not value:
+    if value is None or (isinstance(value, list) and not value):
+        if not required:
+            return []
+        raise AgentToolError("positions 必须是非空候选序号列表")
+    if not isinstance(value, list):
         raise AgentToolError("positions 必须是非空候选序号列表")
     result: list[int] = []
     for raw in value:

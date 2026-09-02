@@ -849,13 +849,15 @@ def is_recent_read_retry_message(message: str) -> bool:
 _RESOURCE_SEARCH_TOKENS = ("资源", "种子", "磁力", "下载源", "资源站")
 _RESOURCE_SEARCH_VERBS = ("找", "搜", "搜索", "查找", "有没有", "有无")
 _DISCOVERY_SEARCH_TOKENS = (
-    "网上", "外部", "影视探索", "探索页", "tmdb", "豆瓣", "bangumi", "bgm",
+    "网上", "外部", "影视探索", "探索页", "影视资料", "影视信息", "条目资料", "条目信息",
+    "tmdb", "豆瓣", "bangumi", "bgm",
 )
 _DISCOVERY_SEARCH_VERBS = _RESOURCE_SEARCH_VERBS + ("查", "查询", "查一下")
 _LOCAL_LIBRARY_TOKENS = ("媒体库", "jellyfin", "emby", "我的库", "本地库", "库里")
 _DISCOVERY_RECOMMEND_ANCHORS = (
     "推荐", "有什么好看的", "看什么", "片荒", "剧荒",
     "有新剧", "有哪些新剧", "有新番", "有哪些新番",
+    "有新国漫", "有哪些新国漫", "有什么新国漫", "新国漫有哪些",
 )
 _DISCOVERY_RECOMMEND_REJECT_TOKENS = _RESOURCE_SEARCH_TOKENS + _LOCAL_LIBRARY_TOKENS
 _RECENT_RESOURCE_REFERENCES = (
@@ -947,7 +949,8 @@ _QB_REALTIME_STATUS_PATTERN = re.compile(
 _MEDIA_LIBRARY_TOTAL_PATTERN = re.compile(
     r"(?:我的|当前|全部)?(?:jellyfin|emby|媒体服务器|媒体库).{0,18}"
     r"(?:媒体总数|媒体数量|总共有多少(?:个|项)?媒体|一共有多少(?:个|项)?媒体|"
-    r"有多少(?:个|项)?媒体|多少(?:个|项)?媒体)|"
+    r"有多少(?:个|项)?媒体|多少(?:个|项)?媒体|"
+    r"(?:总共|一共|共有|有)?多少部电影.{0,20}多少部(?:剧|剧集|电视剧).{0,20}多少集)|"
     r"(?:媒体总数|媒体数量).{0,18}(?:jellyfin|emby|媒体服务器|媒体库)",
     re.IGNORECASE,
 )
@@ -1237,6 +1240,17 @@ def download_task_control_request(message: str) -> tuple[str, str] | None:
     return _DOWNLOAD_CONTROL_OPERATIONS[verb], task_name
 
 
+def is_unsafe_qb_bulk_delete_request(message: str) -> bool:
+    """识别 Agent 明确不支持的 qB 批量破坏请求，返回可执行的安全说明。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not any(token in normalized for token in ("qbittorrent", "qb 下载", "qb下载", "qb 任务", "qb任务")):
+        return False
+    return (
+        any(token in normalized for token in ("全部", "所有", "全清", "清空", "批量"))
+        and any(token in normalized for token in ("删除", "移除", "清理"))
+    )
+
+
 def is_download_task_control_message(message: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
     return any(token in normalized for token in ("下载任务", "qb 任务", "qb任务", "qbittorrent 任务")) and any(
@@ -1305,6 +1319,30 @@ _RSS_SUBSCRIPTION_SUMMARIES_TOKENS = (
 _RSS_SUBSCRIPTION_BULK_TOKENS = (
     "全部", "所有", "列表", "列出", "逐个", "每个", "各个", "汇总",
 )
+
+_MIXED_SUBSCRIPTION_SUMMARY_MEDIA_TOKENS = (
+    "媒体追更", "追更订阅", "媒体订阅", "追更",
+)
+_MIXED_SUBSCRIPTION_SUMMARY_READ_TOKENS = (
+    "哪些", "有什么", "有多少", "列出", "查看", "查询", "配置了", "已配置", "列表", "汇总",
+)
+_MIXED_SUBSCRIPTION_SUMMARY_REJECT_TOKENS = (
+    "创建", "新增", "添加", "删除", "移除", "启用", "停用", "关闭", "修改", "编辑", "刷新",
+)
+
+
+def is_mixed_subscription_summary_message(message: str) -> bool:
+    """识别同一句中的 RSS 与媒体追更汇总，避免只回答前半句。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if "rss" not in normalized:
+        return False
+    if not any(token in normalized for token in _MIXED_SUBSCRIPTION_SUMMARY_MEDIA_TOKENS):
+        return False
+    if any(token in normalized for token in _MIXED_SUBSCRIPTION_SUMMARY_REJECT_TOKENS):
+        return False
+    return any(token in normalized for token in _MIXED_SUBSCRIPTION_SUMMARY_READ_TOKENS)
+
+
 _RSS_SUBSCRIPTION_GENERIC_SUMMARY_NAMES = frozenset({
     "状态", "详情", "摘要", "情况", "健康", "概览", "订阅", "rss", "rss订阅",
     "是否启用", "刷新周期", "刷新间隔", "调度状态",
@@ -1514,7 +1552,17 @@ def _is_negated_rss_refresh_message(message: str) -> bool:
         return True
 
     suffix = compact[refresh_position + len("刷新"):refresh_position + 24]
-    return any(token in suffix for token in _RSS_REFRESH_POST_NEGATION_TOKENS)
+    for token in _RSS_REFRESH_POST_NEGATION_TOKENS:
+        position = suffix.find(token)
+        if position < 0:
+            continue
+        after = suffix[position + len(token):]
+        # “刷新 RSS，但不要直接下载/提交资源”是在约束后续下载动作，
+        # 不是撤回刷新本身。只有否定词没有明确指向其它动作时才制止刷新。
+        if re.match(r"(?:直接|自动)?(?:下载|提交|推送|发送|整理|删除|转存)", after):
+            continue
+        return True
+    return False
 
 
 def is_rss_subscription_refresh_write_message(message: str) -> bool:
@@ -1628,14 +1676,16 @@ _RSS_SUBSCRIPTION_NAMED_ENABLED_PATTERNS = (
 _RSS_SUBSCRIPTION_NAMED_INTERVAL_PATTERNS = (
     re.compile(
         r"^(?:请(?:帮我)?\s*)?(?:把|将)\s*(?P<name>.+?)\s*(?:的\s*)?rss\s*(?:订阅)?\s*"
-        r"(?:的\s*)?(?:自动)?刷新(?:周期|间隔)\s*(?:设置为|设为|改为|调整为)\s*"
-        r"(?P<amount>\d{1,5})\s*(?P<unit>分钟|分|小时|时)[.!。！]?$",
+        r"(?:的\s*)?(?:自动)?刷新(?:周期|间隔)\s*(?:设置为|设置成|设为|设成|改为|改成|调整为|调整成)\s*"
+        r"(?P<amount>\d{1,5})\s*(?P<unit>分钟|分|小时|时)"
+        r"(?:\s*[，,]\s*(?:保持|保留).{0,40}(?:不变|不修改))?[.!。！]?$",
         re.IGNORECASE,
     ),
     re.compile(
         r"^(?:请(?:帮我)?\s*)?(?:把|将)\s*rss\s*(?:订阅)?\s*(?P<name>.+?)\s*"
-        r"(?:的\s*)?(?:自动)?刷新(?:周期|间隔)\s*(?:设置为|设为|改为|调整为)\s*"
-        r"(?P<amount>\d{1,5})\s*(?P<unit>分钟|分|小时|时)[.!。！]?$",
+        r"(?:的\s*)?(?:自动)?刷新(?:周期|间隔)\s*(?:设置为|设置成|设为|设成|改为|改成|调整为|调整成)\s*"
+        r"(?P<amount>\d{1,5})\s*(?P<unit>分钟|分|小时|时)"
+        r"(?:\s*[，,]\s*(?:保持|保留).{0,40}(?:不变|不修改))?[.!。！]?$",
         re.IGNORECASE,
     ),
 )
@@ -1778,6 +1828,14 @@ _MEDIA_SUBSCRIPTION_ENABLED_PATTERN = re.compile(
     rf"^(?:请(?:帮我)?\s*)?(暂停|停用|禁用|关闭|恢复|启用|开启)\s*"
     rf"(?:{_MEDIA_SUBSCRIPTION_SCOPE_PATTERN})\s*"
     r"(?:(?:id|编号)\s*)?[#:]?\s*(\d{1,9})\s*(?:一下)?[.!。！]?$",
+    re.IGNORECASE,
+)
+_MEDIA_SUBSCRIPTION_NAMED_ENABLED_PATTERN = re.compile(
+    r"^(?:请(?:帮我)?\s*)?(暂停|停用|禁用|关闭|恢复|启用|开启)\s*"
+    r"[《「『\"'](?P<name>[^》」』\"']{1,120})[》」』\"']\s*(?:的\s*)?"
+    r"(?:(?:媒体|影视)(?:追更)?订阅|追更订阅)"
+    r"(?:\s*[，,]\s*(?:但|并且)?\s*(?:不要|别)\s*(?:删除|移除))?"
+    r"(?:一下)?[.!。！]?$",
     re.IGNORECASE,
 )
 _MEDIA_SUBSCRIPTION_READ_TOKENS = (
@@ -2133,6 +2191,38 @@ def media_subscription_control_request(
     )
 
 
+def media_subscription_control_name_request(
+    message: str,
+) -> tuple[str, bool] | None:
+    """解析带书名号的单条媒体追更启停请求；真实 ID 由服务端唯一绑定。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
+    if "rss" in normalized.casefold():
+        return None
+    matched = _MEDIA_SUBSCRIPTION_NAMED_ENABLED_PATTERN.fullmatch(normalized)
+    if matched is None:
+        return None
+    name = " ".join(matched.group("name").split()).strip()
+    if not name:
+        return None
+    return name, matched.group(1) in {"恢复", "启用", "开启"}
+
+
+def _media_subscription_rows_by_name(name: str) -> list[dict[str, Any]]:
+    target = unicodedata.normalize("NFKC", str(name or "")).casefold().strip()
+    if not target:
+        return []
+    matches: list[dict[str, Any]] = []
+    for row in db.list_media_subscriptions(limit=500):
+        public = dict(row)
+        aliases = {
+            unicodedata.normalize("NFKC", str(public.get(key) or "")).casefold().strip()
+            for key in ("title", "original_title")
+        }
+        if target in aliases:
+            matches.append(public)
+    return matches
+
+
 def media_subscription_delete_request(message: str) -> dict[str, int] | None:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
     if "rss" in normalized:
@@ -2148,6 +2238,7 @@ def is_media_subscription_delete_write_message(message: str) -> bool:
     normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
     return (
         "rss" not in normalized
+        and not re.search(r"(?:不要|别|不准|无需)\s*(?:删除|移除|取消)", normalized)
         and any(token in normalized for token in ("删除", "移除", "取消"))
         and bool(re.search(r"(?:媒体|影视|追更).{0,6}订阅|订阅.{0,6}追更", normalized))
     )
@@ -3039,7 +3130,7 @@ _TELEGRAM_TEST_NOTIFICATION_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"^(?:请(?:帮我)?\s*)?给\s*(?:telegram|tg)\s*"
+        r"^(?:请(?:帮我)?\s*)?给\s*(?:我(?:的)?\s*)?(?:telegram|tg)\s*"
         r"(?:发送|发|推送)\s*(?:一条\s*)?(?:连接\s*)?测试(?:通知|消息)"
         r"(?:一下|一次)?[.!。！？]?$",
         re.IGNORECASE,
@@ -3409,6 +3500,7 @@ _MEDIA_PROXY_SCOPES = (
 _MEDIA_PROXY_ENABLE_INTENTS = ("启用", "开启", "打开")
 _MEDIA_PROXY_DISABLE_INTENTS = ("停用", "禁用", "关闭", "关掉")
 _MEDIA_PROXY_TEST_INTENTS = ("测试", "探测", "连通", "连接", "能用吗")
+_MEDIA_PROXY_RESTART_INTENTS = ("重启", "重新启动", "重新拉起")
 _MEDIA_PROXY_STATUS_INTENTS = (
     "状态", "概览", "汇总", "摘要", "列表", "运行情况", "有几个", "多少个",
     "正常吗", "是否正常", "是不是正常", "有问题吗", "失败", "异常", "诊断",
@@ -3468,6 +3560,29 @@ def is_media_proxy_control_message(message: str) -> bool:
     wants_enable = any(token in normalized for token in _MEDIA_PROXY_ENABLE_INTENTS)
     wants_disable = any(token in normalized for token in _MEDIA_PROXY_DISABLE_INTENTS)
     return wants_enable != wants_disable
+
+
+def media_proxy_restart_request(message: str) -> dict[str, int] | None:
+    """解析精确实例序号的媒体反代重启命令。"""
+    normalized = _normalize_intent_message(message)
+    if not _has_media_proxy_scope(normalized) or _is_dangerous_action_discussion(normalized):
+        return None
+    if any(token in normalized for token in _MEDIA_PROXY_EDIT_REJECT_TOKENS):
+        return None
+    if not any(token in normalized for token in _MEDIA_PROXY_RESTART_INTENTS):
+        return None
+    numbers = _media_proxy_instance_numbers(normalized)
+    return {"instance_number": numbers[0]} if len(numbers) == 1 else None
+
+
+def is_media_proxy_restart_message(message: str) -> bool:
+    normalized = _normalize_intent_message(message)
+    return bool(
+        _has_media_proxy_scope(normalized)
+        and not _is_dangerous_action_discussion(normalized)
+        and not any(token in normalized for token in _MEDIA_PROXY_EDIT_REJECT_TOKENS)
+        and any(token in normalized for token in _MEDIA_PROXY_RESTART_INTENTS)
+    )
 
 
 def media_proxy_test_request(message: str) -> dict[str, int] | None:
@@ -3560,6 +3675,26 @@ _RECENT_DISCOVERY_REFERENCES = (
     "刚才搜索", "刚才的搜索", "搜索结果", "探索结果", "刚才推荐", "推荐结果",
 )
 _DISCOVERY_WATCHLIST_SCOPES = ("探索收藏", "影视收藏", "发现收藏")
+_DISCOVERY_WATCHLIST_TITLE_SCOPES = (
+    *_DISCOVERY_WATCHLIST_SCOPES,
+    "探索想看", "想看列表", "探索列表", "愿望单",
+)
+
+
+def discovery_watchlist_title_request(message: str) -> str | None:
+    """把“将《片名》加入想看”收敛为先搜索、再按候选序号确认。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not any(scope in normalized for scope in _DISCOVERY_WATCHLIST_TITLE_SCOPES):
+        return None
+    if not any(token in normalized for token in ("加入", "添加", "收藏", "放进", "存到")):
+        return None
+    if any(token in normalized for token in ("移除", "删除", "取消收藏")):
+        return None
+    matched = _MEDIA_RATING_QUOTED_TITLE_RE.search(str(message or ""))
+    if matched is None:
+        return None
+    title = " ".join(matched.group(1).split()).strip()
+    return title[:120] if title else None
 
 
 def recent_discovery_candidate_request(
@@ -3589,6 +3724,8 @@ def recent_discovery_candidate_request(
         return {**base, "action": "resource_search"}
     if "映射" in normalized and any(token in normalized for token in ("候选", "匹配", "tmdb", "查看", "看看")):
         return {**base, "action": "mapping"}
+    if any(token in normalized for token in ("豆瓣评分", "评分", "多少分", "几分")):
+        return {**base, "action": "rating"}
     if any(token in normalized for token in (
         "看看", "查看", "详情", "介绍", "是什么", "是哪部", "哪一个",
     )):
@@ -4522,6 +4659,12 @@ def _extract_workspace_search_query(message: str) -> str:
         query,
         flags=re.IGNORECASE,
     )
+    query = re.split(
+        r"[，,。；;]\s*(?:并?告诉我|再告诉我|分别(?:告诉我)?|并?说明|并?列出|顺便)",
+        query,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0]
     return query.strip(" ，。！？?、:：")[:120]
 
 
@@ -5708,6 +5851,156 @@ def _extract_search_query(message: str) -> str:
     return ""
 
 
+_GENERIC_MEDIA_LIBRARY_REFRESH_RE = re.compile(
+    r"^(?:请(?:帮我)?|帮我|麻烦)?\s*"
+    r"(?:刷新|扫描|更新|重新扫描)\s*(?:一下)?\s*"
+    r"(?:(?:jellyfin|emby)\s*)?(?:的\s*)?"
+    r"(?:(?:全部|所有)\s*)?(?:媒体库|媒体库扫描)\s*[。.!！]?$",
+    re.IGNORECASE,
+)
+
+
+def is_ambiguous_media_library_refresh_message(message: str) -> bool:
+    """泛媒体库刷新没有安全目标，必须先让用户选择具体库。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).strip()
+    return bool(_GENERIC_MEDIA_LIBRARY_REFRESH_RE.fullmatch(normalized))
+
+
+_GUANGYA_BROWSE_REJECT_TOKENS = (
+    "删除", "清理", "回收", "改名", "重命名", "移动", "转存", "上传", "新建", "创建",
+)
+
+
+def guangya_directory_browse_request(
+    message: str, *, allow_implicit: bool = False
+) -> dict[str, Any] | None:
+    """把常见的光鸭根目录/明确目录浏览话术投影为只读 list。"""
+    original = unicodedata.normalize("NFKC", str(message or "")).strip()
+    normalized = original.casefold()
+    if not original:
+        return None
+    if not allow_implicit and not any(scope in normalized for scope in ("光鸭", "云盘")):
+        return None
+    if any(token in normalized for token in _GUANGYA_BROWSE_REJECT_TOKENS):
+        return None
+    if not any(token in normalized for token in ("查看", "看看", "看下", "列出", "打开", "进入", "有哪些", "有什么")):
+        return None
+
+    has_named_child_after_root = bool(re.search(
+        r"根目录\s*(?:下|里|中)?\s*[《「『\"']?"
+        r"(?!(?:有哪些|有什么|包含|内容|的内容))"
+        r"[^《》「」『』\"'，。！？?]{1,120}?[》」』\"']?\s*(?:目录|文件夹)",
+        original,
+        flags=re.IGNORECASE,
+    ))
+    if (
+        "根目录" in normalized
+        and not has_named_child_after_root
+        and any(
+            token in normalized
+            for token in ("文件夹", "目录", "有哪些", "有什么", "列出", "查看")
+        )
+    ):
+        return {"operation": "list", "path": "/", "page": 1, "page_size": 10, "max_items": 500}
+
+    matched = re.search(
+        r"(?:打开|进入|查看|看看|看下|列出)\s*"
+        r"(?:(?:光鸭(?:云盘)?|云盘)\s*)?"
+        r"(?:根目录\s*(?:下|里|中)?\s*)?"
+        r"[《「『\"']?([^《》「」『』\"'，。！？?]{1,120}?)[》」』\"']?\s*"
+        r"(?:目录|文件夹)(?:\s*(?:看看|看下))?(?:\s*(?:里面|里|中|下))?"
+        r"(?:\s*(?:有什么|有哪些|的内容|内容))?\s*[。.!！]?$",
+        original,
+        flags=re.IGNORECASE,
+    )
+    if not matched:
+        return None
+    raw_path = " ".join(matched.group(1).split()).strip(" /：:")
+    raw_path = re.sub(
+        r"^(?:光鸭(?:云盘)?|云盘)\s*", "", raw_path, flags=re.IGNORECASE
+    ).strip(" /：:")
+    if (
+        not raw_path
+        or len(raw_path) > 120
+        or any(
+            part in {".", ".."}
+            for part in raw_path.replace("\\", "/").split("/")
+            if part
+        )
+        or any(unicodedata.category(char).startswith("C") for char in raw_path)
+    ):
+        return None
+    path = "/" + raw_path.replace("\\", "/").strip("/")
+    return {"operation": "list", "path": path, "page": 1, "page_size": 10, "max_items": 500}
+
+
+def guangya_cleanup_preview_request(message: str) -> dict[str, Any] | None:
+    """把明确光鸭子目录的清理请求降为只读冻结预览，绝不直接写云盘。"""
+    original = unicodedata.normalize("NFKC", str(message or "")).strip()
+    normalized = original.casefold()
+    if not any(scope in normalized for scope in ("光鸭", "云盘")):
+        return None
+    if not any(token in normalized for token in ("清理", "检查", "扫描", "查找")):
+        return None
+    has_empty = "空目录" in normalized or "空文件夹" in normalized
+    has_residue = any(token in normalized for token in ("垃圾", "残余", "残留", "广告目录"))
+    if not has_empty and not has_residue:
+        return None
+
+    absolute = re.search(r"(?<![\w.])(/[^\x00\r\n，。！？?]{1,120})", original)
+    if absolute:
+        raw_path = absolute.group(1).strip().rstrip(" /：:")
+        raw_path = re.split(
+            r"\s+(?:(?:目录|文件夹)\s*)?(?:中|里|下|内)(?:的)?"
+            r"(?=\s*(?:空目录|空文件夹|垃圾|残余|残留|广告目录))",
+            raw_path,
+            maxsplit=1,
+        )[0].strip()
+        raw_path = re.sub(r"\s+(?:目录|文件夹)$", "", raw_path).strip()
+    else:
+        named = re.search(
+            r"(?:根目录\s*(?:下|里|中)?\s*)"
+            r"[《「『\"']?([^《》「」『』\"'，。！？?]{1,120}?)[》」』\"']?"
+            r"(?=\s*(?:目录|文件夹)?\s*(?:中|里|下|内)(?:的)?\s*"
+            r"(?:空目录|空文件夹|垃圾|残余|残留|广告目录))",
+            original,
+            flags=re.IGNORECASE,
+        ) or re.search(
+            r"(?:根目录\s*(?:下|里|中)?\s*)"
+            r"[《「『\"']?([^《》「」『』\"'，。！？?]{1,120}?)[》」』\"']?"
+            r"\s*(?:目录|文件夹)(?:\s*(?:中|里|下|内))?",
+            original,
+            flags=re.IGNORECASE,
+        )
+        if not named:
+            return None
+        name = " ".join(named.group(1).split()).strip(" /：:")
+        if not name:
+            return None
+        raw_path = "/" + name
+
+    normalized_path = raw_path.replace("\\", "/")
+    if (
+        normalized_path == "/"
+        or normalized_path.startswith("//")
+        or len(normalized_path) > 120
+        or any(
+            part in {".", ".."}
+            for part in normalized_path.split("/")
+            if part
+        )
+        or any(unicodedata.category(char).startswith("C") for char in normalized_path)
+    ):
+        return None
+    if not normalized_path.startswith("/"):
+        normalized_path = "/" + normalized_path
+    return {
+        "path": normalized_path.rstrip("/"),
+        "max_candidates": 500,
+        "scope": "all" if has_residue else "empty_only",
+    }
+
+
 def is_strm_run_history_message(message: str) -> bool:
     normalized = _normalize_intent_message(message)
     return bool(
@@ -5883,6 +6176,7 @@ def _has_deterministic_media_subscription_binding(message: str) -> bool:
     return bool(
         media_subscription_candidate_request(message) is not None
         or media_subscription_title_request(message) is not None
+        or media_subscription_control_name_request(message) is not None
         or media_subscription_delete_request(message) is not None
         or is_media_subscription_delete_write_message(message)
         or is_media_subscription_notification_rule_message(message)
@@ -8728,6 +9022,31 @@ class AgentOrchestrator:
                 "discovery.confirm_mapping", mapping_confirmation, owner=owner
             )
 
+        watchlist_title = discovery_watchlist_title_request(message)
+        if watchlist_title is not None:
+            if not owner:
+                return self._unsupported(
+                    "加入探索收藏需要在已登录会话中确认",
+                    ["请登录后重新搜索片名并选择一个结果。"],
+                )
+            response = self._invoke_query_read(
+                "discovery.search",
+                {"query": watchlist_title, "limit": 20},
+                owner=owner,
+            )
+            result = response.get("result") if isinstance(response, dict) else None
+            if isinstance(result, dict):
+                suggestions = result.get("suggestions")
+                if not isinstance(suggestions, list):
+                    suggestions = []
+                    result["suggestions"] = suggestions
+                prompt = "从结果中选择一个，例如：把第 1 个加入探索收藏。"
+                if prompt not in suggestions:
+                    suggestions.insert(0, prompt)
+                    del suggestions[4:]
+                result_projection.attach_public_display(response)
+            return response
+
         watchlist_subscription_request = discovery_watchlist_subscription_request(message)
         if watchlist_subscription_request is not None:
             if not owner:
@@ -8765,9 +9084,20 @@ class AgentOrchestrator:
             )
             if isinstance(check_interval_minutes, int):
                 arguments["check_interval_minutes"] = check_interval_minutes
-            return self.prepare(
-                "media.create_subscription", arguments, owner=owner
-            )
+            try:
+                return self.prepare(
+                    "media.create_subscription", arguments, owner=owner
+                )
+            except AgentToolError as exc:
+                if (
+                    exc.code == "precondition_failed"
+                    and "已经在追更订阅中" in str(exc)
+                ):
+                    return self._conversation_response(
+                        "该媒体已经在追更订阅中，无需重复创建。",
+                        ["列出媒体追更订阅"],
+                    )
+                raise
 
         snapshot = self.recent_discovery_store.get(owner=owner) if owner else None
         subscription_request = media_subscription_candidate_request(message)
@@ -8821,9 +9151,21 @@ class AgentOrchestrator:
                 arguments["season"] = season
             if isinstance(check_interval_minutes, int):
                 arguments["check_interval_minutes"] = check_interval_minutes
-            return self.prepare(
-                "media.create_subscription", arguments, owner=owner
-            )
+            try:
+                return self.prepare(
+                    "media.create_subscription", arguments, owner=owner
+                )
+            except AgentToolError as exc:
+                if (
+                    exc.code == "precondition_failed"
+                    and "已经在追更订阅中" in str(exc)
+                ):
+                    title = str(candidate.get("title") or "该媒体").strip()
+                    return self._conversation_response(
+                        f"《{title}》已经在媒体追更订阅中，无需重复创建。",
+                        ["列出媒体追更订阅"],
+                    )
+                raise
 
         recent_discovery_request = recent_discovery_candidate_request(
             message, allow_implicit=snapshot is not None
@@ -8856,6 +9198,26 @@ class AgentOrchestrator:
                         "media_type": candidate["media_type"],
                     },
                     owner=owner,
+                )
+            if recent_discovery_request["action"] == "rating":
+                if not self.registry.has("discovery.lookup_rating"):
+                    return self._clarification_response(
+                        "当前工具集没有启用影视评分查询。",
+                        [f"查看第 {position} 个的详情。"],
+                    )
+                arguments: dict[str, Any] = {
+                    "query": candidate["title"],
+                    "media_type": candidate["media_type"],
+                    "allow_web_fallback": True,
+                }
+                year = str(candidate.get("year") or "").strip()
+                if re.fullmatch(r"(?:19|20)\d{2}", year):
+                    arguments["year"] = year
+                return self._invoke_query_read(
+                    "discovery.lookup_rating",
+                    arguments,
+                    owner=owner,
+                    rate_identity=query_tool_rate_identity,
                 )
             if recent_discovery_request["action"] in {"inspect", "mapping"}:
                 tool_name = (
@@ -9468,6 +9830,45 @@ class AgentOrchestrator:
                 )
             return self.prepare(tool_name, arguments, owner=owner)
 
+        media_named_control = media_subscription_control_name_request(message)
+        if media_named_control is not None:
+            subscription_name, enabled = media_named_control
+            matches = _media_subscription_rows_by_name(subscription_name)
+            if len(matches) == 1:
+                row = matches[0]
+                current_enabled = bool(row.get("enabled"))
+                if current_enabled == enabled:
+                    action = "启用" if enabled else "暂停"
+                    return self._conversation_response(
+                        f"《{row.get('title') or subscription_name}》当前已经是{action}状态，无需重复修改。",
+                        ["列出媒体追更订阅"],
+                    )
+                if not owner:
+                    return self._unsupported(
+                        "修改媒体追更状态需要在已登录会话中确认",
+                        ["请登录后重新提交，并在预检后确认修改。"],
+                    )
+                return self.prepare(
+                    "media.set_subscription_enabled",
+                    {
+                        "subscription_id": int(row["id"]),
+                        "enabled": enabled,
+                    },
+                    owner=owner,
+                )
+            if len(matches) > 1:
+                return self._clarification_response(
+                    f"找到多个名为《{subscription_name}》的媒体追更订阅，请选择一个订阅编号。",
+                    [
+                        f"{'启用' if enabled else '暂停'}媒体订阅 {int(row['id'])}。"
+                        for row in matches[:3]
+                    ],
+                )
+            return self._clarification_response(
+                f"没有找到名为《{subscription_name}》的媒体追更订阅。",
+                ["列出媒体追更订阅"],
+            )
+
         media_delete_request = media_subscription_delete_request(message)
         if media_delete_request is not None:
             if not owner:
@@ -9693,7 +10094,15 @@ class AgentOrchestrator:
                     [CONFIRM_EXECUTION_IN_AGENT],
                 )
             tool_name, arguments = rss_control_request
-            return self.prepare(tool_name, arguments, owner=owner)
+            try:
+                return self.prepare(tool_name, arguments, owner=owner)
+            except AgentToolError as exc:
+                if exc.code == "precondition_failed" and "没有变化" in str(exc):
+                    return self._conversation_response(
+                        "该 RSS 订阅当前已经是目标配置，无需重复修改。",
+                        ["列出全部 RSS 订阅"],
+                    )
+                raise
         rss_named_control = rss_subscription_control_name_request(message)
         if rss_named_control is not None:
             tool_name, subscription_name, extra_arguments = rss_named_control
@@ -9708,7 +10117,15 @@ class AgentOrchestrator:
                     "subscription_id": resolution.subscription_id,
                     **extra_arguments,
                 }
-                return self.prepare(tool_name, arguments, owner=owner)
+                try:
+                    return self.prepare(tool_name, arguments, owner=owner)
+                except AgentToolError as exc:
+                    if exc.code == "precondition_failed" and "没有变化" in str(exc):
+                        return self._conversation_response(
+                            f"RSS 订阅《{subscription_name}》当前已经是目标配置，无需重复修改。",
+                            ["列出全部 RSS 订阅"],
+                        )
+                    raise
             if "enabled" in extra_arguments:
                 action = "启用" if extra_arguments.get("enabled") else "停用"
                 examples = [
@@ -9922,7 +10339,8 @@ class AgentOrchestrator:
                 token in lower
                 for token in (
                     "查看", "检查", "查询", "状态", "进度", "日志", "记录", "历史",
-                    "结果", "完成了吗", "到哪", "怎么样", "定时", "计划", "预览", "试运行",
+                    "结果", "完成了吗", "到哪", "怎么样", "失败", "异常", "待确认", "跳过",
+                    "定时", "计划", "预览", "试运行",
                 )
             )
         ):
@@ -10049,6 +10467,26 @@ class AgentOrchestrator:
                     "刷新 RSS 或媒体追更",
                 ],
             )
+        if (
+            initial_objective.task_kind == "media_library_refresh"
+            and is_ambiguous_media_library_refresh_message(message)
+        ):
+            return self._clarification_response(
+                "刷新媒体库需要指定一个具体的 Jellyfin / Emby 媒体库；Agent 不会把泛指请求扩成全库扫描。",
+                [
+                    "例如：刷新 Jellyfin 的动漫库",
+                    "例如：刷新 Emby 的电影库",
+                ],
+            )
+        if is_unsafe_qb_bulk_delete_request(message):
+            return self._clarification_response(
+                "Agent 不支持批量删除全部 qBittorrent 任务，也不会代为删除下载文件。请先查看实时队列，再指定唯一任务处理。",
+                [
+                    "查看 qBittorrent 当前实时任务",
+                    "暂停 qBittorrent 任务《任务名》",
+                    "移除 qBittorrent 任务《任务名》（保留文件）",
+                ],
+            )
 
         discovery_followup = self._handle_discovery_followup(
             message,
@@ -10099,6 +10537,87 @@ class AgentOrchestrator:
         )
         deterministic_qb_realtime = bool(_QB_REALTIME_STATUS_PATTERN.search(message))
         deterministic_media_counts = bool(_MEDIA_LIBRARY_TOTAL_PATTERN.search(message))
+        deterministic_agent_runtime = initial_objective.task_kind in {
+            "agent_status", "telegram_status",
+        }
+        deterministic_telegram_test = is_telegram_test_notification_message(message)
+        deterministic_rss_refresh = is_rss_subscription_refresh_write_message(message)
+        deterministic_rss_binding = bool(
+            deterministic_rss_refresh
+            or (
+                not _is_dangerous_action_discussion(message)
+                and (
+                rss_subscription_control_request(message) is not None
+                or rss_subscription_control_name_request(message) is not None
+                or rss_subscription_refresh_request(message) is not None
+                or rss_subscription_refresh_name(message) is not None
+                )
+            )
+        )
+        deterministic_local_specific = bool(
+            local_media_intents.local_media_task_request(message) is not None
+            or local_media_intents.local_media_source_summary_request(message) is not None
+            or local_media_intents.is_local_media_source_summaries_message(message)
+            or local_media_intents.is_local_media_review_queue_summary_message(message)
+            or local_media_intents.is_local_media_history_summary_message(message)
+        )
+        deterministic_indexer_summary = bool(
+            is_indexer_sites_summary_message(message)
+            or (
+                "索引站" in lower
+                and any(token in lower for token in ("配置", "哪些", "列表", "开启", "关闭", "可搜索"))
+                and indexer_site_change_request(lower) is None
+            )
+        )
+        deterministic_safe_policy_summary = is_safe_policy_summary_message(message)
+        deterministic_agent_safety = bool(
+            ("agent" in lower or "助手" in lower)
+            and any(token in lower for token in ("安全限制", "安全边界", "二次确认", "哪些操作需要确认"))
+        )
+        deterministic_media_proxy_restart = is_media_proxy_restart_message(message)
+        deterministic_playback_compound = bool(
+            any(token in lower for token in ("播放失败", "播放故障"))
+            and any(token in lower for token in ("302", "媒体反代", "反代状态", "播放链路"))
+            and any(token in lower for token in ("状态", "正常吗", "是否正常", "有问题吗"))
+        )
+        previous_tool = str(
+            _latest_assistant_tool_context(conversation_context).get("tool_name") or ""
+        ).strip()
+        deterministic_guangya_browse = guangya_directory_browse_request(
+            message, allow_implicit=previous_tool == "guangya.fs.query"
+        )
+        if not self.registry.has("guangya.fs.query"):
+            deterministic_guangya_browse = None
+        deterministic_guangya_cleanup_preview = (
+            guangya_cleanup_preview_request(message)
+            if self.registry.has("guangya.organize.cleanup.preview")
+            else None
+        )
+        deterministic_local_diagnosis = (
+            self.registry.has("local_media.diagnose")
+            and local_media_intents.is_local_media_diagnosis_message(message)
+        )
+        deterministic_organize_audit = (
+            organize_audit_request(message)
+            if self.registry.has("organize.audit_logs")
+            else None
+        )
+        deterministic_mixed_subscriptions = (
+            self.registry.has("rss.subscription_summaries")
+            and self.registry.has("media.subscription_summaries")
+            and is_mixed_subscription_summary_message(message)
+        )
+        deterministic_discovery_metadata_search = (
+            self.registry.has("discovery.search")
+            and is_discovery_search_message(message)
+            and any(token in lower for token in ("影视资料", "影视信息", "条目资料", "条目信息"))
+        )
+        deterministic_new_donghua_recommend = (
+            self.registry.has("discovery.recommend")
+            and is_discovery_recommend_message(message)
+            and "新" in lower
+            and any(token in lower for token in ("国漫", "国创", "国产动画"))
+        )
         deterministic_indexer_change = (
             indexer_site_change_request(lower)
             if "索引站" in lower
@@ -10108,7 +10627,23 @@ class AgentOrchestrator:
         skip_model_for_exact_route = bool(
             deterministic_qb_realtime
             or deterministic_media_counts
+            or deterministic_agent_runtime
+            or deterministic_telegram_test
+            or deterministic_rss_binding
+            or deterministic_local_specific
+            or deterministic_indexer_summary
+            or deterministic_safe_policy_summary
+            or deterministic_agent_safety
+            or deterministic_media_proxy_restart
+            or deterministic_playback_compound
             or deterministic_indexer_change is not None
+            or deterministic_guangya_browse is not None
+            or deterministic_guangya_cleanup_preview is not None
+            or deterministic_local_diagnosis
+            or deterministic_organize_audit is not None
+            or deterministic_mixed_subscriptions
+            or deterministic_discovery_metadata_search
+            or deterministic_new_donghua_recommend
         )
         # 已认证会话默认由模型先理解当前目标；服务端注册表仍决定工具是只读
         # 执行还是只能生成行动计划。仅保留需要服务端把媒体名称精确绑定到订阅
@@ -10155,12 +10690,125 @@ class AgentOrchestrator:
                 owner=owner,
                 rate_identity=query_tool_rate_identity,
             )
+        if deterministic_agent_runtime:
+            return self._invoke_query_read("agent.runtime_status", {}, owner=owner)
+        if deterministic_indexer_summary:
+            return self._invoke_query_read("config.indexer_sites_summary", {}, owner=owner)
+        if deterministic_safe_policy_summary:
+            return self._invoke_query_read("config.safe_policy_summary", {}, owner=owner)
+        if deterministic_agent_safety:
+            return self._execute_read_plan(
+                LLMReadPlan(steps=(
+                    LLMToolSelection(tool_name="agent.capabilities", arguments={}),
+                    LLMToolSelection(tool_name="config.safe_policy_summary", arguments={}),
+                )),
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_playback_compound:
+            return self._execute_read_plan(
+                LLMReadPlan(steps=(
+                    LLMToolSelection(tool_name="media_proxy.status_summary", arguments={}),
+                    LLMToolSelection(
+                        tool_name="media_proxy.playback_failure_summary",
+                        arguments={"hours": 24},
+                    ),
+                )),
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_local_specific:
+            response = self._handle_local_media_requests(
+                message,
+                owner=owner,
+                query_tool_rate_identity=query_tool_rate_identity,
+            )
+            if response is not None:
+                return response
+        if deterministic_media_proxy_restart:
+            if not owner:
+                return self._unsupported(
+                    "重启媒体反代需要在已登录会话中确认",
+                    ["请登录后重新提交，并在预检后确认重启。"],
+                )
+            restart_arguments = media_proxy_restart_request(message)
+            if restart_arguments is not None:
+                return self.prepare(
+                    "media_proxy.restart_instance", restart_arguments, owner=owner
+                )
+            status_response = self._invoke_query_read(
+                "media_proxy.status_summary", {}, owner=owner
+            )
+            status_result = status_response.get("result") if isinstance(status_response, dict) else None
+            status_data = status_result.get("data") if isinstance(status_result, dict) else None
+            instances = status_data.get("instances") if isinstance(status_data, dict) else None
+            enabled_instances = [
+                item for item in (instances or [])
+                if isinstance(item, dict) and item.get("enabled") is True
+            ]
+            if len(enabled_instances) == 1:
+                return self.prepare(
+                    "media_proxy.restart_instance",
+                    {"instance_number": int(enabled_instances[0]["instance_number"])},
+                    owner=owner,
+                )
+            if not enabled_instances:
+                return self._clarification_response(
+                    "当前没有已启用的媒体反代实例可重启。",
+                    ["查看媒体反代状态"],
+                )
+            return self._clarification_response(
+                "当前有多个已启用的媒体反代实例，请指定一个公开序号。",
+                [
+                    f"重启媒体反代实例 {int(item['instance_number'])}"
+                    for item in enabled_instances[:3]
+                ],
+            )
         if deterministic_media_counts:
             return self._invoke_default_provider_read(
                 provider="media",
                 operation="media.items.counts",
                 arguments={},
                 intent="读取媒体库实时媒体总数",
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_local_diagnosis:
+            return self._invoke_query_read("local_media.diagnose", {})
+        if deterministic_guangya_cleanup_preview is not None:
+            if not owner:
+                return self._unsupported(
+                    "检查光鸭残留目录需要在已登录会话中执行",
+                    ["请登录 Agent 页面后重新提交该清理范围。"],
+                )
+            return self._invoke_query_read(
+                "guangya.organize.cleanup.preview",
+                deterministic_guangya_cleanup_preview,
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_guangya_browse is not None:
+            if not owner:
+                return self._unsupported(
+                    "查看光鸭目录需要在已登录会话中执行",
+                    ["请登录 Agent 页面后重新查看光鸭目录。"],
+                )
+            return self._invoke_query_read(
+                "guangya.fs.query",
+                deterministic_guangya_browse,
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_mixed_subscriptions:
+            return self._execute_read_plan(
+                LLMReadPlan(steps=(
+                    LLMToolSelection(
+                        tool_name="rss.subscription_summaries", arguments={}
+                    ),
+                    LLMToolSelection(
+                        tool_name="media.subscription_summaries", arguments={}
+                    ),
+                )),
                 owner=owner,
                 rate_identity=query_tool_rate_identity,
             )

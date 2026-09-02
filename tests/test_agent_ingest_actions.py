@@ -105,6 +105,17 @@ class AgentIngestArgumentTests(unittest.TestCase):
                 "positions": [],
             },
         )
+        self.assertEqual(
+            ingest_submit_arguments({
+                "source_type": "guangya_share",
+                "positions": [],
+            }),
+            {
+                "source_type": "guangya_share",
+                "target": "guangya",
+                "positions": [],
+            },
+        )
 
     def test_resource_inspection_rejects_input(self):
         with self.assertRaises(AgentToolError):
