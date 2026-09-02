@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from app.modules.special_media import special_media_position
+from app.modules.special_media import fractional_episode_position, special_media_position
 
 
 
@@ -29,7 +29,12 @@ _ORDINAL_ATTACK_SEASON_TOKEN = re.compile(
 )
 
 _SEASON_TOKEN = re.compile(
-    r"(?i)(?:\bseason[ ._-]*|\bs)(\d{1,2})(?:\b|e\d{1,4}(?:v\d+)?)"
+    # Python 的 ``\b`` 会把 CJK 视为单词字符，导致 ``间谍过家家Season 3``
+    # 与 ``我的英雄学院S4`` 无法命中。这里只禁止前一位是 ASCII 字母/数字，
+    # 既兼容中日文标题紧贴季标，也不会从 ``Preseason`` 等英文单词内部截取。
+    r"(?i)(?:(?<![A-Za-z0-9])season(?:[ ._]*|-(?=\d))|"
+    r"(?<![A-Za-z0-9])s)"
+    r"(\d{1,2})(?:\b|e\d{1,4}(?:v\d+)?)"
     r"|第\s*(\d{1,2})\s*季"
     r"|(?<!\d)(\d{1,2})(?:st|nd|rd|th)[ ._-]*season\b"
 )
@@ -43,7 +48,7 @@ _EPISODE_TOKEN = re.compile(
     r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
     r"|(?:\be(?:p(?:isode)?)?[ ._-]*)(\d{1,4})(?:v\d+)?"
     r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
-    r"|第\s*(\d{1,3})\s*(?:集|[话話])"
+    r"|第\s*(\d{1,4})\s*(?:集|[话話])"
     r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
 )
 
@@ -73,10 +78,34 @@ _SPECIAL_EPISODE_TOKEN = re.compile(
 
 _BARE_EPISODE_SUFFIX = re.compile(
     r"(?i)(?:^|\s+-\s+|[._]+)(\d{1,4})(?:v\d+)?"
-    r"(?:[._]+)?(?=\s*(?:[\[【(（]|$))"
+    r"(?:[._]+)?(?:\s*(?:fin(?:al)?|end|complete|完结|完))?"
+    r"(?=\s*(?:[\[【(（]|$))"
 )
 
 _BRACKET_EPISODE_TOKEN = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]")
+
+# 少量动画发布使用 ``Title - <03> [1080p]``。只有空格包围的发布分隔符、
+# 完整尖括号和后续技术括号/结尾同时成立时才接受，避免误读正式标题中的
+# HTML/数学样式尖括号。
+_ANGLE_EPISODE_TOKEN = re.compile(
+    r"(?i)\s+-\s+<\s*(\d{1,4})(?:v\d+)?\s*>"
+    r"(?=\s*(?:[\[【(（]|$))"
+)
+
+# 动画发布常同时给出季内编号与绝对编号：``20(92)``、``[01(64)]``。
+# 两者都应以第一个数字作为当前季集号，括号内数字仅作为绝对编号证据；
+# 否则通用括号规则会错误地把 ``[01(64)]`` 识别成第 64 集。
+_DUAL_EPISODE_PATTERNS = (
+    re.compile(
+        r"(?i)[\[【]\s*(\d{1,4})(?:v\d+)?\s*[（(]\s*"
+        r"(\d{1,4})\s*[）)]\s*[\]】]"
+    ),
+    re.compile(
+        r"(?i)(?:^|\s+-\s+|[._]+)(\d{1,4})(?:v\d+)?\s*"
+        r"[（(]\s*(\d{1,4})\s*[）)]"
+        r"(?=\s*(?:[\[【(（]|$))"
+    ),
+)
 
 _RELEASE_X_POSITION = re.compile(
     r"(?i)(?<![A-Za-z0-9])(\d{1,2})x(\d{1,3})(?![A-Za-z0-9])"
@@ -203,7 +232,11 @@ def _valid_unlabeled_episode(number: int) -> bool:
     )
 
 def _extract_episode(text: str) -> int | None:
-    """解析显式集号，并兼容中文数字及规格标签前的 ``[01]``。"""
+    """解析显式集号，并兼容中文数字、双编号及规格标签前的 ``[01]``。"""
+    # 小数集属于特别篇语义。若继续套用裸数字规则，``12.5`` 会被错误解析
+    # 成第 5 集；其最终整数位置由特别篇统一分配器决定。
+    if fractional_episode_position(text) is not None:
+        return None
     explicit = _extract_number(_EPISODE_TOKEN, text)
     if explicit is not None:
         return explicit
@@ -213,7 +246,24 @@ def _extract_episode(text: str) -> int | None:
     compact = _parse_release_x_position(text)
     if compact is not None:
         return compact[1]
-    bare_match = _BARE_EPISODE_SUFFIX.search(str(text or ""))
+    source = str(text or "")
+    angle = _ANGLE_EPISODE_TOKEN.search(source)
+    if angle:
+        number = int(angle.group(1))
+        if _valid_unlabeled_episode(number):
+            return number
+    for pattern in _DUAL_EPISODE_PATTERNS:
+        dual = pattern.search(source)
+        if not dual:
+            continue
+        local_episode, absolute_episode = (int(value) for value in dual.groups())
+        if (
+            _valid_unlabeled_episode(local_episode)
+            and _valid_unlabeled_episode(absolute_episode)
+            and absolute_episode >= local_episode
+        ):
+            return local_episode
+    bare_match = _BARE_EPISODE_SUFFIX.search(source)
     if bare_match:
         bare = int(bare_match.group(1))
         if _valid_unlabeled_episode(bare):
@@ -226,6 +276,8 @@ def _extract_episode(text: str) -> int | None:
     return None
 
 def _extract_special_episode(text: str) -> int | None:
+    if fractional_episode_position(text) is not None:
+        return None
     shared_position = special_media_position(text)
     if shared_position is not None:
         return shared_position

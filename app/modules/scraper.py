@@ -54,6 +54,8 @@ from app.modules.recognition.cleaner import (
     strip_media_file_suffix,
 )
 from app.modules.recognition.extractors.deterministic import (
+    _ANGLE_EPISODE_TOKEN,
+    _DUAL_EPISODE_PATTERNS,
     _extract_episode,
     _extract_explicit_season,
     _extract_special_episode,
@@ -83,6 +85,7 @@ from app.modules.recognition_policy import (
     normalize_automatic_match_preset,
 )
 from app.modules.special_media import (
+    fractional_episode_position,
     is_special_directory_name,
     strip_special_media_markers,
 )
@@ -452,7 +455,9 @@ _UNRESOLVED_SEQUEL_HINT = re.compile(
     r"(?=$|[\s._\-\[【(（])"
 )
 _SEASON_TOKEN = re.compile(
-    r"(?i)(?:\bseason[ ._-]*|\bs)(\d{1,2})(?:\b|e\d{1,4}(?:v\d+)?)"
+    r"(?i)(?:(?<![A-Za-z0-9])season(?:[ ._]*|-(?=\d))|"
+    r"(?<![A-Za-z0-9])s)"
+    r"(\d{1,2})(?:\b|e\d{1,4}(?:v\d+)?)"
     r"|第\s*(\d{1,2})\s*季"
     r"|(?<!\d)(\d{1,2})(?:st|nd|rd|th)[ ._-]*season\b"
 )
@@ -466,7 +471,7 @@ _EPISODE_TOKEN = re.compile(
     r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
     r"|(?:\be(?:p(?:isode)?)?[ ._-]*)(\d{1,4})(?:v\d+)?"
     r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
-    r"|第\s*(\d{1,3})\s*(?:集|[话話])"
+    r"|第\s*(\d{1,4})\s*(?:集|[话話])"
     r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
 )
 _CHINESE_EPISODE_TOKEN = re.compile(
@@ -502,6 +507,11 @@ _SPECIAL_EPISODE_RANGE = re.compile(
     r"[ ._\-]*(\d{1,3})\s*[-~～–—]\s*(\d{1,3})"
     r"(?=$|[ ._\-\]\)】])"
 )
+_ADJACENT_SPECIAL_EPISODE_RANGE = re.compile(
+    r"(?i)[\[【(（]\s*(?:ova|oad|oav|sp|specials?|特别篇|特別篇|番外篇?|特典)"
+    r"\s*[\]】)）]\s*[\[【(（]\s*(\d{1,3})\s*[-~～–—]\s*(\d{1,3})"
+    r"\s*[\]】)）]"
+)
 _GENERIC_FOLDER = re.compile(
     r"(?i)^(?:movies?|films?|tv|shows?|series|电影|影片|剧集|电视剧|动漫|纪录片|综艺|"
     r"season\s*\d+|s\d+|第\d+季|disc\s*\d+|cd\s*\d+|1080p|2160p|4k|"
@@ -514,13 +524,14 @@ _AVAILABILITY_TAG = re.compile(
 )
 _BARE_EPISODE_SUFFIX = re.compile(
     r"(?i)(?:^|\s+-\s+|[._]+)(\d{1,4})(?:v\d+)?"
-    r"(?:[._]+)?(?=\s*(?:[\[【(（]|$))"
+    r"(?:[._]+)?(?:\s*(?:fin(?:al)?|end|complete|完结|完))?"
+    r"(?=\s*(?:[\[【(（]|$))"
 )
 _BRACKET_EPISODE_TOKEN = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]")
 _BRACKET_EPISODE_SUFFIX = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]\s*$")
 _BRACKET_EPISODE_RANGE = re.compile(
-    r"(?i)^\s*(?:(?:e?p?\s*)?\d{1,3}\s*[-~～–—]\s*\d{1,3}"
-    r"(?:\s*(?:fin(?:al)?|complete|全集))?|"
+    r"(?i)^\s*(?:(?:e?p?\s*)?\d{1,4}\s*[-~～–—]\s*\d{1,4}"
+    r"(?:\s*(?:tv\s*)?[（(]?(?:fin(?:al)?|end|complete|全集)[）)]?)?|"
     r"第\s*\d{1,3}\s*[-~～–—]\s*\d{1,3}\s*(?:集|[话話]))\s*$"
 )
 _BRACKETED_SEGMENT = re.compile(r"[\[【(（]([^\]】)）]{1,160})[\]】)）]")
@@ -529,6 +540,11 @@ _RELEASE_EPISODE_RANGE = re.compile(
     r"|(?:^|[ ._\-\[\(【])e(?:p(?:isode)?)?[ ._-]*(\d{1,3})"
     r"\s*[-~～–—]\s*(?:e(?:p(?:isode)?)?[ ._-]*)?(\d{1,3})"
     r"(?=$|[ ._\-\]\)】])"
+)
+_PIPE_RELEASE_EPISODE_RANGE = re.compile(
+    r"(?i)(?:^|[\s._\-])S\d{1,2}\s*[|｜]\s*"
+    r"\d{1,4}\s*[-~～–—]\s*\d{1,4}"
+    r"(?=$|[\s._\-+\[【(（])"
 )
 _BARE_COMPLETED_EPISODE_RANGE = re.compile(
     r"(?i)(?:^|[\s._\-\[\(【])(?:e?p?\s*)?(\d{1,3})\s*[-~～–—]\s*(\d{1,3})"
@@ -555,11 +571,14 @@ _STRUCTURED_EPISODE_POSITION = re.compile(
 _BRACKET_RELEASE_META_NOISE = re.compile(
     r"(?i)^(?:cr|iq|adn|repack|readnfo|rartv|multi(?:-?subs?)?|msubs?|"
     r"subfrench|vostfr|jpn?|jap|rus|tver|tv|(?:tv|тв)\s*-\s*(?:0[1-9]|[1-9]\d?)|"
-    r"bd|fhd|mpeg2|vhsrip|audio|version[ ._-]*light|final)$"
+    r"bd|fhd|mpeg2|vhsrip|audio|b[ ._-]?hmt|version[ ._-]*light|final)$"
 )
 _BRACKET_RELEASE_DATE = re.compile(
     r"^((?:19|20)\d{2})([./-])(0?[1-9]|1[0-2])\2"
     r"(0?[1-9]|[12]\d|3[01])$"
+)
+_BRACKET_BROADCAST_SEASON_NOISE = re.compile(
+    r"^(?:(?:19|20)\d{2}年)?(?:[1-9]|1[0-2])月(?:新番|番)$"
 )
 _UNBRACKETED_RELEASE_DATE = re.compile(
     r"(?<!\d)((?:19|20)\d{2})([./-])(0?[1-9]|1[0-2])\2"
@@ -593,7 +612,7 @@ _TRAILING_RELEASE_COMPLETION = re.compile(
 )
 _TRAILING_BRACKET_RELEASE_COMPLETION = re.compile(
     r"(?i)(?P<separator>[\s._-]*)(?:[\[【(（])\s*"
-    r"(?P<tag>COMPLETE)\s*(?:[\]】)）])\s*$"
+    r"(?P<tag>COMPLETE|END)\s*(?:[\]】)）])\s*$"
 )
 _PRIMARY_TRAILING_RELEASE_EDITION_NOISE = re.compile(
     r"(?ix)(?:[ ._\-—–:：]+|^)"
@@ -625,6 +644,7 @@ _RELEASE_LANGUAGE_BRACKET = re.compile(
 )
 _BRACKET_DUB_AUDIO_NOISE = re.compile(
     r"(?i)^(?:国语配音|國語配音|粤语配音|粵語配音|台配|港配|"
+    r"(?:tvb|viutv|代理商)[ ._-]*(?:粤语|粵語)(?:配音)?|"
     r"(?:korean|japanese|english|chinese|mandarin|cantonese)[ ._-]+audio|"
     r"dub(?:bed)?|dual[ ._-]?audio)$"
 )
@@ -635,7 +655,7 @@ _BRACKET_RELEASE_EDITION_NOISE = re.compile(
 _BRACKET_STREAMING_PLATFORM_NOISE = re.compile(
     r"(?i)^(?:wetv|tving|iqiyi|youku|viki|viu|crunchyroll|"
     r"netflix|nf|amazon|amzn|disney|dsnp|hbo|hulu|atvp|apple|itunes|"
-    r"catchplay|bilibili|baha)$"
+    r"catchplay|bilibili|baha|abema|tvb|viutv|ani[ ._-]?one)$"
 )
 # 域名后缀本身不是技术证据；只允许它作为已经具备分辨率/来源/编码证据的
 # 复合括号中的附属噪声，例如 ``[1080p BILIBILI COM WEB-DL]``。这样不会
@@ -1294,6 +1314,9 @@ def _strip_known_episode_suffix(
             return match.group(0)
 
     cleaned = str(value or "")
+    cleaned = _ANGLE_EPISODE_TOKEN.sub(" ", cleaned)
+    for pattern in _DUAL_EPISODE_PATTERNS:
+        cleaned = pattern.sub(replace, cleaned)
     compact = _parse_release_x_position(cleaned)
     if compact is not None:
         compact_season, compact_episode, compact_span = compact
@@ -1320,7 +1343,14 @@ _UNLABELED_EPISODE_RESERVED_VALUES = {
 def parse_release_position(value: str) -> dict[str, int | None]:
     """从发布标题中提取可安全展示/排序的季集位置，不发起任何网络请求。"""
     name = _strip_explicit_tmdb_markers(str(value or ""))
-    stem = name.rsplit(".", 1)[0] if "." in name else name
+    # 资源站发布标题不一定带文件扩展名，发布组本身却可能包含点号，
+    # 例如 ``[c.c动漫][约会大作战 第四季][12]``。只有结尾确实像
+    # 媒体/种子文件扩展名时才剥离，不能直接按最后一个点截断标题。
+    stem = (
+        name.rsplit(".", 1)[0]
+        if re.search(r"\.[A-Za-z0-9]{2,5}$", name)
+        else name
+    )
     episode = _extract_episode(stem)
     season = _extract_season(stem, episode_context=episode is not None)
     compact = _parse_release_x_position(stem)
@@ -1328,12 +1358,20 @@ def parse_release_position(value: str) -> dict[str, int | None]:
         season = season if season is not None else compact[0]
         episode = episode if episode is not None else compact[1]
     episode_end = None
-    special_range = _SPECIAL_EPISODE_RANGE.search(stem)
+    fractional = fractional_episode_position(stem)
+    if fractional is not None:
+        # 小数集号只能在目录/作品作用域内稳定换算为 S00E##，这里不能把
+        # ``12.5`` 展示成普通第 5 集，也不能提前猜测目标特别篇编号。
+        season, episode = 0, None
+    special_range = (
+        _SPECIAL_EPISODE_RANGE.search(stem)
+        or _ADJACENT_SPECIAL_EPISODE_RANGE.search(stem)
+    )
     if special_range:
         start, end = (int(item) for item in special_range.groups())
         if 1 <= start <= end <= 500:
             season, episode, episode_end = 0, start, end
-    else:
+    elif fractional is None:
         special_episode = _extract_special_episode(stem)
         if special_episode is not None:
             season, episode = 0, special_episode
@@ -1411,6 +1449,7 @@ def _is_bracket_noise(content: str) -> bool:
         return True
     if (
         _is_valid_bracket_release_date(compact)
+        or _BRACKET_BROADCAST_SEASON_NOISE.fullmatch(compact)
         or _is_explicit_subtitle_language_noise(compact)
     ):
         return True
@@ -1456,6 +1495,7 @@ def _is_bracket_noise(content: str) -> bool:
         (r"(?i)\b10[ ._-]?bit\b", "10bit"),
         (r"(?i)\b8[ ._-]?bit\b", "8bit"),
         (r"(?i)\bdual[ ._-]+audio\b", "audio"),
+        (r"(?i)\baacx\d{1,2}\b", "aac"),
         (r"(?i)\b(?:ddp|eac3|ac3|aac|dts|flac|opus)[ ._-]?(?:1|2|5|7)[ ._-]?[01]\b", "aac"),
     ):
         token_source = re.sub(pattern, replacement, token_source)
@@ -1579,6 +1619,78 @@ def _non_destructive_release_title_candidates(
         ).strip(" ._-")
         if projected and not _low_information_query(projected):
             candidates.append(projected)
+
+    # 方括号链也常承载清晰的 ``[发布组][作品名][集号/范围][规格]`` 结构。
+    # 只在作品名后的相邻括号明确包含集号时抽取，避免把多个标题副标题括号
+    # 任意拆开；该候选尤其能防止“集标题 + PGS”等尾部噪声覆盖系列主标题。
+    bracket_segments = list(_BRACKETED_SEGMENT.finditer(source))
+    for index, current in enumerate(bracket_segments[:-1]):
+        following_match = bracket_segments[index + 1]
+        # ``【国漫】仙逆【第04集】`` 的作品名位于两个括号之间，不能把前一
+        # 分类标签单独提成标题；这里只消费真正相邻的括号链。
+        if source[current.end():following_match.start()].strip():
+            continue
+        content = current.group(1).strip()
+        following = following_match.group(1).strip()
+        has_position = bool(
+            _EPISODE_TOKEN.search(following)
+            or _CHINESE_EPISODE_TOKEN.search(following)
+            or _BRACKET_EPISODE_RANGE.fullmatch(following)
+        )
+        remainder = source[current.end():].lstrip()
+        if (
+            not has_position
+            or _is_release_prefix(content, remainder)
+            or _is_bracket_noise(content)
+        ):
+            continue
+        projected, _ = _clean_release_stem(content)
+        projected = re.sub(
+            r"\s+", " ", _strip_season_tokens(projected)
+        ).strip(" ._-")
+        if projected and not _low_information_query(projected):
+            candidates.insert(0, projected)
+            break
+
+    # Mikan 等动画发布常用空格包围的 `` / `` 并列中、日、英标题。调用到
+    # 这里时集号可能已由上游剥离，因此以仍保留的明确季标作为结构门槛；
+    # 只投影季标前的完整一侧，不拆 ``Fate/stay night`` 等标题内斜杠。
+    if (
+        position_start is None
+        and _extract_season(source, episode_context=True) is not None
+    ):
+        multilingual_parts = [
+            item.strip()
+            for item in re.split(r"\s+[/／]\s+", source)
+            if item.strip()
+        ]
+        if 2 <= len(multilingual_parts) <= 4:
+            for part in multilingual_parts:
+                season_matches = [
+                    match
+                    for pattern in (
+                        _SEASON_TOKEN,
+                        _CHINESE_SEASON_TOKEN,
+                        _ENGLISH_ORDINAL_SEASON_TOKEN,
+                    )
+                    if (match := pattern.search(part)) is not None
+                ]
+                if not season_matches:
+                    continue
+                season_match = min(season_matches, key=lambda item: item.start())
+                title_part = part[:season_match.start()].strip(" ._-")
+                projected, _ = _clean_release_stem(title_part)
+                projected = re.sub(r"\s+", " ", projected).strip(" ._-")
+                cjk_count = len(re.findall(
+                    r"[\u3040-\u30ff\u3400-\u9fff]", projected
+                ))
+                latin_count = len(re.findall(
+                    r"[A-Za-z][A-Za-z0-9']*", projected
+                ))
+                if (cjk_count >= 4 or latin_count >= 3) and not _low_information_query(
+                    projected
+                ):
+                    candidates.append(projected)
     first = _RELEASE_PREFIX.match(source)
     if first:
         content = _bracket_content(first.group(1))
@@ -1736,6 +1848,7 @@ def _clean_release_stem(value: str) -> tuple[str, dict[str, list[str]]]:
     # 整季目录常把范围写成 ``S01E01-E16``；若只让通用噪声规则删除
     # ``S01E01``，尾部 ``16`` 会继续污染作品标题。
     stem = _RELEASE_EPISODE_RANGE.sub(strip_episode_range, stem)
+    stem = _PIPE_RELEASE_EPISODE_RANGE.sub(strip_episode_range, stem)
     while True:
         match = _RELEASE_PREFIX.match(stem)
         if not match:
@@ -1774,9 +1887,10 @@ def _clean_release_stem(value: str) -> tuple[str, dict[str, list[str]]]:
 
     stem = _BRACKETED_SEGMENT.sub(strip_bracket_noise, stem)
     stem = _RELEASE_REVISION_BRACKET.sub(" ", stem)
-    # ``(Complete)`` 常用于整季/全集发布状态；前面的技术括号被移除后，
-    # 它会成为尾部孤立标记。只清理带括号且位于尾部的形式，避免误删
-    # 真实片名中的 ``Complete``。裸 ``FINAL/FIN`` 继续沿用既有规则。
+    # ``(Complete)`` / ``[END]`` 常用于整季或单集完结状态；前面的技术
+    # 括号被移除后，它们会成为尾部孤立标记。只清理带括号且位于尾部的
+    # 形式，避免误删真实片名中的 Complete/End；裸 FINAL/FIN 继续沿用
+    # 既有规则。
     bracket_completion = _TRAILING_BRACKET_RELEASE_COMPLETION.search(stem)
     if bracket_completion and re.search(
         r"[A-Za-z0-9\u3040-\u30ff\u3400-\u9fff]",
@@ -1958,6 +2072,7 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     guessed_year = _position_number(guessed.get("year"))
     year_tokens = [match.group(1) for match in _YEAR_TOKEN.finditer(identity_stem)]
     filename_year = str(guessed_year or (year_tokens[-1] if year_tokens else ""))
+    fractional_position = fractional_episode_position(stem)
     explicit_episode = _extract_episode(stem)
     guessed_episode = _position_number(guessed.get("episode"))
     guessed_season = _season_number(guessed.get("season"))
@@ -2003,11 +2118,16 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     if special_episode is not None:
         season = 0
         episode = special_episode
+    elif fractional_position is not None:
+        season = 0
+        episode = None
     title_source = _strip_known_episode_suffix(stem, episode, season)
     if explicit_season is None and implicit_season is not None:
         title_source = _remove_text_span(title_source, implicit_season_span)
     if special_episode is not None:
         title_source = _SPECIAL_EPISODE_TOKEN.sub(" ", title_source)
+        title_source = strip_special_media_markers(title_source)
+    elif fractional_position is not None:
         title_source = strip_special_media_markers(title_source)
     release_title_candidates, semantic_components = (
         _non_destructive_release_title_candidates(title_source)
@@ -2053,15 +2173,20 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
         or episode is not None
         or (guessed_type == "episode" and not untrusted_guessed_episode)
     ) else (folder_type or "movie")
-    original_title, _ = _clean_release_stem(
-        _strip_known_episode_suffix(stem, episode, season)
-    )
+    original_source = _strip_known_episode_suffix(stem, episode, season)
+    if fractional_position is not None:
+        original_source = strip_special_media_markers(original_source)
+    original_title, _ = _clean_release_stem(original_source)
     original_title = re.sub(
         r"\s+", " ", _strip_season_tokens(original_title)
     ).strip(" ._-")
     variants = _unique_text(
         release_title_candidates
-        + ([original_title] if original_title and original_title != filename_title else [])
+        + (
+            _split_title_variants(original_title)
+            if original_title and original_title != filename_title
+            else []
+        )
         + _split_title_variants(normalized_title)
         + _split_title_variants(folder_title)
     )

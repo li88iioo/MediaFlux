@@ -7,6 +7,8 @@ from datetime import date, timedelta
 from unittest.mock import Mock
 
 from app.clients.guangya import GuangYaFile
+from app.modules.directory_scrape import FixedMatchScraper
+from app.modules.episode_mapping import DirectoryEpisodeEvidence
 from app.modules.organize import (
     OrganizeRules,
     Organizer,
@@ -69,6 +71,163 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
             "genres": [],
             "origin_country": ["US"],
             "seasons": [{"season_number": 1, "episode_count": 12}],
+        })
+        return scraper
+
+    @staticmethod
+    def _merged_cour_season_detail(*segment_lengths: int) -> dict:
+        starts = (date(2026, 1, 11), date(2026, 7, 5), date(2027, 1, 10))
+        episodes = []
+        episode_number = 1
+        for segment_index, length in enumerate(segment_lengths):
+            started_on = starts[segment_index]
+            for offset in range(length):
+                episodes.append({
+                    "episode_number": episode_number,
+                    "air_date": (started_on + timedelta(days=7 * offset)).isoformat(),
+                })
+                episode_number += 1
+        return {"season_number": 1, "episodes": episodes}
+
+    def _fixed_cour_confirmation(
+        self,
+        *,
+        source_season: int,
+        source_episode_end: int,
+        season_detail: dict,
+        target_season: int = 1,
+    ):
+        show = GuangYaFile(
+            "show",
+            f"Example Show S{source_season:02d}E01-E{source_episode_end:02d}",
+            True,
+            parent_id="source",
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                f"Example.Show.S{source_season:02d}E{episode:02d}.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(1, source_episode_end + 1)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        delegate = TMDBScraper()
+        delegate.get_tv_season_detail = Mock(return_value=copy.deepcopy(season_detail))
+        scraper = FixedMatchScraper(
+            delegate,
+            MatchResult(
+                tmdb_id="82684",
+                external_id="82684",
+                provider="tmdb",
+                title="Example Show",
+                year="2026",
+                media_type="tv",
+                confidence=1.0,
+                status="matched",
+                need_confirm=False,
+                matched_by="manual",
+            ),
+            {
+                "id": 82684,
+                "genres": [{"id": 16}],
+                "origin_country": ["JP"],
+                "first_air_date": "2026-01-11",
+                "seasons": [{
+                    "season_number": target_season,
+                    "episode_count": len(season_detail.get("episodes") or []),
+                }],
+            },
+            map_source_positions=True,
+        )
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True,
+        )
+        return plans, stats, delegate
+
+    @staticmethod
+    def _verified_identity_scraper(
+        *,
+        probe_season: int,
+        seasons: list[dict],
+        title: str = "Example Show",
+        probe_episode: int = 1,
+    ) -> TMDBScraper:
+        episode_count = next(
+            int(item["episode_count"])
+            for item in seasons
+            if int(item["season_number"]) == probe_season
+        )
+        validation = {
+            "required": True,
+            "passed": True,
+            "season": probe_season,
+            "episode": probe_episode,
+            "episode_count": episode_count,
+            "reason": "episode_verified",
+        }
+        seed_match = MatchResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title=title,
+            year="2018",
+            media_type="tv",
+            confidence=0.85,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="匹配置信度 85% 低于严格模式阈值 90%",
+            metadata={
+                "verified_automatic_identity_proof": {
+                    "version": 2,
+                    "kind": "tmdb_tv_episode_identity",
+                    "provider": "tmdb",
+                    "external_id": "82684",
+                    "media_type": "tv",
+                    "confidence": 0.85,
+                    "recognition_threshold": 0.9,
+                    "automatic_match_preset": "balanced",
+                    "global_threshold": 0.9,
+                    "strong_title_score": 0.85,
+                    "candidate_count": 1,
+                    "candidate_gap": 1.0,
+                    "decision_constraints": [],
+                    "selected_constraints": [],
+                    "expected_year": "",
+                    "candidate_year": "2018",
+                    "source_title_key": "tenshishitaraslimedattaken",
+                    "matched_title_key": "tenshishitaraslimedattaken",
+                    "source_position": {
+                        "season": probe_season,
+                        "episode": probe_episode,
+                    },
+                    "target_position": {
+                        "season": probe_season,
+                        "episode": probe_episode,
+                    },
+                    "position_validation": validation,
+                },
+            },
+        )
+        scraper = TMDBScraper()
+        scraper.match = Mock(side_effect=lambda *args, **kwargs: copy.deepcopy(seed_match))
+        scraper.get_detail = Mock(return_value={
+            "id": 82684,
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "first_air_date": "2018-10-02",
+            "seasons": copy.deepcopy(seasons),
         })
         return scraper
 
@@ -395,7 +554,7 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
         self.assertEqual(scraper.match.call_count, 1)
         recognition_name = scraper.match.call_args.args[0]
         self.assertTrue(
-            recognition_name.endswith(".S03E07.mkv"),
+            recognition_name.endswith(".S03E01.mkv"),
             recognition_name,
         )
         self.assertNotIn(".S01E01.", recognition_name)
@@ -999,6 +1158,999 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
             plan.match.metadata["final_position_validation"]["passed"]
             for plan in plans
         ))
+
+    def test_slime_fourth_season_root_absolute_range_is_rebased(self):
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                "[ANi] 關於我轉生變成史萊姆這檔事 第四季 "
+                f"- {episode} [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+                False,
+                1024,
+                f"etag-{episode}",
+                "source",
+            )
+            for episode in range(73, 93)
+        ]
+        client = _TreeClient(
+            {"source": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        seasons = [
+            {"season_number": season, "episode_count": 24}
+            for season in range(1, 5)
+        ]
+        scraper = self._verified_identity_scraper(
+            probe_season=4,
+            seasons=seasons,
+            title="关于我转生变成史莱姆这档事",
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 20)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(4, episode) for episode in range(1, 21)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and plan.episode_mapping.mode == "season_continuous"
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(stats["directory_identity_attestation_bindings"], 1)
+        self.assertEqual(stats["directory_identity_attestation_hits"], 19)
+        self.assertEqual(scraper.match.call_count, 1)
+        self.assertTrue(
+            scraper.match.call_args.args[0].endswith(".S04E01.mp4")
+        )
+
+    def test_slime_fourth_season_maps_into_single_merged_tmdb_season(self):
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                "[ANi] 關於我轉生變成史萊姆這檔事 第四季 "
+                f"- {episode} [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+                False,
+                1024,
+                f"etag-{episode}",
+                "source",
+            )
+            for episode in range(73, 93)
+        ]
+        client = _TreeClient(
+            {"source": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        failed_probe = RecognitionResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title="关于我转生变成史莱姆这档事",
+            year="2018",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="TMDB 中不存在第 4 季，已阻止自动整理",
+            matched_by="search",
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            rejected_constraints=["tmdb_position_season_not_found"],
+        )
+        scraper = TMDBScraper()
+        scraper.match = Mock(
+            side_effect=lambda *args, **kwargs: copy.deepcopy(failed_probe)
+        )
+        scraper.get_detail = Mock(return_value={
+            "id": 82684,
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "first_air_date": "2018-10-02",
+            "seasons": [{"season_number": 1, "episode_count": 92}],
+        })
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 20)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(1, episode) for episode in range(73, 93)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and plan.episode_mapping.mode == "absolute"
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(scraper.match.call_count, 1)
+        self.assertTrue(scraper.match.call_args.args[0].endswith(".S04E01.mp4"))
+
+    def test_slime_reset_second_season_only_isolates_out_of_range_tail(self):
+        show = GuangYaFile(
+            "show",
+            "关于我转生变成史莱姆这档事 第二季 S02E01-E26",
+            True,
+            parent_id="source",
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                "关于我转生变成史莱姆这档事."
+                f"S02E{episode:02d}.2021.2160p.WEB-DL.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(1, 27)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        scraper = self._verified_identity_scraper(
+            probe_season=2,
+            seasons=[
+                {"season_number": 1, "episode_count": 24},
+                {"season_number": 2, "episode_count": 24},
+            ],
+            title="关于我转生变成史莱姆这档事",
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans[:24]], ["move"] * 24)
+        self.assertEqual([plan.action for plan in plans[24:]], ["skip", "skip"])
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans[:24]],
+            [(2, episode) for episode in range(1, 25)],
+        )
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans[24:]],
+            [(2, 25), (2, 26)],
+        )
+        self.assertTrue(all("超出 TMDB" in plan.note for plan in plans[24:]))
+        self.assertEqual(stats["need_confirm"], 2)
+        self.assertEqual(scraper.match.call_count, 1)
+
+    def test_later_season_continuous_pack_uses_e01_identity_probe(self):
+        show = GuangYaFile(
+            "show", "Example Show Second Season", True, parent_id="source"
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                f"Example.Show.S02E{episode:02d}.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(13, 25)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        failed_probe = RecognitionResult(
+            tmdb_id="100",
+            external_id="100",
+            provider="tmdb",
+            title="Example Show",
+            year="2026",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="第 2 季仅有 12 集，E13 超出 TMDB 范围",
+            matched_by="search",
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            rejected_constraints=["tmdb_position_episode_out_of_range"],
+        )
+        scraper = TMDBScraper()
+        scraper.match = Mock(
+            side_effect=lambda *args, **kwargs: copy.deepcopy(failed_probe)
+        )
+        scraper.get_detail = Mock(return_value={
+            "id": 100,
+            "genres": [],
+            "origin_country": ["US"],
+            "first_air_date": "2026-01-01",
+            "seasons": [
+                {"season_number": 1, "episode_count": 12},
+                {"season_number": 2, "episode_count": 12},
+            ],
+        })
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 12)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(2, episode) for episode in range(1, 13)],
+        )
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(stats["directory_identity_cache_hits"], 11)
+        self.assertEqual(scraper.match.call_count, 1)
+        self.assertTrue(scraper.match.call_args.args[0].endswith(".S02E01.mkv"))
+        self.assertIn(
+            "directory_identity_probe_position_recovery",
+            plans[0].match.metadata,
+        )
+
+    def test_identity_probe_does_not_rebase_ordinary_partial_season(self):
+        show = GuangYaFile(
+            "show", "Example Show Season 3 E13-E24", True, parent_id="source"
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                f"Example.Show.S03E{episode:02d}.2026.1080p.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(13, 25)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        scraper = self._verified_identity_scraper(
+            probe_season=3,
+            probe_episode=1,
+            seasons=[
+                {"season_number": season, "episode_count": 24}
+                for season in range(1, 4)
+            ],
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 12)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(3, episode) for episode in range(13, 25)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and not plan.episode_mapping.changed
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(scraper.match.call_count, 1)
+        self.assertTrue(scraper.match.call_args.args[0].endswith(".S03E01.mkv"))
+
+    def test_fixed_tmdb_confirmation_uses_the_same_continued_number_mapping(self):
+        show = GuangYaFile(
+            "show", "Slime Season 3 S03E49-E52", True, parent_id="source"
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                f"Tensei.Shitara.Slime.Datta.Ken.S03E{episode:02d}.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(49, 53)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        detail = {
+            "id": 82684,
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "first_air_date": "2018-10-02",
+            "seasons": [
+                {"season_number": season, "episode_count": 24}
+                for season in range(1, 5)
+            ],
+        }
+        scraper = FixedMatchScraper(
+            TMDBScraper(),
+            MatchResult(
+                tmdb_id="82684",
+                external_id="82684",
+                provider="tmdb",
+                title="关于我转生变成史莱姆这档事",
+                year="2018",
+                media_type="tv",
+                confidence=1.0,
+                status="matched",
+                need_confirm=False,
+                matched_by="manual",
+            ),
+            detail,
+            map_source_positions=True,
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 4)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(3, episode) for episode in range(1, 5)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and plan.episode_mapping.mode == "season_continuous"
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+
+    def test_fixed_tmdb_confirmation_maps_second_cour_into_merged_season(self):
+        plans, stats, delegate = self._fixed_cour_confirmation(
+            source_season=2,
+            source_episode_end=3,
+            season_detail=self._merged_cour_season_detail(12, 13),
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 3)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(1, 13), (1, 14), (1, 15)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and plan.episode_mapping.reason
+            == "publisher_cour_mapped_to_merged_tmdb_season"
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(delegate.get_tv_season_detail.call_count, 3)
+
+    def test_fixed_tmdb_confirmation_keeps_existing_source_season(self):
+        season_detail = self._merged_cour_season_detail(12, 13)
+        season_detail["season_number"] = 2
+        plans, stats, delegate = self._fixed_cour_confirmation(
+            source_season=2,
+            source_episode_end=3,
+            season_detail=season_detail,
+            target_season=2,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 3)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(2, 1), (2, 2), (2, 3)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and not plan.episode_mapping.changed
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        delegate.get_tv_season_detail.assert_not_called()
+
+    def test_fixed_tmdb_confirmation_maps_third_cour_into_merged_season(self):
+        plans, stats, _delegate = self._fixed_cour_confirmation(
+            source_season=3,
+            source_episode_end=3,
+            season_detail=self._merged_cour_season_detail(12, 12, 12),
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 3)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(1, 25), (1, 26), (1, 27)],
+        )
+        self.assertEqual(stats["need_confirm"], 0)
+
+    def test_fixed_tmdb_confirmation_split_cour_without_date_proof_fails_closed(self):
+        variants = {}
+        no_hiatus = self._merged_cour_season_detail(12, 13)
+        first_air_date = date(2026, 1, 11)
+        for offset, episode in enumerate(no_hiatus["episodes"]):
+            episode["air_date"] = (
+                first_air_date + timedelta(days=7 * offset)
+            ).isoformat()
+        variants["no_hiatus"] = no_hiatus
+        incomplete = self._merged_cour_season_detail(12, 13)
+        incomplete["episodes"][12]["air_date"] = ""
+        variants["incomplete_dates"] = incomplete
+
+        for name, season_detail in variants.items():
+            with self.subTest(name=name):
+                plans, stats, _delegate = self._fixed_cour_confirmation(
+                    source_season=2,
+                    source_episode_end=3,
+                    season_detail=season_detail,
+                )
+
+                self.assertEqual([plan.action for plan in plans], ["skip"] * 3)
+                self.assertTrue(all("TMDB" in plan.note for plan in plans))
+                self.assertEqual(stats["need_confirm"], 3)
+
+    def test_fixed_tmdb_preview_final_validates_precomputed_position(self):
+        show = GuangYaFile("show", "Example Show", True, parent_id="source")
+        filename = "Example.Show.S02E13.mkv"
+        video = GuangYaFile(
+            "e13", filename, False, 1024, "etag-13", "show"
+        )
+        client = _TreeClient(
+            {"source": [show], "show": [video], "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        scraper = FixedMatchScraper(
+            TMDBScraper(),
+            MatchResult(
+                tmdb_id="100",
+                external_id="100",
+                provider="tmdb",
+                title="Example Show",
+                year="2026",
+                media_type="tv",
+                confidence=1.0,
+                status="matched",
+                need_confirm=False,
+                matched_by="manual",
+            ),
+            {
+                "id": 100,
+                "genres": [],
+                "origin_country": ["US"],
+                "first_air_date": "2026-01-01",
+                "seasons": [
+                    {"season_number": 1, "episode_count": 12},
+                    {"season_number": 2, "episode_count": 12},
+                ],
+            },
+            position_overrides={filename: (2, 13)},
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True,
+        )
+
+        self.assertTrue(scraper.supports_tmdb_position_validation)
+        self.assertFalse(scraper.map_source_positions)
+        self.assertEqual([plan.action for plan in plans], ["skip"])
+        self.assertIn("超出 TMDB", plans[0].note)
+        self.assertEqual(stats["need_confirm"], 1)
+
+    def test_missing_source_season_position_failure_recovers_via_absolute_range(self):
+        show = GuangYaFile(
+            "show", "Slime Season 3 S03E49-E52", True, parent_id="source"
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                f"Tensei.Shitara.Slime.Datta.Ken.S03E{episode:02d}.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(49, 53)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        failed_probe = RecognitionResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title="关于我转生变成史莱姆这档事",
+            year="2018",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="TMDB 中不存在第 3 季，已阻止自动整理",
+            matched_by="search",
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            rejected_constraints=["tmdb_position_season_not_found"],
+        )
+        scraper = TMDBScraper()
+        scraper.match = Mock(
+            side_effect=lambda *args, **kwargs: copy.deepcopy(failed_probe)
+        )
+        scraper.get_detail = Mock(return_value={
+            "id": 82684,
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "first_air_date": "2018-10-02",
+            "seasons": [{"season_number": 1, "episode_count": 92}],
+        })
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 4)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(1, episode) for episode in range(49, 53)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and plan.episode_mapping.mode == "absolute"
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(stats["directory_identity_cache_hits"], 3)
+        self.assertEqual(scraper.match.call_count, 1)
+        self.assertIn(
+            "directory_identity_probe_position_recovery",
+            plans[0].match.metadata,
+        )
+
+    def test_identity_probe_recomputes_mapping_after_tmdb_detail_refresh(self):
+        show = GuangYaFile(
+            "show", "Example Show Season 3 S03E13-E15", True, parent_id="source"
+        )
+        files = [
+            GuangYaFile(
+                f"e{episode}",
+                f"Example.Show.S03E{episode:02d}.mkv",
+                False,
+                1024,
+                f"etag-{episode}",
+                "show",
+            )
+            for episode in range(13, 16)
+        ]
+        client = _TreeClient(
+            {"source": [show], "show": files, "archive": []},
+            {
+                "source": GuangYaFile("source", "1", True, parent_id="0"),
+                "show": show,
+                "archive": GuangYaFile("archive", "整理", True, parent_id="0"),
+            },
+        )
+        failed_probe = RecognitionResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title="Example Show",
+            year="2018",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="TMDB 中不存在第 3 季，已阻止自动整理",
+            matched_by="search",
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            rejected_constraints=["tmdb_position_season_not_found"],
+        )
+        stale_detail = {
+            "id": 82684,
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "first_air_date": "2018-10-02",
+            "seasons": [{"season_number": 1, "episode_count": 92}],
+        }
+        refreshed_detail = {
+            **stale_detail,
+            "seasons": [
+                {"season_number": season, "episode_count": 24}
+                for season in range(1, 4)
+            ],
+        }
+        scraper = TMDBScraper()
+        scraper.match = Mock(
+            side_effect=lambda *args, **kwargs: copy.deepcopy(failed_probe)
+        )
+        scraper.get_detail = Mock(
+            side_effect=lambda *_args, force_refresh=False, **_kwargs: copy.deepcopy(
+                refreshed_detail if force_refresh else stale_detail
+            )
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual([plan.action for plan in plans], ["move"] * 3)
+        self.assertEqual(
+            [(plan.season, plan.episode) for plan in plans],
+            [(3, 13), (3, 14), (3, 15)],
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and not plan.episode_mapping.changed
+            and plan.episode_mapping.confidence == 1.0
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(scraper.get_detail.call_count, 2)
+        self.assertTrue(
+            plans[0].match.metadata["tmdb_detail_force_refreshed"]
+        )
+        self.assertTrue(
+            plans[0].match.metadata["tmdb_detail_refresh_performed"]
+        )
+        self.assertIn(
+            "directory_identity_probe_position_recovery",
+            plans[0].match.metadata,
+        )
+
+    def test_cached_bare_absolute_mapping_is_recomputed_after_refresh(self):
+        file = GuangYaFile(
+            "e25", "Example Show - 25.mkv", False, 1024, "etag-25", "show"
+        )
+        stale_mapping = {
+            "source_season": None,
+            "source_episode": 25,
+            "target_season": 1,
+            "target_episode": 25,
+            "mode": "absolute",
+            "reason": "absolute_numbering_rolled_over_tmdb_seasons",
+            "confidence": 0.95,
+            "changed": True,
+        }
+        match = RecognitionResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title="Example Show",
+            year="2018",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="matched",
+            need_confirm=False,
+            matched_by="search",
+            preprocess_evaluated=True,
+            effective_season=1,
+            effective_episode=25,
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            metadata={"episode_mapping": stale_mapping},
+        )
+        stale_detail = {
+            "id": 82684,
+            "genres": [],
+            "origin_country": [],
+            "seasons": [{"season_number": 1, "episode_count": 24}],
+        }
+        refreshed_detail = {
+            **stale_detail,
+            "seasons": [
+                {"season_number": 1, "episode_count": 12},
+                {"season_number": 2, "episode_count": 13},
+            ],
+        }
+        scraper = TMDBScraper()
+        scraper.get_detail = Mock(return_value=copy.deepcopy(stale_detail))
+        organizer = Organizer(client=object(), scraper=scraper)
+        organizer._refresh_tmdb_detail_once = Mock(
+            return_value=(copy.deepcopy(refreshed_detail), False)
+        )
+
+        plan = organizer._plan_one(
+            file,
+            "Example Show",
+            self._rules(),
+            match_override=match,
+            automatic=True,
+        )
+
+        self.assertEqual(plan.action, "move")
+        self.assertEqual((plan.season, plan.episode), (2, 13))
+        self.assertIsNotNone(plan.episode_mapping)
+        self.assertEqual(
+            (plan.episode_mapping.source_season, plan.episode_mapping.source_episode),
+            (None, 25),
+        )
+        self.assertEqual(plan.episode_mapping.mode, "absolute")
+        self.assertTrue(plan.match.metadata["tmdb_detail_force_refreshed"])
+        organizer._refresh_tmdb_detail_once.assert_called_once()
+
+    def test_cached_mapping_is_recomputed_after_tmdb_detail_refresh(self):
+        file = GuangYaFile(
+            "e49", "Example.Show.S03E49.mkv", False, 1024, "etag-49", "show"
+        )
+        stale_mapping = {
+            "source_season": 3,
+            "source_episode": 49,
+            "target_season": 1,
+            "target_episode": 49,
+            "mode": "absolute",
+            "reason": "absolute_numbering_rolled_over_tmdb_seasons",
+            "confidence": 1.0,
+            "changed": True,
+        }
+        failed_probe = RecognitionResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title="Example Show",
+            year="2018",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="TMDB 中第 1 季不存在第 49 集，已阻止自动整理",
+            matched_by="search",
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            rejected_constraints=["tmdb_position_episode_out_of_range"],
+            metadata={"episode_mapping": stale_mapping},
+        )
+        refreshed_detail = {
+            "id": 82684,
+            "genres": [],
+            "origin_country": [],
+            "seasons": [
+                {"season_number": season, "episode_count": 24}
+                for season in range(1, 5)
+            ],
+        }
+        scraper = TMDBScraper()
+        scraper.get_detail = Mock(return_value=copy.deepcopy(refreshed_detail))
+        organizer = Organizer(client=object(), scraper=scraper)
+        organizer._refresh_tmdb_detail_once = Mock(
+            return_value=(copy.deepcopy(refreshed_detail), False)
+        )
+        evidence = DirectoryEpisodeEvidence(
+            directory_key="show",
+            directory_name="Example Show Season 3 S03E49-E51",
+            source_season=3,
+            range_start=49,
+            range_end=51,
+            episode_count=3,
+        )
+
+        plan = organizer._plan_one(
+            file,
+            "Example Show Season 3 S03E49-E51",
+            self._rules(),
+            recognition_name="Example.Show.S03E01.mkv",
+            recognition_identity_only=True,
+            parsed_override=(1, 49),
+            source_position_override=(3, 49),
+            directory_episode_evidence=evidence,
+            directory_episode_member_count=3,
+            match_override=failed_probe,
+            automatic=True,
+        )
+
+        self.assertEqual(plan.action, "move")
+        self.assertEqual((plan.season, plan.episode), (3, 1))
+        self.assertIsNotNone(plan.episode_mapping)
+        self.assertEqual(plan.episode_mapping.mode, "season_continuous")
+        self.assertEqual(
+            plan.episode_mapping.reason,
+            "continued_numbering_rebased_to_tmdb_season",
+        )
+        self.assertTrue(plan.match.metadata["tmdb_detail_force_refreshed"])
+        self.assertFalse(plan.match.metadata["tmdb_detail_refresh_performed"])
+        organizer._refresh_tmdb_detail_once.assert_called_once()
+
+    def test_identity_probe_consumes_detail_refreshed_by_parallel_planner(self):
+        file = GuangYaFile(
+            "e13", "Example.Show.S03E13.mkv", False, 1024, "etag-13", "show"
+        )
+        failed_probe = RecognitionResult(
+            tmdb_id="82684",
+            external_id="82684",
+            provider="tmdb",
+            title="Example Show",
+            year="2018",
+            media_type="tv",
+            confidence=1.0,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="TMDB 中不存在第 3 季，已阻止自动整理",
+            matched_by="search",
+            threshold_decision={
+                "threshold": 0.9,
+                "score": 1.0,
+                "passed": True,
+                "reason": "score_met",
+            },
+            rejected_constraints=["tmdb_position_season_not_found"],
+        )
+        stale_detail = {
+            "id": 82684,
+            "genres": [],
+            "origin_country": [],
+            "seasons": [{"season_number": 1, "episode_count": 92}],
+        }
+        refreshed_detail = {
+            **stale_detail,
+            "seasons": [
+                {"season_number": season, "episode_count": 24}
+                for season in range(1, 4)
+            ],
+        }
+        scraper = TMDBScraper()
+        scraper.get_detail = Mock(return_value=copy.deepcopy(stale_detail))
+        organizer = Organizer(client=object(), scraper=scraper)
+        organizer._refresh_tmdb_detail_once = Mock(
+            return_value=(copy.deepcopy(refreshed_detail), False)
+        )
+        evidence = DirectoryEpisodeEvidence(
+            directory_key="show",
+            directory_name="Example Show Season 3 S03E13-E15",
+            source_season=3,
+            range_start=13,
+            range_end=15,
+            episode_count=3,
+        )
+
+        plan = organizer._plan_one(
+            file,
+            "Example Show Season 3 S03E13-E15",
+            self._rules(),
+            recognition_name="Example.Show.S03E01.mkv",
+            recognition_identity_only=True,
+            source_position_override=(3, 13),
+            directory_episode_evidence=evidence,
+            directory_episode_member_count=3,
+            match_override=failed_probe,
+            automatic=True,
+        )
+
+        self.assertEqual(plan.action, "move")
+        self.assertEqual((plan.season, plan.episode), (3, 13))
+        self.assertIsNotNone(plan.episode_mapping)
+        self.assertFalse(plan.episode_mapping.changed)
+        self.assertEqual(plan.episode_mapping.confidence, 1.0)
+        self.assertTrue(plan.match.metadata["tmdb_detail_force_refreshed"])
+        self.assertFalse(plan.match.metadata["tmdb_detail_refresh_performed"])
+        organizer._refresh_tmdb_detail_once.assert_called_once()
+
+    def test_missing_source_season_low_and_mid_ranges_still_fail_closed(self):
+        for range_start, range_end in ((1, 3), (10, 12)):
+            with self.subTest(range_start=range_start, range_end=range_end):
+                show = GuangYaFile(
+                    "show",
+                    f"Example Show Season 3 S03E{range_start:02d}-E{range_end:02d}",
+                    True,
+                    parent_id="source",
+                )
+                files = [
+                    GuangYaFile(
+                        f"e{episode}",
+                        f"Example.Show.S03E{episode:02d}.mkv",
+                        False,
+                        1024,
+                        f"etag-{episode}",
+                        "show",
+                    )
+                    for episode in range(range_start, range_end + 1)
+                ]
+                client = _TreeClient(
+                    {"source": [show], "show": files, "archive": []},
+                    {
+                        "source": GuangYaFile("source", "1", True, parent_id="0"),
+                        "show": show,
+                        "archive": GuangYaFile(
+                            "archive", "整理", True, parent_id="0"
+                        ),
+                    },
+                )
+                failed_probe = RecognitionResult(
+                    tmdb_id="82684",
+                    external_id="82684",
+                    provider="tmdb",
+                    title="Example Show",
+                    year="2018",
+                    media_type="tv",
+                    confidence=1.0,
+                    threshold=0.9,
+                    status="low_confidence",
+                    need_confirm=True,
+                    error="TMDB 中不存在第 3 季，已阻止自动整理",
+                    matched_by="search",
+                    threshold_decision={
+                        "threshold": 0.9,
+                        "score": 1.0,
+                        "passed": True,
+                        "reason": "score_met",
+                    },
+                    rejected_constraints=["tmdb_position_season_not_found"],
+                )
+                scraper = TMDBScraper()
+                scraper.match = Mock(
+                    side_effect=lambda *args, **kwargs: copy.deepcopy(failed_probe)
+                )
+                scraper.get_detail = Mock(return_value={
+                    "id": 82684,
+                    "genres": [],
+                    "origin_country": [],
+                    "first_air_date": "2018-01-01",
+                    "seasons": [{"season_number": 1, "episode_count": 92}],
+                })
+
+                plans, stats = Organizer(client=client, scraper=scraper).organize(
+                    "source", self._rules(), dry_run=True, automatic=True,
+                )
+
+                self.assertEqual(
+                    [plan.action for plan in plans],
+                    ["skip"] * (range_end - range_start + 1),
+                )
+                self.assertTrue(all("TMDB" in plan.note for plan in plans))
+                self.assertEqual(stats["need_confirm"], range_end - range_start + 1)
+                self.assertTrue(
+                    scraper.match.call_args_list[0].args[0].endswith(".S03E01.mkv")
+                )
 
     def test_low_confidence_complete_package_uses_directory_identity_proof(self):
         scraper = self._low_confidence_package_scraper()

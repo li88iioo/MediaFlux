@@ -655,16 +655,21 @@ def _confirmation_rollup(rows: list) -> tuple[dict, dict] | None:
         status = str(row["status"] or "")
         result = _decode_json_object(row["result_json"])
         if status == "completed":
-            outcomes["moved"] += safe_int(result.get("moved"), 0, minimum=0)
+            moved = safe_int(result.get("moved"), 0, minimum=0)
+            skipped = safe_int(result.get("skipped"), 0, minimum=0)
+            failed = safe_int(result.get("failed"), 0, minimum=0)
+            unresolved = safe_int(result.get("need_confirm"), 0, minimum=0)
+            outcomes["moved"] += moved
             outcomes["metadata"] += safe_int(
                 result.get("metadata_moved"), 0, minimum=0,
             )
-            outcomes["skipped"] += safe_int(
-                result.get("skipped"), 0, minimum=0,
-            )
-            outcomes["failed"] += safe_int(
-                result.get("failed"), 0, minimum=0,
-            )
+            outcomes["skipped"] += skipped
+            outcomes["failed"] += failed
+            # 防御旧版本/异常执行留下的“completed + need_confirm”记录：
+            # 候选卡已经终结，剩余文件不能从父汇总中凭空消失，应按未解决
+            # 失败显式计入。正常新链路会在写入前阻止这种状态产生。
+            unresolved_capacity = max(0, file_count - moved - skipped - failed)
+            outcomes["failed"] += min(unresolved, unresolved_capacity)
         elif status == "cancelled":
             outcomes["skipped"] += file_count
         elif status == "expired":
@@ -1464,6 +1469,23 @@ def _record_confirmation_learning(
     return warnings
 
 
+def _confirmation_unresolved_error(stats: dict) -> str:
+    """返回固定候选仍无法形成安全计划时的终态错误。"""
+    unresolved = safe_int(stats.get("need_confirm"), 0, minimum=0)
+    if unresolved <= 0:
+        return ""
+    reasons = [
+        str(item or "").strip()
+        for item in (stats.get("confirmations") or [])
+        if str(item or "").strip()
+    ]
+    detail = reasons[0] if reasons else "所选候选仍未通过安全整理校验"
+    return (
+        f"所选媒体仍有 {unresolved} 个文件无法完成安全规划：{detail}。"
+        "文件保持原位，请检查文件名中的季集编号后重新整理"
+    )
+
+
 def _confirmation_result_event(
     payload: dict, candidate: dict, stats: dict
 ) -> NotificationEvent:
@@ -1471,6 +1493,7 @@ def _confirmation_result_event(
     metadata = safe_int(stats.get("metadata_moved"), 0, minimum=0)
     skipped = safe_int(stats.get("skipped"), 0, minimum=0)
     failed = safe_int(stats.get("failed"), 0, minimum=0)
+    unresolved = safe_int(stats.get("need_confirm"), 0, minimum=0)
     warnings = len(list(stats.get("warnings") or []))
     strm = stats.get("strm") if isinstance(stats.get("strm"), dict) else {}
     if strm.get("ok"):
@@ -1481,14 +1504,24 @@ def _confirmation_result_event(
         strm_label, refresh_label = "启动失败", "未触发"
     else:
         strm_label, refresh_label = "未启用或无变更", "未触发"
-    partial = bool(failed or warnings or (strm and not strm.get("ok") and not strm.get("skipped")))
+    partial = bool(
+        failed
+        or unresolved
+        or warnings
+        or (strm and not strm.get("ok") and not strm.get("skipped"))
+    )
+    result_label = (
+        f"已移动 {moved} · 元数据 {metadata} · 跳过 {skipped} · 失败 {failed}"
+    )
+    if unresolved:
+        result_label += f" · 待确认 {unresolved}"
     return NotificationEvent(
         "⚠️ 人工确认整理部分完成" if partial else "✅ 人工确认整理完成",
         fields=(
             ("目标媒体", _candidate_display_name(candidate)),
             ("源文件目录", payload.get("directory") or payload.get("source_name") or "/"),
             NOTIFICATION_SECTION_BREAK,
-            ("执行结果", f"已移动 {moved} · 元数据 {metadata} · 跳过 {skipped} · 失败 {failed}"),
+            ("执行结果", result_label),
             ("STRM 状态", _terminal_status_label(strm_label)),
             ("媒体库刷新", _terminal_status_label(
                 refresh_label, media_library=True,
@@ -1818,6 +1851,7 @@ def _execute_guangya_confirmation(
                 preserve_specials=True,
                 position_overrides=position_overrides,
                 multipart_overrides=multipart_overrides,
+                map_source_positions=provider == "tmdb",
             ),
         )
         organizer._validate_target_outside_source(parent_id, current_rules.target_dir_id)
@@ -1836,6 +1870,12 @@ def _execute_guangya_confirmation(
         expected_ids = {str(item.get("file_id") or "") for item in files}
         if planned_ids != expected_ids:
             raise DirectoryScrapeConflictError("待确认文件集合已变化，请重新执行整理")
+        unresolved_error = _confirmation_unresolved_error(_preview_stats)
+        if unresolved_error:
+            # 人工按钮只确认媒体身份，并不授权绕过 TMDB 季集边界。固定
+            # 候选若仍无法为全部文件形成安全计划，必须在任何写入前失败
+            # 关闭；否则会出现“已完成 / 已移动 0”且父汇总吞掉文件的假成功。
+            raise DirectoryScrapeConflictError(unresolved_error)
 
         scoped.begin_source_scan()
         # 从这里开始 Organizer 可以调用真实 provider 写接口。即使异常看似

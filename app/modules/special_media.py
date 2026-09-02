@@ -29,11 +29,22 @@ _SPECIAL_MEDIA_NAME = re.compile(
 _SP_SPECIAL_POSITION = re.compile(
     r"(?i)(?<![a-z0-9])sp(?:[ ._-]*(?P<episode>\d{1,3}))?(?![a-z0-9])"
 )
+# Mikan 等发布页会把特别篇类型与编号拆成相邻括号，如 ``[OAD][02]``。
+# 这里要求前一括号是完整特别篇标记、后一括号只有 1-3 位数字，避免把
+# ``OVA [1080p]`` 或普通标题年份误当作特别篇序号。
+_ADJACENT_BRACKET_SPECIAL_POSITION = re.compile(
+    r"(?i)(?:^|[ ._\-\[\(【])(?:ova|oav|oad|sp|specials?|特别篇|特別篇|番外篇?|特典)"
+    r"\s*[\]】)）]\s*[\[【(（]\s*(?P<episode>\d{1,3})\s*[\]】)）]"
+)
 # 小数集号通常是正片之间插入的番外/短篇（1.5、4.5、7.5）。它们不能
 # 原样表达为 Jellyfin/TMDB 的整数 SxxExx，但可以在同一作品作用域内按原始
 # 数值顺序稳定映射到 Season 00。规则只接受明确季集、EP、发布名末尾或括号
 # 位置，避免把容量 ``1.5GB``、版本 ``v1.5`` 和年份小数误判成集号。
 _FRACTIONAL_EPISODE_PATTERNS = (
+    re.compile(
+        r"(?i)(?<![a-z0-9])(?:ova|oav|oad|sp|specials?)[ ._-]*"
+        r"(?P<episode>\d{1,4}\.\d{1,2})(?![a-z0-9])"
+    ),
     re.compile(
         r"(?i)(?<![a-z0-9])s(?P<season>\d{1,3})[ ._-]*"
         r"e(?:p)?[ ._-]*(?P<episode>\d{1,4}\.\d{1,2})(?![a-z0-9])"
@@ -132,12 +143,20 @@ def special_media_position(value: str) -> int | None:
     """返回特别篇显式编号；无编号时交给调用方稳定分配。"""
     stem = _media_stem(value)
     stem = _strip_explicit_tmdb_markers(stem)
+    # ``OAD3.75`` / ``SP12.5`` 的小数是完整语义，不能先截成整数 3/12。
+    # 最终 Season 00 位置由目录级稳定排序或 TMDB 特别篇标题映射决定。
+    if fractional_episode_position(stem) is not None:
+        return None
     season_zero = _SEASON_ZERO_SPECIAL.search(stem)
     if season_zero:
         number = int(season_zero.group("episode"))
         return number if 1 <= number <= 999 else 1
     if _ZERO_EPISODE_SPECIAL.search(stem) or _PROLOGUE_SPECIAL.search(stem):
         return 1
+    adjacent = _ADJACENT_BRACKET_SPECIAL_POSITION.search(stem)
+    if adjacent:
+        number = int(adjacent.group("episode"))
+        return number if 1 <= number <= 999 else None
     for pattern in (_SP_SPECIAL_POSITION, _NC_SPECIAL_POSITION, _BARE_OP_ED_POSITION):
         match = pattern.search(stem)
         if not match:

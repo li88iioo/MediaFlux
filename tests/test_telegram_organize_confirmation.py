@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from app import database as db, notifier
 from app.clients.guangya import GuangYaFile
+from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
 from app.modules import organize_confirmations as confirmation_module
 from app.modules import telegram_notification_center as notification_center
@@ -63,6 +64,22 @@ class ConfirmationTerminalNotificationTests(unittest.TestCase):
         self.assertIn("- <b>🎬 目标媒体：</b> 测试剧集", rendered)
         self.assertIn("- <b>📁 源文件目录：</b> /待确认", rendered)
         self.assertIn("待确认\n\n- <b>📊 执行结果：</b>", rendered)
+
+    def test_guangya_unresolved_files_are_not_reported_as_success(self):
+        event = _confirmation_result_event(
+            {"directory": "/待确认"},
+            {"title": "测试剧集", "year": "2026"},
+            {
+                "moved": 0, "metadata_moved": 0, "skipped": 0, "failed": 0,
+                "need_confirm": 2,
+            },
+        )
+
+        self.assertIn("部分完成", event.title)
+        self.assertIn((
+            "执行结果",
+            "已移动 0 · 元数据 0 · 跳过 0 · 失败 0 · 待确认 2",
+        ), event.fields)
 
     def test_local_refresh_failure_is_not_reported_as_full_success(self):
         event = _local_confirmation_result_event(
@@ -435,6 +452,40 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         outcomes = update_parent.call_args.kwargs["outcomes"]
         self.assertEqual(outcomes["resolved_files"], 1)
         self.assertEqual(outcomes["expired"], 1)
+
+    def test_rollup_counts_legacy_completed_unresolved_files_as_failed(self):
+        group = self._group()
+        group.update({
+            "organize_task_id": "organize-legacy-unresolved",
+            "organize_rollup": {
+                "version": 1, "total": 1, "moved": 0, "metadata": 0,
+                "confirm": 1, "skipped": 0, "failed": 0,
+                "actionable_files": 1, "actionable_groups": 1,
+                "stopped": False, "scan_incomplete": False,
+            },
+        })
+        actions = create_confirmation_actions(
+            group, OrganizeRules(), source_name="下载", chat_id="100",
+        )
+        token = actions[0].callback_data.split(":")[1]
+        db.update_organize_confirmation(
+            token,
+            status="completed",
+            completed_at=db.now(),
+            result_json=json.dumps({
+                "moved": 0, "metadata_moved": 0, "skipped": 0,
+                "failed": 0, "need_confirm": 1,
+            }),
+        )
+
+        rollup = confirmation_module._confirmation_rollup([
+            db.get_organize_confirmation(token),
+        ])
+
+        self.assertIsNotNone(rollup)
+        _baseline, outcomes = rollup
+        self.assertEqual(outcomes["resolved_files"], 1)
+        self.assertEqual(outcomes["failed"], 1)
 
     def test_queued_choice_survives_candidate_ttl(self):
         actions = create_confirmation_actions(
@@ -1390,6 +1441,74 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(thread_ref["token"], token)
         self.assertEqual(db.get_organize_confirmation(token)["status"], "completed")
         self.assertIn("人工确认整理完成", published[-1].title)
+
+    def test_worker_rejects_fixed_candidate_that_still_needs_confirmation(self):
+        rules = OrganizeRules()
+        token, callback = self._capture_confirmation_worker()
+        current_file = GuangYaFile(
+            "file-4", "Nagatoro - 04.mp4", False, size=104,
+            etag="etag-4", parent_id="parent",
+        )
+        fake_client = SimpleNamespace(file_info=lambda _file_id: current_file)
+        fake_match = MatchResult(
+            tmdb_id="105556", title="不要欺负我，长瀞同学", year="2021",
+            media_type="tv", confidence=1.0, need_confirm=False,
+        )
+        fake_scraper = SimpleNamespace()
+        calls = []
+
+        class FakeOrganizer:
+            def __init__(self, **_kwargs):
+                pass
+
+            def _validate_target_outside_source(self, *_args):
+                pass
+
+            def organize(self, *_args, **kwargs):
+                calls.append(kwargs["dry_run"])
+                if not kwargs["dry_run"]:
+                    self.fail("未解决的确认预览不得进入真实写入")
+                return [SimpleNamespace(file_id="file-4")], {
+                    "need_confirm": 1,
+                    "confirmations": ["文件集号超出 TMDB 记录范围"],
+                }
+
+        fake_scoped = SimpleNamespace(begin_source_scan=lambda: None)
+        published = []
+        with patch(
+            "app.modules.organize_confirmations.OrganizeRules.from_config",
+            return_value=rules,
+        ), patch(
+            "app.modules.organize_confirmations.GuangYaClient",
+            return_value=fake_client,
+        ), patch(
+            "app.modules.organize_confirmations._resolve_guangya_confirmation_candidate",
+            return_value=(fake_scraper, fake_match, {"id": 105556}, "tmdb"),
+        ), patch(
+            "app.modules.organize_confirmations.ScopedGuangYaClient",
+            return_value=fake_scoped,
+        ), patch(
+            "app.modules.organize_confirmations.FixedMatchScraper",
+            return_value=SimpleNamespace(),
+        ), patch(
+            "app.modules.organize_confirmations.Organizer", FakeOrganizer,
+        ), patch(
+            "app.modules.telegram_notification_center.publish_notification_thread",
+            side_effect=lambda _key, event, **_kwargs: (
+                published.append(event)
+                or NotificationPublishResult(True, delivered=True, status="sent")
+            ),
+        ):
+            with self.assertRaisesRegex(
+                DirectoryScrapeConflictError, "仍有 1 个文件无法完成安全规划",
+            ):
+                callback()
+
+        row = db.get_organize_confirmation(token)
+        self.assertEqual(calls, [True])
+        self.assertEqual(row["status"], "failed")
+        self.assertIn("文件集号超出 TMDB 记录范围", row["error"])
+        self.assertIn("确认整理失败", published[-1].title)
 
     def test_snapshot_conflict_is_terminal_and_requires_new_scan(self):
         rules = OrganizeRules()

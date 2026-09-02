@@ -131,6 +131,56 @@ class _ExactTVClient:
 
 class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
     @staticmethod
+    def _slime_specials_detail():
+        return {
+            "season_number": 0,
+            "episodes": [
+                {
+                    "episode_number": 1,
+                    "air_date": "2019-03-26",
+                    "name": "第24.5话 闲话：维鲁多拉日记",
+                },
+                {
+                    "episode_number": 7,
+                    "air_date": "2021-01-05",
+                    "name": "第24.9话 闲话：日向·坂口",
+                },
+                {
+                    "episode_number": 8,
+                    "air_date": "2021-06-29",
+                    "name": "第36.5话 闲话：维鲁多拉日记2",
+                },
+                {
+                    "episode_number": 14,
+                    "air_date": "2024-03-30",
+                    "name": "第48.5话 闲话：迪亚波罗日记",
+                },
+                {
+                    "episode_number": 15,
+                    "air_date": "2024-08-10",
+                    "name": "第65.5话 闲话：鲁米纳斯回忆录",
+                },
+            ],
+        }
+
+    @staticmethod
+    def _slime_season_two_detail():
+        return {
+            "season_number": 2,
+            "episodes": [
+                {
+                    "episode_number": episode,
+                    "air_date": (
+                        f"2021-01-{11 + episode:02d}"
+                        if episode <= 19
+                        else f"2021-08-{episode - 19:02d}"
+                    ),
+                }
+                for episode in range(1, 25)
+            ],
+        }
+
+    @staticmethod
     def _strict_tmdb_match(tmdb_id="4242"):
         return MatchResult(
             tmdb_id=str(tmdb_id),
@@ -676,6 +726,19 @@ class SpecialMediaTokenTests(unittest.TestCase):
                 self.assertTrue(is_special_media_name(filename))
                 self.assertEqual(special_media_position(filename), episode)
 
+    def test_adjacent_bracket_special_number_is_preserved(self):
+        self.assertEqual(
+            special_media_position("[Fansub][Example Show][OAD][02][720P].mkv"),
+            2,
+        )
+        self.assertEqual(
+            special_media_position("[Fansub][Example Show][OVA][003][BDRip].mkv"),
+            3,
+        )
+        self.assertIsNone(
+            special_media_position("[Fansub][Example Show][OVA][1080p].mkv")
+        )
+
     def test_sp_tokens_are_specials_without_capturing_normal_words(self):
         expected = {
             "SP.mkv": None,
@@ -697,6 +760,7 @@ class SpecialMediaTokenTests(unittest.TestCase):
             "Show.EP07.5.mkv",
             "Show - 07.5.mkv",
             "Show.[07.5].mkv",
+            "Show.OAD3.75.mkv",
         ):
             with self.subTest(filename=filename):
                 self.assertTrue(has_fractional_episode_position(filename))
@@ -708,6 +772,15 @@ class SpecialMediaTokenTests(unittest.TestCase):
         ):
             with self.subTest(filename=filename):
                 self.assertFalse(has_fractional_episode_position(filename))
+
+    def test_named_fractional_special_is_not_truncated_to_integer_position(self):
+        filename = "Shingeki no Kyojin - Konnan - OAD3.75 [1080p].mkv"
+
+        self.assertTrue(is_special_media_name(filename))
+        self.assertIsNone(special_media_position(filename))
+        season, marker = fractional_episode_position(filename) or (None, None)
+        self.assertIsNone(season)
+        self.assertEqual(str(marker), "3.75")
 
 
     def test_explicit_zero_episode_reserves_first_special_position(self):
@@ -897,6 +970,116 @@ class OrganizePositionSafetyTests(unittest.TestCase):
                 self.assertIn("S00E01", plans[0].new_name)
                 self.assertEqual(stats["need_confirm"], 0)
                 self.assertEqual(stats["fractional_specials_mapped"], 1)
+
+    def test_fractional_episode_prefers_exact_tmdb_special_number(self):
+        client = _TreeClient()
+        client.tree["source"] = [GuangYaFile(
+            "fractional",
+            "[LoliHouse] Tensei Shitara Slime Datta Ken 3rd Season - 48.5 "
+            "[WebRip 1080p HEVC-10bit AAC].mkv",
+            False,
+            1024,
+            "fractional",
+            "source",
+        )]
+        delegate = TMDBScraper()
+        delegate.get_tv_season_detail = Mock(
+            return_value=AutomaticSpecialsTests._slime_specials_detail()
+        )
+        scraper = FixedMatchScraper(
+            delegate,
+            AutomaticSpecialsTests._strict_tmdb_match("82684"),
+            {
+                "id": 82684,
+                "genres": [{"id": 16}],
+                "origin_country": ["JP"],
+                "seasons": [
+                    {"season_number": 0, "episode_count": 15},
+                    {"season_number": 3, "episode_count": 24},
+                ],
+            },
+            preserve_specials=True,
+        )
+        rules = OrganizeRules(
+            target_dir_id="archive", small_file_mb=0, region_split=False,
+            year_split=False, clean_empty=False, link_strm=False,
+            notify_enabled=False,
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", rules, dry_run=True, automatic=True,
+        )
+
+        self.assertEqual(plans[0].action, "move")
+        self.assertEqual((plans[0].season, plans[0].episode), (0, 14))
+        self.assertIn("S00E14", plans[0].new_name)
+        self.assertEqual(stats["need_confirm"], 0)
+
+    def test_complete_two_item_overflow_tail_maps_to_tmdb_specials(self):
+        client = _TreeClient()
+        files = [
+            GuangYaFile(
+                f"overflow-{episode}",
+                "That.Time.I.Got.Reincarnated.as.a.Slime."
+                f"S02E{episode:02d}.2021.mkv",
+                False,
+                1024,
+                f"overflow-{episode}",
+                "source",
+            )
+            for episode in (25, 26)
+        ]
+        client.tree["source"] = files
+        delegate = TMDBScraper()
+        delegate.get_tv_season_detail = Mock(side_effect=lambda _tmdb_id, season: (
+            AutomaticSpecialsTests._slime_specials_detail()
+            if season == 0 else AutomaticSpecialsTests._slime_season_two_detail()
+        ))
+        position_overrides = {
+            item.name: (2, episode)
+            for item, episode in zip(files, (25, 26))
+        }
+        scraper = FixedMatchScraper(
+            delegate,
+            AutomaticSpecialsTests._strict_tmdb_match("82684"),
+            {
+                "id": 82684,
+                "name": "关于我转生变成史莱姆这档事",
+                "first_air_date": "2018-10-02",
+                "genres": [{"id": 16}],
+                "origin_country": ["JP"],
+                "seasons": [
+                    {"season_number": 0, "episode_count": 15},
+                    {"season_number": 1, "episode_count": 24},
+                    {"season_number": 2, "episode_count": 24},
+                ],
+            },
+            preserve_specials=True,
+            position_overrides=position_overrides,
+            map_source_positions=True,
+        )
+        rules = OrganizeRules(
+            target_dir_id="archive", small_file_mb=0, region_split=False,
+            year_split=False, clean_empty=False, link_strm=False,
+            notify_enabled=False,
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", rules, dry_run=True,
+        )
+        by_id = {plan.file_id: plan for plan in plans}
+
+        self.assertEqual(by_id["overflow-25"].action, "move")
+        self.assertEqual(
+            (by_id["overflow-25"].season, by_id["overflow-25"].episode),
+            (0, 7),
+        )
+        self.assertEqual(
+            (by_id["overflow-26"].season, by_id["overflow-26"].episode),
+            (0, 8),
+        )
+        self.assertEqual(by_id["overflow-25"].episode_mapping.mode, "tmdb_special")
+        self.assertEqual(stats["need_confirm"], 0)
 
     def test_fractional_episodes_share_numeric_special_sequence(self):
         client = _TreeClient()

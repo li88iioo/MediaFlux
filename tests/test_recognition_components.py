@@ -28,6 +28,24 @@ class RecognitionCleanerTests(unittest.TestCase):
             _split_title_variants("示例剧 | Example Show"),
             ["示例剧 | Example Show", "示例剧", "Example Show"],
         )
+        self.assertEqual(
+            _split_title_variants("Let's Camp!露营少女/摇曳露营/Yuru Camp"),
+            [
+                "Let's Camp!露营少女/摇曳露营/Yuru Camp",
+                "Let's Camp!露营少女",
+                "摇曳露营",
+                "Yuru Camp",
+                "露营少女",
+                "Let's Camp",
+            ],
+        )
+        self.assertEqual(_split_title_variants("Fate/stay night"), ["Fate/stay night"])
+        self.assertNotIn(
+            "100 III",
+            _split_title_variants(
+                "灵能百分百 / 路人超能100 Ⅲ / モブサイコ100 III / Mob Psycho 100 Ⅲ"
+            ),
+        )
 
     def test_scraper_reexports_same_cleaner_functions(self):
         from app.modules import scraper
@@ -50,6 +68,50 @@ class DeterministicExtractorTests(unittest.TestCase):
         self.assertIsNone(deterministic._parse_release_x_position("Demo 16x9"))
         self.assertTrue(deterministic._has_unaccepted_release_x_position("Demo 16x9"))
         self.assertIsNone(deterministic._extract_episode("Demo 2024 1080p"))
+
+    def test_mikan_attached_season_and_dual_episode_positions(self):
+        from app.modules.recognition.extractors import deterministic
+
+        self.assertEqual(
+            deterministic._extract_explicit_season("间谍过家家Season 3 - 13 END"),
+            3,
+        )
+        self.assertEqual(
+            deterministic._extract_episode("间谍过家家Season 3 - 13 END [1080p]"),
+            13,
+        )
+        self.assertEqual(
+            deterministic._extract_explicit_season("我的英雄学院S4 [01(64)]"),
+            4,
+        )
+        self.assertEqual(
+            deterministic._extract_episode("我的英雄学院S4 [01(64)] [720P]"),
+            1,
+        )
+        self.assertEqual(
+            deterministic._extract_episode("史莱姆 4th Season - 20(92) [1080p]"),
+            20,
+        )
+        self.assertIsNone(
+            deterministic._extract_explicit_season("Preseason 3 - 01")
+        )
+        self.assertIsNone(
+            deterministic._extract_explicit_season(
+                "Shingeki no Kyojin - The Final Season - 30"
+            )
+        )
+        self.assertEqual(
+            deterministic._extract_episode(
+                "Shingeki no Kyojin - The Final Season - 30 [1080p]"
+            ),
+            30,
+        )
+        for token in ("Season 3", "Season-3", "Season_3", "Season.3"):
+            with self.subTest(token=token):
+                self.assertEqual(
+                    deterministic._extract_explicit_season(f"Demo {token} - 07"),
+                    3,
+                )
 
     def test_scraper_reexports_same_deterministic_functions(self):
         from app.modules import scraper

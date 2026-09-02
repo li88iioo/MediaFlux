@@ -135,6 +135,30 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         self.assertEqual(compact, {"season": 2, "episode": 3, "episode_end": None})
         self.assertEqual(special, {"season": 0, "episode": 3, "episode_end": None})
         self.assertEqual(oav, {"season": 0, "episode": 2, "episode_end": None})
+        adjacent_oad = scraper.parse_release_position(
+            "[Fansub][Example Show][OAD][02][720P][CHS].mkv"
+        )
+        adjacent_oad_range = scraper.parse_release_position(
+            "[Fansub][Example Show][OAD][06-08][720P][CHS].mkv"
+        )
+        angle_episode = scraper.parse_release_position(
+            "[Fansub] D4DJ All Mix - <03> [1080p].mkv"
+        )
+        fractional = scraper.parse_release_position(
+            "Example Show S02 - 12.5 [1080p].mkv"
+        )
+        self.assertEqual(
+            adjacent_oad, {"season": 0, "episode": 2, "episode_end": None}
+        )
+        self.assertEqual(
+            adjacent_oad_range, {"season": 0, "episode": 6, "episode_end": 8}
+        )
+        self.assertEqual(
+            angle_episode, {"season": None, "episode": 3, "episode_end": None}
+        )
+        self.assertEqual(
+            fractional, {"season": 0, "episode": None, "episode_end": None}
+        )
         self.assertEqual(named_special, {"season": 0, "episode": 4, "episode_end": None})
         self.assertEqual(special_range, {"season": 0, "episode": 1, "episode_end": 3})
         self.assertEqual(season_episode, {"season": 3, "episode": 8, "episode_end": None})
@@ -213,6 +237,60 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         self.assertEqual((compound.normalized_title, compound.season, compound.episode), ("三体", 2, 3))
         self.assertEqual((topic.normalized_title, topic.episode), ("三体 第十五话题", None))
         self.assertEqual((digest.normalized_title, digest.episode), ("三体 第十二集锦", None))
+
+    def test_four_digit_chinese_episode_and_bracketed_series_title_are_preserved(self):
+        scraper = self.recognition_module()
+        filename = (
+            "[银色子弹字幕组][名侦探柯南]"
+            "[第1211集 鸟人大赛爆炸事件（前篇）][WEBRIP][PGS][1080P].mkv"
+        )
+
+        context = scraper.extract_recognition_context(filename, "")
+        position = scraper.parse_release_position(filename)
+        queries = scraper.generate_query_variants(context)
+
+        self.assertEqual(context.episode, 1211)
+        self.assertEqual(position["episode"], 1211)
+        self.assertIn("名侦探柯南", queries)
+
+    def test_angle_bracket_episode_and_fractional_special_contexts_fail_safe(self):
+        scraper = self.recognition_module()
+
+        angle = scraper.extract_recognition_context(
+            "[喵萌Production&LoliHouse] D4DJ All Mix - <03> "
+            "[WebRip 1080p HEVC-10bit AAC][简繁日内封字幕].mkv",
+            "",
+        )
+        fractional = scraper.extract_recognition_context(
+            "[Lilith-Raws] Tensei Shitara Slime Datta Ken S02 - 12.5 "
+            "[Baha][WEB-DL][1080p].mkv",
+            "",
+        )
+
+        self.assertEqual((angle.media_type, angle.episode), ("tv", 3))
+        self.assertNotIn("<03>", angle.normalized_title)
+        self.assertEqual((fractional.media_type, fractional.season, fractional.episode), (
+            "tv", 0, None,
+        ))
+        self.assertNotIn("12.5", fractional.normalized_title)
+
+    def test_mikan_release_groups_and_pipe_ranges_do_not_pollute_title(self):
+        scraper = self.recognition_module()
+
+        angle = scraper.extract_recognition_context(
+            "[喵萌Production&LoliHouse] D4DJ All Mix - <03> "
+            "[WebRip 1080p HEVC-10bit AAC][简繁日内封字幕].mkv",
+            "",
+        )
+        pack = scraper.extract_recognition_context(
+            "[7³ACG] D4DJ All Mix S02 | 01-12 "
+            "[简繁字幕] BDrip 1080p x265 FLAC 2.0",
+            "",
+        )
+
+        self.assertEqual(angle.normalized_title, "D4DJ All Mix")
+        self.assertEqual(pack.normalized_title, "D4DJ All Mix")
+        self.assertEqual((pack.season, pack.media_type), (2, "tv"))
 
     def test_season_ranges_fail_closed_until_the_model_can_express_them(self):
         scraper = self.recognition_module()
@@ -1340,6 +1418,159 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         self.assertEqual((context.season, context.episode), (2, 8))
         self.assertEqual((parsed["season"], parsed["episode"]), (2, 8))
         self.assertEqual((position["season"], position["episode"]), (2, 8))
+
+    def test_mikan_multiseason_titles_keep_local_episode_numbering(self):
+        scraper = self.recognition_module()
+        parser = scraper.TMDBScraper()
+        samples = (
+            (
+                "[jibaketa合成][代理商粤语]SPY×FAMILY间谍家家酒 / "
+                "间谍过家家Season 3 - 13 END [粤日双语](WEB 1920x1080 AVC AAC).mkv",
+                (3, 13),
+            ),
+            (
+                "[我的英雄学院S4][01(64)][720P][内挂繁中字幕].mkv",
+                (4, 1),
+            ),
+            (
+                "[豌豆字幕组&LoliHouse] 关于我转生变成史莱姆这档事 第四季 / "
+                "Tensei Shitara Slime Datta Ken 4th Season - 20(92) "
+                "[WebRip 1080p HEVC-10bit AAC][简繁外挂字幕].mkv",
+                (4, 20),
+            ),
+        )
+
+        for filename, expected in samples:
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename, "")
+                parsed = _parse_fields(parser, filename)
+                position = scraper.parse_release_position(filename)
+                self.assertEqual((context.season, context.episode), expected)
+                self.assertEqual((parsed["season"], parsed["episode"]), expected)
+                self.assertEqual(
+                    (position["season"], position["episode"]), expected
+                )
+                self.assertNotRegex(context.normalized_title, r"(?:20\(92\)|01\(64\))")
+                if "间谍过家家Season" in filename:
+                    self.assertEqual(context.normalized_title, "间谍过家家")
+
+    def test_mikan_final_season_separator_is_not_a_numeric_season(self):
+        scraper = self.recognition_module()
+        title = (
+            "[Lilith-Raws] 进击的巨人 / Shingeki no Kyojin - "
+            "The Final Season - 30 [Baha][WEB-DL][1080p][AVC AAC][CHT][MP4]"
+        )
+        explicit = (
+            "[Skymoon-Raws] 进击的巨人 第四季 / Shingeki no Kyojin - "
+            "The Final Season - 28 [ViuTV][WEB-DL][1080p][AVC AAC]"
+        )
+
+        self.assertEqual(
+            scraper.parse_release_position(title),
+            {"season": None, "episode": 30, "episode_end": None},
+        )
+        self.assertEqual(
+            scraper.parse_release_position(explicit),
+            {"season": 4, "episode": 28, "episode_end": None},
+        )
+
+    def test_mikan_release_group_dot_is_not_treated_as_an_extension(self):
+        scraper = self.recognition_module()
+        title = (
+            "[c.c动漫][4月新番][约会大作战 第四季][12]"
+            "[BIG5][1080P][MP4][END]"
+        )
+
+        self.assertEqual(
+            scraper.parse_release_position(title),
+            {"season": 4, "episode": 12, "episode_end": None},
+        )
+        context = scraper.extract_recognition_context(f"{title}.mkv", "")
+        self.assertEqual(context.normalized_title, "约会大作战")
+        self.assertEqual((context.season, context.episode), (4, 12))
+        self.assertIn("[c.c动漫]", context.cleaned_components["release_prefixes"])
+        self.assertTrue(
+            "4月新番" in context.cleaned_components["noise_tokens"]
+            or "[4月新番]" in context.cleaned_components["release_prefixes"]
+        )
+        self.assertIn("END", context.cleaned_components["noise_tokens"])
+
+    def test_mikan_combined_release_and_platform_noise_is_removed(self):
+        scraper = self.recognition_module()
+        yuru = scraper.extract_recognition_context(
+            "[jibaketa合成&压制][TVB粤语]Let's Camp!露营少女/摇曳露营/"
+            "Yuru Camp Season 3 - 12 END [粤日双语+内封繁体中文字幕]"
+            "[BD 1920x1080 x264 AACx2 SRT TVB CHT].mkv",
+            "",
+        )
+        blue_exorcist = scraper.extract_recognition_context(
+            "[黒ネズミたち] 青之驱魔师 终夜篇 / "
+            "Ao no Exorcist: Yosuga-hen - 12 "
+            "(ABEMA 1280x720 AVC AAC MP4).mkv",
+            "",
+        )
+        log_horizon = scraper.extract_recognition_context(
+            "[NC-Raws] 记录的地平线 圆桌崩坏（仅限港澳台地区） / "
+            "Log Horizon S03 - 12 [B-HMT][WEB-DL][1080p]"
+            "[AVC AAC][CHS_CHT_SRT][MKV].mkv",
+            "",
+        )
+        mob = scraper.extract_recognition_context(
+            "[离谱Sub] 灵能百分百 第三季 / 路人超能100 Ⅲ / "
+            "モブサイコ100 III / Mob Psycho 100 Ⅲ [03]"
+            "[AVC AAC][1080p][繁体内嵌].mkv",
+            "",
+        )
+        oshi = scraper.extract_recognition_context(
+            "[jibaketa合成][代理商粤语]【我推的孩子】第三季 / "
+            "Oshi no Ko 3rd Season - 11 END [粤日双语+内封繁体中文字幕]"
+            "(WEB 1920x1080 AVC AACx2 SRT Ani-One CHT).mkv",
+            "",
+        )
+
+        self.assertEqual(
+            yuru.normalized_title, "Let's Camp!露营少女/摇曳露营/Yuru Camp"
+        )
+        self.assertEqual((yuru.season, yuru.episode), (3, 12))
+        self.assertEqual(
+            yuru.cleaned_components["release_prefixes"][:2],
+            ["[jibaketa合成&压制]", "[TVB粤语]"],
+        )
+        self.assertEqual(
+            blue_exorcist.normalized_title,
+            "青之驱魔师 终夜篇 / Ao no Exorcist: Yosuga hen",
+        )
+        self.assertEqual((blue_exorcist.season, blue_exorcist.episode), (None, 12))
+        self.assertIn(
+            "ABEMA 1280x720 AVC AAC MP4",
+            blue_exorcist.cleaned_components["noise_tokens"],
+        )
+        self.assertEqual(
+            log_horizon.normalized_title, "记录的地平线 圆桌崩坏 / Log Horizon"
+        )
+        self.assertEqual((log_horizon.season, log_horizon.episode), (3, 12))
+        self.assertIn("B-HMT", log_horizon.cleaned_components["noise_tokens"])
+        mob_queries = scraper.generate_query_variants(mob)
+        self.assertEqual((mob.season, mob.episode), (3, 3))
+        self.assertIn("路人超能100 Ⅲ", mob_queries)
+        self.assertIn("Mob Psycho 100", mob_queries)
+        self.assertNotIn("100 III", mob_queries)
+        self.assertEqual(oshi.normalized_title, "我推的孩子")
+        self.assertIn("[代理商粤语]", oshi.cleaned_components["release_prefixes"])
+
+    def test_mikan_temperature_release_group_is_removed_exactly(self):
+        scraper = self.recognition_module()
+        context = scraper.extract_recognition_context(
+            "[Up to 21°C] 约会大作战第五季 / Date A Live V - 12 "
+            "(CR 1920x1080 AVC AAC MKV).mkv",
+            "",
+        )
+
+        self.assertEqual(context.normalized_title, "约会大作战")
+        self.assertEqual((context.season, context.episode), (5, 12))
+        self.assertIn(
+            "[Up to 21°C]", context.cleaned_components["release_prefixes"]
+        )
 
     def test_explicit_episode_tokens_still_accept_release_delimiters(self):
         scraper = self.recognition_module()

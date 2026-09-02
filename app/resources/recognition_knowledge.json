@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 3,
+  "revision": 6,
   "entries": [
     {
       "knowledge_key": "release-group:ani",
@@ -310,6 +310,24 @@
       ]
     },
     {
+      "knowledge_key": "release-group:jibaketa-composite",
+      "knowledge_type": "release_group",
+      "canonical_value": "jibaketa合成",
+      "aliases": [
+        "jibaketa合成",
+        "jibaketa合成&压制",
+        "jibaketa合成＆压制"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:kuro-nezumi",
+      "knowledge_type": "release_group",
+      "canonical_value": "黒ネズミたち",
+      "aliases": [
+        "黒ネズミたち"
+      ]
+    },
+    {
       "knowledge_key": "release-group:lipu-sub",
       "knowledge_type": "release_group",
       "canonical_value": "离谱Sub",
@@ -432,6 +450,42 @@
       "canonical_value": "FRDS",
       "aliases": [
         "FRDS"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:up-to-21c",
+      "knowledge_type": "release_group",
+      "canonical_value": "Up to 21°C",
+      "aliases": [
+        "Up to 21°C",
+        "Up to 21℃"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:cc-anime",
+      "knowledge_type": "release_group",
+      "canonical_value": "c.c动漫",
+      "aliases": [
+        "c.c动漫",
+        "c.c動漫"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:7cubed-acg",
+      "knowledge_type": "release_group",
+      "canonical_value": "7³ACG",
+      "aliases": [
+        "7³ACG",
+        "7^3ACG"
+      ]
+    },
+    {
+      "knowledge_key": "release-group:miaomeng-production",
+      "knowledge_type": "release_group",
+      "canonical_value": "喵萌Production",
+      "aliases": [
+        "喵萌Production",
+        "喵萌 Production"
       ]
     }
   ]

@@ -268,6 +268,7 @@ class FixedMatchScraper:
         preserve_specials: bool = False,
         position_overrides: dict[object, tuple[int | None, int | None]] | None = None,
         multipart_overrides: dict[object, int] | None = None,
+        map_source_positions: bool = False,
     ) -> None:
         self.delegate = delegate
         self.fixed_match = dataclasses.replace(match)
@@ -277,6 +278,24 @@ class FixedMatchScraper:
         self.preserve_specials = bool(preserve_specials)
         self.position_overrides = dict(position_overrides or {})
         self.multipart_overrides = dict(multipart_overrides or {})
+        # 普通 Web / 本地预览传入的 position_overrides 已由统一映射器计算完成；
+        # Telegram 候选确认保存的是原始源位置，需要 Organizer 在取得所选
+        # TMDB 详情后重新执行同一套安全映射。是否“重新映射”和是否“最终
+        # 校验”是两个独立能力：所有真实 TMDB 委托都必须复核最终季集位置。
+        self.map_source_positions = bool(map_source_positions)
+        from inspect import getattr_static
+
+        def declared_callable(name: str) -> bool:
+            try:
+                getattr_static(delegate, name)
+            except AttributeError:
+                return False
+            return callable(getattr(delegate, name, None))
+
+        self.supports_tmdb_position_validation = bool(
+            declared_callable("validate_position")
+            and declared_callable("position_validation_error")
+        )
 
     def match(self, _filename: str, _parent_path: str = "") -> MatchResult:
         return dataclasses.replace(self.fixed_match)
@@ -382,10 +401,47 @@ class FixedMatchScraper:
         """目标目录已有文件按真实文件名解析，不套用本次手工覆盖。"""
         return self.delegate.parse_media(filename)
 
-    def get_detail(self, tmdb_id: str, media_type: str) -> dict:
-        if str(tmdb_id) == str(self.fixed_match.tmdb_id):
+    def get_detail(
+        self, tmdb_id: str, media_type: str, *, force_refresh: bool = False,
+    ) -> dict:
+        requested_id = str(tmdb_id)
+        fixed_id = str(self.fixed_match.tmdb_id)
+        if requested_id == fixed_id and not force_refresh:
             return dict(self.detail)
-        return self.delegate.get_detail(tmdb_id, media_type)
+
+        getter = getattr(self.delegate, "get_detail", None)
+        if not callable(getter):
+            return {}
+        try:
+            refreshed = getter(tmdb_id, media_type, force_refresh=force_refresh)
+        except TypeError:
+            # 兼容不支持受控刷新的第三方实现与测试桩；真实 TMDBScraper
+            # 会走 force_refresh，从而避免最终季集复核继续读取固定旧快照。
+            refreshed = getter(tmdb_id, media_type)
+        if not isinstance(refreshed, dict) or not refreshed:
+            return {}
+        result = dict(refreshed)
+        returned_id = str(result.get("id") or "").strip()
+        if returned_id and returned_id != requested_id:
+            return {}
+        if requested_id == fixed_id:
+            self.detail = result
+        return dict(result)
+
+    def validate_position(
+        self, detail: dict, media_type: str, season: int | None, episode: int | None,
+    ) -> dict[str, object]:
+        return self.delegate.validate_position(detail, media_type, season, episode)
+
+    def position_validation_error(self, validation: dict[str, object]) -> str:
+        return self.delegate.position_validation_error(validation)
+
+    def get_tv_season_detail(self, tmdb_id: str, season: int) -> dict:
+        getter = getattr(self.delegate, "get_tv_season_detail", None)
+        if not callable(getter):
+            return {}
+        result = getter(tmdb_id, season)
+        return dict(result) if isinstance(result, dict) else {}
 
 
 class ScopedGuangYaClient:
@@ -1856,22 +1912,30 @@ class DirectoryScrapeService:
                 mode=mode,
                 directory_evidence=directory_evidence,
             )
-            # 单季 TMDB 条目下，发布方的第二季若从 E01 重新编号，普通
-            # absolute 回退会错误地保持 E01；但单个文件不足以证明它属于
-            # split-cour。只有目录形成从 E01 开始、至少 3 集且无断档的完整
-            # 连续证据时，才允许用播出间隔重映射。S02E13-E24 这类绝对集号
-            # 包不会满足该条件，因此继续保留普通 absolute 映射。
-            split_cour_directory_evidence = bool(
+            # 单季 TMDB 条目下，发布方可能按 cour 重置为 E01，也可能继续
+            # 使用 TMDB 绝对集号。两种形式都先要求同目录形成连续证据，再由
+            # ``infer_merged_season_cour_mapping`` 用完整停播分段证明唯一目标；
+            # 单文件、缺集目录和分段数量不唯一时均保持原位置并失败关闭。
+            counts_by_season = season_episode_counts(detail)
+            merged_target_count = (
+                next(iter(counts_by_season.values()))
+                if len(counts_by_season) == 1
+                else None
+            )
+            merged_cour_directory_evidence = bool(
                 directory_evidence is not None
                 and directory_evidence.contiguous
                 and directory_evidence.source_season == effective_season
-                and directory_evidence.range_start == 1
                 and directory_evidence.episode_count >= 3
-                and directory_evidence.episode_count == directory_evidence.range_end
                 and source_episode is not None
-                and source_episode <= directory_evidence.range_end
+                and directory_evidence.range_start <= source_episode
+                <= directory_evidence.range_end
+                and (
+                    directory_evidence.range_start == 1
+                    or directory_evidence.range_end == merged_target_count
+                )
             )
-            split_cour_probe_needed = split_cour_directory_evidence and (
+            split_cour_probe_needed = merged_cour_directory_evidence and (
                 not mapping.changed
                 or (
                     mapping.mode == "absolute"
@@ -1886,7 +1950,6 @@ class DirectoryScrapeService:
                 and source_episode is not None
                 and season_detail_loader is not None
             ):
-                counts_by_season = season_episode_counts(detail)
                 if len(counts_by_season) == 1 and effective_season not in counts_by_season:
                     merged_target_season = next(iter(counts_by_season))
                     tmdb_id = str(detail.get("id") or "").strip()
@@ -1904,6 +1967,7 @@ class DirectoryScrapeService:
                         source_episode=source_episode,
                         detail=detail,
                         season_detail=season_detail_cache[cache_key],
+                        directory_evidence=directory_evidence,
                     )
                     if merged_mapping.confidence >= 1.0:
                         mapping = merged_mapping
