@@ -18,18 +18,14 @@ from unittest.mock import ANY, Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app import config, database as db
+from app import config
+from app import database as db
 from app.clients.base import DashboardData
-from app.clients.guangya import GuangYaFile
-from app.clients.qbittorrent import TorrentAddResult, TorrentTask
 from app.clients.emby import EmbyClient
+from app.clients.guangya import GuangYaFile
 from app.clients.jellyfin import JellyfinClient
+from app.clients.qbittorrent import TorrentTask
 from app.main import create_app
-from app.modules.gcid_manifest import (
-    ManifestValidationError,
-    export_manifest,
-    validate_manifest,
-)
 from app.modules.download_dispatcher import (
     create_request,
     dispatch_request,
@@ -39,6 +35,11 @@ from app.modules.download_dispatcher import (
     torrent_download_input,
 )
 from app.modules.download_tracker import DownloadTracker
+from app.modules.gcid_manifest import (
+    ManifestValidationError,
+    export_manifest,
+    validate_manifest,
+)
 from app.modules.local_media_scheduler import (
     LocalMediaProbeRetryable,
     LocalMediaSourceMigrationRequired,
@@ -53,10 +54,11 @@ from app.modules.media_proxy import (
     validate_upstream_url,
 )
 from app.modules.naming import build_context, render_template, validate_template
-from app.modules.organize import OrganizePlan, OrganizeRules, Organizer
+from app.modules.organize import OrganizePlan, Organizer, OrganizeRules
+from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.organize_execution import execute_organize_plans
 from app.modules.organize_postprocess import companion_target_name
-from app.modules.organize_correction import OrganizeCorrectionService
+from app.modules.rss import RSSEngine
 from app.modules.runtime_log import (
     RuntimeLogChunk,
     RuntimeLogEvent,
@@ -66,7 +68,6 @@ from app.modules.runtime_log import (
     read_last_lines,
     read_stream_chunk,
 )
-from app.modules.rss import RSSEngine
 from app.modules.scraper import (
     MatchResult,
     TMDBScraper,
@@ -4680,40 +4681,60 @@ class SecurityTests(InitializedWebTestCase):
             finally:
                 db.DB_PATH = original
 
-    def test_rss_download_claim_prevents_duplicate_submission(self):
+    def test_rss_entry_claim_prevents_duplicate_submission(self):
+        infohash = "1" * 40
         entry = {
             "id": 7,
             "rss_item_id": 3,
             "title": "Episode 01",
             "status": "pending",
             "processed": 0,
-            "payload": '{"torrent_url":"magnet:?xt=urn:btih:test"}',
+            "payload": (
+                '{"torrent_url":"magnet:?xt=urn:btih:' + infohash + '"}'
+            ),
             "download_method": "qb",
             "qb_save_path": "/downloads/anime",
             "gy_target_dir": "",
             "gy_target_dir_name": "",
         }
+        submission = {
+            "request_id": 31,
+            "created": True,
+            "target": "qb",
+            "summary": {
+                "ok": True,
+                "status": "submitted",
+                "succeeded": ["qb"],
+                "failed": [],
+                "duplicate": False,
+                "error": "",
+            },
+            "dispatch": {
+                "results": {"qb": {"ok": True, "task_id": infohash}}
+            },
+        }
         engine = RSSEngine()
         with patch("app.database.get_rss_entry", return_value=entry), patch(
-            "app.database.claim_rss_qb_download",
-            side_effect=[
-                {"status": "claimed", "lease_token": "lease-1"},
-                {"status": "unavailable", "lease_token": ""},
-            ],
+            "app.database.claim_rss_entry", side_effect=[True, False]
         ) as claim, patch(
-            "app.database.finalize_rss_qb_download", return_value=True
-        ) as finalize, patch.object(
-            engine, "_push_qb_detailed", return_value=TorrentAddResult(True)
-        ) as push, patch(
+            "app.indexers.downloads.submit_download_input", return_value=submission
+        ) as submit, patch(
+            "app.database.get_download_request", return_value={
+                "status": "submitted",
+                "qb_status": "submitted",
+                "gy_status": "",
+                "qb_task_id": infohash,
+                "gy_task_id": "",
+            }
+        ), patch(
             "app.database.update_rss_entry_status"
-        ), patch("app.database.add_download_log"):
+        ):
             first = engine.download(7)
             second = engine.download(7)
         self.assertTrue(first["ok"])
         self.assertFalse(second["ok"])
         self.assertEqual(claim.call_count, 2)
-        finalize.assert_called_once()
-        push.assert_called_once_with("magnet:?xt=urn:btih:test", save_path="/downloads/anime")
+        submit.assert_called_once()
 
     def test_telegram_download_request_dedup_and_torrent_metadata(self):
         item = normalize_download_url("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Demo")

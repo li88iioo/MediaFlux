@@ -319,6 +319,167 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         finally:
             conn.close()
 
+    def test_rss_backend_claim_migration_converges_unknown_entries(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.executescript(
+                "CREATE TABLE rss_entries ("
+                "id INTEGER PRIMARY KEY,status TEXT,processed INTEGER,"
+                "processed_at TEXT,submitted_at TEXT,failure_code TEXT,"
+                "failure_retryable INTEGER,failed_at TEXT);"
+                "INSERT INTO rss_entries VALUES("
+                "1,'submitting',0,NULL,'2026-01-01 00:00:00','',0,NULL);"
+                "INSERT INTO rss_entries VALUES("
+                "2,'downloaded',1,'2026-01-01 00:00:01',"
+                "'2026-01-01 00:00:00','',0,NULL);"
+                "CREATE TABLE rss_qb_download_claims ("
+                "infohash TEXT PRIMARY KEY,first_entry_id INTEGER,status TEXT);"
+                "INSERT INTO rss_qb_download_claims VALUES('hash-1',1,'submitting');"
+                "CREATE TABLE rss_guangya_download_claims ("
+                "infohash TEXT PRIMARY KEY,first_entry_id INTEGER,status TEXT);"
+                "INSERT INTO rss_guangya_download_claims VALUES('hash-2',2,'submitted');"
+            )
+
+            db._migrate_unify_rss_download_requests_v20(conn)
+
+            tables = {
+                str(row["name"])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            unresolved = conn.execute(
+                "SELECT status,processed,failure_code,failure_retryable "
+                "FROM rss_entries WHERE id=1"
+            ).fetchone()
+            completed = conn.execute(
+                "SELECT status,processed FROM rss_entries WHERE id=2"
+            ).fetchone()
+            self.assertNotIn("rss_qb_download_claims", tables)
+            self.assertNotIn("rss_guangya_download_claims", tables)
+            self.assertEqual(unresolved["status"], "failed")
+            self.assertEqual(unresolved["processed"], 0)
+            self.assertEqual(
+                unresolved["failure_code"], "submission_outcome_unknown"
+            )
+            self.assertEqual(unresolved["failure_retryable"], 0)
+            self.assertEqual(completed["status"], "downloaded")
+            self.assertEqual(completed["processed"], 1)
+        finally:
+            conn.close()
+
+    def test_rss_claim_migration_preserves_dedupe_without_replaying_history(
+        self,
+    ) -> None:
+        infohash = "a" * 40
+        uncertain_hash = "b" * 40
+        qb_sub = db.add_rss_subscription(
+            name="Legacy qB", urls="https://example.com/qb.xml", download_method="qb"
+        )
+        gy_sub = db.add_rss_subscription(
+            name="Legacy GuangYa",
+            urls="https://example.com/gy.xml",
+            download_method="guangya",
+        )
+        qb_entry = db.add_rss_entry(
+            qb_sub,
+            "Legacy qB item",
+            "legacy-qb",
+            payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{infohash}"}),
+        )
+        gy_entry = db.add_rss_entry(
+            gy_sub,
+            "Legacy GuangYa item",
+            "legacy-gy",
+            payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{infohash}"}),
+        )
+        uncertain_entry = db.add_rss_entry(
+            qb_sub,
+            "Legacy uncertain item",
+            "legacy-uncertain",
+            payload=json.dumps({
+                "torrent_url": f"https://example.com/{uncertain_hash}.torrent"
+            }),
+        )
+        assert qb_entry is not None and gy_entry is not None
+        assert uncertain_entry is not None
+        db.update_rss_entry_status(qb_entry, "downloaded")
+        db.update_rss_entry_status(gy_entry, "downloaded")
+        db.update_rss_entry_status(uncertain_entry, "submitting")
+
+        with db.get_conn() as conn:
+            conn.executescript(
+                "CREATE TABLE rss_qb_download_claims ("
+                "infohash TEXT PRIMARY KEY,first_entry_id INTEGER NOT NULL,"
+                "lease_token TEXT NOT NULL,status TEXT NOT NULL,"
+                "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);"
+                "CREATE TABLE rss_guangya_download_claims ("
+                "infohash TEXT PRIMARY KEY,first_entry_id INTEGER NOT NULL,"
+                "lease_token TEXT NOT NULL,status TEXT NOT NULL,"
+                "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);"
+            )
+            conn.executemany(
+                "INSERT INTO rss_qb_download_claims VALUES(?,?,?,?,?,?)",
+                [
+                    (infohash, qb_entry, "lease-qb", "submitted",
+                     "2026-08-01 00:00:00", "2026-08-01 00:00:01"),
+                    (uncertain_hash, uncertain_entry, "lease-unknown", "unknown",
+                     "2026-08-01 00:01:00", "2026-08-01 00:01:01"),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO rss_guangya_download_claims VALUES(?,?,?,?,?,?)",
+                (infohash, gy_entry, "lease-gy", "submitted",
+                 "2026-08-01 00:00:00", "2026-08-01 00:00:02"),
+            )
+
+            db._migrate_unify_rss_download_requests_v20(conn)
+
+            canonical_key = hashlib.sha256(
+                f"btih:{infohash}".encode("utf-8")
+            ).hexdigest()
+            request = conn.execute(
+                "SELECT * FROM download_requests WHERE request_key=?",
+                (canonical_key,),
+            ).fetchone()
+            uncertain_key = hashlib.sha256(
+                f"btih:{uncertain_hash}".encode("utf-8")
+            ).hexdigest()
+            uncertain = conn.execute(
+                "SELECT * FROM download_requests WHERE request_key=?",
+                (uncertain_key,),
+            ).fetchone()
+            uncertain_rss = conn.execute(
+                "SELECT status,processed,failure_code,failure_retryable "
+                "FROM rss_entries WHERE id=?",
+                (uncertain_entry,),
+            ).fetchone()
+
+        self.assertIsNotNone(request)
+        self.assertEqual(request["targets"], "both")
+        self.assertEqual(request["status"], "completed")
+        self.assertEqual(request["qb_status"], "completed")
+        self.assertEqual(request["gy_status"], "completed")
+        self.assertEqual(request["qb_task_id"], infohash)
+        self.assertEqual(request["local_import_status"], "skipped")
+        self.assertEqual(request["organize_started"], 1)
+        self.assertEqual(request["organize_status"], "skipped")
+        active_ids = {
+            int(row["id"])
+            for row in db.list_active_download_requests(include_local_import=True)
+        }
+        self.assertNotIn(int(request["id"]), active_ids)
+        self.assertIsNotNone(uncertain)
+        self.assertEqual(uncertain["status"], "manual_review")
+        self.assertEqual(uncertain["qb_status"], "manual_review")
+        self.assertEqual(uncertain_rss["status"], "failed")
+        self.assertEqual(uncertain_rss["processed"], 0)
+        self.assertEqual(
+            uncertain_rss["failure_code"], "submission_outcome_unknown"
+        )
+        self.assertEqual(uncertain_rss["failure_retryable"], 0)
+
     def test_fresh_database_contains_complete_v10_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])

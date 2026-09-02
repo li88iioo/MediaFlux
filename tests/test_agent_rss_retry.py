@@ -30,9 +30,11 @@ from tests.support import IsolatedDatabaseTestCase
 
 def _clear_rss() -> None:
     with db.get_conn() as conn:
+        conn.execute("DELETE FROM download_log")
+        conn.execute("DELETE FROM download_request_keys")
+        conn.execute("DELETE FROM download_requests")
         conn.execute("DELETE FROM rss_entries")
         conn.execute("DELETE FROM rss_items")
-        conn.execute("DELETE FROM download_log")
 
 
 class _Response:
@@ -87,7 +89,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             f"Private Episode {index}",
             f"secret-guid-{index}",
             payload=payload or json.dumps({
-                "torrent_url": f"magnet:?xt=urn:btih:SECRET{index}"
+                "torrent_url": f"magnet:?xt=urn:btih:{index:040x}&dn=PRIVATESECRET{index}"
             }),
         )
         assert entry_id is not None

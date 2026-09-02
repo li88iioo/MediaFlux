@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import re
-import secrets
 import sqlite3
 import unicodedata
 from typing import TYPE_CHECKING, Iterable
@@ -241,12 +240,6 @@ def update_rss_subscription(
 
 def delete_rss_subscription(sub_id: int) -> None:
     with get_conn() as conn:
-        for table in ("rss_guangya_download_claims", "rss_qb_download_claims"):
-            conn.execute(
-                f"DELETE FROM {table} WHERE status!='submitted' "
-                "AND first_entry_id IN (SELECT id FROM rss_entries WHERE rss_item_id=?)",
-                (sub_id,),
-            )
         conn.execute("DELETE FROM rss_entries WHERE rss_item_id=?", (sub_id,))
         conn.execute("DELETE FROM rss_items WHERE id=?", (sub_id,))
 
@@ -394,47 +387,7 @@ def recover_stale_submitting_rss_entries(stale_minutes: int = 15) -> int:
             "< datetime('now','localtime', ?)",
             (timestamp, f"-{minutes} minutes"),
         )
-        recovered_entries = int(cur.rowcount or 0)
-        # 光鸭 claim 与 entry 由同一 lease 驱动。外部调用超过一小时仍无终态时，
-        # 将其转入人工核对；旧调用若稍后返回，仍可凭原 lease 原子落最终结果。
-        claim_stale_minutes = max(60, minutes)
-        stale_rows = conn.execute(
-            "SELECT infohash,first_entry_id FROM rss_guangya_download_claims "
-            "WHERE status='submitting' AND (datetime(updated_at) IS NULL OR "
-            "datetime(updated_at)<datetime('now','localtime', ?))",
-            (f"-{claim_stale_minutes} minutes",),
-        ).fetchall()
-        for claim in stale_rows:
-            conn.execute(
-                "UPDATE rss_guangya_download_claims SET status='unknown',updated_at=? "
-                "WHERE infohash=? AND status='submitting'",
-                (timestamp, str(claim["infohash"])),
-            )
-            conn.execute(
-                "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
-                "failure_code='guangya_outcome_unknown',failure_retryable=0,"
-                "failed_at=COALESCE(NULLIF(submitted_at,''),?) WHERE id=?",
-                (timestamp, int(claim["first_entry_id"])),
-            )
-        qb_stale_rows = conn.execute(
-            "SELECT infohash,first_entry_id FROM rss_qb_download_claims "
-            "WHERE status='submitting' AND (datetime(updated_at) IS NULL OR "
-            "datetime(updated_at)<datetime('now','localtime', ?))",
-            (f"-{claim_stale_minutes} minutes",),
-        ).fetchall()
-        for claim in qb_stale_rows:
-            conn.execute(
-                "UPDATE rss_qb_download_claims SET status='unknown',updated_at=? "
-                "WHERE infohash=? AND status='submitting'",
-                (timestamp, str(claim["infohash"])),
-            )
-            conn.execute(
-                "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
-                "failure_code='qb_outcome_unknown',failure_retryable=0,"
-                "failed_at=COALESCE(NULLIF(submitted_at,''),?) WHERE id=?",
-                (timestamp, int(claim["first_entry_id"])),
-            )
-        return recovered_entries
+        return int(cur.rowcount or 0)
 
 
 def get_rss_entry(entry_id: int) -> sqlite3.Row | None:
@@ -654,253 +607,6 @@ def claim_retryable_failed_rss_qb_entries(
         return rows
 
 
-def _normalized_bt_infohash(value: str) -> str:
-    normalized = str(value or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", normalized):
-        raise ValueError("RSS BT infohash 格式无效")
-    return normalized
-
-
-def _claimable_rss_entry(conn, entry_id: int, *, target_status: str) -> bool:
-    stamp = now()
-    processed = 1 if target_status == "downloaded" else 0
-    processed_at = stamp if processed else None
-    cur = conn.execute(
-        "UPDATE rss_entries SET status=?,processed=?,processed_at=?,submitted_at=?,"
-        "retry_count=COALESCE(retry_count,0)+CASE WHEN status='failed' THEN 1 ELSE 0 END,"
-        "failure_code='',failure_retryable=0,failed_at=NULL WHERE id=? "
-        "AND COALESCE(processed,0)=0 AND (status='pending' OR "
-        "(status='failed' AND COALESCE(failure_retryable,0)=1))",
-        (target_status, processed, processed_at, stamp, int(entry_id)),
-    )
-    return int(cur.rowcount or 0) == 1
-
-
-def claim_rss_guangya_download(infohash: str, entry_id: int) -> dict[str, str]:
-    """在同一事务中认领 RSS 条目与光鸭 infohash。"""
-    normalized = _normalized_bt_infohash(infohash)
-    token = secrets.token_hex(16)
-    stamp = now()
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT status FROM rss_guangya_download_claims WHERE infohash=?",
-            (normalized,),
-        ).fetchone()
-        status = str(row["status"] or "") if row is not None else ""
-        if status == "submitting":
-            return {"status": "busy", "lease_token": ""}
-        if status == "unknown":
-            return {"status": "unknown", "lease_token": ""}
-        if status == "submitted":
-            if not _claimable_rss_entry(conn, entry_id, target_status="downloaded"):
-                return {"status": "unavailable", "lease_token": ""}
-            return {"status": "submitted", "lease_token": ""}
-        if not _claimable_rss_entry(conn, entry_id, target_status="submitting"):
-            return {"status": "unavailable", "lease_token": ""}
-        conn.execute(
-            "INSERT INTO rss_guangya_download_claims("
-            "infohash,first_entry_id,lease_token,status,created_at,updated_at"
-            ") VALUES(?,?,?,'submitting',?,?)",
-            (normalized, int(entry_id), token, stamp, stamp),
-        )
-        return {"status": "claimed", "lease_token": token}
-
-
-def finalize_rss_guangya_download(
-    infohash: str,
-    entry_id: int,
-    lease_token: str,
-    *,
-    outcome: str,
-) -> bool:
-    """按 lease 原子落盘光鸭 claim 与 RSS 条目终态。"""
-    normalized = _normalized_bt_infohash(infohash)
-    token = str(lease_token or "").strip()
-    if not token or outcome not in {"submitted", "unknown", "failed"}:
-        return False
-    stamp = now()
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT status,first_entry_id,lease_token FROM rss_guangya_download_claims "
-            "WHERE infohash=?",
-            (normalized,),
-        ).fetchone()
-        if (
-            row is None
-            or int(row["first_entry_id"]) != int(entry_id)
-            or str(row["lease_token"] or "") != token
-            or str(row["status"] or "") not in {"submitting", "unknown"}
-        ):
-            return False
-        if outcome == "failed":
-            conn.execute(
-                "DELETE FROM rss_guangya_download_claims WHERE infohash=? "
-                "AND first_entry_id=? AND lease_token=?",
-                (normalized, int(entry_id), token),
-            )
-            conn.execute(
-                "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
-                "submitted_at=?,failure_code='guangya_submit_failed',"
-                "failure_retryable=0,failed_at=? WHERE id=?",
-                (stamp, stamp, int(entry_id)),
-            )
-            return True
-        claim_status = "submitted" if outcome == "submitted" else "unknown"
-        conn.execute(
-            "UPDATE rss_guangya_download_claims SET status=?,updated_at=? "
-            "WHERE infohash=? AND first_entry_id=? AND lease_token=?",
-            (claim_status, stamp, normalized, int(entry_id), token),
-        )
-        if outcome == "submitted":
-            conn.execute(
-                "UPDATE rss_entries SET status='downloaded',processed=1,processed_at=?,"
-                "submitted_at=?,failure_code='',failure_retryable=0,failed_at=NULL "
-                "WHERE id=?",
-                (stamp, stamp, int(entry_id)),
-            )
-        else:
-            conn.execute(
-                "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
-                "submitted_at=?,failure_code='guangya_outcome_unknown',"
-                "failure_retryable=0,failed_at=? WHERE id=?",
-                (stamp, stamp, int(entry_id)),
-            )
-        return True
-
-
-def claim_rss_qb_download(
-    infohash: str, entry_id: int, *, entry_already_claimed: bool = False
-) -> dict[str, str]:
-    """在同一事务中认领 qB infohash，并可接管 Agent 已预认领的条目。"""
-    normalized = _normalized_bt_infohash(infohash)
-    token = secrets.token_hex(16)
-    stamp = now()
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT status FROM rss_qb_download_claims WHERE infohash=?",
-            (normalized,),
-        ).fetchone()
-        status = str(row["status"] or "") if row is not None else ""
-        if status == "submitting":
-            return {"status": "busy", "lease_token": ""}
-        if status == "unknown":
-            return {"status": "unknown", "lease_token": ""}
-        if status == "submitted":
-            if entry_already_claimed:
-                cur = conn.execute(
-                    "UPDATE rss_entries SET status='downloaded',processed=1,processed_at=?,"
-                    "submitted_at=?,failure_code='',failure_retryable=0,failed_at=NULL "
-                    "WHERE id=? AND status='submitting' AND COALESCE(processed,0)=0",
-                    (stamp, stamp, int(entry_id)),
-                )
-                available = int(cur.rowcount or 0) == 1
-            else:
-                available = _claimable_rss_entry(
-                    conn, entry_id, target_status="downloaded"
-                )
-            return {
-                "status": "submitted" if available else "unavailable",
-                "lease_token": "",
-            }
-        if entry_already_claimed:
-            current = conn.execute(
-                "SELECT status,processed FROM rss_entries WHERE id=?",
-                (int(entry_id),),
-            ).fetchone()
-            available = bool(
-                current is not None
-                and str(current["status"] or "") == "submitting"
-                and not bool(current["processed"])
-            )
-        else:
-            available = _claimable_rss_entry(
-                conn, entry_id, target_status="submitting"
-            )
-        if not available:
-            return {"status": "unavailable", "lease_token": ""}
-        conn.execute(
-            "INSERT INTO rss_qb_download_claims("
-            "infohash,first_entry_id,lease_token,status,created_at,updated_at"
-            ") VALUES(?,?,?,'submitting',?,?)",
-            (normalized, int(entry_id), token, stamp, stamp),
-        )
-        return {"status": "claimed", "lease_token": token}
-
-
-def finalize_rss_qb_download(
-    infohash: str,
-    entry_id: int,
-    lease_token: str,
-    *,
-    outcome: str,
-    failure_code: str = "",
-    retryable: bool = False,
-) -> bool:
-    """按 lease 原子落盘 qB claim 与 RSS 条目终态。"""
-    normalized = _normalized_bt_infohash(infohash)
-    token = str(lease_token or "").strip()
-    if not token or outcome not in {"submitted", "unknown", "failed"}:
-        return False
-    normalized_failure = str(failure_code or "").strip().lower()
-    if normalized_failure not in _RSS_FAILURE_CODES:
-        normalized_failure = "qb_rejected"
-        retryable = False
-    stamp = now()
-    with get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT status,first_entry_id,lease_token FROM rss_qb_download_claims "
-            "WHERE infohash=?",
-            (normalized,),
-        ).fetchone()
-        if (
-            row is None
-            or int(row["first_entry_id"]) != int(entry_id)
-            or str(row["lease_token"] or "") != token
-            or str(row["status"] or "") not in {"submitting", "unknown"}
-        ):
-            return False
-        if outcome == "failed":
-            conn.execute(
-                "DELETE FROM rss_qb_download_claims WHERE infohash=? "
-                "AND first_entry_id=? AND lease_token=?",
-                (normalized, int(entry_id), token),
-            )
-            conn.execute(
-                "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
-                "submitted_at=?,failure_code=?,failure_retryable=?,failed_at=? WHERE id=?",
-                (
-                    stamp, normalized_failure, 1 if retryable else 0, stamp,
-                    int(entry_id),
-                ),
-            )
-            return True
-        claim_status = "submitted" if outcome == "submitted" else "unknown"
-        conn.execute(
-            "UPDATE rss_qb_download_claims SET status=?,updated_at=? "
-            "WHERE infohash=? AND first_entry_id=? AND lease_token=?",
-            (claim_status, stamp, normalized, int(entry_id), token),
-        )
-        if outcome == "submitted":
-            conn.execute(
-                "UPDATE rss_entries SET status='downloaded',processed=1,processed_at=?,"
-                "submitted_at=?,failure_code='',failure_retryable=0,failed_at=NULL "
-                "WHERE id=?",
-                (stamp, stamp, int(entry_id)),
-            )
-        else:
-            conn.execute(
-                "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
-                "submitted_at=?,failure_code='qb_outcome_unknown',"
-                "failure_retryable=0,failed_at=? WHERE id=?",
-                (stamp, stamp, int(entry_id)),
-            )
-        return True
-
-
 def claim_rss_entry(entry_id: int) -> bool:
     """原子认领条目，防止 Web/自动任务/TG 重复提交同一下载。"""
     with get_conn() as conn:
@@ -1026,12 +732,6 @@ def update_rss_entries_processed(entry_ids: list[int], processed: bool) -> int:
             [1 if processed else 0, processed_at, status, *ids, *allowed_statuses],
         )
         if not processed and cur.rowcount:
-            for table in ("rss_guangya_download_claims", "rss_qb_download_claims"):
-                conn.execute(
-                    f"DELETE FROM {table} WHERE status='unknown' "
-                    f"AND first_entry_id IN ({placeholders})",
-                    ids,
-                )
             conn.execute(
                 f"UPDATE rss_entry_media SET skip_reason='',updated_at=? "
                 f"WHERE rss_entry_id IN ({placeholders})",
@@ -1114,12 +814,6 @@ def update_rss_entries_processed_snapshot(
             conn.rollback()
             return 0
         if not processed:
-            for table in ("rss_guangya_download_claims", "rss_qb_download_claims"):
-                conn.execute(
-                    f"DELETE FROM {table} WHERE status='unknown' "
-                    f"AND first_entry_id IN ({placeholders})",
-                    ids,
-                )
             conn.execute(
                 f"UPDATE rss_entry_media SET skip_reason='',updated_at=? "
                 f"WHERE rss_entry_id IN ({placeholders})",

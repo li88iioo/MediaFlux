@@ -1,14 +1,13 @@
 """RSS 订阅引擎（mikan 蜜柑计划适配）。
 
 能力：
-- MikanParser：feedparser 解析 mikan RSS，提取标题/磁力种子/发布时间/guid
-- RSSEngine：订阅项管理、刷新拉取去重、下载联动（推 qB / 推光鸭离线，跨下载器去重）
+- MikanParser：feedparser 解析 Mikan RSS，提取标题、下载地址、发布时间与 guid
+- RSSEngine：订阅管理、刷新去重，并把 qB/光鸭任务接入统一下载状态机
 
 下载目标由配置 RSS_DOWNLOAD_METHOD 决定：qb / guangya。
 """
 from __future__ import annotations
 
-import hashlib
 import ipaddress
 import json
 import re
@@ -18,18 +17,18 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import unquote, urljoin, urlsplit
 from dataclasses import dataclass
 from datetime import datetime
+from urllib.parse import unquote, urljoin, urlsplit
 
 import feedparser
 import httpx
 
 from app import database as db
 from app.config import get, get_many
+from app.indexers.providers.base import magnet_infohash
 from app.logger import get_logger
 from app.modules.media_identity import build_media_key, parse_episode_label
-from app.indexers.providers.base import magnet_infohash
 
 logger = get_logger(__name__)
 
@@ -721,32 +720,18 @@ class RSSEngine:
                 return match.group(1).lower()
         return ""
 
-    @classmethod
-    def _submission_claim_key(cls, torrent_url: str) -> str:
-        """返回后端提交的持久幂等键；不透明 URL 使用命名空间指纹。"""
-        infohash = cls._torrent_infohash(torrent_url)
-        if infohash:
-            return infohash
-        normalized_url = str(torrent_url or "").strip()
-        if not normalized_url:
-            return ""
-        return hashlib.blake2b(
-            ("rss-opaque-url-v1\0" + normalized_url).encode("utf-8"),
-            digest_size=20,
-        ).hexdigest()
-
-    def _qb_client(self):
-        from app.clients.qbittorrent import QBittorrentClient
-        return QBittorrentClient(
-            url=get("QB_URL"),
-            username=get("QB_USERNAME"),
-            password=get("QB_PASSWORD"),
-            api_key=get("QB_API_KEY"),
-        )
-
     @staticmethod
     def _entry_method(entry) -> str:
         return (entry["download_method"] or get("RSS_DOWNLOAD_METHOD", "qb")).strip().lower()
+
+    @staticmethod
+    def _entry_value(entry, key: str, default=""):
+        """读取 dict/sqlite.Row 的可选字段；Agent 冻结快照只包含 qB 所需列。"""
+        try:
+            value = entry[key]
+        except (IndexError, KeyError, TypeError):
+            return default
+        return default if value is None else value
 
     @staticmethod
     def _entry_torrent_url(entry) -> str:
@@ -756,313 +741,299 @@ class RSSEngine:
             payload = {}
         return str(payload.get("torrent_url") or payload.get("link") or "").strip()
 
+    @classmethod
+    def _download_input(cls, entry, torrent_url: str):
+        """把 RSS 条目转换为统一下载输入，并保留可验证的 BT 身份提示。"""
+        from app.modules.download_dispatcher import (
+            DownloadInput,
+            normalize_download_url,
+        )
+
+        item = normalize_download_url(torrent_url)
+        title = str(entry["title"] or item.title or "RSS 下载任务").strip()
+        identity_hint = ""
+        # 某些 RSS 只提供 HTTP .torrent 地址，但路径本身带标准 BTIH。
+        # 保留原 URL 让后端取得 tracker/passkey，同时将 BTIH 用于统一幂等
+        # 与 qB API 后续任务匹配；magnet/torrent 本身已有经过解析的身份。
+        if item.kind == "http":
+            infohash = cls._torrent_infohash(torrent_url)
+            if infohash:
+                identity_hint = f"btih:{infohash}"
+        return DownloadInput(
+            kind=item.kind,
+            title=title,
+            source_value=item.source_value,
+            torrent_data=item.torrent_data,
+            identity_hint=identity_hint,
+        )
+
+    @staticmethod
+    def _accepted_duplicate(summary: dict, request, method: str) -> bool:
+        if not summary.get("duplicate"):
+            return False
+        root_status = str(summary.get("existing_status") or "").strip().lower()
+        if root_status not in {
+            "pending", "submitting", "submitted", "downloading", "completed", "resubmitted",
+        }:
+            return False
+        if request is None:
+            return root_status == "pending"
+        backend_field = "qb_status" if method == "qb" else "gy_status"
+        try:
+            backend_status = str(request[backend_field] or "").strip().lower()
+        except (IndexError, KeyError, TypeError):
+            backend_status = ""
+        return backend_status in {"", "submitting", "submitted", "downloading", "completed"}
+
+    @staticmethod
+    def _backend_failure(method: str, submission: dict) -> tuple[str, bool, bool]:
+        """从统一分发内部结果提取 RSS 所需的稳定失败分类。"""
+        summary = submission.get("summary") or {}
+        dispatch = submission.get("dispatch") or {}
+        backend = (dispatch.get("results") or {}).get(method) or {}
+        review_required = bool(
+            summary.get("status") == "manual_review"
+            or dispatch.get("review_required")
+            or dispatch.get("outcome_unknown")
+        )
+        if method == "qb":
+            code = str(backend.get("failure_code") or "").strip().lower()
+            if review_required:
+                return "qb_outcome_unknown", False, True
+            return code or "qb_rejected", bool(backend.get("retryable")), False
+        if review_required:
+            return "guangya_outcome_unknown", False, True
+        return "guangya_submit_failed", False, False
+
     def _download_entry(
         self,
         entry,
         *,
-        qb_client=None,
-        known_hashes: set[str] | None = None,
-        snapshot_error: str = "",
+        entry_already_claimed: bool = False,
+        qb_runtime_config: dict | None = None,
     ) -> dict:
+        """将单条 RSS 下载统一接入 download_request / DownloadTracker。"""
         if not entry:
             return {"error": "条目不存在", "ok": False}
 
         entry_id = int(entry["id"])
         method = self._entry_method(entry)
+        if method not in {"qb", "guangya"}:
+            method = "qb"
         try:
             payload = json.loads(entry["payload"] or "{}")
         except (TypeError, ValueError):
             payload = None
         if not isinstance(payload, dict):
-            if db.claim_rss_entry(entry_id):
+            if entry_already_claimed or db.claim_rss_entry(entry_id):
                 db.record_rss_entry_failure(entry_id, "invalid_payload", False)
             return {"error": "条目数据无效", "ok": False, "method": method}
 
         torrent_url = str(payload.get("torrent_url") or payload.get("link") or "").strip()
         if not torrent_url:
-            if db.claim_rss_entry(entry_id):
+            if entry_already_claimed or db.claim_rss_entry(entry_id):
                 db.record_rss_entry_failure(entry_id, "missing_torrent_url", False)
             return {"error": "条目无种子链接", "ok": False, "method": method}
 
         infohash = self._torrent_infohash(torrent_url)
-        claim_key = self._submission_claim_key(torrent_url)
-        hashes = known_hashes if known_hashes is not None else set()
         if entry["status"] == "downloaded" or bool(entry["processed"]):
-            if method == "qb" and infohash and infohash in hashes:
-                return {
-                    "ok": True, "method": "qb", "status": "downloaded",
-                    "existing": True, "infohash": infohash, "already_processed": True,
-                }
             return {
-                "error": "条目已处理；如需重新下载，请先标记为未处理",
-                "ok": False,
+                "ok": True,
+                "method": method,
+                "status": "downloaded",
+                "existing": True,
+                "infohash": infohash,
+                "already_processed": True,
             }
+        if not entry_already_claimed and not db.claim_rss_entry(entry_id):
+            return {"error": "条目正在提交或已被处理", "ok": False, "method": method}
 
-        if method == "qb" and snapshot_error:
-            return {"error": snapshot_error, "ok": False, "method": "qb"}
-
-        guangya_claim = ""
-        guangya_lease = ""
-        qb_claim = ""
-        qb_lease = ""
-        entry_managed_by_backend_claim = False
-        if method == "guangya":
-            claim = db.claim_rss_guangya_download(claim_key, entry_id)
-            guangya_claim = str(claim.get("status") or "")
-            guangya_lease = str(claim.get("lease_token") or "")
-            if guangya_claim in {"busy", "unknown", "unavailable"}:
-                messages = {
-                    "busy": "相同资源正在提交，请稍后刷新状态",
-                    "unknown": "相同资源的提交结果待核对，已阻止重复提交",
-                    "unavailable": "条目正在提交或已被处理",
-                }
-                return {
-                    "error": messages[guangya_claim],
-                    "ok": False,
-                    "method": method,
-                    "infohash": infohash,
-                    "review_required": guangya_claim == "unknown",
-                }
-            entry_managed_by_backend_claim = guangya_claim in {"claimed", "submitted"}
-        elif method == "qb":
-            claim = db.claim_rss_qb_download(claim_key, entry_id)
-            qb_claim = str(claim.get("status") or "")
-            qb_lease = str(claim.get("lease_token") or "")
-            if qb_claim in {"busy", "unknown", "unavailable"}:
-                messages = {
-                    "busy": "相同资源正在提交，请稍后刷新状态",
-                    "unknown": "相同资源的提交结果待核对，已阻止重复提交",
-                    "unavailable": "条目正在提交或已被处理",
-                }
-                return {
-                    "error": messages[qb_claim],
-                    "ok": False,
-                    "method": method,
-                    "infohash": infohash,
-                    "review_required": qb_claim == "unknown",
-                }
-            entry_managed_by_backend_claim = qb_claim in {"claimed", "submitted"}
-        elif not db.claim_rss_entry(entry_id):
-            return {"error": "条目正在提交或已被处理", "ok": False}
-
-        existing = bool(
-            (method == "qb" and infohash and infohash in hashes)
-            or guangya_claim == "submitted"
-            or qb_claim == "submitted"
-        )
-        unverified = False
-        failure_code = ""
-        retryable = False
-        error = ""
-        outcome_unknown = False
+        request_id = 0
         try:
-            if existing:
-                ok = True
-            elif method == "guangya":
-                submission = self._push_guangya(
-                    torrent_url,
-                    entry["title"],
-                    target_dir_id=entry["gy_target_dir"] or "",
-                    target_dir_name=entry["gy_target_dir_name"] or "",
-                )
-                ok = bool(submission.get("ok"))
-                outcome_unknown = bool(
-                    submission.get("outcome_unknown")
-                    or submission.get("partial_success")
-                )
-                if not ok:
-                    failure_code = (
-                        "guangya_outcome_unknown"
-                        if outcome_unknown else "guangya_submit_failed"
-                    )
-            else:
-                method = "qb"
-                push_kwargs = {"save_path": entry["qb_save_path"] or ""}
-                if qb_client is not None:
-                    push_kwargs["client"] = qb_client
-                push_result = self._push_qb_detailed(torrent_url, **push_kwargs)
-                ok = bool(push_result.ok)
-                failure_code = str(push_result.failure_code or "")
-                retryable = bool(push_result.retryable)
-                outcome_unknown = failure_code == "qb_outcome_unknown"
-                unverified = bool(ok and not infohash)
-                if ok and infohash:
-                    hashes.add(infohash)
+            item = self._download_input(entry, torrent_url)
+            runtime = qb_runtime_config if isinstance(qb_runtime_config, dict) else None
+            qb_save_path = str(self._entry_value(entry, "qb_save_path", "") or "")
+            if not qb_save_path and runtime is not None:
+                qb_save_path = str(runtime.get("default_save_path") or "")
+            qb_category = (
+                str(runtime.get("category") or "")
+                if runtime is not None
+                else str(get("RSS_QB_CATEGORY", "") or "")
+            )
+            from app.indexers.downloads import submit_download_input
+
+            submission = submit_download_input(
+                item,
+                method,
+                origin=f"rss:{int(entry['rss_item_id'])}",
+                gy_target_dir=str(self._entry_value(entry, "gy_target_dir", "") or ""),
+                gy_target_name=str(
+                    self._entry_value(entry, "gy_target_dir_name", "") or ""
+                ),
+                qb_save_path=qb_save_path,
+                qb_category=qb_category,
+                qb_runtime_config=runtime,
+                qb_task_id_hint=infohash if method == "qb" else "",
+                rss_item_id=int(entry["rss_item_id"]),
+                log_path=_safe_download_source_marker(torrent_url),
+            )
+            request_id = int(submission.get("request_id") or 0)
+        except ValueError:
+            db.record_rss_entry_failure(entry_id, "invalid_payload", False)
+            db.add_download_log(
+                source=method,
+                title=entry["title"],
+                path=_safe_download_source_marker(torrent_url),
+                rss_item_id=int(entry["rss_item_id"]),
+                status="failed",
+                backend_task_id=infohash,
+                error="RSS 下载链接格式无效",
+            )
+            return {
+                "ok": False,
+                "method": method,
+                "status": "failed",
+                "existing": False,
+                "unverified": False,
+                "infohash": infohash,
+                "error": "RSS 下载链接格式无效",
+            }
         except Exception as exc:
             logger.warning(
-                "RSS 下载失败 entry_id=%s method=%s type=%s",
+                "RSS 统一下载提交异常 entry_id=%s method=%s type=%s",
                 entry_id,
                 method,
                 type(exc).__name__,
             )
-            ok = False
-            outcome_unknown = True
-            failure_code = (
-                "guangya_outcome_unknown"
-                if method == "guangya" else "qb_outcome_unknown"
+            db.record_rss_entry_failure(
+                entry_id,
+                "guangya_outcome_unknown" if method == "guangya" else "qb_outcome_unknown",
+                False,
             )
-            retryable = False
+            db.add_download_log(
+                source=method,
+                title=entry["title"],
+                path=_safe_download_source_marker(torrent_url),
+                rss_item_id=int(entry["rss_item_id"]),
+                request_id=request_id or None,
+                status="failed",
+                backend_task_id=infohash,
+                error="统一下载请求处理结果未知，请人工核对",
+            )
+            return {
+                "ok": False,
+                "method": method,
+                "status": "failed",
+                "existing": False,
+                "unverified": False,
+                "infohash": infohash,
+                "error": "提交结果待核对，请先检查下载器状态，勿直接重复提交",
+                "review_required": True,
+                "request_id": request_id,
+            }
 
-        if guangya_claim == "claimed":
-            outcome = (
-                "submitted" if ok else
-                "unknown" if outcome_unknown else
-                "failed"
-            )
-            finalized = db.finalize_rss_guangya_download(
-                claim_key, entry_id, guangya_lease, outcome=outcome
-            )
-            if not finalized:
-                logger.error(
-                    "RSS 光鸭提交终态写入冲突 entry_id=%s outcome=%s",
-                    entry_id,
-                    outcome,
+        summary = submission.get("summary") or {}
+        dispatch = submission.get("dispatch") or {}
+        current_request = db.get_download_request(request_id) if request_id else None
+        existing = self._accepted_duplicate(summary, current_request, method)
+        ok = str(summary.get("status") or "") in {"submitted", "partial"} or existing
+        backend = (dispatch.get("results") or {}).get(method) or {}
+        task_id = str(backend.get("task_id") or "")
+        if not task_id and current_request is not None and method == "qb":
+            task_id = str(current_request["qb_task_id"] or "")
+        unverified = bool(method == "qb" and ok and not task_id)
+        error = str(summary.get("error") or "")
+        review_required = False
+        if ok:
+            db.update_rss_entry_status(entry_id, "downloaded")
+            if summary.get("duplicate"):
+                db.add_download_log(
+                    source=method,
+                    title=entry["title"],
+                    path=_safe_download_source_marker(torrent_url),
+                    rss_item_id=int(entry["rss_item_id"]),
+                    request_id=request_id or None,
+                    status="existing",
+                    backend_task_id=(
+                        str(current_request["qb_task_id"] or "")
+                        if current_request is not None and method == "qb"
+                        else str(current_request["gy_task_id"] or "")
+                        if current_request is not None
+                        else infohash
+                    ),
                 )
-                ok = False
-                outcome_unknown = True
-                failure_code = "guangya_outcome_unknown"
-                error = "提交结果已返回，但状态写入冲突，请人工核对"
-        elif qb_claim == "claimed":
-            outcome = (
-                "submitted" if ok else
-                "unknown" if outcome_unknown else
-                "failed"
-            )
-            finalized = db.finalize_rss_qb_download(
-                claim_key, entry_id, qb_lease, outcome=outcome,
-                failure_code=failure_code, retryable=retryable,
-            )
-            if not finalized:
-                logger.error(
-                    "RSS qB 提交终态写入冲突 entry_id=%s outcome=%s",
-                    entry_id,
-                    outcome,
-                )
-                ok = False
-                outcome_unknown = True
-                failure_code = "qb_outcome_unknown"
-                error = "提交结果已返回，但状态写入冲突，请人工核对"
+        else:
+            failure_code, retryable, review_required = self._backend_failure(method, submission)
+            if summary.get("duplicate") and current_request is not None:
+                backend_field = "qb_status" if method == "qb" else "gy_status"
+                backend_status = str(current_request[backend_field] or "").strip().lower()
+                if backend_status in {"outcome_unknown", "manual_review"}:
+                    failure_code = (
+                        "qb_outcome_unknown"
+                        if method == "qb"
+                        else "guangya_outcome_unknown"
+                    )
+                    retryable = False
+                    review_required = True
+            db.record_rss_entry_failure(entry_id, failure_code, retryable)
+            if review_required:
+                error = "提交结果待核对，请先检查下载器状态，勿直接重复提交"
+            elif not error:
+                error = "下载后端提交失败"
 
-        status = "downloaded" if ok else "failed"
-        if not entry_managed_by_backend_claim:
-            if ok:
-                db.update_rss_entry_status(entry_id, status)
-            else:
-                db.record_rss_entry_failure(
-                    entry_id, failure_code or "unknown_failure", retryable
-                )
-        if not ok and not error:
-            error = (
-                "提交结果待核对，请先检查下载器状态，勿直接重复提交"
-                if outcome_unknown else
-                "下载后端提交失败"
-            )
-        log_status = (
-            "existing" if existing else
-            "unverified" if unverified else
-            "success" if ok else "failed"
-        )
-        db.add_download_log(
-            source=method,
-            title=entry["title"],
-            path=_safe_download_source_marker(torrent_url),
-            rss_item_id=entry["rss_item_id"],
-            status=log_status,
-            backend_task_id=infohash,
-            error=error,
-        )
         result = {
             "ok": ok,
             "method": method,
-            "status": status,
+            "status": "downloaded" if ok else "failed",
             "existing": existing,
             "unverified": unverified,
             "infohash": infohash,
+            "request_id": request_id,
         }
         if not ok:
             result["error"] = error or "提交失败"
-            if outcome_unknown:
+            if review_required:
                 result["review_required"] = True
         return result
 
-    def _qb_snapshot(self, entries: list) -> tuple[object | None, set[str], str]:
-        # 只有能提取 infohash 的 qB 条目才需要提交前对账。
-        # 对不透明下载链接无法可靠去重，继续提交并明确标记为“待核验”，
-        # 避免因 qB 列表暂时不可读而阻断原有单条下载契约。
-        needs_reconcile = any(
-            self._entry_method(entry) == "qb"
-            and bool(self._torrent_infohash(self._entry_torrent_url(entry)))
-            for entry in entries
-            if entry
-        )
-        if not needs_reconcile:
-            return None, set(), ""
-        client = self._qb_client()
-        try:
-            hashes = {
-                str(task.hash or "").strip().lower()
-                for task in client.list_torrents()
-                if str(task.hash or "").strip()
-            }
-            return client, hashes, ""
-        except Exception as exc:
-            logger.error("读取 qB 任务快照失败 type=%s", type(exc).__name__)
-            return client, set(), "无法读取 qB 任务列表，已停止提交以避免重复任务"
-
     def download(self, entry_id: int) -> dict:
-        """下载单条条目；qB 提交前先按 infohash 对账。"""
-        from app.clients.qbittorrent import close_qbittorrent_client
-
-        entry = db.get_rss_entry(entry_id)
-        client, hashes, snapshot_error = self._qb_snapshot([entry] if entry else [])
-        try:
-            return self._download_entry(
-                entry, qb_client=client, known_hashes=hashes, snapshot_error=snapshot_error
-            )
-        finally:
-            close_qbittorrent_client(client)
+        """下载单条条目并建立可持续跟踪的统一下载请求。"""
+        return self._download_entry(db.get_rss_entry(entry_id))
 
     def download_many(self, entry_ids: list[int]) -> dict:
         ids = list(dict.fromkeys(int(item) for item in entry_ids))[:_RSS_DOWNLOAD_BATCH_SIZE]
         entries = [db.get_rss_entry(entry_id) for entry_id in ids]
-        snapshot_client, hashes, snapshot_error = self._qb_snapshot(entries)
-        from app.clients.qbittorrent import close_qbittorrent_client
-        close_qbittorrent_client(snapshot_client)
         succeeded: list[dict] = []
         existing: list[dict] = []
         unverified: list[dict] = []
         failed: list[dict] = []
-        jobs = list(enumerate(zip(ids, entries)))
+        jobs = list(enumerate(zip(ids, entries, strict=True)))
         groups: dict[str, list[tuple[int, tuple[int, object]]]] = {}
         for position, job in jobs:
             _entry_id, entry = job
             torrent_url = self._entry_torrent_url(entry) if entry else ""
-            group_key = (
-                self._submission_claim_key(torrent_url)
-                if torrent_url else f"missing:{position}"
-            )
+            if torrent_url and entry is not None:
+                try:
+                    from app.modules.download_dispatcher import request_keys
+
+                    group_key = request_keys(
+                        self._download_input(entry, torrent_url)
+                    )[0]
+                except (TypeError, ValueError):
+                    group_key = f"invalid:{position}"
+            else:
+                group_key = f"missing:{position}"
             groups.setdefault(group_key, []).append((position, job))
 
         def submit_group(
             group: list[tuple[int, tuple[int, object]]],
         ) -> list[tuple[int, int, dict]]:
-            # requests.Session 不保证跨线程安全；每个提交创建独立客户端。
-            # 相同资源必须在同一 worker 内顺序执行，确保首个已知失败释放
-            # claim 后同批次下一条可继续，而成功/未知结果仍能阻止重复提交。
-            group_hashes = set(hashes)
-            outcomes: list[tuple[int, int, dict]] = []
-            for position, (entry_id, entry) in group:
-                outcomes.append((
-                    position,
-                    entry_id,
-                    self._download_entry(
-                        entry,
-                        qb_client=None,
-                        known_hashes=group_hashes,
-                        snapshot_error=snapshot_error,
-                    ),
-                ))
-            return outcomes
+            # 相同资源保持顺序；不同资源最多四路提交。统一 request_key 在 DB
+            # 内提供跨订阅、跨入口幂等，不再维护 RSS 专属下载后端 claim。
+            return [
+                (position, entry_id, self._download_entry(entry))
+                for position, (entry_id, entry) in group
+            ]
 
         grouped_jobs = list(groups.values())
         worker_count = min(4, len(grouped_jobs))
@@ -1084,6 +1055,7 @@ class RSSEngine:
                 "id": entry_id,
                 "method": result.get("method"),
                 "infohash": result.get("infohash") or "",
+                "request_id": int(result.get("request_id") or 0),
             }
             if result.get("existing"):
                 existing.append(item)
@@ -1180,130 +1152,23 @@ class RSSEngine:
     def _submit_claimed_qb_rows(
         self, claimed_rows: list, runtime_config: dict
     ) -> tuple[int, int, int]:
-        from app.clients.qbittorrent import (
-            QBittorrentClient, TorrentAddResult, close_qbittorrent_client,
-        )
-
-        client = QBittorrentClient(
-            url=str(runtime_config.get("url") or ""),
-            username=str(runtime_config.get("username") or ""),
-            password=str(runtime_config.get("password") or ""),
-            api_key=str(runtime_config.get("api_key") or ""),
-            timeout=max(1, int(runtime_config.get("timeout") or 10)),
-        )
-        category = str(runtime_config.get("category") or "")
-        default_save_path = str(runtime_config.get("default_save_path") or "")
+        """提交已由 Agent 原子确认的 RSS 条目，仍复用统一下载状态机。"""
         submitted = 0
         failed = 0
         outcome_unknown_count = 0
-        try:
-            for row in claimed_rows:
-                entry_id = int(row["id"])
-                title = str(row["title"] or "")
-                try:
-                    payload = json.loads(row["payload"] or "{}")
-                except (TypeError, ValueError):
-                    payload = None
-                if not isinstance(payload, dict):
-                    db.record_rss_entry_failure(entry_id, "invalid_payload", False)
-                    failed += 1
-                    continue
-                torrent_url = str(payload.get("torrent_url") or payload.get("link") or "")
-                if not torrent_url:
-                    db.record_rss_entry_failure(entry_id, "missing_torrent_url", False)
-                    failed += 1
-                    continue
-
-                infohash = self._torrent_infohash(torrent_url)
-                claim_key = self._submission_claim_key(torrent_url)
-                claim_status = ""
-                lease_token = ""
-                existing = False
-                claim = db.claim_rss_qb_download(
-                    claim_key, entry_id, entry_already_claimed=True
-                )
-                claim_status = str(claim.get("status") or "")
-                lease_token = str(claim.get("lease_token") or "")
-                if claim_status == "submitted":
-                    existing = True
-                    result = TorrentAddResult(True, "", False)
-                elif claim_status != "claimed":
-                    if claim_status == "busy":
-                        failure_code = "qb_dedupe_busy"
-                        retryable = True
-                        failure_message = "相同资源正在提交，本条已保留为可重试状态"
-                    elif claim_status == "unknown":
-                        failure_code = "qb_outcome_unknown"
-                        retryable = False
-                        failure_message = "相同资源提交结果待核对，已阻止重复提交"
-                    else:
-                        failure_code = "unknown_failure"
-                        retryable = False
-                        failure_message = "RSS 条目状态已变化，本次未提交"
-                    db.record_rss_entry_failure(entry_id, failure_code, retryable)
-                    failed += 1
-                    if failure_code == "qb_outcome_unknown":
-                        outcome_unknown_count += 1
-                    db.add_download_log(
-                        source="qb", title=title,
-                        path=_safe_download_source_marker(torrent_url),
-                        rss_item_id=int(row["rss_item_id"]), status="failed",
-                        backend_task_id=infohash,
-                        error=failure_message,
-                    )
-                    continue
-                if not existing:
-                    try:
-                        result = client.add_torrent_detailed(
-                            urls=torrent_url,
-                            save_path=str(row["qb_save_path"] or "") or default_save_path,
-                            category=category,
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Agent RSS qB 提交失败 entry_id=%s type=%s",
-                            entry_id,
-                            type(exc).__name__,
-                        )
-                        result = TorrentAddResult(False, "qb_outcome_unknown", False)
-
-                outcome_unknown = result.failure_code == "qb_outcome_unknown"
-                if claim_status == "claimed":
-                    finalized = db.finalize_rss_qb_download(
-                        claim_key, entry_id, lease_token,
-                        outcome=(
-                            "submitted" if result.ok else
-                            "unknown" if outcome_unknown else "failed"
-                        ),
-                        failure_code=result.failure_code,
-                        retryable=bool(result.retryable),
-                    )
-                    if not finalized:
-                        logger.error(
-                            "Agent RSS qB 终态写入冲突 entry_id=%s", entry_id
-                        )
-                        result = TorrentAddResult(False, "qb_outcome_unknown", False)
-                        outcome_unknown = True
-                if result.ok:
-                    submitted += 1
-                else:
-                    failed += 1
-                    if outcome_unknown:
-                        outcome_unknown_count += 1
-                db.add_download_log(
-                    source="qb",
-                    title=title,
-                    path=_safe_download_source_marker(torrent_url),
-                    rss_item_id=int(row["rss_item_id"]),
-                    status="existing" if existing else "success" if result.ok else "failed",
-                    backend_task_id=infohash,
-                    error=(
-                        "提交结果待人工核对" if outcome_unknown else ""
-                    ),
-                )
-            return submitted, failed, outcome_unknown_count
-        finally:
-            close_qbittorrent_client(client)
+        for row in claimed_rows:
+            result = self._download_entry(
+                row,
+                entry_already_claimed=True,
+                qb_runtime_config=runtime_config,
+            )
+            if result.get("ok"):
+                submitted += 1
+            else:
+                failed += 1
+                if result.get("review_required"):
+                    outcome_unknown_count += 1
+        return submitted, failed, outcome_unknown_count
 
     def auto_download(self, sub_id: int, *, expected_revision: str = "") -> dict:
         """刷新后自动下载所有 pending 条目。"""
@@ -1379,39 +1244,6 @@ class RSSEngine:
             "filtered": filtered,
             "deferred": max(0, len(pending_ids) - processed),
         }
-
-    # ===== 推送实现 =====
-    def _push_qb_detailed(
-        self, torrent_url: str, save_path: str = "", *, client=None
-    ):
-        from app.clients.qbittorrent import TorrentAddResult
-
-        from app.clients.qbittorrent import close_qbittorrent_client
-
-        owned = client is None
-        c = client or self._qb_client()
-        category = get("RSS_QB_CATEGORY", "")
-        save_path = save_path or get("RSS_QB_SAVE_PATH", "")
-        try:
-            result = c.add_torrent_detailed(
-                urls=torrent_url, save_path=save_path, category=category
-            )
-            if not isinstance(result, TorrentAddResult):
-                return TorrentAddResult(False, "qb_invalid_result", False)
-            return result
-        finally:
-            if owned:
-                close_qbittorrent_client(c)
-
-    def _push_guangya(self, torrent_url: str, title: str = "",
-                      target_dir_id: str = "", target_dir_name: str = "") -> dict:
-        from app.modules.offline import submit_offline
-        return submit_offline(
-            torrent_url,
-            title=title,
-            target_dir_id=target_dir_id,
-            target_dir_name=target_dir_name,
-        )
 
     # ===== 工具 =====
     @staticmethod

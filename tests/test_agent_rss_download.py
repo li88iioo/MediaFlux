@@ -21,17 +21,19 @@ from app.agent.rss_download_actions import (
     submit_pending_rss_to_qb_confirmed,
 )
 from app.agent.service import get_agent_service, reset_agent_service_for_tests
-from app.main import create_app
 from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
+from app.main import create_app
 from app.modules.rss import RSSEngine
 from tests.support import IsolatedDatabaseTestCase
 
 
 def _clear_rss() -> None:
     with db.get_conn() as conn:
+        conn.execute("DELETE FROM download_log")
+        conn.execute("DELETE FROM download_request_keys")
+        conn.execute("DELETE FROM download_requests")
         conn.execute("DELETE FROM rss_entries")
         conn.execute("DELETE FROM rss_items")
-        conn.execute("DELETE FROM download_log")
 
 
 class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
@@ -70,7 +72,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
     @staticmethod
     def _entry(sub_id: int, index: int, *, url: bool = True) -> int:
         payload = (
-            json.dumps({"torrent_url": f"magnet:?xt=urn:btih:SECRET{index}"})
+            json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{index:040x}&dn=PRIVATESECRET{index}"})
             if url else "{}"
         )
         entry_id = db.add_rss_entry(
@@ -288,15 +290,16 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
             timeout=10,
         )
         add.assert_called_once_with(
-            urls="magnet:?xt=urn:btih:SECRET1",
+            urls=f"magnet:?xt=urn:btih:{1:040x}&dn=PRIVATESECRET1",
             save_path="/private/subscription/path",
             category="rss-agent",
+            torrents=None,
         )
         self.assertEqual(db.get_rss_entry(valid)["status"], "downloaded")
         self.assertEqual(db.get_rss_entry(invalid)["status"], "failed")
         logs = db.list_download_logs(source="qb", limit=5)
         serialized_logs = json.dumps([dict(row) for row in logs], ensure_ascii=False)
-        self.assertNotIn("SECRET1", serialized_logs)
+        self.assertNotIn("PRIVATESECRET1", serialized_logs)
         self.assertNotIn("magnet:?", serialized_logs)
         self.assertIn("[magnet]", serialized_logs)
 

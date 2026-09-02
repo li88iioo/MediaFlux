@@ -40,7 +40,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
     "上次进程在本地媒体写操作期间中断"
@@ -695,30 +695,6 @@ CREATE INDEX IF NOT EXISTS idx_rss_entries_failure_retry
     ON rss_entries(status, failure_retryable, processed, id DESC);
 CREATE INDEX IF NOT EXISTS idx_rss_entries_item_status_id
     ON rss_entries(rss_item_id, status, id DESC);
-
-CREATE TABLE IF NOT EXISTS rss_guangya_download_claims (
-    infohash TEXT PRIMARY KEY,
-    first_entry_id INTEGER NOT NULL,
-    lease_token TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'submitting'
-        CHECK(status IN ('submitting','submitted','unknown')),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_rss_guangya_claims_status_updated
-    ON rss_guangya_download_claims(status, updated_at DESC);
-
-CREATE TABLE IF NOT EXISTS rss_qb_download_claims (
-    infohash TEXT PRIMARY KEY,
-    first_entry_id INTEGER NOT NULL,
-    lease_token TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'submitting'
-        CHECK(status IN ('submitting','submitted','unknown')),
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_rss_qb_claims_status_updated
-    ON rss_qb_download_claims(status, updated_at DESC);
 
 CREATE TABLE IF NOT EXISTS rss_media_bindings (
     rss_item_id INTEGER PRIMARY KEY,
@@ -2695,6 +2671,269 @@ def _migrate_strm_refresh_outbox_v19(conn: sqlite3.Connection) -> None:
     )
 
 
+def _legacy_rss_download_identity(
+    payload: object, claim_key: object
+) -> tuple[str, str, tuple[str, ...], str]:
+    """把旧 RSS claim 还原为统一下载请求身份；仅供 v20 数据迁移。"""
+    import base64
+    from urllib.parse import parse_qs, unquote, urlsplit
+
+    try:
+        decoded = json.loads(str(payload or "{}"))
+    except (TypeError, ValueError):
+        decoded = {}
+    source = (
+        str(decoded.get("torrent_url") or decoded.get("link") or "").strip()
+        if isinstance(decoded, dict)
+        else ""
+    )
+    lowered = source.lower()
+    if lowered.startswith("magnet:?"):
+        kind = "magnet"
+    elif lowered.startswith("ed2k://"):
+        kind = "ed2k"
+    else:
+        kind = "http"
+
+    btih = ""
+    try:
+        parsed = urlsplit(source)
+        if kind == "magnet":
+            for value in parse_qs(parsed.query).get("xt", []):
+                xt = str(value or "").strip()
+                if not xt.lower().startswith("urn:btih:"):
+                    continue
+                raw = xt[len("urn:btih:"):]
+                if re.fullmatch(r"(?i)[0-9a-f]{40}", raw):
+                    btih = raw.lower()
+                    break
+                if re.fullmatch(r"(?i)[a-z2-7]{32}", raw):
+                    try:
+                        btih = base64.b32decode(raw.upper()).hex()
+                    except (ValueError, TypeError):
+                        pass
+                    break
+        elif kind == "http":
+            for part in reversed(
+                [item for item in unquote(parsed.path).split("/") if item]
+            ):
+                match = re.fullmatch(r"(?i)([0-9a-f]{40})(?:\.torrent)?", part)
+                if match:
+                    btih = match.group(1).lower()
+                    break
+    except (TypeError, ValueError):
+        btih = ""
+
+    normalized_claim = str(claim_key or "").strip().lower()
+    if btih and normalized_claim and btih != normalized_claim:
+        # claim 与 payload 不一致时，不能把一个不可信旧键当成 qB task hash。
+        btih = ""
+
+    identities: list[str] = []
+    if btih:
+        identities.append(f"btih:{btih}")
+    if source and (kind != "magnet" or not btih):
+        identities.append(f"{kind}:{source}")
+    if not identities:
+        identities.append(f"legacy-rss-claim:{normalized_claim or 'unknown'}")
+    request_keys = tuple(
+        dict.fromkeys(
+            hashlib.sha256(value.encode("utf-8")).hexdigest()
+            for value in identities
+        )
+    )
+    return kind, source, request_keys, btih
+
+
+def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
+    """把 RSS 专属后端 claim 收口到统一下载请求后退休旧表。"""
+
+    def columns(table: str) -> set[str]:
+        return {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+
+    request_columns = columns("download_requests")
+    key_columns = columns("download_request_keys")
+    entry_columns = columns("rss_entries")
+    can_transfer = (
+        {
+            "id", "request_key", "origin", "kind", "title", "source_value",
+            "targets", "status", "qb_task_id", "qb_status", "gy_status",
+            "organize_started", "organize_status", "organize_finished_at",
+            "local_import_status", "local_import_error",
+            "local_import_completed_at", "error", "created_at", "updated_at",
+            "completed_at",
+        } <= request_columns
+        and {"request_key", "request_id", "created_at"} <= key_columns
+        and {
+            "id", "rss_item_id", "title", "payload", "status", "processed",
+            "created_at", "submitted_at",
+        } <= entry_columns
+    )
+    migrated_request_ids: set[int] = set()
+    migration_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    for table, backend in (
+        ("rss_qb_download_claims", "qb"),
+        ("rss_guangya_download_claims", "guangya"),
+    ):
+        claim_columns = columns(table)
+        if not claim_columns:
+            continue
+
+        if can_transfer and {
+            "infohash", "first_entry_id", "status", "created_at", "updated_at"
+        } <= claim_columns:
+            claims = conn.execute(
+                f"SELECT infohash,first_entry_id,status,created_at,updated_at FROM {table}"
+            ).fetchall()
+            for claim in claims:
+                entry = conn.execute(
+                    "SELECT id,rss_item_id,title,payload,status,processed,created_at,"
+                    "submitted_at FROM rss_entries WHERE id=?",
+                    (int(claim[1]),),
+                ).fetchone()
+                if entry is None:
+                    continue
+                kind, source, request_keys, btih = _legacy_rss_download_identity(
+                    entry[3], claim[0]
+                )
+                placeholders = ",".join("?" for _ in request_keys)
+                existing = conn.execute(
+                    "SELECT r.id FROM download_requests r WHERE r.id IN ("
+                    "SELECT request_id FROM download_request_keys "
+                    f"WHERE request_key IN ({placeholders}) UNION "
+                    "SELECT id FROM download_requests "
+                    f"WHERE request_key IN ({placeholders})"
+                    ") ORDER BY r.id DESC LIMIT 1",
+                    [*request_keys, *request_keys],
+                ).fetchone()
+                claim_status = str(claim[2] or "").strip().lower()
+                certain_completed = claim_status == "submitted" and bool(entry[5])
+                root_status = "completed" if certain_completed else "manual_review"
+                backend_status = "completed" if certain_completed else "manual_review"
+                error = (
+                    ""
+                    if certain_completed
+                    else "旧 RSS 下载提交结果无法证明，已转为人工核对"
+                )
+                created_at = str(claim[3] or entry[6] or migration_stamp)
+                updated_at = str(claim[4] or entry[7] or migration_stamp)
+
+                if existing is None:
+                    values = {
+                        "request_key": request_keys[0],
+                        "origin": f"rss:{int(entry[1])}",
+                        "kind": kind,
+                        "title": str(entry[2] or "RSS 下载任务"),
+                        "source_value": source,
+                        "targets": backend,
+                        "status": root_status,
+                        "qb_task_id": btih if backend == "qb" else "",
+                        "qb_status": backend_status if backend == "qb" else "",
+                        "gy_status": backend_status if backend == "guangya" else "",
+                        "organize_started": (
+                            1 if backend == "guangya" and certain_completed else 0
+                        ),
+                        "organize_status": (
+                            "skipped" if backend == "guangya" and certain_completed else ""
+                        ),
+                        "organize_finished_at": (
+                            updated_at
+                            if backend == "guangya" and certain_completed
+                            else None
+                        ),
+                        "local_import_status": (
+                            "skipped" if backend == "qb" and certain_completed else ""
+                        ),
+                        "local_import_error": (
+                            "旧 RSS 完成记录仅迁移幂等边界，不回放历史本地整理"
+                            if backend == "qb" and certain_completed
+                            else ""
+                        ),
+                        "local_import_completed_at": (
+                            updated_at if backend == "qb" and certain_completed else None
+                        ),
+                        "error": error,
+                        "created_at": created_at,
+                        "updated_at": updated_at,
+                        "completed_at": updated_at,
+                    }
+                    names = ",".join(values)
+                    markers = ",".join("?" for _ in values)
+                    created = conn.execute(
+                        f"INSERT INTO download_requests({names}) VALUES({markers})",
+                        list(values.values()),
+                    )
+                    request_id = int(created.lastrowid)
+                    migrated_request_ids.add(request_id)
+                else:
+                    request_id = int(existing[0])
+                    if request_id in migrated_request_ids:
+                        current = conn.execute(
+                            "SELECT targets,status FROM download_requests WHERE id=?",
+                            (request_id,),
+                        ).fetchone()
+                        current_target = str(current[0] or "") if current else ""
+                        merged_target = (
+                            current_target
+                            if current_target == backend
+                            else "both"
+                            if current_target in {"qb", "guangya", "both"}
+                            else backend
+                        )
+                        updates = {
+                            "targets": merged_target,
+                            f"{backend if backend == 'qb' else 'gy'}_status": backend_status,
+                            "updated_at": updated_at,
+                        }
+                        if backend == "qb" and btih:
+                            updates["qb_task_id"] = btih
+                        if backend == "qb" and certain_completed:
+                            updates.update({
+                                "local_import_status": "skipped",
+                                "local_import_error": (
+                                    "旧 RSS 完成记录仅迁移幂等边界，不回放历史本地整理"
+                                ),
+                                "local_import_completed_at": updated_at,
+                            })
+                        if backend == "guangya" and certain_completed:
+                            updates.update({
+                                "organize_started": 1,
+                                "organize_status": "skipped",
+                                "organize_finished_at": updated_at,
+                            })
+                        if not certain_completed:
+                            updates.update({
+                                "status": "manual_review",
+                                "error": error,
+                                "completed_at": updated_at,
+                            })
+                        sets = ",".join(f"{name}=?" for name in updates)
+                        conn.execute(
+                            f"UPDATE download_requests SET {sets} WHERE id=?",
+                            [*updates.values(), request_id],
+                        )
+
+                conn.executemany(
+                    "INSERT OR IGNORE INTO download_request_keys("
+                    "request_key,request_id,created_at) VALUES(?,?,?)",
+                    [(key, request_id, created_at) for key in request_keys],
+                )
+
+        # 旧进程中断时可能留下无法续接的 lease。远端是否已接收不可证明，
+        # 因此把仍未处理的条目收敛到人工核对，再删除旧协调表。
+        conn.execute(
+            "UPDATE rss_entries SET status='failed',processed=0,processed_at=NULL,"
+            "failure_code='submission_outcome_unknown',failure_retryable=0,"
+            "failed_at=COALESCE(failed_at,NULLIF(submitted_at,''),"
+            "datetime('now','localtime')) WHERE COALESCE(processed,0)=0 "
+            f"AND id IN (SELECT first_entry_id FROM {table})"
+        )
+        conn.execute(f"DROP TABLE {table}")
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -2715,6 +2954,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     16: _migrate_agent_guangya_fs_change_jobs_v17,
     17: _migrate_agent_provider_plans_v18,
     18: _migrate_strm_refresh_outbox_v19,
+    19: _migrate_unify_rss_download_requests_v20,
 }
 
 
@@ -3046,6 +3286,7 @@ def init_db() -> None:
                 _migrate_retire_organize_notification_outbox_v15(connection)
                 _migrate_retire_telegram_write_confirmations_v16(connection)
                 _migrate_strm_refresh_outbox_v19(connection)
+                _migrate_unify_rss_download_requests_v20(connection)
 
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
@@ -4729,10 +4970,6 @@ from app.repositories.rss import (  # noqa: E402,F401
     claim_pending_rss_qb_entries,
     claim_retryable_failed_rss_qb_entries,
     claim_rss_entry,
-    claim_rss_guangya_download,
-    claim_rss_qb_download,
-    finalize_rss_guangya_download,
-    finalize_rss_qb_download,
     count_rss_downloaded_entries_since,
     delete_rss_subscription,
     find_rss_subscriptions_by_normalized_name,

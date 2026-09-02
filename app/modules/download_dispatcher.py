@@ -59,6 +59,10 @@ class DownloadInput:
     title: str
     source_value: str = ""
     torrent_data: bytes | None = None
+    # 仅供已经从可信 RSS/索引元数据中提取到协议身份、但仍需保留原始
+    # HTTP .torrent 地址的入口使用。格式必须是 btih:<40hex> 或
+    # btmh:<64hex>；request_keys 会再次校验，非法提示不会参与幂等。
+    identity_hint: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +272,12 @@ def request_keys(item: DownloadInput) -> tuple[str, ...]:
         namespace, identity, _original_xt = _magnet_request_identity(source_value)
 
     identities: list[str] = []
+    identity_hint = str(getattr(item, "identity_hint", "") or "").strip().lower()
+    if kind == "http" and (
+        re.fullmatch(r"btih:[0-9a-f]{40}", identity_hint)
+        or re.fullmatch(r"btmh:[0-9a-f]{64}", identity_hint)
+    ):
+        identities.append(identity_hint)
     if namespace and identity:
         identities.append(f"{namespace}:{identity}")
         if namespace == "btih" and verified_btmh_identity:
@@ -728,12 +738,38 @@ def resubmit_download_request(
 
 
 
+def _qb_submit_overrides(
+    *,
+    save_path: str | None,
+    category: str | None,
+    runtime_config: dict[str, Any] | None,
+    task_id_hint: str,
+) -> dict[str, Any]:
+    """只传递真实 qB 覆盖值，保持默认提交器及测试替身的旧调用契约。"""
+    overrides: dict[str, Any] = {}
+    if save_path is not None:
+        overrides["save_path"] = save_path
+    if category is not None:
+        overrides["category"] = category
+    if runtime_config is not None:
+        overrides["runtime_config"] = runtime_config
+    if task_id_hint:
+        overrides["task_id_hint"] = task_id_hint
+    return overrides
+
+
 def dispatch_missing_targets(
     request_id: int,
     targets: str,
     *,
     gy_target_dir: str = "",
     gy_target_name: str = "",
+    qb_save_path: str | None = None,
+    qb_category: str | None = None,
+    qb_runtime_config: dict[str, Any] | None = None,
+    qb_task_id_hint: str = "",
+    rss_item_id: int | None = None,
+    log_path: str | None = None,
 ) -> dict[str, Any]:
     """向已有资源请求补充尚未提交的后端，不重置已成功目标。"""
     if targets not in SUPPORTED_TARGETS:
@@ -749,7 +785,17 @@ def dispatch_missing_targets(
     source_value = str(row["source_value"] or "")
     results: dict[str, dict[str, Any]] = {}
     if "qb" in claimed:
-        results["qb"] = _safe_submit("qBittorrent", _submit_qb, row)
+        results["qb"] = _safe_submit(
+            "qBittorrent",
+            _submit_qb,
+            row,
+            **_qb_submit_overrides(
+                save_path=qb_save_path,
+                category=qb_category,
+                runtime_config=qb_runtime_config,
+                task_id_hint=qb_task_id_hint,
+            ),
+        )
     if "guangya" in claimed:
         results["guangya"] = _safe_submit(
             "光鸭云盘", _submit_guangya, row,
@@ -812,7 +858,11 @@ def dispatch_missing_targets(
 
     for source, result in results.items():
         db.add_download_log(
-            source=source, title=title, path=source_value, request_id=int(request_id),
+            source=source,
+            title=title,
+            path=source_value if log_path is None else str(log_path),
+            rss_item_id=rss_item_id,
+            request_id=int(request_id),
             backend_task_id=str(result.get("task_id") or ""),
             status=_backend_submission_status(source, result),
             error=_submission_log_error(result, late_notice),
@@ -832,8 +882,19 @@ def dispatch_missing_targets(
         "outcome_unknown": has_unknown, "review_required": has_unknown,
     }
 
-def dispatch_request(request_id: int, targets: str, *,
-                     gy_target_dir: str = "", gy_target_name: str = "") -> dict[str, Any]:
+def dispatch_request(
+    request_id: int,
+    targets: str,
+    *,
+    gy_target_dir: str = "",
+    gy_target_name: str = "",
+    qb_save_path: str | None = None,
+    qb_category: str | None = None,
+    qb_runtime_config: dict[str, Any] | None = None,
+    qb_task_id_hint: str = "",
+    rss_item_id: int | None = None,
+    log_path: str | None = None,
+) -> dict[str, Any]:
     if targets not in SUPPORTED_TARGETS:
         return {"ok": False, "error": "下载目标无效"}
     row = db.get_download_request(request_id)
@@ -846,7 +907,17 @@ def dispatch_request(request_id: int, targets: str, *,
     source_value = str(row["source_value"] or "")
     results: dict[str, dict[str, Any]] = {}
     if targets in {"qb", "both"}:
-        results["qb"] = _safe_submit("qBittorrent", _submit_qb, row)
+        results["qb"] = _safe_submit(
+            "qBittorrent",
+            _submit_qb,
+            row,
+            **_qb_submit_overrides(
+                save_path=qb_save_path,
+                category=qb_category,
+                runtime_config=qb_runtime_config,
+                task_id_hint=qb_task_id_hint,
+            ),
+        )
     if targets in {"guangya", "both"}:
         results["guangya"] = _safe_submit(
             "光鸭云盘", _submit_guangya, row,
@@ -909,7 +980,8 @@ def dispatch_request(request_id: int, targets: str, *,
         db.add_download_log(
             source=source,
             title=title,
-            path=source_value,
+            path=source_value if log_path is None else str(log_path),
+            rss_item_id=rss_item_id,
             request_id=request_id,
             backend_task_id=str(result.get("task_id") or ""),
             status=_backend_submission_status(source, result),
@@ -1183,20 +1255,66 @@ def _safe_submit(name: str, submitter, row, **kwargs) -> dict[str, Any]:
         return {"ok": False, "task_id": "", "error": str(exc) or f"{name} 提交异常"}
 
 
-def _submit_qb(row) -> dict[str, Any]:
-    if not get("QB_URL", "").strip():
+def _submit_qb(
+    row,
+    *,
+    save_path: str | None = None,
+    category: str | None = None,
+    runtime_config: dict[str, Any] | None = None,
+    task_id_hint: str = "",
+) -> dict[str, Any]:
+    runtime = runtime_config if isinstance(runtime_config, dict) else None
+    runtime_keys = {
+        "QB_URL": "url",
+        "QB_USERNAME": "username",
+        "QB_PASSWORD": "password",
+        "QB_API_KEY": "api_key",
+    }
+
+    def configured(name: str, fallback: str = "") -> str:
+        if runtime is None:
+            return str(get(name, fallback) or "")
+        return str(runtime.get(runtime_keys[name], fallback) or "")
+
+    qb_url = configured("QB_URL")
+    if not qb_url.strip():
         return {"ok": False, "error": "未配置 qBittorrent"}
+    try:
+        timeout = max(
+            1,
+            int(runtime.get("timeout") or 10) if runtime is not None else 10,
+        )
+    except (TypeError, ValueError):
+        timeout = 10
     client = QBittorrentClient(
-        url=get("QB_URL"), username=get("QB_USERNAME"),
-        password=get("QB_PASSWORD"), api_key=get("QB_API_KEY"),
+        url=qb_url,
+        username=configured("QB_USERNAME"),
+        password=configured("QB_PASSWORD"),
+        api_key=configured("QB_API_KEY"),
+        timeout=timeout,
     )
-    category = get("TG_QB_CATEGORY", get("RSS_QB_CATEGORY", ""))
-    save_path = get("TG_QB_SAVE_PATH", get("RSS_QB_SAVE_PATH", ""))
+    default_category = (
+        runtime.get("category")
+        if runtime is not None
+        else get("TG_QB_CATEGORY", get("RSS_QB_CATEGORY", ""))
+    )
+    default_save_path = (
+        runtime.get("default_save_path")
+        if runtime is not None
+        else get("TG_QB_SAVE_PATH", get("RSS_QB_SAVE_PATH", ""))
+    )
+    resolved_category = str(category if category is not None else default_category or "")
+    resolved_save_path = str(
+        save_path if save_path is not None else default_save_path or ""
+    )
     torrents = row["torrent_data"] if row["kind"] == "torrent" else None
     urls = "" if torrents else str(row["source_value"] or "")
     try:
         result = client.add_torrent_detailed(
-            urls=urls, save_path=save_path, category=category, torrents=torrents,
+            urls=urls,
+            save_path=resolved_save_path,
+            category=resolved_category,
+            torrents=torrents,
         )
         failure_code = str(result.failure_code or "")
         error = ""
@@ -1206,9 +1324,18 @@ def _submit_qb(row) -> dict[str, Any]:
                 if failure_code == "qb_outcome_unknown"
                 else "qB 提交失败"
             )
+        normalized_hint = str(task_id_hint or "").strip().lower()
+        if row["kind"] != "http" or not _QB_TORRENT_ID_RE.fullmatch(
+            normalized_hint
+        ):
+            normalized_hint = ""
         return {
             "ok": bool(result.ok),
-            "task_id": result.task_ids[0] if result.task_ids else torrent_identity(row),
+            "task_id": (
+                result.task_ids[0]
+                if result.task_ids
+                else torrent_identity(row) or normalized_hint
+            ),
             "task_ids": list(result.task_ids),
             "failure_code": failure_code,
             "retryable": bool(result.retryable),

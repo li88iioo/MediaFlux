@@ -12,6 +12,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
+from app import database as db
 from app.indexers.errors import (
     IndexerError,
     IndexerInvalidResponse,
@@ -20,13 +21,13 @@ from app.indexers.errors import (
     IndexerValidationError,
 )
 from app.indexers.models import ResolvedDownload
-from app import database as db
 from app.logger import get_logger
 from app.modules.download_dispatcher import (
+    DownloadInput,
     create_request,
-    download_resubmit_capabilities,
     dispatch_missing_targets,
     dispatch_request,
+    download_resubmit_capabilities,
     normalize_download_url,
     public_dispatch_summary,
     request_keys,
@@ -226,7 +227,33 @@ def _persist_and_dispatch(
     user_id: str = "",
     message_id: str = "",
     admission_id: int | None = None,
+    gy_target_dir: str = "",
+    gy_target_name: str = "",
+    qb_save_path: str | None = None,
+    qb_category: str | None = None,
+    qb_runtime_config: dict[str, Any] | None = None,
+    qb_task_id_hint: str = "",
+    rss_item_id: int | None = None,
+    log_path: str | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, Any]]:
+    dispatch_kwargs: dict[str, Any] = {}
+    if gy_target_dir:
+        dispatch_kwargs["gy_target_dir"] = gy_target_dir
+    if gy_target_name:
+        dispatch_kwargs["gy_target_name"] = gy_target_name
+    if qb_save_path is not None:
+        dispatch_kwargs["qb_save_path"] = qb_save_path
+    if qb_category is not None:
+        dispatch_kwargs["qb_category"] = qb_category
+    if qb_runtime_config is not None:
+        dispatch_kwargs["qb_runtime_config"] = qb_runtime_config
+    if qb_task_id_hint:
+        dispatch_kwargs["qb_task_id_hint"] = qb_task_id_hint
+    if rss_item_id is not None:
+        dispatch_kwargs["rss_item_id"] = rss_item_id
+    if log_path is not None:
+        dispatch_kwargs["log_path"] = log_path
+
     keys = request_keys(item)
     existing = db.get_download_request_by_request_key(keys[0])
     if existing is None and len(keys) > 1:
@@ -266,7 +293,11 @@ def _persist_and_dispatch(
         else:
             if admission_id is not None:
                 db.bind_media_download_admission_request(admission_id, existing_id)
-            appended = dispatch_missing_targets(existing_id, target)
+            appended = dispatch_missing_targets(
+                existing_id,
+                target,
+                **dispatch_kwargs,
+            )
             if appended.get("handled"):
                 return {"id": existing_id, "created": False}, existing_id, appended
             return {
@@ -286,7 +317,11 @@ def _persist_and_dispatch(
         if not request_id:
             raise DownloadRequestCreationError()
     try:
-        result = dispatch_request(request_id, dispatch_target)
+        result = dispatch_request(
+            request_id,
+            dispatch_target,
+            **dispatch_kwargs,
+        )
     except Exception as exc:
         # 请求已与 admission 原子绑定；此后任何异常都不能再当成可安全重试。
         # 远端可能已经接收任务，保守转入人工核验并持续占用 media_key。
@@ -323,6 +358,59 @@ def _persist_and_dispatch(
     return created, request_id, result
 
 
+def submit_download_input(
+    item: DownloadInput,
+    target: str,
+    *,
+    origin: str,
+    chat_id: str = "",
+    user_id: str = "",
+    message_id: str = "",
+    admission_id: int | None = None,
+    gy_target_dir: str = "",
+    gy_target_name: str = "",
+    qb_save_path: str | None = None,
+    qb_category: str | None = None,
+    qb_runtime_config: dict[str, Any] | None = None,
+    qb_task_id_hint: str = "",
+    rss_item_id: int | None = None,
+    log_path: str | None = None,
+) -> dict[str, Any]:
+    """持久化并分发一个已规范化下载输入。
+
+    这是非资源站入口（RSS 等）接入统一 ``download_request`` 状态机的
+    唯一同步入口。调用方可以读取 ``summary`` 做稳定业务映射；``dispatch``
+    仅供同进程内部保留失败分类，不应直接透传给 Web/TG。
+    """
+    normalized_target = str(target or "").strip().lower()
+    if normalized_target not in DOWNLOAD_TARGETS:
+        raise ValueError("下载目标无效")
+    created, request_id, dispatch = _persist_and_dispatch(
+        item,
+        str(origin or "").strip() or "unknown",
+        normalized_target,
+        chat_id=str(chat_id),
+        user_id=str(user_id),
+        message_id=str(message_id),
+        admission_id=admission_id,
+        gy_target_dir=str(gy_target_dir or ""),
+        gy_target_name=str(gy_target_name or ""),
+        qb_save_path=qb_save_path,
+        qb_category=qb_category,
+        qb_runtime_config=qb_runtime_config,
+        qb_task_id_hint=str(qb_task_id_hint or ""),
+        rss_item_id=rss_item_id,
+        log_path=log_path,
+    )
+    return {
+        "request_id": int(request_id),
+        "created": bool(created.get("created")),
+        "target": normalized_target,
+        "summary": public_dispatch_summary(dispatch),
+        "dispatch": dispatch,
+    }
+
+
 async def download_indexer_result(
     service,
     result_id: str,
@@ -345,18 +433,19 @@ async def download_indexer_result(
     async with _download_limiter():
         stored, resolved = await _resolve(service, result_id)
         item = await _resolved_download_input(service, stored, resolved)
-        created, request_id, result = await asyncio.to_thread(
-            _persist_and_dispatch,
+        submitted = await asyncio.to_thread(
+            submit_download_input,
             item,
-            f"{normalized_origin_namespace}:{stored.site_id}",
             normalized_target,
+            origin=f"{normalized_origin_namespace}:{stored.site_id}",
             chat_id=str(chat_id),
             user_id=str(user_id),
             message_id=str(message_id),
             **({"admission_id": admission_id} if admission_id is not None else {}),
         )
 
-    public = public_dispatch_summary(result)
+    request_id = int(submitted["request_id"])
+    public = submitted["summary"]
     duplicate = public["duplicate"]
     succeeded = public["succeeded"]
     failed = public["failed"]
@@ -366,7 +455,7 @@ async def download_indexer_result(
         "result_id": result_id,
         "ok": status in {"submitted", "partial"},
         "request_id": request_id,
-        "created": bool(created.get("created")),
+        "created": bool(submitted["created"]),
         "target": normalized_target,
         "status": status,
         "succeeded": succeeded,
