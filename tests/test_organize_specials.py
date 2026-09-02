@@ -1081,6 +1081,113 @@ class OrganizePositionSafetyTests(unittest.TestCase):
         self.assertEqual(by_id["overflow-25"].episode_mapping.mode, "tmdb_special")
         self.assertEqual(stats["need_confirm"], 0)
 
+    def test_automatic_two_item_overflow_tail_uses_safe_identity_probe(self):
+        client = _TreeClient()
+        show = GuangYaFile(
+            "slime-tail",
+            "【发布组】关于我转生变成史莱姆这档事 第二季 Part 2",
+            True,
+            parent_id="source",
+        )
+        files = [
+            GuangYaFile(
+                f"overflow-{episode}",
+                "关于我转生变成史莱姆这档事."
+                "That.Time.I.Got.Reincarnated.as.a.Slime."
+                f"S02E{episode:02d}.2021.2160p.WEB-DL.mkv",
+                False,
+                1024,
+                f"overflow-{episode}",
+                "slime-tail",
+            )
+            for episode in (25, 26)
+        ]
+        client.tree["source"] = [show]
+        client.tree["slime-tail"] = files
+        client.info["slime-tail"] = show
+
+        def match(filename, _parent_path="", **_kwargs):
+            # 生产识别器会在原始 S02E25/E26 上先触发 TMDB 位置越界；只有
+            # 去位置化的 E01 身份探针能先稳定确定正确作品。
+            if ".S02E01." not in filename:
+                return MatchResult(
+                    tmdb_id="118541",
+                    external_id="118541",
+                    provider="tmdb",
+                    title="转生史莱姆日记",
+                    year="2021",
+                    media_type="tv",
+                    confidence=0.92,
+                    status="low_confidence",
+                    need_confirm=True,
+                    matched_by="search",
+                    error="文件集号超出 TMDB 记录范围，已阻止自动整理",
+                )
+            return MatchResult(
+                tmdb_id="82684",
+                external_id="82684",
+                provider="tmdb",
+                title="关于我转生变成史莱姆这档事",
+                year="2018",
+                media_type="tv",
+                confidence=0.937,
+                threshold=0.9,
+                status="matched",
+                need_confirm=False,
+                matched_by="bangumi_hint",
+            )
+
+        scraper = TMDBScraper()
+        scraper.match = Mock(side_effect=match)
+        scraper.get_detail = Mock(return_value={
+            "id": 82684,
+            "name": "关于我转生变成史莱姆这档事",
+            "first_air_date": "2018-10-02",
+            "genres": [{"id": 16}],
+            "origin_country": ["JP"],
+            "seasons": [
+                {"season_number": 0, "episode_count": 15},
+                {"season_number": 1, "episode_count": 24},
+                {"season_number": 2, "episode_count": 24},
+            ],
+        })
+        scraper.get_tv_season_detail = Mock(
+            side_effect=lambda _tmdb_id, season: (
+                AutomaticSpecialsTests._slime_specials_detail()
+                if season == 0
+                else AutomaticSpecialsTests._slime_season_two_detail()
+            )
+        )
+        rules = OrganizeRules(
+            target_dir_id="archive", small_file_mb=0, region_split=False,
+            year_split=False, clean_empty=False, link_strm=False,
+            notify_enabled=False,
+        )
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", rules, dry_run=True, automatic=True,
+        )
+        by_id = {plan.file_id: plan for plan in plans}
+
+        self.assertTrue(all(
+            ".S02E01." in call.args[0] for call in scraper.match.call_args_list
+        ))
+        self.assertEqual(by_id["overflow-25"].action, "move")
+        self.assertEqual(
+            (by_id["overflow-25"].season, by_id["overflow-25"].episode),
+            (0, 7),
+        )
+        self.assertEqual(
+            (by_id["overflow-26"].season, by_id["overflow-26"].episode),
+            (0, 8),
+        )
+        self.assertTrue(all(
+            plan.episode_mapping is not None
+            and plan.episode_mapping.mode == "tmdb_special"
+            for plan in plans
+        ))
+        self.assertEqual(stats["need_confirm"], 0)
+
     def test_fractional_episodes_share_numeric_special_sequence(self):
         client = _TreeClient()
         client.tree["source"] = [

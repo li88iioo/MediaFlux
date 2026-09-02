@@ -2024,11 +2024,19 @@ class Organizer:
                                 position[1],
                             ))
         directory_episode_evidence = build_directory_episode_evidence(evidence_entries)
-        # 普通跨季/绝对编号仍至少要求 3 集。短序列只提供给“正片季尾完整
-        # 溢出项 ↔ TMDB 特别篇”这一条更窄、另有季详情与日期约束的规则。
+        # 后续季只剩 2 个连续文件时也需要一个不携带越界位置的作品身份探针，
+        # 否则 S02E25/E26 会在取得正确 TMDB 身份前就被逐文件位置校验拦截。
+        # 这份短证据只参与身份识别；普通跨季/绝对编号映射仍由
+        # ``infer_episode_mapping`` 坚持至少 3 集的门槛。
         directory_episode_sequence_evidence = build_directory_episode_evidence(
             evidence_entries, minimum_episodes=1,
         )
+        directory_identity_episode_evidence = dict(directory_episode_evidence)
+        for evidence_key, evidence in directory_episode_sequence_evidence.items():
+            if evidence.source_season > 1 and evidence.episode_count >= 2:
+                directory_identity_episode_evidence.setdefault(evidence_key, evidence)
+        # 单文件/短序列只提供给“正片季尾完整溢出项 ↔ TMDB 特别篇”这一条
+        # 更窄、另有季详情与日期约束的规则。
         directory_identity_cache: dict[tuple[str, str, str, str], MatchResult] = {}
         directory_identity_hit_groups: set[tuple[str, str, str, str]] = set()
         recognition_work_cache: dict[tuple[str, str, str, bool, str], MatchResult] = {}
@@ -2046,7 +2054,7 @@ class Organizer:
         episode_groups: dict[str, list[_ScannedVideo]] = {}
         for item in scanned_videos:
             evidence_key = episode_evidence_keys.get(item.file.file_id, "")
-            if item.special or evidence_key not in directory_episode_evidence:
+            if item.special or evidence_key not in directory_identity_episode_evidence:
                 continue
             episode_groups.setdefault(evidence_key, []).append(item)
 
@@ -2054,7 +2062,7 @@ class Organizer:
         emitted_episode_groups: set[str] = set()
         for item in scanned_videos:
             evidence_key = episode_evidence_keys.get(item.file.file_id, "")
-            evidence = directory_episode_evidence.get(evidence_key)
+            evidence = directory_identity_episode_evidence.get(evidence_key)
             if item.special or evidence is None:
                 planning_videos.append(item)
                 continue
@@ -2127,12 +2135,12 @@ class Organizer:
             parent_context = recognition_parent_paths.get(
                 item.file.file_id, item.recognition_parent_path
             )
-            episode_evidence = directory_episode_evidence.get(
+            identity_episode_evidence = directory_identity_episode_evidence.get(
                 episode_evidence_keys.get(item.file.file_id, "")
             )
             if (
                 recognition_name == ""
-                and episode_evidence is not None
+                and identity_episode_evidence is not None
                 and not explicit_file_marker
             ):
                 # 连续剧集包已有“同标题 + 连续集号”的目录级证据时，优先
@@ -2164,7 +2172,7 @@ class Organizer:
                     identity_episode = (
                         1
                         if uses_safe_identity_probe
-                        else int(episode_evidence.range_end)
+                        else int(identity_episode_evidence.range_end)
                     )
                     recognition_name = (
                         f"{title_hint}{year_token}.S{identity_season:02d}"
@@ -2219,7 +2227,10 @@ class Organizer:
                     )
                 ),
                 source_position_override=source_positions.get(item.file.file_id),
-                directory_episode_evidence=episode_evidence,
+                directory_episode_evidence=directory_episode_evidence.get(
+                    episode_evidence_keys.get(item.file.file_id, "")
+                ),
+                directory_identity_evidence=identity_episode_evidence,
                 directory_sequence_evidence=directory_episode_sequence_evidence.get(
                     episode_evidence_keys.get(item.file.file_id, "")
                 ),
@@ -5985,6 +5996,7 @@ class Organizer:
         parsed_override: tuple[int | None, int | None] | None = None,
         source_position_override: tuple[int | None, int | None] | None = None,
         directory_episode_evidence: DirectoryEpisodeEvidence | None = None,
+        directory_identity_evidence: DirectoryEpisodeEvidence | None = None,
         directory_sequence_evidence: DirectoryEpisodeEvidence | None = None,
         directory_episode_member_count: int = 0,
         recognition_name: str = "",
@@ -6790,14 +6802,17 @@ class Organizer:
                 # 当前文件的真实位置。真实位置已从源文件恢复、经统一映射，
                 # 并在上方通过 TMDB 最终校验。只有当前源位置确实属于本目录
                 # 连续证据时，才允许将“身份证明”和“位置证明”安全解耦。
+                identity_probe_evidence = (
+                    directory_identity_evidence or directory_episode_evidence
+                )
                 source_position_in_directory_evidence = bool(
                     recognition_identity_only
-                    and directory_episode_evidence is not None
-                    and plan.source_season == directory_episode_evidence.source_season
+                    and identity_probe_evidence is not None
+                    and plan.source_season == identity_probe_evidence.source_season
                     and plan.source_episode is not None
-                    and directory_episode_evidence.range_start
+                    and identity_probe_evidence.range_start
                     <= plan.source_episode
-                    <= directory_episode_evidence.range_end
+                    <= identity_probe_evidence.range_end
                 )
                 proof_position_matches = bool(
                     parsed_season == proof_season
