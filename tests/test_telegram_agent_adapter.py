@@ -6532,6 +6532,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
         interaction = store.create_resource_interaction(
             owner="tg:v1:100\x1f200",
             candidates=_store_resource_candidates("resource_result_123456"),
+            search_id="rs_1234567890abcdef",
         )
         prepare_id = interaction["items"][0]["qb_action_id"]
         prepare_call = SimpleNamespace(
@@ -6556,6 +6557,7 @@ class TelegramAgentAdapterTests(unittest.TestCase):
                     "source_type": "resource_candidates",
                     "positions": [1],
                     "target": "qb",
+                    "search_id": "rs_1234567890abcdef",
                 },
                 owner="tg:v1:100\x1f200",
                 request_id=ANY,

@@ -109,6 +109,68 @@ class AgentRealUserRoutingTests(unittest.TestCase):
             "guangya.fs.query", "guangya.fs.query",
         ])
 
+    def test_guangya_directory_natural_language_pagination_reuses_safe_snapshot(self):
+        agent, calls = self._agent("guangya.fs.query")
+        context = [{
+            "role": "assistant",
+            "tool_name": "guangya.fs.query",
+            "text": "光鸭列表完成：第 1 页展示 10 个对象。",
+        }]
+        cursor = {
+            "observation_ref": "OBS0123456789ABCDEF0123456789ABCDEF",
+            "page": 1,
+            "page_size": 10,
+            "has_more": True,
+        }
+        with patch(
+            "app.agent.orchestrator.latest_guangya_observation_cursor",
+            return_value=cursor,
+        ), patch.object(agent, "_query_with_model_tools") as model:
+            response = agent.query(
+                "下一页",
+                owner="web-owner",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+        model.assert_not_called()
+        self.assertEqual(response["tool_call"]["name"], "guangya.fs.query")
+        self.assertEqual(calls, [(
+            "guangya.fs.query",
+            {
+                "observation_ref": cursor["observation_ref"],
+                "page": 2,
+                "page_size": 10,
+            },
+        )])
+
+    def test_guangya_directory_last_page_does_not_query_or_guess(self):
+        agent, calls = self._agent("guangya.fs.query")
+        context = [{
+            "role": "assistant",
+            "tool_name": "guangya.fs.query",
+            "text": "光鸭列表完成。",
+        }]
+        with patch(
+            "app.agent.orchestrator.latest_guangya_observation_cursor",
+            return_value={
+                "observation_ref": "OBS0123456789ABCDEF0123456789ABCDEF",
+                "page": 2,
+                "page_size": 10,
+                "has_more": False,
+            },
+        ), patch.object(agent, "_query_with_model_tools") as model:
+            response = agent.query(
+                "还有呢",
+                owner="web-owner",
+                conversation_context=context,
+                trusted_conversation_context=True,
+                present=False,
+            )
+        model.assert_not_called()
+        self.assertEqual(calls, [])
+        self.assertIn("最后一页", response["result"]["summary"])
+
     def test_arbitrary_guangya_cleanup_starts_with_read_only_frozen_preview(self):
         agent, calls = self._agent("guangya.organize.cleanup.preview")
         with patch.object(agent, "_query_with_model_tools") as model:

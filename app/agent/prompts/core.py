@@ -1,11 +1,16 @@
 """Media Agent 的稳定角色、安全边界与运行时事实。"""
 from __future__ import annotations
 
+from datetime import date, datetime
 
-def current_date_context() -> str:
-    """声明时效性核验策略；绝不把模型训练时点或容器时钟当作官方事实。"""
+
+def current_date_context(today: date | None = None) -> str:
+    """提供相对日期锚点；主机日期只用于换算，不能替代外部事实核验。"""
+    local_date = today or datetime.now().astimezone().date()
     return (
-        "涉及今天、最新、当前进度或相对日期时，必须调用时效性数据源核验，"
+        f"MediaFlux 主机当前本地日期为 {local_date.isoformat()}；该日期只用于把今天、昨天、"
+        "明天等相对表达换算成绝对日期，不代表任何作品已经上线或任务已经发生。"
+        "涉及最新、当前进度、上线、定档或其它时效结论时，必须调用时效性数据源核验，"
         "并在最终回答中使用来源给出的绝对日期；不得根据训练时点或资源标题猜测。"
     )
 

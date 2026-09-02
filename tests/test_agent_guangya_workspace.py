@@ -110,6 +110,15 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
 
     def test_observation_can_continue_by_ref_and_is_owner_bound(self):
         first = self._query(FakeWorkspaceClient(), page_size=2)
+        self.assertEqual(
+            workspace_actions.latest_guangya_observation_cursor("owner"),
+            {
+                "observation_ref": first.data["observation_ref"],
+                "page": 1,
+                "page_size": 2,
+                "has_more": True,
+            },
+        )
         arguments = workspace_actions.guangya_fs_query_arguments({
             "observation_ref": first.data["observation_ref"],
             "page": 2, "page_size": 2,
@@ -119,6 +128,10 @@ class GuangYaWorkspaceAgentTests(unittest.TestCase):
         )
         self.assertEqual(second.data["page"], 2)
         self.assertEqual(len(second.data["entries"]), 2)
+        self.assertEqual(
+            workspace_actions.latest_guangya_observation_cursor("owner")["has_more"],
+            False,
+        )
         with self.assertRaisesRegex(Exception, "不属于当前会话"):
             guangya_workspace.load_directory_observation(
                 first.data["observation_ref"], owner="other-owner"

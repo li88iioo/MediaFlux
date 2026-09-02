@@ -33,6 +33,9 @@ _TTL_SECONDS = 10 * 60.0
 class _Flow:
     owner: str
     observation_ref: str
+    page: int = 1
+    page_size: int = 10
+    has_more: bool | None = None
     generation: int = 0
     revision: int = 0
     updated_at: float = 0.0
@@ -95,10 +98,22 @@ def _begin_update(owner: str) -> tuple[str, AgentContextWriteGuard]:
                 if not valid_observation_ref(ref):
                     ref = ""
             if ref:
+                page = _safe_cursor_integer(
+                    persisted.payload.get("page"), default=1, maximum=200
+                )
+                page_size = _safe_cursor_integer(
+                    persisted.payload.get("page_size"), default=10, maximum=10
+                )
+                raw_has_more = persisted.payload.get("has_more")
                 with _lock:
                     _flows[owner] = _Flow(
                         owner=owner,
                         observation_ref=ref,
+                        page=page,
+                        page_size=page_size,
+                        has_more=(
+                            raw_has_more if isinstance(raw_has_more, bool) else None
+                        ),
                         generation=persisted.generation,
                         revision=persisted.revision,
                         updated_at=time.monotonic(),
@@ -109,6 +124,12 @@ def _begin_update(owner: str) -> tuple[str, AgentContextWriteGuard]:
 
 def _save(flow: _Flow) -> bool:
     flow.updated_at = time.monotonic()
+    payload = {
+        "observation_ref": flow.observation_ref,
+        "page": flow.page,
+        "page_size": flow.page_size,
+        "has_more": flow.has_more,
+    }
     if _repository is not None:
         try:
             guarded = getattr(_repository, "replace_latest_guarded", None)
@@ -118,7 +139,7 @@ def _save(flow: _Flow) -> bool:
                 persisted = guarded(
                     owner=flow.owner,
                     context_type=_CONTEXT_TYPE,
-                    payload={"observation_ref": flow.observation_ref},
+                    payload=payload,
                     expires_at=time.time() + _TTL_SECONDS,
                     guard=AgentContextWriteGuard(flow.generation, flow.revision),
                 )
@@ -130,7 +151,7 @@ def _save(flow: _Flow) -> bool:
                 _repository.replace_latest(
                     owner=flow.owner,
                     context_type=_CONTEXT_TYPE,
-                    payload={"observation_ref": flow.observation_ref},
+                    payload=payload,
                     expires_at=time.time() + _TTL_SECONDS,
                 )
         except Exception as exc:
@@ -141,9 +162,20 @@ def _save(flow: _Flow) -> bool:
     return True
 
 
-def latest_guangya_observation_ref(owner: str) -> str:
+def _safe_cursor_integer(value: Any, *, default: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return number if 1 <= number <= maximum else default
+
+
+def latest_guangya_observation_cursor(owner: str) -> dict[str, Any]:
+    """返回最近只读观察的分页游标；旧上下文缺字段时保持可兼容。"""
     if not owner:
-        return ""
+        return {}
     if _repository is not None:
         try:
             persisted = _repository.get_latest(
@@ -152,18 +184,41 @@ def latest_guangya_observation_ref(owner: str) -> str:
             if persisted is not None:
                 ref = str(persisted.payload.get("observation_ref") or "").strip().upper()
                 if valid_observation_ref(ref):
-                    return ref
+                    raw_has_more = persisted.payload.get("has_more")
+                    return {
+                        "observation_ref": ref,
+                        "page": _safe_cursor_integer(
+                            persisted.payload.get("page"), default=1, maximum=200
+                        ),
+                        "page_size": _safe_cursor_integer(
+                            persisted.payload.get("page_size"), default=10, maximum=10
+                        ),
+                        "has_more": (
+                            raw_has_more if isinstance(raw_has_more, bool) else None
+                        ),
+                    }
         except Exception as exc:
             logger.warning("Agent 光鸭观察上下文读取失败 type=%s", type(exc).__name__)
         with _lock:
             _flows.pop(owner, None)
-        return ""
+        return {}
     with _lock:
         flow = _flows.get(owner)
         if flow and time.monotonic() - flow.updated_at <= _TTL_SECONDS:
-            return flow.observation_ref
+            return {
+                "observation_ref": flow.observation_ref,
+                "page": flow.page,
+                "page_size": flow.page_size,
+                "has_more": flow.has_more,
+            }
         _flows.pop(owner, None)
-    return ""
+    return {}
+
+
+def latest_guangya_observation_ref(owner: str) -> str:
+    return str(
+        latest_guangya_observation_cursor(owner).get("observation_ref") or ""
+    )
 
 
 def guangya_capabilities_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -292,18 +347,9 @@ def _read_observation_page(
         raise AgentToolError("光鸭目录观察需要已登录会话", code="precondition_failed")
     client: GuangYaClient | None = None
     new_observation = False
-    update_context = False
-    previous_ref = ""
-    guard = AgentContextWriteGuard(0, 0)
+    previous_ref, guard = _begin_update(context.owner)
+    update_context = True
     requested_ref = str(arguments.get("observation_ref") or "").strip().upper()
-    if requested_ref:
-        current_ref = latest_guangya_observation_ref(context.owner)
-        if current_ref != requested_ref:
-            previous_ref, guard = _begin_update(context.owner)
-            update_context = True
-    else:
-        previous_ref, guard = _begin_update(context.owner)
-        update_context = True
     try:
         if requested_ref:
             payload = load_directory_observation(requested_ref, owner=context.owner)
@@ -341,6 +387,9 @@ def _read_observation_page(
     if update_context:
         flow = _Flow(
             owner=context.owner, observation_ref=ref,
+            page=int(page["page"]),
+            page_size=int(page["page_size"]),
+            has_more=bool(page["has_more"]),
             generation=guard.generation, revision=guard.revision,
         )
         if not _save(flow):

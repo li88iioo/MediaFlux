@@ -70,10 +70,12 @@ class ConfirmationTicket:
 _CONFIRMATION_REPLY_PHRASES = frozenset({
     "确认", "确认执行", "确定", "确定执行", "同意", "执行", "开始执行",
     "好的", "好的执行", "好的帮我执行", "好，执行", "好,执行",
+    "确认吧", "确认执行吧", "执行吧", "可以执行", "就这样执行",
     "ok", "yes", "confirm",
 })
 _CANCELLATION_REPLY_PHRASES = frozenset({
     "取消", "取消执行", "算了", "不要了", "不执行", "放弃",
+    "先别执行", "别执行", "不用了", "撤销", "撤销操作", "停止执行",
     "cancel", "no",
 })
 

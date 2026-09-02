@@ -64,7 +64,10 @@ from app.agent.guangya_cleanup_actions import (
 )
 from app.agent.guangya_fs_change_actions import clear_guangya_fs_change_context
 from app.agent.guangya_rename_actions import clear_guangya_rename_context
-from app.agent.guangya_workspace_actions import clear_guangya_workspace_context
+from app.agent.guangya_workspace_actions import (
+    clear_guangya_workspace_context,
+    latest_guangya_observation_cursor,
+)
 from app.agent.provider_actions import clear_provider_session_state
 from app.agent.indexer_config_actions import current_indexer_site_ids
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
@@ -95,6 +98,7 @@ from app.agent.recent_read_operations import READ_PLAN_OPERATION, RecentReadOper
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     new_resource_search_id,
+    normalize_resource_search_id,
     public_candidate_projection,
     safe_resource_snapshot,
 )
@@ -1240,14 +1244,66 @@ def download_task_control_request(message: str) -> tuple[str, str] | None:
     return _DOWNLOAD_CONTROL_OPERATIONS[verb], task_name
 
 
+_QUOTED_INTENT_DATA_PATTERNS = tuple(
+    re.compile(pattern)
+    for pattern in (
+        r"《[^》]{1,500}》",
+        r"「[^」]{1,500}」",
+        r"『[^』]{1,500}』",
+        r"【[^】]{1,500}】",
+        r"“[^”]{1,500}”",
+        r'"[^"\n]{1,500}"',
+        r"'[^'\n]{1,500}'",
+        r"`[^`\n]{1,500}`",
+    )
+)
+
+
+def _intent_text_without_quoted_data(message: str) -> str:
+    """移除明确标注的片名/文件名数据，再判断危险或调度意图。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold()
+    for pattern in _QUOTED_INTENT_DATA_PATTERNS:
+        normalized = pattern.sub(" ", normalized)
+    normalized = " ".join(normalized.split()).strip()
+    # 用户不一定会给片名加书名号。完整的“搜索……资源”句式中，搜索词整体
+    # 都是不可信数据，即便片名恰好包含“明天 / 删除全部下载任务”等命令词，
+    # 也不能被危险操作或预约识别器当成意图。若资源搜索后还跟着另一个分句，
+    # 句尾将不再是资源搜索收束词，后续动作仍会被正常检查。
+    if (
+        any(token in normalized for token in _RESOURCE_SEARCH_VERBS)
+        and re.search(
+            r"(?:资源|种子|磁力(?:链接)?|下载源|资源站)"
+            r"(?:吗|呢|么)?\s*[?？。.!！]*$",
+            normalized,
+        )
+    ):
+        return "资源搜索"
+    return normalized
+
+
 def is_unsafe_qb_bulk_delete_request(message: str) -> bool:
     """识别 Agent 明确不支持的 qB 批量破坏请求，返回可执行的安全说明。"""
-    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
-    if not any(token in normalized for token in ("qbittorrent", "qb 下载", "qb下载", "qb 任务", "qb任务")):
+    normalized = _intent_text_without_quoted_data(message)
+    if not any(
+        token in normalized
+        for token in (
+            "qbittorrent",
+            "qb 下载",
+            "qb下载",
+            "qb 任务",
+            "qb任务",
+            "下载队列",
+            "下载任务",
+            "资源下载任务",
+        )
+    ):
         return False
     return (
         any(token in normalized for token in ("全部", "所有", "全清", "清空", "批量"))
-        and any(token in normalized for token in ("删除", "移除", "清理"))
+        and any(
+            token in normalized
+            for token in ("删除", "删掉", "移除", "清理", "清空")
+        )
     )
 
 
@@ -4758,6 +4814,118 @@ def _extract_resource_search_query(message: str) -> str:
     return query.strip(" ，。！？?、:：")[:120]
 
 
+_RESOURCE_SEARCH_CORRECTION_ANCHORS = (
+    "不是这个", "不是刚才", "换成", "换一个", "改搜", "重新搜",
+    "重新找", "选错了", "我说错了", "刚才说错",
+)
+_RESOURCE_SEARCH_CORRECTION_REJECT_SCOPES = (
+    "rss", "刷新周期", "媒体追更", "媒体订阅", "媒体库", "反代",
+    "strm", "光鸭目录", "本地整理", "下载任务", "下载队列",
+)
+_DELAYED_ACTION_TOKENS = (
+    "刷新", "同步", "下载", "转存", "整理", "清理", "删除", "移除",
+    "重启", "发送", "启用", "关闭", "暂停", "恢复", "创建", "新增",
+    "订阅", "扫描", "刮削", "重命名", "移动", "检查",
+)
+_DELAYED_ACTION_IMPERATIVE_TOKENS = (
+    "请", "帮我", "给我", "把", "替我", "安排", "定时", "预约",
+)
+_DELAYED_TIME_PATTERNS = (
+    re.compile(
+        r"(?:半|[0-9]{1,4}|[零〇一二两三四五六七八九十百千]{1,7})\s*"
+        r"(?:分钟|小时|天|周)(?:后|之后)"
+    ),
+    re.compile(
+        r"(?:明天|后天|今晚|明晚|下周(?:[一二三四五六日天])?|下个月|"
+        r"稍后|待会儿|等会儿|一会儿|过一会儿)"
+    ),
+    re.compile(r"[0-9]{1,2}月[0-9]{1,2}日(?:\s*(?:早上|上午|中午|下午|晚上|凌晨|[0-9]{1,2}点))?"),
+    re.compile(r"每(?:周|星期)[一二三四五六日天](?:\s*(?:早上|上午|中午|下午|晚上|凌晨|[0-9]{1,2}点))?"),
+    re.compile(r"每天\s*(?:早上|上午|中午|下午|晚上|凌晨|[0-9]{1,2}点)"),
+    re.compile(r"(?:这周|本周|下周)?(?:周|星期)[一二三四五六日天](?:早上|上午|中午|下午|晚上|凌晨)?"),
+    re.compile(
+        r"(?:早上|上午|中午|下午|晚上|凌晨)?\s*"
+        r"(?:[0-9]{1,2}|[一二三四五六七八九十]{1,3})\s*点"
+        r"(?:\s*(?:半|[0-9]{1,2}\s*分))?"
+    ),
+)
+
+
+def unsupported_scheduled_action_request(message: str) -> str:
+    """识别当前没有可靠调度载体的一次性延时或精确时刻写请求。"""
+    # 既有只读重试文案中的“稍后”表示“此前部分检查未完成”，本轮收到该
+    # 短句时应立即安全重放，而不是把它误判成一个未来预约。
+    if is_recent_read_retry_message(message):
+        return ""
+    normalized = _intent_text_without_quoted_data(message)
+    if not normalized or not any(token in normalized for token in _DELAYED_ACTION_TOKENS):
+        return ""
+    # STRM 与光鸭本身已有可确认、可持久化的 cron 策略，不能被通用
+    # “不支持预约”防线误伤。解析失败也交还原有领域路由产生精确提示。
+    for supported_parser in (
+        strm_schedule_policy_request,
+        guangya_organize_schedule_policy_request,
+    ):
+        try:
+            if supported_parser(message) is not None:
+                return ""
+        except AgentToolError:
+            return ""
+    question_like = bool(
+        normalized.rstrip().endswith(("?", "？", "吗", "么"))
+        or any(token in normalized for token in ("会不会", "是否", "什么时候", "几点"))
+    )
+    imperative = any(token in normalized for token in _DELAYED_ACTION_IMPERATIVE_TOKENS)
+    if question_like and not imperative:
+        return ""
+    for pattern in _DELAYED_TIME_PATTERNS:
+        matched = pattern.search(normalized)
+        if matched is not None:
+            return matched.group(0)[:40]
+    return ""
+
+
+def resource_search_correction_request(
+    message: str,
+    conversation_context: list[dict[str, Any]] | None,
+) -> dict[str, Any] | None:
+    """把“不是这个，换成 2024 年那个”绑定到最近一次明确资源搜索。"""
+    normalized = unicodedata.normalize("NFKC", str(message or "")).casefold().strip()
+    if not normalized or not any(
+        anchor in normalized for anchor in _RESOURCE_SEARCH_CORRECTION_ANCHORS
+    ):
+        return None
+    if any(scope in normalized for scope in _RESOURCE_SEARCH_CORRECTION_REJECT_SCOPES):
+        return None
+
+    quoted = _MEDIA_RATING_QUOTED_TITLE_RE.search(str(message or ""))
+    title = " ".join((quoted.group(1) if quoted is not None else "").split()).strip()
+    if not title:
+        for item in reversed(conversation_context or []):
+            if not isinstance(item, dict) or str(item.get("role") or "").casefold() != "user":
+                continue
+            prior = str(
+                item.get("text") or item.get("message") or item.get("content") or ""
+            ).strip()
+            if not is_indexer_resource_search_message(prior):
+                continue
+            title = _extract_resource_search_query(prior)
+            if title:
+                break
+    years = {
+        int(value)
+        for value in re.findall(r"(?<![0-9])((?:18|19|20|21)\d{2})(?![0-9])", normalized)
+    }
+    if not title or (quoted is None and not years):
+        return None
+    if len(years) > 1:
+        return None
+    arguments: dict[str, Any] = {"title": title[:120], "limit": 20}
+    if years:
+        arguments["year"] = years.pop()
+    return arguments
+
+
 def indexer_site_change_followup_request(
     message: str,
     conversation_context: list[dict[str, Any]] | None = None,
@@ -5934,6 +6102,64 @@ def guangya_directory_browse_request(
     return {"operation": "list", "path": path, "page": 1, "page_size": 10, "max_items": 500}
 
 
+_GUANGYA_NEXT_PAGE_PHRASES = frozenset({
+    "下一页", "下页", "继续", "继续看", "继续看看", "继续列出",
+    "再来一页", "查看更多", "后面呢", "还有呢", "还有哪些",
+})
+_GUANGYA_PREVIOUS_PAGE_PHRASES = frozenset({
+    "上一页", "上页", "返回上一页", "回上一页", "前一页",
+})
+
+
+def guangya_directory_page_request(
+    message: str, *, owner: str, previous_tool: str
+) -> dict[str, Any] | None:
+    """把目录列表的自然语言翻页绑定到最近一次光鸭只读快照。"""
+    if previous_tool != "guangya.fs.query":
+        return None
+    compact = re.sub(
+        r"[\s，。！？!?、；;：:~～]+",
+        "",
+        unicodedata.normalize("NFKC", str(message or "")).casefold(),
+    )
+    direction = ""
+    requested_page = 0
+    if compact in _GUANGYA_NEXT_PAGE_PHRASES:
+        direction = "next"
+    elif compact in _GUANGYA_PREVIOUS_PAGE_PHRASES:
+        direction = "previous"
+    else:
+        matched = re.fullmatch(r"(?:查看|打开|跳到|去)?第?([0-9]{1,3})页", compact)
+        if matched is None:
+            return None
+        requested_page = int(matched.group(1))
+        if not 1 <= requested_page <= 200:
+            return None
+
+    cursor = latest_guangya_observation_cursor(str(owner or "").strip())
+    observation_ref = str(cursor.get("observation_ref") or "")
+    if not observation_ref:
+        return {"state": "missing"}
+    current_page = int(cursor.get("page") or 1)
+    page_size = int(cursor.get("page_size") or 10)
+    if direction == "next":
+        if cursor.get("has_more") is False:
+            return {"state": "last"}
+        requested_page = current_page + 1
+    elif direction == "previous":
+        if current_page <= 1:
+            return {"state": "first"}
+        requested_page = current_page - 1
+    return {
+        "state": "query",
+        "arguments": {
+            "observation_ref": observation_ref,
+            "page": requested_page,
+            "page_size": page_size,
+        },
+    }
+
+
 def guangya_cleanup_preview_request(message: str) -> dict[str, Any] | None:
     """把明确光鸭子目录的清理请求降为只读冻结预览，绝不直接写云盘。"""
     original = unicodedata.normalize("NFKC", str(message or "")).strip()
@@ -7093,7 +7319,8 @@ class AgentOrchestrator:
                 "批量资源提交需要在已登录会话中确认",
                 ["请重新登录后搜索资源，再明确选择多个候选和下载目标。"],
             )
-        snapshot = self.recent_resource_store.get(owner=owner)
+        search_id = normalize_resource_search_id(request.get("search_id"))
+        snapshot = self.recent_resource_store.get(owner=owner, search_id=search_id)
         candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
         if not isinstance(candidates, list) or len(candidates) < 2:
             return self._response(
@@ -7134,9 +7361,16 @@ class AgentOrchestrator:
                 ["把第 1、2 个到 qB。", "把前 3 个到两边。"],
             )
         try:
+            submit_arguments: dict[str, Any] = {
+                "source_type": "resource_candidates",
+                "positions": positions,
+                "target": target,
+            }
+            if search_id:
+                submit_arguments["search_id"] = search_id
             return self.prepare(
                 "ingest.submit",
-                {"source_type": "resource_candidates", "positions": positions, "target": target},
+                submit_arguments,
                 owner=owner,
             )
         except AgentToolError as exc:
@@ -7164,7 +7398,8 @@ class AgentOrchestrator:
                 LOGIN_REQUIRED_ACTION,
                 ["请重新登录后先搜索缺集资源，再明确选择推荐项和下载目标。"],
             )
-        snapshot = self.recent_resource_store.get(owner=owner)
+        search_id = normalize_resource_search_id(request.get("search_id"))
+        snapshot = self.recent_resource_store.get(owner=owner, search_id=search_id)
         candidates = snapshot.get("candidates", []) if isinstance(snapshot, dict) else []
         if not isinstance(candidates, list) or not candidates:
             return self._response(
@@ -7259,9 +7494,16 @@ class AgentOrchestrator:
                     type(exc).__name__,
                 )
         try:
+            submit_arguments: dict[str, Any] = {
+                "source_type": "resource_candidates",
+                "positions": [position],
+                "target": target,
+            }
+            if search_id:
+                submit_arguments["search_id"] = search_id
             return self.prepare(
                 "ingest.submit",
-                {"source_type": "resource_candidates", "positions": [position], "target": target},
+                submit_arguments,
                 owner=owner,
                 followup_context=workflow_followup_context(
                     verification_context,
@@ -8250,6 +8492,52 @@ class AgentOrchestrator:
                     message, response, owner=llm_rate_owner or owner
                 )
 
+            delayed_time = unsupported_scheduled_action_request(message)
+            if delayed_time:
+                response = self._clarification_response(
+                    f"当前不会把“{delayed_time}”的预约请求悄悄改成立即执行。"
+                    "一次性延时和精确时刻任务暂未开放，请选择立即执行，或使用对应功能已有的固定周期配置。",
+                    [
+                        "去掉时间后立即执行并生成确认预览",
+                        "如果是 RSS，请指定订阅名称和固定刷新周期",
+                        "如果是媒体追更，请创建按间隔检查的订阅",
+                    ],
+                )
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
+                )
+
+            resource_correction = resource_search_correction_request(
+                message, conversation_context
+            )
+            if resource_correction is not None:
+                revoked = (
+                    self.invalidate_query_confirmation_epoch(owner=owner)
+                    if str(owner or "").strip()
+                    else 0
+                )
+                response = self._invoke_query_read(
+                    "indexer.search_resources",
+                    resource_correction,
+                    owner=owner,
+                    rate_identity=query_tool_rate_identity,
+                )
+                if revoked and isinstance(response.get("result"), dict):
+                    result = dict(response["result"])
+                    suggestions = list(result.get("suggestions") or [])
+                    notice = "之前待确认的选择已取消，请从新的搜索结果重新选择。"
+                    if notice not in suggestions:
+                        suggestions.insert(0, notice)
+                    result["suggestions"] = suggestions[:3]
+                    response = {**response, "result": result}
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
+                )
+
             ingest_link = agent_ingest_link_request(message)
             if ingest_link is not None:
                 if not owner:
@@ -8418,13 +8706,52 @@ class AgentOrchestrator:
             # 写动作、危险域与 owner-scoped 候选仍由服务端确定性绑定；
             # 其余读问题统一交给 _query_raw 中的原生 LLM 循环先处理。
             recent_resource_request = None
-            if owner and self.recent_resource_store.get(owner=owner) is not None:
+            reply_search_id = normalize_resource_search_id(
+                (reply_context or {}).get("resource_search_id")
+            )
+            reply_message_id = (reply_context or {}).get("message_id")
+            has_telegram_reply = (
+                isinstance(reply_message_id, int)
+                and not isinstance(reply_message_id, bool)
+                and reply_message_id > 0
+            )
+            resource_snapshot = (
+                self.recent_resource_store.get(
+                    owner=owner, search_id=reply_search_id
+                )
+                if owner and reply_search_id
+                else self.recent_resource_store.get(owner=owner)
+                if owner
+                else None
+            )
+            if resource_snapshot is not None:
                 recent_resource_request = _recent_resource_pre_model_submit_request(
                     message, conversation_context
+                )
+            # 回复 Telegram 旧消息时只接受与该消息绑定的搜索快照。若映射已
+            # 过期或消息并非资源卡，宁可要求重新搜索，也不能误用当前最新候选。
+            if (
+                recent_resource_request is not None
+                and has_telegram_reply
+                and not reply_search_id
+            ):
+                response = self._clarification_response(
+                    "引用的资源卡没有可恢复的候选快照，未使用当前最新搜索结果。",
+                    ["请重新搜索资源后再选择序号和下载目标。"],
+                )
+                if not present:
+                    return response
+                return self._present_tool_response(
+                    message, response, owner=llm_rate_owner or owner
                 )
             # 最近资源候选属于已经建立的强上下文。像“第 2 个到光鸭”或
             # “下载 34 集到 qB”必须先进入确认流程，不能再次交给模型猜测。
             if recent_resource_request is not None:
+                if reply_search_id:
+                    recent_resource_request = {
+                        **recent_resource_request,
+                        "search_id": reply_search_id,
+                    }
                 response = (
                     self._continue_recent_resource_batch_submit(
                         recent_resource_request, owner=owner
@@ -10583,10 +10910,16 @@ class AgentOrchestrator:
         previous_tool = str(
             _latest_assistant_tool_context(conversation_context).get("tool_name") or ""
         ).strip()
+        deterministic_guangya_page = guangya_directory_page_request(
+            message,
+            owner=owner,
+            previous_tool=previous_tool,
+        )
         deterministic_guangya_browse = guangya_directory_browse_request(
             message, allow_implicit=previous_tool == "guangya.fs.query"
         )
         if not self.registry.has("guangya.fs.query"):
+            deterministic_guangya_page = None
             deterministic_guangya_browse = None
         deterministic_guangya_cleanup_preview = (
             guangya_cleanup_preview_request(message)
@@ -10637,6 +10970,7 @@ class AgentOrchestrator:
             or deterministic_media_proxy_restart
             or deterministic_playback_compound
             or deterministic_indexer_change is not None
+            or deterministic_guangya_page is not None
             or deterministic_guangya_browse is not None
             or deterministic_guangya_cleanup_preview is not None
             or deterministic_local_diagnosis
@@ -10784,6 +11118,27 @@ class AgentOrchestrator:
             return self._invoke_query_read(
                 "guangya.organize.cleanup.preview",
                 deterministic_guangya_cleanup_preview,
+                owner=owner,
+                rate_identity=query_tool_rate_identity,
+            )
+        if deterministic_guangya_page is not None:
+            state = str(deterministic_guangya_page.get("state") or "")
+            if state == "missing":
+                return self._clarification_response(
+                    "最近一次光鸭目录列表已经失效，请重新打开目标目录。",
+                    ["重新列出光鸭根目录", "明确要打开的光鸭目录"],
+                )
+            if state == "last":
+                return self._conversation_response(
+                    "当前光鸭目录列表已经到最后一页，没有更多对象。"
+                )
+            if state == "first":
+                return self._conversation_response(
+                    "当前光鸭目录列表已经在第一页。"
+                )
+            return self._invoke_query_read(
+                "guangya.fs.query",
+                dict(deterministic_guangya_page["arguments"]),
                 owner=owner,
                 rate_identity=query_tool_rate_identity,
             )

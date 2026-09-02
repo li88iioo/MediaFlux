@@ -57,6 +57,7 @@ from app.agent.query_lifecycle import (
     begin_query_confirmation_epoch,
     invalidate_query_confirmation_epoch,
 )
+from app.agent.recent_resource_candidates import normalize_resource_search_id
 from app.agent.presentation_stream import (
     PublicNarrativeProjector,
     PublicNarrativeValidationError,
@@ -385,9 +386,13 @@ def _normalize_resource_page_payload(
 
 
 def _resource_interaction_layout(
-    candidates: Any, page: Any
+    candidates: Any, page: Any, *, search_id: str = ""
 ) -> dict[str, Any]:
     """构造单张资源卡的规范化页面与导航快照。"""
+    raw_search_id = str(search_id or "").strip()
+    normalized_search_id = normalize_resource_search_id(raw_search_id)
+    if raw_search_id and not normalized_search_id:
+        raise ValueError("无法创建 Telegram 资源分页")
     payload = _normalize_resource_page_payload(candidates, page)
     all_candidates = payload["candidates"]
     page_number = payload["page"]
@@ -404,8 +409,14 @@ def _resource_interaction_layout(
 
     navigation_payloads: dict[str, str] = {}
     for direction, target_page in navigation_pages:
+        navigation_payload: dict[str, Any] = {
+            "page": target_page,
+            "candidates": all_candidates,
+        }
+        if normalized_search_id:
+            navigation_payload["search_id"] = normalized_search_id
         arguments_json = json.dumps(
-            {"page": target_page, "candidates": all_candidates},
+            navigation_payload,
             ensure_ascii=True,
             separators=(",", ":"),
             sort_keys=True,
@@ -421,6 +432,7 @@ def _resource_interaction_layout(
         "page_candidates": page_candidates,
         "navigation_payloads": navigation_payloads,
         "action_count": len(page_candidates) * 2 + len(navigation_payloads),
+        "search_id": normalized_search_id,
     }
 
 
@@ -537,18 +549,25 @@ def _resolved_action_payload(
     if action == "prepare_resource":
         arguments = _load_action_json_object(arguments_json)
         position = arguments.get("position")
+        raw_search_id = str(arguments.get("search_id") or "").strip()
+        search_id = normalize_resource_search_id(raw_search_id)
+        if raw_search_id and not search_id:
+            raise ValueError("操作已过期或无效")
         if (
             isinstance(position, bool)
             or not isinstance(position, int)
             or not 1 <= position <= _RESOURCE_RESULT_LIMIT
         ):
             raise ValueError("操作已过期或无效")
-        return {
+        resolved = {
             "action": action,
             "result_id": metadata["result_id"],
             "position": position,
             "target": metadata["target"],
         }
+        if search_id:
+            resolved["search_id"] = search_id
+        return resolved
     if action == "prepare_confirmation_followup":
         return {
             "action": action,
@@ -574,6 +593,12 @@ def _resolved_action_payload(
         normalized = _normalize_resource_page_payload(
             payload.get("candidates"), payload.get("page")
         )
+        raw_search_id = str(payload.get("search_id") or "").strip()
+        search_id = normalize_resource_search_id(raw_search_id)
+        if raw_search_id and not search_id:
+            raise ValueError("操作已过期或无效")
+        if search_id:
+            normalized["search_id"] = search_id
         return {"action": action, **normalized}
     if action == "invoke_workspace_action":
         return {"action": action, "action_key": metadata["action_key"]}
@@ -590,12 +615,15 @@ class TelegramAgentActionStore:
         max_entries: int = _ACTION_MAX_ENTRIES,
         clock: Callable[[], float] = time.monotonic,
         token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(18),
+        resource_reply_ttl_seconds: float = 600.0,
     ) -> None:
         self._ttl_seconds = max(1.0, float(ttl_seconds))
         self._max_entries = max(2, int(max_entries))
+        self._resource_reply_ttl_seconds = max(1.0, float(resource_reply_ttl_seconds))
         self._clock = clock
         self._token_factory = token_factory
         self._items: dict[str, _AgentAction] = {}
+        self._resource_replies: dict[tuple[str, int], tuple[float, str]] = {}
         self._lock = threading.RLock()
 
     def _prune_locked(self, now: float) -> None:
@@ -603,6 +631,73 @@ class TelegramAgentActionStore:
             key for key, value in self._items.items() if value.expires_at <= now
         ]:
             self._items.pop(action_id, None)
+        self._prune_resource_replies_locked(now)
+
+    def _prune_resource_replies_locked(self, now: float) -> None:
+        for key in [
+            key
+            for key, (expires_at, _search_id) in self._resource_replies.items()
+            if expires_at <= now
+        ]:
+            self._resource_replies.pop(key, None)
+
+    def _trim_resource_replies_locked(self) -> None:
+        while len(self._resource_replies) > self._max_entries:
+            oldest = min(
+                self._resource_replies,
+                key=lambda key: self._resource_replies[key][0],
+            )
+            self._resource_replies.pop(oldest, None)
+
+    def _revoke_resource_replies_locked(self, owner: str) -> int:
+        keys = [key for key in self._resource_replies if key[0] == owner]
+        for key in keys:
+            self._resource_replies.pop(key, None)
+        return len(keys)
+
+    def bind_resource_reply(
+        self, *, owner: str, message_id: int, search_id: str
+    ) -> bool:
+        """绑定已发送资源卡与其搜索快照，供 Telegram 引用回复恢复。"""
+        owner_key = str(owner or "").strip()
+        normalized_search_id = normalize_resource_search_id(search_id)
+        if (
+            not owner_key
+            or isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+            or not normalized_search_id
+        ):
+            return False
+        with self._lock:
+            now = self._clock()
+            self._prune_resource_replies_locked(now)
+            key = (owner_key, message_id)
+            self._resource_replies.pop(key, None)
+            self._resource_replies[key] = (
+                now + self._resource_reply_ttl_seconds,
+                normalized_search_id,
+            )
+            self._trim_resource_replies_locked()
+        return True
+
+    def resource_reply_search_id(self, *, owner: str, message_id: int) -> str:
+        """返回指定身份引用的资源卡快照；缺失或过期时安全失败。"""
+        owner_key = str(owner or "").strip()
+        if (
+            not owner_key
+            or isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+        ):
+            return ""
+        with self._lock:
+            now = self._clock()
+            self._prune_resource_replies_locked(now)
+            stored = self._resource_replies.get((owner_key, message_id))
+            if stored is None:
+                return ""
+            return normalize_resource_search_id(stored[1])
 
     def _trim_capacity_locked(self) -> None:
         """按完整交互组淘汰，避免只留下执行或取消中的单个按钮。"""
@@ -738,12 +833,15 @@ class TelegramAgentActionStore:
         owner: str,
         candidates: list[dict[str, Any]],
         page: int = 0,
+        search_id: str = "",
     ) -> dict[str, Any]:
         """原子创建单张资源卡的预检与分页 callback 组。"""
         owner_key = str(owner or "").strip()
         if not owner_key:
             raise ValueError("无法创建 Telegram 资源操作")
-        layout = _resource_interaction_layout(candidates, page)
+        layout = _resource_interaction_layout(
+            candidates, page, search_id=search_id
+        )
         action_count = int(layout["action_count"])
         if action_count <= 0 or action_count > self._max_entries:
             raise RuntimeError("Telegram 资源操作组超出容量")
@@ -760,11 +858,14 @@ class TelegramAgentActionStore:
                 position = int(layout["page_start"]) + offset + 1
                 qb_id = next(action_ids)
                 guangya_id = next(action_ids)
+                resource_arguments = {
+                    "position": position,
+                    "result_id": candidate["result_id"],
+                }
+                if layout["search_id"]:
+                    resource_arguments["search_id"] = layout["search_id"]
                 arguments_json = json.dumps(
-                    {
-                        "position": position,
-                        "result_id": candidate["result_id"],
-                    },
+                    resource_arguments,
                     ensure_ascii=True,
                     separators=(",", ":"),
                 )
@@ -1047,7 +1148,7 @@ class TelegramAgentActionStore:
             return len(revoked)
 
     def revoke_owner(self, *, owner: str) -> int:
-        """撤销当前 Telegram 身份尚未消费的全部回调操作。"""
+        """撤销当前 Telegram 身份尚未消费的全部回调与回复绑定。"""
         owner_key = str(owner or "").strip()
         if not owner_key:
             return 0
@@ -1060,7 +1161,8 @@ class TelegramAgentActionStore:
             ]
             for action_id in revoked:
                 self._items.pop(action_id, None)
-            return len(revoked)
+            reply_count = self._revoke_resource_replies_locked(owner_key)
+            return len(revoked) + reply_count
 
 
 class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
@@ -1075,12 +1177,14 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         max_entries: int = _ACTION_MAX_ENTRIES,
         clock: Callable[[], float] = time.time,
         token_factory: Callable[[], str] = lambda: secrets.token_urlsafe(18),
+        resource_reply_ttl_seconds: float = 600.0,
     ) -> None:
         super().__init__(
             ttl_seconds=ttl_seconds,
             max_entries=max_entries,
             clock=clock,
             token_factory=token_factory,
+            resource_reply_ttl_seconds=resource_reply_ttl_seconds,
         )
 
     @staticmethod
@@ -1261,11 +1365,14 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         owner: str,
         candidates: list[dict[str, Any]],
         page: int = 0,
+        search_id: str = "",
     ) -> dict[str, Any]:
         owner_key = str(owner or "").strip()
         if not owner_key:
             raise ValueError("无法创建 Telegram 资源操作")
-        layout = _resource_interaction_layout(candidates, page)
+        layout = _resource_interaction_layout(
+            candidates, page, search_id=search_id
+        )
         action_count = int(layout["action_count"])
         if action_count <= 0 or action_count > self._max_entries:
             raise RuntimeError("Telegram 资源操作组超出容量")
@@ -1286,11 +1393,14 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
                 position = int(layout["page_start"]) + offset + 1
                 qb_id = next(action_ids)
                 guangya_id = next(action_ids)
+                resource_arguments = {
+                    "position": position,
+                    "result_id": candidate["result_id"],
+                }
+                if layout["search_id"]:
+                    resource_arguments["search_id"] = layout["search_id"]
                 arguments_json = json.dumps(
-                    {
-                        "position": position,
-                        "result_id": candidate["result_id"],
-                    },
+                    resource_arguments,
                     ensure_ascii=True,
                     separators=(",", ":"),
                 )
@@ -1592,12 +1702,15 @@ class SQLiteTelegramAgentActionStore(TelegramAgentActionStore):
         with self._lock, db.get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._ensure_schema(conn)
-            self._prune(conn, self._clock())
+            now = self._clock()
+            self._prune(conn, now)
+            self._prune_resource_replies_locked(now)
             cursor = conn.execute(
                 "DELETE FROM telegram_agent_actions WHERE owner_digest=?",
                 (self._owner_digest(owner_key),),
             )
-            return max(0, int(cursor.rowcount or 0))
+            reply_count = self._revoke_resource_replies_locked(owner_key)
+            return max(0, int(cursor.rowcount or 0)) + reply_count
 
 
 _action_store: TelegramAgentActionStore = SQLiteTelegramAgentActionStore()
@@ -2675,9 +2788,11 @@ def _publish_telegram_callback_response(
     state_buffer: AgentStateCommitBuffer | None = None,
     runtime_generation: int | None = None,
     is_allowed: Callable[[], bool] | None = None,
+    resource_search_id: str = "",
 ) -> bool:
     """只让当前且仍获准的 callback 构造动作、发布消息并写入历史。"""
     allowed_check = is_allowed or (lambda: True)
+    bound_resource_search_id = normalize_resource_search_id(resource_search_id)
 
     def prepare_if_allowed() -> tuple[str, Any | None] | None:
         return prepare_output() if allowed_check() else None
@@ -2723,6 +2838,17 @@ def _publish_telegram_callback_response(
     def finalize_callback() -> None:
         if state_buffer is not None:
             state_buffer.commit()
+        delivery = publish_result.delivery
+        if (
+            bound_resource_search_id
+            and delivery is not None
+            and delivery.message_id is not None
+        ):
+            get_telegram_agent_action_store().bind_resource_reply(
+                owner=owner,
+                message_id=delivery.message_id,
+                search_id=bound_resource_search_id,
+            )
         _record_telegram_callback_conversation(
             owner,
             message=history_message,
@@ -3450,7 +3576,9 @@ def _record_telegram_callback_conversation(
     )
 
 
-def _telegram_reply_context(message: Any) -> dict[str, Any]:
+def _telegram_reply_context(
+    message: Any, *, owner: str = ""
+) -> dict[str, Any]:
     """只接受同一聊天中由 Bot 发出的被回复消息，作为有限追问上下文。"""
     replied = getattr(message, "reply_to_message", None)
     if replied is None:
@@ -3458,7 +3586,11 @@ def _telegram_reply_context(message: Any) -> dict[str, Any]:
     current_chat = getattr(getattr(message, "chat", None), "id", None)
     replied_chat = getattr(getattr(replied, "chat", None), "id", None)
     author = getattr(replied, "from_user", None)
-    if current_chat is None or replied_chat != current_chat or not bool(getattr(author, "is_bot", False)):
+    if (
+        current_chat is None
+        or replied_chat != current_chat
+        or not bool(getattr(author, "is_bot", False))
+    ):
         return {}
     raw_text = getattr(replied, "text", None) or getattr(replied, "caption", None)
     safe_text = sanitize_public_text(raw_text, limit=600)
@@ -3466,8 +3598,19 @@ def _telegram_reply_context(message: Any) -> dict[str, Any]:
         return {}
     message_id = getattr(replied, "message_id", None)
     context: dict[str, Any] = {"text": safe_text}
-    if isinstance(message_id, int):
+    if (
+        isinstance(message_id, int)
+        and not isinstance(message_id, bool)
+        and message_id > 0
+    ):
         context["message_id"] = message_id
+        search_id = normalize_resource_search_id(
+            get_telegram_agent_action_store().resource_reply_search_id(
+                owner=owner, message_id=message_id
+            )
+        )
+        if search_id:
+            context["resource_search_id"] = search_id
     return context
 
 
@@ -4223,6 +4366,19 @@ def _resource_candidates_are_primary(response: Any) -> bool:
     return contract.get("resource_candidates") == "primary"
 
 
+def _resource_search_id(response: Any) -> str:
+    """提取服务端签发的资源搜索快照标识，不信任展示文本。"""
+    if not isinstance(response, dict):
+        return ""
+    result = response.get("result")
+    if not isinstance(result, dict):
+        return ""
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return ""
+    return normalize_resource_search_id(data.get("search_id"))
+
+
 def _confirmation_is_primary(response: Any) -> bool:
     return response_contract(response).get("presentation") == "confirmation"
 
@@ -4233,6 +4389,7 @@ def _resource_markup_with_guard(
     owner: str,
     candidates: list[dict[str, Any]],
     page: int = 0,
+    search_id: str = "",
 ) -> tuple[Any | None, str]:
     if not candidates:
         return None, ""
@@ -4240,6 +4397,7 @@ def _resource_markup_with_guard(
         owner=owner,
         candidates=candidates,
         page=page,
+        search_id=search_id,
     )
     page_number = int(interaction["page"])
     total_pages = int(interaction["total_pages"])
@@ -4283,12 +4441,14 @@ def _resource_markup(
     owner: str,
     candidates: list[dict[str, Any]],
     page: int = 0,
+    search_id: str = "",
 ):
     markup, _guard_action_id = _resource_markup_with_guard(
         telebot,
         owner=owner,
         candidates=candidates,
         page=page,
+        search_id=search_id,
     )
     return markup
 
@@ -4486,7 +4646,7 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
         if conversation_context:
             query_kwargs["conversation_context"] = conversation_context
             query_kwargs["trusted_conversation_context"] = True
-        reply_context = _telegram_reply_context(message)
+        reply_context = _telegram_reply_context(message, owner=owner)
         if reply_context:
             query_kwargs["reply_context"] = reply_context
         if confirmation_epoch is not None:
@@ -4607,7 +4767,10 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
             pending_confirmation_plan_id = primary_action_plan["plan_id"]
             pending_confirmation_store = get_telegram_agent_action_store()
 
+        resource_reply_search_id = ""
+
         def prepare_final_output() -> tuple[str, Any]:
+            nonlocal resource_reply_search_id
             markup = None
             rendered = render_agent_response(response)
             if pending_confirmation_plan_id and primary_action_plan:
@@ -4633,10 +4796,12 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
                         else []
                     )
                     if candidates:
+                        resource_reply_search_id = _resource_search_id(response)
                         markup = _resource_markup(
                             telebot,
                             owner=owner,
                             candidates=candidates,
+                            search_id=resource_reply_search_id,
                         )
                         rendered = _render_resource_candidates(response, candidates)
                     else:
@@ -4711,6 +4876,17 @@ def handle_agent_message(bot: Any, telebot: Any, message: Any) -> bool:
 
         def finalize_conversation() -> None:
             state_buffer.commit()
+            delivery = publish_result.delivery
+            if (
+                resource_reply_search_id
+                and delivery is not None
+                and delivery.message_id is not None
+            ):
+                get_telegram_agent_action_store().bind_resource_reply(
+                    owner=owner,
+                    message_id=delivery.message_id,
+                    search_id=resource_reply_search_id,
+                )
             if confirmation_intent == "cancel":
                 # 文本取消已经在服务端撤销票据；同步清掉旧卡片的 opaque
                 # callback，避免用户之后误点一个必然失效的按钮。
@@ -4937,6 +5113,7 @@ def handle_agent_patrol_callback(
                     module,
                     owner=owner,
                     candidates=candidates,
+                    search_id=_resource_search_id(response),
                 ),
             )
 
@@ -4960,6 +5137,7 @@ def handle_agent_patrol_callback(
             state_buffer=state_buffer,
             runtime_generation=runtime_generation,
             is_allowed=operation_is_current,
+            resource_search_id=_resource_search_id(response),
         )
         if published is False:
             _cancel_telegram_runtime_operation(
@@ -5092,6 +5270,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                         owner=owner,
                         candidates=action["candidates"],
                         page=action["page"],
+                        search_id=str(action.get("search_id") or ""),
                     )
 
             def pagination_is_current() -> bool:
@@ -5199,13 +5378,16 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 }
                 if confirmation_epoch is not None:
                     prepare_kwargs["expected_owner_generation"] = confirmation_epoch
+                submit_arguments = {
+                    "source_type": "resource_candidates",
+                    "positions": [action["position"]],
+                    "target": action["target"],
+                }
+                if action.get("search_id"):
+                    submit_arguments["search_id"] = action["search_id"]
                 response = service.prepare(
                     "ingest.submit",
-                    {
-                        "source_type": "resource_candidates",
-                        "positions": [action["position"]],
-                        "target": action["target"],
-                    },
+                    submit_arguments,
                     **prepare_kwargs,
                 )
                 action_plan = sanitize_action_plan(
@@ -5231,6 +5413,12 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                                 or claimed.get("result_id") != action["result_id"]
                                 or claimed.get("position") != action["position"]
                                 or claimed.get("target") != action["target"]
+                                or normalize_resource_search_id(
+                                    claimed.get("search_id")
+                                )
+                                != normalize_resource_search_id(
+                                    action.get("search_id")
+                                )
                             ):
                                 raise ValueError("操作已过期或无效")
                             markup = _confirmation_markup(
@@ -5608,6 +5796,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                         module,
                         owner=owner,
                         candidates=candidates,
+                        search_id=_resource_search_id(response),
                     ),
                 )
 
@@ -5627,6 +5816,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 state_buffer=state_buffer,
                 runtime_generation=callback_runtime_generation,
                 is_allowed=callback_operation_is_current,
+                resource_search_id=_resource_search_id(response),
             )
             if published is False:
                 _cancel_telegram_runtime_operation(
