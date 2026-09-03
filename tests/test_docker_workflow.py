@@ -309,7 +309,16 @@ esac
     def test_release_build_uses_shared_build_info_contract(self) -> None:
         self.assertIn("packaging/scripts/generate_build_info.py", self.text)
         self.assertIn("packaging/scripts/docker_version_tag.py", self.text)
-        self.assertIn('--ref "$VERSION_REF" --commit "$BUILD_SHA"', self.text)
+        context = self.text.split("      - name: Prepare build context", 1)[1].split(
+            "      - uses: docker/setup-qemu-action@v3", 1
+        )[0]
+        epoch = 'SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$BUILD_SHA")'
+        generator = "python packaging/scripts/generate_build_info.py"
+        self.assertLess(context.index(epoch), context.index(generator))
+        self.assertIn('--ref "$VERSION_REF" --commit "$BUILD_SHA"', context)
+        self.assertIn("--platform linux --arch multi --package docker", context)
+        self.assertIn('--build-time "$SOURCE_DATE_EPOCH"', context)
+        self.assertNotIn("--package runtime", context)
         self.assertIn("VERSION_REF=${{ steps.context.outputs.version_ref }}", self.text)
         self.assertIn("GIT_SHA=${{ steps.context.outputs.source_sha }}", self.text)
         self.assertIn("SOURCE_DATE_EPOCH=${{ steps.context.outputs.source_date_epoch }}", self.text)

@@ -431,9 +431,11 @@ jobs:
           if [[ "$RELEASE_BUILD" != "true" ]]; then
             BUILD_INFO_ARGS+=(--development)
           fi
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$BUILD_SHA")
           python packaging/scripts/generate_build_info.py \
             --ref "$VERSION_REF" --commit "$BUILD_SHA" \
-            --platform docker --arch multi --package runtime \
+            --platform linux --arch multi --package docker \
+            --build-time "$SOURCE_DATE_EPOCH" \
             --output "$RUNNER_TEMP/BUILD-INFO.json" \
             "${BUILD_INFO_ARGS[@]}"
           VERSION=$(jq -r '.version' "$RUNNER_TEMP/BUILD-INFO.json")
@@ -442,7 +444,6 @@ jobs:
           SERIES=${VERSION%%[-+]*}
           SERIES=$(printf '%s' "$SERIES" | cut -d. -f1,2)
           SHORT_SHA=${BUILD_SHA:0:12}
-          SOURCE_DATE_EPOCH=$(git show -s --format=%ct "$BUILD_SHA")
           {
             echo "image_repository=$IMAGE_REPOSITORY"
             echo "version_ref=$VERSION_REF"
