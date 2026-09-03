@@ -1,19 +1,22 @@
 """Media Agent 的服务端配置连通性只读动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import time
-from typing import Any
 import unicodedata
+from datetime import datetime
+from typing import Any
 from urllib.parse import urlsplit
 
 import requests
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 
 _ALLOWED_ARGUMENTS = {"server_type"}
+
+
 class _RedirectNotAllowed(Exception):
     """媒体连接测试不允许离开已配置目标。"""
 
@@ -40,8 +43,11 @@ def _now() -> str:
 
 def _visible_text(value: Any, *, limit: int, default: str = "") -> str:
     normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
-    cleaned = "".join(" " if unicodedata.category(char).startswith("C") else char for char in normalized)
-    return (" ".join(cleaned.split())[:limit] or default)
+    cleaned = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in normalized
+    )
+    return " ".join(cleaned.split())[:limit] or default
 
 
 def _safe_identity_text(
@@ -97,11 +103,13 @@ def _safe_result(
         status=status,
         summary=summary,
         data=payload,
-        evidence=[Evidence(
-            "configured_media_server",
-            "使用服务端当前生效配置验证媒体服务器，不返回地址或访问凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "configured_media_server",
+                "使用服务端当前生效配置验证媒体服务器，不返回地址或访问凭据。",
+                _now(),
+            )
+        ],
         suggestions=suggestions or [],
         error="" if ok else summary,
     )
@@ -142,21 +150,53 @@ def _request_headers(server_type: str, credential: str) -> dict[str, str]:
 
 def _failure_status(exc: Exception) -> tuple[str, str, list[str]]:
     if isinstance(exc, _RedirectNotAllowed):
-        return "redirect_not_allowed", "媒体服务器拒绝固定目标连接", ["请检查媒体服务器地址或反向代理重定向配置。"]
+        return (
+            "redirect_not_allowed",
+            "媒体服务器拒绝固定目标连接",
+            ["请检查媒体服务器地址或反向代理重定向配置。"],
+        )
     if isinstance(exc, requests.Timeout):
-        return "timeout", "媒体服务器连接超时", ["请检查服务状态、网络路由或反向代理后重试。"]
+        return (
+            "timeout",
+            "媒体服务器连接超时",
+            ["请检查服务状态、网络路由或反向代理后重试。"],
+        )
     if isinstance(exc, requests.ConnectionError):
-        return "connection", "无法连接媒体服务器", ["请确认服务已启动且当前配置地址可从 MediaFlux 访问。"]
+        return (
+            "connection",
+            "无法连接媒体服务器",
+            ["请确认服务已启动且当前配置地址可从 MediaFlux 访问。"],
+        )
     if isinstance(exc, requests.HTTPError):
         status_code = getattr(getattr(exc, "response", None), "status_code", None)
         if status_code in {401, 403}:
-            return "authentication", "媒体服务器鉴权失败", ["请在设置中更新访问凭据后重试。"]
+            return (
+                "authentication",
+                "媒体服务器鉴权失败",
+                ["请在设置中更新访问凭据后重试。"],
+            )
         if status_code == 404:
-            return "not_found", "媒体服务器接口不可用", ["请确认服务类型与反向代理路径配置正确。"]
-        return "http_error", "媒体服务器返回异常状态", ["请检查媒体服务器日志与反向代理配置。"]
+            return (
+                "not_found",
+                "媒体服务器接口不可用",
+                ["请确认服务类型与反向代理路径配置正确。"],
+            )
+        return (
+            "http_error",
+            "媒体服务器返回异常状态",
+            ["请检查媒体服务器日志与反向代理配置。"],
+        )
     if isinstance(exc, (ValueError, TypeError)):
-        return "invalid_response", "媒体服务器响应格式无效", ["请确认目标确为兼容的 Jellyfin 或 Emby 服务。"]
-    return "unavailable", "媒体服务器暂时不可用", ["请稍后重试，或从设置页重新校验媒体服务器配置。"]
+        return (
+            "invalid_response",
+            "媒体服务器响应格式无效",
+            ["请确认目标确为兼容的 Jellyfin 或 Emby 服务。"],
+        )
+    return (
+        "unavailable",
+        "媒体服务器暂时不可用",
+        ["请稍后重试，或从设置页重新校验媒体服务器配置。"],
+    )
 
 
 def test_media_server(arguments: dict[str, Any]) -> ToolResult:

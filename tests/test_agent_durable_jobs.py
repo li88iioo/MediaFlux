@@ -1,8 +1,9 @@
 """Agent owner 隔离、可恢复长任务的状态机与公开语义测试。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import json
+from datetime import datetime
 from unittest.mock import Mock, patch
 
 from app import database as db
@@ -12,12 +13,11 @@ from app.agent.durable_job_actions import (
     start_episode_audit_arguments,
     start_episode_audit_confirmed,
 )
+from app.agent.errors import AgentToolError
 from app.agent.library_patrol_progress import empty_patrol_projection
 from app.agent.models import ToolContext, ToolResult
-from app.agent.registry import AgentToolError
 from app.modules.agent_jobs_scheduler import AgentJobsScheduler
 from tests.support import IsolatedDatabaseTestCase
-
 
 _AS_OF = "2026-08-09"
 _JOB_TYPE = "library_episode_audit"
@@ -35,7 +35,9 @@ def _projection_json() -> str:
     return json.dumps(empty_patrol_projection(as_of=_AS_OF), ensure_ascii=False)
 
 
-def _result(*, ok: bool, status: str, checked: int = 0, continuation: bool = False) -> ToolResult:
+def _result(
+    *, ok: bool, status: str, checked: int = 0, continuation: bool = False
+) -> ToolResult:
     return ToolResult(
         ok=ok,
         status=status,
@@ -79,7 +81,9 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             job_type=_JOB_TYPE,
             dedupe_key=dedupe_key,
             input_json=json.dumps({"as_of": _AS_OF, "max_series": 2}),
-            checkpoint_json=json.dumps({"as_of": _AS_OF, "cursor": "", "stall_attempts": 0}),
+            checkpoint_json=json.dumps(
+                {"as_of": _AS_OF, "cursor": "", "stall_attempts": 0}
+            ),
             projection_json=_projection_json(),
             progress_total=0,
             max_attempts=max_attempts,
@@ -89,9 +93,10 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
     def test_disabled_feature_gate_does_not_claim_or_execute_jobs(self):
         executor = Mock()
         scheduler = AgentJobsScheduler(audit_executor=executor)
-        with patch("app.agent.feature_gate.is_agent_enabled", return_value=False), patch(
-            "app.modules.agent_jobs_scheduler.db.claim_due_agent_job"
-        ) as claim:
+        with (
+            patch("app.agent.feature_gate.is_agent_enabled", return_value=False),
+            patch("app.modules.agent_jobs_scheduler.db.claim_due_agent_job") as claim,
+        ):
             self.assertEqual(scheduler.run_once(), 0)
         claim.assert_not_called()
         executor.assert_not_called()
@@ -99,13 +104,20 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
     def test_owner_isolation_and_no_raw_owner_persistence(self):
         row, created = self._create(owner="private-owner-a")
         self.assertTrue(created)
-        self.assertIsNotNone(db.get_agent_job(owner="private-owner-a", job_id=row["job_id"]))
-        self.assertIsNone(db.get_agent_job(owner="private-owner-b", job_id=row["job_id"]))
+        self.assertIsNotNone(
+            db.get_agent_job(owner="private-owner-a", job_id=row["job_id"])
+        )
+        self.assertIsNone(
+            db.get_agent_job(owner="private-owner-b", job_id=row["job_id"])
+        )
         self.assertEqual(db.list_agent_jobs(owner="private-owner-b"), [])
-        self.assertIsNone(db.find_active_agent_job(
-            owner="private-owner-b", job_type=_JOB_TYPE, dedupe_key=f"{_AS_OF}:2"
-        ))
+        self.assertIsNone(
+            db.find_active_agent_job(
+                owner="private-owner-b", job_type=_JOB_TYPE, dedupe_key=f"{_AS_OF}:2"
+            )
+        )
         self.assertNotIn("private-owner-a", repr(dict(row)))
+
     def test_active_creation_is_idempotent_but_terminal_job_allows_new_run(self):
         first, created = self._create(owner="owner-idempotent")
         self.assertTrue(created)
@@ -131,27 +143,33 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(claimed["job_id"], row["job_id"])
         generation = int(claimed["lease_generation"])
-        self.assertTrue(db.renew_agent_job_lease(
-            str(row["job_id"]),
-            expected_lease_generation=generation,
-            renewed_at="2099-01-01 00:01:00",
-        ))
-        self.assertFalse(db.complete_agent_job(
-            str(row["job_id"]),
-            expected_lease_generation=generation - 1,
-            projection_json=_projection_json(),
-            progress_current=0,
-            progress_total=0,
-            summary="stale",
-        ))
-        self.assertTrue(db.complete_agent_job(
-            str(row["job_id"]),
-            expected_lease_generation=generation,
-            projection_json=_projection_json(),
-            progress_current=0,
-            progress_total=0,
-            summary="done",
-        ))
+        self.assertTrue(
+            db.renew_agent_job_lease(
+                str(row["job_id"]),
+                expected_lease_generation=generation,
+                renewed_at="2099-01-01 00:01:00",
+            )
+        )
+        self.assertFalse(
+            db.complete_agent_job(
+                str(row["job_id"]),
+                expected_lease_generation=generation - 1,
+                projection_json=_projection_json(),
+                progress_current=0,
+                progress_total=0,
+                summary="stale",
+            )
+        )
+        self.assertTrue(
+            db.complete_agent_job(
+                str(row["job_id"]),
+                expected_lease_generation=generation,
+                projection_json=_projection_json(),
+                progress_current=0,
+                progress_total=0,
+                summary="done",
+            )
+        )
 
     def test_cancel_is_owner_scoped_and_running_job_stops_at_batch_boundary(self):
         row, _ = self._create(owner="owner-cancel")
@@ -172,12 +190,16 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertEqual(outcome, "requested")
         self.assertEqual(requested["status"], "running")
         generation = int(claimed["lease_generation"])
-        self.assertTrue(db.is_agent_job_cancel_requested(
-            str(row["job_id"]), expected_lease_generation=generation
-        ))
-        self.assertTrue(db.finalize_cancelled_agent_job(
-            str(row["job_id"]), expected_lease_generation=generation
-        ))
+        self.assertTrue(
+            db.is_agent_job_cancel_requested(
+                str(row["job_id"]), expected_lease_generation=generation
+            )
+        )
+        self.assertTrue(
+            db.finalize_cancelled_agent_job(
+                str(row["job_id"]), expected_lease_generation=generation
+            )
+        )
         terminal = db.get_agent_job(owner="owner-cancel", job_id=str(row["job_id"]))
         self.assertEqual(terminal["status"], "cancelled")
 
@@ -252,23 +274,29 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertEqual(recovered["status"], "retry_wait")
         self.assertEqual(recovered["error_code"], "ProcessInterrupted")
         self.assertEqual(int(recovered["lease_generation"]), old_generation + 1)
-        self.assertFalse(db.complete_agent_job(
-            str(row["job_id"]),
-            expected_lease_generation=old_generation,
-            projection_json=_projection_json(),
-            progress_current=0,
-            progress_total=0,
-            summary="stale",
-        ))
+        self.assertFalse(
+            db.complete_agent_job(
+                str(row["job_id"]),
+                expected_lease_generation=old_generation,
+                projection_json=_projection_json(),
+                progress_current=0,
+                progress_total=0,
+                summary="stale",
+            )
+        )
 
     def test_not_configured_is_terminal_failure_and_never_reported_up_to_date(self):
         row, _ = self._create(owner="owner-not-configured")
         scheduler = AgentJobsScheduler(
-            audit_executor=lambda _arguments: _result(ok=False, status="not_configured"),
+            audit_executor=lambda _arguments: _result(
+                ok=False, status="not_configured"
+            ),
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         self.assertEqual(scheduler.run_once(), 1)
-        stored = db.get_agent_job(owner="owner-not-configured", job_id=str(row["job_id"]))
+        stored = db.get_agent_job(
+            owner="owner-not-configured", job_id=str(row["job_id"])
+        )
         self.assertEqual(stored["status"], "failed")
         self.assertEqual(stored["error_code"], "NotConfigured")
         public = get_agent_job_status(
@@ -286,17 +314,25 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         self.assertEqual(scheduler.run_once(), 1)
-        stored = db.get_agent_job(owner="owner-unavailable", job_id=str(unavailable["job_id"]))
+        stored = db.get_agent_job(
+            owner="owner-unavailable", job_id=str(unavailable["job_id"])
+        )
         self.assertEqual(stored["status"], "retry_wait")
         self.assertEqual(stored["error_code"], "UpstreamUnavailable")
 
-        inconclusive, _ = self._create(owner="owner-inconclusive", dedupe_key=f"{_AS_OF}:3")
+        inconclusive, _ = self._create(
+            owner="owner-inconclusive", dedupe_key=f"{_AS_OF}:3"
+        )
         scheduler = AgentJobsScheduler(
-            audit_executor=lambda _arguments: _result(ok=False, status="inconclusive", checked=1),
+            audit_executor=lambda _arguments: _result(
+                ok=False, status="inconclusive", checked=1
+            ),
             clock=MutableClock(datetime(2099, 1, 1, 0, 0, 0)),
         )
         self.assertEqual(scheduler.run_once(), 1)
-        stored = db.get_agent_job(owner="owner-inconclusive", job_id=str(inconclusive["job_id"]))
+        stored = db.get_agent_job(
+            owner="owner-inconclusive", job_id=str(inconclusive["job_id"])
+        )
         self.assertEqual(stored["status"], "succeeded")
         public = get_agent_job_status(
             {"job_id": str(inconclusive["job_id"]), "limit": 5},
@@ -306,7 +342,9 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertEqual(public.status, "inconclusive")
         self.assertNotIn("暂未发现", public.summary)
 
-    def test_confirmation_describes_full_scan_with_batch_limit_and_rejects_stale_replay(self):
+    def test_confirmation_describes_full_scan_with_batch_limit_and_rejects_stale_replay(
+        self,
+    ):
         arguments = start_episode_audit_arguments({"as_of": _AS_OF, "max_series": 2})
         context = ToolContext(owner="owner-confirm")
         preview, fingerprint = prepare_start_episode_audit(arguments, context)
@@ -314,7 +352,9 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertIn("每批最多 2 部", preview.summary)
         self.assertIn("创建后台", preview.summary)
         self.assertTrue(any("不会自动下载" in item for item in preview.data["effects"]))
-        self.assertTrue(any("Jellyfin / Emby" in item for item in preview.data["effects"]))
+        self.assertTrue(
+            any("Jellyfin / Emby" in item for item in preview.data["effects"])
+        )
         wake = Mock()
         with patch(
             "app.agent.durable_job_actions.get_agent_jobs_scheduler",

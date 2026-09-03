@@ -1,16 +1,18 @@
 """Media Agent 的通用非敏感策略读取与确认写入。"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import json
 import secrets
-from typing import Any, Callable
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -204,11 +206,13 @@ def summarize_safe_policies(_arguments: dict[str, Any]) -> ToolResult:
         status="ready",
         summary=f"当前可安全管理 {len(items)} 项非敏感策略",
         data={"policies": items, "policy_count": len(items)},
-        evidence=[Evidence(
-            "server_configuration",
-            "仅返回固定白名单策略的公开值与环境托管标记；未读取或返回凭据、地址、路径及其他配置。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅返回固定白名单策略的公开值与环境托管标记；未读取或返回凭据、地址、路径及其他配置。",
+                _now(),
+            )
+        ],
         suggestions=["修改任一策略都需要先预检并使用一次性确认票据。"],
     )
 
@@ -292,20 +296,18 @@ def _precondition_failure(state: dict[str, Any]) -> ToolResult | None:
             summary="登录页暂时不能切换为 TMDB 每日电影",
             error="请先在设置中配置 TMDB API Key。",
         )
-    if (
-        state["policy"] == "discovery_cache_ttl_seconds"
-        and int(state["requested"]) > int(state["peer_value"])
-    ):
+    if state["policy"] == "discovery_cache_ttl_seconds" and int(
+        state["requested"]
+    ) > int(state["peer_value"]):
         return ToolResult(
             ok=False,
             status="precondition_failed",
             summary="媒体探索缓存时间不能超过旧缓存保留时间",
             error="请先增大旧缓存保留时间，或使用更小的缓存时间。",
         )
-    if (
-        state["policy"] == "discovery_stale_ttl_seconds"
-        and int(state["requested"]) < int(state["peer_value"])
-    ):
+    if state["policy"] == "discovery_stale_ttl_seconds" and int(
+        state["requested"]
+    ) < int(state["peer_value"]):
         return ToolResult(
             ok=False,
             status="precondition_failed",
@@ -326,7 +328,9 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
     if policy == "tmdb_match_mode":
         effects.append("刷新当前进程的探索与识别缓存；不会立即刮削或移动媒体")
         if requested == "loose":
-            suggestions.append("宽松模式会降低匹配门槛，请留意识别结果可能出现更多相似标题候选。")
+            suggestions.append(
+                "宽松模式会降低匹配门槛，请留意识别结果可能出现更多相似标题候选。"
+            )
     elif policy == "login_wallpaper_mode":
         effects.append(
             "重新安排登录页壁纸刷新；TMDB 模式可能在后台请求一张公开图片，"
@@ -375,11 +379,13 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
             "requested_value": state["requested"],
             "effects": effects,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅比较目标白名单策略、必要前置条件与配置快照；未返回内部配置键或任何敏感值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅比较目标白名单策略、必要前置条件与配置快照；未返回内部配置键或任何敏感值。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -467,7 +473,9 @@ def _refresh_indexer_runtime() -> bool:
         web_refreshed = False
         logger.warning("Agent BTBTLA Web 运行时刷新失败 type=%s", type(exc).__name__)
     try:
-        from app.modules.telegram_resource_search import shutdown_telegram_indexer_worker
+        from app.modules.telegram_resource_search import (
+            shutdown_telegram_indexer_worker,
+        )
 
         telegram_refreshed = shutdown_telegram_indexer_worker(
             timeout=_RUNTIME_REFRESH_TIMEOUT_SECONDS
@@ -476,7 +484,9 @@ def _refresh_indexer_runtime() -> bool:
             logger.warning("Agent BTBTLA Telegram 运行时刷新超时")
     except Exception as exc:
         telegram_refreshed = False
-        logger.warning("Agent BTBTLA Telegram 运行时刷新失败 type=%s", type(exc).__name__)
+        logger.warning(
+            "Agent BTBTLA Telegram 运行时刷新失败 type=%s", type(exc).__name__
+        )
     return web_refreshed and telegram_refreshed
 
 
@@ -541,24 +551,27 @@ def set_safe_policy_confirmed(
     definition = _POLICIES[policy]
     _effects_value, suggestions = _effects(state)
     if not runtime_refreshed:
-        suggestions.insert(0, "配置已保存，但当前进程未能完整刷新；请重启服务以确保新策略生效。")
+        suggestions.insert(
+            0, "配置已保存，但当前进程未能完整刷新；请重启服务以确保新策略生效。"
+        )
     return ToolResult(
         ok=True,
         status="completed",
         summary=(
-            f"已将{definition.label}改为"
-            f"{definition.public_label(arguments['value'])}"
+            f"已将{definition.label}改为{definition.public_label(arguments['value'])}"
         ),
         data={
             "policy": policy,
             "runtime_refreshed": runtime_refreshed,
             "runtime_scope": "current_process",
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "使用一次性确认票据与配置快照原子更新一项固定白名单策略。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "使用一次性确认票据与配置快照原子更新一项固定白名单策略。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 

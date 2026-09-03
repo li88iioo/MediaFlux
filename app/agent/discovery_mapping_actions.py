@@ -1,19 +1,21 @@
 """发现详情、跨源 TMDB 候选与确认映射。"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 import logging
 import re
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
-from app import config, database as db
+from app import config
+from app import database as db
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolContext, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import sanitize_public_text
+from app.agent.public_safety import sanitize_public_text
 from app.agent.session_context import (
     AgentContextWriteGuard,
     AgentSessionContextRepository,
@@ -56,7 +58,11 @@ def _safe(value: Any, limit: int) -> str:
 
 
 def _identity(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict) or set(arguments) != {"provider", "external_id", "media_type"}:
+    if not isinstance(arguments, dict) or set(arguments) != {
+        "provider",
+        "external_id",
+        "media_type",
+    }:
         raise AgentToolError("必须且只能提供 provider、external_id 和 media_type")
     provider = str(arguments["provider"] or "").strip().casefold()
     external_id = str(arguments["external_id"] or "").strip()
@@ -88,20 +94,30 @@ def discovery_confirm_mapping_arguments(arguments: dict[str, Any]) -> dict[str, 
 
 
 def _feature_disabled() -> ToolResult:
-    return ToolResult(False, "disabled", "影视探索功能当前已关闭", error="请先启用影视探索。")
+    return ToolResult(
+        False, "disabled", "影视探索功能当前已关闭", error="请先启用影视探索。"
+    )
 
 
-def get_discovery_detail(arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
+def get_discovery_detail(
+    arguments: dict[str, Any], _context: ToolContext
+) -> ToolResult:
     if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled()
     card = get_discovery_service().get_detail(
         arguments["provider"], arguments["media_type"], arguments["external_id"]
     )
     if card is None:
-        return ToolResult(False, "not_found", "没有找到该影视详情", error="来源详情不存在。")
+        return ToolResult(
+            False, "not_found", "没有找到该影视详情", error="来源详情不存在。"
+        )
     rating = None
     try:
-        rating = round(max(0.0, min(float(card.rating), 10.0)), 1) if card.rating is not None else None
+        rating = (
+            round(max(0.0, min(float(card.rating), 10.0)), 1)
+            if card.rating is not None
+            else None
+        )
     except (TypeError, ValueError, OverflowError):
         rating = None
     return ToolResult(
@@ -119,17 +135,24 @@ def get_discovery_detail(arguments: dict[str, Any], _context: ToolContext) -> To
             "rating_source": _safe(card.rating_source, 30),
             "overview": _safe(card.overview, 500),
             "mapping_confirmed": bool(
-                card.provider == "tmdb" or (
-                    (row := db.get_media_external_id(card.provider, card.external_id, card.media_type))
+                card.provider == "tmdb"
+                or (
+                    (
+                        row := db.get_media_external_id(
+                            card.provider, card.external_id, card.media_type
+                        )
+                    )
                     and bool(row["confirmed"])
                 )
             ),
         },
-        evidence=[Evidence(
-            "discovery_detail",
-            "只读取来源详情与映射确认状态；未保存映射、收藏、订阅或下载任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_detail",
+                "只读取来源详情与映射确认状态；未保存映射、收藏、订阅或下载任务。",
+                _now(),
+            )
+        ],
     )
 
 
@@ -149,7 +172,9 @@ def reset_discovery_mapping_context_for_tests() -> None:
 
 
 def clear_discovery_mapping_context(
-    *, owner: str, delete_persisted: bool = True,
+    *,
+    owner: str,
+    delete_persisted: bool = True,
 ) -> bool:
     owner_key = str(owner or "").strip()
     if not owner_key:
@@ -158,13 +183,17 @@ def clear_discovery_mapping_context(
         removed = _recent.pop(owner_key, None) is not None
     if delete_persisted and _repository is not None:
         try:
-            removed = bool(_repository.delete_latest(
-                owner=owner_key, context_type=_CONTEXT_TYPE,
-            )) or removed
-        except Exception as exc:
-            logger.warning(
-                "Agent 发现映射上下文清理失败 type=%s", type(exc).__name__
+            removed = (
+                bool(
+                    _repository.delete_latest(
+                        owner=owner_key,
+                        context_type=_CONTEXT_TYPE,
+                    )
+                )
+                or removed
             )
+        except Exception as exc:
+            logger.warning("Agent 发现映射上下文清理失败 type=%s", type(exc).__name__)
     return removed
 
 
@@ -180,7 +209,11 @@ def _snapshot_payload(snapshot: _MappingSnapshot) -> dict[str, Any]:
 
 
 def _snapshot_from_payload(
-    owner: str, payload: dict[str, Any], *, generation: int = 0, revision: int = 0,
+    owner: str,
+    payload: dict[str, Any],
+    *,
+    generation: int = 0,
+    revision: int = 0,
 ) -> _MappingSnapshot | None:
     try:
         provider = str(payload.get("provider") or "").strip().casefold()
@@ -212,14 +245,16 @@ def _snapshot_from_payload(
             score = float(raw.get("score") or 0)
             if not 0 <= score <= 1:
                 return None
-            candidates.append({
-                "candidate_number": number,
-                "tmdb_id": tmdb_id,
-                "title": _safe(raw.get("title"), 160) or "未命名候选",
-                "year": _safe(raw.get("year"), 12),
-                "media_type": candidate_type,
-                "score": round(score, 3),
-            })
+            candidates.append(
+                {
+                    "candidate_number": number,
+                    "tmdb_id": tmdb_id,
+                    "title": _safe(raw.get("title"), 160) or "未命名候选",
+                    "year": _safe(raw.get("year"), 12),
+                    "media_type": candidate_type,
+                    "score": round(score, 3),
+                }
+            )
         return _MappingSnapshot(
             owner=str(owner),
             provider=provider,
@@ -279,14 +314,16 @@ def _store_snapshot(snapshot: _MappingSnapshot) -> bool:
                     expires_at=time.time() + _TTL_SECONDS,
                 )
         except Exception as exc:
-            logger.warning(
-                "Agent 发现映射上下文持久化失败 type=%s", type(exc).__name__
-            )
+            logger.warning("Agent 发现映射上下文持久化失败 type=%s", type(exc).__name__)
             with _lock:
                 _recent.pop(snapshot.owner, None)
             return False
     with _lock:
-        expired = [owner for owner, item in _recent.items() if time.monotonic() - item.created_at > _TTL_SECONDS]
+        expired = [
+            owner
+            for owner, item in _recent.items()
+            if time.monotonic() - item.created_at > _TTL_SECONDS
+        ]
         for owner in expired:
             _recent.pop(owner, None)
         _recent[snapshot.owner] = snapshot
@@ -298,24 +335,27 @@ def _consume_snapshot(snapshot: _MappingSnapshot) -> bool:
         consume = getattr(_repository, "consume_latest_guarded", None)
         try:
             if callable(consume) and snapshot.generation > 0 and snapshot.revision > 0:
-                consumed = bool(consume(
-                    owner=snapshot.owner,
-                    context_type=_CONTEXT_TYPE,
-                    guard=AgentContextWriteGuard(
-                        generation=snapshot.generation,
-                        revision=snapshot.revision,
-                    ),
-                ))
+                consumed = bool(
+                    consume(
+                        owner=snapshot.owner,
+                        context_type=_CONTEXT_TYPE,
+                        guard=AgentContextWriteGuard(
+                            generation=snapshot.generation,
+                            revision=snapshot.revision,
+                        ),
+                    )
+                )
             elif not callable(consume):
-                consumed = bool(_repository.delete_latest(
-                    owner=snapshot.owner, context_type=_CONTEXT_TYPE,
-                ))
+                consumed = bool(
+                    _repository.delete_latest(
+                        owner=snapshot.owner,
+                        context_type=_CONTEXT_TYPE,
+                    )
+                )
             else:
                 consumed = False
         except Exception as exc:
-            logger.warning(
-                "Agent 发现映射上下文消费失败 type=%s", type(exc).__name__
-            )
+            logger.warning("Agent 发现映射上下文消费失败 type=%s", type(exc).__name__)
             return False
         if not consumed:
             return False
@@ -331,12 +371,12 @@ def _get_snapshot(owner: str) -> _MappingSnapshot | None:
     if _repository is not None:
         try:
             persisted = _repository.get_latest(
-                owner=owner_key, context_type=_CONTEXT_TYPE, now=time.time(),
+                owner=owner_key,
+                context_type=_CONTEXT_TYPE,
+                now=time.time(),
             )
         except Exception as exc:
-            logger.warning(
-                "Agent 发现映射上下文恢复失败 type=%s", type(exc).__name__
-            )
+            logger.warning("Agent 发现映射上下文恢复失败 type=%s", type(exc).__name__)
             with _lock:
                 _recent.pop(owner_key, None)
             return None
@@ -351,8 +391,10 @@ def _get_snapshot(owner: str) -> _MappingSnapshot | None:
                 _recent.pop(owner_key, None)
             return None
         restored = _snapshot_from_payload(
-            owner_key, persisted.payload,
-            generation=persisted.generation, revision=persisted.revision,
+            owner_key,
+            persisted.payload,
+            generation=persisted.generation,
+            revision=persisted.revision,
         )
         if restored is None:
             with _lock:
@@ -369,7 +411,9 @@ def _get_snapshot(owner: str) -> _MappingSnapshot | None:
         return item
 
 
-def get_discovery_mapping_candidates(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
+def get_discovery_mapping_candidates(
+    arguments: dict[str, Any], context: ToolContext
+) -> ToolResult:
     if not context.owner:
         raise AgentToolError("映射候选需要已登录会话", code="precondition_failed")
     if not config.get_bool("DISCOVERY_ENABLED"):
@@ -378,15 +422,23 @@ def get_discovery_mapping_candidates(arguments: dict[str, Any], context: ToolCon
         guard = _begin_snapshot(context.owner)
     except Exception as exc:
         logger.warning("Agent 发现映射上下文初始化失败 type=%s", type(exc).__name__)
-        raise AgentToolError("映射候选上下文暂时不可用", code="precondition_failed") from exc
+        raise AgentToolError(
+            "映射候选上下文暂时不可用", code="precondition_failed"
+        ) from exc
     service = get_discovery_service()
-    card = service.get_detail(arguments["provider"], arguments["media_type"], arguments["external_id"])
+    card = service.get_detail(
+        arguments["provider"], arguments["media_type"], arguments["external_id"]
+    )
     if card is None:
-        return ToolResult(False, "not_found", "没有找到该影视详情", error="来源详情不存在。")
+        return ToolResult(
+            False, "not_found", "没有找到该影视详情", error="来源详情不存在。"
+        )
     result = service.lookup_tmdb_mapping(
         card.provider, card.external_id, card.media_type, card.title, card.year
     )
-    raw_candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+    raw_candidates = (
+        result.get("candidates") if isinstance(result.get("candidates"), list) else []
+    )
     candidates: list[dict[str, Any]] = []
     for raw in raw_candidates[:5]:
         if not isinstance(raw, dict):
@@ -398,42 +450,70 @@ def get_discovery_mapping_candidates(arguments: dict[str, Any], context: ToolCon
             score = round(max(0.0, min(float(raw.get("score") or 0), 1.0)), 3)
         except (TypeError, ValueError, OverflowError):
             score = 0.0
-        candidates.append({
-            "candidate_number": len(candidates) + 1,
-            "tmdb_id": tmdb_id,
-            "title": _safe(raw.get("title"), 160) or "未命名候选",
-            "year": _safe(raw.get("year"), 12),
-            "media_type": str(raw.get("media_type") or card.media_type) if str(raw.get("media_type") or card.media_type) in _ALLOWED_MEDIA_TYPES else card.media_type,
-            "score": score,
-        })
-    stored = _store_snapshot(_MappingSnapshot(
-        owner=context.owner, provider=card.provider, external_id=card.external_id,
-        media_type=card.media_type, title=_safe(card.title, 160), year=_safe(card.year, 12),
-        candidates=candidates, created_at=time.monotonic(),
-        generation=guard.generation, revision=guard.revision,
-    ))
+        candidates.append(
+            {
+                "candidate_number": len(candidates) + 1,
+                "tmdb_id": tmdb_id,
+                "title": _safe(raw.get("title"), 160) or "未命名候选",
+                "year": _safe(raw.get("year"), 12),
+                "media_type": str(raw.get("media_type") or card.media_type)
+                if str(raw.get("media_type") or card.media_type) in _ALLOWED_MEDIA_TYPES
+                else card.media_type,
+                "score": score,
+            }
+        )
+    stored = _store_snapshot(
+        _MappingSnapshot(
+            owner=context.owner,
+            provider=card.provider,
+            external_id=card.external_id,
+            media_type=card.media_type,
+            title=_safe(card.title, 160),
+            year=_safe(card.year, 12),
+            candidates=candidates,
+            created_at=time.monotonic(),
+            generation=guard.generation,
+            revision=guard.revision,
+        )
+    )
     if not stored:
-        raise AgentToolError("本次映射候选已被更新请求取代，请重新查询", code="precondition_failed")
+        raise AgentToolError(
+            "本次映射候选已被更新请求取代，请重新查询", code="precondition_failed"
+        )
     confirmed = bool(result.get("confirmed"))
     return ToolResult(
         True,
         "completed" if confirmed or candidates else "empty",
-        ("该条目已有确认过的 TMDB 映射" if confirmed else f"找到 {len(candidates)} 个 TMDB 映射候选"),
+        (
+            "该条目已有确认过的 TMDB 映射"
+            if confirmed
+            else f"找到 {len(candidates)} 个 TMDB 映射候选"
+        ),
         data={
             "source_title": _safe(card.title, 160) or "未命名条目",
             "provider": card.provider,
             "media_type": card.media_type,
             "mapping_confirmed": confirmed,
-            "candidates": [{k: v for k, v in item.items() if k != "tmdb_id"} for item in candidates],
+            "candidates": [
+                {k: v for k, v in item.items() if k != "tmdb_id"} for item in candidates
+            ],
             "candidate_count": len(candidates),
             "limits": {"max_candidates": 5, "ttl_seconds": int(_TTL_SECONDS)},
         },
-        evidence=[Evidence(
-            "discovery_mapping",
-            "只读查询映射与 TMDB 候选；未写入 media_external_ids。候选内部 TMDB ID 仅保存在当前会话短期上下文。",
-            _now(),
-        )],
-        suggestions=([] if confirmed else ["如需保存，请回复：确认第 1 个映射。"] if candidates else []),
+        evidence=[
+            Evidence(
+                "discovery_mapping",
+                "只读查询映射与 TMDB 候选；未写入 media_external_ids。候选内部 TMDB ID 仅保存在当前会话短期上下文。",
+                _now(),
+            )
+        ],
+        suggestions=(
+            []
+            if confirmed
+            else ["如需保存，请回复：确认第 1 个映射。"]
+            if candidates
+            else []
+        ),
     )
 
 
@@ -441,12 +521,16 @@ def _current_mapping_state(snapshot: _MappingSnapshot) -> dict[str, Any] | None:
     existing = db.get_media_external_id(
         snapshot.provider, snapshot.external_id, snapshot.media_type
     )
-    return None if existing is None else {
-        "tmdb_id": str(existing["tmdb_id"] or ""),
-        "confirmed": bool(existing["confirmed"]),
-        "version": max(0, int(existing["version"] or 0)),
-        "updated_at": str(existing["updated_at"] or ""),
-    }
+    return (
+        None
+        if existing is None
+        else {
+            "tmdb_id": str(existing["tmdb_id"] or ""),
+            "confirmed": bool(existing["confirmed"]),
+            "version": max(0, int(existing["version"] or 0)),
+            "updated_at": str(existing["updated_at"] or ""),
+        }
+    )
 
 
 def _mapping_context(
@@ -460,7 +544,13 @@ def _mapping_context(
         existing_state = _current_mapping_state(snapshot)
     return confirmation_context_fingerprint(
         {
-            "source": [snapshot.provider, snapshot.external_id, snapshot.media_type, snapshot.title, snapshot.year],
+            "source": [
+                snapshot.provider,
+                snapshot.external_id,
+                snapshot.media_type,
+                snapshot.title,
+                snapshot.year,
+            ],
             "candidate": candidate,
             "existing": existing_state,
         },
@@ -473,19 +563,33 @@ def prepare_confirm_discovery_mapping(
 ) -> tuple[ToolResult, str]:
     snapshot = _get_snapshot(context.owner)
     if snapshot is None:
-        raise AgentToolError("最近映射候选不存在或已过期，请重新查询", code="precondition_failed")
-    candidate = next((item for item in snapshot.candidates if item["candidate_number"] == arguments["candidate_number"]), None)
+        raise AgentToolError(
+            "最近映射候选不存在或已过期，请重新查询", code="precondition_failed"
+        )
+    candidate = next(
+        (
+            item
+            for item in snapshot.candidates
+            if item["candidate_number"] == arguments["candidate_number"]
+        ),
+        None,
+    )
     if candidate is None:
         raise AgentToolError("映射候选序号不存在", code="precondition_failed")
     service = get_discovery_service()
     try:
-        match = service.verify_tmdb_mapping_candidate(candidate["tmdb_id"], snapshot.media_type)
+        match = service.verify_tmdb_mapping_candidate(
+            candidate["tmdb_id"], snapshot.media_type
+        )
     except (TypeError, ValueError):
         raise AgentToolError("所选 TMDB 候选当前无法核验", code="precondition_failed")
     verified = dict(candidate)
     verified["title"] = _safe(match.get("title"), 160) or candidate["title"]
     verified["year"] = _safe(match.get("year"), 12) or candidate["year"]
-    snapshot.candidates = [verified if item["candidate_number"] == arguments["candidate_number"] else item for item in snapshot.candidates]
+    snapshot.candidates = [
+        verified if item["candidate_number"] == arguments["candidate_number"] else item
+        for item in snapshot.candidates
+    ]
     if not _store_snapshot(snapshot):
         raise AgentToolError("映射候选已变化，请重新查询", code="confirmation_stale")
     fingerprint = _mapping_context(snapshot, verified)
@@ -503,7 +607,9 @@ def prepare_confirm_discovery_mapping(
                 "不会加入收藏、创建订阅、搜索资源或下载。",
             ],
         },
-        evidence=[Evidence("tmdb_detail", "已重新读取并核验所选 TMDB 候选身份。", _now())],
+        evidence=[
+            Evidence("tmdb_detail", "已重新读取并核验所选 TMDB 候选身份。", _now())
+        ],
     ), fingerprint
 
 
@@ -513,14 +619,25 @@ def confirm_discovery_mapping_confirmed(
     snapshot = _get_snapshot(context.owner)
     if snapshot is None:
         raise AgentToolError("映射候选已过期，请重新查询", code="confirmation_stale")
-    candidate = next((item for item in snapshot.candidates if item["candidate_number"] == arguments["candidate_number"]), None)
+    candidate = next(
+        (
+            item
+            for item in snapshot.candidates
+            if item["candidate_number"] == arguments["candidate_number"]
+        ),
+        None,
+    )
     existing_state = _current_mapping_state(snapshot)
     if candidate is None or _mapping_context(
         snapshot, candidate, existing_state=existing_state, state_loaded=True
     ) != str(expected_context or ""):
-        raise AgentToolError("来源、候选或现有映射已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "来源、候选或现有映射已变化，请重新预检", code="confirmation_stale"
+        )
     if not _consume_snapshot(snapshot):
-        raise AgentToolError("映射候选已变化或已被消费，请重新查询", code="confirmation_stale")
+        raise AgentToolError(
+            "映射候选已变化或已被消费，请重新查询", code="confirmation_stale"
+        )
     saved = get_discovery_service().confirm_tmdb_mapping_if_unchanged(
         snapshot.provider,
         snapshot.external_id,
@@ -529,7 +646,9 @@ def confirm_discovery_mapping_confirmed(
         existing_state,
     )
     if saved is None:
-        raise AgentToolError("现有映射在保存时发生变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "现有映射在保存时发生变化，请重新预检", code="confirmation_stale"
+        )
     return ToolResult(
         True,
         "completed",
@@ -542,5 +661,9 @@ def confirm_discovery_mapping_confirmed(
             "candidate_title": candidate["title"],
             "mapping_confirmed": True,
         },
-        evidence=[Evidence("media_external_ids", "已保存经过 TMDB 详情核验的确认映射。", _now())],
+        evidence=[
+            Evidence(
+                "media_external_ids", "已保存经过 TMDB 详情核验的确认映射。", _now()
+            )
+        ],
     )

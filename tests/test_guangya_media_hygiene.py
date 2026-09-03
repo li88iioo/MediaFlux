@@ -1,17 +1,15 @@
 """光鸭媒体名称卫生能力测试（当前覆盖番号清理策略）。"""
+
 from __future__ import annotations
 
-from copy import deepcopy
-from pathlib import Path
 import tempfile
 import unittest
+from copy import deepcopy
+from pathlib import Path
 from unittest import mock
 
 from app.agent import guangya_rename_actions as actions
-from app.agent.models import RiskLevel, ToolContext
-from app.agent.orchestrator import AgentOrchestrator
-from app.agent.registry import AgentToolError
-from app.agent.tools import build_tool_registry
+from app.agent.models import ToolContext
 from app.clients.guangya import GuangYaFile
 from app.modules import guangya_media_hygiene as hygiene
 from app.modules import guangya_rename
@@ -26,22 +24,41 @@ class FakeHygieneClient:
             "0": [GuangYaFile("root", "NSFW", True, parent_id="0")],
             "root": [
                 GuangYaFile(
-                    "dir", "(spam.example.com)-ABC-123", True,
-                    parent_id="root", etag="dir-etag", updated_at=1,
-                ),
+                    "dir",
+                    "(spam.example.com)-ABC-123",
+                    True,
+                    parent_id="root",
+                    etag="dir-etag",
+                    updated_at=1,
+                )
             ],
             "dir": [
                 GuangYaFile(
-                    "video", "'spam.example.com'.ABC-123。mp4", False,
-                    parent_id="dir", size=100, etag="video-etag", extension="mp4",
+                    "video",
+                    "'spam.example.com'.ABC-123。mp4",
+                    False,
+                    parent_id="dir",
+                    size=100,
+                    etag="video-etag",
+                    extension="mp4",
                 ),
                 GuangYaFile(
-                    "subtitle", "(spam.example.com)-ABC-123.CHT.srt", False,
-                    parent_id="dir", size=10, etag="sub-etag", extension="srt",
+                    "subtitle",
+                    "(spam.example.com)-ABC-123.CHT.srt",
+                    False,
+                    parent_id="dir",
+                    size=10,
+                    etag="sub-etag",
+                    extension="srt",
                 ),
                 GuangYaFile(
-                    "poster", "poster.jpg", False,
-                    parent_id="dir", size=5, etag="poster-etag", extension="jpg",
+                    "poster",
+                    "poster.jpg",
+                    False,
+                    parent_id="dir",
+                    size=5,
+                    etag="poster-etag",
+                    extension="jpg",
                 ),
             ],
         }
@@ -74,10 +91,18 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.plan_dir = Path(self.temp.name) / "plans"
         self.patches = [
-            mock.patch.object(guangya_rename, "_plan_directory", return_value=self.plan_dir),
-            mock.patch.object(guangya_rename, "_owner_digest", return_value="owner-digest"),
-            mock.patch.object(guangya_rename, "get_web_secret", return_value="test-secret"),
-            mock.patch.object(actions, "organize_operation_owner_digest", return_value="owner-digest"),
+            mock.patch.object(
+                guangya_rename, "_plan_directory", return_value=self.plan_dir
+            ),
+            mock.patch.object(
+                guangya_rename, "_owner_digest", return_value="owner-digest"
+            ),
+            mock.patch.object(
+                guangya_rename, "get_web_secret", return_value="test-secret"
+            ),
+            mock.patch.object(
+                actions, "organize_operation_owner_digest", return_value="owner-digest"
+            ),
             mock.patch.object(
                 hygiene.config,
                 "get",
@@ -107,9 +132,7 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
             recursive=True,
             limit=100,
         )
-        changes = {
-            item["old_name"]: item["new_name"] for item in plan["entries"]
-        }
+        changes = {item["old_name"]: item["new_name"] for item in plan["entries"]}
         self.assertEqual(changes["'spam.example.com'.ABC-123。mp4"], "ABC-123.mp4")
         self.assertEqual(
             changes["(spam.example.com)-ABC-123.CHT.srt"], "ABC-123.CHT.srt"
@@ -122,10 +145,17 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
 
     def test_unknown_second_video_blocks_companion_and_directory_rename(self):
         client = FakeHygieneClient()
-        client.directories["dir"].append(GuangYaFile(
-            "unknown-video", "unidentified-release.mp4", False,
-            parent_id="dir", size=90, etag="unknown-etag", extension="mp4",
-        ))
+        client.directories["dir"].append(
+            GuangYaFile(
+                "unknown-video",
+                "unidentified-release.mp4",
+                False,
+                parent_id="dir",
+                size=90,
+                etag="unknown-etag",
+                extension="mp4",
+            )
+        )
         plan = hygiene.build_media_hygiene_plan(
             client,
             owner="owner",
@@ -133,12 +163,8 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
             recursive=True,
             limit=100,
         )
-        changes = {
-            item["old_name"]: item["new_name"] for item in plan["entries"]
-        }
-        self.assertEqual(
-            changes["'spam.example.com'.ABC-123。mp4"], "ABC-123.mp4"
-        )
+        changes = {item["old_name"]: item["new_name"] for item in plan["entries"]}
+        self.assertEqual(changes["'spam.example.com'.ABC-123。mp4"], "ABC-123.mp4")
         self.assertNotIn("(spam.example.com)-ABC-123.CHT.srt", changes)
         self.assertNotIn("(spam.example.com)-ABC-123", changes)
         self.assertEqual(plan["stats"]["unidentified_video_count"], 1)
@@ -191,7 +217,9 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
         scheduler = mock.Mock()
         scheduler.trigger.return_value = {"ok": True, "queued": True}
         with (
-            mock.patch.object(actions, "load_rename_plan", return_value={"mode": "media_hygiene"}),
+            mock.patch.object(
+                actions, "load_rename_plan", return_value={"mode": "media_hygiene"}
+            ),
             mock.patch.object(
                 actions,
                 "execute_rename_plan",
@@ -199,9 +227,9 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
             ),
             mock.patch("app.modules.scheduler.get_scheduler", return_value=scheduler),
         ):
-            result = actions.execute_durable_guangya_rename_job({
-                "plan_id": "a" * 32, "plan_fingerprint": "b" * 64,
-            })
+            result = actions.execute_durable_guangya_rename_job(
+                {"plan_id": "a" * 32, "plan_fingerprint": "b" * 64}
+            )
         scheduler.trigger.assert_called_once_with(
             "organize", force_full=True, sync_mode="full"
         )
@@ -222,10 +250,9 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
                 "app.modules.scheduler.get_scheduler", return_value=scheduler
             ) as get_scheduler,
         ):
-            result = actions.execute_durable_guangya_rename_job({
-                "plan_id": "a" * 32, "plan_fingerprint": "b" * 64,
-            })
-
+            result = actions.execute_durable_guangya_rename_job(
+                {"plan_id": "a" * 32, "plan_fingerprint": "b" * 64}
+            )
         get_scheduler.assert_not_called()
         scheduler.trigger.assert_not_called()
         self.assertNotIn("strm_triggered", result["stats"])
@@ -233,65 +260,16 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
     def test_terminal_private_plan_is_removed_after_retention(self):
         client = FakeHygieneClient()
         plan = hygiene.build_media_hygiene_plan(
-            client, owner="owner",
-            path="/NSFW/(spam.example.com)-ABC-123", limit=100,
+            client, owner="owner", path="/NSFW/(spam.example.com)-ABC-123", limit=100
         )
         guangya_rename.update_rename_plan_execution(
             plan["plan_id"], status="completed", execution={"renamed": 3}
         )
         with mock.patch.object(
-            guangya_rename.time, "time",
+            guangya_rename.time,
+            "time",
             return_value=plan["created_at_epoch"] + 8 * 24 * 60 * 60,
         ):
             result = guangya_rename.maintain_rename_plans()
         self.assertEqual(result["removed"], 1)
         self.assertFalse((self.plan_dir / f"{plan['plan_id']}.json").exists())
-
-    def test_registry_exposes_hygiene_preview(self):
-        registry = build_tool_registry()
-        capabilities = {item["name"]: item for item in registry.capabilities()}
-        self.assertEqual(
-            capabilities["guangya.media_hygiene.preview"]["risk"],
-            RiskLevel.READ.value,
-        )
-        llm = {
-            item["name"]
-            for item in registry.llm_orchestration_capabilities(
-                include_confirmations=True
-            )
-        }
-        self.assertIn("guangya.media_hygiene.preview", llm)
-        self.assertIn("guangya.rename.execute", llm)
-        self.assertNotIn("guangya.media_hygiene.execute", capabilities)
-        self.assertTrue(
-            capabilities["guangya.rename.execute"]["requires_confirmation"]
-        )
-
-    def test_media_hygiene_preview_uses_only_canonical_execute(self):
-        client = FakeHygieneClient()
-        service = AgentOrchestrator(build_tool_registry())
-        with mock.patch.object(actions, "GuangYaClient", return_value=client):
-            preview = service.invoke(
-                "guangya.media_hygiene.preview",
-                {"path": "/NSFW", "recursive": True, "limit": 100},
-                owner="owner",
-            )
-            with self.assertRaises(AgentToolError) as removed:
-                service.prepare(
-                    "guangya.media_hygiene.execute", {}, owner="owner"
-                )
-            prepared = service.prepare(
-                "guangya.rename.execute", {}, owner="owner"
-            )
-
-        self.assertEqual(removed.exception.code, "tool_not_found")
-        self.assertEqual(preview["result"]["status"], "ready")
-        self.assertEqual(prepared["tool_call"]["name"], "guangya.rename.execute")
-        self.assertEqual(
-            prepared["action_plan"]["title"],
-            "执行光鸭重命名",
-        )
-
-
-if __name__ == "__main__":
-    unittest.main()

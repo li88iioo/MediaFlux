@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _extract(source: str, start: str, end: str) -> str:
     start_index = source.index(start)
-    return source[start_index:source.index(end, start_index)]
+    return source[start_index : source.index(end, start_index)]
 
 
 def _run_node(script: str) -> None:
@@ -202,7 +202,10 @@ class OrganizeStatusPollingLifecycleTests(unittest.TestCase):
     def test_status_polling_uses_no_interval_loop(self):
         source = (ROOT / "app/static/js/organize.js").read_text(encoding="utf-8")
         self.assertNotIn("setInterval(loadStatus", source)
-        self.assertIn("Promise.allSettled", (ROOT / "app/static/js/local-media.js").read_text(encoding="utf-8"))
+        self.assertIn(
+            "Promise.allSettled",
+            (ROOT / "app/static/js/local-media.js").read_text(encoding="utf-8"),
+        )
 
     def test_config_save_serializes_requests_and_coalesces_while_busy(self):
         source = (ROOT / "app/static/js/organize.js").read_text(encoding="utf-8")
@@ -374,10 +377,11 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
         self.assertIn("tmdbRequestGate=createDraftRequestGate", source)
         self.assertGreaterEqual(source.count("signal:ticket.signal"), 5)
 
-
     def test_config_save_preserves_edits_made_while_request_is_in_flight(self):
         app_source = (ROOT / "app/static/js/app.js").read_text(encoding="utf-8")
-        settings_source = (ROOT / "app/static/js/settings.js").read_text(encoding="utf-8")
+        settings_source = (ROOT / "app/static/js/settings.js").read_text(
+            encoding="utf-8"
+        )
         save_block = _extract(
             app_source,
             "    window.collectConfigFields = function (root) {",
@@ -453,6 +457,7 @@ class SettingsDraftLifecycleTests(unittest.TestCase):
         reload_call = dashboard.index("window.location.reload()", pending_branch)
         self.assertIn("return;", dashboard[pending_branch:reload_call])
 
+
 class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
     def test_media_recent_ignores_old_body_after_newer_results_apply(self):
         source = (ROOT / "app/templates/media_recent.html").read_text(encoding="utf-8")
@@ -461,8 +466,9 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             "    const form=document.querySelector('[data-media-recent-filter]');",
             "\n    form?.addEventListener('submit'",
         )
-        script = textwrap.dedent(
-            """
+        script = (
+            textwrap.dedent(
+                """
             const assert = require('node:assert/strict');
             const makeClassList = () => ({add() {}, remove() {}, toggle() {}, contains() {return false;}});
             let currentResults = {
@@ -507,8 +513,10 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             const requestAnimationFrame = callback => {callback(); return 1;};
             const matchMedia = () => ({matches: false});
             """
-        ) + block + textwrap.dedent(
-            """
+            )
+            + block
+            + textwrap.dedent(
+                """
             (async () => {
               const first = updateResults('/first');
               await new Promise(setImmediate);
@@ -527,6 +535,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.deepEqual(historyUrls, ['/second']);
             })().catch(error => {console.error(error); process.exit(1);});
             """
+            )
         )
         _run_node(script)
 
@@ -537,8 +546,9 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             "const torrentCachePolicyForm=document.getElementById('torrentCachePolicyForm');",
             "\nlet overviewTimer=null;",
         )
-        script = textwrap.dedent(
-            """
+        script = (
+            textwrap.dedent(
+                """
             const assert = require('node:assert/strict');
             const handlers = {};
             const attributes = {};
@@ -581,8 +591,10 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               saveAppConfig: async () => ({}),
             };
             """
-        ) + block + textwrap.dedent(
-            """
+            )
+            + block
+            + textwrap.dedent(
+                """
             (async () => {
               const first = openTorrentCachePolicy();
               await new Promise(setImmediate);
@@ -604,11 +616,14 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.equal(attributes['aria-busy'], 'false');
             })().catch(error => {console.error(error); process.exit(1);});
             """
+            )
         )
         _run_node(script)
 
     def test_directory_external_hints_ignore_changed_query(self):
-        source = (ROOT / "app/static/js/guangya-directory-scrape.js").read_text(encoding="utf-8")
+        source = (ROOT / "app/static/js/guangya-directory-scrape.js").read_text(
+            encoding="utf-8"
+        )
         invalidate_block = _extract(
             source,
             "    function invalidateExternalHints() {",
@@ -619,8 +634,9 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             "    async function loadExternalHints() {",
             "\n\n    function addChip",
         )
-        script = textwrap.dedent(
-            """
+        script = (
+            textwrap.dedent(
+                """
             const assert = require('node:assert/strict');
             const externalHints = {hidden: true, replaceChildren() {this.cleared = (this.cleared || 0) + 1;}};
             const elements = {
@@ -640,8 +656,11 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             let rendered = 0;
             const renderExternalHints = () => {rendered += 1; externalHints.hidden = false;};
             """
-        ) + invalidate_block + load_block + textwrap.dedent(
-            """
+            )
+            + invalidate_block
+            + load_block
+            + textwrap.dedent(
+                """
             (async () => {
               const pending = loadExternalHints();
               await new Promise(setImmediate);
@@ -656,14 +675,18 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.equal(alerts.length, 0);
             })().catch(error => {console.error(error); process.exit(1);});
             """
+            )
         )
         _run_node(script)
 
     def test_share_preview_is_invalidated_when_url_changes_mid_inspection(self):
-        source = (ROOT / "app/templates/_share_transfer_scripts.html").read_text(encoding="utf-8")
+        source = (ROOT / "app/templates/_share_transfer_scripts.html").read_text(
+            encoding="utf-8"
+        )
         block = _extract(source, "    let previewId='';", "\n    function renderTarget")
-        script = textwrap.dedent(
-            """
+        script = (
+            textwrap.dedent(
+                """
             const assert = require('node:assert/strict');
             const elements = {
               shareUrl: {value: 'https://guangyapan.com/s/old'},
@@ -690,8 +713,10 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             let resolveInspect;
             const fetch = () => new Promise(resolve => {resolveInspect = resolve;});
             """
-        ) + block + textwrap.dedent(
-            """
+            )
+            + block
+            + textwrap.dedent(
+                """
             (async () => {
               const pending = inspectShare();
               await new Promise(setImmediate);
@@ -712,6 +737,7 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.match(elements.shareMessage.textContent, /重新解析/);
             })().catch(error => {console.error(error); process.exit(1);});
             """
+            )
         )
         _run_node(script)
 
@@ -722,8 +748,9 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
             "    const modalEl=document.getElementById('mediaConfigModal');",
             "\n})();",
         )
-        script = textwrap.dedent(
-            """
+        script = (
+            textwrap.dedent(
+                """
             const assert = require('node:assert/strict');
             function control(dataset = {}) {
               return {
@@ -805,8 +832,10 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               location: {reload() {reloads += 1;}},
             };
             """
-        ) + block + textwrap.dedent(
-            """
+            )
+            + block
+            + textwrap.dedent(
+                """
             (async () => {
               const firstLoad = openConfig('jellyfin', openButton);
               await new Promise(setImmediate);
@@ -848,8 +877,10 @@ class FrontendAsyncRequestLifecycleTests(unittest.TestCase):
               assert.ok(modalOptions.onRequestClose);
             })().catch(error => {console.error(error); process.exit(1);});
             """
+            )
         )
         _run_node(script)
+
 
 class AppModalFocusLifecycleTests(unittest.TestCase):
     def test_nested_modals_only_close_top_and_restore_focus_layer_by_layer(self):
@@ -976,104 +1007,66 @@ class AppModalFocusLifecycleTests(unittest.TestCase):
 
 
 class AgentVisualViewportLifecycleTests(unittest.TestCase):
-    def test_bfcache_rebind_is_idempotent_and_cancels_pending_frame(self):
+    def test_visual_viewport_height_is_applied_without_layout_delay(self):
         source = (ROOT / "app/static/js/agent.js").read_text(encoding="utf-8")
         viewport_block = _extract(
             source,
-            "    function cancelVisualViewportFrame() {",
-            "\n\n    syncConversationLayout();",
+            "    function syncViewportHeight() {",
+            "\n\n    composer?.addEventListener",
         )
         script = textwrap.dedent(
             f"""
             const assert = require('node:assert/strict');
-            let visualViewportFrame = 0;
-            let boundVisualViewport = null;
-            let nextFrame = 0;
-            const frames = new Map();
-            const cancelled = [];
-            const windowHandlers = {{}};
-            const viewportHandlers = {{resize: new Set(), scroll: new Set()}};
-            const viewport = {{
-              height: 700,
-              addEventListener: (name, handler) => viewportHandlers[name].add(handler),
-              removeEventListener: (name, handler) => viewportHandlers[name].delete(handler),
-            }};
-            const window = {{
-              visualViewport: viewport,
-              innerHeight: 800,
-              requestAnimationFrame: callback => {{const id = ++nextFrame; frames.set(id, callback); return id;}},
-              cancelAnimationFrame: id => {{cancelled.push(id); frames.delete(id);}},
-              addEventListener: (name, handler) => {{windowHandlers[name] = handler;}},
-            }};
             const styleValues = {{}};
+            const window = {{visualViewport: {{height: 700}}, innerHeight: 800}};
             const document = {{
-              activeElement: null,
               documentElement: {{style: {{setProperty: (name, value) => {{styleValues[name] = value;}}}}}},
             }};
-            const page = {{classList: {{toggle: () => {{}}}}}};
-            const promptInput = {{}};
-            const scrollToLatest = () => {{}};
             {viewport_block}
-            assert.equal(viewportHandlers.resize.size, 1);
-            assert.equal(viewportHandlers.scroll.size, 1);
-            assert.ok(visualViewportFrame > 0);
-            const pendingFrame = visualViewportFrame;
-            windowHandlers.pagehide();
-            assert.equal(viewportHandlers.resize.size, 0);
-            assert.equal(viewportHandlers.scroll.size, 0);
-            assert.equal(visualViewportFrame, 0);
-            assert.deepEqual(cancelled, [pendingFrame]);
-            windowHandlers.pageshow({{persisted: true}});
-            windowHandlers.pageshow({{persisted: true}});
-            assert.equal(viewportHandlers.resize.size, 1);
-            assert.equal(viewportHandlers.scroll.size, 1);
-            const frame = frames.get(visualViewportFrame);
-            frame();
+            syncViewportHeight();
             assert.equal(styleValues['--agent-viewport-height'], '700px');
+            window.visualViewport.height = 643.6;
+            syncViewportHeight();
+            assert.equal(styleValues['--agent-viewport-height'], '644px');
             """
         )
         _run_node(script)
+        self.assertIn(
+            "window.visualViewport?.addEventListener('resize', syncViewportHeight",
+            source,
+        )
+        self.assertIn("window.addEventListener('resize', syncViewportHeight", source)
 
 
 class AgentTranscriptLifecycleTests(unittest.TestCase):
-    def test_transcript_pruning_keeps_latest_and_active_message(self):
+    def test_transcript_pruning_keeps_the_latest_bounded_history(self):
         source = (ROOT / "app/static/js/agent.js").read_text(encoding="utf-8")
         prune_block = _extract(
             source,
-            "    function transcriptMessageMustRemain",
-            "\n    function appendUserMessage",
+            "    function pruneTranscript() {",
+            "\n\n    function appendMessage",
         )
         script = textwrap.dedent(
             f"""
             const assert = require('node:assert/strict');
-            const MAX_TRANSCRIPT_MESSAGES = 120;
-            const confirmationTimers = new Map();
-            let activeQuery = null;
+            const MAX_TRANSCRIPT_ITEMS = 120;
             const transcript = {{children: []}};
-            const clearConfirmationTimer = () => {{}};
+            Object.defineProperty(transcript, 'firstElementChild', {{
+              get: () => transcript.children[0] || null,
+            }});
             const message = (id) => {{
               const item = {{
                 id,
-                classList: {{contains: (name) => name === 'agent-message'}},
-                querySelector: () => null,
-                querySelectorAll: () => [],
                 remove: () => {{transcript.children.splice(transcript.children.indexOf(item), 1);}},
               }};
               return item;
             }};
             {prune_block}
             transcript.children = Array.from({{length: 122}}, (_, index) => message(index));
-            pruneTranscript({{preserve: [transcript.children.at(-1)]}});
+            pruneTranscript();
             assert.equal(transcript.children.length, 120);
             assert.equal(transcript.children[0].id, 2);
             assert.equal(transcript.children.at(-1).id, 121);
-
-            transcript.children = Array.from({{length: 121}}, (_, index) => message(index));
-            activeQuery = {{pending: transcript.children[0]}};
-            pruneTranscript({{preserve: [transcript.children.at(-1)]}});
-            assert.equal(transcript.children.length, 120);
-            assert.equal(transcript.children[0].id, 0);
-            assert.equal(transcript.children.some((item) => item.id === 1), false);
             """
         )
         _run_node(script)

@@ -1,11 +1,13 @@
 """Agent 写操作的稳定、脱敏确认展示契约。"""
+
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any
 
 from app.agent.models import RiskLevel, ToolResult
-from app.agent.result_projection import public_tool_label, sanitize_public_text
+from app.agent.public_safety import public_tool_label, sanitize_public_text
 
 CONTRACT_VERSION = 1
 
@@ -274,7 +276,6 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "object": "最近检查并冻结的下载直链、光鸭分享或资源候选",
         "impact": "会按确认页列出的来源、候选序号和目标创建幂等下载或转存请求；不会在确认页暴露链接、访问令牌、云端 file_id 或内部下载句柄。",
         "reversibility": "已发出的下载或转存请求无法从 Agent 撤回；可在对应下载器或光鸭任务中暂停、删除或人工处理。",
-
     },
     "library.trigger_patrol_now": {
         "action": "立即排队全库缺集巡检",
@@ -347,7 +348,9 @@ def build_confirmation_contract(
     contract = {
         "version": CONTRACT_VERSION,
         "action": _safe_contract_text(copy.get("action"), fallback=label),
-        "object": _safe_contract_text(copy.get("object"), fallback="当前预检选中的对象"),
+        "object": _safe_contract_text(
+            copy.get("object"), fallback="当前预检选中的对象"
+        ),
         "impact": _safe_contract_text(
             copy.get("impact"), fallback="确认后会执行服务端预检通过的受控操作。"
         ),
@@ -378,7 +381,9 @@ def sanitize_confirmation_contract(value: Any) -> dict[str, Any]:
     projected = {
         "version": CONTRACT_VERSION,
         "action": _safe_contract_text(value.get("action"), fallback="执行受控操作"),
-        "object": _safe_contract_text(value.get("object"), fallback="当前预检选中的对象"),
+        "object": _safe_contract_text(
+            value.get("object"), fallback="当前预检选中的对象"
+        ),
         "impact": _safe_contract_text(
             value.get("impact"), fallback="确认后会执行服务端预检通过的受控操作。"
         ),

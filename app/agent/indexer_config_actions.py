@@ -1,15 +1,16 @@
 """Media Agent 的非敏感资源站点配置读取与确认写入。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.indexers.config import (
     DEFAULT_INDEXER_SITE_IDS,
     INDEXER_SITE_LABELS,
@@ -74,9 +75,7 @@ def indexer_sites_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def _requested_updates(arguments: dict[str, Any]) -> dict[str, str]:
     updates = build_indexer_site_updates(arguments["site_ids"])
     if "enable_search" in arguments:
-        updates["INDEXER_SEARCH_ENABLED"] = (
-            "1" if arguments["enable_search"] else "0"
-        )
+        updates["INDEXER_SEARCH_ENABLED"] = "1" if arguments["enable_search"] else "0"
     return updates
 
 
@@ -130,15 +129,15 @@ def summarize_indexer_sites(_arguments: dict[str, Any]) -> ToolResult:
                 config.has_external_override(key) for key in _TARGET_KEYS
             ),
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅返回固定白名单站点的 ID、展示名与数量；未返回其他配置内容。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅返回固定白名单站点的 ID、展示名与数量；未返回其他配置内容。",
+                _now(),
+            )
+        ],
         suggestions=(
-            []
-            if site_ids
-            else ["可明确指定至少一个资源站点并在预检后确认保存。"]
+            [] if site_ids else ["可明确指定至少一个资源站点并在预检后确认保存。"]
         ),
     )
 
@@ -193,8 +192,7 @@ def _precondition_failure(state: dict[str, Any]) -> ToolResult | None:
         )
     requested_search = state["requested_enable_search"]
     search_unchanged = (
-        requested_search is None
-        or state["current_search_enabled"] is requested_search
+        requested_search is None or state["current_search_enabled"] is requested_search
     )
     if state["current_site_ids"] == state["requested_site_ids"] and search_unchanged:
         return ToolResult(
@@ -245,11 +243,13 @@ def _preview_set_indexer_sites(state: dict[str, Any]) -> ToolResult:
             "requested_enable_search": state["requested_enable_search"],
             "effects": effects,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅比较固定白名单站点选择与配置快照；未返回其他配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅比较固定白名单站点选择与配置快照；未返回其他配置值。",
+                _now(),
+            )
+        ],
     )
 
 
@@ -274,11 +274,11 @@ def _refresh_runtime() -> dict[str, bool]:
         )
     except Exception as exc:
         status["web"] = False
-        logger.warning(
-            "Agent Web 资源站点运行时刷新失败 type=%s", type(exc).__name__
-        )
+        logger.warning("Agent Web 资源站点运行时刷新失败 type=%s", type(exc).__name__)
     try:
-        from app.modules.telegram_resource_search import shutdown_telegram_indexer_worker
+        from app.modules.telegram_resource_search import (
+            shutdown_telegram_indexer_worker,
+        )
 
         if not shutdown_telegram_indexer_worker(
             timeout=_RUNTIME_REFRESH_TIMEOUT_SECONDS
@@ -361,11 +361,13 @@ def set_indexer_sites_confirmed(
             "runtime_refresh": runtime_refresh,
             "runtime_scope": "current_process",
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "使用一次性确认票据与配置快照原子更新固定白名单站点选择。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "使用一次性确认票据与配置快照原子更新固定白名单站点选择。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -383,11 +385,13 @@ def verify_indexer_sites_write(
     suggestions = list(result.suggestions)
     evidence = list(result.evidence)
     if verified:
-        evidence.append(Evidence(
-            "server_configuration",
-            "已从服务端持久化配置快照回读资源站点选择；未返回配置键或配置值。",
-            _now(),
-        ))
+        evidence.append(
+            Evidence(
+                "server_configuration",
+                "已从服务端持久化配置快照回读资源站点选择；未返回配置键或配置值。",
+                _now(),
+            )
+        )
     else:
         message = "站点选择已提交，但持久化回读尚未确认完整结果；请刷新设置页复核。"
         if message not in suggestions:

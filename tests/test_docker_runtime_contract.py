@@ -25,9 +25,9 @@ class DockerRuntimeContractTests(unittest.TestCase):
         cls.dev_compose = yaml.safe_load(
             (cls.ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8")
         )
-        cls.dev_env_example = (
-            cls.ROOT / ".env.development.example"
-        ).read_text(encoding="utf-8")
+        cls.dev_env_example = (cls.ROOT / ".env.development.example").read_text(
+            encoding="utf-8"
+        )
         cls.development_env = {
             key: value
             for key, value in dotenv_values(
@@ -39,9 +39,9 @@ class DockerRuntimeContractTests(unittest.TestCase):
             cls.ROOT / "packaging" / "scripts" / "docker-entrypoint.sh"
         ).read_text(encoding="utf-8")
         cls.dockerignore = (cls.ROOT / ".dockerignore").read_text(encoding="utf-8")
-        cls.workflow = (
-            cls.ROOT / ".github" / "workflows" / "docker.yml"
-        ).read_text(encoding="utf-8")
+        cls.workflow = (cls.ROOT / ".github" / "workflows" / "docker.yml").read_text(
+            encoding="utf-8"
+        )
 
     def test_image_uses_unified_single_worker_runtime_entrypoint(self) -> None:
         self.assertIn("COPY mediaflux.py /app/", self.dockerfile)
@@ -68,7 +68,9 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertIn("/app/db/logs", self.dockerfile)
         self.assertIn("/data/strm", self.dockerfile)
 
-        paths = RuntimePaths.from_environment(expected, platform_name="Linux", frozen=False)
+        paths = RuntimePaths.from_environment(
+            expected, platform_name="Linux", frozen=False
+        )
         self.assertEqual(paths.data_dir, Path("/app/db"))
         self.assertEqual(paths.config_dir, Path("/app/db"))
         self.assertEqual(paths.cache_dir, Path("/app/db/cache"))
@@ -77,8 +79,12 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertEqual(paths.database_path, Path("/app/db/mediaflux.db"))
         self.assertEqual(paths.env_file, Path("/app/db/user.env"))
 
-    def test_container_strm_runtime_path_is_the_default_business_output_root(self) -> None:
-        with tempfile.TemporaryDirectory(prefix="mediaflux-docker-strm-default-") as root:
+    def test_container_strm_runtime_path_is_the_default_business_output_root(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="mediaflux-docker-strm-default-"
+        ) as root:
             root_path = Path(root)
             data_dir = root_path / "db"
             strm_dir = root_path / "strm"
@@ -175,19 +181,33 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertIn("# ---------- 宿主机端口 ----------", self.dev_env_example)
         self.assertIn("# MEDIAFLUX_RUN_AS_ROOT=0", self.dev_env_example)
 
-        referenced = set(re.findall(r"\$\{([A-Z0-9_]+)\}", (self.ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8")))
+        referenced = set(
+            re.findall(
+                r"\$\{([A-Z0-9_]+)\}",
+                (self.ROOT / "docker-compose.dev.yml").read_text(encoding="utf-8"),
+            )
+        )
         self.assertEqual(referenced - self.development_env.keys(), set())
 
-    def test_image_entrypoint_defaults_to_nas_compatibility_and_supports_drop_privileges(self) -> None:
-        self.assertIn("apt-get install -y --no-install-recommends ffmpeg gosu", self.dockerfile)
+    def test_image_entrypoint_defaults_to_nas_compatibility_and_supports_drop_privileges(
+        self,
+    ) -> None:
+        self.assertIn(
+            "apt-get install -y --no-install-recommends ffmpeg gosu", self.dockerfile
+        )
         self.assertIn("MEDIAFLUX_FFPROBE=/usr/bin/ffprobe", self.dockerfile)
         self.assertIn("/usr/bin/ffprobe -version >/dev/null 2>&1", self.dockerfile)
         self.assertIn("COPY packaging/scripts/docker-entrypoint.sh", self.dockerfile)
-        self.assertIn('ENTRYPOINT ["/usr/local/bin/mediaflux-entrypoint"]', self.dockerfile)
+        self.assertIn(
+            'ENTRYPOINT ["/usr/local/bin/mediaflux-entrypoint"]', self.dockerfile
+        )
         self.assertNotIn("USER mediaflux", self.dockerfile)
         self.assertIn('exec gosu "$puid:$pgid" "$@"', self.entrypoint)
         self.assertIn('chown -R "$puid:$pgid" /app/db', self.entrypoint)
-        self.assertIn('data_owner_marker="/app/db/.mediaflux-owner-${puid}-${pgid}"', self.entrypoint)
+        self.assertIn(
+            'data_owner_marker="/app/db/.mediaflux-owner-${puid}-${pgid}"',
+            self.entrypoint,
+        )
         self.assertIn("MEDIAFLUX_FIX_DATA_PERMISSIONS", self.entrypoint)
         self.assertEqual(self.entrypoint.count('chown -R "$puid:$pgid" /app/db'), 1)
         self.assertIn('chown "$puid:$pgid" /data/strm', self.entrypoint)
@@ -214,11 +234,15 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertIn("入口脚本**永不递归改权**", deploy)
         self.assertIn("不要同时配置 Compose 的 `user:`", deploy)
 
-    def test_operator_docs_match_health_backup_and_release_runtime_contracts(self) -> None:
+    def test_operator_docs_match_health_backup_and_release_runtime_contracts(
+        self,
+    ) -> None:
         readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
         deploy = (self.ROOT / "docs" / "部署指南.md").read_text(encoding="utf-8")
         faq = (self.ROOT / "docs" / "常见问题.md").read_text(encoding="utf-8")
-        config_reference = (self.ROOT / "docs" / "配置参考.md").read_text(encoding="utf-8")
+        config_reference = (self.ROOT / "docs" / "配置参考.md").read_text(
+            encoding="utf-8"
+        )
         development = (self.ROOT / "docs" / "开发文档.md").read_text(encoding="utf-8")
 
         self.assertNotIn("curl -I ", faq)
@@ -236,9 +260,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
         workflow = yaml.safe_load(self.workflow)
         jobs = workflow["jobs"]
         browser = jobs["browser"]
-        browser_runs = "\n".join(
-            str(step.get("run", "")) for step in browser["steps"]
-        )
+        browser_runs = "\n".join(str(step.get("run", "")) for step in browser["steps"])
         playwright_modules = {
             f"tests.{path.stem}"
             for path in (self.ROOT / "tests").glob("test_*.py")
@@ -250,7 +272,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertEqual(
             playwright_modules,
             {
-                "tests.test_agent_browser",
+                "tests.test_agent_kernel_browser",
                 "tests.test_guangya_directory_scrape_browser",
                 "tests.test_guangya_directory_scrape_ui",
                 "tests.test_media_profile_in_place_ui",
@@ -288,8 +310,8 @@ class DockerRuntimeContractTests(unittest.TestCase):
             'legacy_organize_key = "organize-summary:docker-upgrade:100"',
             '"<b>✅ 光鸭整理完成</b>\\n"',
             '"<blockquote>升级迁移测试 &amp; 安全正文</blockquote>"',
-            'AND name=\'organize_notification_outbox\'',
-            'legacy_organize_table is None',
+            "AND name='organize_notification_outbox'",
+            "legacy_organize_table is None",
             '"FROM telegram_notification_outbox WHERE event_key=?"',
             'event["title"] == "✅ 光鸭整理完成"',
             '"升级迁移测试 & 安全正文"',
@@ -352,14 +374,16 @@ class DockerRuntimeContractTests(unittest.TestCase):
             "chmod 0444 /app/app/_build_info.json",
         ):
             self.assertIn(value, self.dockerfile)
-        self.assertNotIn("COPY --chown=mediaflux:mediaflux app /app/app", self.dockerfile)
+        self.assertNotIn(
+            "COPY --chown=mediaflux:mediaflux app /app/app", self.dockerfile
+        )
 
     def test_release_workflow_fails_closed_before_publishing(self) -> None:
         for value in (
             "if: startsWith(github.ref, 'refs/tags/v')",
             'git merge-base --is-ancestor "$BUILD_SHA" origin/main',
-            'module._changelog_section(',
-            'permissions:\n  contents: read',
+            "module._changelog_section(",
+            "permissions:\n  contents: read",
             "from app import __version__",
             "does not match source version",
             "CHANGELOG.md is missing a dated, non-empty",
@@ -388,7 +412,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
 
     def test_official_container_defaults_cover_zero_env_first_run(self) -> None:
         self.assertIn("MEDIAFLUX_CONTAINER=1", self.dockerfile)
-        self.assertIn('MEDIAFLUX_RUN_AS_ROOT:-1', self.entrypoint)
+        self.assertIn("MEDIAFLUX_RUN_AS_ROOT:-1", self.entrypoint)
 
 
 if __name__ == "__main__":

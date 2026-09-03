@@ -1,26 +1,25 @@
 """媒体消费、显式偏好、今日摘要与通知规则的 Agent 回归。"""
+
 from __future__ import annotations
 
 from unittest.mock import Mock, patch
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.media_consumption_actions import (
     continue_watching_arguments,
     notification_rule_update_arguments,
     preferences_update_arguments,
 )
-from app.agent.orchestrator import (
-    continue_watching_request,
-    is_today_media_summary_message,
-    media_preferences_request,
-    media_subscription_notification_rule_request,
-)
-from app.agent.models import ToolResult
 from app.agent.rate_limit import agent_rate_limiter
-from app.agent.registry import AgentToolError
-from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.clients.base import MediaItem
 from app.modules.media_server_profiles import MediaServerProfile
+from tests.agent_kernel_test_harness import (
+    get_kernel_test_service as get_agent_service,
+)
+from tests.agent_kernel_test_harness import (
+    reset_kernel_test_service as reset_agent_service_for_tests,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -84,11 +83,9 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             {"preferred_download_target": "both"},
         )
         self.assertEqual(
-            notification_rule_update_arguments({
-                "subscription_number": 1,
-                "enabled": True,
-                "notify_on_missing": True,
-            }),
+            notification_rule_update_arguments(
+                {"subscription_number": 1, "enabled": True, "notify_on_missing": True}
+            ),
             {"subscription_number": 1, "enabled": True, "notify_on_missing": True},
         )
         with self.assertRaises(AgentToolError):
@@ -98,7 +95,9 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             notification_rule_update_arguments({"subscription_number": 1})
 
-    def test_continue_watching_requires_explicit_user_and_redacts_internal_ids(self) -> None:
+    def test_continue_watching_requires_explicit_user_and_redacts_internal_ids(
+        self,
+    ) -> None:
         service = get_agent_service()
         profile = MediaServerProfile(
             source="configured:jellyfin",
@@ -141,14 +140,18 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertEqual(item["progress"], 42.5)
         serialized = repr(response)
         for secret in (
-            "PRIVATE-ITEM-ID", "PRIVATE-USER-ID", "PRIVATE-TOKEN", "private.local"
+            "PRIVATE-ITEM-ID",
+            "PRIVATE-USER-ID",
+            "PRIVATE-TOKEN",
+            "private.local",
         ):
             self.assertNotIn(secret, serialized)
         client.continue_watching.assert_called_once_with("PRIVATE-USER-ID", limit=8)
         client.close.assert_called_once_with()
-
         failed_client = Mock()
-        failed_client.continue_watching.side_effect = RuntimeError("provider unavailable")
+        failed_client.continue_watching.side_effect = RuntimeError(
+            "provider unavailable"
+        )
         with (
             patch(
                 "app.agent.media_consumption_actions.list_configured_profiles",
@@ -166,7 +169,6 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(unavailable["result"]["status"], "unavailable")
         failed_client.close.assert_called_once_with()
-
         profile_without_user = MediaServerProfile(
             source="configured:jellyfin",
             server_type="jellyfin",
@@ -180,42 +182,37 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             "app.agent.media_consumption_actions.list_configured_profiles",
             return_value=[profile_without_user],
         ):
-            blocked = service.invoke(
-                "media.continue_watching", {}, owner="owner-a"
-            )
+            blocked = service.invoke("media.continue_watching", {}, owner="owner-a")
         self.assertEqual(blocked["result"]["status"], "precondition_failed")
         self.assertIn("不会回退", blocked["result"]["error"])
 
-    def test_preferences_are_owner_isolated_confirmation_gated_and_clearable(self) -> None:
+    def test_preferences_are_owner_isolated_confirmation_gated_and_clearable(
+        self,
+    ) -> None:
         service = get_agent_service()
+        before = service.invoke("media.preferences", {}, owner="owner-a")
+        self.assertFalse(before["result"]["data"]["explicit"])
         prepared = service.prepare(
             "media.set_preferences",
-            {
-                "preferred_server": "jellyfin",
-                "preferred_download_target": "both",
-            },
+            {"preferred_server": "jellyfin", "preferred_download_target": "both"},
             owner="owner-a",
         )
         self.assertEqual(prepared["mode"], "confirmation_required")
-        before = service.invoke("media.preferences", {}, owner="owner-a")
-        self.assertFalse(before["result"]["data"]["explicit"])
-        confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="owner-a"
-        )
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(confirmed["result"]["status"], "completed")
-
         owner_a = service.invoke("media.preferences", {}, owner="owner-a")
         owner_b = service.invoke("media.preferences", {}, owner="owner-b")
         self.assertEqual(owner_a["result"]["data"]["preferred_server"], "jellyfin")
         self.assertTrue(owner_a["result"]["data"]["explicit"])
         self.assertEqual(owner_b["result"]["data"]["preferred_server"], "any")
         self.assertFalse(owner_b["result"]["data"]["explicit"])
-
         clear = service.prepare("media.clear_preferences", {}, owner="owner-a")
         service.confirm(clear["action_plan"]["plan_id"], owner="owner-a")
         cleared = service.invoke("media.preferences", {}, owner="owner-a")
         self.assertFalse(cleared["result"]["data"]["explicit"])
-        self.assertEqual(cleared["result"]["data"]["preferred_download_target"], "guangya")
+        self.assertEqual(
+            cleared["result"]["data"]["preferred_download_target"], "guangya"
+        )
 
     def test_preference_confirmation_detects_stale_revision(self) -> None:
         service = get_agent_service()
@@ -232,9 +229,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         )
         self.assertIsNotNone(changed)
         with self.assertRaises(AgentToolError) as captured:
-            service.confirm(
-                prepared["action_plan"]["plan_id"], owner="owner-a"
-            )
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(captured.exception.code, "confirmation_stale")
 
     def test_notification_rule_is_revisioned_and_resettable(self) -> None:
@@ -247,7 +242,6 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertFalse(defaults["result"]["data"]["enabled"])
         self.assertTrue(defaults["result"]["data"]["notify_on_missing"])
         self.assertFalse(defaults["result"]["data"]["explicit"])
-
         prepared = service.prepare(
             "media.set_subscription_notification_rule",
             {
@@ -266,7 +260,6 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertTrue(explicit["result"]["data"]["enabled"])
         self.assertTrue(explicit["result"]["data"]["notify_on_satisfied"])
         self.assertTrue(explicit["result"]["data"]["explicit"])
-
         reset = service.prepare(
             "media.reset_subscription_notification_rule",
             {"subscription_number": self.sid},
@@ -286,23 +279,20 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         revision = int(db.get_media_subscription(self.sid)["revision"])
         with db.get_conn() as conn:
             conn.execute(
-                "INSERT INTO media_subscription_runs("
-                "subscription_id,trigger_type,subscription_revision,status,summary,"
-                "payload_json,error,started_at,finished_at) VALUES(?, 'manual', ?, "
-                "'missing', '', '{}', '', ?, ?)",
+                "INSERT INTO media_subscription_runs(subscription_id,trigger_type,subscription_revision,status,summary,payload_json,error,started_at,finished_at) VALUES(?, 'manual', ?, 'missing', '', '{}', '', ?, ?)",
                 (self.sid, revision, stamp, stamp),
             )
             conn.execute(
-                "INSERT INTO download_log(source,title,status,created_at,updated_at,completed_at) "
-                "VALUES('qb', ?, 'success', ?, ?, ?)",
+                "INSERT INTO download_log(source,title,status,created_at,updated_at,completed_at) VALUES('qb', ?, 'success', ?, ?, ?)",
                 ("安全标题", stamp, stamp, stamp),
             )
             conn.execute(
-                "INSERT INTO download_log(source,title,status,created_at,updated_at,completed_at) "
-                "VALUES('qb', ?, 'success', ?, ?, ?)",
+                "INSERT INTO download_log(source,title,status,created_at,updated_at,completed_at) VALUES('qb', ?, 'success', ?, ?, ?)",
                 ("/private/library/SECRET.mkv", stamp, stamp, stamp),
             )
-        response = get_agent_service().invoke("media.today_summary", {}, owner="owner-a")
+        response = get_agent_service().invoke(
+            "media.today_summary", {}, owner="owner-a"
+        )
         data = response["result"]["data"]
         self.assertEqual(data["event_count"], 3)
         self.assertEqual(data["subscription_runs"]["missing"], 1)
@@ -311,102 +301,12 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         self.assertNotIn("SECRET", repr(response))
         self.assertLessEqual(len(data["content_titles"]), 8)
 
-    def test_explicit_download_target_preference_is_used_for_recent_resource(self) -> None:
-        service = get_agent_service()
-        prepared = service.prepare(
-            "media.set_preferences",
-            {"preferred_download_target": "qb"},
-            owner="owner-a",
-        )
-        service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
-        service.recent_resource_store.capture(
-            owner="owner-a",
-            result=ToolResult(
-                True,
-                "success",
-                "找到资源",
-                data={
-                    "items": [{
-                        "result_id": "resource-result-0001",
-                        "title": "安全候选",
-                        "site_id": "mikan",
-                        "site_name": "Mikan",
-                        "size_text": "1 GiB",
-                        "download_state": "ready",
-                        "download_kinds": ["magnet"],
-                    }]
-                },
-            ),
-        )
-        with patch.object(
-            service,
-            "prepare",
-            return_value={"mode": "confirmation_required"},
-        ) as prepare_mock:
-            response = service._continue_recent_resource_submit(
-                {"source_type": "resource_candidates", "positions": [1], "target": None}, owner="owner-a"
-            )
-        self.assertEqual(response["mode"], "confirmation_required")
-        self.assertEqual(
-            prepare_mock.call_args.args[:2],
-            (
-                "ingest.submit",
-                {
-                    "source_type": "resource_candidates",
-                    "positions": [1],
-                    "target": "qb",
-                },
-            ),
-        )
+    def test_resource_submit_retrieval_includes_saved_preference_reader(self) -> None:
+        from app.agent.kernel.capabilities import CapabilityRetriever
 
-    def test_natural_language_parsers_bind_exact_safe_tools(self) -> None:
-        self.assertEqual(
-            continue_watching_request("查看 Jellyfin 继续观看前 5 个"),
-            {"server": "jellyfin", "limit": 5},
+        selection = CapabilityRetriever().retrieve(
+            "把刚才第 1 个资源按我的默认下载目标提交",
+            get_agent_service().catalog,
         )
-        self.assertEqual(
-            media_preferences_request("以后默认下载到光鸭"),
-            (
-                "media.set_preferences",
-                {"preferred_download_target": "guangya"},
-            ),
-        )
-        self.assertIsNone(
-            media_preferences_request("媒体偏好改成国语，默认下载到光鸭")
-        )
-        self.assertEqual(
-            media_subscription_notification_rule_request(
-                f"开启媒体订阅 {self.sid} 的缺集通知"
-            ),
-            (
-                "media.set_subscription_notification_rule",
-                {
-                    "subscription_number": self.sid,
-                    "notify_on_missing": True,
-                    "enabled": True,
-                },
-            ),
-        )
-        self.assertTrue(is_today_media_summary_message("今天下载和入库了什么"))
-        self.assertFalse(is_today_media_summary_message("今天新番播什么"))
-
-    def test_natural_queries_route_without_guessing(self) -> None:
-        service = get_agent_service()
-        preferences = service.query("查看我的媒体偏好", owner="owner-a", present=False)
-        self.assertEqual(preferences["tool_call"]["name"], "media.preferences")
-        rule = service.query(
-            f"查看媒体订阅 {self.sid} 的通知规则", owner="owner-a", present=False
-        )
-        self.assertEqual(
-            rule["tool_call"]["name"], "media.subscription_notification_rule"
-        )
-        prepared = service.query(
-            f"开启媒体订阅 {self.sid} 的缺集通知",
-            owner="owner-a",
-            present=False,
-        )
-        self.assertEqual(prepared["mode"], "confirmation_required")
-        self.assertEqual(
-            prepared["tool_call"]["name"],
-            "media.set_subscription_notification_rule",
-        )
+        self.assertIn("ingest.submit", selection.names)
+        self.assertIn("media.preferences", selection.names)

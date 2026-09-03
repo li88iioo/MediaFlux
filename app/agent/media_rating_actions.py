@@ -1,20 +1,21 @@
 """按明确媒体身份查询评分；优先豆瓣结构化数据，必要时受控核验豆瓣条目页。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import math
 import re
 import unicodedata
+from datetime import datetime
 from typing import Any
 from urllib.parse import urlsplit
 
-from bs4 import BeautifulSoup
 import httpx
+from bs4 import BeautifulSoup
 
 from app import config
 from app.agent.async_bridge import AsyncBridgeUnavailable, run_awaitable_sync
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.agent.web_search_actions import search_web
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.search import get_discovery_search_service
@@ -60,7 +61,13 @@ def _match_text(value: Any) -> str:
 
 
 def _media_type_label(media_type: str) -> str:
-    return "电视剧" if media_type == "tv" else "电影" if media_type == "movie" else "影视作品"
+    return (
+        "电视剧"
+        if media_type == "tv"
+        else "电影"
+        if media_type == "movie"
+        else "影视作品"
+    )
 
 
 def _douban_title_key(value: Any) -> str:
@@ -217,16 +224,18 @@ def _success_result(
             "source_method": source_method,
             "web_fallback_used": web_fallback_used,
         },
-        evidence=[Evidence(
-            "douban" if not web_fallback_used else "web_search",
-            {
-                "douban_search": "豆瓣结构化媒体数据",
-                "douban_detail": "豆瓣结构化媒体详情",
-                "web_search": "豆瓣网页搜索摘要",
-                "web_fetch": "豆瓣公开条目页",
-            }.get(source_method, "豆瓣公开媒体数据"),
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "douban" if not web_fallback_used else "web_search",
+                {
+                    "douban_search": "豆瓣结构化媒体数据",
+                    "douban_detail": "豆瓣结构化媒体详情",
+                    "web_search": "豆瓣网页搜索摘要",
+                    "web_fetch": "豆瓣公开条目页",
+                }.get(source_method, "豆瓣公开媒体数据"),
+                _now(),
+            )
+        ],
         suggestions=["如果要继续检查缺集或更新，直接说“检查这部剧有没有缺集”。"],
     )
 
@@ -267,7 +276,9 @@ def _rating_from_douban_html(
     title_text = (
         str(title_node.get("content") or "")
         if title_node is not None
-        else soup.title.get_text(" ", strip=True) if soup.title is not None else ""
+        else soup.title.get_text(" ", strip=True)
+        if soup.title is not None
+        else ""
     )
     description_text = (
         str(description_node.get("content") or "")
@@ -281,8 +292,10 @@ def _rating_from_douban_html(
     if year and year not in identity_text:
         return None
     lowered_identity = identity_text.casefold()
-    if media_type == "tv" and "电影" in lowered_identity and not any(
-        token in lowered_identity for token in ("电视剧", "剧集", "电视")
+    if (
+        media_type == "tv"
+        and "电影" in lowered_identity
+        and not any(token in lowered_identity for token in ("电视剧", "剧集", "电视"))
     ):
         return None
     if media_type == "movie" and any(
@@ -299,7 +312,11 @@ def _rating_from_douban_html(
         node = soup.select_one(selector)
         if node is None:
             continue
-        raw_value = node.get("content") if node.name == "meta" else node.get_text(" ", strip=True)
+        raw_value = (
+            node.get("content")
+            if node.name == "meta"
+            else node.get_text(" ", strip=True)
+        )
         rating = _valid_rating(raw_value)
         if rating is not None:
             return rating
@@ -373,7 +390,9 @@ def _web_rating(
     qualifiers = [query]
     if year:
         qualifiers.append(year)
-    qualifiers.extend([_media_type_label(media_type), "豆瓣评分", "site:movie.douban.com"])
+    qualifiers.extend(
+        [_media_type_label(media_type), "豆瓣评分", "site:movie.douban.com"]
+    )
     result = search_web({"query": " ".join(qualifiers), "max_results": 5})
     if not result.ok:
         return None
@@ -391,13 +410,19 @@ def _web_rating(
         if not query_key or _douban_title_key(title) != query_key:
             continue
         lowered = combined.casefold()
-        if media_type == "tv" and "电影" in lowered and not any(
-            token in lowered for token in ("电视剧", "剧集", "电视")
+        if (
+            media_type == "tv"
+            and "电影" in lowered
+            and not any(token in lowered for token in ("电视剧", "剧集", "电视"))
         ):
             continue
-        if media_type == "movie" and any(token in lowered for token in ("电视剧", "剧集")):
+        if media_type == "movie" and any(
+            token in lowered for token in ("电视剧", "剧集")
+        ):
             continue
-        match = _SCORE_NEAR_LABEL_RE.search(combined) or _SCORE_BEFORE_LABEL_RE.search(combined)
+        match = _SCORE_NEAR_LABEL_RE.search(combined) or _SCORE_BEFORE_LABEL_RE.search(
+            combined
+        )
         if match and (not year or year in combined):
             rating = _valid_rating(match.group(1))
             if rating is not None:
@@ -501,7 +526,9 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
     media_label = _media_type_label(media_type)
     identity = f"《{query}》"
     if year or media_type:
-        qualifiers = "，".join(value for value in (year, media_label if media_type else "") if value)
+        qualifiers = "，".join(
+            value for value in (year, media_label if media_type else "") if value
+        )
         identity += f"（{qualifiers}）"
     if not media_type:
         reason = "存在同名作品，暂时无法确认要查询电影还是电视剧"
@@ -528,11 +555,13 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
             "source_method": "none",
             "web_fallback_used": web_fallback_attempted,
         },
-        evidence=[Evidence(
-            "douban",
-            "已尝试豆瓣结构化数据；启用网页搜索时也会核验豆瓣网页摘要。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "douban",
+                "已尝试豆瓣结构化数据；启用网页搜索时也会核验豆瓣网页摘要。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
         error="rating_unavailable" if provider_error else "rating_not_found",
     )

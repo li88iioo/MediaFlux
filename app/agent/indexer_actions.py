@@ -1,4 +1,5 @@
 """Media Agent 的多站资源搜索与确认提交动作。"""
+
 from __future__ import annotations
 
 import asyncio
@@ -15,8 +16,8 @@ from app.agent.async_bridge import (
     AsyncBridgeUnavailable,
     ensure_sync_bridge_available,
 )
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.indexers.downloads import (
     DownloadRequestCreationError,
@@ -110,26 +111,32 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         },
     )
     title = _visible_text(arguments.get("title"), name="title", required=True)
-    original_title = _visible_text(arguments.get("original_title", ""), name="original_title")
-    english_title = _visible_text(arguments.get("english_title", ""), name="english_title")
+    original_title = _visible_text(
+        arguments.get("original_title", ""), name="original_title"
+    )
+    english_title = _visible_text(
+        arguments.get("english_title", ""), name="english_title"
+    )
 
     raw_aliases = arguments.get("aliases", [])
     if not isinstance(raw_aliases, list) or len(raw_aliases) > 8:
         raise AgentToolError("aliases 必须是最多包含 8 项的数组")
-    aliases = [_visible_text(value, name="alias", required=True) for value in raw_aliases]
+    aliases = [
+        _visible_text(value, name="alias", required=True) for value in raw_aliases
+    ]
 
     year = arguments.get("year")
     if year is not None and (
-        isinstance(year, bool)
-        or not isinstance(year, int)
-        or not 1800 <= year <= 2200
+        isinstance(year, bool) or not isinstance(year, int) or not 1800 <= year <= 2200
     ):
         raise AgentToolError("year 必须是 1800 到 2200 的整数")
     media_type = arguments.get("media_type", "")
-    if (
-        not isinstance(media_type, str)
-        or media_type.strip().lower() not in {"", "movie", "tv", "anime"}
-    ):
+    if not isinstance(media_type, str) or media_type.strip().lower() not in {
+        "",
+        "movie",
+        "tv",
+        "anime",
+    }:
         raise AgentToolError("media_type 仅支持 movie、tv 或 anime")
     media_type = media_type.strip().lower()
 
@@ -178,7 +185,6 @@ def submit_arguments(arguments: dict[str, Any]) -> dict[str, str]:
     if not isinstance(target, str) or target.strip().lower() not in _TARGETS:
         raise AgentToolError("target 仅支持 qb、guangya 或 both")
     return {"result_id": result_id.strip(), "target": target.strip().lower()}
-
 
 
 def _safe_text(value: Any, maximum: int) -> str:
@@ -275,8 +281,7 @@ def search_resources(
         item = _public_item(raw_item)
         if (
             _RESULT_ID_RE.fullmatch(str(item.get("result_id") or ""))
-            and str(item.get("download_state") or "").lower()
-            in {"ready", "resolvable"}
+            and str(item.get("download_state") or "").lower() in {"ready", "resolvable"}
             and bool(set(item.get("download_kinds") or []) & {"magnet", "torrent"})
         ):
             candidate_position += 1
@@ -332,9 +337,7 @@ def search_resources(
             )
         ],
         suggestions=(
-            ["回复“第 2 个到 qB / 光鸭 / 两边”，即可进入提交确认。"]
-            if items
-            else []
+            ["回复“第 2 个到 qB / 光鸭 / 两边”，即可进入提交确认。"] if items else []
         ),
     )
 
@@ -521,7 +524,9 @@ def _submit_resource(
             )
         )
     except IndexerError as exc:
-        return ToolResult(False, "conflict", exc.public_message, error=exc.public_message)
+        return ToolResult(
+            False, "conflict", exc.public_message, error=exc.public_message
+        )
     except InvalidDownloadData:
         return ToolResult(
             False, "unavailable", "资源下载数据无效", error="资源下载数据无效。"
@@ -595,8 +600,11 @@ def submit_resource_confirmed(
     if not secrets.compare_digest(
         str(state["fingerprint"]), str(expected_context or "")
     ):
-        raise AgentToolError("资源或下载配置已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "资源或下载配置已变化，请重新预检", code="confirmation_stale"
+        )
     return _submit_resource(arguments, service=state.get("service"))
+
 
 def _capture_submit_resource_batch(arguments: dict[str, Any]) -> dict[str, Any]:
     if not config.get_bool("INDEXER_SEARCH_ENABLED"):
@@ -618,9 +626,7 @@ def _capture_submit_resource_batch(arguments: dict[str, Any]) -> dict[str, Any]:
                     "site_name": str(item.site_name),
                     "title": str(item.title),
                     "download_state": str(item.download_state),
-                    "download_kinds": sorted(
-                        str(kind) for kind in item.download_kinds
-                    ),
+                    "download_kinds": sorted(str(kind) for kind in item.download_kinds),
                 }
             )
     except IndexerError as exc:
@@ -776,7 +782,12 @@ def _submit_resource_batch(
     }
     accepted = counts["submitted"] + counts["partial"]
     review_required = counts["manual_review"]
-    if accepted and not counts["failed"] and not counts["duplicate"] and not review_required:
+    if (
+        accepted
+        and not counts["failed"]
+        and not counts["duplicate"]
+        and not review_required
+    ):
         status, summary = "accepted", f"{accepted} 个下载任务已提交"
     elif accepted:
         status, summary = (
@@ -784,7 +795,10 @@ def _submit_resource_batch(
             f"批量提交完成：{accepted} 个已受理，{len(items) - accepted} 个未受理",
         )
     elif review_required:
-        status, summary = "review_required", f"{review_required} 个下载任务提交结果待核对"
+        status, summary = (
+            "review_required",
+            f"{review_required} 个下载任务提交结果待核对",
+        )
     elif counts["duplicate"] and not counts["failed"]:
         status, summary = "conflict", "所选资源均已提交或正在处理中"
     else:
@@ -827,5 +841,7 @@ def submit_resource_batch_confirmed(
     if not secrets.compare_digest(
         str(state["fingerprint"]), str(expected_context or "")
     ):
-        raise AgentToolError("资源集合或下载配置已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "资源集合或下载配置已变化，请重新预检", code="confirmation_stale"
+        )
     return _submit_resource_batch(arguments, service=state.get("service"))

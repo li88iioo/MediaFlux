@@ -1,25 +1,29 @@
 """Agent 光鸭重命名：只读冻结计划、owner-bound 确认与持久执行。"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 import logging
 import re
 import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolContext, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import sanitize_public_text
-from app.agent.session_context import AgentContextWriteGuard, AgentSessionContextRepository
+from app.agent.public_safety import sanitize_public_text
+from app.agent.session_context import (
+    AgentContextWriteGuard,
+    AgentSessionContextRepository,
+)
 from app.clients.guangya import GuangYaClient
 from app.modules.guangya_media_hygiene import build_media_hygiene_plan
 from app.modules.guangya_rename import (
+    CANONICAL_RENAME_PLAN_MODES,
     GuangYaRenamePlanError,
     GuangYaRenamePlanStale,
-    CANONICAL_RENAME_PLAN_MODES,
     build_rename_plan,
     confirm_rename_plan,
     discard_rename_plan,
@@ -38,11 +42,19 @@ _PLAN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _FINGERPRINT_RE = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC_RENAME_MODES = {"remove_bitrate", "replace_text"}
 _PREVIEW_COUNT_KEYS = (
-    "scope_count", "scanned_items", "scanned_dirs", "matched",
-    "rename_count", "conflict_count", "no_change_count",
-    "identified_video_count", "unidentified_video_count",
-    "video_rename_count", "companion_rename_count",
-    "directory_rename_count", "metadata_enriched_count",
+    "scope_count",
+    "scanned_items",
+    "scanned_dirs",
+    "matched",
+    "rename_count",
+    "conflict_count",
+    "no_change_count",
+    "identified_video_count",
+    "unidentified_video_count",
+    "video_rename_count",
+    "companion_rename_count",
+    "directory_rename_count",
+    "metadata_enriched_count",
 )
 
 
@@ -96,10 +108,7 @@ def _safe_preview(value: Any) -> dict[str, Any] | None:
     if mode not in CANONICAL_RENAME_PLAN_MODES:
         return None
     try:
-        counts = {
-            key: max(0, int(value.get(key) or 0))
-            for key in _PREVIEW_COUNT_KEYS
-        }
+        counts = {key: max(0, int(value.get(key) or 0)) for key in _PREVIEW_COUNT_KEYS}
     except (TypeError, ValueError, OverflowError):
         return None
     samples: list[str] = []
@@ -146,9 +155,13 @@ def _flow_from_payload(
     ):
         return None
     return _Flow(
-        owner=str(owner), plan_id=plan_id, fingerprint=fingerprint,
-        preview_safe=preview_safe, updated_at=time.monotonic(),
-        generation=max(0, int(generation or 0)), revision=max(0, int(revision or 0)),
+        owner=str(owner),
+        plan_id=plan_id,
+        fingerprint=fingerprint,
+        preview_safe=preview_safe,
+        updated_at=time.monotonic(),
+        generation=max(0, int(generation or 0)),
+        revision=max(0, int(revision or 0)),
     )
 
 
@@ -168,12 +181,14 @@ def _begin_flow_update(
         begin_update = getattr(_repository, "begin_context_update", None)
         if callable(begin_update):
             persisted, guard = begin_update(
-                owner=owner, context_type=_CONTEXT_TYPE,
+                owner=owner,
+                context_type=_CONTEXT_TYPE,
             )
             previous = None
             if persisted is not None:
                 previous = _flow_from_payload(
-                    owner, persisted.payload,
+                    owner,
+                    persisted.payload,
                     generation=persisted.generation,
                     revision=persisted.revision,
                 )
@@ -203,7 +218,8 @@ def _save(flow: _Flow) -> bool:
                     payload=_flow_payload(flow),
                     expires_at=time.time() + _TTL_SECONDS,
                     guard=AgentContextWriteGuard(
-                        generation=flow.generation, revision=flow.revision,
+                        generation=flow.generation,
+                        revision=flow.revision,
                     ),
                 )
                 if persisted is None:
@@ -212,15 +228,18 @@ def _save(flow: _Flow) -> bool:
                 flow.revision = persisted.revision
             else:
                 _repository.replace_latest(
-                    owner=flow.owner, context_type=_CONTEXT_TYPE,
-                    payload=_flow_payload(flow), expires_at=time.time() + _TTL_SECONDS,
+                    owner=flow.owner,
+                    context_type=_CONTEXT_TYPE,
+                    payload=_flow_payload(flow),
+                    expires_at=time.time() + _TTL_SECONDS,
                 )
         except Exception as exc:
             logger.warning("Agent 光鸭重命名上下文保存失败 type=%s", type(exc).__name__)
             return False
     with _lock:
         expired = [
-            owner for owner, item in _flows.items()
+            owner
+            for owner, item in _flows.items()
             if time.monotonic() - item.updated_at > _TTL_SECONDS
         ]
         for owner in expired:
@@ -236,7 +255,9 @@ def _flow(owner: str) -> _Flow | None:
     if _repository is not None:
         try:
             persisted = _repository.get_latest(
-                owner=owner_key, context_type=_CONTEXT_TYPE, now=time.time(),
+                owner=owner_key,
+                context_type=_CONTEXT_TYPE,
+                now=time.time(),
             )
         except Exception as exc:
             logger.warning("Agent 光鸭重命名上下文恢复失败 type=%s", type(exc).__name__)
@@ -244,8 +265,10 @@ def _flow(owner: str) -> _Flow | None:
         if persisted is None:
             return None
         restored = _flow_from_payload(
-            owner_key, persisted.payload,
-            generation=persisted.generation, revision=persisted.revision,
+            owner_key,
+            persisted.payload,
+            generation=persisted.generation,
+            revision=persisted.revision,
         )
         if restored is None:
             return None
@@ -265,16 +288,23 @@ def _consume(flow: _Flow) -> bool:
         consume = getattr(_repository, "consume_latest_guarded", None)
         try:
             if callable(consume) and flow.generation > 0 and flow.revision > 0:
-                consumed = bool(consume(
-                    owner=flow.owner, context_type=_CONTEXT_TYPE,
-                    guard=AgentContextWriteGuard(
-                        generation=flow.generation, revision=flow.revision,
-                    ),
-                ))
+                consumed = bool(
+                    consume(
+                        owner=flow.owner,
+                        context_type=_CONTEXT_TYPE,
+                        guard=AgentContextWriteGuard(
+                            generation=flow.generation,
+                            revision=flow.revision,
+                        ),
+                    )
+                )
             elif not callable(consume):
-                consumed = bool(_repository.delete_latest(
-                    owner=flow.owner, context_type=_CONTEXT_TYPE,
-                ))
+                consumed = bool(
+                    _repository.delete_latest(
+                        owner=flow.owner,
+                        context_type=_CONTEXT_TYPE,
+                    )
+                )
             else:
                 consumed = False
         except Exception as exc:
@@ -321,10 +351,17 @@ def guangya_rename_preview_arguments(arguments: dict[str, Any]) -> dict[str, Any
     if type(recursive) is not bool:
         raise AgentToolError("recursive 必须是布尔值")
     limit = arguments.get("limit", 100)
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= 10_000
+    ):
         raise AgentToolError("limit 必须是 1 到 10000 的整数")
     normalized: dict[str, Any] = {
-        "paths": paths, "mode": mode, "recursive": recursive, "limit": limit,
+        "paths": paths,
+        "mode": mode,
+        "recursive": recursive,
+        "limit": limit,
     }
     if mode == "replace_text":
         find_text = arguments.get("find")
@@ -387,7 +424,8 @@ def _preview_projection(plan: dict[str, Any]) -> dict[str, Any]:
         before = sanitize_public_text(item.get("before"), limit=255)
         after = sanitize_public_text(item.get("after"), limit=255)
         sample = sanitize_public_text(
-            f"{before} → {after}" if before and after else "", limit=520,
+            f"{before} → {after}" if before and after else "",
+            limit=520,
         )
         if sample:
             sample_changes.append(sample)
@@ -401,11 +439,15 @@ def _preview_projection(plan: dict[str, Any]) -> dict[str, Any]:
         "conflict_count": max(0, int(stats.get("conflict_count") or 0)),
         "no_change_count": max(0, int(stats.get("no_change_count") or 0)),
         "identified_video_count": max(0, int(stats.get("identified_video_count") or 0)),
-        "unidentified_video_count": max(0, int(stats.get("unidentified_video_count") or 0)),
+        "unidentified_video_count": max(
+            0, int(stats.get("unidentified_video_count") or 0)
+        ),
         "video_rename_count": max(0, int(stats.get("video_rename_count") or 0)),
         "companion_rename_count": max(0, int(stats.get("companion_rename_count") or 0)),
         "directory_rename_count": max(0, int(stats.get("directory_rename_count") or 0)),
-        "metadata_enriched_count": max(0, int(stats.get("metadata_enriched_count") or 0)),
+        "metadata_enriched_count": max(
+            0, int(stats.get("metadata_enriched_count") or 0)
+        ),
         "mode": str(plan.get("mode") or ""),
         "recursive": bool(plan.get("recursive")),
         "sample_changes": sample_changes,
@@ -419,7 +461,8 @@ def _preview_projection(plan: dict[str, Any]) -> dict[str, Any]:
 
 
 def preview_guangya_rename(
-    arguments: dict[str, Any], context: ToolContext,
+    arguments: dict[str, Any],
+    context: ToolContext,
 ) -> ToolResult:
     if not context.owner:
         raise AgentToolError("光鸭重命名需要已登录会话", code="precondition_failed")
@@ -439,41 +482,51 @@ def preview_guangya_rename(
         client.close()
     preview = _preview_projection(plan)
     flow = _Flow(
-        owner=context.owner, plan_id=str(plan["plan_id"]),
-        fingerprint=str(plan["fingerprint"]), preview_safe=preview,
-        generation=guard.generation, revision=guard.revision,
+        owner=context.owner,
+        plan_id=str(plan["plan_id"]),
+        fingerprint=str(plan["fingerprint"]),
+        preview_safe=preview,
+        generation=guard.generation,
+        revision=guard.revision,
     )
     if not _save(flow):
         discard_rename_plan(flow.plan_id)
-        raise AgentToolError("重命名预览已被更新请求取代，请重新生成", code="precondition_failed")
+        raise AgentToolError(
+            "重命名预览已被更新请求取代，请重新生成", code="precondition_failed"
+        )
     _discard_replaced_plan(previous, flow.plan_id)
     count = int(preview["rename_count"])
     conflicts = int(preview["conflict_count"])
     summary = (
         f"找到 {count} 个可安全重命名对象"
         + (f"，另有 {conflicts} 个名称冲突已排除" if conflicts else "")
-        if count else "没有找到可安全执行的名称变更"
+        if count
+        else "没有找到可安全执行的名称变更"
     )
     suggestions = (
         ["如预览无误，可以确认执行刚才的光鸭重命名计划。"]
-        if count else ["请调整路径、重命名方式或匹配文本后重新预览。"]
+        if count
+        else ["请调整路径、重命名方式或匹配文本后重新预览。"]
     )
     return ToolResult(
         ok=True,
         status="ready" if count else "no_changes",
         summary=summary,
         data=preview,
-        evidence=[Evidence(
-            "guangya_snapshot",
-            "已按 file_id、父目录、名称、大小和内容标识冻结远端快照；未执行云端写入。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "guangya_snapshot",
+                "已按 file_id、父目录、名称、大小和内容标识冻结远端快照；未执行云端写入。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
 
 def preview_guangya_media_hygiene(
-    arguments: dict[str, Any], context: ToolContext,
+    arguments: dict[str, Any],
+    context: ToolContext,
 ) -> ToolResult:
     if not context.owner:
         raise AgentToolError("媒体名称清理需要已登录会话", code="precondition_failed")
@@ -491,63 +544,84 @@ def preview_guangya_media_hygiene(
         client.close()
     preview = _preview_projection(plan)
     flow = _Flow(
-        owner=context.owner, plan_id=str(plan["plan_id"]),
-        fingerprint=str(plan["fingerprint"]), preview_safe=preview,
-        generation=guard.generation, revision=guard.revision,
+        owner=context.owner,
+        plan_id=str(plan["plan_id"]),
+        fingerprint=str(plan["fingerprint"]),
+        preview_safe=preview,
+        generation=guard.generation,
+        revision=guard.revision,
     )
     if not _save(flow):
         discard_rename_plan(flow.plan_id)
-        raise AgentToolError("名称清理预览已被更新请求取代，请重新生成", code="precondition_failed")
+        raise AgentToolError(
+            "名称清理预览已被更新请求取代，请重新生成", code="precondition_failed"
+        )
     _discard_replaced_plan(previous, flow.plan_id)
     count = int(preview["rename_count"])
     conflicts = int(preview["conflict_count"])
     summary = (
         f"找到 {count} 个可安全清理名称的光鸭对象"
         + (f"，另有 {conflicts} 个重名冲突已排除" if conflicts else "")
-        if count else "没有发现可安全清理的域名污染媒体名称"
+        if count
+        else "没有发现可安全清理的域名污染媒体名称"
     )
     return ToolResult(
         ok=True,
         status="ready" if count else "no_changes",
         summary=summary,
         data=preview,
-        evidence=[Evidence(
-            "guangya_snapshot",
-            "已提取高置信番号并冻结目录、视频和唯一关联伴随文件的名称映射；未执行云端写入。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "guangya_snapshot",
+                "已提取高置信番号并冻结目录、视频和唯一关联伴随文件的名称映射；未执行云端写入。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["如预览无误，可以确认执行；成功后会自动触发 STRM 全量核对。"]
-            if count else ["未识别到高置信番号或域名污染时会保留原名称，可缩小到更精确的目录后重试。"]
+            if count
+            else [
+                "未识别到高置信番号或域名污染时会保留原名称，可缩小到更精确的目录后重试。"
+            ]
         ),
     )
 
 
 def _confirmation_fingerprint(flow: _Flow, plan: dict[str, Any]) -> str:
-    return confirmation_context_fingerprint({
-        "owner": flow.owner,
-        "plan_id": flow.plan_id,
-        "plan_fingerprint": flow.fingerprint,
-        "credential_generation": int(plan.get("credential_generation") or 0),
-        "rename_count": int(flow.preview_safe.get("rename_count") or 0),
-        "mode": str(flow.preview_safe.get("mode") or ""),
-        "trigger_strm": bool(flow.preview_safe.get("trigger_strm")),
-    }, domain="guangya-rename-confirmation")
+    return confirmation_context_fingerprint(
+        {
+            "owner": flow.owner,
+            "plan_id": flow.plan_id,
+            "plan_fingerprint": flow.fingerprint,
+            "credential_generation": int(plan.get("credential_generation") or 0),
+            "rename_count": int(flow.preview_safe.get("rename_count") or 0),
+            "mode": str(flow.preview_safe.get("mode") or ""),
+            "trigger_strm": bool(flow.preview_safe.get("trigger_strm")),
+        },
+        domain="guangya-rename-confirmation",
+    )
 
 
 def prepare_guangya_rename_confirmation(
-    _arguments: dict[str, Any], context: ToolContext,
+    _arguments: dict[str, Any],
+    context: ToolContext,
 ) -> tuple[ToolResult, str]:
     flow = _flow(context.owner)
     if flow is None:
-        raise AgentToolError("最近重命名预览不存在或已过期，请重新生成", code="precondition_failed")
+        raise AgentToolError(
+            "最近重命名预览不存在或已过期，请重新生成", code="precondition_failed"
+        )
     try:
         plan = load_rename_plan(
-            flow.plan_id, owner=context.owner, expected_fingerprint=flow.fingerprint,
+            flow.plan_id,
+            owner=context.owner,
+            expected_fingerprint=flow.fingerprint,
         )
         client = GuangYaClient()
         try:
-            if not client.logged_in or int(client.credential_generation) != int(plan["credential_generation"]):
+            if not client.logged_in or int(client.credential_generation) != int(
+                plan["credential_generation"]
+            ):
                 raise GuangYaRenamePlanStale("光鸭登录凭据已变化，请重新预览")
         finally:
             client.close()
@@ -564,40 +638,55 @@ def prepare_guangya_rename_confirmation(
         "confirmation_required",
         (
             f"确认后将清理 {count} 个光鸭媒体名称"
-            if media_hygiene else f"确认后将批量转换 {count} 个光鸭对象名称"
+            if media_hygiene
+            else f"确认后将批量转换 {count} 个光鸭对象名称"
         ),
-        data={**flow.preview_safe, "effects": [
-            "只执行刚才冻结并排除冲突后的名称映射，不会扩大扫描范围。",
-            "执行前会重新核对登录凭据、文件快照与目标名称占用情况。",
-            "每次写入后都会按 file_id 读取真实名称，HTTP 200 不直接视为成功。",
-            "旧名称、新名称与写入结果会保存在私有回滚清单中。",
-            *(
-                ["至少一个名称成功变更后会自动触发 STRM 全量核对。"]
-                if strm_linked else []
-            ),
-        ]},
-        evidence=[Evidence(
-            "guangya_rename_plan",
-            "已核对当前会话的冻结计划、凭据世代和计划签名。",
-            _now(),
-        )],
+        data={
+            **flow.preview_safe,
+            "effects": [
+                "只执行刚才冻结并排除冲突后的名称映射，不会扩大扫描范围。",
+                "执行前会重新核对登录凭据、文件快照与目标名称占用情况。",
+                "每次写入后都会按 file_id 读取真实名称，HTTP 200 不直接视为成功。",
+                "旧名称、新名称与写入结果会保存在私有回滚清单中。",
+                *(
+                    ["至少一个名称成功变更后会自动触发 STRM 全量核对。"]
+                    if strm_linked
+                    else []
+                ),
+            ],
+        },
+        evidence=[
+            Evidence(
+                "guangya_rename_plan",
+                "已核对当前会话的冻结计划、凭据世代和计划签名。",
+                _now(),
+            )
+        ],
     ), _confirmation_fingerprint(flow, plan)
 
 
 def execute_guangya_rename_confirmed(
-    _arguments: dict[str, Any], expected_context: str, context: ToolContext,
+    _arguments: dict[str, Any],
+    expected_context: str,
+    context: ToolContext,
 ) -> ToolResult:
     flow = _flow(context.owner)
     if flow is None:
         raise AgentToolError("重命名预览已过期，请重新生成", code="confirmation_stale")
     try:
         plan = load_rename_plan(
-            flow.plan_id, owner=context.owner, expected_fingerprint=flow.fingerprint,
+            flow.plan_id,
+            owner=context.owner,
+            expected_fingerprint=flow.fingerprint,
         )
         if _confirmation_fingerprint(flow, plan) != str(expected_context or ""):
-            raise AgentToolError("重命名预览已变化，请重新预检", code="confirmation_stale")
+            raise AgentToolError(
+                "重命名预览已变化，请重新预检", code="confirmation_stale"
+            )
         confirmed = confirm_rename_plan(
-            flow.plan_id, owner=context.owner, expected_fingerprint=flow.fingerprint,
+            flow.plan_id,
+            owner=context.owner,
+            expected_fingerprint=flow.fingerprint,
         )
         from app.modules.organize_tasks import get_organize_manager
 
@@ -629,7 +718,11 @@ def execute_guangya_rename_confirmed(
         )
     context_consumed = _consume(flow)
     internal_id = str(task.get("task_id") or "")
-    operation_ref = organize_operation_public_ref(internal_id) if re.fullmatch(r"[0-9a-f]{32}", internal_id) else ""
+    operation_ref = (
+        organize_operation_public_ref(internal_id)
+        if re.fullmatch(r"[0-9a-f]{32}", internal_id)
+        else ""
+    )
     queued = bool(task.get("queued"))
     return ToolResult(
         True,
@@ -643,23 +736,28 @@ def execute_guangya_rename_confirmed(
             "rename_count": int(flow.preview_safe.get("rename_count") or 0),
             "requires_manual": not context_consumed,
         },
-        evidence=[Evidence(
-            "organize_queue",
-            "冻结计划已提交到可恢复的光鸭写入队列；公开结果不包含文件 ID、路径或清单位置。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "organize_queue",
+                "冻结计划已提交到可恢复的光鸭写入队列；公开结果不包含文件 ID、路径或清单位置。",
+                _now(),
+            )
+        ],
         suggestions=[
             "可以稍后查询光鸭整理状态查看完成、部分完成或失败数量。",
             *(
                 ["会话状态未能可靠消费，请勿重复提交同一计划。"]
-                if not context_consumed else []
+                if not context_consumed
+                else []
             ),
         ],
     )
 
 
 def execute_durable_guangya_rename_job(
-    payload: dict[str, Any], *, cancel_check=None,
+    payload: dict[str, Any],
+    *,
+    cancel_check=None,
 ) -> dict[str, Any]:
     plan = load_rename_plan(
         str(payload.get("plan_id") or ""),
@@ -677,9 +775,7 @@ def execute_durable_guangya_rename_job(
                 "organize", force_full=True, sync_mode="full"
             )
         except Exception as exc:
-            logger.warning(
-                "光鸭改名后 STRM 联动失败 type=%s", type(exc).__name__
-            )
+            logger.warning("光鸭改名后 STRM 联动失败 type=%s", type(exc).__name__)
             triggered = {"ok": False}
         if bool(triggered.get("ok")):
             stats["strm_triggered"] = 1

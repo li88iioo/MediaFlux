@@ -1,14 +1,16 @@
 """项目配置组件解释：只返回固定标签、能力影响和安全下一步。"""
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.feature_actions import summarize_feature_states
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 
 
 @dataclass(frozen=True)
@@ -40,16 +42,16 @@ def _qb_auth(value: Callable[[str], str]) -> bool:
 
 
 def _strm_enabled(value: Callable[[str], str]) -> bool:
-    return _state(value("STRM_SCHEDULE_ENABLED")) or bool(
-        value("GY_STRM_SOURCE_DIRS")
-    )
+    return _state(value("STRM_SCHEDULE_ENABLED")) or bool(value("GY_STRM_SOURCE_DIRS"))
 
 
 def _strm_ready(value: Callable[[str], str]) -> bool:
-    return bool(value("GY_STRM_SOURCE_DIRS")) and all((
-        _has(value, "GY_STRM_BASE_URL"),
-        _has(value, "STRM_ROOT"),
-    ))
+    return bool(value("GY_STRM_SOURCE_DIRS")) and all(
+        (
+            _has(value, "GY_STRM_BASE_URL"),
+            _has(value, "STRM_ROOT"),
+        )
+    )
 
 
 def _ai_provider_ready(value: Callable[[str], str]) -> bool:
@@ -63,7 +65,9 @@ _COMPONENTS: dict[str, ComponentDefinition] = {
         required_fields=(("JELLYFIN_URL", "服务地址"), ("JELLYFIN_API_KEY", "API Key")),
         blocked_capabilities=("Jellyfin 媒体库搜索", "剧集缺集审计", "剧集更新核对"),
         enabled=lambda value: _state(value("JELLYFIN_ENABLED")),
-        ready=lambda value: _has(value, "JELLYFIN_URL") and _has(value, "JELLYFIN_API_KEY"),
+        ready=lambda value: (
+            _has(value, "JELLYFIN_URL") and _has(value, "JELLYFIN_API_KEY")
+        ),
     ),
     "emby": ComponentDefinition(
         label="Emby / Jellyfin 10.x",
@@ -84,8 +88,15 @@ _COMPONENTS: dict[str, ComponentDefinition] = {
     "qbittorrent": ComponentDefinition(
         label="qBittorrent",
         purpose="接收资源站结果并查看下载队列、传输速度与停滞任务。",
-        required_fields=(("QB_URL", "服务地址"), ("__qb_auth__", "API Key 或用户名/密码")),
-        blocked_capabilities=("提交资源到 qBittorrent", "下载队列诊断", "下载任务状态读取"),
+        required_fields=(
+            ("QB_URL", "服务地址"),
+            ("__qb_auth__", "API Key 或用户名/密码"),
+        ),
+        blocked_capabilities=(
+            "提交资源到 qBittorrent",
+            "下载队列诊断",
+            "下载任务状态读取",
+        ),
         enabled=lambda value: _has(value, "QB_URL") or _qb_auth(value),
         ready=lambda value: _has(value, "QB_URL") and _qb_auth(value),
     ),
@@ -114,7 +125,11 @@ _COMPONENTS: dict[str, ComponentDefinition] = {
 _FEATURE_DETAILS: dict[str, dict[str, Any]] = {
     "discovery": {
         "purpose": "统一浏览放映排期、豆瓣、TMDB 与 Bangumi 榜单。",
-        "blocked_capabilities": ("媒体探索页面", "豆瓣与 TMDB 榜单", "Bangumi 放送内容"),
+        "blocked_capabilities": (
+            "媒体探索页面",
+            "豆瓣与 TMDB 榜单",
+            "Bangumi 放送内容",
+        ),
     },
     "douban": {
         "purpose": "在媒体探索中读取豆瓣电影与电视剧榜单。",
@@ -181,7 +196,9 @@ def _field_override_keys(field: str) -> tuple[str, ...]:
         return ("GY_STRM_SOURCE_DIRS",)
     if field == "__shared_ai_provider__":
         return (
-            "AGENT_LLM_API_URL", "AGENT_LLM_API_KEY", "AGENT_LLM_MODEL",
+            "AGENT_LLM_API_URL",
+            "AGENT_LLM_API_KEY",
+            "AGENT_LLM_MODEL",
         )
     return (field,)
 
@@ -216,7 +233,8 @@ def _base_component_payload(component: str) -> dict[str, Any]:
         status = "not_configured"
 
     missing = [
-        label for field, label in definition.required_fields
+        label
+        for field, label in definition.required_fields
         if not _field_present(value, field)
     ]
     if status == "disabled":
@@ -225,7 +243,9 @@ def _base_component_payload(component: str) -> dict[str, Any]:
     if status == "ready":
         next_steps = ["当前必要配置已具备；如仍不可用，请运行对应的状态或连通性诊断。"]
     elif managed:
-        next_steps = ["该组件至少一项必要设置由运行环境管理，请在部署配置中核对后重启服务。"]
+        next_steps = [
+            "该组件至少一项必要设置由运行环境管理，请在部署配置中核对后重启服务。"
+        ]
     elif status == "disabled":
         next_steps = [f"先在设置页启用{definition.label}，再填写必要配置。"]
     else:
@@ -241,9 +261,13 @@ def _base_component_payload(component: str) -> dict[str, Any]:
         "status": status,
         "enabled": enabled,
         "purpose": definition.purpose,
-        "required_field_labels": [label for _field, label in definition.required_fields],
+        "required_field_labels": [
+            label for _field, label in definition.required_fields
+        ],
         "missing_field_labels": missing,
-        "blocked_capabilities": list(definition.blocked_capabilities) if status != "ready" else [],
+        "blocked_capabilities": list(definition.blocked_capabilities)
+        if status != "ready"
+        else [],
         "next_steps": next_steps,
         "managed_by_environment": managed,
         "agent_action": None,
@@ -253,7 +277,8 @@ def _base_component_payload(component: str) -> dict[str, Any]:
 def _feature_payload(component: str) -> dict[str, Any]:
     summary = summarize_feature_states({})
     feature = next(
-        item for item in summary.data.get("features", [])
+        item
+        for item in summary.data.get("features", [])
         if item.get("feature") == component
     )
     availability = str(feature.get("availability") or "blocked")
@@ -267,7 +292,9 @@ def _feature_payload(component: str) -> dict[str, Any]:
         "search_disabled": "先开启多站资源搜索，再重新检查探索页资源结果。",
         "no_enabled_sites": "请先在设置页至少启用一个资源站点。",
     }
-    next_steps.extend(reason_steps[reason] for reason in reasons if reason in reason_steps)
+    next_steps.extend(
+        reason_steps[reason] for reason in reasons if reason in reason_steps
+    )
     if managed:
         next_steps = ["该开关由运行环境管理，请在部署配置中调整并重启服务。"]
     if not next_steps:
@@ -293,7 +320,9 @@ def _feature_payload(component: str) -> dict[str, Any]:
         "purpose": details["purpose"],
         "required_field_labels": [],
         "missing_field_labels": [],
-        "blocked_capabilities": list(details["blocked_capabilities"]) if status != "ready" else [],
+        "blocked_capabilities": list(details["blocked_capabilities"])
+        if status != "ready"
+        else [],
         "next_steps": next_steps,
         "managed_by_environment": managed,
         "agent_action": agent_action,
@@ -323,10 +352,12 @@ def explain_config_component(arguments: dict[str, Any]) -> ToolResult:
         status=status,
         summary=summary,
         data=payload,
-        evidence=[Evidence(
-            "server_configuration",
-            "仅解释白名单组件的配置状态、字段标签和能力影响；未返回配置键、配置值、地址、路径或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅解释白名单组件的配置状态、字段标签和能力影响；未返回配置键、配置值、地址、路径或凭据。",
+                _now(),
+            )
+        ],
         suggestions=payload["next_steps"],
     )

@@ -1,16 +1,18 @@
 """影视探索收藏的安全摘要与确认写入。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import re
-from typing import Any
 import unicodedata
+from datetime import datetime
+from typing import Any
 
-from app import config, database as db
+from app import config
+from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.service import get_discovery_service
 
@@ -71,7 +73,11 @@ def watchlist_summary_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) != {"watchlist_number"}:
         raise AgentToolError("必须且只能提供 watchlist_number")
-    return {"watchlist_number": _positive_id(arguments["watchlist_number"], field="watchlist_number")}
+    return {
+        "watchlist_number": _positive_id(
+            arguments["watchlist_number"], field="watchlist_number"
+        )
+    }
 
 
 def add_watchlist_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -125,14 +131,14 @@ def list_watchlist_summaries(_arguments: dict[str, Any]) -> ToolResult:
         status="success" if count else "empty",
         summary=f"探索收藏中共有 {count} 项" if count else "探索收藏当前为空",
         data={"count": count, "items": items},
-        evidence=[Evidence(
-            "discovery_watchlist",
-            "仅读取本地探索收藏的编号、来源、类型、标题和年份。",
-            _now(),
-        )],
-        suggestions=(
-            ["可按收藏编号查看单项，或移除明确编号的收藏。"] if count else []
-        ),
+        evidence=[
+            Evidence(
+                "discovery_watchlist",
+                "仅读取本地探索收藏的编号、来源、类型、标题和年份。",
+                _now(),
+            )
+        ],
+        suggestions=(["可按收藏编号查看单项，或移除明确编号的收藏。"] if count else []),
     )
 
 
@@ -154,11 +160,13 @@ def get_watchlist_summary(arguments: dict[str, Any]) -> ToolResult:
         status="success",
         summary=f"探索收藏 {number}：{item['title']}",
         data=item,
-        evidence=[Evidence(
-            "discovery_watchlist",
-            "仅读取本地探索收藏的公开摘要。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_watchlist",
+                "仅读取本地探索收藏的公开摘要。",
+                _now(),
+            )
+        ],
     )
 
 
@@ -179,12 +187,16 @@ def _snapshot_payload(row: Any) -> dict[str, Any]:
 
 
 def _fingerprint(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _encode_context(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def _decode_context(value: str) -> dict[str, Any]:
@@ -270,17 +282,21 @@ def prepare_add_watchlist(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
             "media_type": canonical["media_type"],
             "affected": 1,
         },
-        evidence=[Evidence(
-            "discovery_provider",
-            "预检时核对影视条目；确认执行只写入本地收藏，不会下载资源。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_provider",
+                "预检时核对影视条目；确认执行只写入本地收藏，不会下载资源。",
+                _now(),
+            )
+        ],
         suggestions=["确认票据只可使用一次；收藏状态变化后需要重新预检。"],
     )
     return preview, _encode_context(context)
 
 
-def add_watchlist_confirmed(arguments: dict[str, Any], expected_context: str) -> ToolResult:
+def add_watchlist_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
     context = _decode_context(expected_context)
     canonical = context.get("canonical")
     if context.get("operation") != "add" or not isinstance(canonical, dict):
@@ -313,7 +329,9 @@ def add_watchlist_confirmed(arguments: dict[str, Any], expected_context: str) ->
             "INSERT INTO media_watchlist(provider,external_id,media_type,title,year,poster_key,created_at) "
             "VALUES(?,?,?,?,?,?,?)",
             (
-                identity[0], identity[1], identity[2],
+                identity[0],
+                identity[1],
+                identity[2],
                 str(canonical.get("title") or "")[:160],
                 str(canonical.get("year") or "")[:12],
                 str(canonical.get("poster_key") or "")[:500],
@@ -331,11 +349,13 @@ def add_watchlist_confirmed(arguments: dict[str, Any], expected_context: str) ->
             "title": _safe_text(canonical.get("title"), 160),
             "affected": 1,
         },
-        evidence=[Evidence(
-            "discovery_watchlist",
-            "已使用一次性确认票据写入本地探索收藏；未提交下载任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_watchlist",
+                "已使用一次性确认票据写入本地探索收藏；未提交下载任务。",
+                _now(),
+            )
+        ],
     )
 
 
@@ -368,17 +388,21 @@ def prepare_remove_watchlist(arguments: dict[str, Any]) -> tuple[ToolResult, str
             "title": title,
             "affected": 1,
         },
-        evidence=[Evidence(
-            "discovery_watchlist",
-            "仅预检本地探索收藏；不会删除媒体文件、订阅或下载任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_watchlist",
+                "仅预检本地探索收藏；不会删除媒体文件、订阅或下载任务。",
+                _now(),
+            )
+        ],
         suggestions=["确认票据只可使用一次；收藏状态变化后需要重新预检。"],
     )
     return preview, _encode_context(context)
 
 
-def remove_watchlist_confirmed(arguments: dict[str, Any], expected_context: str) -> ToolResult:
+def remove_watchlist_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
     context = _decode_context(expected_context)
     snapshot = context.get("snapshot")
     expected_fingerprint = str(context.get("fingerprint") or "")
@@ -392,7 +416,9 @@ def remove_watchlist_confirmed(arguments: dict[str, Any], expected_context: str)
         raise AgentToolError("确认上下文无效", code="confirmation_invalid")
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM media_watchlist WHERE id=?", (number,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM media_watchlist WHERE id=?", (number,)
+        ).fetchone()
         current = _snapshot_payload(row)
         if row is None or _fingerprint(current) != expected_fingerprint:
             return ToolResult(
@@ -401,7 +427,9 @@ def remove_watchlist_confirmed(arguments: dict[str, Any], expected_context: str)
                 summary="探索收藏状态已变化，请重新预检",
                 error="确认快照已失效。",
             )
-        deleted = conn.execute("DELETE FROM media_watchlist WHERE id=?", (number,)).rowcount
+        deleted = conn.execute(
+            "DELETE FROM media_watchlist WHERE id=?", (number,)
+        ).rowcount
         if deleted != 1:
             return ToolResult(
                 ok=False,
@@ -420,9 +448,11 @@ def remove_watchlist_confirmed(arguments: dict[str, Any], expected_context: str)
             "title": title,
             "affected": 1,
         },
-        evidence=[Evidence(
-            "discovery_watchlist",
-            "已使用一次性确认票据删除本地收藏记录；未删除媒体文件或下载任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_watchlist",
+                "已使用一次性确认票据删除本地收藏记录；未删除媒体文件或下载任务。",
+                _now(),
+            )
+        ],
     )

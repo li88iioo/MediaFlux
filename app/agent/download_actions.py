@@ -1,15 +1,17 @@
 """qBittorrent 下载队列的只读、安全诊断。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import math
 import re
-from typing import Any
 import unicodedata
+from datetime import datetime
+from typing import Any
 
-from app import config, database as db
+from app import config
+from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.clients.qbittorrent import (
     QBittorrentClient,
     TorrentTask,
@@ -27,10 +29,28 @@ _SENSITIVE_TITLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ALLOWED_STATES = {
-    "downloading", "stalledDL", "stalledUP", "uploading", "pausedDL", "pausedUP",
-    "queuedDL", "queuedUP", "checkingDL", "checkingUP", "forcedDL", "forcedUP",
-    "metaDL", "forcedMetaDL", "error", "missingFiles", "moving", "allocating",
-    "checkingResumeData", "stoppedDL", "stoppedUP", "unknown",
+    "downloading",
+    "stalledDL",
+    "stalledUP",
+    "uploading",
+    "pausedDL",
+    "pausedUP",
+    "queuedDL",
+    "queuedUP",
+    "checkingDL",
+    "checkingUP",
+    "forcedDL",
+    "forcedUP",
+    "metaDL",
+    "forcedMetaDL",
+    "error",
+    "missingFiles",
+    "moving",
+    "allocating",
+    "checkingResumeData",
+    "stoppedDL",
+    "stoppedUP",
+    "unknown",
 }
 
 
@@ -46,7 +66,9 @@ def download_diagnosis_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def download_request_summaries_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict) or not set(arguments).issubset({"scope", "limit"}):
+    if not isinstance(arguments, dict) or not set(arguments).issubset(
+        {"scope", "limit"}
+    ):
         raise AgentToolError("下载请求列表参数无效")
     scope = str(arguments.get("scope") or "active").strip().lower()
     if scope not in {"active", "attention", "recent"}:
@@ -59,12 +81,30 @@ def download_request_summaries_arguments(arguments: dict[str, Any]) -> dict[str,
 
 def _safe_request_status(value: Any) -> str:
     status = str(value or "").strip().lower()
-    return status if status in {
-        "pending", "submitting", "submitted", "accepted", "queued", "running",
-        "downloading", "completed", "success", "failed", "partial",
-        "manual_review", "requires_manual", "skipped", "cancelled",
-        "outcome_unknown", "not_started",
-    } else "unknown"
+    return (
+        status
+        if status
+        in {
+            "pending",
+            "submitting",
+            "submitted",
+            "accepted",
+            "queued",
+            "running",
+            "downloading",
+            "completed",
+            "success",
+            "failed",
+            "partial",
+            "manual_review",
+            "requires_manual",
+            "skipped",
+            "cancelled",
+            "outcome_unknown",
+            "not_started",
+        }
+        else "unknown"
+    )
 
 
 def _safe_targets(value: Any) -> list[str]:
@@ -72,10 +112,13 @@ def _safe_targets(value: Any) -> list[str]:
     if raw == "both":
         return ["qb", "guangya"]
     normalized = re.sub(r"[+|/、，\s]+", ",", raw)
-    return list(dict.fromkeys(
-        item for item in (part.strip() for part in normalized.split(","))
-        if item in {"qb", "guangya"}
-    ))
+    return list(
+        dict.fromkeys(
+            item
+            for item in (part.strip() for part in normalized.split(","))
+            if item in {"qb", "guangya"}
+        )
+    )
 
 
 def download_request_public_summary(row: Any) -> dict[str, Any]:
@@ -115,11 +158,13 @@ def summarize_download_requests(arguments: dict[str, Any]) -> ToolResult:
         status="success" if items else "empty",
         summary=f"{label}下载请求 {len(items)} 项",
         data={"scope": scope, "count": len(items), "items": items},
-        evidence=[Evidence(
-            "download_requests",
-            "读取 MediaFlux 下载请求的 qB、光鸭、整理与 STRM 阶段摘要；未返回链接、路径、哈希或云端任务标识。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "download_requests",
+                "读取 MediaFlux 下载请求的 qB、光鸭、整理与 STRM 阶段摘要；未返回链接、路径、哈希或云端任务标识。",
+                _now(),
+            )
+        ],
         suggestions=[] if items else ["可切换 active、attention 或 recent 范围查看。"],
     )
 
@@ -152,7 +197,9 @@ def _safe_title(value: Any) -> str:
         or re.search(r"(?:^|\s)/(?:[^/\s]+/)+", title)
     ):
         return "下载任务"
-    title = "".join(" " if unicodedata.category(char).startswith("C") else char for char in title)
+    title = "".join(
+        " " if unicodedata.category(char).startswith("C") else char for char in title
+    )
     title = " ".join(title.split())
     if len(title) > _MAX_TITLE_LENGTH:
         title = title[: _MAX_TITLE_LENGTH - 1].rstrip() + "…"
@@ -189,11 +236,20 @@ def _classify(task: TorrentTask) -> tuple[str, list[str], str]:
     if state in {"pausedDL", "stoppedDL"} and progress < 100:
         return "paused", [], "任务当前处于暂停状态。"
     if state in {"downloading", "forcedDL"} and progress < 100 and speed == 0:
-        return "attention", ["zero_download_speed"], "当前快照下载速度为零；尚不能判定持续停滞。"
+        return (
+            "attention",
+            ["zero_download_speed"],
+            "当前快照下载速度为零；尚不能判定持续停滞。",
+        )
     if state in {"downloading", "forcedDL"} and progress < 100:
         return "downloading", [], "任务正在下载。"
     if progress >= 100 or state in {
-        "uploading", "stalledUP", "forcedUP", "queuedUP", "pausedUP", "stoppedUP",
+        "uploading",
+        "stalledUP",
+        "forcedUP",
+        "queuedUP",
+        "pausedUP",
+        "stoppedUP",
     }:
         return "completed", [], "任务已完成下载。"
     if state == "unknown":
@@ -201,7 +257,9 @@ def _classify(task: TorrentTask) -> tuple[str, list[str], str]:
     return "other", ["inconsistent_state"], "任务状态与进度组合需要进一步核对。"
 
 
-def _task_projection(task: TorrentTask, kind: str, reasons: list[str], assessment: str) -> dict[str, Any]:
+def _task_projection(
+    task: TorrentTask, kind: str, reasons: list[str], assessment: str
+) -> dict[str, Any]:
     eta = _bounded_int(task.eta, maximum=2_147_483_647)
     return {
         "name": _safe_title(task.name),
@@ -219,7 +277,11 @@ def _task_projection(task: TorrentTask, kind: str, reasons: list[str], assessmen
 
 def _connection_projection(info: TransferInfo) -> dict[str, Any]:
     raw_status = str(info.connection_status or "").strip().casefold()
-    status = raw_status if raw_status in {"connected", "disconnected", "firewalled"} else "unknown"
+    status = (
+        raw_status
+        if raw_status in {"connected", "disconnected", "firewalled"}
+        else "unknown"
+    )
     return {
         "api_state": "reachable",
         "transfer_status": status,
@@ -252,8 +314,18 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
             ok=True,
             status="not_configured",
             summary="qBittorrent 尚未配置",
-            data={"connection": {"api_state": "not_configured"}, "summary": {}, "attention_tasks": []},
-            evidence=[Evidence("configuration", "仅检查 qBittorrent 配置完整性，未读取配置值。", _now())],
+            data={
+                "connection": {"api_state": "not_configured"},
+                "summary": {},
+                "attention_tasks": [],
+            },
+            evidence=[
+                Evidence(
+                    "configuration",
+                    "仅检查 qBittorrent 配置完整性，未读取配置值。",
+                    _now(),
+                )
+            ],
             suggestions=["请先在设置页配置 qBittorrent 地址与认证信息。"],
         )
     if readiness == "incomplete":
@@ -261,8 +333,18 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
             ok=True,
             status="incomplete",
             summary="qBittorrent 认证配置不完整",
-            data={"connection": {"api_state": "incomplete"}, "summary": {}, "attention_tasks": []},
-            evidence=[Evidence("configuration", "仅检查 qBittorrent 配置完整性，未读取配置值。", _now())],
+            data={
+                "connection": {"api_state": "incomplete"},
+                "summary": {},
+                "attention_tasks": [],
+            },
+            evidence=[
+                Evidence(
+                    "configuration",
+                    "仅检查 qBittorrent 配置完整性，未读取配置值。",
+                    _now(),
+                )
+            ],
             suggestions=["请补充 API Key，或同时配置用户名与密码。"],
         )
 
@@ -283,8 +365,18 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
             ok=False,
             status="unavailable",
             summary="暂时无法读取 qBittorrent 队列",
-            data={"connection": {"api_state": "unavailable"}, "summary": {}, "attention_tasks": []},
-            evidence=[Evidence("qbittorrent", "尝试读取实时任务与传输摘要，未执行下载任务写操作。", _now())],
+            data={
+                "connection": {"api_state": "unavailable"},
+                "summary": {},
+                "attention_tasks": [],
+            },
+            evidence=[
+                Evidence(
+                    "qbittorrent",
+                    "尝试读取实时任务与传输摘要，未执行下载任务写操作。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查 qBittorrent 服务、认证信息和网络后重试。"],
             error="下载器当前不可用。",
         )
@@ -317,10 +409,16 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
         if kind in {"failed", "stalled", "attention", "other"}:
             attention_total += 1
             if len(attention_tasks) < _MAX_ATTENTION_TASKS:
-                attention_tasks.append(_task_projection(task, kind, reasons, assessment))
+                attention_tasks.append(
+                    _task_projection(task, kind, reasons, assessment)
+                )
 
     connection = _connection_projection(transfer)
-    transfer_attention = connection["transfer_status"] in {"disconnected", "firewalled", "unknown"}
+    transfer_attention = connection["transfer_status"] in {
+        "disconnected",
+        "firewalled",
+        "unknown",
+    }
     needs_attention = attention_total > 0 or transfer_attention
     status = "attention" if needs_attention else "healthy"
     if attention_total:
@@ -335,7 +433,9 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
     if counts["stalled"] or counts["attention"]:
         suggestions.append("请结合 Tracker、连接数和后续快照确认任务是否持续停滞。")
     if transfer_attention:
-        suggestions.append("qBittorrent API 可访问，但传输连接受限或断开，请检查网络与监听状态。")
+        suggestions.append(
+            "qBittorrent API 可访问，但传输连接受限或断开，请检查网络与监听状态。"
+        )
 
     return ToolResult(
         ok=True,
@@ -347,6 +447,12 @@ def diagnose_download_queue(_arguments: dict[str, Any]) -> ToolResult:
             "attention_tasks": attention_tasks,
             "attention_truncated": attention_total > _MAX_ATTENTION_TASKS,
         },
-        evidence=[Evidence("qbittorrent", "读取 qBittorrent 实时任务与传输摘要；未执行暂停、恢复、删除或提交。", _now())],
+        evidence=[
+            Evidence(
+                "qbittorrent",
+                "读取 qBittorrent 实时任务与传输摘要；未执行暂停、恢复、删除或提交。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

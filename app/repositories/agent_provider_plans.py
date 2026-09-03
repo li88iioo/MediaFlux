@@ -1,4 +1,5 @@
 """持久化、owner/session 隔离的 Agent Provider 写计划。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -10,7 +11,7 @@ import time
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
-from app.agent.registry import AgentToolError
+from app.agent.errors import AgentToolError
 from app.modules.web_secret import get_web_secret
 
 if TYPE_CHECKING:
@@ -146,8 +147,7 @@ def _internal_row(row: Any) -> dict[str, Any]:
 
 def _trim_history(conn: Any, *, owner_digest: str, session_digest: str) -> None:
     cutoff = (
-        datetime.now().astimezone()
-        - timedelta(seconds=_TERMINAL_RETENTION_SECONDS)
+        datetime.now().astimezone() - timedelta(seconds=_TERMINAL_RETENTION_SECONDS)
     ).strftime("%Y-%m-%d %H:%M:%S.%f")
     conn.execute(
         "DELETE FROM agent_provider_plans WHERE status IN "
@@ -165,10 +165,7 @@ def _trim_history(conn: Any, *, owner_digest: str, session_digest: str) -> None:
         conn.executemany(
             "DELETE FROM agent_provider_plans WHERE owner_digest=? "
             "AND session_digest=? AND plan_id=?",
-            [
-                (owner_digest, session_digest, str(row["plan_id"]))
-                for row in rows
-            ],
+            [(owner_digest, session_digest, str(row["plan_id"])) for row in rows],
         )
     overflow = conn.execute(
         "SELECT plan_id FROM agent_provider_plans WHERE status IN "
@@ -185,9 +182,7 @@ def _trim_history(conn: Any, *, owner_digest: str, session_digest: str) -> None:
 
 def invalidate_provider_plans_for_owner(*, owner: str) -> dict[str, int]:
     """撤销 owner 的短期 Provider 状态；运行中计划仅脱敏后等待执行者收尾。"""
-    owner_digest = _digest(
-        owner, domain=b"mediaflux-agent-provider-plan-owner:v1"
-    )
+    owner_digest = _digest(owner, domain=b"mediaflux-agent-provider-plan-owner:v1")
     stamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -284,9 +279,7 @@ def create_provider_plan(
     return _internal_row(row)
 
 
-def get_latest_prepared_provider_plan(
-    *, owner: str, session_id: str
-) -> dict[str, Any]:
+def get_latest_prepared_provider_plan(*, owner: str, session_id: str) -> dict[str, Any]:
     """返回当前 owner/session 最新且未过期的 Provider 写计划。"""
     owner_digest, session_digest = _principal(owner, session_id)
     stamp = now()
@@ -314,9 +307,7 @@ def get_latest_prepared_provider_plan(
     return _internal_row(row)
 
 
-def get_provider_plan(
-    *, owner: str, session_id: str, plan_ref: str
-) -> dict[str, Any]:
+def get_provider_plan(*, owner: str, session_id: str, plan_ref: str) -> dict[str, Any]:
     owner_digest, session_digest = _principal(owner, session_id)
     normalized = _plan_id(plan_ref)
     stamp = now()
@@ -328,7 +319,10 @@ def get_provider_plan(
         ).fetchone()
         if row is None:
             raise AgentToolError("未找到对应的 Provider 写计划", code="plan_not_found")
-        if str(row["status"]) == "prepared" and float(row["expires_at"] or 0) <= time.time():
+        if (
+            str(row["status"]) == "prepared"
+            and float(row["expires_at"] or 0) <= time.time()
+        ):
             conn.execute(
                 "UPDATE agent_provider_plans SET status='stale',summary='写计划已过期',"
                 "error_code='plan_expired',finished_at=?,updated_at=? WHERE plan_id=?",
@@ -364,12 +358,20 @@ def claim_provider_plan(
         status = str(row["status"])
         if status != "prepared":
             if status == "succeeded":
-                raise AgentToolError("该 Provider 写计划已经执行", code="already_executed")
+                raise AgentToolError(
+                    "该 Provider 写计划已经执行", code="already_executed"
+                )
             if status == "running":
-                raise AgentToolError("该 Provider 写计划正在执行", code="already_running")
+                raise AgentToolError(
+                    "该 Provider 写计划正在执行", code="already_running"
+                )
             if status == "outcome_unknown":
-                raise AgentToolError("上次执行结果未知，请先人工核对", code="outcome_unknown")
-            raise AgentToolError("Provider 写计划已失效，请重新预检", code="confirmation_stale")
+                raise AgentToolError(
+                    "上次执行结果未知，请先人工核对", code="outcome_unknown"
+                )
+            raise AgentToolError(
+                "Provider 写计划已失效，请重新预检", code="confirmation_stale"
+            )
         if float(row["expires_at"] or 0) <= current_time:
             conn.execute(
                 "UPDATE agent_provider_plans SET status='stale',summary='写计划已过期',"

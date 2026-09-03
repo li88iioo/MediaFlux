@@ -1,14 +1,16 @@
 """媒体系统健康总检：聚合本地快照、配置完整性与媒体节点探测。"""
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from app.agent.config_diagnosis_actions import diagnose_config
+from app.agent.errors import AgentToolError
 from app.agent.media_server_actions import diagnose_media_servers
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import public_followup_prompt
+from app.agent.public_safety import public_followup_prompt
 from app.agent.workspace_briefing_actions import summarize_workspace_briefing
 from app.logger import get_logger
 
@@ -40,11 +42,15 @@ def _safe_count(value: Any, *, maximum: int = 1_000_000_000) -> int:
         return 0
 
 
-def _safe_result(source: str, handler: Callable[[dict[str, Any]], ToolResult]) -> ToolResult | None:
+def _safe_result(
+    source: str, handler: Callable[[dict[str, Any]], ToolResult]
+) -> ToolResult | None:
     try:
         result = handler({})
     except Exception as exc:
-        logger.warning("Agent 媒体健康总检子检查失败 source=%s type=%s", source, type(exc).__name__)
+        logger.warning(
+            "Agent 媒体健康总检子检查失败 source=%s type=%s", source, type(exc).__name__
+        )
         return None
     if not isinstance(result, ToolResult):
         logger.warning("Agent 媒体健康总检子检查返回类型无效 source=%s", source)
@@ -53,7 +59,11 @@ def _safe_result(source: str, handler: Callable[[dict[str, Any]], ToolResult]) -
 
 
 def _workspace_area(result: ToolResult | None) -> dict[str, Any]:
-    if result is None or result.status == "unavailable" or not isinstance(result.data, dict):
+    if (
+        result is None
+        or result.status == "unavailable"
+        or not isinstance(result.data, dict)
+    ):
         return {
             "source": "workspace",
             "status": "unavailable",
@@ -64,10 +74,22 @@ def _workspace_area(result: ToolResult | None) -> dict[str, Any]:
             "waiting_count": 0,
             "unavailable_area_count": 0,
         }
-    coverage = result.data.get("coverage") if isinstance(result.data.get("coverage"), dict) else {}
-    unavailable_count = len(coverage.get("unavailable")) if isinstance(coverage.get("unavailable"), list) else 0
+    coverage = (
+        result.data.get("coverage")
+        if isinstance(result.data.get("coverage"), dict)
+        else {}
+    )
+    unavailable_count = (
+        len(coverage.get("unavailable"))
+        if isinstance(coverage.get("unavailable"), list)
+        else 0
+    )
     attention = _safe_count(result.data.get("attention_total"))
-    status = "attention" if result.status in {"partial", "attention"} or unavailable_count or attention else "healthy"
+    status = (
+        "attention"
+        if result.status in {"partial", "attention"} or unavailable_count or attention
+        else "healthy"
+    )
     reasons: list[str] = []
     if unavailable_count:
         reasons.append("workspace_partial")
@@ -88,7 +110,11 @@ def _workspace_area(result: ToolResult | None) -> dict[str, Any]:
 
 
 def _configuration_area(result: ToolResult | None) -> dict[str, Any]:
-    if result is None or result.status == "unavailable" or not isinstance(result.data, dict):
+    if (
+        result is None
+        or result.status == "unavailable"
+        or not isinstance(result.data, dict)
+    ):
         return {
             "source": "configuration",
             "status": "unavailable",
@@ -100,8 +126,14 @@ def _configuration_area(result: ToolResult | None) -> dict[str, Any]:
             "ready_component_count": 0,
             "component_count": 0,
         }
-    counts = result.data.get("counts") if isinstance(result.data.get("counts"), dict) else {}
-    components = result.data.get("components") if isinstance(result.data.get("components"), list) else []
+    counts = (
+        result.data.get("counts") if isinstance(result.data.get("counts"), dict) else {}
+    )
+    components = (
+        result.data.get("components")
+        if isinstance(result.data.get("components"), list)
+        else []
+    )
     errors = _safe_count(counts.get("errors"))
     warnings = _safe_count(counts.get("warnings"))
     reasons = []
@@ -119,7 +151,8 @@ def _configuration_area(result: ToolResult | None) -> dict[str, Any]:
         "error_count": errors,
         "warning_count": warnings,
         "ready_component_count": sum(
-            isinstance(item, dict) and item.get("status") == "ready" for item in components
+            isinstance(item, dict) and item.get("status") == "ready"
+            for item in components
         ),
         "component_count": min(len(components), 100),
     }
@@ -127,19 +160,26 @@ def _configuration_area(result: ToolResult | None) -> dict[str, Any]:
 
 def _media_server_area(result: ToolResult | None) -> tuple[dict[str, Any], bool]:
     if result is None or not isinstance(result.data, dict):
-        return ({
-            "source": "media_servers",
-            "status": "unavailable",
-            "attention_count": 0,
-            "reason_codes": ["media_server_diagnosis_unavailable"],
-            "next_tool": "config.diagnose_media_servers",
-            "enabled_count": 0,
-            "configured_count": 0,
-            "online_count": 0,
-            "compatible_count": 0,
-        }, False)
-    counts = result.data.get("counts") if isinstance(result.data.get("counts"), dict) else {}
-    nodes = result.data.get("nodes") if isinstance(result.data.get("nodes"), list) else []
+        return (
+            {
+                "source": "media_servers",
+                "status": "unavailable",
+                "attention_count": 0,
+                "reason_codes": ["media_server_diagnosis_unavailable"],
+                "next_tool": "config.diagnose_media_servers",
+                "enabled_count": 0,
+                "configured_count": 0,
+                "online_count": 0,
+                "compatible_count": 0,
+            },
+            False,
+        )
+    counts = (
+        result.data.get("counts") if isinstance(result.data.get("counts"), dict) else {}
+    )
+    nodes = (
+        result.data.get("nodes") if isinstance(result.data.get("nodes"), list) else []
+    )
     network_accessed = result.data.get("network_accessed") is True
     enabled = _safe_count(counts.get("enabled"), maximum=2)
     configured = _safe_count(counts.get("configured"), maximum=2)
@@ -159,20 +199,25 @@ def _media_server_area(result: ToolResult | None) -> tuple[dict[str, Any], bool]
             reasons.append("media_server_offline")
         if reported_attention:
             reasons.append("media_server_compatibility_attention")
-        attention = max(reported_attention, 1 if reasons or result.status != "healthy" else 0)
+        attention = max(
+            reported_attention, 1 if reasons or result.status != "healthy" else 0
+        )
         status = "attention" if attention else "healthy"
 
-    return ({
-        "source": "media_servers",
-        "status": status,
-        "attention_count": attention,
-        "reason_codes": reasons,
-        "next_tool": "config.diagnose_media_servers",
-        "enabled_count": enabled,
-        "configured_count": configured,
-        "online_count": online,
-        "compatible_count": compatible,
-    }, network_accessed)
+    return (
+        {
+            "source": "media_servers",
+            "status": status,
+            "attention_count": attention,
+            "reason_codes": reasons,
+            "next_tool": "config.diagnose_media_servers",
+            "enabled_count": enabled,
+            "configured_count": configured,
+            "online_count": online,
+            "compatible_count": compatible,
+        },
+        network_accessed,
+    )
 
 
 def diagnose_workspace_health(_arguments: dict[str, Any]) -> ToolResult:
@@ -231,8 +276,16 @@ def diagnose_workspace_health(_arguments: dict[str, Any]) -> ToolResult:
             "areas": areas,
         },
         evidence=[
-            Evidence("workspace_local_snapshot", "读取工作区本地安全计数与能力就绪状态。", _now()),
-            Evidence("configuration_completeness", "仅检查关键配置组合是否完整，未返回配置值。", _now()),
+            Evidence(
+                "workspace_local_snapshot",
+                "读取工作区本地安全计数与能力就绪状态。",
+                _now(),
+            ),
+            Evidence(
+                "configuration_completeness",
+                "仅检查关键配置组合是否完整，未返回配置值。",
+                _now(),
+            ),
             Evidence(
                 "configured_media_servers",
                 "对已配置媒体节点执行固定系统信息探测；未返回地址、名称或访问凭据。",

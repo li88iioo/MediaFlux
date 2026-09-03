@@ -1,14 +1,15 @@
 """工作区系统简报：仅聚合本地安全状态，不主动探测外部服务。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.indexer_readiness_actions import diagnose_indexer_readiness
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import public_followup_prompt
+from app.agent.public_safety import public_followup_prompt
 from app.agent.workspace_todo_actions import summarize_workspace_todo
 from app.logger import get_logger
 
@@ -122,11 +123,13 @@ def summarize_workspace_briefing(_arguments: dict[str, Any]) -> ToolResult:
             if todo.status == "unavailable" or not todo.ok
             else "读取下载、RSS、整理、STRM、本地媒体与 Agent 持久自动化的本地安全计数。"
         )
-        evidence.append(Evidence(
-            "workspace_local_snapshot",
-            todo_evidence,
-            _now(),
-        ))
+        evidence.append(
+            Evidence(
+                "workspace_local_snapshot",
+                todo_evidence,
+                _now(),
+            )
+        )
     else:
         for source, next_tool in (
             ("downloads", "downloads.diagnose_queue"),
@@ -137,15 +140,17 @@ def summarize_workspace_briefing(_arguments: dict[str, Any]) -> ToolResult:
             ("download_verification", "downloads.diagnose_queue"),
             ("library_patrol", "library.patrol_status"),
         ):
-            areas.append({
-                "source": source,
-                "status": "unavailable",
-                "attention_count": 0,
-                "active_count": 0,
-                "waiting_count": 0,
-                "reason_codes": ["local_snapshot_unavailable"],
-                "next_tool": next_tool,
-            })
+            areas.append(
+                {
+                    "source": source,
+                    "status": "unavailable",
+                    "attention_count": 0,
+                    "active_count": 0,
+                    "waiting_count": 0,
+                    "reason_codes": ["local_snapshot_unavailable"],
+                    "next_tool": next_tool,
+                }
+            )
 
     try:
         indexers = diagnose_indexer_readiness({})
@@ -156,43 +161,61 @@ def summarize_workspace_briefing(_arguments: dict[str, Any]) -> ToolResult:
     else:
         indexer_evidence = "读取索引器本地开关与能力声明；未访问资源站。"
     areas.append(_indexer_area(indexers))
-    evidence.append(Evidence(
-        "indexer_local_readiness",
-        indexer_evidence,
-        _now(),
-    ))
+    evidence.append(
+        Evidence(
+            "indexer_local_readiness",
+            indexer_evidence,
+            _now(),
+        )
+    )
 
     try:
         areas.append(_media_server_area())
     except Exception as exc:
-        logger.warning("Agent 系统简报读取媒体服务器配置失败 type=%s", type(exc).__name__)
-        areas.append({
-            "source": "media_servers",
-            "status": "unavailable",
-            "attention_count": 0,
-            "active_count": 0,
-            "waiting_count": 0,
-            "reason_codes": ["media_server_config_unavailable"],
-            "next_tool": "config.diagnose",
-            "enabled_count": 0,
-            "ready_count": 0,
-            "connectivity": "not_probed",
-        })
+        logger.warning(
+            "Agent 系统简报读取媒体服务器配置失败 type=%s", type(exc).__name__
+        )
+        areas.append(
+            {
+                "source": "media_servers",
+                "status": "unavailable",
+                "attention_count": 0,
+                "active_count": 0,
+                "waiting_count": 0,
+                "reason_codes": ["media_server_config_unavailable"],
+                "next_tool": "config.diagnose",
+                "enabled_count": 0,
+                "ready_count": 0,
+                "connectivity": "not_probed",
+            }
+        )
         media_server_evidence = "尝试读取媒体服务器本地配置失败；未连接服务器。"
     else:
-        media_server_evidence = "仅检查媒体服务器是否启用及必要配置是否齐全；未连接服务器。"
-    evidence.append(Evidence(
-        "media_server_local_config",
-        media_server_evidence,
-        _now(),
-    ))
+        media_server_evidence = (
+            "仅检查媒体服务器是否启用及必要配置是否齐全；未连接服务器。"
+        )
+    evidence.append(
+        Evidence(
+            "media_server_local_config",
+            media_server_evidence,
+            _now(),
+        )
+    )
 
     attention_total = sum(_safe_count(item.get("attention_count")) for item in areas)
     active_total = sum(_safe_count(item.get("active_count")) for item in areas)
     waiting_total = sum(_safe_count(item.get("waiting_count")) for item in areas)
-    unavailable = [str(item.get("source")) for item in areas if item.get("status") == "unavailable"]
-    disabled = [str(item.get("source")) for item in areas if item.get("status") == "disabled"]
-    not_configured = [str(item.get("source")) for item in areas if item.get("status") == "not_configured"]
+    unavailable = [
+        str(item.get("source")) for item in areas if item.get("status") == "unavailable"
+    ]
+    disabled = [
+        str(item.get("source")) for item in areas if item.get("status") == "disabled"
+    ]
+    not_configured = [
+        str(item.get("source"))
+        for item in areas
+        if item.get("status") == "not_configured"
+    ]
     available = [
         str(item.get("source"))
         for item in areas
@@ -247,7 +270,10 @@ def summarize_workspace_briefing(_arguments: dict[str, Any]) -> ToolResult:
                 "unavailable": unavailable,
                 "disabled": disabled,
                 "not_configured": not_configured,
-                "not_probed": ["media_server_connectivity", "cloud_directory_pending_scan"],
+                "not_probed": [
+                    "media_server_connectivity",
+                    "cloud_directory_pending_scan",
+                ],
             },
             "areas": areas,
         },

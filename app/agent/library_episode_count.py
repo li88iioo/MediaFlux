@@ -1,12 +1,13 @@
 """指定剧集的本地集数查询：只读取 Jellyfin / Emby，不做 TMDB 缺集判断。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import unicodedata
+from datetime import datetime
 from typing import Any
 
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.services import inspect_series_episode_sources
 
 _MAX_EPISODES = 2000
@@ -55,9 +56,7 @@ def count_series_episodes_arguments(arguments: dict[str, Any]) -> dict[str, Any]
         raise AgentToolError("tmdb_id 必须是字符串")
     tmdb_id = tmdb_id.strip()
     if tmdb_id and (
-        not tmdb_id.isascii()
-        or not tmdb_id.isdigit()
-        or not 1 <= len(tmdb_id) <= 10
+        not tmdb_id.isascii() or not tmdb_id.isdigit() or not 1 <= len(tmdb_id) <= 10
     ):
         raise AgentToolError("tmdb_id 必须是 1 到 10 位数字")
     normalized = {"query": query, "tmdb_id": tmdb_id}
@@ -96,7 +95,9 @@ def _safe_source(source: dict[str, Any]) -> dict[str, Any]:
         and int(item[0]) > 0
         and int(item[1]) > 0
     }
-    selected = source.get("selected") if isinstance(source.get("selected"), dict) else {}
+    selected = (
+        source.get("selected") if isinstance(source.get("selected"), dict) else {}
+    )
     return {
         "server_type": str(source.get("server_type") or ""),
         "server_name": str(source.get("server_name") or "媒体服务器"),
@@ -141,11 +142,13 @@ def _result(
         status=status,
         summary=summary,
         data=data,
-        evidence=[Evidence(
-            "media_servers",
-            "直接读取已配置 Jellyfin / Emby 的本地 Series 与普通集号；不访问 TMDB，也不据此判断是否缺集。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_servers",
+                "直接读取已配置 Jellyfin / Emby 的本地 Series 与普通集号；不访问 TMDB，也不据此判断是否缺集。",
+                _now(),
+            )
+        ],
         suggestions=suggestions or [],
         error=error,
     )
@@ -180,7 +183,9 @@ def count_series_episodes(arguments: dict[str, Any]) -> ToolResult:
             error="media_server_not_configured",
         )
 
-    matched = [source for source in sources if str(source.get("status")) in _FOUND_STATUSES]
+    matched = [
+        source for source in sources if str(source.get("status")) in _FOUND_STATUSES
+    ]
     safe_sources = [_safe_source(source) for source in sources]
     if not matched:
         statuses = {str(source.get("status") or "unavailable") for source in sources}
@@ -194,7 +199,9 @@ def count_series_episodes(arguments: dict[str, Any]) -> ToolResult:
             status = "library_ambiguous"
             suggestions = ["请使用媒体服务器中显示的完整媒体库名称重试。"]
         elif statuses == {"not_found"}:
-            scope_label = f"「{library_name}」媒体库" if library_name else "已配置的媒体库"
+            scope_label = (
+                f"「{library_name}」媒体库" if library_name else "已配置的媒体库"
+            )
             summary = f"没有在{scope_label}中找到《{query}》"
             status = "not_found"
             suggestions = ["请尝试官方名称、原始名称，或提供 TMDB ID。"]
@@ -230,7 +237,9 @@ def count_series_episodes(arguments: dict[str, Any]) -> ToolResult:
     title = query
     year = ""
     for source in matched:
-        selected = source.get("selected") if isinstance(source.get("selected"), dict) else {}
+        selected = (
+            source.get("selected") if isinstance(source.get("selected"), dict) else {}
+        )
         title = str(selected.get("name") or title)
         year = str(selected.get("year") or year)
         ignored_specials += max(0, int(source.get("ignored_specials", 0) or 0))
@@ -251,7 +260,9 @@ def count_series_episodes(arguments: dict[str, Any]) -> ToolResult:
     incomplete = truncated or ignored_unknown > 0
     status = "partial" if incomplete else "success"
     ok = True
-    source_label = matched[0].get("server_name") or matched[0].get("server_type") or "媒体库"
+    source_label = (
+        matched[0].get("server_name") or matched[0].get("server_type") or "媒体库"
+    )
     if len(matched) > 1:
         source_label = f"{len(matched)} 个媒体服务器"
     summary = f"{source_label} 中《{title}》本地收录 {count} 集"
@@ -260,9 +271,13 @@ def count_series_episodes(arguments: dict[str, Any]) -> ToolResult:
 
     suggestions: list[str] = []
     if incomplete:
-        suggestions.append("当前数字是已确认的本地普通集下限，请修复未编号条目或稍后重试。")
+        suggestions.append(
+            "当前数字是已确认的本地普通集下限，请修复未编号条目或稍后重试。"
+        )
     elif ignored_specials:
-        suggestions.append(f"默认未计入特别篇（第 0 季），共忽略 {ignored_specials} 项。")
+        suggestions.append(
+            f"默认未计入特别篇（第 0 季），共忽略 {ignored_specials} 项。"
+        )
     suggestions.append("如果要检查缺集，请继续说“检查这部剧有没有缺集”。")
 
     return _result(

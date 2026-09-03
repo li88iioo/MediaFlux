@@ -9,13 +9,13 @@
 - strm_index     STRM 文件索引
 - settings_kv    通用 KV（兜底配置存储）
 """
+
 from __future__ import annotations
 
-import json
 import hashlib
 import hmac
 import html
-from html.parser import HTMLParser
+import json
 import os
 import re
 import sqlite3
@@ -25,6 +25,7 @@ import time
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 from app.config import PATHS
@@ -40,11 +41,9 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
-LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = (
-    "上次进程在本地媒体写操作期间中断"
-)
+LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
     "上次进程在本地媒体识别或计划期间中断，已释放为可重试"
 )
@@ -55,7 +54,9 @@ def is_interrupted_local_media_write_error(error: object) -> bool:
     return str(error or "").startswith(LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX)
 
 
-_SQLITE_CONTENTION_PHASES = frozenset({"connect_setup", "operation", "commit", "init_schema"})
+_SQLITE_CONTENTION_PHASES = frozenset(
+    {"connect_setup", "operation", "commit", "init_schema"}
+)
 _sqlite_contention_lock = threading.Lock()
 _sqlite_contention_counts = {
     "total": 0,
@@ -164,6 +165,7 @@ def configure_database(path: Path, *, test_mode: bool = False) -> Path:
     with _wal_setup_lock:
         _wal_mode_cache.clear()
     return configured_path
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS organize_log (
@@ -1451,6 +1453,44 @@ CREATE INDEX IF NOT EXISTS idx_agent_confirmations_owner_expiry
 CREATE INDEX IF NOT EXISTS idx_agent_confirmations_expiry
     ON agent_confirmations(expires_at);
 
+CREATE TABLE IF NOT EXISTS agent_kernel_sessions (
+    owner_digest TEXT NOT NULL,
+    session_digest TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    state_json TEXT NOT NULL,
+    state_hmac TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(owner_digest, session_digest)
+);
+CREATE TABLE IF NOT EXISTS agent_kernel_refs (
+    ref_id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    session_digest TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    value_json TEXT NOT NULL,
+    value_hmac TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_kernel_refs_scope
+    ON agent_kernel_refs(owner_digest, session_digest, expires_at);
+CREATE TABLE IF NOT EXISTS agent_kernel_events (
+    event_id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    session_digest TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK(sequence > 0),
+    event_type TEXT NOT NULL,
+    event_json TEXT NOT NULL,
+    event_hmac TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    UNIQUE(owner_digest, session_digest, turn_id, sequence)
+);
+CREATE INDEX IF NOT EXISTS idx_agent_kernel_events_session
+    ON agent_kernel_events(owner_digest, session_digest, created_at, sequence);
+
 CREATE TABLE IF NOT EXISTS agent_action_leases (
     lease_key TEXT PRIMARY KEY,
     lease_token TEXT NOT NULL,
@@ -1712,9 +1752,7 @@ def _protect_database_files(path: Path | None = None) -> None:
         if not protect_sqlite_files(target):
             logger.warning("数据库私有文件权限收紧失败")
     except Exception as exc:  # 权限防护为 best-effort，不能破坏数据库可用性
-        logger.warning(
-            "数据库私有文件权限收紧异常 type=%s", type(exc).__name__
-        )
+        logger.warning("数据库私有文件权限收紧异常 type=%s", type(exc).__name__)
 
 
 def _database_file_identity(path: Path) -> tuple[int, int, int] | None:
@@ -1905,9 +1943,7 @@ def _restore_interrupted_agent_session_context_v2(
             )
         # 已确认现表仅是旧表的空集或一致子集，可以丢弃并从完整旧表重做。
         conn.execute("DROP TABLE agent_session_context")
-    conn.execute(
-        "ALTER TABLE agent_session_context_v1 RENAME TO agent_session_context"
-    )
+    conn.execute("ALTER TABLE agent_session_context_v1 RENAME TO agent_session_context")
     logger.warning("检测到未完成的 Agent 会话上下文迁移，已安全恢复并重新执行")
 
 
@@ -2129,8 +2165,7 @@ def _migrate_agent_action_history_v6(conn: sqlite3.Connection) -> None:
 def _migrate_local_media_recognition_summary_v7(conn: sqlite3.Connection) -> None:
     """持久化本地整理的最终媒体识别摘要。"""
     columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(local_media_tasks)")
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(local_media_tasks)")
     }
     if columns and "recognition_summary" not in columns:
         conn.execute(
@@ -2182,10 +2217,7 @@ def _migrate_agent_guangya_operation_jobs_v10(
         _migrate_organize_operation_jobs_v4(conn)
         return
     table_sql = str(row["sql"] or "")
-    if (
-        "agent_guangya_rename" in table_sql
-        and "agent_guangya_cleanup" in table_sql
-    ):
+    if "agent_guangya_rename" in table_sql and "agent_guangya_cleanup" in table_sql:
         return
     for index_name in (
         "idx_organize_operation_jobs_pending",
@@ -2195,8 +2227,7 @@ def _migrate_agent_guangya_operation_jobs_v10(
     ):
         conn.execute(f"DROP INDEX IF EXISTS {index_name}")
     conn.execute(
-        "ALTER TABLE organize_operation_jobs "
-        "RENAME TO organize_operation_jobs_v9"
+        "ALTER TABLE organize_operation_jobs RENAME TO organize_operation_jobs_v9"
     )
     conn.execute(
         "CREATE TABLE organize_operation_jobs ("
@@ -2269,8 +2300,7 @@ def _migrate_agent_guangya_fs_change_jobs_v17(
     ):
         conn.execute(f"DROP INDEX IF EXISTS {index_name}")
     conn.execute(
-        "ALTER TABLE organize_operation_jobs "
-        "RENAME TO organize_operation_jobs_v16"
+        "ALTER TABLE organize_operation_jobs RENAME TO organize_operation_jobs_v16"
     )
     conn.execute(
         "CREATE TABLE organize_operation_jobs ("
@@ -2350,12 +2380,10 @@ def _migrate_agent_provider_plans_v18(conn: sqlite3.Connection) -> None:
     )
 
 
-
 def _migrate_local_media_numbering_mode_v11(conn: sqlite3.Connection) -> None:
     """持久化本地剧集编号方式，保证预览与最终执行使用同一映射。"""
     columns = {
-        str(row["name"])
-        for row in conn.execute("PRAGMA table_info(local_media_tasks)")
+        str(row["name"]) for row in conn.execute("PRAGMA table_info(local_media_tasks)")
     }
     if columns and "numbering_mode" not in columns:
         conn.execute(
@@ -2407,9 +2435,7 @@ def _migrate_media_subscription_notification_outbox_v13(
         return
 
     legacy = "media_subscription_notification_outbox_v12"
-    conn.execute(
-        "DROP INDEX IF EXISTS idx_media_subscription_notification_due"
-    )
+    conn.execute("DROP INDEX IF EXISTS idx_media_subscription_notification_due")
     conn.execute(
         "DROP INDEX IF EXISTS idx_media_subscription_notification_subscription"
     )
@@ -2465,8 +2491,7 @@ def _migrate_organize_confirmation_rollup_v14(
 ) -> None:
     """关联人工确认与原整理任务，并记录汇总回写终态。"""
     columns = {
-        str(row[1])
-        for row in conn.execute("PRAGMA table_info(organize_confirmations)")
+        str(row[1]) for row in conn.execute("PRAGMA table_info(organize_confirmations)")
     }
     if not columns:
         # 极早期/损坏开发库可能只有版本号而没有该表；后续正式 schema
@@ -2503,12 +2528,12 @@ class _LegacyTelegramHTMLTextExtractor(HTMLParser):
             self.parts.append("\n")
 
     def handle_starttag(
-        self, tag: str, attrs: list[tuple[str, str | None]],
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
     ) -> None:
         del attrs
-        if tag.casefold() == "br":
-            self._newline()
-        elif tag.casefold() in self._BLOCK_TAGS:
+        if tag.casefold() == "br" or tag.casefold() in self._BLOCK_TAGS:
             self._newline()
 
     def handle_endtag(self, tag: str) -> None:
@@ -2574,10 +2599,13 @@ def _migrate_retire_organize_notification_outbox_v15(
         idempotency_key = str(row[0] or "").strip()
         digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
         event_key = f"retired-organize:{digest}"
-        if conn.execute(
-            "SELECT 1 FROM telegram_notification_outbox WHERE event_key=?",
-            (event_key,),
-        ).fetchone() is not None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM telegram_notification_outbox WHERE event_key=?",
+                (event_key,),
+            ).fetchone()
+            is not None
+        ):
             raise sqlite3.IntegrityError(
                 "统一 Telegram outbox 已存在旧整理通知迁移键；已保留源表等待人工核验"
             )
@@ -2619,14 +2647,10 @@ def _migrate_retire_organize_notification_outbox_v15(
             ),
         )
         if result.rowcount != 1:
-            raise sqlite3.IntegrityError(
-                "旧整理通知迁移写入数量异常；已保留源表"
-            )
+            raise sqlite3.IntegrityError("旧整理通知迁移写入数量异常；已保留源表")
         inserted += 1
     if inserted != len(rows):
-        raise sqlite3.IntegrityError(
-            "旧整理通知迁移数量不一致；已保留源表"
-        )
+        raise sqlite3.IntegrityError("旧整理通知迁移数量不一致；已保留源表")
     conn.execute("DROP TABLE organize_notification_outbox")
 
 
@@ -2703,7 +2727,7 @@ def _legacy_rss_download_identity(
                 xt = str(value or "").strip()
                 if not xt.lower().startswith("urn:btih:"):
                     continue
-                raw = xt[len("urn:btih:"):]
+                raw = xt[len("urn:btih:") :]
                 if re.fullmatch(r"(?i)[0-9a-f]{40}", raw):
                     btih = raw.lower()
                     break
@@ -2738,8 +2762,7 @@ def _legacy_rss_download_identity(
         identities.append(f"legacy-rss-claim:{normalized_claim or 'unknown'}")
     request_keys = tuple(
         dict.fromkeys(
-            hashlib.sha256(value.encode("utf-8")).hexdigest()
-            for value in identities
+            hashlib.sha256(value.encode("utf-8")).hexdigest() for value in identities
         )
     )
     return kind, source, request_keys, btih
@@ -2749,27 +2772,48 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
     """把 RSS 专属后端 claim 收口到统一下载请求后退休旧表。"""
 
     def columns(table: str) -> set[str]:
-        return {
-            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
-        }
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
     request_columns = columns("download_requests")
     key_columns = columns("download_request_keys")
     entry_columns = columns("rss_entries")
     can_transfer = (
         {
-            "id", "request_key", "origin", "kind", "title", "source_value",
-            "targets", "status", "qb_task_id", "qb_status", "gy_status",
-            "organize_started", "organize_status", "organize_finished_at",
-            "local_import_status", "local_import_error",
-            "local_import_completed_at", "error", "created_at", "updated_at",
+            "id",
+            "request_key",
+            "origin",
+            "kind",
+            "title",
+            "source_value",
+            "targets",
+            "status",
+            "qb_task_id",
+            "qb_status",
+            "gy_status",
+            "organize_started",
+            "organize_status",
+            "organize_finished_at",
+            "local_import_status",
+            "local_import_error",
+            "local_import_completed_at",
+            "error",
+            "created_at",
+            "updated_at",
             "completed_at",
-        } <= request_columns
+        }
+        <= request_columns
         and {"request_key", "request_id", "created_at"} <= key_columns
         and {
-            "id", "rss_item_id", "title", "payload", "status", "processed",
-            "created_at", "submitted_at",
-        } <= entry_columns
+            "id",
+            "rss_item_id",
+            "title",
+            "payload",
+            "status",
+            "processed",
+            "created_at",
+            "submitted_at",
+        }
+        <= entry_columns
     )
     migration_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -2793,7 +2837,10 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
         if incoming == "completed" and normalized in ambiguous:
             return incoming, True
         if incoming == "manual_review" and normalized in {
-            "", "pending", "submitting", "outcome_unknown"
+            "",
+            "pending",
+            "submitting",
+            "outcome_unknown",
         }:
             return incoming, True
         # 旧迁移记录不能覆盖当前下载链路已经推进到 submitted、
@@ -2808,9 +2855,11 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
         if not claim_columns:
             continue
 
-        if can_transfer and {
-            "infohash", "first_entry_id", "status", "created_at", "updated_at"
-        } <= claim_columns:
+        if (
+            can_transfer
+            and {"infohash", "first_entry_id", "status", "created_at", "updated_at"}
+            <= claim_columns
+        ):
             claims = conn.execute(
                 f"SELECT infohash,first_entry_id,status,created_at,updated_at FROM {table}"
             ).fetchall()
@@ -2863,7 +2912,9 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                             1 if backend == "guangya" and certain_completed else 0
                         ),
                         "organize_status": (
-                            "skipped" if backend == "guangya" and certain_completed else ""
+                            "skipped"
+                            if backend == "guangya" and certain_completed
+                            else ""
                         ),
                         "organize_finished_at": (
                             updated_at
@@ -2879,7 +2930,9 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                             else ""
                         ),
                         "local_import_completed_at": (
-                            updated_at if backend == "qb" and certain_completed else None
+                            updated_at
+                            if backend == "qb" and certain_completed
+                            else None
                         ),
                         "error": error,
                         "created_at": created_at,
@@ -2912,16 +2965,19 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                     merged_statuses = {
                         "qb": (
                             merged_backend_status
-                            if backend == "qb" else str(current["qb_status"] or "")
+                            if backend == "qb"
+                            else str(current["qb_status"] or "")
                         ),
                         "guangya": (
                             merged_backend_status
-                            if backend == "guangya" else str(current["gy_status"] or "")
+                            if backend == "guangya"
+                            else str(current["gy_status"] or "")
                         ),
                     }
                     target_backends = (
                         ("qb", "guangya")
-                        if merged_target == "both" else (merged_target,)
+                        if merged_target == "both"
+                        else (merged_target,)
                     )
                     target_statuses = [
                         merged_statuses[item]
@@ -2933,12 +2989,14 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                     if (
                         target_statuses
                         and all(value == "completed" for value in target_statuses)
-                        and current_root_status not in {"partial", "failed", "cancelled"}
+                        and current_root_status
+                        not in {"partial", "failed", "cancelled"}
                     ):
                         merged_root_status = "completed"
                     elif (
                         "manual_review" in target_statuses
-                        and current_root_status not in {"partial", "failed", "cancelled"}
+                        and current_root_status
+                        not in {"partial", "failed", "cancelled"}
                     ):
                         merged_root_status = "manual_review"
 
@@ -2951,35 +3009,42 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                         "status": merged_root_status,
                         "updated_at": effective_updated_at,
                     }
-                    if backend == "qb" and btih and not str(current["qb_task_id"] or ""):
+                    if (
+                        backend == "qb"
+                        and btih
+                        and not str(current["qb_task_id"] or "")
+                    ):
                         updates["qb_task_id"] = btih
                     if backend == "qb" and certain_completed and claim_applied:
                         if not str(current["local_import_status"] or ""):
-                            updates.update({
-                                "local_import_status": "skipped",
-                                "local_import_error": (
-                                    "旧 RSS 完成记录仅迁移幂等边界，不回放历史本地整理"
-                                ),
-                                "local_import_completed_at": updated_at,
-                            })
+                            updates.update(
+                                {
+                                    "local_import_status": "skipped",
+                                    "local_import_error": (
+                                        "旧 RSS 完成记录仅迁移幂等边界，不回放历史本地整理"
+                                    ),
+                                    "local_import_completed_at": updated_at,
+                                }
+                            )
                     if backend == "guangya" and certain_completed and claim_applied:
                         if not str(current["organize_status"] or ""):
-                            updates.update({
-                                "organize_started": max(
-                                    1, int(current["organize_started"] or 0)
-                                ),
-                                "organize_status": "skipped",
-                                "organize_finished_at": updated_at,
-                            })
+                            updates.update(
+                                {
+                                    "organize_started": max(
+                                        1, int(current["organize_started"] or 0)
+                                    ),
+                                    "organize_status": "skipped",
+                                    "organize_finished_at": updated_at,
+                                }
+                            )
                     if (
                         merged_root_status == "manual_review"
                         and claim_applied
                         and not str(current["error"] or "")
                     ):
                         updates["error"] = error
-                    if (
-                        merged_root_status in {"completed", "manual_review"}
-                        and not str(current["completed_at"] or "")
+                    if merged_root_status in {"completed", "manual_review"} and not str(
+                        current["completed_at"] or ""
                     ):
                         updates["completed_at"] = updated_at
                     sets = ",".join(f"{name}=?" for name in updates)
@@ -3006,6 +3071,39 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
         conn.execute(f"DROP TABLE {table}")
 
 
+def _migrate_agent_kernel_v21(conn: sqlite3.Connection) -> None:
+    """建立新 Agent Kernel 的统一会话、引用与真实事件存储。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_kernel_sessions ("
+        "owner_digest TEXT NOT NULL,session_digest TEXT NOT NULL,"
+        "generation INTEGER NOT NULL CHECK(generation >= 0),"
+        "state_json TEXT NOT NULL,state_hmac TEXT NOT NULL,updated_at REAL NOT NULL,"
+        "PRIMARY KEY(owner_digest,session_digest))"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_kernel_refs ("
+        "ref_id TEXT PRIMARY KEY,owner_digest TEXT NOT NULL,session_digest TEXT NOT NULL,"
+        "kind TEXT NOT NULL,value_json TEXT NOT NULL,value_hmac TEXT NOT NULL,"
+        "expires_at REAL NOT NULL,created_at REAL NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_kernel_refs_scope "
+        "ON agent_kernel_refs(owner_digest,session_digest,expires_at)"
+    )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_kernel_events ("
+        "event_id TEXT PRIMARY KEY,owner_digest TEXT NOT NULL,session_digest TEXT NOT NULL,"
+        "turn_id TEXT NOT NULL,request_id TEXT NOT NULL,"
+        "sequence INTEGER NOT NULL CHECK(sequence > 0),event_type TEXT NOT NULL,"
+        "event_json TEXT NOT NULL,event_hmac TEXT NOT NULL,occurred_at TEXT NOT NULL,"
+        "created_at REAL NOT NULL,UNIQUE(owner_digest,session_digest,turn_id,sequence))"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_kernel_events_session "
+        "ON agent_kernel_events(owner_digest,session_digest,created_at,sequence)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -3027,6 +3125,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     17: _migrate_agent_provider_plans_v18,
     18: _migrate_strm_refresh_outbox_v19,
     19: _migrate_unify_rss_download_requests_v20,
+    20: _migrate_agent_kernel_v21,
 }
 
 
@@ -3189,8 +3288,7 @@ def _sync_missing_schema_columns(conn: sqlite3.Connection) -> None:
                 continue
 
             target_cols = {
-                str(r[1])
-                for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()
+                str(r[1]) for r in conn.execute(f"PRAGMA table_info({tbl})").fetchall()
             }
             for row in mem.execute(f"PRAGMA table_info({tbl})").fetchall():
                 _cid, col_name, col_type, notnull, dflt_value, _pk = row
@@ -3213,8 +3311,12 @@ def _sync_missing_schema_columns(conn: sqlite3.Connection) -> None:
 
 
 def finalize_provider_action_history_for_plan(
-    conn: sqlite3.Connection, *, plan_ref: str, status: str,
-    error_code: str, timestamp: str,
+    conn: sqlite3.Connection,
+    *,
+    plan_ref: str,
+    status: str,
+    error_code: str,
+    timestamp: str,
 ) -> int:
     """把 Provider 计划终态投影到已经存在的确认审计。
 
@@ -3224,7 +3326,10 @@ def finalize_provider_action_history_for_plan(
     normalized_plan = str(plan_ref or "").strip().upper()
     normalized_status = str(status or "").strip().casefold()
     if not normalized_plan or normalized_status not in {
-        "succeeded", "failed", "stale", "outcome_unknown",
+        "succeeded",
+        "failed",
+        "stale",
+        "outcome_unknown",
     }:
         return 0
     labels = {
@@ -3256,8 +3361,7 @@ def finalize_provider_action_history_for_plan(
             continue
         if (
             isinstance(details, dict)
-            and str(details.get("plan_ref") or "").strip().upper()
-            == normalized_plan
+            and str(details.get("plan_ref") or "").strip().upper() == normalized_plan
         ):
             history_ids.append(int(row["id"]))
     if not history_ids:
@@ -3348,6 +3452,7 @@ def init_db() -> None:
         local_media_recovery_lock = None
         try:
             _prepare_schema_migration(conn, database_existed=database_existed)
+
             # 未打版本的早期数据库也可能已有 v1 约束表；补列与重建必须作为
             # 一个原子步骤完成，避免退出后留下半迁移 schema。
             def prepare_schema_baseline(connection: sqlite3.Connection) -> None:
@@ -3363,7 +3468,9 @@ def init_db() -> None:
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
                 conn,
-                operation=lambda connection: _execute_schema_script(connection, _SCHEMA),
+                operation=lambda connection: _execute_schema_script(
+                    connection, _SCHEMA
+                ),
             )
             conn.execute(
                 "UPDATE agent_rate_limit_buckets SET expires_at="
@@ -3423,7 +3530,9 @@ def init_db() -> None:
             ).fetchall()
             for interrupted in interrupted_confirmations:
                 try:
-                    stored_payload = json.loads(str(interrupted["payload_json"] or "{}"))
+                    stored_payload = json.loads(
+                        str(interrupted["payload_json"] or "{}")
+                    )
                 except (TypeError, ValueError, json.JSONDecodeError):
                     stored_payload = {}
                 if not isinstance(stored_payload, dict):
@@ -3506,9 +3615,7 @@ def init_db() -> None:
                         raw_result = {}
                     normalized_result = read_organize_result(raw_result)
                     previous_error = str(
-                        normalized_result.get("error")
-                        or interrupted_run["error"]
-                        or ""
+                        normalized_result.get("error") or interrupted_run["error"] or ""
                     ).strip()
                     if previous_error and previous_error != interrupted_message:
                         normalized_result["previous_error"] = previous_error
@@ -3696,9 +3803,7 @@ def init_db() -> None:
                 "WHERE status='executing' AND tool_name<>'provider.change.execute'",
                 (timestamp,),
             )
-            _recover_interrupted_provider_plans_on_startup(
-                conn, timestamp=timestamp
-            )
+            _recover_interrupted_provider_plans_on_startup(conn, timestamp=timestamp)
             conn.execute(
                 "UPDATE agent_provider_plans SET status='stale',"
                 "summary='写计划已过期',error_code='plan_expired',"
@@ -3747,17 +3852,13 @@ def get_conn():
         try:
             conn.rollback()
         except sqlite3.Error as rollback_exc:
-            logger.warning(
-                "数据库回滚失败 type=%s", type(rollback_exc).__name__
-            )
+            logger.warning("数据库回滚失败 type=%s", type(rollback_exc).__name__)
         raise
     finally:
         try:
             conn.close()
         except sqlite3.Error as close_exc:
-            logger.warning(
-                "数据库连接关闭失败 type=%s", type(close_exc).__name__
-            )
+            logger.warning("数据库连接关闭失败 type=%s", type(close_exc).__name__)
         finally:
             _protect_database_files()
 
@@ -3778,7 +3879,6 @@ from app.repositories.agent_web_search import (  # noqa: E402,F401
     set_agent_web_search_cache,
 )
 
-
 # ===== 媒体探测缓存 =====
 # 统一数据访问门面：批量读取保持单连接契约。
 from app.repositories.media_probe import (  # noqa: E402,F401
@@ -3788,21 +3888,6 @@ from app.repositories.media_probe import (  # noqa: E402,F401
     upsert_media_probe_cache,
     upsert_media_probe_failure_cache,
 )
-
-
-# ===== 整理后媒体规格补全队列 =====
-from app.repositories.organize_probe import (  # noqa: E402,F401
-    cancel_organize_probe_job,
-    claim_due_organize_probe_jobs,
-    commit_organize_probe_rename,
-    complete_organize_probe_job,
-    count_organize_probe_jobs,
-    enqueue_organize_probe_completion,
-    fail_or_retry_organize_probe_job,
-    recover_stale_organize_probe_jobs,
-    release_organize_probe_job,
-)
-
 
 # ===== Emby / Jellyfin 多实例媒体反代 =====
 # 统一数据访问门面：schema/连接仍由本模块持有。
@@ -3824,6 +3909,19 @@ from app.repositories.media_proxy import (  # noqa: E402,F401
     update_media_proxy_instance,
 )
 
+# ===== 整理后媒体规格补全队列 =====
+from app.repositories.organize_probe import (  # noqa: E402,F401
+    cancel_organize_probe_job,
+    claim_due_organize_probe_jobs,
+    commit_organize_probe_rename,
+    complete_organize_probe_job,
+    count_organize_probe_jobs,
+    enqueue_organize_probe_completion,
+    fail_or_retry_organize_probe_job,
+    recover_stale_organize_probe_jobs,
+    release_organize_probe_job,
+)
+
 
 # ===== 便捷 CRUD（按需扩展）=====
 def kv_get(key: str, default: str = "") -> str:
@@ -3841,8 +3939,6 @@ def kv_set(key: str, value: str) -> None:
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             (key, value, now()),
         )
-
-
 
 
 def _ensure_organize_delete_audit_schema(conn: sqlite3.Connection) -> None:
@@ -3875,13 +3971,25 @@ def _ensure_organize_delete_audit_schema(conn: sqlite3.Connection) -> None:
             ON organize_delete_audit(file_id, id DESC);
     """)
 
+
 def add_organize_delete_audit(
-    *, trigger: str, file_id: str, reason: str, status: str,
-    organize_log_id: int | None = None, provider: str = "guangya",
-    file_name: str = "", parent_id: str = "", size: int = 0, gcid: str = "",
-    replacement_file_id: str = "", replacement_name: str = "",
-    replacement_size: int = 0, replacement_gcid: str = "",
-    provider_result: str = "", error: str = "",
+    *,
+    trigger: str,
+    file_id: str,
+    reason: str,
+    status: str,
+    organize_log_id: int | None = None,
+    provider: str = "guangya",
+    file_name: str = "",
+    parent_id: str = "",
+    size: int = 0,
+    gcid: str = "",
+    replacement_file_id: str = "",
+    replacement_name: str = "",
+    replacement_size: int = 0,
+    replacement_gcid: str = "",
+    provider_result: str = "",
+    error: str = "",
 ) -> int:
     timestamp = now()
     with get_conn() as conn:
@@ -3891,10 +3999,26 @@ def add_organize_delete_audit(
             "file_name,parent_id,size,gcid,replacement_file_id,replacement_name,"
             "replacement_size,replacement_gcid,reason,status,provider_result,error,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (organize_log_id, trigger, provider, file_id, file_name, parent_id,
-             int(size or 0), gcid, replacement_file_id, replacement_name,
-             int(replacement_size or 0), replacement_gcid, reason, status,
-             provider_result, error, timestamp, timestamp),
+            (
+                organize_log_id,
+                trigger,
+                provider,
+                file_id,
+                file_name,
+                parent_id,
+                int(size or 0),
+                gcid,
+                replacement_file_id,
+                replacement_name,
+                int(replacement_size or 0),
+                replacement_gcid,
+                reason,
+                status,
+                provider_result,
+                error,
+                timestamp,
+                timestamp,
+            ),
         )
         return int(cur.lastrowid)
 
@@ -3927,7 +4051,8 @@ def get_organize_delete_audit(audit_id: int) -> sqlite3.Row | None:
 
 
 def list_organize_delete_audits(
-    organize_log_id: int | None = None, limit: int = 100,
+    organize_log_id: int | None = None,
+    limit: int = 100,
 ) -> list[sqlite3.Row]:
     sql = "SELECT * FROM organize_delete_audit"
     params: list = []
@@ -3939,6 +4064,7 @@ def list_organize_delete_audits(
     with get_conn() as conn:
         _ensure_organize_delete_audit_schema(conn)
         return conn.execute(sql, params).fetchall()
+
 
 def _normalize_organize_position(value) -> int | None:
     """防止外部解析器的 list/dict 等值直接进入 SQLite INTEGER 参数。"""
@@ -3988,10 +4114,13 @@ def add_organize_log(
     season = _normalize_organize_position(season)
     episode = _normalize_organize_position(episode)
     # 调用方可以主动标记为不完整，但不能覆盖关键快照缺失这一事实。
-    incomplete = bool(legacy_incomplete) or not bool(original_name and original_parent_id)
+    incomplete = bool(legacy_incomplete) or not bool(
+        original_name and original_parent_id
+    )
     release_parse_json = (
         json.dumps(release_parse, ensure_ascii=False, separators=(",", ":"))
-        if isinstance(release_parse, dict) and release_parse else ""
+        if isinstance(release_parse, dict) and release_parse
+        else ""
     )
 
     def insert(conn: sqlite3.Connection) -> int:
@@ -4002,12 +4131,34 @@ def add_organize_log(
             "operation_token,version,legacy_incomplete,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                source, original_path, new_path, file_id, status, tmdb_id, provider, external_id,
-                operation_type, source_dir_id, original_parent_id, original_name,
-                current_parent_id, current_name, target_parent_id, media_type, title,
-                year, season, episode, error, release_parse_json, parent_log_id,
-                str(operation_token or "").strip(), 1, 1 if incomplete else 0,
-                timestamp, timestamp,
+                source,
+                original_path,
+                new_path,
+                file_id,
+                status,
+                tmdb_id,
+                provider,
+                external_id,
+                operation_type,
+                source_dir_id,
+                original_parent_id,
+                original_name,
+                current_parent_id,
+                current_name,
+                target_parent_id,
+                media_type,
+                title,
+                year,
+                season,
+                episode,
+                error,
+                release_parse_json,
+                parent_log_id,
+                str(operation_token or "").strip(),
+                1,
+                1 if incomplete else 0,
+                timestamp,
+                timestamp,
             ),
         )
         return int(cur.lastrowid)
@@ -4030,15 +4181,25 @@ def add_organize_log_items(
         file_id = str(item.get("file_id") or "").strip()
         if not file_id:
             continue
-        rows.append((
-            log_id, file_id, str(item.get("role") or "metadata"),
-            str(item.get("original_parent_id") or ""), str(item.get("original_name") or ""),
-            str(item.get("current_parent_id") or ""), str(item.get("current_name") or ""),
-            str(item.get("target_parent_id") or ""), str(item.get("target_name") or ""),
-            int(item.get("size") or 0), str(item.get("etag") or ""),
-            str(item.get("status") or "success"), str(item.get("error") or ""),
-            timestamp, timestamp,
-        ))
+        rows.append(
+            (
+                log_id,
+                file_id,
+                str(item.get("role") or "metadata"),
+                str(item.get("original_parent_id") or ""),
+                str(item.get("original_name") or ""),
+                str(item.get("current_parent_id") or ""),
+                str(item.get("current_name") or ""),
+                str(item.get("target_parent_id") or ""),
+                str(item.get("target_name") or ""),
+                int(item.get("size") or 0),
+                str(item.get("etag") or ""),
+                str(item.get("status") or "success"),
+                str(item.get("error") or ""),
+                timestamp,
+                timestamp,
+            )
+        )
     if not rows:
         return 0
 
@@ -4125,9 +4286,11 @@ def finalize_pending_organize_logs(
     if normalized_status not in {"skipped", "failed"}:
         raise ValueError("不支持的人工确认终态")
     normalized_source = str(source or "").strip()
-    normalized_ids = list(dict.fromkeys(
-        str(item or "").strip() for item in file_ids if str(item or "").strip()
-    ))
+    normalized_ids = list(
+        dict.fromkeys(
+            str(item or "").strip() for item in file_ids if str(item or "").strip()
+        )
+    )
     if not normalized_source or not normalized_ids:
         return 0
     placeholders = ",".join("?" for _ in normalized_ids)
@@ -4158,7 +4321,9 @@ def finalize_pending_organize_logs(
         return len(log_ids)
 
 
-def _organize_log_filters(status: str | None = None, keyword: str = "") -> tuple[str, list]:
+def _organize_log_filters(
+    status: str | None = None, keyword: str = ""
+) -> tuple[str, list]:
     sql = " WHERE 1=1"
     params: list = []
     if status:
@@ -4171,8 +4336,9 @@ def _organize_log_filters(status: str | None = None, keyword: str = "") -> tuple
     return sql, params
 
 
-def list_organize_logs(status: str | None = None, keyword: str = "",
-                       limit: int = 20, offset: int = 0) -> list[sqlite3.Row]:
+def list_organize_logs(
+    status: str | None = None, keyword: str = "", limit: int = 20, offset: int = 0
+) -> list[sqlite3.Row]:
     filters, params = _organize_log_filters(status, keyword)
     sql = "SELECT * FROM organize_log" + filters + " ORDER BY id DESC LIMIT ? OFFSET ?"
     params.extend([max(1, int(limit)), max(0, int(offset))])
@@ -4182,7 +4348,9 @@ def list_organize_logs(status: str | None = None, keyword: str = "",
 
 def latest_organize_log_id() -> int:
     with get_conn() as conn:
-        row = conn.execute("SELECT COALESCE(MAX(id),0) AS id FROM organize_log").fetchone()
+        row = conn.execute(
+            "SELECT COALESCE(MAX(id),0) AS id FROM organize_log"
+        ).fetchone()
         return int(row["id"] or 0)
 
 
@@ -4227,17 +4395,27 @@ def list_organize_root_identities(media_root_path: str) -> list[sqlite3.Row]:
 def count_organize_logs(status: str | None = None, keyword: str = "") -> int:
     filters, params = _organize_log_filters(status, keyword)
     with get_conn() as conn:
-        return int(conn.execute(
-            "SELECT COUNT(*) FROM organize_log" + filters, params
-        ).fetchone()[0])
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM organize_log" + filters, params
+            ).fetchone()[0]
+        )
 
 
-_TIMELINE_STATUS_VALUES = {"success", "failed", "skipped", "reverted", "processing", "manual"}
+_TIMELINE_STATUS_VALUES = {
+    "success",
+    "failed",
+    "skipped",
+    "reverted",
+    "processing",
+    "manual",
+}
 _TIMELINE_ORIGIN_VALUES = {"all", "guangya", "local"}
 
 
-def _organize_timeline_query(*, owner: str = "admin", origin: str = "all",
-                             status: str = "", keyword: str = "") -> tuple[str, list[object]]:
+def _organize_timeline_query(
+    *, owner: str = "admin", origin: str = "all", status: str = "", keyword: str = ""
+) -> tuple[str, list[object]]:
     normalized_origin = str(origin or "all").strip().lower()
     normalized_status = str(status or "").strip().lower()
     if normalized_origin not in _TIMELINE_ORIGIN_VALUES:
@@ -4332,18 +4510,30 @@ def _organize_timeline_query(*, owner: str = "admin", origin: str = "all",
     return sql, params
 
 
-def list_organize_timeline(*, owner: str = "admin", origin: str = "all", status: str = "",
-                           keyword: str = "", limit: int = 20, offset: int = 0) -> list[sqlite3.Row]:
-    sql, params = _organize_timeline_query(owner=owner, origin=origin, status=status, keyword=keyword)
+def list_organize_timeline(
+    *,
+    owner: str = "admin",
+    origin: str = "all",
+    status: str = "",
+    keyword: str = "",
+    limit: int = 20,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
+    sql, params = _organize_timeline_query(
+        owner=owner, origin=origin, status=status, keyword=keyword
+    )
     sql += " ORDER BY updated_at DESC, origin DESC, id DESC LIMIT ? OFFSET ?"
     params.extend([max(1, int(limit)), max(0, int(offset))])
     with get_conn() as conn:
         return conn.execute(sql, params).fetchall()
 
 
-def count_organize_timeline(*, owner: str = "admin", origin: str = "all", status: str = "",
-                            keyword: str = "") -> int:
-    sql, params = _organize_timeline_query(owner=owner, origin=origin, status=status, keyword=keyword)
+def count_organize_timeline(
+    *, owner: str = "admin", origin: str = "all", status: str = "", keyword: str = ""
+) -> int:
+    sql, params = _organize_timeline_query(
+        owner=owner, origin=origin, status=status, keyword=keyword
+    )
     with get_conn() as conn:
         return int(conn.execute(f"SELECT COUNT(*) FROM ({sql})", params).fetchone()[0])
 
@@ -4380,12 +4570,16 @@ def get_agent_organize_audit(
         status="" if normalized_status == "all" else normalized_status,
     )
     with get_conn() as conn:
-        total = int(conn.execute(f"SELECT COUNT(*) FROM ({base_sql})", params).fetchone()[0])
+        total = int(
+            conn.execute(f"SELECT COUNT(*) FROM ({base_sql})", params).fetchone()[0]
+        )
         origin_rows = conn.execute(
-            f"SELECT origin, COUNT(*) AS count FROM ({base_sql}) GROUP BY origin", params
+            f"SELECT origin, COUNT(*) AS count FROM ({base_sql}) GROUP BY origin",
+            params,
         ).fetchall()
         status_rows = conn.execute(
-            f"SELECT status, COUNT(*) AS count FROM ({base_sql}) GROUP BY status", params
+            f"SELECT status, COUNT(*) AS count FROM ({base_sql}) GROUP BY status",
+            params,
         ).fetchall()
         rows = conn.execute(
             "SELECT origin,status,title,media_type,year,season,episode,updated_at "
@@ -4395,8 +4589,12 @@ def get_agent_organize_audit(
 
     return {
         "total": total,
-        "by_origin": {str(row["origin"]): int(row["count"] or 0) for row in origin_rows},
-        "by_status": {str(row["status"]): int(row["count"] or 0) for row in status_rows},
+        "by_origin": {
+            str(row["origin"]): int(row["count"] or 0) for row in origin_rows
+        },
+        "by_status": {
+            str(row["status"]): int(row["count"] or 0) for row in status_rows
+        },
         "records": [dict(row) for row in rows[:safe_limit]],
         "truncated": len(rows) > safe_limit,
     }
@@ -4413,7 +4611,8 @@ def list_organize_log_items(log_id: int) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM organize_log_items WHERE log_id=? ORDER BY CASE role "
-            "WHEN 'video' THEN 0 ELSE 1 END,id", (log_id,)
+            "WHEN 'video' THEN 0 ELSE 1 END,id",
+            (log_id,),
         ).fetchall()
 
 
@@ -4449,13 +4648,14 @@ def claim_organize_log_operation(
         return cur.rowcount == 1
 
 
-
 class _BatchClaimRejected(RuntimeError):
     pass
 
 
 def claim_organize_log_operations_batch(
-    entries: list[dict], next_status: str, allowed_statuses: tuple[str, ...],
+    entries: list[dict],
+    next_status: str,
+    allowed_statuses: tuple[str, ...],
 ) -> bool:
     """在单一事务内认领整批日志；任一版本/状态漂移则全部回滚。"""
     statuses = tuple(dict.fromkeys(str(item) for item in allowed_statuses if str(item)))
@@ -4473,21 +4673,43 @@ def claim_organize_log_operations_batch(
                 token = str(entry.get("operation_token") or "")
                 if not token:
                     raise _BatchClaimRejected("missing operation token")
-                cur = conn.execute(sql, (
-                    next_status, token, now(), int(entry["log_id"]),
-                    *statuses, int(entry["expected_version"]),
-                ))
+                cur = conn.execute(
+                    sql,
+                    (
+                        next_status,
+                        token,
+                        now(),
+                        int(entry["log_id"]),
+                        *statuses,
+                        int(entry["expected_version"]),
+                    ),
+                )
                 if cur.rowcount != 1:
                     raise _BatchClaimRejected("batch claim rejected")
     except _BatchClaimRejected:
         return False
     return True
 
+
 def update_organize_log(log_id: int, **fields) -> bool:
     allowed = {
-        "status", "new_path", "current_parent_id", "current_name", "target_parent_id",
-        "tmdb_id", "provider", "external_id", "media_type", "title", "year", "season", "episode", "error",
-        "operation_type", "operation_token", "legacy_incomplete",
+        "status",
+        "new_path",
+        "current_parent_id",
+        "current_name",
+        "target_parent_id",
+        "tmdb_id",
+        "provider",
+        "external_id",
+        "media_type",
+        "title",
+        "year",
+        "season",
+        "episode",
+        "error",
+        "operation_type",
+        "operation_token",
+        "legacy_incomplete",
     }
     sets, values = [], []
     for key, value in fields.items():
@@ -4507,8 +4729,14 @@ def update_organize_log(log_id: int, **fields) -> bool:
 
 def update_organize_log_item(item_id: int, **fields) -> bool:
     allowed = {
-        "current_parent_id", "current_name", "target_parent_id", "target_name",
-        "status", "error", "size", "etag",
+        "current_parent_id",
+        "current_name",
+        "target_parent_id",
+        "target_name",
+        "status",
+        "error",
+        "size",
+        "etag",
     }
     sets, values = [], []
     for key, value in fields.items():
@@ -4540,11 +4768,18 @@ def add_organize_operation_step(
             "from_parent_id,from_name,to_parent_id,to_name,status,error,started_at,finished_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                log_id, operation_token, int(step_index), action,
-                str(fields.get("file_id") or ""), str(fields.get("from_parent_id") or ""),
-                str(fields.get("from_name") or ""), str(fields.get("to_parent_id") or ""),
-                str(fields.get("to_name") or ""), str(fields.get("status") or "pending"),
-                str(fields.get("error") or ""), fields.get("started_at") or timestamp,
+                log_id,
+                operation_token,
+                int(step_index),
+                action,
+                str(fields.get("file_id") or ""),
+                str(fields.get("from_parent_id") or ""),
+                str(fields.get("from_name") or ""),
+                str(fields.get("to_parent_id") or ""),
+                str(fields.get("to_name") or ""),
+                str(fields.get("status") or "pending"),
+                str(fields.get("error") or ""),
+                fields.get("started_at") or timestamp,
                 fields.get("finished_at"),
             ),
         )
@@ -4587,25 +4822,33 @@ def recover_interrupted_organize_operations() -> dict[str, int]:
     return {"logs": logs, "steps": steps, "delete_audits": audits}
 
 
-
 def clear_organize_logs() -> dict[str, int]:
     """清理可安全删除的光鸭与本地整理记录，不触碰任何媒体文件。"""
     guangya_busy_statuses = ("reorganizing", "returning", "reverting", "deleting")
     local_busy_statuses = (
-        "waiting_stable", "recognizing", "planned", "moving",
-        "verifying", "refreshing", "rolling_back",
+        "waiting_stable",
+        "recognizing",
+        "planned",
+        "moving",
+        "verifying",
+        "refreshing",
+        "rolling_back",
     )
     guangya_placeholders = ",".join("?" for _ in guangya_busy_statuses)
     local_placeholders = ",".join("?" for _ in local_busy_statuses)
     with get_conn() as conn:
-        guangya_busy = int(conn.execute(
-            f"SELECT COUNT(*) FROM organize_log WHERE status IN ({guangya_placeholders})",
-            guangya_busy_statuses,
-        ).fetchone()[0])
-        local_busy = int(conn.execute(
-            f"SELECT COUNT(*) FROM local_media_tasks WHERE status IN ({local_placeholders})",
-            local_busy_statuses,
-        ).fetchone()[0])
+        guangya_busy = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM organize_log WHERE status IN ({guangya_placeholders})",
+                guangya_busy_statuses,
+            ).fetchone()[0]
+        )
+        local_busy = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM local_media_tasks WHERE status IN ({local_placeholders})",
+                local_busy_statuses,
+            ).fetchone()[0]
+        )
 
         rows = conn.execute(
             f"SELECT id FROM organize_log WHERE status NOT IN ({guangya_placeholders})",
@@ -4631,15 +4874,21 @@ def clear_organize_logs() -> dict[str, int]:
                 f"DELETE FROM organize_log_items WHERE log_id IN ({id_placeholders})",
                 log_ids,
             )
-            deleted_guangya = int(conn.execute(
-                f"DELETE FROM organize_log WHERE id IN ({id_placeholders})",
-                log_ids,
-            ).rowcount or 0)
+            deleted_guangya = int(
+                conn.execute(
+                    f"DELETE FROM organize_log WHERE id IN ({id_placeholders})",
+                    log_ids,
+                ).rowcount
+                or 0
+            )
 
-        deleted_local = int(conn.execute(
-            f"DELETE FROM local_media_tasks WHERE status NOT IN ({local_placeholders})",
-            local_busy_statuses,
-        ).rowcount or 0)
+        deleted_local = int(
+            conn.execute(
+                f"DELETE FROM local_media_tasks WHERE status NOT IN ({local_placeholders})",
+                local_busy_statuses,
+            ).rowcount
+            or 0
+        )
 
     return {
         "deleted": deleted_guangya + deleted_local,
@@ -4658,10 +4907,18 @@ def count_logs_by_status(table: str = "organize_log") -> dict:
         raise ValueError(f"unsupported table: {table}")
     defaults = (
         {
-            "success": 0, "failed": 0, "skipped": 0, "reverted": 0,
-            "interrupted": 0, "partial_failed": 0, "revert_failed": 0,
-            "reorganizing": 0, "returning": 0, "reverting": 0,
-            "deleting": 0, "deleted": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "reverted": 0,
+            "interrupted": 0,
+            "partial_failed": 0,
+            "revert_failed": 0,
+            "reorganizing": 0,
+            "returning": 0,
+            "reverting": 0,
+            "deleting": 0,
+            "deleted": 0,
         }
         if table == "organize_log"
         else {"success": 0, "failed": 0, "submitted": 0}
@@ -4677,41 +4934,6 @@ def count_logs_by_status(table: str = "organize_log") -> dict:
 
 # ===== TMDB 映射锁 =====
 # 统一数据访问门面：管理 API 与识别业务共享同一 Repository 实现。
-from app.repositories.recognition import (  # noqa: E402,F401
-    delete_tmdb_lock,
-    get_tmdb_lock,
-    list_tmdb_locks,
-    upsert_tmdb_lock,
-)
-
-
-# ===== 下载日志与统一下载请求 =====
-# 统一数据访问门面：Repository 复用本模块持有的连接状态与迁移。
-from app.repositories.download_requests import (  # noqa: E402,F401
-    _DOWNLOAD_ATTENTION_WHERE,
-    add_download_log,
-    bind_media_download_admission_request,
-    bind_pending_download_request_owner,
-    bind_download_request_guangya_staging,
-    claim_failed_share_transfer_request,
-    clear_download_request_attention,
-    clear_download_request_attentions,
-    count_download_requests_requiring_attention,
-    count_download_logs,
-    create_download_request,
-    create_share_transfer_request,
-    delete_download_logs,
-    finish_share_transfer_request,
-    get_download_request,
-    get_download_request_status_snapshot,
-    list_download_logs,
-    list_download_requests_requiring_attention,
-    mark_download_request_resubmitted,
-    purge_expired_download_request_torrent_data,
-    update_download_log,
-)
-
-
 # ===== Agent 下载结果自动复核 =====
 # 统一数据访问门面：终态与通知发件箱保持单事务写入。
 from app.repositories.agent_download_verification import (  # noqa: E402,F401
@@ -4725,9 +4947,41 @@ from app.repositories.agent_download_verification import (  # noqa: E402,F401
     get_agent_download_verification,
     list_agent_download_verification_notifications,
     release_agent_download_verification_notification,
-    retry_agent_download_verification_notification,
     renew_agent_download_verification_lease,
+    retry_agent_download_verification_notification,
     update_agent_download_verification,
+)
+
+# ===== 下载日志与统一下载请求 =====
+# 统一数据访问门面：Repository 复用本模块持有的连接状态与迁移。
+from app.repositories.download_requests import (  # noqa: E402,F401
+    _DOWNLOAD_ATTENTION_WHERE,
+    add_download_log,
+    bind_download_request_guangya_staging,
+    bind_media_download_admission_request,
+    bind_pending_download_request_owner,
+    claim_failed_share_transfer_request,
+    clear_download_request_attention,
+    clear_download_request_attentions,
+    count_download_logs,
+    count_download_requests_requiring_attention,
+    create_download_request,
+    create_share_transfer_request,
+    delete_download_logs,
+    finish_share_transfer_request,
+    get_download_request,
+    get_download_request_status_snapshot,
+    list_download_logs,
+    list_download_requests_requiring_attention,
+    mark_download_request_resubmitted,
+    purge_expired_download_request_torrent_data,
+    update_download_log,
+)
+from app.repositories.recognition import (  # noqa: E402,F401
+    delete_tmdb_lock,
+    get_tmdb_lock,
+    list_tmdb_locks,
+    upsert_tmdb_lock,
 )
 
 
@@ -4853,7 +5107,9 @@ def purge_expired_agent_task_history(
         }
 
 
-def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dict[str, int]:
+def purge_agent_subject_data(
+    *, owner: str, principal: str | None = None
+) -> dict[str, int]:
     """清除一个主体的全部 Agent 持久化数据；与单会话删除语义明确分离。"""
     normalized_owner = str(owner or "").strip()
     normalized_principal = str(principal if principal is not None else owner).strip()
@@ -4869,15 +5125,21 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
         ).hexdigest()
 
     digests = {
-        "action_history": digest(b"mediaflux-agent-action-history:v1\0", normalized_owner),
-        "session_context": digest(b"mediaflux-agent-session-context:v1\0", normalized_owner),
+        "action_history": digest(
+            b"mediaflux-agent-action-history:v1\0", normalized_owner
+        ),
+        "session_context": digest(
+            b"mediaflux-agent-session-context:v1\0", normalized_owner
+        ),
         "confirmations": digest(b"mediaflux-agent-confirmation:v1\0", normalized_owner),
         "jobs": digest(b"mediaflux-agent-durable-job:v1\0", normalized_owner),
         "provider_plans": digest(
             b"mediaflux-agent-provider-plan-owner:v1\0", normalized_owner
         ),
         "workflows": digest(b"mediaflux-agent-missing-workflow:v1\0", normalized_owner),
-        "telegram_actions": digest(b"mediaflux-telegram-agent-action:v1\0", normalized_owner),
+        "telegram_actions": digest(
+            b"mediaflux-telegram-agent-action:v1\0", normalized_owner
+        ),
         "conversations": digest(
             b"mediaflux-agent-conversation-principal:v1\0", normalized_principal
         ),
@@ -4924,9 +5186,8 @@ def purge_agent_subject_data(*, owner: str, principal: str | None = None) -> dic
             "DELETE FROM organize_operation_jobs WHERE owner_digest=? AND status<>'running'",
             (digests["jobs"],),
         )
-        deleted["organize_operation_jobs"] = (
-            max(0, int(running.rowcount or 0))
-            + max(0, int(removable.rowcount or 0))
+        deleted["organize_operation_jobs"] = max(0, int(running.rowcount or 0)) + max(
+            0, int(removable.rowcount or 0)
         )
         provider_running = conn.execute(
             "UPDATE agent_provider_plans SET "
@@ -4971,6 +5232,23 @@ def maintain_sqlite_database(*, incremental_pages: int = 200) -> dict[str, int |
 
 # ===== Agent 媒体库巡检 =====
 # 统一数据访问门面：巡检结果、版本与通知发件箱保持单事务一致性。
+# ===== Agent owner 隔离的可恢复长任务 =====
+from app.repositories.agent_jobs import (  # noqa: E402,F401
+    cancel_agent_job,
+    claim_due_agent_job,
+    complete_agent_job,
+    continue_agent_job,
+    create_agent_job,
+    fail_or_retry_agent_job,
+    finalize_cancelled_agent_job,
+    find_active_agent_job,
+    find_latest_active_agent_job,
+    get_agent_job,
+    is_agent_job_cancel_requested,
+    list_agent_jobs,
+    release_agent_job_lease,
+    renew_agent_job_lease,
+)
 from app.repositories.agent_library_patrol import (  # noqa: E402,F401
     cancel_agent_library_patrol_lease,
     claim_due_agent_library_patrol,
@@ -4989,26 +5267,6 @@ from app.repositories.agent_library_patrol import (  # noqa: E402,F401
     update_agent_library_patrol,
 )
 
-
-# ===== Agent owner 隔离的可恢复长任务 =====
-from app.repositories.agent_jobs import (  # noqa: E402,F401
-    cancel_agent_job,
-    claim_due_agent_job,
-    complete_agent_job,
-    continue_agent_job,
-    create_agent_job,
-    fail_or_retry_agent_job,
-    finalize_cancelled_agent_job,
-    find_active_agent_job,
-    find_latest_active_agent_job,
-    get_agent_job,
-    is_agent_job_cancel_requested,
-    list_agent_jobs,
-    release_agent_job_lease,
-    renew_agent_job_lease,
-)
-
-
 # ===== 下载请求认领与本地入库状态 =====
 from app.repositories.download_requests import (  # noqa: E402,F401
     claim_download_request,
@@ -5016,6 +5274,8 @@ from app.repositories.download_requests import (  # noqa: E402,F401
     claim_download_request_organize,
     claim_download_request_staging_finalize,
     claim_download_request_targets,
+    finalize_download_request_notification,
+    finalize_download_request_submission,
     get_download_request_by_request_key,
     get_download_request_by_request_keys,
     link_download_request_to_local_media_task,
@@ -5023,52 +5283,12 @@ from app.repositories.download_requests import (  # noqa: E402,F401
     list_protected_guangya_staging_ids,
     mark_download_request_local_media_failed,
     mark_download_request_local_media_skipped,
-    finalize_download_request_notification,
-    finalize_download_request_submission,  # noqa: F401 - unified database facade
-    renew_download_request_notification_lease,
     recover_stale_submitting_download_requests,
+    renew_download_request_notification_lease,
     update_download_request,
     update_download_request_and_sync_media_admission,
     update_download_request_for_local_media_task,
 )
-
-
-# ===== RSS 订阅、条目状态机与诊断 =====
-# 统一数据访问门面：schema/migration 由 init_db 集中持有。
-from app.repositories.rss import (  # noqa: E402,F401
-    add_rss_entry,
-    add_rss_entry_with_media,
-    add_rss_subscription,
-    claim_pending_rss_qb_entries,
-    claim_retryable_failed_rss_qb_entries,
-    claim_rss_entry,
-    count_rss_downloaded_entries_since,
-    delete_rss_subscription,
-    find_rss_subscriptions_by_normalized_name,
-    get_pending_rss_qb_snapshot,
-    get_retryable_failed_rss_qb_snapshot,
-    get_rss_diagnostic_summary,
-    get_rss_manual_review_summary,
-    get_rss_subscription_safe_summary,
-    get_rss_entry,
-    get_rss_stats,
-    get_rss_subscription,
-    list_enabled_rss_subscription_safe_targets,
-    list_enabled_rss_subscriptions,
-    list_due_rss_subscriptions,
-    list_rss_entries,
-    list_rss_subscription_safe_summaries,
-    list_rss_subscriptions,
-    purge_processed_rss_entries,
-    recover_stale_submitting_rss_entries,
-    record_rss_entry_failure,
-    skip_pending_rss_entries,
-    update_rss_entries_processed,
-    update_rss_entries_processed_snapshot,
-    update_rss_entry_status,
-    update_rss_subscription,
-)
-
 
 # ===== 媒体订阅、候选资源与下载准入 =====
 # 独立于 RSS schema；统一订阅中心只在应用层聚合。
@@ -5097,60 +5317,94 @@ from app.repositories.media_subscriptions import (  # noqa: E402,F401
     list_media_subscription_workflows,
     list_media_subscriptions,
     media_subscription_check_is_active,
-    replace_media_subscription_candidates,
-    recover_stale_media_subscription_checks,
     reconcile_media_download_admissions,
     reconcile_startup_media_download_admissions,
+    recover_stale_media_subscription_checks,
+    replace_media_subscription_candidates,
     sync_media_download_admission_for_request,
     update_media_download_admission,
-    update_media_subscription_config,
     update_media_subscription_candidate,
+    update_media_subscription_config,
     upsert_media_subscription,
 )
 
+# ===== RSS 订阅、条目状态机与诊断 =====
+# 统一数据访问门面：schema/migration 由 init_db 集中持有。
+from app.repositories.rss import (  # noqa: E402,F401
+    add_rss_entry,
+    add_rss_entry_with_media,
+    add_rss_subscription,
+    claim_pending_rss_qb_entries,
+    claim_retryable_failed_rss_qb_entries,
+    claim_rss_entry,
+    count_rss_downloaded_entries_since,
+    delete_rss_subscription,
+    find_rss_subscriptions_by_normalized_name,
+    get_pending_rss_qb_snapshot,
+    get_retryable_failed_rss_qb_snapshot,
+    get_rss_diagnostic_summary,
+    get_rss_entry,
+    get_rss_manual_review_summary,
+    get_rss_stats,
+    get_rss_subscription,
+    get_rss_subscription_safe_summary,
+    list_due_rss_subscriptions,
+    list_enabled_rss_subscription_safe_targets,
+    list_enabled_rss_subscriptions,
+    list_rss_entries,
+    list_rss_subscription_safe_summaries,
+    list_rss_subscriptions,
+    purge_processed_rss_entries,
+    record_rss_entry_failure,
+    recover_stale_submitting_rss_entries,
+    skip_pending_rss_entries,
+    update_rss_entries_processed,
+    update_rss_entries_processed_snapshot,
+    update_rss_entry_status,
+    update_rss_subscription,
+)
 
 # ===== STRM 索引 =====
 # 统一数据访问门面：核心索引 CRUD 按业务域拆分并共享同一实现。
 from app.repositories.strm import (  # noqa: E402,F401
-    cancel_stale_strm_metadata_jobs,
+    acknowledge_strm_refresh_paths,
     cancel_retired_strm_metadata_jobs,
+    cancel_stale_strm_metadata_jobs,
     cancel_strm_metadata_job,
     claim_due_strm_metadata_jobs,
     claim_strm_change_targets,
-    complete_strm_metadata_job,
     complete_strm_change_target,
+    complete_strm_metadata_job,
     count_due_strm_change_targets,
+    count_pending_strm_change_targets,
     count_strm_metadata_jobs,
     count_strm_refresh_paths,
-    count_pending_strm_change_targets,
     delete_strm_index_ids,
-    enqueue_strm_metadata_jobs,
     enqueue_strm_change_targets,
+    enqueue_strm_metadata_jobs,
+    enqueue_strm_refresh_paths,
     fail_or_retry_strm_metadata_job,
     fail_strm_change_target,
     group_changes_by_target,
-    list_strm_metadata_queue,
-    list_strm_refresh_entries,
     list_strm_change_queue,
     list_strm_index,
     list_strm_index_by_prefix,
     list_strm_indexes_by_file_id,
+    list_strm_metadata_queue,
+    list_strm_refresh_entries,
     merge_strm_changes,
-    recover_stale_strm_metadata_jobs,
     recover_stale_strm_change_targets,
-    reschedule_strm_change_targets,
-    seconds_until_next_strm_change_target,
+    recover_stale_strm_metadata_jobs,
+    release_strm_change_targets,
     renew_strm_change_target_leases,
     renew_strm_metadata_job_lease,
-    acknowledge_strm_refresh_paths,
-    enqueue_strm_refresh_paths,
     requeue_strm_metadata_jobs,
-    release_strm_change_targets,
+    reschedule_strm_change_targets,
+    seconds_until_next_strm_change_target,
     strm_metadata_job_is_current,
     upsert_strm_index,
     upsert_strm_index_batch,
 )
-
 
 _STRM_SOURCE_SNAPSHOT_KEY = "strm.configured_sources.snapshot.v1"
 
@@ -5268,7 +5522,9 @@ def reconcile_strm_retired_sources_transaction(
     重建缺失的退役记录。
     """
     active_ids = tuple(
-        dict.fromkeys(str(item).strip() for item in active_source_ids if str(item).strip())
+        dict.fromkeys(
+            str(item).strip() for item in active_source_ids if str(item).strip()
+        )
     )
     normalized_retired: dict[str, tuple[str, str]] = {}
     for raw_id, raw_name, raw_root in retired_sources:
@@ -5313,7 +5569,9 @@ def reconcile_configured_strm_sources(
         return list(retired)
 
 
-def enqueue_strm_retired_source(source_id: str, source_name: str, strm_root: str) -> None:
+def enqueue_strm_retired_source(
+    source_id: str, source_name: str, strm_root: str
+) -> None:
     timestamp = now()
     with get_conn() as conn:
         _ensure_strm_retired_sources_table(conn)
@@ -5322,7 +5580,13 @@ def enqueue_strm_retired_source(source_id: str, source_name: str, strm_root: str
             "updated_at,attempts,last_error) VALUES(?,?,?,?,?,0,'') "
             "ON CONFLICT(source_id) DO UPDATE SET source_name=excluded.source_name,"
             "strm_root=excluded.strm_root,updated_at=excluded.updated_at,last_error=''",
-            (str(source_id), str(source_name or ""), str(strm_root or ""), timestamp, timestamp),
+            (
+                str(source_id),
+                str(source_name or ""),
+                str(strm_root or ""),
+                timestamp,
+                timestamp,
+            ),
         )
 
 
@@ -5375,8 +5639,16 @@ def _sanitize_strm_failure_error(value: object) -> str:
 
 
 def record_strm_failure(
-    *, source_id: str, source_name: str, file_id: str, parent_id: str,
-    filename: str, action: str, rel_dir: str, target_rel_path: str, error: object,
+    *,
+    source_id: str,
+    source_name: str,
+    file_id: str,
+    parent_id: str,
+    filename: str,
+    action: str,
+    rel_dir: str,
+    target_rel_path: str,
+    error: object,
 ) -> int:
     if action not in {"generate", "metadata"}:
         raise ValueError("STRM failure action must be generate or metadata")
@@ -5392,9 +5664,19 @@ def record_strm_failure(
             "filename=excluded.filename,rel_dir=excluded.rel_dir,"
             "target_rel_path=excluded.target_rel_path,error=excluded.error,status='open',"
             "failure_count=strm_failures.failure_count+1,updated_at=excluded.updated_at,resolved_at=NULL",
-            (str(source_id), str(source_name or ""), str(file_id), str(parent_id or ""),
-             str(filename), action, str(rel_dir or ""), str(target_rel_path or ""),
-             _sanitize_strm_failure_error(error), timestamp, timestamp),
+            (
+                str(source_id),
+                str(source_name or ""),
+                str(file_id),
+                str(parent_id or ""),
+                str(filename),
+                action,
+                str(rel_dir or ""),
+                str(target_rel_path or ""),
+                _sanitize_strm_failure_error(error),
+                timestamp,
+                timestamp,
+            ),
         )
         row = conn.execute(
             "SELECT id FROM strm_failures WHERE source_id=? AND file_id=? AND action=?",
@@ -5404,8 +5686,13 @@ def record_strm_failure(
 
 
 def list_strm_failures(
-    *, status: str = "open", source_id: str = "", action: str = "",
-    ids: list[int] | None = None, before_id: int | None = None, limit: int = 200,
+    *,
+    status: str = "open",
+    source_id: str = "",
+    action: str = "",
+    ids: list[int] | None = None,
+    before_id: int | None = None,
+    limit: int = 200,
     offset: int = 0,
 ) -> list[sqlite3.Row]:
     clauses: list[str] = []
@@ -5436,12 +5723,15 @@ def list_strm_failures(
         values.append(max(0, int(offset)))
     with get_conn() as conn:
         return conn.execute(
-            f"SELECT * FROM strm_failures{where} ORDER BY id DESC LIMIT ?{offset_sql}", values
+            f"SELECT * FROM strm_failures{where} ORDER BY id DESC LIMIT ?{offset_sql}",
+            values,
         ).fetchall()
 
 
 def get_strm_failure_retry_snapshot(
-    *, action: str = "", limit: int = 101,
+    *,
+    action: str = "",
+    limit: int = 101,
 ) -> list[sqlite3.Row]:
     """返回确认绑定所需的最小失败项快照，不读取路径、文件名或错误正文。"""
     if action not in {"", "generate", "metadata"}:
@@ -5462,7 +5752,7 @@ def get_strm_failure_retry_snapshot(
 
 
 def claim_strm_failures(ids: list[int], *, limit: int = 1000) -> list[sqlite3.Row]:
-    normalized = list(dict.fromkeys(int(item) for item in ids))[:max(1, int(limit))]
+    normalized = list(dict.fromkeys(int(item) for item in ids))[: max(1, int(limit))]
     if not normalized:
         return []
     placeholders = ",".join("?" for _ in normalized)
@@ -5508,31 +5798,43 @@ def count_strm_failures(
         values.append(str(action))
     where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
     with get_conn() as conn:
-        return int(conn.execute(
-            "SELECT COUNT(*) AS count FROM strm_failures" + where, values
-        ).fetchone()["count"])
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM strm_failures" + where, values
+            ).fetchone()["count"]
+        )
 
 
 def summarize_strm_failures() -> dict:
     with get_conn() as conn:
-        open_count = int(conn.execute(
-            "SELECT COUNT(*) AS count FROM strm_failures WHERE status='open'"
-        ).fetchone()["count"])
-        resolved_count = int(conn.execute(
-            "SELECT COUNT(*) AS count FROM strm_failures WHERE status='resolved'"
-        ).fetchone()["count"])
+        open_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM strm_failures WHERE status='open'"
+            ).fetchone()["count"]
+        )
+        resolved_count = int(
+            conn.execute(
+                "SELECT COUNT(*) AS count FROM strm_failures WHERE status='resolved'"
+            ).fetchone()["count"]
+        )
         rows = conn.execute(
             "SELECT source_id,MAX(source_name) AS source_name,COUNT(*) AS count "
             "FROM strm_failures WHERE status='open' GROUP BY source_id ORDER BY source_name,source_id"
         ).fetchall()
     sources = [
-        {"id": str(row["source_id"]), "name": str(row["source_name"] or row["source_id"]),
-         "open": int(row["count"])}
+        {
+            "id": str(row["source_id"]),
+            "name": str(row["source_name"] or row["source_id"]),
+            "open": int(row["count"]),
+        }
         for row in rows
     ]
     return {
-        "open": open_count, "resolved": resolved_count, "total": open_count + resolved_count,
-        "by_source": {item["id"]: item["open"] for item in sources}, "sources": sources,
+        "open": open_count,
+        "resolved": resolved_count,
+        "total": open_count + resolved_count,
+        "by_source": {item["id"]: item["open"] for item in sources},
+        "sources": sources,
     }
 
 
@@ -5574,14 +5876,16 @@ def get_strm_failure_triage_summary() -> dict[str, object]:
         by_action[action]["total"] += count
         summary[status] = int(summary[status]) + count
         summary["total"] = int(summary["total"]) + count
-        summary["active_repeated"] = int(summary["active_repeated"]) + max(0, int(row["active_repeated"] or 0))
-        summary["active_retried"] = int(summary["active_retried"]) + max(0, int(row["active_retried"] or 0))
+        summary["active_repeated"] = int(summary["active_repeated"]) + max(
+            0, int(row["active_repeated"] or 0)
+        )
+        summary["active_retried"] = int(summary["active_retried"]) + max(
+            0, int(row["active_retried"] or 0)
+        )
     return summary
 
 
-def resolve_strm_failure(
-    failure_id: int, *, expected_status: str = "retrying"
-) -> bool:
+def resolve_strm_failure(failure_id: int, *, expected_status: str = "retrying") -> bool:
     timestamp = now()
     with get_conn() as conn:
         cur = conn.execute(
@@ -5604,7 +5908,11 @@ def resolve_strm_failure_for_item(source_id: str, file_id: str, action: str) -> 
 
 
 def resolve_strm_failures_for_items(
-    source_id: str, file_ids: Iterable[str], action: str, *, chunk_size: int = 400,
+    source_id: str,
+    file_ids: Iterable[str],
+    action: str,
+    *,
+    chunk_size: int = 400,
 ) -> int:
     """批量关闭同一来源/动作下已成功落盘的 STRM 失败项。"""
     ids = list(dict.fromkeys(str(item) for item in file_ids if str(item)))
@@ -5615,7 +5923,7 @@ def resolve_strm_failures_for_items(
     updated = 0
     with get_conn() as conn:
         for offset in range(0, len(ids), safe_chunk):
-            chunk = ids[offset:offset + safe_chunk]
+            chunk = ids[offset : offset + safe_chunk]
             placeholders = ",".join("?" for _ in chunk)
             cur = conn.execute(
                 "UPDATE strm_failures SET status='resolved',updated_at=?,resolved_at=? "
@@ -5635,8 +5943,12 @@ def mark_strm_failure_stale(
             "UPDATE strm_failures SET status='open',error=?,"
             "failure_count=failure_count+1,updated_at=?,resolved_at=NULL "
             "WHERE id=? AND status=?",
-            (_sanitize_strm_failure_error(error), now(), int(failure_id),
-             str(expected_status)),
+            (
+                _sanitize_strm_failure_error(error),
+                now(),
+                int(failure_id),
+                str(expected_status),
+            ),
         )
         return cur.rowcount == 1
 
@@ -5649,15 +5961,26 @@ def release_strm_failure_retry(
         cur = conn.execute(
             "UPDATE strm_failures SET status='open',error=?,updated_at=?,resolved_at=NULL "
             "WHERE id=? AND status=?",
-            (_sanitize_strm_failure_error(error), now(), int(failure_id),
-             str(expected_status)),
+            (
+                _sanitize_strm_failure_error(error),
+                now(),
+                int(failure_id),
+                str(expected_status),
+            ),
         )
         return cur.rowcount == 1
 
 
 def update_strm_failure_retry(
-    failure_id: int, *, source_id: str, source_name: str, file, rel_dir: str,
-    target_rel_path: str, error: object, expected_status: str = "retrying",
+    failure_id: int,
+    *,
+    source_id: str,
+    source_name: str,
+    file,
+    rel_dir: str,
+    target_rel_path: str,
+    error: object,
+    expected_status: str = "retrying",
 ) -> bool:
     with get_conn() as conn:
         cur = conn.execute(
@@ -5665,17 +5988,29 @@ def update_strm_failure_retry(
             "rel_dir=?,target_rel_path=?,error=?,status='open',"
             "failure_count=failure_count+1,updated_at=?,resolved_at=NULL "
             "WHERE id=? AND status=?",
-            (str(source_id), str(source_name or ""), str(file.parent_id or ""),
-             str(file.name), str(rel_dir or ""), str(target_rel_path or ""),
-             _sanitize_strm_failure_error(error), now(), int(failure_id),
-             str(expected_status)),
+            (
+                str(source_id),
+                str(source_name or ""),
+                str(file.parent_id or ""),
+                str(file.name),
+                str(rel_dir or ""),
+                str(target_rel_path or ""),
+                _sanitize_strm_failure_error(error),
+                now(),
+                int(failure_id),
+                str(expected_status),
+            ),
         )
         return cur.rowcount == 1
 
 
 def delete_strm_failures(
-    *, ids: list[int] | None = None, all_items: bool = False,
-    status: str = "", source_id: str = "", action: str = "",
+    *,
+    ids: list[int] | None = None,
+    all_items: bool = False,
+    status: str = "",
+    source_id: str = "",
+    action: str = "",
 ) -> int:
     """按 ID 列表或筛选条件清理 STRM 失败台账记录。"""
     clauses: list[str] = []
@@ -5735,7 +6070,7 @@ def _strm_source_id(source: str) -> str:
     source = str(source or "").strip()
     for prefix in ("guangya:", "guangya-meta:"):
         if source.startswith(prefix):
-            return source[len(prefix):]
+            return source[len(prefix) :]
     return source
 
 
@@ -5771,9 +6106,18 @@ def _classify_strm_index_row(
 
 def _strm_index_kind(source: str) -> str:
     source = str(source or "").strip()
-    if source.startswith("guangya-meta:") or source.startswith("local-meta:") or "-meta:" in source:
+    if (
+        source.startswith("guangya-meta:")
+        or source.startswith("local-meta:")
+        or "-meta:" in source
+    ):
         return "metadata"
-    if source.startswith("guangya:") or source.startswith("local:") or source.startswith("115:") or source.startswith("quark:"):
+    if (
+        source.startswith("guangya:")
+        or source.startswith("local:")
+        or source.startswith("115:")
+        or source.startswith("quark:")
+    ):
         return "video"
     return "other"
 
@@ -5812,9 +6156,7 @@ def list_strm_index_diagnostics(strm_root: str) -> dict:
         "metadata_queue": count_strm_metadata_jobs(),
     }
     for row in rows:
-        classification = _classify_strm_index_row(
-            row, strm_root, configured_source_ids
-        )
+        classification = _classify_strm_index_row(row, strm_root, configured_source_ids)
         for key in ("existing", "missing", "real_source", "confirmed_test_artifact"):
             result[key] += int(classification[key])
         if classification["confirmed_test_artifact"]:
@@ -5854,9 +6196,12 @@ def delete_confirmed_test_strm_indexes(ids: list[int]) -> int:
                 "SELECT id,source,strm_path FROM strm_index WHERE id=?",
                 (row_id,),
             ).fetchone()
-            if row is None or not _classify_strm_index_row(
-                row, strm_root, configured_source_ids
-            )["confirmed_test_artifact"]:
+            if (
+                row is None
+                or not _classify_strm_index_row(row, strm_root, configured_source_ids)[
+                    "confirmed_test_artifact"
+                ]
+            ):
                 raise ValueError("请求包含非确认测试索引，已拒绝整个清理请求")
         placeholders = ",".join("?" for _ in normalized_ids)
         cursor = conn.execute(
@@ -5900,9 +6245,16 @@ def create_organize_confirmation(
             "organize_task_id,rollup_applied,expires_at,created_at,updated_at"
             ") VALUES(?,?,?,?,?,?,'pending',?,0,?,?,?)",
             (
-                str(token), str(fingerprint), str(chat_id or ""),
-                str(source_name or ""), str(directory_path or ""), encoded,
-                str(organize_task_id or ""), str(expires_at), timestamp, timestamp,
+                str(token),
+                str(fingerprint),
+                str(chat_id or ""),
+                str(source_name or ""),
+                str(directory_path or ""),
+                encoded,
+                str(organize_task_id or ""),
+                str(expires_at),
+                timestamp,
+                timestamp,
             ),
         )
         return int(cursor.lastrowid)
@@ -6104,7 +6456,10 @@ def cancel_organize_confirmation(
                 "WHERE id=? AND status='pending'",
                 (
                     json.dumps(
-                        {"cancelled": True, "resolution": str(resolution or "cancelled")},
+                        {
+                            "cancelled": True,
+                            "resolution": str(resolution or "cancelled"),
+                        },
                         ensure_ascii=False,
                     ),
                     timestamp,
@@ -6131,7 +6486,6 @@ def cancel_organize_confirmation(
     return cancelled
 
 
-
 def list_due_pending_organize_confirmations(
     *, token: str = "", limit: int = 100
 ) -> list[sqlite3.Row]:
@@ -6147,7 +6501,9 @@ def list_due_pending_organize_confirmations(
         params.append(resolved_limit)
         return conn.execute(
             "SELECT * FROM organize_confirmations WHERE status='pending' "
-            "AND expires_at<=?" + token_clause + " ORDER BY expires_at ASC,id ASC LIMIT ?",
+            "AND expires_at<=?"
+            + token_clause
+            + " ORDER BY expires_at ASC,id ASC LIMIT ?",
             params,
         ).fetchall()
 
@@ -6217,8 +6573,10 @@ def get_organize_confirmation_queue_position(row_id: int) -> int:
             "COALESCE(queued_at,created_at)<? OR "
             "(COALESCE(queued_at,created_at)=? AND id<?))))",
             (
-                int(row_id), str(target["queue_time"] or ""),
-                str(target["queue_time"] or ""), int(row_id),
+                int(row_id),
+                str(target["queue_time"] or ""),
+                str(target["queue_time"] or ""),
+                int(row_id),
             ),
         ).fetchone()
     return int(row["total"] or 0) if row is not None else 0
@@ -6307,9 +6665,13 @@ def _enqueue_organize_confirmation_delivery(
         "next_attempt_at=excluded.next_attempt_at,last_error='',sent_at=NULL,"
         "updated_at=excluded.updated_at",
         (
-            str(token or ""), str(event_json or "{}"), str(chat_id or ""),
+            str(token or ""),
+            str(event_json or "{}"),
+            str(chat_id or ""),
             int(message_id) if message_id else None,
-            timestamp, timestamp, timestamp,
+            timestamp,
+            timestamp,
+            timestamp,
         ),
     )
 
@@ -6423,7 +6785,12 @@ def claim_due_organize_confirmation_delivery(
             "UPDATE organize_confirmation_delivery_outbox SET status='sending',"
             "lease_generation=lease_generation+1,updated_at=? WHERE id=? AND "
             "lease_generation=? AND status=?",
-            (str(current_time), int(row["id"]), int(row["lease_generation"]), str(row["status"])),
+            (
+                str(current_time),
+                int(row["id"]),
+                int(row["lease_generation"]),
+                str(row["status"]),
+            ),
         )
         if cursor.rowcount != 1:
             return None
@@ -6440,7 +6807,12 @@ def complete_organize_confirmation_delivery(
         cursor = conn.execute(
             "UPDATE organize_confirmation_delivery_outbox SET status='sent',sent_at=?,"
             "last_error='',updated_at=? WHERE id=? AND status='sending' AND lease_generation=?",
-            (str(sent_at), str(sent_at), int(delivery_id), int(expected_lease_generation)),
+            (
+                str(sent_at),
+                str(sent_at),
+                int(delivery_id),
+                int(expected_lease_generation),
+            ),
         )
         return cursor.rowcount == 1
 
@@ -6458,8 +6830,11 @@ def retry_organize_confirmation_delivery(
             "attempts=attempts+1,next_attempt_at=?,last_error=?,updated_at=? "
             "WHERE id=? AND status='sending' AND lease_generation=?",
             (
-                str(next_attempt_at), str(error or "DeliveryFailed")[:500], now(),
-                int(delivery_id), int(expected_lease_generation),
+                str(next_attempt_at),
+                str(error or "DeliveryFailed")[:500],
+                now(),
+                int(delivery_id),
+                int(expected_lease_generation),
             ),
         )
         return cursor.rowcount == 1
@@ -6475,14 +6850,23 @@ def get_organize_confirmation_delivery(token: str) -> sqlite3.Row | None:
 
 # ===== GCID 导入任务 =====
 _GCID_IMPORT_TASK_STATUSES = {
-    "previewed", "running", "success", "partial_success", "failed",
+    "previewed",
+    "running",
+    "success",
+    "partial_success",
+    "failed",
 }
 _GCID_IMPORT_ITEM_STATUSES = {"previewed", "running", "success", "failed"}
 
 
-def create_gcid_import_task(*, operation_token: str, manifest_digest: str,
-                            target_dir_id: str, file_count: int,
-                            total_size: int) -> int:
+def create_gcid_import_task(
+    *,
+    operation_token: str,
+    manifest_digest: str,
+    target_dir_id: str,
+    file_count: int,
+    total_size: int,
+) -> int:
     token = str(operation_token or "").strip()
     digest = str(manifest_digest or "").strip().lower()
     target = str(target_dir_id or "").strip()
@@ -6538,15 +6922,26 @@ def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
         if status not in _GCID_IMPORT_ITEM_STATUSES:
             raise ValueError("GCID 导入明细状态无效")
         seen.add(path.casefold())
-        normalized.append((
-            int(task_id), path, size, gcid, status,
-            str(item.get("remote_file_id") or "").strip(),
-            str(item.get("error") or "")[:1000], timestamp, timestamp,
-        ))
+        normalized.append(
+            (
+                int(task_id),
+                path,
+                size,
+                gcid,
+                status,
+                str(item.get("remote_file_id") or "").strip(),
+                str(item.get("error") or "")[:1000],
+                timestamp,
+                timestamp,
+            )
+        )
     with get_conn() as conn:
-        if conn.execute(
-            "SELECT 1 FROM gcid_import_tasks WHERE id=?", (int(task_id),)
-        ).fetchone() is None:
+        if (
+            conn.execute(
+                "SELECT 1 FROM gcid_import_tasks WHERE id=?", (int(task_id),)
+            ).fetchone()
+            is None
+        ):
             raise ValueError("GCID 导入任务不存在")
         conn.execute("DELETE FROM gcid_import_items WHERE task_id=?", (int(task_id),))
         conn.executemany(
@@ -6557,10 +6952,14 @@ def replace_gcid_import_items(task_id: int, items: list[dict]) -> None:
         )
 
 
-def update_gcid_import_task(task_id: int, *, status: str | None = None,
-                            success_count: int | None = None,
-                            failed_count: int | None = None,
-                            error: str | None = None) -> None:
+def update_gcid_import_task(
+    task_id: int,
+    *,
+    status: str | None = None,
+    success_count: int | None = None,
+    failed_count: int | None = None,
+    error: str | None = None,
+) -> None:
     updates: list[str] = []
     params: list = []
     if status is not None:
@@ -6569,7 +6968,10 @@ def update_gcid_import_task(task_id: int, *, status: str | None = None,
             raise ValueError("GCID 导入任务状态无效")
         updates.append("status=?")
         params.append(normalized_status)
-    for key, value in (("success_count", success_count), ("failed_count", failed_count)):
+    for key, value in (
+        ("success_count", success_count),
+        ("failed_count", failed_count),
+    ):
         if value is not None:
             normalized_count = int(value)
             if normalized_count < 0:
@@ -6621,8 +7023,9 @@ def list_gcid_import_items(task_id: int, status: str = "") -> list[sqlite3.Row]:
 
 
 # ===== 后台任务运行记录 =====
-def add_task_run(task_name: str, trigger_type: str,
-                 status: str = "running", result: str = "") -> int:
+def add_task_run(
+    task_name: str, trigger_type: str, status: str = "running", result: str = ""
+) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT INTO task_runs(task_name,trigger_type,status,started_at,result) "
@@ -6632,8 +7035,9 @@ def add_task_run(task_name: str, trigger_type: str,
         return cur.lastrowid
 
 
-def finish_task_run(run_id: int, status: str, result: str = "",
-                    error: str = "") -> None:
+def finish_task_run(
+    run_id: int, status: str, result: str = "", error: str = ""
+) -> None:
     with get_conn() as conn:
         conn.execute(
             "UPDATE task_runs SET status=?,finished_at=?,result=?,error=? WHERE id=?",
@@ -6658,13 +7062,23 @@ _AGENT_ACTION_HISTORY_PER_OWNER_LIMIT = 2000
 _AGENT_ACTION_HISTORY_GLOBAL_LIMIT = 20_000
 
 
-def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
-                             status: str, ok: bool, summary: str,
-                             safe_details: dict | None = None,
-                             error_code: str = "", elapsed_ms: int = 0,
-                             started_at: str = "", finished_at: str = "",
-                             confirmation_id: str = "", finalize_only: bool = False,
-                             connection: sqlite3.Connection | None = None) -> int:
+def add_agent_action_history(
+    *,
+    owner_digest: str,
+    tool_name: str,
+    risk: str,
+    status: str,
+    ok: bool,
+    summary: str,
+    safe_details: dict | None = None,
+    error_code: str = "",
+    elapsed_ms: int = 0,
+    started_at: str = "",
+    finished_at: str = "",
+    confirmation_id: str = "",
+    finalize_only: bool = False,
+    connection: sqlite3.Connection | None = None,
+) -> int:
     """写入一条脱敏 Agent 动作审计；调用方只能传入安全投影。"""
     normalized_owner = str(owner_digest or "").strip().lower()
     normalized_tool = str(tool_name or "").strip()
@@ -6683,7 +7097,9 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
         raise ValueError("Agent 审计状态无效")
     if not normalized_summary or len(normalized_summary) > 240:
         raise ValueError("Agent 审计摘要无效")
-    if normalized_error and (len(normalized_error) > 64 or not re.fullmatch(r"[a-z0-9_]+", normalized_error)):
+    if normalized_error and (
+        len(normalized_error) > 64 or not re.fullmatch(r"[a-z0-9_]+", normalized_error)
+    ):
         raise ValueError("Agent 审计错误码无效")
     if normalized_confirmation and (
         len(normalized_confirmation) > 128
@@ -6702,12 +7118,15 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
             raise ValueError("Agent 审计详情只允许标量")
         if isinstance(value, str) and len(value) > 128:
             raise ValueError("Agent 审计详情文本过长")
-    encoded = json.dumps(details, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        details, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     if len(encoded.encode("utf-8")) > 4096:
         raise ValueError("Agent 审计详情过大")
     elapsed = max(0, min(int(elapsed_ms or 0), 86_400_000))
     finished = str(finished_at or now()).strip()
     started = str(started_at or finished).strip()
+
     def write(conn: sqlite3.Connection) -> int:
         _ensure_agent_action_history_schema(conn)
         history_id = 0
@@ -6775,9 +7194,9 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
                 _AGENT_ACTION_HISTORY_PER_OWNER_LIMIT,
             ),
         )
-        total = int(conn.execute(
-            "SELECT COUNT(*) FROM agent_action_history"
-        ).fetchone()[0] or 0)
+        total = int(
+            conn.execute("SELECT COUNT(*) FROM agent_action_history").fetchone()[0] or 0
+        )
         if total > _AGENT_ACTION_HISTORY_GLOBAL_LIMIT:
             # 一次收敛到全局容量：先按 owner 内新旧排序，再按轮次公平保留。
             # 这样会优先保留每个 owner 的最新记录，并确保当前新审计不因
@@ -6803,8 +7222,9 @@ def add_agent_action_history(*, owner_digest: str, tool_name: str, risk: str,
         return write(conn)
 
 
-def list_agent_action_history(*, owner_digest: str, limit: int = 20,
-                              outcome: str = "all") -> list[sqlite3.Row]:
+def list_agent_action_history(
+    *, owner_digest: str, limit: int = 20, outcome: str = "all"
+) -> list[sqlite3.Row]:
     """倒序读取 Agent 动作审计；只支持固定结果分类与有界条数。"""
     normalized_owner = str(owner_digest or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", normalized_owner):
@@ -6857,38 +7277,48 @@ def get_last_task_run(task_name: str) -> sqlite3.Row | None:
 def get_dashboard_automation_summary() -> dict:
     """返回看板所需的本地自动化状态，不触发任何第三方请求。"""
     with get_conn() as conn:
-        downloads_active = int(conn.execute(
-            "SELECT COUNT(*) FROM download_requests WHERE "
-            "(status IN ('submitting','submitted','downloading') OR "
-            "(status='completed' AND gy_status='completed' AND organize_started=0)) AND "
-            "COALESCE(qb_status,'') NOT IN ('failed','manual_review') AND "
-            "COALESCE(gy_status,'') NOT IN ('failed','manual_review') AND "
-            "COALESCE(local_import_status,'')!='failed' AND COALESCE(organize_started,0)>=0"
-        ).fetchone()[0])
-        downloads_review = int(conn.execute(
-            f"SELECT COUNT(*) FROM download_requests WHERE {_DOWNLOAD_ATTENTION_WHERE}"
-        ).fetchone()[0])
-        rss_subscriptions = int(conn.execute(
-            "SELECT COUNT(*) FROM rss_items WHERE enabled=1"
-        ).fetchone()[0])
+        downloads_active = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM download_requests WHERE "
+                "(status IN ('submitting','submitted','downloading') OR "
+                "(status='completed' AND gy_status='completed' AND organize_started=0)) AND "
+                "COALESCE(qb_status,'') NOT IN ('failed','manual_review') AND "
+                "COALESCE(gy_status,'') NOT IN ('failed','manual_review') AND "
+                "COALESCE(local_import_status,'')!='failed' AND COALESCE(organize_started,0)>=0"
+            ).fetchone()[0]
+        )
+        downloads_review = int(
+            conn.execute(
+                f"SELECT COUNT(*) FROM download_requests WHERE {_DOWNLOAD_ATTENTION_WHERE}"
+            ).fetchone()[0]
+        )
+        rss_subscriptions = int(
+            conn.execute("SELECT COUNT(*) FROM rss_items WHERE enabled=1").fetchone()[0]
+        )
         # 看板「订阅」是全站订阅总量：RSS 订阅源与媒体追更订阅都要计入，
         # 否则只做媒体追更的用户会在顶栏看到 0。
-        media_subscriptions = int(conn.execute(
-            "SELECT COUNT(*) FROM media_subscriptions WHERE enabled=1"
-        ).fetchone()[0])
+        media_subscriptions = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM media_subscriptions WHERE enabled=1"
+            ).fetchone()[0]
+        )
         rss_row = conn.execute(
             "SELECT "
             "SUM(CASE WHEN status IN ('pending','submitting') THEN 1 ELSE 0 END) AS pending,"
             "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed "
             "FROM rss_entries"
         ).fetchone()
-        organize_issues = int(conn.execute(
-            "SELECT COUNT(*) FROM organize_log WHERE "
-            "status IN ('failed','interrupted','partial_failed','revert_failed')"
-        ).fetchone()[0])
-        strm_failures = int(conn.execute(
-            "SELECT COUNT(*) FROM strm_failures WHERE status='open'"
-        ).fetchone()[0])
+        organize_issues = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM organize_log WHERE "
+                "status IN ('failed','interrupted','partial_failed','revert_failed')"
+            ).fetchone()[0]
+        )
+        strm_failures = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM strm_failures WHERE status='open'"
+            ).fetchone()[0]
+        )
         last_strm = conn.execute(
             "SELECT status,COALESCE(finished_at,started_at,'') AS happened_at "
             "FROM task_runs WHERE task_name='strm_sync' ORDER BY id DESC LIMIT 1"
@@ -6928,7 +7358,12 @@ def get_agent_persistent_health_summary() -> dict[str, dict[str, object]]:
         ).fetchone()
 
     verification_keys = (
-        "total", "pending", "running", "retry_wait", "visible", "attention",
+        "total",
+        "pending",
+        "running",
+        "retry_wait",
+        "visible",
+        "attention",
     )
     verification = {
         key: max(0, int((verification_row[key] if verification_row else 0) or 0))
@@ -6949,11 +7384,19 @@ def get_agent_persistent_health_summary() -> dict[str, dict[str, object]]:
         patrol = {
             "status": str(patrol_row["status"] or ""),
             "outcome": str(patrol_row["outcome"] or ""),
-            "checked_series_count": max(0, int(patrol_row["checked_series_count"] or 0)),
-            "updates_available_count": max(0, int(patrol_row["updates_available_count"] or 0)),
-            "missing_episode_count": max(0, int(patrol_row["missing_episode_count"] or 0)),
+            "checked_series_count": max(
+                0, int(patrol_row["checked_series_count"] or 0)
+            ),
+            "updates_available_count": max(
+                0, int(patrol_row["updates_available_count"] or 0)
+            ),
+            "missing_episode_count": max(
+                0, int(patrol_row["missing_episode_count"] or 0)
+            ),
             "inconclusive_count": max(0, int(patrol_row["inconclusive_count"] or 0)),
-            "unmapped_series_count": max(0, int(patrol_row["unmapped_series_count"] or 0)),
+            "unmapped_series_count": max(
+                0, int(patrol_row["unmapped_series_count"] or 0)
+            ),
             "findings_truncated": bool(patrol_row["findings_truncated"]),
         }
     return {"download_verification": verification, "library_patrol": patrol}
@@ -6977,6 +7420,7 @@ from app.repositories.discovery import (  # noqa: E402,F401
     upsert_discovery_cache,
     upsert_media_external_id,
 )
+
 
 # ===== 本地媒体自动整理 =====
 def _local_media_owner(owner: str) -> str:
@@ -7038,18 +7482,35 @@ def _active_local_media_task_for_path(
 
 
 def _local_media_source_has_active_task(
-    conn: sqlite3.Connection, *, source_id: int, owner: str,
+    conn: sqlite3.Connection,
+    *,
+    source_id: int,
+    owner: str,
 ) -> bool:
-    return conn.execute(
-        "SELECT 1 FROM local_media_tasks WHERE source_id=? AND owner=? "
-        "AND status NOT IN ('completed','failed') LIMIT 1",
-        (int(source_id), owner),
-    ).fetchone() is not None
+    return (
+        conn.execute(
+            "SELECT 1 FROM local_media_tasks WHERE source_id=? AND owner=? "
+            "AND status NOT IN ('completed','failed') LIMIT 1",
+            (int(source_id), owner),
+        ).fetchone()
+        is not None
+    )
 
 
-def _local_media_target_signature(rows: Iterable[sqlite3.Row | dict[str, object]]) -> tuple:
-    fields = ("category", "path", "provider", "library_id", "library_name", "server_path")
-    return tuple(sorted(tuple(str(row[field] or "") for field in fields) for row in rows))
+def _local_media_target_signature(
+    rows: Iterable[sqlite3.Row | dict[str, object]],
+) -> tuple:
+    fields = (
+        "category",
+        "path",
+        "provider",
+        "library_id",
+        "library_name",
+        "server_path",
+    )
+    return tuple(
+        sorted(tuple(str(row[field] or "") for field in fields) for row in rows)
+    )
 
 
 def _latest_terminal_local_media_task_for_path(
@@ -7148,21 +7609,42 @@ def create_local_media_source(
             "enabled,stable_seconds,scan_enabled,scan_interval_minutes,media_type,mode,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                safe_owner, safe_name, str(qb_profile or ""), str(qb_path_prefix or ""), safe_root,
-                "", "",
-                1 if enabled else 0, 0, 0, 10, safe_media_type, safe_mode,
-                timestamp, timestamp,
+                safe_owner,
+                safe_name,
+                str(qb_profile or ""),
+                str(qb_path_prefix or ""),
+                safe_root,
+                "",
+                "",
+                1 if enabled else 0,
+                0,
+                0,
+                10,
+                safe_media_type,
+                safe_mode,
+                timestamp,
+                timestamp,
             ),
         )
         return int(cur.lastrowid)
 
 
 def save_local_media_source_bundle(
-    *, source_id: int | None = None, name: str, qb_profile: str, qb_path_prefix: str,
-    local_root: str, enabled: bool, media_type: str, mode: str,
-    targets: list[dict[str, str]] | None, owner: str = "admin",
-    smb_user: str = "", smb_pass: str = "",
-    stable_seconds: int | None = None, scan_enabled: bool | None = None,
+    *,
+    source_id: int | None = None,
+    name: str,
+    qb_profile: str,
+    qb_path_prefix: str,
+    local_root: str,
+    enabled: bool,
+    media_type: str,
+    mode: str,
+    targets: list[dict[str, str]] | None,
+    owner: str = "admin",
+    smb_user: str = "",
+    smb_pass: str = "",
+    stable_seconds: int | None = None,
+    scan_enabled: bool | None = None,
     scan_interval_minutes: int | None = None,
 ) -> int:
     """在单个事务内保存来源与全部分类目标。"""
@@ -7204,13 +7686,21 @@ def save_local_media_source_bundle(
                 raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
             if server_path:
                 from app.modules.media_server_path_mapping import MediaServerPathMapping
-                server_path = MediaServerPathMapping(target_path, server_path).server_prefix
+
+                server_path = MediaServerPathMapping(
+                    target_path, server_path
+                ).server_prefix
             seen.add(category)
-            normalized_targets.append({
-                "category": category, "path": target_path, "provider": provider,
-                "library_id": library_id, "library_name": library_name,
-                "server_path": server_path,
-            })
+            normalized_targets.append(
+                {
+                    "category": category,
+                    "path": target_path,
+                    "provider": provider,
+                    "library_id": library_id,
+                    "library_name": library_name,
+                    "server_path": server_path,
+                }
+            )
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -7220,10 +7710,23 @@ def save_local_media_source_bundle(
                 "smb_user,smb_pass,"
                 "enabled,stable_seconds,scan_enabled,scan_interval_minutes,media_type,mode,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (safe_owner, safe_name, str(qb_profile or "").strip(), str(qb_path_prefix or "").strip(),
-                 safe_root, "", "",
-                 1 if enabled else 0, 0, 0, 10,
-                 safe_media_type, safe_mode, timestamp, timestamp),
+                (
+                    safe_owner,
+                    safe_name,
+                    str(qb_profile or "").strip(),
+                    str(qb_path_prefix or "").strip(),
+                    safe_root,
+                    "",
+                    "",
+                    1 if enabled else 0,
+                    0,
+                    0,
+                    10,
+                    safe_media_type,
+                    safe_mode,
+                    timestamp,
+                    timestamp,
+                ),
             )
             saved_id = int(cur.lastrowid)
         else:
@@ -7258,15 +7761,15 @@ def save_local_media_source_bundle(
                     "FROM local_library_targets WHERE source_id=? AND owner=?",
                     (saved_id, safe_owner),
                 ).fetchall()
-                targets_changed = (
-                    _local_media_target_signature(current_targets)
-                    != _local_media_target_signature(normalized_targets)
-                )
+                targets_changed = _local_media_target_signature(
+                    current_targets
+                ) != _local_media_target_signature(normalized_targets)
             if (
-                (requested_operational != current_operational or targets_changed)
-                and _local_media_source_has_active_task(
-                    conn, source_id=saved_id, owner=safe_owner,
-                )
+                requested_operational != current_operational or targets_changed
+            ) and _local_media_source_has_active_task(
+                conn,
+                source_id=saved_id,
+                owner=safe_owner,
             ):
                 raise ValueError("来源仍有未完成任务，不能修改运行配置")
             cur = conn.execute(
@@ -7274,21 +7777,47 @@ def save_local_media_source_bundle(
                 "smb_user=?,smb_pass=?,"
                 "enabled=?,stable_seconds=?,scan_enabled=?,scan_interval_minutes=?,media_type=?,mode=?,updated_at=? "
                 "WHERE id=? AND owner=?",
-                (safe_name, str(qb_profile or "").strip(), str(qb_path_prefix or "").strip(),
-                 safe_root, "", "",
-                 1 if enabled else 0, 0, 0, 10,
-                 safe_media_type, safe_mode, timestamp, saved_id, safe_owner),
+                (
+                    safe_name,
+                    str(qb_profile or "").strip(),
+                    str(qb_path_prefix or "").strip(),
+                    safe_root,
+                    "",
+                    "",
+                    1 if enabled else 0,
+                    0,
+                    0,
+                    10,
+                    safe_media_type,
+                    safe_mode,
+                    timestamp,
+                    saved_id,
+                    safe_owner,
+                ),
             )
             if cur.rowcount != 1:
                 raise LookupError("本地媒体来源不存在")
         if normalized_targets is not None:
-            conn.execute("DELETE FROM local_library_targets WHERE source_id=? AND owner=?", (saved_id, safe_owner))
+            conn.execute(
+                "DELETE FROM local_library_targets WHERE source_id=? AND owner=?",
+                (saved_id, safe_owner),
+            )
             for item in normalized_targets:
                 conn.execute(
                     "INSERT INTO local_library_targets(source_id,owner,category,path,provider,library_id,library_name,server_path,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                    (saved_id, safe_owner, item["category"], item["path"], item["provider"],
-                     item["library_id"], item["library_name"], item["server_path"], timestamp, timestamp),
+                    (
+                        saved_id,
+                        safe_owner,
+                        item["category"],
+                        item["path"],
+                        item["provider"],
+                        item["library_id"],
+                        item["library_name"],
+                        item["server_path"],
+                        timestamp,
+                        timestamp,
+                    ),
                 )
         return saved_id
 
@@ -7349,7 +7878,10 @@ def upsert_local_library_target(
         raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
     if safe_server_path:
         from app.modules.media_server_path_mapping import MediaServerPathMapping
-        safe_server_path = MediaServerPathMapping(safe_path, safe_server_path).server_prefix
+
+        safe_server_path = MediaServerPathMapping(
+            safe_path, safe_server_path
+        ).server_prefix
     timestamp = now()
     with get_conn() as conn:
         source = conn.execute(
@@ -7365,8 +7897,16 @@ def upsert_local_library_target(
             "library_id=excluded.library_id,library_name=excluded.library_name,"
             "server_path=excluded.server_path,updated_at=excluded.updated_at",
             (
-                int(source_id), safe_owner, safe_category, safe_path,
-                safe_provider, safe_library_id, safe_library_name, safe_server_path, timestamp, timestamp,
+                int(source_id),
+                safe_owner,
+                safe_category,
+                safe_path,
+                safe_provider,
+                safe_library_id,
+                safe_library_name,
+                safe_server_path,
+                timestamp,
+                timestamp,
             ),
         )
         row = conn.execute(
@@ -7418,15 +7958,17 @@ def replace_local_library_targets(
         if not provider and (library_id or library_name or server_path):
             raise ValueError("未选择媒体服务器时不能绑定媒体库或服务端路径")
         seen.add(key)
-        normalized.append({
-            "source_id": source_id,
-            "category": category,
-            "path": path,
-            "provider": provider,
-            "library_id": library_id,
-            "library_name": library_name,
-            "server_path": server_path,
-        })
+        normalized.append(
+            {
+                "source_id": source_id,
+                "category": category,
+                "path": path,
+                "provider": provider,
+                "library_id": library_id,
+                "library_name": library_name,
+                "server_path": server_path,
+            }
+        )
 
     timestamp = now()
     with get_conn() as conn:
@@ -7438,7 +7980,9 @@ def replace_local_library_targets(
                 (safe_owner,),
             ).fetchall()
         }
-        unknown = sorted({int(item["source_id"]) for item in normalized} - existing_source_ids)
+        unknown = sorted(
+            {int(item["source_id"]) for item in normalized} - existing_source_ids
+        )
         if unknown:
             raise LookupError("本地媒体来源不存在")
         conn.execute("DELETE FROM local_library_targets WHERE owner=?", (safe_owner,))
@@ -7448,9 +7992,16 @@ def replace_local_library_targets(
                 "library_id,library_name,server_path,created_at,updated_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (
-                    int(item["source_id"]), safe_owner, item["category"], item["path"],
-                    item["provider"], item["library_id"], item["library_name"],
-                    item["server_path"], timestamp, timestamp,
+                    int(item["source_id"]),
+                    safe_owner,
+                    item["category"],
+                    item["path"],
+                    item["provider"],
+                    item["library_id"],
+                    item["library_name"],
+                    item["server_path"],
+                    timestamp,
+                    timestamp,
                 ),
             )
 
@@ -7465,6 +8016,7 @@ def create_local_media_task(
     operation_token: str = "",
 ) -> int:
     import uuid
+
     from app.modules.local_media_models import LOCAL_MEDIA_TRIGGERS
 
     safe_owner = _local_media_owner(owner)
@@ -7500,7 +8052,9 @@ def create_local_media_task(
 
         if hash_task is not None:
             task_id = int(hash_task["id"])
-            terminal = str(hash_task["status"] or "") in _LOCAL_MEDIA_TERMINAL_TASK_STATUSES
+            terminal = (
+                str(hash_task["status"] or "") in _LOCAL_MEDIA_TERMINAL_TASK_STATUSES
+            )
             if terminal:
                 if active is not None:
                     return _bind_qb_hash_to_active_local_media_task(
@@ -7510,15 +8064,23 @@ def create_local_media_task(
                         safe_path,
                         previous_hash_task_id=task_id,
                     )
-                if _canonical_local_media_content_path(hash_task["content_path"]) != safe_path:
+                if (
+                    _canonical_local_media_content_path(hash_task["content_path"])
+                    != safe_path
+                ):
                     raise ValueError("相同 qB 任务对应的内容路径不一致")
                 _normalize_local_media_task_path(conn, hash_task, safe_path)
                 return task_id
 
-            if _canonical_local_media_content_path(hash_task["content_path"]) != safe_path:
+            if (
+                _canonical_local_media_content_path(hash_task["content_path"])
+                != safe_path
+            ):
                 raise ValueError("相同 qB 任务对应的内容路径不一致")
             if active is not None and int(active["id"]) != task_id:
-                raise RuntimeError("同一路径存在多个活动本地媒体任务，请先完成或清理旧任务")
+                raise RuntimeError(
+                    "同一路径存在多个活动本地媒体任务，请先完成或清理旧任务"
+                )
             _normalize_local_media_task_path(conn, hash_task, safe_path)
             return task_id
 
@@ -7627,15 +8189,21 @@ def create_and_link_qb_local_media_task(
         else:
             task_id = int(hash_task["id"])
             existing_target = f"local-media-task:{task_id}"
-            already_linked = str(request_row["local_import_target"] or "") == existing_target
-            terminal = str(hash_task["status"] or "") in _LOCAL_MEDIA_TERMINAL_TASK_STATUSES
+            already_linked = (
+                str(request_row["local_import_target"] or "") == existing_target
+            )
+            terminal = (
+                str(hash_task["status"] or "") in _LOCAL_MEDIA_TERMINAL_TASK_STATUSES
+            )
             hash_path = _canonical_local_media_content_path(hash_task["content_path"])
 
             if not terminal:
                 if hash_path != safe_path:
                     raise ValueError("相同 qB 任务对应的内容路径不一致")
                 if active is not None and int(active["id"]) != task_id:
-                    raise RuntimeError("同一路径存在多个活动本地媒体任务，请先完成或清理旧任务")
+                    raise RuntimeError(
+                        "同一路径存在多个活动本地媒体任务，请先完成或清理旧任务"
+                    )
                 _normalize_local_media_task_path(conn, hash_task, safe_path)
             elif already_linked:
                 if hash_path != safe_path:
@@ -7683,6 +8251,7 @@ def create_and_link_qb_local_media_task(
             raise ValueError("下载请求的本地入库状态已变化")
         return task_id, restarted
 
+
 def list_download_requests_for_local_media_task(task_id: int) -> list[sqlite3.Row]:
     """返回绑定到同一本地整理任务的下载事务。"""
     target = f"local-media-task:{int(task_id)}"
@@ -7727,11 +8296,13 @@ def list_local_media_qb_write_conflicts(qb_hashes: list[str]) -> list[sqlite3.Ro
     schema 或 SQLite 状态不可用时异常必须上抛，由控制层对 resume/delete
     失败关闭；这里不能把“无法判断”伪装成“没有冲突”。
     """
-    normalized = sorted({
-        str(value or "").strip().casefold()
-        for value in qb_hashes
-        if str(value or "").strip()
-    })
+    normalized = sorted(
+        {
+            str(value or "").strip().casefold()
+            for value in qb_hashes
+            if str(value or "").strip()
+        }
+    )
     if not normalized:
         return []
     if len(normalized) > 200:
@@ -7760,7 +8331,9 @@ def list_waiting_local_media_tasks(*, owner: str = "admin", limit: int = 500):
     return [LocalMediaTask.from_row(row) for row in rows]
 
 
-def delete_local_media_tasks(task_ids: list[int], *, owner: str = "admin") -> dict[str, int]:
+def delete_local_media_tasks(
+    task_ids: list[int], *, owner: str = "admin"
+) -> dict[str, int]:
     """删除指定的非运行中本地整理日志；关联条目和步骤由外键级联清理。"""
     from app.modules.local_media_models import LOCAL_BUSY_TASK_STATUSES
 
@@ -7778,11 +8351,13 @@ def delete_local_media_tasks(task_ids: list[int], *, owner: str = "admin") -> di
     placeholders = ",".join("?" for _ in normalized_ids)
     busy_placeholders = ",".join("?" for _ in LOCAL_BUSY_TASK_STATUSES)
     with get_conn() as conn:
-        deleted = int(conn.execute(
-            f"DELETE FROM local_media_tasks WHERE owner=? AND id IN ({placeholders}) "
-            f"AND status NOT IN ({busy_placeholders})",
-            [safe_owner, *normalized_ids, *LOCAL_BUSY_TASK_STATUSES],
-        ).rowcount)
+        deleted = int(
+            conn.execute(
+                f"DELETE FROM local_media_tasks WHERE owner=? AND id IN ({placeholders}) "
+                f"AND status NOT IN ({busy_placeholders})",
+                [safe_owner, *normalized_ids, *LOCAL_BUSY_TASK_STATUSES],
+            ).rowcount
+        )
         remaining_rows = conn.execute(
             f"SELECT id,status FROM local_media_tasks WHERE owner=? AND id IN ({placeholders})",
             [safe_owner, *normalized_ids],
@@ -7791,22 +8366,27 @@ def delete_local_media_tasks(task_ids: list[int], *, owner: str = "admin") -> di
     return {
         "requested": len(normalized_ids),
         "deleted": deleted,
-        "skipped_busy": sum(status in LOCAL_BUSY_TASK_STATUSES for status in remaining.values()),
+        "skipped_busy": sum(
+            status in LOCAL_BUSY_TASK_STATUSES for status in remaining.values()
+        ),
         "missing": len(normalized_ids) - deleted - len(remaining),
     }
 
 
-
 def _agent_workspace_title_pattern(query: str) -> str:
     """为 Agent 标题搜索转义 LIKE 通配符，避免把用户输入解释为查询语法。"""
-    value = str(query or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    value = (
+        str(query or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    )
     return f"%{value}%"
 
 
 def _agent_workspace_search_rows(sql: str, query: str, limit: int) -> dict[str, object]:
     safe_limit = max(1, min(int(limit), 20))
     with get_conn() as conn:
-        rows = conn.execute(sql, (_agent_workspace_title_pattern(query), safe_limit + 1)).fetchall()
+        rows = conn.execute(
+            sql, (_agent_workspace_title_pattern(query), safe_limit + 1)
+        ).fetchall()
     return {
         "items": [dict(row) for row in rows[:safe_limit]],
         "truncated": len(rows) > safe_limit,
@@ -7823,7 +8403,9 @@ def search_agent_workspace_rss(query: str, *, limit: int = 8) -> dict[str, objec
     )
 
 
-def search_agent_workspace_downloads(query: str, *, limit: int = 8) -> dict[str, object]:
+def search_agent_workspace_downloads(
+    query: str, *, limit: int = 8
+) -> dict[str, object]:
     """仅按下载标题搜索；不读取路径、任务标识、源值或错误正文。"""
     safe_limit = max(1, min(int(limit), 20))
     pattern = _agent_workspace_title_pattern(query)
@@ -7877,7 +8459,11 @@ def search_agent_workspace_local_media(
             "SELECT title,media_type,year,status,trigger,created_at,updated_at "
             "FROM local_media_tasks WHERE owner=? "
             "AND COALESCE(title,'') LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
-            (_local_media_owner(owner), _agent_workspace_title_pattern(query), safe_limit + 1),
+            (
+                _local_media_owner(owner),
+                _agent_workspace_title_pattern(query),
+                safe_limit + 1,
+            ),
         ).fetchall()
     return {
         "items": [dict(row) for row in rows[:safe_limit]],
@@ -7885,7 +8471,9 @@ def search_agent_workspace_local_media(
     }
 
 
-def get_local_media_diagnostic_summary(*, owner: str = "admin") -> dict[str, dict[str, int]]:
+def get_local_media_diagnostic_summary(
+    *, owner: str = "admin"
+) -> dict[str, dict[str, int]]:
     """只读聚合本地媒体运行状态，不读取路径、标题、哈希或错误正文。"""
     safe_owner = _local_media_owner(owner)
     with get_conn() as conn:
@@ -7921,14 +8509,32 @@ def get_local_media_diagnostic_summary(*, owner: str = "admin") -> dict[str, dic
         return {key: max(0, int(row[key] or 0)) for key in keys}
 
     return {
-        "sources": counts(source_row, (
-            "total", "enabled", "disabled", "move_mode",
-            "preview_only_mode", "enabled_without_targets",
-        )),
-        "tasks": counts(task_row, (
-            "total", "waiting_stable", "active", "requires_manual", "planned",
-            "failed", "completed", "qb_completed", "scan", "manual",
-        )),
+        "sources": counts(
+            source_row,
+            (
+                "total",
+                "enabled",
+                "disabled",
+                "move_mode",
+                "preview_only_mode",
+                "enabled_without_targets",
+            ),
+        ),
+        "tasks": counts(
+            task_row,
+            (
+                "total",
+                "waiting_stable",
+                "active",
+                "requires_manual",
+                "planned",
+                "failed",
+                "completed",
+                "qb_completed",
+                "scan",
+                "manual",
+            ),
+        ),
     }
 
 
@@ -7946,12 +8552,16 @@ def _local_media_age_bucket_sql(timestamp_expression: str) -> str:
 def get_local_media_review_queue_summary(*, owner: str = "admin") -> dict[str, object]:
     """聚合待人工确认队列；只返回数量、触发来源和年龄分桶。"""
     safe_owner = _local_media_owner(owner)
-    age_sql = _local_media_age_bucket_sql("COALESCE(NULLIF(updated_at,''),created_at,'')")
+    age_sql = _local_media_age_bucket_sql(
+        "COALESCE(NULLIF(updated_at,''),created_at,'')"
+    )
     with get_conn() as conn:
-        total = int(conn.execute(
-            "SELECT COUNT(*) FROM local_media_tasks WHERE owner=? AND status='requires_manual'",
-            (safe_owner,),
-        ).fetchone()[0])
+        total = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM local_media_tasks WHERE owner=? AND status='requires_manual'",
+                (safe_owner,),
+            ).fetchone()[0]
+        )
         trigger_rows = conn.execute(
             "SELECT trigger,COUNT(*) AS count FROM local_media_tasks "
             "WHERE owner=? AND status='requires_manual' GROUP BY trigger",
@@ -7964,21 +8574,30 @@ def get_local_media_review_queue_summary(*, owner: str = "admin") -> dict[str, o
         ).fetchall()
     return {
         "total": total,
-        "by_trigger": {str(row["trigger"] or "unknown"): int(row["count"] or 0) for row in trigger_rows},
-        "age_buckets": {str(row["age_bucket"]): int(row["count"] or 0) for row in age_rows},
+        "by_trigger": {
+            str(row["trigger"] or "unknown"): int(row["count"] or 0)
+            for row in trigger_rows
+        },
+        "age_buckets": {
+            str(row["age_bucket"]): int(row["count"] or 0) for row in age_rows
+        },
     }
 
 
 def get_local_media_history_summary(*, owner: str = "admin") -> dict[str, object]:
     """聚合本地媒体终态历史；不读取标题、路径、标识或错误正文。"""
     safe_owner = _local_media_owner(owner)
-    timestamp_expression = "COALESCE(NULLIF(completed_at,''),NULLIF(updated_at,''),created_at,'')"
+    timestamp_expression = (
+        "COALESCE(NULLIF(completed_at,''),NULLIF(updated_at,''),created_at,'')"
+    )
     age_sql = _local_media_age_bucket_sql(timestamp_expression)
     with get_conn() as conn:
-        total = int(conn.execute(
-            "SELECT COUNT(*) FROM local_media_tasks WHERE owner=? AND status IN ('completed','failed')",
-            (safe_owner,),
-        ).fetchone()[0])
+        total = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM local_media_tasks WHERE owner=? AND status IN ('completed','failed')",
+                (safe_owner,),
+            ).fetchone()[0]
+        )
         status_rows = conn.execute(
             "SELECT status,COUNT(*) AS count FROM local_media_tasks "
             "WHERE owner=? AND status IN ('completed','failed') GROUP BY status",
@@ -7996,16 +8615,29 @@ def get_local_media_history_summary(*, owner: str = "admin") -> dict[str, object
         ).fetchall()
     return {
         "total": total,
-        "by_status": {str(row["status"]): int(row["count"] or 0) for row in status_rows},
-        "by_trigger": {str(row["trigger"] or "unknown"): int(row["count"] or 0) for row in trigger_rows},
-        "age_buckets": {str(row["age_bucket"]): int(row["count"] or 0) for row in age_rows},
+        "by_status": {
+            str(row["status"]): int(row["count"] or 0) for row in status_rows
+        },
+        "by_trigger": {
+            str(row["trigger"] or "unknown"): int(row["count"] or 0)
+            for row in trigger_rows
+        },
+        "age_buckets": {
+            str(row["age_bucket"]): int(row["count"] or 0) for row in age_rows
+        },
     }
 
 
 def prepare_manual_local_media_task(
-    source_id: int, content_path: str, *, owner: str = "admin",
-    tmdb_id: str = "", media_type: str = "", rules_snapshot: str = "",
-    season_override: int | None = None, episode_override: int | None = None,
+    source_id: int,
+    content_path: str,
+    *,
+    owner: str = "admin",
+    tmdb_id: str = "",
+    media_type: str = "",
+    rules_snapshot: str = "",
+    season_override: int | None = None,
+    episode_override: int | None = None,
     numbering_mode: str = "auto",
 ) -> int:
     """原子创建或重置可重试的手动任务；活动任务绝不被改回等待态。"""
@@ -8015,6 +8647,7 @@ def prepare_manual_local_media_task(
     safe_path = _canonical_local_media_content_path(content_path)
     normalized_type = str(media_type or "").strip().lower()
     from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
+
     raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
     if raw_numbering_mode not in NUMBERING_MODES:
         raise ValueError("剧集编号模式无效")
@@ -8031,7 +8664,9 @@ def prepare_manual_local_media_task(
             raise ValueError("集数必须是整数")
         if not 1 <= episode_override <= 999:
             raise ValueError("集数超出允许范围")
-    if normalized_type == "movie" and (season_override is not None or episode_override is not None):
+    if normalized_type == "movie" and (
+        season_override is not None or episode_override is not None
+    ):
         raise ValueError("电影任务不能指定季数或集数")
     if normalized_type == "movie":
         normalized_numbering_mode = "auto"
@@ -8040,7 +8675,8 @@ def prepare_manual_local_media_task(
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         source = conn.execute(
-            "SELECT id FROM local_media_sources WHERE id=? AND owner=?", (int(source_id), safe_owner)
+            "SELECT id FROM local_media_sources WHERE id=? AND owner=?",
+            (int(source_id), safe_owner),
         ).fetchone()
         if not source:
             raise LookupError("本地媒体来源不存在")
@@ -8067,9 +8703,19 @@ def prepare_manual_local_media_task(
                 "season_override=?,episode_override=?,numbering_mode=?,title='',year='',"
                 "operation_token=?,error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
-                (safe_path, str(rules_snapshot or ""), str(tmdb_id or "").strip(), normalized_type,
-                 season_override, episode_override, normalized_numbering_mode,
-                 token, timestamp, task_id, safe_owner),
+                (
+                    safe_path,
+                    str(rules_snapshot or ""),
+                    str(tmdb_id or "").strip(),
+                    normalized_type,
+                    season_override,
+                    episode_override,
+                    normalized_numbering_mode,
+                    token,
+                    timestamp,
+                    task_id,
+                    safe_owner,
+                ),
             )
             if cur.rowcount != 1:
                 raise ValueError("任务状态已变化，请刷新后重试")
@@ -8083,9 +8729,20 @@ def prepare_manual_local_media_task(
             "operation_token,rules_snapshot,tmdb_id,media_type,season_override,episode_override,"
             "numbering_mode,created_at,updated_at) "
             "VALUES(?,?,NULL,?,'manual','waiting_stable',?,?,?,?,?,?,?,?,?)",
-            (safe_owner, int(source_id), safe_path, token, str(rules_snapshot or ""),
-             str(tmdb_id or "").strip(), normalized_type, season_override, episode_override,
-             normalized_numbering_mode, timestamp, timestamp),
+            (
+                safe_owner,
+                int(source_id),
+                safe_path,
+                token,
+                str(rules_snapshot or ""),
+                str(tmdb_id or "").strip(),
+                normalized_type,
+                season_override,
+                episode_override,
+                normalized_numbering_mode,
+                timestamp,
+                timestamp,
+            ),
         )
         return int(cur.lastrowid)
 
@@ -8130,6 +8787,7 @@ def claim_local_media_confirmation_task(
     normalized_type = str(media_type or "").strip().lower()
     normalized_tmdb_id = str(tmdb_id or "").strip()
     from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
+
     raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
     if raw_numbering_mode not in NUMBERING_MODES:
         raise ValueError("剧集编号模式无效")
@@ -8155,10 +8813,18 @@ def claim_local_media_confirmation_task(
 
     where = "id=? AND owner=? AND status='requires_manual' AND version=?"
     params: list[object] = [
-        str(rules_snapshot or ""), normalized_tmdb_id, normalized_type,
-        season_override, episode_override, normalized_numbering_mode,
-        str(title or ""), str(year or ""),
-        now(), int(task_id), _local_media_owner(owner), int(expected_version),
+        str(rules_snapshot or ""),
+        normalized_tmdb_id,
+        normalized_type,
+        season_override,
+        episode_override,
+        normalized_numbering_mode,
+        str(title or ""),
+        str(year or ""),
+        now(),
+        int(task_id),
+        _local_media_owner(owner),
+        int(expected_version),
     ]
     expected_digest = str(expected_snapshot_digest or "").strip()
     if expected_digest:
@@ -8182,10 +8848,21 @@ def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> 
     if "content_path" in fields:
         raise ValueError("本地媒体任务路径只能通过原子准入接口设置")
     allowed = {
-        "status", "stable_since", "snapshot_digest", "rules_snapshot", "recognition_summary",
-        "tmdb_id", "media_type",
-        "season_override", "episode_override", "numbering_mode", "title", "year",
-        "error", "warning", "completed_at",
+        "status",
+        "stable_since",
+        "snapshot_digest",
+        "rules_snapshot",
+        "recognition_summary",
+        "tmdb_id",
+        "media_type",
+        "season_override",
+        "episode_override",
+        "numbering_mode",
+        "title",
+        "year",
+        "error",
+        "warning",
+        "completed_at",
     }
     sets: list[str] = []
     params: list[object] = []
@@ -8226,7 +8903,8 @@ def add_local_media_task_item(
     timestamp = now()
     with get_conn() as conn:
         task = conn.execute(
-            "SELECT id FROM local_media_tasks WHERE id=? AND owner=?", (int(task_id), safe_owner)
+            "SELECT id FROM local_media_tasks WHERE id=? AND owner=?",
+            (int(task_id), safe_owner),
         ).fetchone()
         if not task:
             raise LookupError("本地媒体任务不存在")
@@ -8237,8 +8915,19 @@ def add_local_media_task_item(
             "role=excluded.role,media_group=excluded.media_group,action=excluded.action,size=excluded.size,"
             "mtime_ns=excluded.mtime_ns,device=excluded.device,inode=excluded.inode,updated_at=excluded.updated_at",
             (
-                int(task_id), safe_owner, str(source_path), str(target_path), str(role), str(media_group),
-                str(action), max(0, int(size)), int(mtime_ns), int(device), int(inode), timestamp, timestamp,
+                int(task_id),
+                safe_owner,
+                str(source_path),
+                str(target_path),
+                str(role),
+                str(media_group),
+                str(action),
+                max(0, int(size)),
+                int(mtime_ns),
+                int(device),
+                int(inode),
+                timestamp,
+                timestamp,
             ),
         )
         row = conn.execute(
@@ -8248,7 +8937,9 @@ def add_local_media_task_item(
         return int(row["id"])
 
 
-def list_local_media_task_items(task_id: int, *, owner: str = "admin") -> list[sqlite3.Row]:
+def list_local_media_task_items(
+    task_id: int, *, owner: str = "admin"
+) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT * FROM local_media_task_items WHERE task_id=? AND owner=? ORDER BY id",
@@ -8269,7 +8960,8 @@ def add_local_media_operation_step(
     safe_owner = _local_media_owner(owner)
     with get_conn() as conn:
         task = conn.execute(
-            "SELECT id FROM local_media_tasks WHERE id=? AND owner=?", (int(task_id), safe_owner)
+            "SELECT id FROM local_media_tasks WHERE id=? AND owner=?",
+            (int(task_id), safe_owner),
         ).fetchone()
         if not task:
             raise LookupError("本地媒体任务不存在")
@@ -8280,8 +8972,12 @@ def add_local_media_operation_step(
             "action=excluded.action,source_path=excluded.source_path,target_path=excluded.target_path,"
             "status='pending',error='',started_at=NULL,finished_at=NULL",
             (
-                int(task_id), str(operation_token), int(step_index), str(action),
-                str(source_path), str(target_path),
+                int(task_id),
+                str(operation_token),
+                int(step_index),
+                str(action),
+                str(source_path),
+                str(target_path),
             ),
         )
         row = conn.execute(
@@ -8318,7 +9014,9 @@ def update_local_media_operation_step(
         return cur.rowcount == 1
 
 
-def list_local_media_operation_steps(task_id: int, *, owner: str = "admin") -> list[sqlite3.Row]:
+def list_local_media_operation_steps(
+    task_id: int, *, owner: str = "admin"
+) -> list[sqlite3.Row]:
     with get_conn() as conn:
         return conn.execute(
             "SELECT steps.* FROM local_media_operation_steps AS steps "
@@ -8328,9 +9026,17 @@ def list_local_media_operation_steps(task_id: int, *, owner: str = "admin") -> l
         ).fetchall()
 
 
-def update_local_media_source(source_id: int, *, owner: str = "admin", **fields) -> bool:
+def update_local_media_source(
+    source_id: int, *, owner: str = "admin", **fields
+) -> bool:
     allowed = {
-        "name", "qb_profile", "qb_path_prefix", "local_root", "enabled", "media_type", "mode",
+        "name",
+        "qb_profile",
+        "qb_path_prefix",
+        "local_root",
+        "enabled",
+        "media_type",
+        "mode",
     }
     normalized_fields: list[tuple[str, object]] = []
     for key, value in fields.items():
@@ -8364,15 +9070,17 @@ def update_local_media_source(source_id: int, *, owner: str = "admin", **fields)
         if current is None:
             return False
         operational_changed = any(
-            key != "name" and current[key] != value
-            for key, value in normalized_fields
+            key != "name" and current[key] != value for key, value in normalized_fields
         )
         if operational_changed and _local_media_source_has_active_task(
-            conn, source_id=int(source_id), owner=safe_owner,
+            conn,
+            source_id=int(source_id),
+            owner=safe_owner,
         ):
             raise ValueError("来源仍有未完成任务，不能修改运行配置")
         cur = conn.execute(
-            f"UPDATE local_media_sources SET {', '.join(sets)} WHERE id=? AND owner=?", params
+            f"UPDATE local_media_sources SET {', '.join(sets)} WHERE id=? AND owner=?",
+            params,
         )
         return cur.rowcount == 1
 
@@ -8382,11 +9090,14 @@ def delete_local_media_source(source_id: int, *, owner: str = "admin") -> bool:
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         if _local_media_source_has_active_task(
-            conn, source_id=int(source_id), owner=safe_owner,
+            conn,
+            source_id=int(source_id),
+            owner=safe_owner,
         ):
             raise ValueError("来源仍有未完成任务，不能删除")
         cur = conn.execute(
-            "DELETE FROM local_media_sources WHERE id=? AND owner=?", (int(source_id), safe_owner)
+            "DELETE FROM local_media_sources WHERE id=? AND owner=?",
+            (int(source_id), safe_owner),
         )
         return cur.rowcount == 1
 
@@ -8404,10 +9115,16 @@ def reset_local_media_task(
 ) -> bool:
     import uuid
 
-    normalized_type = None if media_type is None else str(media_type or "").strip().lower()
+    normalized_type = (
+        None if media_type is None else str(media_type or "").strip().lower()
+    )
     normalized_numbering_mode = None
     if numbering_mode is not None:
-        from app.modules.episode_mapping import NUMBERING_MODES, normalize_numbering_mode
+        from app.modules.episode_mapping import (
+            NUMBERING_MODES,
+            normalize_numbering_mode,
+        )
+
         raw_numbering_mode = str(numbering_mode or "auto").strip().lower()
         if raw_numbering_mode not in NUMBERING_MODES:
             raise ValueError("剧集编号模式无效")
@@ -8424,15 +9141,25 @@ def reset_local_media_task(
             raise ValueError(f"{label}必须是整数")
         if not minimum <= value <= maximum:
             raise ValueError(f"{label}超出允许范围")
-    if normalized_type == "movie" and (season_override is not None or episode_override is not None):
+    if normalized_type == "movie" and (
+        season_override is not None or episode_override is not None
+    ):
         raise ValueError("电影任务不能指定季数或集数")
     if normalized_type == "movie":
         normalized_numbering_mode = "auto"
     assignments = [
-        "status='waiting_stable'", "stable_since=''", "snapshot_digest=''",
-        "recognition_summary=''", "title=''", "year=''", "operation_token=?",
-        "error=''", "warning=''", "completed_at=NULL",
-        "version=version+1", "updated_at=?",
+        "status='waiting_stable'",
+        "stable_since=''",
+        "snapshot_digest=''",
+        "recognition_summary=''",
+        "title=''",
+        "year=''",
+        "operation_token=?",
+        "error=''",
+        "warning=''",
+        "completed_at=NULL",
+        "version=version+1",
+        "updated_at=?",
     ]
     params: list[object] = [uuid.uuid4().hex, now()]
     if tmdb_id is not None:
@@ -8460,11 +9187,13 @@ def reset_local_media_task(
             "SELECT status,error FROM local_media_tasks WHERE id=? AND owner=?",
             (int(task_id), safe_owner),
         ).fetchone()
-        if current is None or str(current["status"] or "") not in {"failed", "requires_manual"}:
+        if current is None or str(current["status"] or "") not in {
+            "failed",
+            "requires_manual",
+        }:
             return False
-        if (
-            is_interrupted_local_media_write_error(current["error"])
-            and not bool(confirm_interrupted_write)
+        if is_interrupted_local_media_write_error(current["error"]) and not bool(
+            confirm_interrupted_write
         ):
             return False
         cur = conn.execute(
@@ -8482,9 +9211,7 @@ def reset_local_media_task(
         return True
 
 
-def claim_agent_action_lease(
-    lease_key: str, *, ttl_seconds: int = 90
-) -> str | None:
+def claim_agent_action_lease(lease_key: str, *, ttl_seconds: int = 90) -> str | None:
     """跨 owner/Worker 原子领取短期外部动作去重租约。"""
     import uuid
 
@@ -8496,9 +9223,7 @@ def claim_agent_action_lease(
     token = uuid.uuid4().hex
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        conn.execute(
-            "DELETE FROM agent_action_leases WHERE expires_at<=?", (current,)
-        )
+        conn.execute("DELETE FROM agent_action_leases WHERE expires_at<=?", (current,))
         cur = conn.execute(
             "INSERT OR IGNORE INTO agent_action_leases("
             "lease_key,lease_token,expires_at,created_at) VALUES(?,?,?,?)",
@@ -8549,10 +9274,16 @@ def reset_local_media_task_if_current(
         return False
 
 
-def delete_local_library_target(source_id: int, category: str, *, owner: str = "admin") -> bool:
+def delete_local_library_target(
+    source_id: int, category: str, *, owner: str = "admin"
+) -> bool:
     with get_conn() as conn:
         cur = conn.execute(
             "DELETE FROM local_library_targets WHERE source_id=? AND category=? AND owner=?",
-            (int(source_id), str(category or "").strip().lower(), _local_media_owner(owner)),
+            (
+                int(source_id),
+                str(category or "").strip().lower(),
+                _local_media_owner(owner),
+            ),
         )
         return cur.rowcount == 1

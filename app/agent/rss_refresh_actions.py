@@ -1,16 +1,17 @@
 """Media Agent 的单订阅 RSS 受控刷新动作。"""
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.rss import rss_subscription_refresh_revision
 
@@ -131,9 +132,7 @@ def _refresh_rss_subscription_state(state: dict[str, Any]) -> ToolResult:
 
     from app.modules.rss import RSSEngine
 
-    raw = RSSEngine().refresh(
-        subscription_id, expected_revision=str(state["revision"])
-    )
+    raw = RSSEngine().refresh(subscription_id, expected_revision=str(state["revision"]))
     if raw.get("busy"):
         return ToolResult(
             ok=False,
@@ -196,9 +195,7 @@ def _refresh_rss_subscription_state(state: dict[str, Any]) -> ToolResult:
                 _now(),
             )
         ],
-        suggestions=(
-            ["其余订阅源已处理；请稍后核对暂不可用源。"] if partial else []
-        ),
+        suggestions=(["其余订阅源已处理；请稍后核对暂不可用源。"] if partial else []),
     )
 
 
@@ -206,11 +203,12 @@ def refresh_rss_subscription_confirmed(
     arguments: dict[str, int], expected_context: str
 ) -> ToolResult:
     state = _capture(arguments)
-    if not secrets.compare_digest(
-        str(state["revision"]), str(expected_context or "")
-    ):
-        raise AgentToolError("RSS 订阅配置已变化，请重新预检", code="confirmation_stale")
+    if not secrets.compare_digest(str(state["revision"]), str(expected_context or "")):
+        raise AgentToolError(
+            "RSS 订阅配置已变化，请重新预检", code="confirmation_stale"
+        )
     return _refresh_rss_subscription_state(state)
+
 
 def rss_refresh_subscriptions_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
@@ -247,12 +245,14 @@ def _capture_many(arguments: dict[str, Any]) -> dict[str, Any]:
     requested_scope = arguments.get("scope")
     if requested_scope == "all_configured":
         states = [
-            _capture_row(int(row["id"]), row)
-            for row in db.list_rss_subscriptions()
+            _capture_row(int(row["id"]), row) for row in db.list_rss_subscriptions()
         ]
         scope = "all_configured"
     else:
-        states = [_capture({"subscription_id": item}) for item in arguments["subscription_ids"]]
+        states = [
+            _capture({"subscription_id": item})
+            for item in arguments["subscription_ids"]
+        ]
         scope = "selected"
     fingerprint = hashlib.sha256(
         json.dumps(
@@ -300,7 +300,9 @@ def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
             summary="当前没有已配置的 RSS 订阅",
             error="请先创建并配置至少一个 RSS 订阅。",
         )
-    missing = [item["subscription_id"] for item in state["states"] if not item["exists"]]
+    missing = [
+        item["subscription_id"] for item in state["states"] if not item["exists"]
+    ]
     unconfigured = [
         item["subscription_id"]
         for item in state["states"]
@@ -319,7 +321,9 @@ def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
             error="；".join(details),
         )
 
-    names = [item.get("name") or f"#{item['subscription_id']}" for item in state["states"]]
+    names = [
+        item.get("name") or f"#{item['subscription_id']}" for item in state["states"]
+    ]
     displayed_names = names[:12]
     name_summary = "、".join(displayed_names)
     if len(names) > len(displayed_names):
@@ -334,7 +338,10 @@ def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
             "scope": state["scope"],
             "subscription_count": len(names),
             "subscriptions": [
-                {"subscription_id": item["subscription_id"], "name": item.get("name") or ""}
+                {
+                    "subscription_id": item["subscription_id"],
+                    "name": item.get("name") or "",
+                }
                 for item in displayed_states
             ],
             "subscriptions_truncated": len(state["states"]) > len(displayed_states),
@@ -344,11 +351,13 @@ def _preview_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
                 "不会自动创建下载任务。",
             ],
         },
-        evidence=[Evidence(
-            "rss_database",
-            "仅核对本地订阅名称和可刷新状态；尚未访问订阅源。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "仅核对本地订阅名称和可刷新状态；尚未访问订阅源。",
+                _now(),
+            )
+        ],
     )
 
 
@@ -427,9 +436,11 @@ def _refresh_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
     failed = requested - succeeded
     has_partial = partial_subscriptions > 0
     status = (
-        "failed" if succeeded == 0 else
-        "partial" if failed > 0 or has_partial else
-        "completed"
+        "failed"
+        if succeeded == 0
+        else "partial"
+        if failed > 0 or has_partial
+        else "completed"
     )
     return ToolResult(
         ok=succeeded > 0,
@@ -439,7 +450,8 @@ def _refresh_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
             f"新增 {totals['new']}，排除 {totals['skipped']}"
             + (
                 f"；{partial_subscriptions} 个订阅部分完成，暂不可用源 {failed_sources}"
-                if has_partial else ""
+                if has_partial
+                else ""
             )
         ),
         data={
@@ -452,20 +464,21 @@ def _refresh_rss_subscriptions_state(state: dict[str, Any]) -> ToolResult:
             "subscriptions": results[:_BULK_DISPLAY_LIMIT],
             "subscriptions_truncated": len(results) > _BULK_DISPLAY_LIMIT,
         },
-        evidence=[Evidence(
-            "rss_refresh",
-            "已按确认时绑定的订阅配置逐个刷新；响应仅包含名称、状态和聚合计数。",
-            _now(),
-        )],
-        suggestions=(
-            ["失败或冲突的订阅可以稍后单独重试。"] if failed else []
-        ) + (
-            ["其余订阅源已处理；请稍后核对暂不可用源。"]
-            if has_partial else []
-        ),
+        evidence=[
+            Evidence(
+                "rss_refresh",
+                "已按确认时绑定的订阅配置逐个刷新；响应仅包含名称、状态和聚合计数。",
+                _now(),
+            )
+        ],
+        suggestions=(["失败或冲突的订阅可以稍后单独重试。"] if failed else [])
+        + (["其余订阅源已处理；请稍后核对暂不可用源。"] if has_partial else []),
         error=(
-            "部分订阅未刷新成功。" if failed else
-            "部分订阅源暂不可用。" if has_partial else ""
+            "部分订阅未刷新成功。"
+            if failed
+            else "部分订阅源暂不可用。"
+            if has_partial
+            else ""
         ),
     )
 
@@ -477,5 +490,7 @@ def refresh_rss_subscriptions_confirmed(
     if not secrets.compare_digest(
         str(current["fingerprint"]), str(expected_context or "")
     ):
-        raise AgentToolError("相关 RSS 订阅配置已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "相关 RSS 订阅配置已变化，请重新预检", code="confirmation_stale"
+        )
     return _refresh_rss_subscriptions_state(current)

@@ -1,4 +1,5 @@
 """光鸭整理来源中的空目录与严格垃圾残留目录安全清理。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -11,10 +12,11 @@ import time
 import unicodedata
 import uuid
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from app.clients.guangya import GuangYaClient, GuangYaFile
 from app.config import PATHS
@@ -56,8 +58,19 @@ _IMAGE_EXTS = {"jpg", "jpeg", "png", "webp", "gif", "bmp"}
 _LINK_EXTS = {"url", "website", "html", "htm"}
 _TEXT_EXTS = {"txt"}
 _PROTECTED_MEDIA_IMAGE_STEMS = {
-    "poster", "fanart", "cover", "folder", "thumb", "thumbnail", "backdrop",
-    "banner", "landscape", "logo", "clearlogo", "disc", "discart",
+    "poster",
+    "fanart",
+    "cover",
+    "folder",
+    "thumb",
+    "thumbnail",
+    "backdrop",
+    "banner",
+    "landscape",
+    "logo",
+    "clearlogo",
+    "disc",
+    "discart",
 }
 
 
@@ -142,7 +155,8 @@ def _auth(payload: dict[str, Any]) -> str:
     if not secret:
         raise GuangYaCleanupPlanError("残留清理计划签名密钥不可用")
     return hmac.new(
-        secret, b"mediaflux-guangya-cleanup-plan:v1\0" + _canonical(payload),
+        secret,
+        b"mediaflux-guangya-cleanup-plan:v1\0" + _canonical(payload),
         hashlib.sha256,
     ).hexdigest()
 
@@ -155,7 +169,9 @@ def _atomic_write(payload: dict[str, Any]) -> None:
     encoded = (json.dumps(stored, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
     if len(encoded) > _MAX_PLAN_BYTES:
         raise GuangYaCleanupPlanError("残留清理计划过大，请降低候选上限")
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
+    fd, temporary = tempfile.mkstemp(
+        prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent
+    )
     replaced = False
     try:
         with os.fdopen(fd, "wb") as stream:
@@ -188,7 +204,10 @@ def _read(plan_id: str) -> dict[str, Any]:
         raise GuangYaCleanupPlanError("残留清理计划不存在或已过期") from exc
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise GuangYaCleanupPlanError("残留清理计划文件损坏") from exc
-    if not isinstance(payload, dict) or int(payload.get("version") or 0) != _PLAN_VERSION:
+    if (
+        not isinstance(payload, dict)
+        or int(payload.get("version") or 0) != _PLAN_VERSION
+    ):
         raise GuangYaCleanupPlanError("残留清理计划版本无效")
     if not hmac.compare_digest(str(payload.get("auth") or ""), _auth(payload)):
         raise GuangYaCleanupPlanError("残留清理计划完整性校验失败")
@@ -203,9 +222,14 @@ def _append_journal(plan_id: str, event: dict[str, Any]) -> None:
     fd = os.open(path, flags, 0o600)
     try:
         with os.fdopen(fd, "a", encoding="utf-8") as stream:
-            stream.write(json.dumps(
-                {"at": _now_iso(), **event}, ensure_ascii=False, separators=(",", ":")
-            ) + "\n")
+            stream.write(
+                json.dumps(
+                    {"at": _now_iso(), **event},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
             stream.flush()
             os.fsync(stream.fileno())
     finally:
@@ -246,7 +270,8 @@ def maintain_cleanup_plans() -> dict[str, int]:
             journal = _journal_path(path.stem)
             size = int(path.stat().st_size) + (
                 int(journal.stat().st_size)
-                if journal.is_file() and not journal.is_symlink() else 0
+                if journal.is_file() and not journal.is_symlink()
+                else 0
             )
             try:
                 payload = _read(path.stem)
@@ -284,7 +309,8 @@ def maintain_cleanup_plans() -> dict[str, int]:
     for journal in directory.glob("*.jsonl"):
         try:
             if (
-                journal.is_file() and not journal.is_symlink()
+                journal.is_file()
+                and not journal.is_symlink()
                 and journal.stem not in plan_ids
             ):
                 journal.unlink()
@@ -301,12 +327,15 @@ def maintain_cleanup_plans() -> dict[str, int]:
         total_bytes = max(0, total_bytes - size)
         removed += 1
     remaining = sum(
-        1 for path in directory.glob("*.json")
+        1
+        for path in directory.glob("*.json")
         if path.is_file() and not path.is_symlink()
     )
     return {
-        "removed": removed, "remaining": remaining,
-        "active": active, "bytes": total_bytes,
+        "removed": removed,
+        "remaining": remaining,
+        "active": active,
+        "bytes": total_bytes,
     }
 
 
@@ -347,15 +376,19 @@ def confirm_cleanup_plan(
     stats = dict(payload.get("stats") or {})
     if max(0, int(stats.get("undecided_count") or 0)) > 0:
         raise GuangYaCleanupPlanError("仍有候选尚未逐项复核，不能确认执行")
-    if not list(payload.get("residuals") or []) and not list(payload.get("empties") or []):
+    if not list(payload.get("residuals") or []) and not list(
+        payload.get("empties") or []
+    ):
         raise GuangYaCleanupPlanError("当前冻结计划没有需要执行的清理对象")
     current = time.time()
-    payload.update({
-        "status": "confirmed",
-        "confirmed_at": _now_iso(),
-        "confirmed_at_epoch": current,
-        "execute_until_epoch": current + _CONFIRMED_TTL_SECONDS,
-    })
+    payload.update(
+        {
+            "status": "confirmed",
+            "confirmed_at": _now_iso(),
+            "confirmed_at_epoch": current,
+            "execute_until_epoch": current + _CONFIRMED_TTL_SECONDS,
+        }
+    )
     _atomic_write(payload)
     return payload
 
@@ -439,15 +472,26 @@ def _snapshot(item: GuangYaFile) -> dict[str, Any]:
 
 
 def _signature(entries: list[dict[str, Any]]) -> str:
-    return hashlib.sha256(json.dumps(
-        sorted(entries, key=lambda row: (row["parent_id"], row["name"].casefold(), row["file_id"])),
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            sorted(
+                entries,
+                key=lambda row: (
+                    row["parent_id"],
+                    row["name"].casefold(),
+                    row["file_id"],
+                ),
+            ),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
-def _collect_tree_entries(node_id: str, nodes: dict[str, _Node]) -> list[dict[str, Any]]:
+def _collect_tree_entries(
+    node_id: str, nodes: dict[str, _Node]
+) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
     stack = [node_id]
     while stack:
@@ -472,10 +516,12 @@ def build_cleanup_plan(
         if not source_id or source_id == "0":
             raise GuangYaCleanupPlanError("整理来源 ID 无效")
         if all(item["id"] != source_id for item in normalized_sources):
-            normalized_sources.append({
-                "id": source_id,
-                "name": str(source.get("name") or f"来源{index}"),
-            })
+            normalized_sources.append(
+                {
+                    "id": source_id,
+                    "name": str(source.get("name") or f"来源{index}"),
+                }
+            )
     sources = normalized_sources
     if not sources:
         raise GuangYaCleanupPlanError("未配置光鸭整理来源")
@@ -486,7 +532,8 @@ def build_cleanup_plan(
     scanned_items = 0
     scanned_dirs = 0
     protected_source_ids = {
-        str(source.get("id") or "").strip() for source in sources
+        str(source.get("id") or "").strip()
+        for source in sources
         if str(source.get("id") or "").strip()
     }
     protected_boundaries = 0
@@ -582,23 +629,28 @@ def build_cleanup_plan(
     for index, node_id in enumerate(residual_ids, start=1):
         node = nodes[node_id]
         tree = _collect_tree_entries(node_id, nodes)
-        candidates.append({
-            "candidate_number": index,
-            "root": _snapshot(node.item),
-            "tree": tree,
-            "signature": _signature(tree),
-            "container_name": f"{index:03d}-{_safe_public_name(node.item.name, '残留目录')}",
-            "source_index": node.source_index,
-            "file_count": summaries[node_id].file_count,
-            "total_size": summaries[node_id].total_size,
-            "file_names": [
-                str(entry.get("name") or "")
-                for entry in tree
-                if not bool(entry.get("is_dir"))
-            ],
-        })
+        candidates.append(
+            {
+                "candidate_number": index,
+                "root": _snapshot(node.item),
+                "tree": tree,
+                "signature": _signature(tree),
+                "container_name": f"{index:03d}-{_safe_public_name(node.item.name, '残留目录')}",
+                "source_index": node.source_index,
+                "file_count": summaries[node_id].file_count,
+                "total_size": summaries[node_id].total_size,
+                "file_names": [
+                    str(entry.get("name") or "")
+                    for entry in tree
+                    if not bool(entry.get("is_dir"))
+                ],
+            }
+        )
     empties = [
-        {"root": _snapshot(nodes[node_id].item), "depth": nodes[node_id].path.count("/")}
+        {
+            "root": _snapshot(nodes[node_id].item),
+            "depth": nodes[node_id].path.count("/"),
+        }
         for node_id in empty_ids
     ]
     empties.sort(key=lambda row: (-int(row["depth"]), row["root"]["name"].casefold()))
@@ -614,9 +666,14 @@ def build_cleanup_plan(
         "residuals": [],
         "empties": empties,
     }
-    fingerprint = hashlib.sha256(json.dumps(
-        fingerprint_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")).hexdigest()
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     payload: dict[str, Any] = {
         "version": _PLAN_VERSION,
         "plan_id": plan_id,
@@ -628,7 +685,8 @@ def build_cleanup_plan(
         "status": "preview",
         "fingerprint": fingerprint,
         "source_ids": fingerprint_payload["sources"],
-        "batch_name": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-") + plan_id[:8],
+        "batch_name": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
+        + plan_id[:8],
         "stats": {
             "source_count": len(sources),
             "scanned_items": scanned_items,
@@ -646,9 +704,8 @@ def build_cleanup_plan(
             "preserved_dir_count": preserved_dirs,
             "unsupported_empty_dir_count": unsupported_empty_dirs,
         },
-        "samples": [
-            str(item["root"]["name"]) for item in candidates[:3]
-        ] + [str(item["root"]["name"]) for item in empties[:2]],
+        "samples": [str(item["root"]["name"]) for item in candidates[:3]]
+        + [str(item["root"]["name"]) for item in empties[:2]],
         "candidates": candidates,
         "candidate_decisions": {},
         "residuals": [],
@@ -679,7 +736,8 @@ def revise_cleanup_plan(
     if str(plan.get("status") or "preview") != "preview":
         raise GuangYaCleanupPlanStale("残留清理计划已进入执行阶段，请重新预览")
     candidates = [
-        dict(item) for item in list(plan.get("candidates") or [])
+        dict(item)
+        for item in list(plan.get("candidates") or [])
         if isinstance(item, dict)
     ]
     by_number = {
@@ -728,57 +786,76 @@ def revise_cleanup_plan(
         if action == "quarantine":
             selected_numbers.append(number)
             selected_file_count += max(0, int(candidate.get("file_count") or 0))
-            residuals.append({
-                key: candidate[key]
-                for key in (
-                    "candidate_number", "root", "tree", "signature",
-                    "container_name", "source_index", "file_count", "total_size",
-                )
-                if key in candidate
-            })
+            residuals.append(
+                {
+                    key: candidate[key]
+                    for key in (
+                        "candidate_number",
+                        "root",
+                        "tree",
+                        "signature",
+                        "container_name",
+                        "source_index",
+                        "file_count",
+                        "total_size",
+                    )
+                    if key in candidate
+                }
+            )
         elif action == "keep":
             kept_numbers.append(number)
 
     reviewed_count = len(selected_numbers) + len(kept_numbers)
     stats = dict(plan.get("stats") or {})
-    stats.update({
-        "candidate_count": len(candidates),
-        "reviewed_count": reviewed_count,
-        "selected_count": len(selected_numbers),
-        "kept_count": len(kept_numbers),
-        "undecided_count": max(0, len(candidates) - reviewed_count),
-        "residual_dir_count": len(residuals),
-        "quarantine_file_count": selected_file_count,
-    })
+    stats.update(
+        {
+            "candidate_count": len(candidates),
+            "reviewed_count": reviewed_count,
+            "selected_count": len(selected_numbers),
+            "kept_count": len(kept_numbers),
+            "undecided_count": max(0, len(candidates) - reviewed_count),
+            "residual_dir_count": len(residuals),
+            "quarantine_file_count": selected_file_count,
+        }
+    )
 
     new_plan_id = uuid.uuid4().hex
     current = time.time()
     revised = {
-        key: value for key, value in plan.items()
-        if key not in {
-            "auth", "confirmed_at", "confirmed_at_epoch", "execute_until_epoch",
-            "execution", "updated_at",
+        key: value
+        for key, value in plan.items()
+        if key
+        not in {
+            "auth",
+            "confirmed_at",
+            "confirmed_at_epoch",
+            "execute_until_epoch",
+            "execution",
+            "updated_at",
         }
     }
-    revised.update({
-        "plan_id": new_plan_id,
-        "created_at": _now_iso(),
-        "created_at_epoch": current,
-        "expires_at_epoch": current + _PLAN_TTL_SECONDS,
-        "status": "preview",
-        "selection_revision": max(0, int(plan.get("selection_revision") or 0)) + 1,
-        "candidate_decisions": current_decisions,
-        "residuals": residuals,
-        "stats": stats,
-        "samples": [
-            str(item.get("root", {}).get("name") or "") for item in residuals[:3]
-        ] + [
-            str(item.get("root", {}).get("name") or "")
-            for item in list(plan.get("empties") or [])[:2]
-        ],
-        "batch_name": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
-        + new_plan_id[:8],
-    })
+    revised.update(
+        {
+            "plan_id": new_plan_id,
+            "created_at": _now_iso(),
+            "created_at_epoch": current,
+            "expires_at_epoch": current + _PLAN_TTL_SECONDS,
+            "status": "preview",
+            "selection_revision": max(0, int(plan.get("selection_revision") or 0)) + 1,
+            "candidate_decisions": current_decisions,
+            "residuals": residuals,
+            "stats": stats,
+            "samples": [
+                str(item.get("root", {}).get("name") or "") for item in residuals[:3]
+            ]
+            + [
+                str(item.get("root", {}).get("name") or "")
+                for item in list(plan.get("empties") or [])[:2]
+            ],
+            "batch_name": datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-")
+            + new_plan_id[:8],
+        }
+    )
     fingerprint_payload = {
         "owner_digest": revised.get("owner_digest"),
         "credential_generation": revised.get("credential_generation"),
@@ -788,9 +865,14 @@ def revise_cleanup_plan(
         "residuals": residuals,
         "empties": list(revised.get("empties") or []),
     }
-    revised["fingerprint"] = hashlib.sha256(json.dumps(
-        fingerprint_payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")).hexdigest()
+    revised["fingerprint"] = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
     _atomic_write(revised)
     capacity = maintain_cleanup_plans()
     if (
@@ -816,7 +898,9 @@ def _matches(item: GuangYaFile | None, snapshot: dict[str, Any]) -> bool:
 def _rescan_tree(client: GuangYaClient, root: dict[str, Any]) -> list[dict[str, Any]]:
     root_id = str(root.get("file_id") or "")
     parent_id = str(root.get("parent_id") or "0")
-    current = {str(item.file_id): item for item in client.list_dir(parent_id)}.get(root_id)
+    current = {str(item.file_id): item for item in client.list_dir(parent_id)}.get(
+        root_id
+    )
     if not _matches(current, root):
         raise GuangYaCleanupPlanStale("残留目录状态已变化，请重新预览")
     entries = [_snapshot(current)]
@@ -834,8 +918,7 @@ def _rescan_tree(client: GuangYaClient, root: dict[str, Any]) -> list[dict[str, 
 
 def _find_unique_dir(client: GuangYaClient, parent_id: str, name: str) -> str:
     matches = [
-        item for item in client.list_dir(parent_id)
-        if item.is_dir and item.name == name
+        item for item in client.list_dir(parent_id) if item.is_dir and item.name == name
     ]
     if len(matches) > 1:
         raise GuangYaCleanupPlanStale("隔离目录名称不唯一，已停止清理")
@@ -843,8 +926,7 @@ def _find_unique_dir(client: GuangYaClient, parent_id: str, name: str) -> str:
         return str(matches[0].file_id)
     created = str(client.create_dir(name, parent_id) or "")
     matches = [
-        item for item in client.list_dir(parent_id)
-        if item.is_dir and item.name == name
+        item for item in client.list_dir(parent_id) if item.is_dir and item.name == name
     ]
     if len(matches) != 1 or (created and str(matches[0].file_id) != created):
         raise GuangYaCleanupPlanError("隔离目录创建后校验失败")
@@ -854,11 +936,13 @@ def _find_unique_dir(client: GuangYaClient, parent_id: str, name: str) -> str:
 def _validated_selected_residuals(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """复核逐项决定与执行清单完全一致，防止保留项进入写入阶段。"""
     residuals = [
-        dict(item) for item in list(plan.get("residuals") or [])
+        dict(item)
+        for item in list(plan.get("residuals") or [])
         if isinstance(item, dict)
     ]
     candidates = [
-        dict(item) for item in list(plan.get("candidates") or [])
+        dict(item)
+        for item in list(plan.get("candidates") or [])
         if isinstance(item, dict)
     ]
     if not candidates:
@@ -878,9 +962,7 @@ def _validated_selected_residuals(plan: dict[str, Any]) -> list[dict[str, Any]]:
             expected_numbers.add(number)
         elif action != "keep":
             raise GuangYaCleanupPlanError("残留清理仍有候选未完成复核")
-    actual_numbers = {
-        int(item.get("candidate_number") or 0) for item in residuals
-    }
+    actual_numbers = {int(item.get("candidate_number") or 0) for item in residuals}
     if expected_numbers != actual_numbers or len(actual_numbers) != len(residuals):
         raise GuangYaCleanupPlanError("残留清理执行范围与逐项决定不一致")
     for item in residuals:
@@ -888,9 +970,7 @@ def _validated_selected_residuals(plan: dict[str, Any]) -> list[dict[str, Any]]:
         candidate = by_number[number]
         for key in ("root", "tree", "signature", "source_index"):
             if item.get(key) != candidate.get(key):
-                raise GuangYaCleanupPlanError(
-                    f"残留候选 #{number} 的冻结快照不一致"
-                )
+                raise GuangYaCleanupPlanError(f"残留候选 #{number} 的冻结快照不一致")
     return residuals
 
 
@@ -912,7 +992,8 @@ def execute_cleanup_plan(
         str(plan.get("owner_digest") or ""), str(payload.get("owner_digest") or "")
     ):
         raise GuangYaCleanupPlanError("残留清理任务会话不匹配")
-    expected_generation = int(payload.get("credential_generation") or -1)
+    raw_generation = payload.get("credential_generation")
+    expected_generation = int(raw_generation) if raw_generation is not None else -1
     client = client_factory()
     quarantined = 0
     empty_deleted = 0
@@ -922,7 +1003,10 @@ def execute_cleanup_plan(
     started_at = _now_iso()
     journal_started = False
     try:
-        if not client.logged_in or int(client.credential_generation) != expected_generation:
+        if (
+            not client.logged_in
+            or int(client.credential_generation) != expected_generation
+        ):
             raise GuangYaCleanupPlanStale("光鸭登录凭据已变化，请重新预览")
         residuals = _validated_selected_residuals(plan)
         empties = list(plan.get("empties") or [])
@@ -939,21 +1023,35 @@ def execute_cleanup_plan(
             if cancel_check is not None:
                 cancel_check()
             root = dict(item.get("root") or {})
-            parent = {str(row.file_id): row for row in client.list_dir(str(root.get("parent_id") or "0"))}
+            parent = {
+                str(row.file_id): row
+                for row in client.list_dir(str(root.get("parent_id") or "0"))
+            }
             current = parent.get(str(root.get("file_id") or ""))
-            if not _matches(current, root) or client.list_dir(str(root.get("file_id") or "")):
+            if not _matches(current, root) or client.list_dir(
+                str(root.get("file_id") or "")
+            ):
                 raise GuangYaCleanupPlanStale("空目录状态已变化，请重新预览")
 
-        _update_execution(plan_id, "running", {
-            "started_at": started_at,
-            "quarantined": 0,
-            "empty_deleted": 0,
-            "failed": 0,
-        })
-        _append_journal(plan_id, {
-            "action": "preflight", "status": "completed",
-            "residuals": len(residuals), "empties": len(empties),
-        })
+        _update_execution(
+            plan_id,
+            "running",
+            {
+                "started_at": started_at,
+                "quarantined": 0,
+                "empty_deleted": 0,
+                "failed": 0,
+            },
+        )
+        _append_journal(
+            plan_id,
+            {
+                "action": "preflight",
+                "status": "completed",
+                "residuals": len(residuals),
+                "empties": len(empties),
+            },
+        )
         journal_started = True
 
         batch_id = ""
@@ -977,12 +1075,16 @@ def execute_cleanup_plan(
             if not unchanged:
                 failed += 1
                 precondition_failed += 1
-                _append_journal(plan_id, {
-                    "action": "quarantine", "index": index,
-                    "file_id": str(root.get("file_id") or ""),
-                    "status": "failed",
-                    "error_type": "PreWriteSnapshotChanged",
-                })
+                _append_journal(
+                    plan_id,
+                    {
+                        "action": "quarantine",
+                        "index": index,
+                        "file_id": str(root.get("file_id") or ""),
+                        "status": "failed",
+                        "error_type": "PreWriteSnapshotChanged",
+                    },
+                )
                 continue
             container_id = _find_unique_dir(
                 client, batch_id, str(item.get("container_name") or f"残留-{index:03d}")
@@ -1009,12 +1111,16 @@ def execute_cleanup_plan(
                     verification_failed += 1
                 if not error_type:
                     error_type = "PostWriteVerificationFailed"
-            _append_journal(plan_id, {
-                "action": "quarantine", "index": index,
-                "file_id": str(root.get("file_id") or ""),
-                "status": "completed" if applied else "failed",
-                "error_type": error_type,
-            })
+            _append_journal(
+                plan_id,
+                {
+                    "action": "quarantine",
+                    "index": index,
+                    "file_id": str(root.get("file_id") or ""),
+                    "status": "completed" if applied else "failed",
+                    "error_type": error_type,
+                },
+            )
 
         for index, item in enumerate(empties, start=1):
             if cancel_check is not None:
@@ -1035,12 +1141,16 @@ def execute_cleanup_plan(
             if not unchanged:
                 failed += 1
                 precondition_failed += 1
-                _append_journal(plan_id, {
-                    "action": "delete_empty", "index": index,
-                    "file_id": str(root.get("file_id") or ""),
-                    "status": "failed",
-                    "error_type": "PreWriteSnapshotChanged",
-                })
+                _append_journal(
+                    plan_id,
+                    {
+                        "action": "delete_empty",
+                        "index": index,
+                        "file_id": str(root.get("file_id") or ""),
+                        "status": "failed",
+                        "error_type": "PreWriteSnapshotChanged",
+                    },
+                )
                 continue
             error_type = ""
             try:
@@ -1069,12 +1179,16 @@ def execute_cleanup_plan(
                     verification_failed += 1
                 if not error_type:
                     error_type = "PostWriteVerificationFailed"
-            _append_journal(plan_id, {
-                "action": "delete_empty", "index": index,
-                "file_id": str(root.get("file_id") or ""),
-                "status": "completed" if applied else "failed",
-                "error_type": error_type,
-            })
+            _append_journal(
+                plan_id,
+                {
+                    "action": "delete_empty",
+                    "index": index,
+                    "file_id": str(root.get("file_id") or ""),
+                    "status": "completed" if applied else "failed",
+                    "error_type": error_type,
+                },
+            )
 
         status = "completed" if failed == 0 else "partial"
         execution = {
@@ -1102,19 +1216,28 @@ def execute_cleanup_plan(
         }
     except BaseException as exc:
         if journal_started:
-            _append_journal(plan_id, {
-                "action": "fatal", "status": "failed", "error_type": type(exc).__name__
-            })
+            _append_journal(
+                plan_id,
+                {
+                    "action": "fatal",
+                    "status": "failed",
+                    "error_type": type(exc).__name__,
+                },
+            )
         try:
-            _update_execution(plan_id, "failed", {
-                "started_at": started_at,
-                "finished_at": _now_iso(),
-                "quarantined": quarantined,
-                "empty_deleted": empty_deleted,
-                "failed": failed,
-                "precondition_failed": precondition_failed,
-                "error_type": type(exc).__name__,
-            })
+            _update_execution(
+                plan_id,
+                "failed",
+                {
+                    "started_at": started_at,
+                    "finished_at": _now_iso(),
+                    "quarantined": quarantined,
+                    "empty_deleted": empty_deleted,
+                    "failed": failed,
+                    "precondition_failed": precondition_failed,
+                    "error_type": type(exc).__name__,
+                },
+            )
         except Exception:
             pass
         raise

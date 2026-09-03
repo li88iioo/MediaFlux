@@ -1,21 +1,24 @@
 #!/usr/bin/env python3
 """Media Agent 只读生产就绪诊断。默认不访问网络、不写配置或数据库。"""
+
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from pathlib import Path
 import sqlite3
 import stat
 import sys
-from typing import Sequence
+from collections.abc import Sequence
+from pathlib import Path
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app import config
-from app.agent.tools import build_tool_registry
+from app.agent.domain_catalog import build_tool_specs
+from app.agent.kernel.capabilities import ToolEffect
+from app.agent.kernel.ports import catalog_from_tool_specs
 from app.clients.openai_compatible import (
     PROTOCOLS,
     normalize_provider_location,
@@ -26,14 +29,17 @@ from app.modules.runtime_diagnostics import DiagnosticCheck, DiagnosticReport
 from app.modules.web_secret import configured_web_secret
 from app.runtime_paths import get_runtime_paths
 
-_REQUIRED_AGENT_TABLES = frozenset({
-    "agent_confirmations",
-    "agent_conversations",
-    "agent_conversation_messages",
-    "agent_jobs",
-    "agent_rate_limit_buckets",
-    "agent_session_context",
-})
+_REQUIRED_AGENT_TABLES = frozenset(
+    {
+        "agent_confirmations",
+        "agent_kernel_sessions",
+        "agent_kernel_refs",
+        "agent_kernel_events",
+        "agent_jobs",
+        "agent_rate_limit_buckets",
+        "agent_session_context",
+    }
+)
 _MIN_SECRET_LENGTH = 32
 _MIN_SCRAPE_KEY_LENGTH = 24
 
@@ -54,13 +60,19 @@ def _provider_check() -> DiagnosticCheck:
         return DiagnosticCheck(
             "agent.provider",
             "warning",
-            "LLM 自动规划当前关闭；确定性工具路由仍可工作。",
-            "如需自然语言自动工具编排，请启用 LLM 并运行设置页能力测试。",
+            "LLM 原生规划当前关闭，Media Agent 自然语言入口不可用。",
+            "如需使用 Agent，请启用 LLM 并运行设置页能力测试。",
         )
     base_url = config.get("AGENT_LLM_API_URL", "").strip()
     model = config.get("AGENT_LLM_MODEL", "").strip()
-    protocol = config.get("AGENT_LLM_PROTOCOL", "auto").strip().lower().replace("-", "_")
-    missing = [name for name, value in (("API Base URL", base_url), ("模型", model)) if not value]
+    protocol = (
+        config.get("AGENT_LLM_PROTOCOL", "auto").strip().lower().replace("-", "_")
+    )
+    missing = [
+        name
+        for name, value in (("API Base URL", base_url), ("模型", model))
+        if not value
+    ]
     if missing:
         return DiagnosticCheck(
             "agent.provider",
@@ -85,7 +97,11 @@ def _provider_check() -> DiagnosticCheck:
             "LLM Provider 地址未通过 HTTPS/公网安全校验。",
             "使用无内嵌凭据、无查询参数的公网 HTTPS Base URL。",
         )
-    key_state = "API Key 已配置" if config.get("AGENT_LLM_API_KEY", "").strip() else "API Key 未配置"
+    key_state = (
+        "API Key 已配置"
+        if config.get("AGENT_LLM_API_KEY", "").strip()
+        else "API Key 未配置"
+    )
     return DiagnosticCheck(
         "agent.provider",
         "ok",
@@ -155,7 +171,9 @@ def _web_secret_check() -> DiagnosticCheck:
             and all(33 <= ord(char) <= 126 for char in secret)
         )
         if valid:
-            return DiagnosticCheck("agent.web_secret", "ok", "WEB_SECRET_KEY 已安全配置。")
+            return DiagnosticCheck(
+                "agent.web_secret", "ok", "WEB_SECRET_KEY 已安全配置。"
+            )
         return DiagnosticCheck(
             "agent.web_secret",
             "error",
@@ -167,7 +185,11 @@ def _web_secret_check() -> DiagnosticCheck:
     try:
         metadata = fallback.lstat()
     except FileNotFoundError:
-        status = "error" if config.get("APP_ENV", "development").strip().lower() == "production" else "warning"
+        status = (
+            "error"
+            if config.get("APP_ENV", "development").strip().lower() == "production"
+            else "warning"
+        )
         return DiagnosticCheck(
             "agent.web_secret",
             status,
@@ -191,7 +213,9 @@ def _web_secret_check() -> DiagnosticCheck:
             "持久化 Web Secret 文件类型或权限不安全。",
             "移除不安全文件，并让目标服务账户重新生成或显式配置密钥。",
         )
-    return DiagnosticCheck("agent.web_secret", "ok", "持久化 Web Secret 文件存在且权限收紧。")
+    return DiagnosticCheck(
+        "agent.web_secret", "ok", "持久化 Web Secret 文件存在且权限收紧。"
+    )
 
 
 def _key_capabilities_check() -> DiagnosticCheck:
@@ -205,50 +229,63 @@ def _key_capabilities_check() -> DiagnosticCheck:
         )
     states = [
         "metrics scrape key 已配置" if scrape_key else "metrics scrape key 未配置",
-        "Provider key 已配置" if config.get("AGENT_LLM_API_KEY", "").strip() else "Provider key 未配置",
+        "Provider key 已配置"
+        if config.get("AGENT_LLM_API_KEY", "").strip()
+        else "Provider key 未配置",
     ]
     status = "ok" if scrape_key else "warning"
-    suggestion = "" if scrape_key else "如需无会话 Prometheus 抓取，请配置独立 AGENT_METRICS_SCRAPE_KEY。"
+    suggestion = (
+        ""
+        if scrape_key
+        else "如需无会话 Prometheus 抓取，请配置独立 AGENT_METRICS_SCRAPE_KEY。"
+    )
     return DiagnosticCheck("agent.keys", status, "；".join(states) + "。", suggestion)
 
 
 def _tool_capabilities_check() -> DiagnosticCheck:
     try:
-        registry = build_tool_registry()
-        all_tools = registry.capabilities()
-        read_tools = registry.llm_read_capabilities()
-        confirmation_tools = registry.llm_confirmation_capabilities()
-    except Exception:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        all_tools = catalog.visible({})
+        read_tools = [tool for tool in all_tools if tool.effect is ToolEffect.READ]
+        effect_tools = [
+            tool for tool in all_tools if tool.effect is not ToolEffect.READ
+        ]
+        aliases = [tool.model_name for tool in all_tools]
+        if len(aliases) != len(set(aliases)):
+            raise ValueError("duplicate model aliases")
+    except Exception:  # noqa: BLE001 - diagnostic must report every catalog build failure
         return DiagnosticCheck(
             "agent.capabilities",
             "error",
-            "Agent 内置工具注册表无法构建。",
-            "检查最近的工具定义、别名与确认契约变更。",
+            "Agent Kernel 能力目录无法构建。",
+            "检查最近的分域工具定义、模型别名与 EffectPlan 契约变更。",
         )
-    if not all_tools or not read_tools or not confirmation_tools:
+    if not all_tools or not read_tools or not effect_tools:
         return DiagnosticCheck(
             "agent.capabilities",
             "error",
-            "Agent 工具能力集合不完整。",
-            "检查只读工具与确认后写入工具的注册状态。",
+            "Agent Kernel 能力集合不完整。",
+            "检查只读工具与需要 EffectPlan 确认的写入工具。",
         )
     return DiagnosticCheck(
         "agent.capabilities",
         "ok",
-        f"工具注册表可用：{len(all_tools)} 项能力，{len(read_tools)} 项 LLM 只读，{len(confirmation_tools)} 项确认后动作。",
+        f"Kernel 能力目录可用：{len(all_tools)} 项能力，{len(read_tools)} 项只读，{len(effect_tools)} 项确认后动作。",
     )
 
 
 def run_agent_diagnostics() -> DiagnosticReport:
     """执行离线、只读且不回显任何密钥值的 Agent 诊断。"""
-    return DiagnosticReport((
-        _agent_config_check(),
-        _provider_check(),
-        _database_check(),
-        _web_secret_check(),
-        _key_capabilities_check(),
-        _tool_capabilities_check(),
-    ))
+    return DiagnosticReport(
+        (
+            _agent_config_check(),
+            _provider_check(),
+            _database_check(),
+            _web_secret_check(),
+            _key_capabilities_check(),
+            _tool_capabilities_check(),
+        )
+    )
 
 
 def _exit_code(report: DiagnosticReport) -> int:

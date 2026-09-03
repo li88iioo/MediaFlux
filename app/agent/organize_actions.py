@@ -1,18 +1,19 @@
 """光鸭整理的只读预览与服务端确认后启动动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
-from app.modules.organize import OrganizeRules, Organizer, organize_rules_snapshot
+from app.modules.organize import Organizer, OrganizeRules, organize_rules_snapshot
 from app.modules.organize_sources import normalize_organize_sources
 from app.modules.organize_tasks import get_organize_manager
 
@@ -94,7 +95,9 @@ def _credential_generation(client: GuangYaClient) -> int:
 
 
 def _task_running() -> bool:
-    status = str(get_organize_manager().task_status().get("status") or "").strip().lower()
+    status = (
+        str(get_organize_manager().task_status().get("status") or "").strip().lower()
+    )
     return status in {"running", "stopping"}
 
 
@@ -142,12 +145,16 @@ def _preview_data(
                 match = getattr(plan, "match", None)
                 title = str(getattr(match, "title", "") or "").strip()
                 if title and len(samples) < _PREVIEW_SAMPLE_LIMIT:
-                    samples.append({
-                        "title": title[:160],
-                        "year": str(getattr(match, "year", "") or "")[:8],
-                        "media_type": str(getattr(match, "media_type", "") or "")[:16],
-                        "action": action if action in action_counts else "skip",
-                    })
+                    samples.append(
+                        {
+                            "title": title[:160],
+                            "year": str(getattr(match, "year", "") or "")[:8],
+                            "media_type": str(getattr(match, "media_type", "") or "")[
+                                :16
+                            ],
+                            "action": action if action in action_counts else "skip",
+                        }
+                    )
     finally:
         organizer.close()
 
@@ -222,7 +229,11 @@ def _organize_preview_snapshot(
             summary="光鸭整理预览扫描不完整",
             data=data,
             error="部分目录无法读取，本次不会创建执行确认。",
-            evidence=[Evidence("guangya_organizer", "执行只读 dry-run；未进行云盘写入。", _now())],
+            evidence=[
+                Evidence(
+                    "guangya_organizer", "执行只读 dry-run；未进行云盘写入。", _now()
+                )
+            ],
             suggestions=["请检查光鸭连接后重新预览。"],
         )
     if for_confirmation and data["sampled_files"] == 0:
@@ -232,7 +243,11 @@ def _organize_preview_snapshot(
             summary="当前来源中没有可整理的媒体文件",
             data=data,
             error="没有发现需要启动整理任务的内容。",
-            evidence=[Evidence("guangya_organizer", "执行只读 dry-run；未进行云盘写入。", _now())],
+            evidence=[
+                Evidence(
+                    "guangya_organizer", "执行只读 dry-run；未进行云盘写入。", _now()
+                )
+            ],
         )
 
     summary = (
@@ -250,7 +265,13 @@ def _organize_preview_snapshot(
         status="preview",
         summary=summary,
         data=data,
-        evidence=[Evidence("guangya_organizer", "执行只读 dry-run；未移动、改名或删除云盘内容。", _now())],
+        evidence=[
+            Evidence(
+                "guangya_organizer",
+                "执行只读 dry-run；未移动、改名或删除云盘内容。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -340,11 +361,13 @@ def _preview_guangya_organize_stop_task(task: dict[str, Any]) -> ToolResult:
         status="preview",
         summary="确认后将安全停止当前光鸭整理任务",
         data={"requested": True, "cooperative": True},
-        evidence=[Evidence(
-            "guangya_organizer",
-            "停止为协作式操作：当前文件操作可能先完成，已完成的云盘写入不会回滚。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "guangya_organizer",
+                "停止为协作式操作：当前文件操作可能先完成，已完成的云盘写入不会回滚。",
+                _now(),
+            )
+        ],
         suggestions=["确认后任务会在安全边界停止，不会撤销已完成的移动或改名。"],
     )
 
@@ -354,7 +377,9 @@ def prepare_guangya_organize_stop(
 ) -> tuple[ToolResult, str]:
     """用同一份任务快照生成预检结果和确认上下文。"""
     task = _organize_stop_context_payload()
-    return _preview_guangya_organize_stop_task(task), _serialize_organize_stop_context(task)
+    return _preview_guangya_organize_stop_task(task), _serialize_organize_stop_context(
+        task
+    )
 
 
 def _parse_organize_stop_context(expected_context: str) -> dict[str, Any]:
@@ -366,9 +391,14 @@ def _parse_organize_stop_context(expected_context: str) -> dict[str, Any]:
             code="confirmation_stale",
         ) from exc
     if not isinstance(task, dict) or set(task) != {
-        "task_id", "status", "stoppable", "started_at",
+        "task_id",
+        "status",
+        "stoppable",
+        "started_at",
     }:
-        raise AgentToolError("整理任务状态已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "整理任务状态已变化，请重新预检", code="confirmation_stale"
+        )
     return task
 
 
@@ -382,7 +412,9 @@ def stop_guangya_organize_confirmed(
         _serialize_organize_stop_context(current_task),
         _serialize_organize_stop_context(expected_task),
     ):
-        raise AgentToolError("整理任务状态已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "整理任务状态已变化，请重新预检", code="confirmation_stale"
+        )
 
     task_id = str(expected_task.get("task_id") or "")
     if (
@@ -390,24 +422,30 @@ def stop_guangya_organize_confirmed(
         or expected_task.get("stoppable") is not True
         or not task_id
     ):
-        raise AgentToolError("整理任务状态已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "整理任务状态已变化，请重新预检", code="confirmation_stale"
+        )
 
     result = get_organize_manager().stop(
         expected_task_id=task_id,
         require_running=True,
     )
     if not result.get("ok"):
-        raise AgentToolError("整理任务状态已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "整理任务状态已变化，请重新预检", code="confirmation_stale"
+        )
     return ToolResult(
         ok=True,
         status="accepted",
         summary="光鸭整理停止请求已提交",
         data={"accepted": True},
-        evidence=[Evidence(
-            "guangya_organizer",
-            "已请求任务在当前文件操作完成后安全停止；未返回任务、目录或文件标识。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "guangya_organizer",
+                "已请求任务在当前文件操作完成后安全停止；未返回任务、目录或文件标识。",
+                _now(),
+            )
+        ],
         suggestions=["可询问：查看光鸭整理进度。"],
     )
 
@@ -456,7 +494,13 @@ def _run_guangya_organize_once(
             status="accepted",
             summary="光鸭整理任务已提交",
             data={"trigger_type": "manual", "source_count": len(sources)},
-            evidence=[Evidence("guangya_organizer", "已提交后台整理；未返回目录或任务标识。", _now())],
+            evidence=[
+                Evidence(
+                    "guangya_organizer",
+                    "已提交后台整理；未返回目录或任务标识。",
+                    _now(),
+                )
+            ],
             suggestions=["可询问：查看光鸭整理进度。"],
         )
     finally:

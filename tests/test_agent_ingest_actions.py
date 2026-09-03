@@ -1,10 +1,11 @@
 """Agent 统一资源接入链路与传统 Telegram 隔离测试。"""
+
 from __future__ import annotations
 
 import unittest
 from unittest.mock import patch
 
-from app.agent.confirmation import ConfirmationStore
+from app.agent.errors import AgentToolError
 from app.agent.ingest_actions import (
     AgentIngestSessionStore,
     IngestActions,
@@ -13,19 +14,16 @@ from app.agent.ingest_actions import (
     ingest_submit_arguments,
 )
 from app.agent.models import ToolContext, ToolResult
-from app.agent.orchestrator import AgentOrchestrator, recent_ingest_submit_request
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     new_resource_search_id,
     safe_resource_snapshot,
 )
-from app.agent.registry import AgentToolError
 from app.agent.state_commit import (
     AgentStateCommitBuffer,
     defer_agent_state_commits,
     stage_agent_resource_candidates,
 )
-from app.agent.tools import build_tool_registry
 
 _MAGNET = "magnet:?xt=urn:btih:" + "a" * 40 + "&dn=Demo"
 _SHARE = "https://www.guangyapan.com/s/1938060615538466851_aecd7hu726g3whGl#/share"
@@ -37,15 +35,17 @@ def _resource_result(result_id: str, title: str) -> ToolResult:
         "success",
         "searched",
         data={
-            "items": [{
-                "result_id": result_id,
-                "title": title,
-                "site_id": "mikan",
-                "site_name": "Mikan",
-                "size_text": "1.2 GiB",
-                "download_state": "ready",
-                "download_kinds": ["magnet"],
-            }],
+            "items": [
+                {
+                    "result_id": result_id,
+                    "title": title,
+                    "site_id": "mikan",
+                    "site_name": "Mikan",
+                    "size_text": "1.2 GiB",
+                    "download_state": "ready",
+                    "download_kinds": ["magnet"],
+                }
+            ]
         },
     )
 
@@ -53,11 +53,13 @@ def _resource_result(result_id: str, title: str) -> ToolResult:
 class AgentIngestArgumentTests(unittest.TestCase):
     def test_submit_arguments_are_public_coordinates_only(self):
         self.assertEqual(
-            ingest_submit_arguments({
-                "source_type": "resource_candidates",
-                "positions": [2, 1, 2],
-                "target": "both",
-            }),
+            ingest_submit_arguments(
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [2, 1, 2],
+                    "target": "both",
+                }
+            ),
             {
                 "source_type": "resource_candidates",
                 "positions": [2, 1],
@@ -65,84 +67,59 @@ class AgentIngestArgumentTests(unittest.TestCase):
             },
         )
         with self.assertRaises(AgentToolError):
-            ingest_submit_arguments({
-                "source_type": "direct_url",
-                "target": "qb",
-                "input": _MAGNET,
-            })
+            ingest_submit_arguments(
+                {"source_type": "direct_url", "target": "qb", "input": _MAGNET}
+            )
 
     def test_resource_search_id_is_optional_but_strict_when_present(self):
         search_id = "rs_1234567890abcdef"
         self.assertEqual(
-            ingest_submit_arguments({
-                "source_type": "resource_candidates",
-                "positions": [1],
-                "target": "qb",
-                "search_id": search_id,
-            })["search_id"],
+            ingest_submit_arguments(
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [1],
+                    "target": "qb",
+                    "search_id": search_id,
+                }
+            )["search_id"],
             search_id,
         )
         with self.assertRaises(AgentToolError):
-            ingest_submit_arguments({
-                "source_type": "resource_candidates",
-                "positions": [1],
-                "target": "qb",
-                "search_id": "latest",
-            })
+            ingest_submit_arguments(
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [1],
+                    "target": "qb",
+                    "search_id": "latest",
+                }
+            )
         with self.assertRaises(AgentToolError):
-            ingest_submit_arguments({
-                "source_type": "direct_url",
-                "target": "qb",
-                "search_id": search_id,
-            })
+            ingest_submit_arguments(
+                {"source_type": "direct_url", "target": "qb", "search_id": search_id}
+            )
 
     def test_share_defaults_to_guangya_and_all_items(self):
         self.assertEqual(
             ingest_submit_arguments({"source_type": "guangya_share"}),
-            {
-                "source_type": "guangya_share",
-                "target": "guangya",
-                "positions": [],
-            },
+            {"source_type": "guangya_share", "target": "guangya", "positions": []},
         )
         self.assertEqual(
-            ingest_submit_arguments({
-                "source_type": "guangya_share",
-                "positions": [],
-            }),
-            {
-                "source_type": "guangya_share",
-                "target": "guangya",
-                "positions": [],
-            },
+            ingest_submit_arguments({"source_type": "guangya_share", "positions": []}),
+            {"source_type": "guangya_share", "target": "guangya", "positions": []},
         )
 
     def test_resource_inspection_rejects_input(self):
         with self.assertRaises(AgentToolError):
-            ingest_inspect_arguments({
-                "source_type": "resource_candidates",
-                "input": "secret",
-            })
+            ingest_inspect_arguments(
+                {"source_type": "resource_candidates", "input": "secret"}
+            )
 
     def test_status_requires_public_positive_request_number(self):
         self.assertEqual(
-            ingest_status_arguments({"request_number": 12}),
-            {"request_number": 12},
+            ingest_status_arguments({"request_number": 12}), {"request_number": 12}
         )
         with self.assertRaises(AgentToolError):
             ingest_status_arguments({"request_id": 12})
-
-    def test_direct_followup_accepts_target_only_but_rejects_negation(self):
-        self.assertEqual(
-            recent_ingest_submit_request("qB", source_type="direct_url"),
-            {"source_type": "direct_url", "target": "qb"},
-        )
-        self.assertIsNone(
-            recent_ingest_submit_request("不要下载到 qB", source_type="direct_url")
-        )
-        self.assertIsNone(
-            recent_ingest_submit_request("qB 还是光鸭？", source_type="direct_url")
-        )
 
 
 class AgentIngestActionTests(unittest.TestCase):
@@ -150,8 +127,7 @@ class AgentIngestActionTests(unittest.TestCase):
         self.store = AgentIngestSessionStore()
         self.resources = RecentResourceCandidateStore()
         self.actions = IngestActions(
-            store=self.store,
-            recent_resource_store=self.resources,
+            store=self.store, recent_resource_store=self.resources
         )
         self.context = ToolContext(owner="owner-a")
 
@@ -202,8 +178,7 @@ class AgentIngestActionTests(unittest.TestCase):
         return_value={"id": 42, "created": True, "status": "pending"},
     )
     @patch(
-        "app.agent.ingest_actions.download_target_readiness",
-        return_value={"qb": True},
+        "app.agent.ingest_actions.download_target_readiness", return_value={"qb": True}
     )
     def test_direct_link_requires_confirmation_and_executes_via_dispatcher(
         self, _readiness, create_request_mock, dispatch_mock, _get_request
@@ -211,11 +186,7 @@ class AgentIngestActionTests(unittest.TestCase):
         self.actions.inspect(
             {"source_type": "direct_url", "input": _MAGNET}, self.context
         )
-        arguments = {
-            "source_type": "direct_url",
-            "target": "qb",
-            "positions": [],
-        }
+        arguments = {"source_type": "direct_url", "target": "qb", "positions": []}
         preview, fingerprint = self.actions.prepare_submit(arguments, self.context)
         self.assertTrue(preview.ok)
         self.assertNotIn("magnet:?", repr(preview.to_dict()))
@@ -283,77 +254,55 @@ class AgentIngestActionTests(unittest.TestCase):
             f"{arguments['result_id']}:{arguments['target']}",
         )
         self.resources.capture(
-            owner="owner-a",
-            result=_resource_result("resource-old-0001", "Old"),
+            owner="owner-a", result=_resource_result("resource-old-0001", "Old")
         )
         staged_search_id = new_resource_search_id()
         staged_snapshot = safe_resource_snapshot(
-            _resource_result("resource-new-0001", "New"),
-            search_id=staged_search_id,
+            _resource_result("resource-new-0001", "New"), search_id=staged_search_id
         )
         buffer = AgentStateCommitBuffer(owner="owner-a")
-        arguments = ingest_submit_arguments({
-            "source_type": "resource_candidates",
-            "positions": [1],
-            "target": "qb",
-        })
-
+        arguments = ingest_submit_arguments(
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"}
+        )
         with defer_agent_state_commits(buffer):
-            self.assertTrue(stage_agent_resource_candidates(
-                owner="owner-a",
-                snapshot=staged_snapshot,
-            ))
+            self.assertTrue(
+                stage_agent_resource_candidates(
+                    owner="owner-a", snapshot=staged_snapshot
+                )
+            )
             self.actions.prepare_submit(arguments, self.context)
-
         self.assertEqual(arguments["search_id"], staged_search_id)
-        prepare_resource.assert_called_once_with({
-            "result_id": "resource-new-0001",
-            "target": "qb",
-        })
+        prepare_resource.assert_called_once_with(
+            {"result_id": "resource-new-0001", "target": "qb"}
+        )
         buffer.discard()
 
     @patch("app.agent.indexer_candidate_actions.submit_resource_confirmed")
     @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
     def test_confirm_uses_frozen_snapshot_after_a_newer_search(
-        self,
-        prepare_resource,
-        submit_resource,
+        self, prepare_resource, submit_resource
     ):
         prepare_resource.side_effect = lambda arguments: (
             ToolResult(True, "confirmation_required", "preview", data={"resource": {}}),
             f"{arguments['result_id']}:{arguments['target']}",
         )
         submit_resource.side_effect = lambda arguments, _expected: ToolResult(
-            True,
-            "accepted",
-            "submitted",
-            data={"result_id": arguments["result_id"]},
+            True, "accepted", "submitted", data={"result_id": arguments["result_id"]}
         )
         first_search_id = self.resources.capture(
-            owner="owner-a",
-            result=_resource_result("resource-first-001", "First"),
+            owner="owner-a", result=_resource_result("resource-first-001", "First")
         )
-        arguments = ingest_submit_arguments({
-            "source_type": "resource_candidates",
-            "positions": [1],
-            "target": "qb",
-        })
+        arguments = ingest_submit_arguments(
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"}
+        )
         _preview, expected_context = self.actions.prepare_submit(
-            arguments,
-            self.context,
+            arguments, self.context
         )
         self.assertEqual(arguments["search_id"], first_search_id)
         self.resources.capture(
-            owner="owner-a",
-            result=_resource_result("resource-second-01", "Second"),
+            owner="owner-a", result=_resource_result("resource-second-01", "Second")
         )
-
-        result = self.actions.execute_submit(
-            arguments,
-            expected_context,
-            self.context,
-        )
-
+        result = self.actions.execute_submit(arguments, expected_context, self.context)
         self.assertTrue(result.ok)
         self.assertEqual(result.data["result_id"], "resource-first-001")
         self.assertEqual(
@@ -361,16 +310,13 @@ class AgentIngestActionTests(unittest.TestCase):
             ["resource-first-001", "resource-first-001"],
         )
         submit_resource.assert_called_once_with(
-            {"result_id": "resource-first-001", "target": "qb"},
-            "resource-first-001:qb",
+            {"result_id": "resource-first-001", "target": "qb"}, "resource-first-001:qb"
         )
 
     @patch("app.agent.indexer_candidate_actions.submit_resource_confirmed")
     @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
     def test_confirm_fails_closed_when_frozen_snapshot_was_evicted(
-        self,
-        prepare_resource,
-        submit_resource,
+        self, prepare_resource, submit_resource
     ):
         resources = RecentResourceCandidateStore(max_snapshots_per_owner=1)
         actions = IngestActions(store=self.store, recent_resource_store=resources)
@@ -379,97 +325,19 @@ class AgentIngestActionTests(unittest.TestCase):
             f"{arguments['result_id']}:{arguments['target']}",
         )
         resources.capture(
-            owner="owner-a",
-            result=_resource_result("resource-first-001", "First"),
+            owner="owner-a", result=_resource_result("resource-first-001", "First")
         )
-        arguments = ingest_submit_arguments({
-            "source_type": "resource_candidates",
-            "positions": [1],
-            "target": "qb",
-        })
+        arguments = ingest_submit_arguments(
+            {"source_type": "resource_candidates", "positions": [1], "target": "qb"}
+        )
         _preview, expected_context = actions.prepare_submit(arguments, self.context)
         resources.capture(
-            owner="owner-a",
-            result=_resource_result("resource-second-01", "Second"),
+            owner="owner-a", result=_resource_result("resource-second-01", "Second")
         )
-
         with self.assertRaises(AgentToolError) as raised:
             actions.execute_submit(arguments, expected_context, self.context)
-
         self.assertEqual(raised.exception.code, "confirmation_stale")
         submit_resource.assert_not_called()
-
-    @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
-    def test_orchestrator_ticket_freezes_resolved_search_id(self, prepare_resource):
-        prepare_resource.side_effect = lambda arguments: (
-            ToolResult(True, "confirmation_required", "preview", data={"resource": {}}),
-            f"{arguments['result_id']}:{arguments['target']}",
-        )
-        search_id = self.resources.capture(
-            owner="owner-a",
-            result=_resource_result("resource-ticket-001", "Ticket"),
-        )
-        confirmation_store = ConfirmationStore()
-        service = AgentOrchestrator(
-            build_tool_registry(self.resources, self.store),
-            confirmation_store=confirmation_store,
-            recent_resource_store=self.resources,
-            recent_ingest_store=self.store,
-        )
-
-        prepared = service.prepare(
-            "ingest.submit",
-            {
-                "source_type": "resource_candidates",
-                "positions": [1],
-                "target": "qb",
-            },
-            owner="owner-a",
-        )
-
-        self.assertEqual(prepared["mode"], "confirmation_required")
-        tickets = confirmation_store.list_active_tickets(owner="owner-a")
-        self.assertEqual(len(tickets), 1)
-        self.assertEqual(tickets[0].arguments["search_id"], search_id)
-
-    def test_registry_has_only_unified_ingest_submission(self):
-        registry = build_tool_registry(self.resources, self.store)
-        self.assertTrue(registry.has("ingest.inspect"))
-        self.assertTrue(registry.has("ingest.submit"))
-        self.assertTrue(registry.has("ingest.status"))
-        self.assertFalse(registry.has("indexer.submit_candidate"))
-        self.assertFalse(registry.has("indexer.submit_candidates"))
-
-    @patch(
-        "app.agent.ingest_actions.download_target_readiness",
-        return_value={"qb": True},
-    )
-    def test_orchestrator_routes_link_and_followup_through_confirmation(self, _readiness):
-        registry = build_tool_registry(self.resources, self.store)
-        service = AgentOrchestrator(
-            registry,
-            confirmation_store=ConfirmationStore(),
-            recent_resource_store=self.resources,
-            recent_ingest_store=self.store,
-        )
-        response = service.query(_MAGNET, owner="owner-a")
-        self.assertEqual(response["tool_call"]["name"], "ingest.inspect")
-        self.assertNotIn("magnet:?", repr(response))
-
-        prepared = service.query("下载到 qB", owner="owner-a", present=False)
-        self.assertEqual(prepared["mode"], "confirmation_required")
-        self.assertEqual(prepared["tool_call"]["name"], "ingest.submit")
-        self.assertNotIn("magnet:?", repr(prepared))
-
-        service.reset_session(owner="owner-a")
-        inline = service.query(
-            f"把这个链接下载到 qB：{_MAGNET}",
-            owner="owner-a",
-            present=False,
-        )
-        self.assertEqual(inline["mode"], "confirmation_required")
-        self.assertEqual(inline["tool_call"]["name"], "ingest.submit")
-        self.assertNotIn("magnet:?", repr(inline))
 
     @patch("app.agent.ingest_actions.db.get_download_request")
     def test_status_returns_only_public_request_projection(self, get_request):
@@ -491,7 +359,3 @@ class AgentIngestActionTests(unittest.TestCase):
         self.assertEqual(result.data["request"]["request_number"], 7)
         self.assertNotIn("source_value", result.data["request"])
         self.assertNotIn("magnet:?", repr(result.to_dict()))
-
-
-if __name__ == "__main__":
-    unittest.main()

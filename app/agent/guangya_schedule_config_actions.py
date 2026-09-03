@@ -1,15 +1,16 @@
 """Media Agent 的光鸭连接状态与定时整理策略安全工具。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.organize_scheduler import OrganizeScheduler, get_organize_scheduler
@@ -65,11 +66,13 @@ def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
                 "connected": False,
                 "reachable": False,
             },
-            evidence=[Evidence(
-                "guangya_connection",
-                "连接状态检查未返回账号、Token、目录或原始错误。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "guangya_connection",
+                    "连接状态检查未返回账号、Token、目录或原始错误。",
+                    _now(),
+                )
+            ],
             suggestions=["可稍后重试，或到光鸭账号页重新校验连接。"],
         )
     finally:
@@ -85,11 +88,13 @@ def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
                 "connected": False,
                 "reachable": False,
             },
-            evidence=[Evidence(
-                "guangya_connection",
-                "仅检查本机是否已有光鸭凭据；未返回手机号、Token 或目录信息。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "guangya_connection",
+                    "仅检查本机是否已有光鸭凭据；未返回手机号、Token 或目录信息。",
+                    _now(),
+                )
+            ],
             suggestions=["请先在光鸭账号页完成短信验证连接。"],
         )
 
@@ -103,11 +108,13 @@ def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
                 "connected": True,
                 "reachable": True,
             },
-            evidence=[Evidence(
-                "guangya_connection",
-                "使用最小只读目录请求验证连接；未刷新或返回任何凭据。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "guangya_connection",
+                    "使用最小只读目录请求验证连接；未刷新或返回任何凭据。",
+                    _now(),
+                )
+            ],
             suggestions=[],
         )
 
@@ -120,11 +127,13 @@ def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
             "connected": False,
             "reachable": False,
         },
-        evidence=[Evidence(
-            "guangya_connection",
-            "最小只读连接验证未通过；未刷新或返回任何凭据与原始错误。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "guangya_connection",
+                "最小只读连接验证未通过；未刷新或返回任何凭据与原始错误。",
+                _now(),
+            )
+        ],
         suggestions=["请到光鸭账号页重新校验或重新连接账号。"],
     )
 
@@ -235,11 +244,13 @@ def summarize_guangya_organize_schedule_policy(
             "managed_by_environment": bool(managed),
             "managed_fields": _public_fields(managed),
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅返回光鸭定时整理的三项白名单策略、可运行状态与环境托管标记；未返回目录或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅返回光鸭定时整理的三项白名单策略、可运行状态与环境托管标记；未返回目录或凭据。",
+                _now(),
+            )
+        ],
         suggestions=[
             "修改策略需要先预检并使用一次性确认票据。",
             "策略修改只会重新安排后续整理，不会立即启动或中断整理任务。",
@@ -317,7 +328,9 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
     if current["cron"] != requested["cron"]:
         effects.append(f"将后续整理计划表达式改为 {requested['cron']}")
     if current["notify_enabled"] != requested["notify_enabled"]:
-        effects.append(f"{'开启' if requested['notify_enabled'] else '关闭'}光鸭整理通知")
+        effects.append(
+            f"{'开启' if requested['notify_enabled'] else '关闭'}光鸭整理通知"
+        )
     effects.append("刷新当前进程调度器，并按新策略重新计算下一次运行时间")
 
     suggestions = ["本次写入不会立即执行光鸭整理，也不会中断正在运行的任务。"]
@@ -341,11 +354,13 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
             "changed_fields": _public_fields(state["changed_keys"]),
             "effects": effects,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅比较光鸭定时整理白名单策略与配置快照；未返回其他配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅比较光鸭定时整理白名单策略与配置快照；未返回其他配置值。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -433,10 +448,12 @@ def set_guangya_organize_schedule_policy_confirmed(
             "runtime_refreshed": runtime_refreshed,
             "runtime_scope": "当前进程",
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "使用一次性确认票据与配置快照原子更新光鸭定时整理白名单策略。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "使用一次性确认票据与配置快照原子更新光鸭定时整理白名单策略。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

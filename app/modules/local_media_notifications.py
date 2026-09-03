@@ -1,11 +1,13 @@
 """本地媒体整理的结构化 Telegram 通知。只展示文件名，不泄露本地绝对路径。"""
+
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from app import config
 from app import database as db
-from app.agent.result_projection import sanitize_public_text
+from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from app.sensitive_data import redact_sensitive_text
@@ -32,12 +34,27 @@ def _safe_error_summary(value: object) -> str:
     raw = str(value or "").strip()
     normalized = raw.casefold()
     mappings = (
-        (("目标目录不存在", "归档目录不存在"), "目标归档目录不存在或不可访问，请检查媒体来源的归档路径。"),
-        (("permission denied", "权限不足", "不可写"), "目标目录权限不足，请检查容器挂载与读写权限。"),
-        (("源文件不存在", "no such file", "文件已不存在"), "源文件已不存在或已被其他任务移动，请重新扫描来源。"),
-        (("目标已存在", "移动冲突", "发生变化"), "文件状态或目标位置已变化，请重新预览后再整理。"),
+        (
+            ("目标目录不存在", "归档目录不存在"),
+            "目标归档目录不存在或不可访问，请检查媒体来源的归档路径。",
+        ),
+        (
+            ("permission denied", "权限不足", "不可写"),
+            "目标目录权限不足，请检查容器挂载与读写权限。",
+        ),
+        (
+            ("源文件不存在", "no such file", "文件已不存在"),
+            "源文件已不存在或已被其他任务移动，请重新扫描来源。",
+        ),
+        (
+            ("目标已存在", "移动冲突", "发生变化"),
+            "文件状态或目标位置已变化，请重新预览后再整理。",
+        ),
         (("tmdb",), "TMDB 识别或查询失败，请稍后重试或手动确认。"),
-        (("媒体库刷新", "jellyfin", "emby"), "媒体文件已处理，但媒体库刷新未完成，请检查媒体服务器连接。"),
+        (
+            ("媒体库刷新", "jellyfin", "emby"),
+            "媒体文件已处理，但媒体库刷新未完成，请检查媒体服务器连接。",
+        ),
     )
     for markers, message in mappings:
         if any(marker in normalized for marker in markers):
@@ -72,24 +89,38 @@ def build_local_media_event(
         deleted = list(_value(payload, "deleted_junk", []) or [])
         warnings = list(_value(payload, "warnings", []) or [])
         if not warnings and not result:
-            warnings = [item for item in str(getattr(task, "warning", "") or "").split("；") if item]
-        refresh_status = str(_value(payload, "media_refresh_status", "") or "").strip().lower()
+            warnings = [
+                item
+                for item in str(getattr(task, "warning", "") or "").split("；")
+                if item
+            ]
+        refresh_status = (
+            str(_value(payload, "media_refresh_status", "") or "").strip().lower()
+        )
         if not refresh_status:
-            refresh_status = "failed" if any("刷新失败" in item or "未刷新媒体库" in item for item in warnings) else "completed"
+            refresh_status = (
+                "failed"
+                if any(
+                    "刷新失败" in item or "未刷新媒体库" in item for item in warnings
+                )
+                else "completed"
+            )
         refresh_label = {
             "completed": "刷新完成 🎯",
             "queued": "已排队（合并刷新） ⏳",
             "failed": "刷新失败（需处理） ❌",
             "skipped": "未启用",
         }.get(refresh_status, "状态未知")
-        fields.extend((
+        fields.extend(
             (
-                "执行结果",
-                f"已移动 {len(moved)} · "
-                f"清理 {len(deleted)} 个确认垃圾文件 · 警告 {len(warnings)}",
-            ),
-            ("媒体库刷新", refresh_label),
-        ))
+                (
+                    "执行结果",
+                    f"已移动 {len(moved)} · "
+                    f"清理 {len(deleted)} 个确认垃圾文件 · 警告 {len(warnings)}",
+                ),
+                ("媒体库刷新", refresh_label),
+            )
+        )
         media = list(_value(payload, "media", []) or [])
         for item in media[:8]:
             title = str(_value(item, "title", "") or "未识别媒体")
@@ -110,12 +141,19 @@ def build_local_media_event(
         if refresh_status == "failed":
             title = "⚠️ 本地媒体整理部分完成"
         return NotificationEvent(
-            title, fields=tuple(fields), lines=tuple(lines), layout="relaxed",
+            title,
+            fields=tuple(fields),
+            lines=tuple(lines),
+            layout="relaxed",
         )
 
     preview = _value(payload, "preview", {})
     if status == "requires_manual":
-        reason = str(_value(preview, "reason", "") or getattr(task, "error", "") or "TMDB 结果需要人工确认")
+        reason = str(
+            _value(preview, "reason", "")
+            or getattr(task, "error", "")
+            or "TMDB 结果需要人工确认"
+        )
         candidate = _value(preview, "candidate", {})
         title = str(_value(candidate, "title", "") or "")
         year = str(_value(candidate, "year", "") or "")
@@ -166,15 +204,21 @@ def build_local_media_event(
     if status == "planned":
         fields.append(("处理状态", "预览已生成，尚未执行文件操作"))
         return NotificationEvent(
-            "ℹ️ 本地媒体预览完成", fields=tuple(fields), layout="relaxed",
+            "ℹ️ 本地媒体预览完成",
+            fields=tuple(fields),
+            layout="relaxed",
         )
 
-    fields.append((
-        "错误原因",
-        _safe_error_summary(error or getattr(task, "error", "")),
-    ))
+    fields.append(
+        (
+            "错误原因",
+            _safe_error_summary(error or getattr(task, "error", "")),
+        )
+    )
     return NotificationEvent(
-        "❌ 本地媒体整理失败", fields=tuple(fields), layout="relaxed",
+        "❌ 本地媒体整理失败",
+        fields=tuple(fields),
+        layout="relaxed",
     )
 
 
@@ -187,8 +231,9 @@ def notify_local_media_task(
     chat_id: str = "",
 ) -> bool:
     """读取任务上下文并发送通知；任务不存在时静默跳过。"""
-    if (not config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
-            or not config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)):
+    if not config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True) or not config.get_bool(
+        "GY_ORGANIZE_LIBRARY_NOTIFY", True
+    ):
         return False
     task = db.get_local_media_task(task_id, owner=owner)
     if task is None:
@@ -208,7 +253,8 @@ def notify_local_media_task(
         accepted = False
         for request in linked_requests:
             outcome = publish_download_lifecycle(
-                int(request["id"]), stats=result,
+                int(request["id"]),
+                stats=result,
             )
             accepted = bool(outcome) or accepted
         # 人工候选按钮必须独立保留；其余结果已合并到下载事务消息。
@@ -225,23 +271,28 @@ def notify_local_media_task(
 
     from app.modules.telegram_notification_center import publish_notification_thread
     from app.modules.telegram_notification_policy import (
-        NotificationImportance, NotificationTopic,
+        NotificationImportance,
+        NotificationTopic,
     )
 
     status = str((result or {}).get("status") or getattr(task, "status", ""))
     importance = (
-        NotificationImportance.ERROR if event.title.startswith(("❌", "⚠️")) else
-        NotificationImportance.ACTION if status == "requires_manual" else
-        NotificationImportance.RESULT
+        NotificationImportance.ERROR
+        if event.title.startswith(("❌", "⚠️"))
+        else NotificationImportance.ACTION
+        if status == "requires_manual"
+        else NotificationImportance.RESULT
     )
-    return bool(publish_notification_thread(
-        f"local-media:{int(task_id)}",
-        event,
-        topic=NotificationTopic.LOCAL_MEDIA,
-        importance=importance,
-        chat_id=chat_id,
-        topic_enabled=(
-            config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
-            and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)
-        ),
-    ))
+    return bool(
+        publish_notification_thread(
+            f"local-media:{int(task_id)}",
+            event,
+            topic=NotificationTopic.LOCAL_MEDIA,
+            importance=importance,
+            chat_id=chat_id,
+            topic_enabled=(
+                config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
+                and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)
+            ),
+        )
+    )

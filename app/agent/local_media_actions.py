@@ -1,12 +1,13 @@
 """本地媒体来源、任务与调度器的安全只读诊断。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.local_media_scheduler import peek_local_media_scheduler_status
 
@@ -76,11 +77,13 @@ def diagnose_local_media(_arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="暂时无法读取本地媒体状态",
             data=_empty_data(),
-            evidence=[Evidence(
-                "local_media_database",
-                "尝试读取本地媒体数据库与进程状态；未扫描媒体文件系统，也未访问下载器或外部服务。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "local_media_database",
+                    "尝试读取本地媒体数据库与进程状态；未扫描媒体文件系统，也未访问下载器或外部服务。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查本地数据库与服务进程状态后重试。"],
             error="本地媒体诊断当前不可用。",
         )
@@ -116,14 +119,18 @@ def diagnose_local_media(_arguments: dict[str, Any]) -> ToolResult:
         "running": bool(runtime.get("running")) if isinstance(runtime, dict) else False,
         "interval_seconds": max(
             0.0,
-            float(runtime.get("interval_seconds") or 0.0) if isinstance(runtime, dict) else 0.0,
+            float(runtime.get("interval_seconds") or 0.0)
+            if isinstance(runtime, dict)
+            else 0.0,
         ),
     }
     categories = {
         "requires_manual": tasks["requires_manual"],
         "failed": tasks["failed"],
         "enabled_sources_without_targets": sources["enabled_without_targets"],
-        "scheduler_not_running": int(bool(sources["enabled"] and not scheduler["running"])),
+        "scheduler_not_running": int(
+            bool(sources["enabled"] and not scheduler["running"])
+        ),
     }
     attention_total = sum(categories.values())
 
@@ -169,11 +176,13 @@ def diagnose_local_media(_arguments: dict[str, Any]) -> ToolResult:
             "scheduler": scheduler,
             "attention": {"total": attention_total, "categories": categories},
         },
-        evidence=[Evidence(
-            "local_media_database",
-            "读取本地媒体安全聚合与进程内调度状态；未扫描媒体文件系统，未访问下载器、TMDB 或外部服务，也未启动任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "local_media_database",
+                "读取本地媒体安全聚合与进程内调度状态；未扫描媒体文件系统，未访问下载器、TMDB 或外部服务，也未启动任务。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -213,8 +222,7 @@ def _fixed_triggers(raw: Any) -> dict[str, int]:
         "manual": _count(source.get("manual")),
     }
     known["unknown"] = sum(
-        _count(value) for key, value in source.items()
-        if str(key) not in known
+        _count(value) for key, value in source.items() if str(key) not in known
     )
     return known
 
@@ -265,7 +273,9 @@ def summarize_local_media_review_queue(_arguments: dict[str, Any]) -> ToolResult
         ok = True
     suggestions: list[str] = []
     if age_buckets["over_7d"]:
-        suggestions.append(f"其中有 {age_buckets['over_7d']} 项已等待超过 7 天，建议优先处理。")
+        suggestions.append(
+            f"其中有 {age_buckets['over_7d']} 项已等待超过 7 天，建议优先处理。"
+        )
     elif age_buckets["1d_to_7d"]:
         suggestions.append(f"其中有 {age_buckets['1d_to_7d']} 项已等待 1 到 7 天。")
     return ToolResult(
@@ -318,7 +328,9 @@ def summarize_local_media_history(_arguments: dict[str, Any]) -> ToolResult:
     failed = by_status["failed"]
     if failed:
         status = "attention"
-        summary = f"本地媒体历史中有 {failed} 项失败，已完成 {by_status['completed']} 项"
+        summary = (
+            f"本地媒体历史中有 {failed} 项失败，已完成 {by_status['completed']} 项"
+        )
         ok = False
     elif total:
         status = "healthy"
@@ -342,6 +354,7 @@ def summarize_local_media_history(_arguments: dict[str, Any]) -> ToolResult:
         evidence=[_summary_evidence("终态历史")],
         suggestions=(
             ["可查看最近整理失败摘要，确认失败集中在本地整理还是光鸭整理。"]
-            if failed else []
+            if failed
+            else []
         ),
     )

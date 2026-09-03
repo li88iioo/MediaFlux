@@ -10,6 +10,7 @@
 
 启动条件：配置 TG_BOT_TOKEN。未配置则不启动，仅日志提示。
 """
+
 from __future__ import annotations
 
 import hmac
@@ -29,7 +30,6 @@ from app.notifier import (
     render_event,
     send_event_result,
 )
-
 
 logger = get_logger(__name__)
 
@@ -53,11 +53,11 @@ _local_organize_running = False
 _ORGANIZE_LIFECYCLE_WAIT_SECONDS = 30 * 60
 
 
-
-
 def _organize_group_progress(task_state: dict) -> tuple[int, int, str, str]:
     """读取组级进度投影，返回 (当前序号, 总数, 组名, 阶段)。"""
-    progress = task_state.get("group_progress") if isinstance(task_state, dict) else None
+    progress = (
+        task_state.get("group_progress") if isinstance(task_state, dict) else None
+    )
     if not isinstance(progress, dict):
         return 0, 0, "", ""
     try:
@@ -89,10 +89,15 @@ def _organize_group_progress_line(task_state: dict) -> str:
 def _organize_task_active() -> bool:
     try:
         from app.modules.organize_tasks import get_organize_manager
-        return get_organize_manager().task_status().get("status") in {"running", "stopping"}
+
+        return get_organize_manager().task_status().get("status") in {
+            "running",
+            "stopping",
+        }
     except Exception as exc:
         logger.warning("读取整理任务互斥状态失败 type=%s", type(exc).__name__)
         return True
+
 
 def _authorized(chat_id) -> bool:
     configured = get("TG_CHAT_ID", "").strip()
@@ -104,7 +109,9 @@ def _configuration_complete() -> bool:
 
 
 def _reject_unauthorized(bot, msg_or_call) -> bool:
-    chat = getattr(getattr(msg_or_call, "message", None), "chat", None) or getattr(msg_or_call, "chat", None)
+    chat = getattr(getattr(msg_or_call, "message", None), "chat", None) or getattr(
+        msg_or_call, "chat", None
+    )
     chat_id = getattr(chat, "id", "")
     if _authorized(chat_id):
         return False
@@ -160,10 +167,14 @@ def _reject_unauthorized_resource_search(bot, msg_or_call) -> bool:
 
     if telegram_user_is_allowed(user_id):
         return False
-    logger.warning("拒绝未授权 Telegram 群组资源搜索: chat=%s user=%s", chat_id, user_id)
+    logger.warning(
+        "拒绝未授权 Telegram 群组资源搜索: chat=%s user=%s", chat_id, user_id
+    )
     try:
         if getattr(msg_or_call, "id", None):
-            bot.answer_callback_query(msg_or_call.id, "你无权在此群组使用资源搜索", show_alert=True)
+            bot.answer_callback_query(
+                msg_or_call.id, "你无权在此群组使用资源搜索", show_alert=True
+            )
         else:
             bot.reply_to(msg_or_call, "你无权在此群组使用资源搜索")
     except Exception:
@@ -221,10 +232,12 @@ def _organize_scope_markup(
         actions=[(decision, value) for _label, decision, value in choices],
     )
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
-    markup.add(*[
-        telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{action_id}")
-        for (label, _decision, _value), action_id in zip(choices, action_ids)
-    ])
+    markup.add(
+        *[
+            telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{action_id}")
+            for (label, _decision, _value), action_id in zip(choices, action_ids)
+        ]
+    )
     return markup
 
 
@@ -235,7 +248,9 @@ _SHARE_DIR_PAGE_SIZE = 8
 def _telegram_identity(message_or_call) -> tuple[str, str]:
     message = getattr(message_or_call, "message", None) or message_or_call
     chat = getattr(message, "chat", None)
-    user = getattr(message_or_call, "from_user", None) or getattr(message, "from_user", None)
+    user = getattr(message_or_call, "from_user", None) or getattr(
+        message, "from_user", None
+    )
     return str(getattr(chat, "id", "")), str(getattr(user, "id", ""))
 
 
@@ -246,8 +261,14 @@ _RESOURCE_TARGET_TITLE_LIMIT = 180
 
 
 def _resource_action_button(
-    telebot, store, session_id: str, chat_id: str, user_id: str,
-    text: str, kind: str, value=None,
+    telebot,
+    store,
+    session_id: str,
+    chat_id: str,
+    user_id: str,
+    text: str,
+    kind: str,
+    value=None,
 ):
     action_id = store.create_action(session_id, chat_id, user_id, kind, value)
     return telebot.types.InlineKeyboardButton(text, callback_data=f"mrs:{action_id}")
@@ -271,14 +292,14 @@ def _write_confirmation_markup(
         telebot.types.InlineKeyboardButton(
             "确认执行", callback_data=f"tgc:{confirm_id}"
         ),
-        telebot.types.InlineKeyboardButton(
-            "取消", callback_data=f"tgc:{cancel_id}"
-        ),
+        telebot.types.InlineKeyboardButton("取消", callback_data=f"tgc:{cancel_id}"),
     )
     return markup
 
 
-def _edit_write_confirmation_message(bot, message, title: str, detail: str = "") -> bool:
+def _edit_write_confirmation_message(
+    bot, message, title: str, detail: str = ""
+) -> bool:
     """原位封口旧命令确认卡，明确移除一次性按钮。"""
     edit = getattr(bot, "edit_message_text", None)
     chat_id = getattr(getattr(message, "chat", None), "id", None)
@@ -318,15 +339,17 @@ def _truncate_resource_text(value, limit: int, *, fallback: str = "") -> str:
     text = _resource_plain_text(value, fallback=fallback)
     if len(text) <= limit:
         return text
-    return text[:max(1, limit - 1)].rstrip() + "…"
+    return text[: max(1, limit - 1)].rstrip() + "…"
 
 
 def _resource_item_meta(item: dict, *, include_site: bool = True) -> str:
     parts = []
     if include_site:
-        parts.append(_resource_plain_text(
-            item.get("site_name") or item.get("site_id"), fallback="未知站点"
-        ))
+        parts.append(
+            _resource_plain_text(
+                item.get("site_name") or item.get("site_id"), fallback="未知站点"
+            )
+        )
     if item.get("size_text"):
         parts.append(_resource_plain_text(item["size_text"]))
     if item.get("seeders") is not None:
@@ -338,8 +361,14 @@ def _resource_item_meta(item: dict, *, include_site: bool = True) -> str:
 
 
 def _resource_search_view(
-    telebot, session_id: str, *, chat_id: str, user_id: str,
-    site_id: str = "", page: int = 0, store=None,
+    telebot,
+    session_id: str,
+    *,
+    chat_id: str,
+    user_id: str,
+    site_id: str = "",
+    page: int = 0,
+    store=None,
 ):
     from app.modules.telegram_resource_search import get_telegram_resource_search_store
 
@@ -348,19 +377,24 @@ def _resource_search_view(
     all_items = list(snapshot["items"])
     selected_site = str(site_id or "")
     items = [
-        item for item in all_items
+        item
+        for item in all_items
         if not selected_site or str(item.get("site_id") or "") == selected_site
     ]
     pages = max(1, (len(items) + _RESOURCE_PAGE_SIZE - 1) // _RESOURCE_PAGE_SIZE)
     page = max(0, min(int(page), pages - 1))
     start = page * _RESOURCE_PAGE_SIZE
-    visible = items[start:start + _RESOURCE_PAGE_SIZE]
+    visible = items[start : start + _RESOURCE_PAGE_SIZE]
 
     site_names = {
-        str(site.get("site_id") or ""): str(site.get("site_name") or site.get("site_id") or "")
+        str(site.get("site_id") or ""): str(
+            site.get("site_name") or site.get("site_id") or ""
+        )
         for site in snapshot["sites"]
     }
-    scope_name = site_names.get(selected_site, "全部站点") if selected_site else "全部站点"
+    scope_name = (
+        site_names.get(selected_site, "全部站点") if selected_site else "全部站点"
+    )
     query = html.escape(_resource_plain_text(snapshot["query"], fallback="未命名媒体"))
     scope = html.escape(_resource_plain_text(scope_name, fallback="全部站点"))
     lines = [
@@ -370,68 +404,111 @@ def _resource_search_view(
     if visible:
         lines.append("")
         for offset, item in enumerate(visible, start=start + 1):
-            title = html.escape(_truncate_resource_text(
-                item.get("title"), _RESOURCE_TITLE_LIMIT, fallback="未命名资源"
-            ))
+            title = html.escape(
+                _truncate_resource_text(
+                    item.get("title"), _RESOURCE_TITLE_LIMIT, fallback="未命名资源"
+                )
+            )
             lines.append(f"<b>{offset}. {title}</b>")
             lines.append(html.escape(_resource_item_meta(item, include_site=False)))
     else:
         lines.extend(["", "当前站点没有匹配资源。"])
 
     failures = [
-        site for site in snapshot["sites"]
-        if str(site.get("status") or "") == "error"
+        site for site in snapshot["sites"] if str(site.get("status") or "") == "error"
     ]
     if failures:
         lines.append("")
         lines.append("<b>站点状态</b>")
         for site in failures:
-            name = html.escape(str(site.get("site_name") or site.get("site_id") or "站点"))
+            name = html.escape(
+                str(site.get("site_name") or site.get("site_id") or "站点")
+            )
             reason = html.escape(str(site.get("message") or "检索失败"))
             lines.append(f"{name}：{reason}")
 
     markup = telebot.types.InlineKeyboardMarkup(row_width=3)
     source_buttons = [
         _resource_action_button(
-            telebot, store, session_id, chat_id, user_id,
+            telebot,
+            store,
+            session_id,
+            chat_id,
+            user_id,
             f"{'✓ ' if not selected_site else ''}全部 {len(all_items)}",
-            "view", {"site_id": "", "page": 0},
+            "view",
+            {"site_id": "", "page": 0},
         )
     ]
     for site in snapshot["sites"]:
         sid = str(site.get("site_id") or "")
         if not sid:
             continue
-        suffix = " !" if site.get("status") == "error" else f" {int(site.get('count') or 0)}"
+        suffix = (
+            " !" if site.get("status") == "error" else f" {int(site.get('count') or 0)}"
+        )
         label = f"{'✓ ' if sid == selected_site else ''}{site.get('site_name') or sid}{suffix}"
-        source_buttons.append(_resource_action_button(
-            telebot, store, session_id, chat_id, user_id, label[:32],
-            "view", {"site_id": sid, "page": 0},
-        ))
+        source_buttons.append(
+            _resource_action_button(
+                telebot,
+                store,
+                session_id,
+                chat_id,
+                user_id,
+                label[:32],
+                "view",
+                {"site_id": sid, "page": 0},
+            )
+        )
     markup.add(*source_buttons)
 
     for offset, item in enumerate(visible, start=start + 1):
         compact = _truncate_resource_text(
             item.get("title"), _RESOURCE_BUTTON_TITLE_LIMIT, fallback="未命名资源"
         )
-        markup.add(_resource_action_button(
-            telebot, store, session_id, chat_id, user_id, f"{offset}. {compact}",
-            "item", {
-                "result_id": str(item.get("result_id") or ""),
-                "site_id": selected_site, "page": page,
-            },
-        ))
+        markup.add(
+            _resource_action_button(
+                telebot,
+                store,
+                session_id,
+                chat_id,
+                user_id,
+                f"{offset}. {compact}",
+                "item",
+                {
+                    "result_id": str(item.get("result_id") or ""),
+                    "site_id": selected_site,
+                    "page": page,
+                },
+            )
+        )
     nav = []
     if page > 0:
-        nav.append(_resource_action_button(
-            telebot, store, session_id, chat_id, user_id, "上一页",
-            "view", {"site_id": selected_site, "page": page - 1},
-        ))
+        nav.append(
+            _resource_action_button(
+                telebot,
+                store,
+                session_id,
+                chat_id,
+                user_id,
+                "上一页",
+                "view",
+                {"site_id": selected_site, "page": page - 1},
+            )
+        )
     if page + 1 < pages:
-        nav.append(_resource_action_button(
-            telebot, store, session_id, chat_id, user_id, "下一页",
-            "view", {"site_id": selected_site, "page": page + 1},
-        ))
+        nav.append(
+            _resource_action_button(
+                telebot,
+                store,
+                session_id,
+                chat_id,
+                user_id,
+                "下一页",
+                "view",
+                {"site_id": selected_site, "page": page + 1},
+            )
+        )
     if nav:
         markup.add(*nav)
     if pages > 1:
@@ -440,45 +517,87 @@ def _resource_search_view(
 
 
 def _resource_target_view(
-    telebot, session_id: str, result_id: str, *, chat_id: str, user_id: str,
-    site_id: str = "", page: int = 0, store=None,
+    telebot,
+    session_id: str,
+    result_id: str,
+    *,
+    chat_id: str,
+    user_id: str,
+    site_id: str = "",
+    page: int = 0,
+    store=None,
 ):
     from app.modules.telegram_resource_search import get_telegram_resource_search_store
 
     store = store or get_telegram_resource_search_store()
     snapshot = store.snapshot(session_id, chat_id, user_id)
-    item = next((item for item in snapshot["items"] if item.get("result_id") == result_id), None)
+    item = next(
+        (item for item in snapshot["items"] if item.get("result_id") == result_id), None
+    )
     if item is None:
         raise ValueError("资源结果已失效")
-    title = html.escape(_truncate_resource_text(
-        item.get("title"), _RESOURCE_TARGET_TITLE_LIMIT, fallback="未命名资源"
-    ))
-    text = (
-        "<b>选择下载目标</b>\n"
-        f"{title}\n"
-        f"{html.escape(_resource_item_meta(item))}"
+    title = html.escape(
+        _truncate_resource_text(
+            item.get("title"), _RESOURCE_TARGET_TITLE_LIMIT, fallback="未命名资源"
+        )
     )
+    text = f"<b>选择下载目标</b>\n{title}\n{html.escape(_resource_item_meta(item))}"
     markup = telebot.types.InlineKeyboardMarkup(row_width=3)
-    for label, target in (("qBittorrent", "qb"), ("光鸭云盘", "guangya"), ("全部", "both")):
-        markup.add(_resource_action_button(
-            telebot, store, session_id, chat_id, user_id, label,
-            "download", {"result_id": result_id, "target": target},
-        ))
-    markup.add(_resource_action_button(
-        telebot, store, session_id, chat_id, user_id, "返回资源列表",
-        "view", {"site_id": site_id, "page": page},
-    ))
+    for label, target in (
+        ("qBittorrent", "qb"),
+        ("光鸭云盘", "guangya"),
+        ("全部", "both"),
+    ):
+        markup.add(
+            _resource_action_button(
+                telebot,
+                store,
+                session_id,
+                chat_id,
+                user_id,
+                label,
+                "download",
+                {"result_id": result_id, "target": target},
+            )
+        )
+    markup.add(
+        _resource_action_button(
+            telebot,
+            store,
+            session_id,
+            chat_id,
+            user_id,
+            "返回资源列表",
+            "view",
+            {"site_id": site_id, "page": page},
+        )
+    )
     return text, markup
 
 
-def _share_action_button(telebot, store, preview_id: str, chat_id: str, user_id: str,
-                         text: str, action: str, value=None):
+def _share_action_button(
+    telebot,
+    store,
+    preview_id: str,
+    chat_id: str,
+    user_id: str,
+    text: str,
+    action: str,
+    value=None,
+):
     action_id = store.create_action(preview_id, chat_id, user_id, action, value)
     return telebot.types.InlineKeyboardButton(text, callback_data=f"gys:{action_id}")
 
 
-def _share_selection_view(telebot, preview_id: str, *, chat_id: str, user_id: str = "",
-                          page: int = 0, store=None):
+def _share_selection_view(
+    telebot,
+    preview_id: str,
+    *,
+    chat_id: str,
+    user_id: str = "",
+    page: int = 0,
+    store=None,
+):
     """构建分享文件分页视图；callback 只携带 opaque action ID。"""
     from app.modules.share_transfer import get_share_transfer_store
 
@@ -491,38 +610,79 @@ def _share_selection_view(telebot, preview_id: str, *, chat_id: str, user_id: st
     start = page * _SHARE_PAGE_SIZE
     selected = set(snapshot["selected_ids"])
     markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-    for item in files[start:start + _SHARE_PAGE_SIZE]:
+    for item in files[start : start + _SHARE_PAGE_SIZE]:
         marker = "[x]" if item["id"] in selected else "[ ]"
         kind = "目录" if item.get("is_dir") else "文件"
         label = f"{marker} {kind}: {str(item['name'])[:42]}"
-        markup.add(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, label, "toggle",
-            {"file_id": item["id"], "page": page},
-        ))
+        markup.add(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                label,
+                "toggle",
+                {"file_id": item["id"], "page": page},
+            )
+        )
     nav = []
     if page > 0:
-        nav.append(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, "上一页", "files", page - 1,
-        ))
+        nav.append(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                "上一页",
+                "files",
+                page - 1,
+            )
+        )
     if page + 1 < pages:
-        nav.append(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, "下一页", "files", page + 1,
-        ))
+        nav.append(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                "下一页",
+                "files",
+                page + 1,
+            )
+        )
     if nav:
         markup.add(*nav)
     markup.add(
-        _share_action_button(telebot, store, preview_id, chat_id, user_id, "全选", "all", page),
-        _share_action_button(telebot, store, preview_id, chat_id, user_id, "全不选", "none", page),
+        _share_action_button(
+            telebot, store, preview_id, chat_id, user_id, "全选", "all", page
+        ),
+        _share_action_button(
+            telebot, store, preview_id, chat_id, user_id, "全不选", "none", page
+        ),
         row_width=2,
     )
-    markup.add(_share_action_button(
-        telebot, store, preview_id, chat_id, user_id,
-        f"目标目录: {snapshot['target_name']}", "target",
-        {"parent_id": "0", "parent_name": "根目录", "page": 0, "trail": []},
-    ))
     markup.add(
-        _share_action_button(telebot, store, preview_id, chat_id, user_id, "确认转存", "confirm"),
-        _share_action_button(telebot, store, preview_id, chat_id, user_id, "取消", "cancel"),
+        _share_action_button(
+            telebot,
+            store,
+            preview_id,
+            chat_id,
+            user_id,
+            f"目标目录: {snapshot['target_name']}",
+            "target",
+            {"parent_id": "0", "parent_name": "根目录", "page": 0, "trail": []},
+        )
+    )
+    markup.add(
+        _share_action_button(
+            telebot, store, preview_id, chat_id, user_id, "确认转存", "confirm"
+        ),
+        _share_action_button(
+            telebot, store, preview_id, chat_id, user_id, "取消", "cancel"
+        ),
         row_width=2,
     )
     text = (
@@ -535,9 +695,19 @@ def _share_selection_view(telebot, preview_id: str, *, chat_id: str, user_id: st
     return text, markup
 
 
-def _share_target_view(telebot, preview_id: str, *, chat_id: str, user_id: str = "",
-                       parent_id: str = "0", parent_name: str = "根目录", page: int = 0,
-                       trail=None, client=None, store=None):
+def _share_target_view(
+    telebot,
+    preview_id: str,
+    *,
+    chat_id: str,
+    user_id: str = "",
+    parent_id: str = "0",
+    parent_name: str = "根目录",
+    page: int = 0,
+    trail=None,
+    client=None,
+    store=None,
+):
     """构建光鸭目标目录选择器，目录 ID 仅保存在服务端 action store。"""
     from app.clients.guangya import GuangYaClient, close_guangya_client
     from app.modules.share_transfer import get_share_transfer_store
@@ -556,45 +726,122 @@ def _share_target_view(telebot, preview_id: str, *, chat_id: str, user_id: str =
     finally:
         if owns_client:
             close_guangya_client(client)
-    pages = max(1, (len(directories) + _SHARE_DIR_PAGE_SIZE - 1) // _SHARE_DIR_PAGE_SIZE)
+    pages = max(
+        1, (len(directories) + _SHARE_DIR_PAGE_SIZE - 1) // _SHARE_DIR_PAGE_SIZE
+    )
     page = max(0, min(int(page), pages - 1))
     trail = list(trail or [])
     markup = telebot.types.InlineKeyboardMarkup(row_width=1)
-    markup.add(_share_action_button(
-        telebot, store, preview_id, chat_id, user_id, "选择当前目录", "choose_target",
-        {"target_id": str(parent_id or "0"), "target_name": str(parent_name or "根目录")},
-    ))
-    start = page * _SHARE_DIR_PAGE_SIZE
-    for item in directories[start:start + _SHARE_DIR_PAGE_SIZE]:
-        markup.add(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, str(item.name)[:48], "target",
+    markup.add(
+        _share_action_button(
+            telebot,
+            store,
+            preview_id,
+            chat_id,
+            user_id,
+            "选择当前目录",
+            "choose_target",
             {
-                "parent_id": str(item.file_id), "parent_name": str(item.name), "page": 0,
-                "trail": trail + [{"id": str(parent_id or "0"), "name": str(parent_name or "根目录")}],
+                "target_id": str(parent_id or "0"),
+                "target_name": str(parent_name or "根目录"),
             },
-        ))
+        )
+    )
+    start = page * _SHARE_DIR_PAGE_SIZE
+    for item in directories[start : start + _SHARE_DIR_PAGE_SIZE]:
+        markup.add(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                str(item.name)[:48],
+                "target",
+                {
+                    "parent_id": str(item.file_id),
+                    "parent_name": str(item.name),
+                    "page": 0,
+                    "trail": trail
+                    + [
+                        {
+                            "id": str(parent_id or "0"),
+                            "name": str(parent_name or "根目录"),
+                        }
+                    ],
+                },
+            )
+        )
     nav = []
     if page > 0:
-        nav.append(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, "上一页", "target",
-            {"parent_id": str(parent_id), "parent_name": str(parent_name), "page": page - 1, "trail": trail},
-        ))
+        nav.append(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                "上一页",
+                "target",
+                {
+                    "parent_id": str(parent_id),
+                    "parent_name": str(parent_name),
+                    "page": page - 1,
+                    "trail": trail,
+                },
+            )
+        )
     if page + 1 < pages:
-        nav.append(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, "下一页", "target",
-            {"parent_id": str(parent_id), "parent_name": str(parent_name), "page": page + 1, "trail": trail},
-        ))
+        nav.append(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                "下一页",
+                "target",
+                {
+                    "parent_id": str(parent_id),
+                    "parent_name": str(parent_name),
+                    "page": page + 1,
+                    "trail": trail,
+                },
+            )
+        )
     if nav:
         markup.add(*nav)
     if trail:
         previous = trail[-1]
-        markup.add(_share_action_button(
-            telebot, store, preview_id, chat_id, user_id, "上级目录", "target",
-            {"parent_id": previous["id"], "parent_name": previous["name"], "page": 0, "trail": trail[:-1]},
-        ))
-    markup.add(_share_action_button(
-        telebot, store, preview_id, chat_id, user_id, "返回文件选择", "files", 0,
-    ))
+        markup.add(
+            _share_action_button(
+                telebot,
+                store,
+                preview_id,
+                chat_id,
+                user_id,
+                "上级目录",
+                "target",
+                {
+                    "parent_id": previous["id"],
+                    "parent_name": previous["name"],
+                    "page": 0,
+                    "trail": trail[:-1],
+                },
+            )
+        )
+    markup.add(
+        _share_action_button(
+            telebot,
+            store,
+            preview_id,
+            chat_id,
+            user_id,
+            "返回文件选择",
+            "files",
+            0,
+        )
+    )
     text = (
         "<b>选择目标目录</b>\n"
         f"目标目录: {html.escape(str(parent_name or '根目录'))}\n"
@@ -678,6 +925,7 @@ def init_bot(stop_event: threading.Event | None = None):
                 _progress_recovery_stop = recovery_stop
 
                 if operation_ids:
+
                     def recover_progress() -> None:
                         recovered = _recover_stale_progress_until_delivered(
                             bot,
@@ -735,9 +983,7 @@ def _start_sync_gy(bot, telebot, source_message) -> bool:
             sync_label,
             source_message=source_message,
             timeout_seconds=4 * 60 * 60,
-        ).begin(
-            "<b>正在完整同步光鸭 STRM</b>\n正在并发扫描全部云端目录并比对本地索引…"
-        )
+        ).begin("<b>正在完整同步光鸭 STRM</b>\n正在并发扫描全部云端目录并比对本地索引…")
         threading.Thread(
             target=_do_sync,
             args=(source_message.chat.id, progress, "full"),
@@ -814,8 +1060,7 @@ def _start_organize_local(bot, telebot, source_message) -> bool:
     if not _configured_local_organize_sources():
         bot.reply_to(
             source_message,
-            "没有可整理的本地来源\n"
-            "请先配置本地下载路径和至少一个媒体库归档目标。",
+            "没有可整理的本地来源\n请先配置本地下载路径和至少一个媒体库归档目标。",
         )
         return False
     if _maintenance_task_busy():
@@ -1023,6 +1268,7 @@ def _register_commands(bot, telebot):
             if _reject_unauthorized(bot, msg):
                 return None
             return handler(msg, *args, **kwargs)
+
         return wrapped
 
     def require_write_auth(handler):
@@ -1030,6 +1276,7 @@ def _register_commands(bot, telebot):
             if _reject_unauthorized_group_write(bot, msg):
                 return None
             return handler(msg, *args, **kwargs)
+
         return wrapped
 
     @bot.message_handler(commands=["help"])
@@ -1058,10 +1305,7 @@ def _register_commands(bot, telebot):
         if _telegram_agent_available():
             agent_lines.append("/agent_reset — 重置 Agent 会话")
         sections.append("\n".join(agent_lines))
-        sections.append(
-            "<b>运行状态</b>\n"
-            "/status — 查看整理、同步与待处理状态"
-        )
+        sections.append("<b>运行状态</b>\n/status — 查看整理、同步与待处理状态")
         bot.reply_to(msg, "\n\n".join(sections))
 
     @bot.message_handler(commands=["status"])
@@ -1123,7 +1367,9 @@ def _register_commands(bot, telebot):
 
     def start_resource_search(msg):
         text = str(getattr(msg, "text", "") or "").strip()
-        query = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+        query = (
+            text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+        )
         if not query:
             bot.reply_to(
                 msg,
@@ -1238,6 +1484,7 @@ def _register_commands(bot, telebot):
     @require_auth
     def cmd_rss(msg):
         from app import database as db
+
         rows = db.list_rss_subscriptions()
         if not rows:
             bot.reply_to(msg, "暂无 RSS 订阅项\n\n请在控制台「RSS 订阅」页添加订阅源")
@@ -1246,7 +1493,9 @@ def _register_commands(bot, telebot):
         for r in rows:
             enabled = "启用" if r["enabled"] else "停用"
             action = "自动下载" if r["action"] == "download" else "手动"
-            lines.append(f"[{enabled}] <b>#{r['id']} {html.escape(str(r['name']))}</b> [{action}]")
+            lines.append(
+                f"[{enabled}] <b>#{r['id']} {html.escape(str(r['name']))}</b> [{action}]"
+            )
         lines.append("\n/rss_refresh ID - 刷新订阅\n/rss_dl ID - 下载条目")
         bot.reply_to(msg, "\n".join(lines))
 
@@ -1390,10 +1639,14 @@ def _register_commands(bot, telebot):
             actions=[(decision, value) for _label, decision, value in choices],
         )
         keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
-        keyboard.add(*[
-            telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{action_id}")
-            for (label, _decision, _value), action_id in zip(choices, action_ids)
-        ])
+        keyboard.add(
+            *[
+                telebot.types.InlineKeyboardButton(
+                    label, callback_data=f"tgc:{action_id}"
+                )
+                for (label, _decision, _value), action_id in zip(choices, action_ids)
+            ]
+        )
         bot.reply_to(
             msg,
             "<b>选择下载目标</b>\n"
@@ -1437,7 +1690,10 @@ def _register_commands(bot, telebot):
             bot.reply_to(msg, "暂不支持该文件，仅可发送 .torrent 种子文件")
             return
         try:
-            from app.modules.download_dispatcher import create_request, torrent_download_input
+            from app.modules.download_dispatcher import (
+                create_request,
+                torrent_download_input,
+            )
 
             send_typing(
                 bot,
@@ -1457,7 +1713,10 @@ def _register_commands(bot, telebot):
             if not request["created"]:
                 if reissue_pending_picker(msg, request, item.title):
                     return
-                bot.reply_to(msg, f"该种子已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）")
+                bot.reply_to(
+                    msg,
+                    f"该种子已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）",
+                )
                 return
             send_target_picker(msg, request["id"], item.title)
         except ValueError as exc:
@@ -1467,11 +1726,19 @@ def _register_commands(bot, telebot):
             logger.error("Telegram 种子解析失败 type=%s", type(exc).__name__)
             bot.reply_to(msg, "种子文件处理失败，请确认文件完整后重试")
 
-    @bot.message_handler(func=lambda msg: bool(getattr(msg, "text", "")) and not msg.text.startswith("/"), content_types=["text"])
+    @bot.message_handler(
+        func=lambda msg: (
+            bool(getattr(msg, "text", "")) and not msg.text.startswith("/")
+        ),
+        content_types=["text"],
+    )
     @require_auth
     def receive_link(msg):
         from app.modules.download_dispatcher import (
-            create_request, extract_download_url, normalize_download_url, route_download_url,
+            create_request,
+            extract_download_url,
+            normalize_download_url,
+            route_download_url,
         )
 
         url = extract_download_url(msg.text)
@@ -1508,7 +1775,10 @@ def _register_commands(bot, telebot):
             if not request["created"]:
                 if reissue_pending_picker(msg, request, item.title):
                     return
-                bot.reply_to(msg, f"该任务已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）")
+                bot.reply_to(
+                    msg,
+                    f"该任务已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）",
+                )
                 return
             send_target_picker(msg, request["id"], item.title)
         except ValueError as exc:
@@ -1518,13 +1788,17 @@ def _register_commands(bot, telebot):
             logger.warning("Telegram 链接处理失败 (%s)", type(exc).__name__)
             bot.reply_to(msg, "链接处理失败，请检查链接后重试")
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("tgc:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("tgc:")
+    )
     def choose_write_confirmation(call):
         if _reject_unauthorized_group_write(bot, call):
             return
         _handle_write_confirmation_callback(bot, call, telebot)
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("aga:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("agk:")
+    )
     def choose_agent_action(call):
         if _reject_unauthorized(bot, call):
             return
@@ -1532,7 +1806,9 @@ def _register_commands(bot, telebot):
 
         handle_agent_callback(bot, call, telebot)
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("agp:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("agp:")
+    )
     def choose_agent_patrol_action(call):
         if _reject_unauthorized(bot, call):
             return
@@ -1540,25 +1816,33 @@ def _register_commands(bot, telebot):
 
         handle_agent_patrol_callback(bot, call, telebot)
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("gys:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("gys:")
+    )
     def choose_share_transfer(call):
         if _reject_unauthorized_group_write(bot, call):
             return
         _handle_share_callback(bot, call, telebot)
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("orgc:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("orgc:")
+    )
     def choose_organize_candidate(call):
         if _reject_unauthorized_group_write(bot, call):
             return
         _handle_organize_confirmation_callback(bot, call)
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("mrs:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("mrs:")
+    )
     def choose_media_resource(call):
         if _reject_unauthorized_resource_search(bot, call):
             return
         _handle_resource_search_callback(bot, call, telebot)
 
-    @bot.callback_query_handler(func=lambda call: str(getattr(call, "data", "")).startswith("dl:"))
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("dl:")
+    )
     def choose_download_target(call):
         if _reject_unauthorized_group_write(bot, call):
             return
@@ -1643,10 +1927,12 @@ def _run_rss_download(bot, msg, eid: int, progress: TelegramProgress | None) -> 
 
         result = RSSEngine().download(eid)
         if result.get("review_required"):
-            detail = html.escape(str(
-                result.get("error")
-                or "提交结果待核对，请先检查下载器状态，勿直接重复提交"
-            ))
+            detail = html.escape(
+                str(
+                    result.get("error")
+                    or "提交结果待核对，请先检查下载器状态，勿直接重复提交"
+                )
+            )
             text = f"<b>RSS 下载结果待核对</b>\n{detail}"
         elif result.get("error"):
             text = f"<b>RSS 下载提交失败</b>\n{html.escape(str(result['error']))}"
@@ -1662,7 +1948,6 @@ def _run_rss_download(bot, msg, eid: int, progress: TelegramProgress | None) -> 
         progress.finish(text)
     else:
         bot.reply_to(msg, text)
-
 
 
 def _run_telegram_resource_search(
@@ -1685,7 +1970,11 @@ def _run_telegram_resource_search(
             sites=list(result.get("sites") or []),
         )
         text, markup = _resource_search_view(
-            telebot, session_id, chat_id=chat_id, user_id=user_id, store=store,
+            telebot,
+            session_id,
+            chat_id=chat_id,
+            user_id=user_id,
+            store=store,
         )
         if progress is not None:
             progress.finish(text, reply_markup=markup)
@@ -1719,13 +2008,20 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
         value = action.get("value") if isinstance(action.get("value"), dict) else {}
         if kind == "view":
             text, markup = _resource_search_view(
-                telebot, session_id, chat_id=chat_id, user_id=user_id,
+                telebot,
+                session_id,
+                chat_id=chat_id,
+                user_id=user_id,
                 site_id=str(value.get("site_id") or ""),
-                page=int(value.get("page") or 0), store=store,
+                page=int(value.get("page") or 0),
+                store=store,
             )
             bot.answer_callback_query(call.id, "已切换资源范围")
             bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id, reply_markup=markup,
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
             )
             return
         if kind == "item":
@@ -1733,13 +2029,21 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
             if not result_id:
                 raise TelegramResourceSearchError("资源结果已失效，请重新搜索")
             text, markup = _resource_target_view(
-                telebot, session_id, result_id, chat_id=chat_id, user_id=user_id,
+                telebot,
+                session_id,
+                result_id,
+                chat_id=chat_id,
+                user_id=user_id,
                 site_id=str(value.get("site_id") or ""),
-                page=int(value.get("page") or 0), store=store,
+                page=int(value.get("page") or 0),
+                store=store,
             )
             bot.answer_callback_query(call.id, "请选择下载目标")
             bot.edit_message_text(
-                text, call.message.chat.id, call.message.message_id, reply_markup=markup,
+                text,
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=markup,
             )
             return
         if kind == "download":
@@ -1789,7 +2093,6 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
         bot.answer_callback_query(call.id, "操作失败，请重新搜索", show_alert=True)
 
 
-
 def _handle_write_confirmation_callback(bot, call, telebot) -> None:
     from app.modules.telegram_write_confirmations import (
         TelegramWriteConfirmationError,
@@ -1823,7 +2126,10 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             )
             if row is None:
                 _edit_write_confirmation_message(
-                    bot, call.message, "下载请求已失效", "该请求已处理或不属于当前会话。"
+                    bot,
+                    call.message,
+                    "下载请求已失效",
+                    "该请求已处理或不属于当前会话。",
                 )
                 bot.answer_callback_query(
                     call.id,
@@ -1906,7 +2212,10 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             bot.answer_callback_query(call.id, "已确认，开始完整同步")
             if not _start_sync_gy(bot, telebot, call.message):
                 _edit_write_confirmation_message(
-                    bot, call.message, "STRM 同步未启动", "请根据提示检查配置或稍后重试。"
+                    bot,
+                    call.message,
+                    "STRM 同步未启动",
+                    "请根据提示检查配置或稍后重试。",
                 )
             return
         if operation == "organize":
@@ -1925,7 +2234,10 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             bot.answer_callback_query(call.id, f"已确认，开始{labels[scope]}")
             if not starter(bot, telebot, call.message):
                 _edit_write_confirmation_message(
-                    bot, call.message, f"{labels[scope]}未启动", "请根据提示检查配置或稍后重试。"
+                    bot,
+                    call.message,
+                    f"{labels[scope]}未启动",
+                    "请根据提示检查配置或稍后重试。",
                 )
             return
         if operation == "resource_download":
@@ -2081,19 +2393,25 @@ def _dispatch_resource_download(
             text += "\n" + _download_follow_up_text(succeeded_items)
             get_download_tracker().reload()
         else:
-            text = "下载提交失败\n" + html.escape(str(result.get("error") or "请检查下载器配置"))
+            text = "下载提交失败\n" + html.escape(
+                str(result.get("error") or "请检查下载器配置")
+            )
         bot.edit_message_text(text, chat_id, message_id, reply_markup=None)
     except Exception as exc:
         logger.warning("Telegram 资源站下载失败 type=%s", type(exc).__name__)
         try:
-            bot.edit_message_text("下载处理失败，请稍后重试", chat_id, message_id, reply_markup=None)
+            bot.edit_message_text(
+                "下载处理失败，请稍后重试", chat_id, message_id, reply_markup=None
+            )
         except Exception:
             pass
 
 
 def _handle_organize_confirmation_callback(bot, call) -> None:
     from app.modules.organize_confirmations import (
-        cancel_confirmation, skip_confirmation, start_confirmation,
+        cancel_confirmation,
+        skip_confirmation,
+        start_confirmation,
     )
 
     chat_id, _user_id = _telegram_identity(call)
@@ -2135,9 +2453,7 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         external_id_raw = str(candidate.get("external_id") or tmdb_id_raw).strip()
         if not provider and tmdb_id_raw:
             provider = "tmdb"
-        title = str(
-            candidate.get("title") or external_id_raw or "候选媒体"
-        )
+        title = str(candidate.get("title") or external_id_raw or "候选媒体")
         year = str(candidate.get("year") or "")
         external_id = external_id_raw
         display = f"{title} ({year})" if year else title
@@ -2153,20 +2469,26 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         else:
             status_text = (
                 f"等待执行 · 前方 {queue_position} 项"
-                if queue_position else "等待执行 · 等待当前整理完成"
+                if queue_position
+                else "等待执行 · 等待当前整理完成"
             )
             callback_text = "该任务已在队列中" if replayed else "已加入整理队列"
         bot.answer_callback_query(call.id, callback_text)
         media_type = str(result.get("media_type") or candidate.get("media_type") or "")
         media_label = (
-            "成人内容" if provider in {"metatube", "clean_title"}
-            else "剧集" if media_type == "tv" else "电影"
+            "成人内容"
+            if provider in {"metatube", "clean_title"}
+            else "剧集"
+            if media_type == "tv"
+            else "电影"
         )
         scope_summary = str(result.get("scope_summary") or "")
         source_name = str(result.get("source_name") or result.get("directory") or "")
         identity_label = (
-            "MetaTube" if provider == "metatube"
-            else "清洗标题" if provider == "clean_title"
+            "MetaTube"
+            if provider == "metatube"
+            else "清洗标题"
+            if provider == "clean_title"
             else "TMDB"
         )
         detail_fields: list[tuple[object, object]] = [
@@ -2180,37 +2502,39 @@ def _handle_organize_confirmation_callback(bot, call) -> None:
         ]
         if source_name:
             detail_fields.append(("存储来源", source_name))
-        detail_fields.extend((
-            NOTIFICATION_SECTION_BREAK,
-            ("队列", str(result.get("task_id") or "")),
-            ("处理状态", status_text),
-        ))
+        detail_fields.extend(
+            (
+                NOTIFICATION_SECTION_BREAK,
+                ("队列", str(result.get("task_id") or "")),
+                ("处理状态", status_text),
+            )
+        )
         bot.edit_message_text(
-            render_event(NotificationEvent(
-                f"✅ 已选择：{display}",
-                fields=tuple(detail_fields),
-                footer="可以继续选择其他待确认媒体，系统会按点击顺序串行整理。",
-                layout="relaxed",
-            )),
+            render_event(
+                NotificationEvent(
+                    f"✅ 已选择：{display}",
+                    fields=tuple(detail_fields),
+                    footer="可以继续选择其他待确认媒体，系统会按点击顺序串行整理。",
+                    layout="relaxed",
+                )
+            ),
             call.message.chat.id,
             call.message.message_id,
             reply_markup=None,
         )
     except (TypeError, ValueError) as exc:
-        bot.answer_callback_query(
-            call.id, str(exc or "确认参数无效"), show_alert=True
-        )
+        bot.answer_callback_query(call.id, str(exc or "确认参数无效"), show_alert=True)
     except Exception as exc:
-        logger.warning(
-            "Telegram 整理候选处理失败 type=%s", type(exc).__name__
-        )
+        logger.warning("Telegram 整理候选处理失败 type=%s", type(exc).__name__)
         bot.answer_callback_query(
             call.id, "确认整理提交失败，请稍后重试", show_alert=True
         )
 
+
 def _inspect_telegram_share(bot, msg, share_url: str, telebot) -> None:
     from app.modules.share_transfer import (
-        get_share_transfer_store, inspect_share_for_transfer,
+        get_share_transfer_store,
+        inspect_share_for_transfer,
     )
 
     chat_id, user_id = _telegram_identity(msg)
@@ -2222,7 +2546,10 @@ def _inspect_telegram_share(bot, msg, share_url: str, telebot) -> None:
             store=get_share_transfer_store(),
         )
         text, markup = _share_selection_view(
-            telebot, preview["preview_id"], chat_id=chat_id, user_id=user_id,
+            telebot,
+            preview["preview_id"],
+            chat_id=chat_id,
+            user_id=user_id,
             store=get_share_transfer_store(),
         )
         bot.reply_to(msg, text, reply_markup=markup)
@@ -2264,33 +2591,54 @@ def _handle_share_callback(bot, call, telebot) -> None:
             store.toggle(preview_id, str(value.get("file_id") or ""), chat_id, user_id)
             page = int(value.get("page") or 0)
             text, markup = _share_selection_view(
-                telebot, preview_id, chat_id=chat_id, user_id=user_id, page=page, store=store,
+                telebot,
+                preview_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                page=page,
+                store=store,
             )
         elif action == "all":
             store.select_all(preview_id, chat_id, user_id)
             text, markup = _share_selection_view(
-                telebot, preview_id, chat_id=chat_id, user_id=user_id,
-                page=int(value or 0), store=store,
+                telebot,
+                preview_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                page=int(value or 0),
+                store=store,
             )
         elif action == "none":
             store.select_none(preview_id, chat_id, user_id)
             text, markup = _share_selection_view(
-                telebot, preview_id, chat_id=chat_id, user_id=user_id,
-                page=int(value or 0), store=store,
+                telebot,
+                preview_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                page=int(value or 0),
+                store=store,
             )
         elif action == "files":
             text, markup = _share_selection_view(
-                telebot, preview_id, chat_id=chat_id, user_id=user_id,
-                page=int(value or 0), store=store,
+                telebot,
+                preview_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                page=int(value or 0),
+                store=store,
             )
         elif action == "target":
             value = value if isinstance(value, dict) else {}
             text, markup = _share_target_view(
-                telebot, preview_id, chat_id=chat_id, user_id=user_id,
+                telebot,
+                preview_id,
+                chat_id=chat_id,
+                user_id=user_id,
                 parent_id=str(value.get("parent_id") or "0"),
                 parent_name=str(value.get("parent_name") or "根目录"),
                 page=int(value.get("page") or 0),
-                trail=value.get("trail") or [], store=store,
+                trail=value.get("trail") or [],
+                store=store,
             )
         elif action == "choose_target":
             value = value if isinstance(value, dict) else {}
@@ -2298,30 +2646,48 @@ def _handle_share_callback(bot, call, telebot) -> None:
                 preview_id,
                 str(value.get("target_id") or "0"),
                 str(value.get("target_name") or "根目录"),
-                chat_id, user_id,
+                chat_id,
+                user_id,
             )
             text, markup = _share_selection_view(
-                telebot, preview_id, chat_id=chat_id, user_id=user_id, store=store,
+                telebot,
+                preview_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                store=store,
             )
         elif action == "confirm":
             snapshot = store.snapshot(preview_id, chat_id, user_id)
             selected_ids = list(snapshot["selected_ids"])
             locked = store.consume(
-                preview_id, chat_id, user_id, selected_ids=selected_ids,
-                target_id=snapshot["target_id"], target_name=snapshot["target_name"],
+                preview_id,
+                chat_id,
+                user_id,
+                selected_ids=selected_ids,
+                target_id=snapshot["target_id"],
+                target_name=snapshot["target_name"],
             )
             bot.answer_callback_query(call.id, "正在转存")
             _edit_share_message(
-                bot, call,
+                bot,
+                call,
                 f"正在转存 {len(locked.selected_ids)} 项到 {html.escape(locked.target_name)}",
             )
             threading.Thread(
                 target=_dispatch_share_transfer_callback,
                 args=(
-                    bot, call.message.chat.id, call.message.message_id, preview_id,
-                    selected_ids, locked.target_id, locked.target_name, chat_id, user_id,
+                    bot,
+                    call.message.chat.id,
+                    call.message.message_id,
+                    preview_id,
+                    selected_ids,
+                    locked.target_id,
+                    locked.target_name,
+                    chat_id,
+                    user_id,
                 ),
-                name=f"tg-share-{preview_id[:8]}", daemon=True,
+                name=f"tg-share-{preview_id[:8]}",
+                daemon=True,
             ).start()
             return
         else:
@@ -2329,10 +2695,14 @@ def _handle_share_callback(bot, call, telebot) -> None:
         bot.answer_callback_query(call.id)
         _edit_share_message(bot, call, text, markup)
     except (TypeError, ValueError) as exc:
-        bot.answer_callback_query(call.id, str(exc) or "操作已过期或无效", show_alert=True)
+        bot.answer_callback_query(
+            call.id, str(exc) or "操作已过期或无效", show_alert=True
+        )
     except Exception as exc:
         logger.warning("Telegram 光鸭分享操作失败 (%s)", type(exc).__name__)
-        bot.answer_callback_query(call.id, "操作失败，请重新解析分享链接", show_alert=True)
+        bot.answer_callback_query(
+            call.id, "操作失败，请重新解析分享链接", show_alert=True
+        )
 
 
 def _dispatch_share_transfer_callback(
@@ -2346,13 +2716,22 @@ def _dispatch_share_transfer_callback(
     owner_chat_id: str,
     owner_user_id: str,
 ) -> None:
-    from app.modules.share_transfer import create_share_request, get_share_transfer_store
+    from app.modules.share_transfer import (
+        create_share_request,
+        get_share_transfer_store,
+    )
 
     try:
         result = create_share_request(
-            preview_id, selected_ids, target_id, owner_chat_id,
-            user_id=owner_user_id, target_name=target_name, origin="telegram",
-            tracker_chat_id=str(message_chat_id), store=get_share_transfer_store(),
+            preview_id,
+            selected_ids,
+            target_id,
+            owner_chat_id,
+            user_id=owner_user_id,
+            target_name=target_name,
+            origin="telegram",
+            tracker_chat_id=str(message_chat_id),
+            store=get_share_transfer_store(),
         )
         if result.get("duplicate") and result.get("accepted"):
             text = (
@@ -2374,12 +2753,16 @@ def _dispatch_share_transfer_callback(
             else:
                 text += "\n当前配置不触发后续整理链。"
         else:
-            text = "光鸭分享转存失败\n" + html.escape(str(result.get("error") or "请稍后查看任务状态"))
+            text = "光鸭分享转存失败\n" + html.escape(
+                str(result.get("error") or "请稍后查看任务状态")
+            )
         bot.edit_message_text(text, message_chat_id, message_id)
     except Exception as exc:
         logger.warning("Telegram 光鸭分享转存提交失败 (%s)", type(exc).__name__)
         try:
-            bot.edit_message_text("光鸭分享转存失败，请稍后查看任务状态", message_chat_id, message_id)
+            bot.edit_message_text(
+                "光鸭分享转存失败，请稍后查看任务状态", message_chat_id, message_id
+            )
         except Exception:
             pass
 
@@ -2395,13 +2778,19 @@ def _download_follow_up_text(succeeded: list[str]) -> str:
     if "qb" in succeeded:
         enabled = bool(db.list_local_media_sources(owner="admin", enabled_only=True))
         if enabled:
-            follow_up.append("qBittorrent 任务完成后将按本地媒体来源执行识别、移动和媒体库刷新。")
+            follow_up.append(
+                "qBittorrent 任务完成后将按本地媒体来源执行识别、移动和媒体库刷新。"
+            )
         else:
-            follow_up.append("qBittorrent 任务完成后仅通知状态；当前没有启用的本地媒体来源。")
+            follow_up.append(
+                "qBittorrent 任务完成后仅通知状态；当前没有启用的本地媒体来源。"
+            )
     return "\n".join(follow_up)
 
 
-def _dispatch_download_callback(bot, chat_id, message_id, request_id: int, target: str) -> None:
+def _dispatch_download_callback(
+    bot, chat_id, message_id, request_id: int, target: str
+) -> None:
     try:
         from app.modules.download_dispatcher import dispatch_request
         from app.modules.download_tracker import get_download_tracker
@@ -2411,8 +2800,12 @@ def _dispatch_download_callback(bot, chat_id, message_id, request_id: int, targe
             labels = {"qb": "qBittorrent", "guangya": "光鸭云盘"}
             succeeded_items = list(result.get("succeeded") or [])
             succeeded = "、".join(labels.get(item, item) for item in succeeded_items)
-            failed = "、".join(labels.get(item, item) for item in result.get("failed", []))
-            text = f"<b>下载任务已提交</b>\n请求: #{request_id}\n成功: {succeeded or '无'}"
+            failed = "、".join(
+                labels.get(item, item) for item in result.get("failed", [])
+            )
+            text = (
+                f"<b>下载任务已提交</b>\n请求: #{request_id}\n成功: {succeeded or '无'}"
+            )
             if failed:
                 text += f"\n失败: {failed}\n{html.escape(result.get('error') or '')}"
             text += "\n" + _download_follow_up_text(succeeded_items)
@@ -2421,7 +2814,8 @@ def _dispatch_download_callback(bot, chat_id, message_id, request_id: int, targe
         else:
             bot.edit_message_text(
                 f"下载提交失败\n{html.escape(result.get('error') or '未知错误')}",
-                chat_id, message_id,
+                chat_id,
+                message_id,
                 reply_markup=None,
             )
     except Exception as exc:
@@ -2433,7 +2827,9 @@ def _dispatch_download_callback(bot, chat_id, message_id, request_id: int, targe
         try:
             bot.edit_message_text(
                 "下载提交异常，请检查下载器连接与任务配置后重试",
-                chat_id, message_id, reply_markup=None,
+                chat_id,
+                message_id,
+                reply_markup=None,
             )
         except Exception:
             pass
@@ -2446,14 +2842,23 @@ def _make_strm_progress_editor(bot, chat_id, progress_handle):
     edits = 0
     seen_stages: set[str] = set()
     labels = {
-        "scan": "扫描云端目录", "generate": "生成 STRM", "metadata": "同步元数据",
-        "cleanup": "清理索引", "refresh": "刷新媒体库", "complete": "完成",
-        "failed": "失败", "retry": "重试失败项",
+        "scan": "扫描云端目录",
+        "generate": "生成 STRM",
+        "metadata": "同步元数据",
+        "cleanup": "清理索引",
+        "refresh": "刷新媒体库",
+        "complete": "完成",
+        "failed": "失败",
+        "retry": "重试失败项",
     }
 
     def update(stage, completed, total, detail):
         nonlocal edits
-        if not progress_handle or edits >= _MAX_STRM_PROGRESS_EDITS or stage in seen_stages:
+        if (
+            not progress_handle
+            or edits >= _MAX_STRM_PROGRESS_EDITS
+            or stage in seen_stages
+        ):
             return
         seen_stages.add(str(stage))
         bounded_total = max(1, int(total or 0))
@@ -2468,6 +2873,7 @@ def _make_strm_progress_editor(bot, chat_id, progress_handle):
             edits += 1
         except Exception as exc:
             logger.warning("Telegram STRM 进度编辑失败 type=%s", type(exc).__name__)
+
     return update
 
 
@@ -2493,7 +2899,9 @@ def _strm_cleanup_text(stats: dict) -> str:
     )
 
 
-def _strm_result_status(stats: dict, *, partial: bool = False, stopped: bool = False) -> str:
+def _strm_result_status(
+    stats: dict, *, partial: bool = False, stopped: bool = False
+) -> str:
     if stopped or stats.get("stopped"):
         return "⏹️ 同步已停止"
     if (
@@ -2566,9 +2974,7 @@ def _strm_summary_event(
     source_overview = ""
     if sources:
         visible_sources = sources[:12]
-        source_lines = [
-            _strm_source_report_line(source) for source in visible_sources
-        ]
+        source_lines = [_strm_source_report_line(source) for source in visible_sources]
         omitted = len(sources) - len(visible_sources)
         if omitted:
             source_lines.append(
@@ -2576,10 +2982,13 @@ def _strm_summary_event(
             )
         source_overview = "\n".join(source_lines)
     if stats.get("clean_skipped"):
-        lines.append("部分来源检测到扫描或一致性异常；为避免误删，已跳过对应来源的失效清理。")
+        lines.append(
+            "部分来源检测到扫描或一致性异常；为避免误删，已跳过对应来源的失效清理。"
+        )
 
     removed_changes = sum(
-        1 for item in (stats.get("changes") or [])
+        1
+        for item in (stats.get("changes") or [])
         if isinstance(item, dict)
         and str(item.get("action") or "") in {"removed", "removed_dir"}
     )
@@ -2643,7 +3052,10 @@ def _do_sync(chat_id, progress_handle=None, sync_mode: str = "full"):
     global _sync_running
     try:
         from app.modules.scheduler import get_scheduler
-        progress = _make_strm_progress_editor(_bot or get_bot(), str(chat_id), progress_handle)
+
+        progress = _make_strm_progress_editor(
+            _bot or get_bot(), str(chat_id), progress_handle
+        )
         result = get_scheduler().run_blocking(
             "telegram", on_progress=progress, sync_mode=sync_mode
         )
@@ -2660,14 +3072,13 @@ def _do_sync(chat_id, progress_handle=None, sync_mode: str = "full"):
                     )
             stats = result["stats"]
             source_results = [
-                source for source in (result.get("sources") or [])
+                source
+                for source in (result.get("sources") or [])
                 if isinstance(source, dict)
             ]
             _deliver_strm_terminal(
                 chat_id,
-                _strm_summary_event(
-                    result, stats, len(source_results), source_results
-                ),
+                _strm_summary_event(result, stats, len(source_results), source_results),
                 progress_handle,
             )
         else:
@@ -2765,12 +3176,13 @@ def _finish_organize_progress_when_lifecycle_settles(
 
 
 def _await_organize_lifecycle(
-    chat_id: object, state: dict, progress: TelegramProgress,
+    chat_id: object,
+    state: dict,
+    progress: TelegramProgress,
 ) -> None:
     """整理后台线程继续等待完整链路，避免进度与互斥状态过早结束。"""
     progress.update(
-        "<b>光鸭整理已完成，正在收尾</b>\n"
-        "结果卡已生成，正在等待 STRM 与媒体库状态回写…"
+        "<b>光鸭整理已完成，正在收尾</b>\n结果卡已生成，正在等待 STRM 与媒体库状态回写…"
     )
     _finish_organize_progress_when_lifecycle_settles(chat_id, state, progress)
 
@@ -2857,7 +3269,11 @@ def _run_guangya_organize_stage(
             if group_total
             else f"{status}:{current}:{state.get('message', '')}"
         )
-        if progress is not None and marker != last_state and status in {"running", "stopping"}:
+        if (
+            progress is not None
+            and marker != last_state
+            and status in {"running", "stopping"}
+        ):
             current_line = f"\n当前：{html.escape(current)}" if current else ""
             group_line = ""
             if group_total:
@@ -2895,8 +3311,12 @@ def _run_local_organize_stage(
     task_ids = [int(item) for item in (scan_result.get("task_ids") or [])]
     last_marker = ""
     while task_ids:
-        tasks = [db.get_local_media_task(task_id, owner="admin") for task_id in task_ids]
-        statuses = [str(task.status) if task is not None else "failed" for task in tasks]
+        tasks = [
+            db.get_local_media_task(task_id, owner="admin") for task_id in task_ids
+        ]
+        statuses = [
+            str(task.status) if task is not None else "failed" for task in tasks
+        ]
         active = sum(
             status not in {"completed", "failed", "requires_manual"}
             for status in statuses
@@ -2944,7 +3364,7 @@ def _run_local_organize_stage(
                 else:
                     moved_items += 1
     source_errors = [
-        f"{str(item.get('name') or '未命名来源')}：{str(item.get('error') or '')}"
+        f"{item.get('name') or '未命名来源'!s}：{item.get('error') or ''!s}"
         for item in (scan_result.get("sources") or [])
         if isinstance(item, dict) and str(item.get("error") or "")
     ]
@@ -2966,9 +3386,7 @@ def _local_organize_event(summary: dict) -> NotificationEvent:
         or int(summary.get("failed", 0) or 0)
         or summary.get("source_errors")
     )
-    lines = [
-        f"• {message}" for message in list(summary.get("source_errors") or [])[:5]
-    ]
+    lines = [f"• {message}" for message in list(summary.get("source_errors") or [])[:5]]
     if not int(summary.get("candidate_count", 0) or 0):
         lines.append("下载目录中暂未发现可整理的媒体候选。")
     return NotificationEvent(
@@ -2998,14 +3416,17 @@ def _local_organize_event(summary: dict) -> NotificationEvent:
         footer=(
             "本地待确认项目将继续发送候选卡；若未收到，"
             "请前往 Web「本地媒体 → 待确认」处理。"
-            if int(summary.get("requires_manual", 0) or 0) else ""
+            if int(summary.get("requires_manual", 0) or 0)
+            else ""
         ),
     )
 
 
 def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationEvent:
     cloud_status = str(cloud_state.get("status") or "failed")
-    cloud_stats = cloud_state.get("stats") if isinstance(cloud_state.get("stats"), dict) else {}
+    cloud_stats = (
+        cloud_state.get("stats") if isinstance(cloud_state.get("stats"), dict) else {}
+    )
     cloud_need_confirm = int(cloud_stats.get("need_confirm", 0) or 0)
     cloud_failed = int(cloud_stats.get("failed", 0) or 0)
     cloud_skipped = int(cloud_stats.get("skipped", 0) or 0)
@@ -3024,15 +3445,16 @@ def _all_organize_event(cloud_state: dict, local_summary: dict) -> NotificationE
     if cloud_error:
         lines.append(f"光鸭：{cloud_error[:300]}")
     lines.extend(
-        f"本地：{message}" for message in list(local_summary.get("source_errors") or [])[:4]
+        f"本地：{message}"
+        for message in list(local_summary.get("source_errors") or [])[:4]
     )
     strm = cloud_stats.get("strm") if isinstance(cloud_stats.get("strm"), dict) else {}
     strm_text = "未触发"
     if strm:
-        strm_text = "已触发" if strm.get("ok") else str(strm.get("error") or "未完成")[:120]
-    strm_attention = bool(
-        strm and not strm.get("ok") and not strm.get("skipped")
-    )
+        strm_text = (
+            "已触发" if strm.get("ok") else str(strm.get("error") or "未完成")[:120]
+        )
+    strm_attention = bool(strm and not strm.get("ok") and not strm.get("skipped"))
     attention = bool(
         cloud_status != "completed"
         or cloud_need_confirm
@@ -3101,12 +3523,16 @@ def _notify_local_organize_confirmations(summary: dict, chat_id: object) -> int:
         if not isinstance(result, dict):
             result = {"status": "requires_manual"}
         try:
-            delivered += int(bool(notify_local_media_task(
-                task_id,
-                result,
-                owner="admin",
-                chat_id=str(chat_id),
-            )))
+            delivered += int(
+                bool(
+                    notify_local_media_task(
+                        task_id,
+                        result,
+                        owner="admin",
+                        chat_id=str(chat_id),
+                    )
+                )
+            )
         except Exception as exc:
             logger.warning(
                 "Telegram 本地整理待确认通知失败 task=%s type=%s",
@@ -3157,10 +3583,12 @@ def _do_organize(
             send_event_result(
                 NotificationEvent(
                     "整理失败",
-                    fields=((
-                        "错误原因",
-                        str(state.get("error") or "任务未能正常启动"),
-                    ),),
+                    fields=(
+                        (
+                            "错误原因",
+                            str(state.get("error") or "任务未能正常启动"),
+                        ),
+                    ),
                     layout="relaxed",
                 ),
                 chat_id=str(chat_id),
@@ -3251,7 +3679,7 @@ def _do_organize_all(
         )
         if cloud_stats.get("confirmation_groups"):
             try:
-                from app.modules.organize import OrganizeRules, Organizer
+                from app.modules.organize import Organizer, OrganizeRules
 
                 Organizer.notify_task_confirmations(
                     cloud_stats,
@@ -3303,8 +3731,11 @@ def start_bot_blocking(stop_event: threading.Event | None = None):
                 logger.warning("TG Bot polling 意外结束，准备自动重连")
         except Exception as exc:
             log_throttled(
-                logger, logging.ERROR, f"tg-bot-polling:{type(exc).__name__}",
-                "TG Bot polling 异常退出 type=%s，将自动重连", type(exc).__name__,
+                logger,
+                logging.ERROR,
+                f"tg-bot-polling:{type(exc).__name__}",
+                "TG Bot polling 异常退出 type=%s，将自动重连",
+                type(exc).__name__,
             )
         if effective_stop.wait(delay):
             break
@@ -3364,7 +3795,9 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
             if cancel_operations:
                 from app.bot.progress import cancel_active_operations
 
-                cancel_active_operations("服务正在停止，本次操作已结束；启动完成后可重新发起。")
+                cancel_active_operations(
+                    "服务正在停止，本次操作已结束；启动完成后可重新发起。"
+                )
         except Exception as exc:
             logger.warning("收尾 Telegram 长任务失败 type=%s", type(exc).__name__)
     try:
@@ -3409,7 +3842,9 @@ def _stop_bot_locked(timeout: float = 5.0, *, cancel_operations: bool = True) ->
             # 重新创建终态重投/恢复 generation，不能只依赖对象 identity。
             _registered_bot_id = None
     try:
-        from app.modules.telegram_resource_search import shutdown_telegram_indexer_worker
+        from app.modules.telegram_resource_search import (
+            shutdown_telegram_indexer_worker,
+        )
 
         shutdown_telegram_indexer_worker(timeout=timeout)
     except Exception as exc:

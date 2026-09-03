@@ -1,10 +1,12 @@
 """Media Agent 的结构化模型与安全响应协议。"""
+
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from functools import wraps
-from typing import Any, Callable
+from typing import Any
 
 
 class RiskLevel(str, Enum):
@@ -14,13 +16,6 @@ class RiskLevel(str, Enum):
     LOW_WRITE = "low_write"
     WRITE = "write"
     DANGER = "danger"
-
-
-class LLMToolDisposition(str, Enum):
-    """LLM 选中工具后，服务端允许采取的唯一动作。"""
-
-    EXECUTE_READ = "execute_read"
-    PREPARE_CONFIRMATION = "prepare_confirmation"
 
 
 @dataclass(frozen=True)
@@ -42,6 +37,7 @@ class ToolResult:
     evidence: list[Evidence] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     error: str = ""
+    model_data: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -53,6 +49,13 @@ class ToolResult:
             "suggestions": list(self.suggestions),
             "error": self.error,
         }
+
+    def to_model_dict(self) -> dict[str, Any]:
+        """返回供模型继续规划的紧凑 DTO；公开结果仍使用 ``to_dict``。"""
+        value = self.to_dict()
+        if self.model_data is not None:
+            value["data"] = self.model_data
+        return value
 
 
 ArgumentsValidator = Callable[[dict[str, Any]], dict[str, Any]]
@@ -71,9 +74,10 @@ class ToolContext:
 
 
 ContextualToolHandler = Callable[[dict[str, Any], ToolContext], ToolResult]
-ConfirmationFollowupResolver = Callable[[ToolContext], dict[str, Any]]
 ContextFreeConfirmedToolHandler = Callable[[dict[str, Any], str], ToolResult]
-ContextualConfirmedToolHandler = Callable[[dict[str, Any], str, ToolContext], ToolResult]
+ContextualConfirmedToolHandler = Callable[
+    [dict[str, Any], str, ToolContext], ToolResult
+]
 ContextFreeConfirmationPreparer = Callable[[dict[str, Any]], tuple[ToolResult, str]]
 ContextualConfirmationPreparer = Callable[
     [dict[str, Any], ToolContext], tuple[ToolResult, str]
@@ -82,6 +86,8 @@ ContextualConfirmationPreparer = Callable[
 
 @dataclass(frozen=True, kw_only=True)
 class ToolSpec:
+    """领域 action 的原子能力声明；由 Kernel 适配为统一工具契约。"""
+
     name: str
     description: str
     risk: RiskLevel
@@ -93,33 +99,14 @@ class ToolSpec:
     context_confirmation_preparer: ContextualConfirmationPreparer | None = None
     context_confirmed_handler: ContextualConfirmedToolHandler | None = None
     post_write_verifier: PostWriteVerifier | None = None
-    # LLM 能力声明必须跟随工具本身，避免路由器维护另一份易漂移白名单。
-    # 这些字段只控制“模型可见性”，不会改变风险等级或绕过确认门。
-    llm_read: bool = False
-    llm_read_plan: bool = False
-    llm_confirmation: bool = False
-    native_alias: str = ""
-    # 只读预览可声明唯一的确认型续接工具。该字段只生成“准备行动计划”入口，
-    # 不会执行写操作；最终写入仍必须消费一次性确认票据。
-    confirmation_followup: str = ""
-    # 少数预览（如 Provider 写计划）需要从 owner/session 私有状态恢复
-    # 不透明参数；解析器只生成目标工具参数，仍会经过目标 validator 与确认门。
-    confirmation_followup_resolver: ConfirmationFollowupResolver | None = None
-    # 结果的主展示语义跟随工具定义，避免编排器和消息渠道维护工具名白名单。
-    result_presentation: str = "narrative"
-    stages_resource_candidates: bool = False
-    # 领域能力语义只参与模型候选召回与执行展示，不授予任何工具权限。
-    llm_domains: tuple[str, ...] = ()
-    llm_source_kind: str = "system_state"
-    llm_evidence_role: str = "primary"
-    llm_freshness: str = "snapshot"
-    llm_parallel_safe: bool = True
-    # 多阶段能力只需在工具注册处声明一次工作流关系。路由器仅补齐模型
-    # 所选阶段之前的必要步骤，不自动暴露后续写阶段，也不维护自然语言合同。
-    llm_workflow: str = ""
-    llm_workflow_stage: int = 0
-    # 只用于模型候选召回与能力说明，不参与权限、风险、确认或限流判定。
-    llm_examples: tuple[str, ...] = ()
+    model_name: str = ""
+    related_tools: tuple[str, ...] = ()
+    domains: tuple[str, ...] = ()
+    source_kind: str = "system_state"
+    freshness: str = "snapshot"
+    workflow: str = ""
+    workflow_stage: int = 0
+    examples: tuple[str, ...] = ()
 
     @staticmethod
     def context_free_confirmation_preparer(
@@ -129,7 +116,8 @@ class ToolSpec:
 
         @wraps(handler)
         def adapted(
-            arguments: dict[str, Any], _context: ToolContext,
+            arguments: dict[str, Any],
+            _context: ToolContext,
         ) -> tuple[ToolResult, str]:
             return handler(arguments)
 
@@ -159,24 +147,3 @@ class ToolSpec:
             "parameters": self.parameters,
             "requires_confirmation": self.requires_confirmation,
         }
-
-    def llm_capability_dict(self) -> dict[str, Any]:
-        capability = self.public_dict()
-        examples = [
-            str(item).strip()[:160]
-            for item in self.llm_examples[:6]
-            if str(item).strip()
-        ]
-        if examples:
-            capability["examples"] = examples
-        capability["semantics"] = {
-            "domains": list(self.llm_domains),
-            "source_kind": self.llm_source_kind,
-            "evidence_role": self.llm_evidence_role,
-            "freshness": self.llm_freshness,
-            "parallel_safe": self.llm_parallel_safe,
-            "workflow": self.llm_workflow,
-            "workflow_stage": self.llm_workflow_stage,
-            "confirmation_followup": self.confirmation_followup,
-        }
-        return capability

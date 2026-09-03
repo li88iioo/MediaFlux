@@ -1,4 +1,5 @@
 """RSS 条目的安全列表、确认标记与精确 qB 提交。"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -6,9 +7,9 @@ from typing import Any
 
 from app import database as db
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import sanitize_public_text
+from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -50,7 +51,9 @@ def rss_entry_summaries_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) - {"subscription_number", "status", "limit"}:
-        raise AgentToolError("rss.entry_summaries 只接受 subscription_number、status 和 limit")
+        raise AgentToolError(
+            "rss.entry_summaries 只接受 subscription_number、status 和 limit"
+        )
     status = str(arguments.get("status") or "pending").strip().casefold()
     limit = arguments.get("limit", 20)
     if status not in _ALLOWED_STATUSES:
@@ -67,7 +70,10 @@ def rss_entry_summaries_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def rss_mark_entries_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict) or set(arguments) != {"entry_numbers", "processed"}:
+    if not isinstance(arguments, dict) or set(arguments) != {
+        "entry_numbers",
+        "processed",
+    }:
         raise AgentToolError("必须且只能提供 entry_numbers 和 processed")
     if not isinstance(arguments["processed"], bool):
         raise AgentToolError("processed 必须是布尔值")
@@ -114,31 +120,44 @@ def list_rss_entry_summaries(arguments: dict[str, Any]) -> ToolResult:
     entries: list[dict[str, Any]] = []
     for row in rows:
         failure_code = str(row["failure_code"] or "")
-        entries.append({
-            "entry_number": int(row["id"]),
-            "subscription_number": int(row["rss_item_id"]),
-            "subscription_name": sanitize_public_text(row["sub_name"], limit=80) or "RSS 订阅",
-            "title": sanitize_public_text(row["title"], limit=180) or "未命名条目",
-            "status": str(row["status"] or "unknown"),
-            "processed": bool(row["processed"]),
-            "published_at": str(row["pub_date"] or ""),
-            "created_at": str(row["created_at"] or ""),
-            "season": row["media_season"],
-            "episode": row["media_episode"],
-            "skip_reason": sanitize_public_text(row["skip_reason"], limit=120),
-            "failure_code": _SAFE_FAILURE_LABELS.get(failure_code, "未分类失败") if failure_code else "",
-            "failure_retryable": bool(row["failure_retryable"]),
-        })
+        entries.append(
+            {
+                "entry_number": int(row["id"]),
+                "subscription_number": int(row["rss_item_id"]),
+                "subscription_name": sanitize_public_text(row["sub_name"], limit=80)
+                or "RSS 订阅",
+                "title": sanitize_public_text(row["title"], limit=180) or "未命名条目",
+                "status": str(row["status"] or "unknown"),
+                "processed": bool(row["processed"]),
+                "published_at": str(row["pub_date"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "season": row["media_season"],
+                "episode": row["media_episode"],
+                "skip_reason": sanitize_public_text(row["skip_reason"], limit=120),
+                "failure_code": _SAFE_FAILURE_LABELS.get(failure_code, "未分类失败")
+                if failure_code
+                else "",
+                "failure_retryable": bool(row["failure_retryable"]),
+            }
+        )
     return ToolResult(
         ok=True,
         status="completed" if entries else "empty",
-        summary=f"找到 {len(entries)} 个符合条件的 RSS 条目" if entries else "没有符合条件的 RSS 条目",
-        data={"entries": entries, "entry_count": len(entries), "limits": {"max_items": 50}},
-        evidence=[Evidence(
-            "sqlite:rss_entries",
-            "仅返回公开条目编号、标题、状态和季集线索；未读取或返回 GUID、payload、下载 URL、路径或凭据。",
-            _now(),
-        )],
+        summary=f"找到 {len(entries)} 个符合条件的 RSS 条目"
+        if entries
+        else "没有符合条件的 RSS 条目",
+        data={
+            "entries": entries,
+            "entry_count": len(entries),
+            "limits": {"max_items": 50},
+        },
+        evidence=[
+            Evidence(
+                "sqlite:rss_entries",
+                "仅返回公开条目编号、标题、状态和季集线索；未读取或返回 GUID、payload、下载 URL、路径或凭据。",
+                _now(),
+            )
+        ],
     )
 
 
@@ -146,15 +165,26 @@ def _mark_snapshot(arguments: dict[str, Any]) -> dict[str, Any]:
     rows = _query_rows(arguments["entry_numbers"])
     by_id = {int(row["id"]): row for row in rows}
     requested = arguments["entry_numbers"]
-    eligible_statuses = {"pending", "failed", "skipped"} if arguments["processed"] else {"failed", "skipped"}
-    snapshot = [{
-        "id": item,
-        "status": str(by_id[item]["status"] or "") if item in by_id else "missing",
-        "processed": bool(by_id[item]["processed"]) if item in by_id else False,
-        "created_at": str(by_id[item]["created_at"] or "") if item in by_id else "",
-        "failure_code": str(by_id[item]["failure_code"] or "") if item in by_id else "",
-        "failure_retryable": bool(by_id[item]["failure_retryable"]) if item in by_id else False,
-    } for item in requested]
+    eligible_statuses = (
+        {"pending", "failed", "skipped"}
+        if arguments["processed"]
+        else {"failed", "skipped"}
+    )
+    snapshot = [
+        {
+            "id": item,
+            "status": str(by_id[item]["status"] or "") if item in by_id else "missing",
+            "processed": bool(by_id[item]["processed"]) if item in by_id else False,
+            "created_at": str(by_id[item]["created_at"] or "") if item in by_id else "",
+            "failure_code": str(by_id[item]["failure_code"] or "")
+            if item in by_id
+            else "",
+            "failure_retryable": bool(by_id[item]["failure_retryable"])
+            if item in by_id
+            else False,
+        }
+        for item in requested
+    ]
     eligible = all(item["status"] in eligible_statuses for item in snapshot)
     return {
         "snapshot": snapshot,
@@ -182,30 +212,44 @@ def prepare_mark_rss_entries(arguments: dict[str, Any]) -> tuple[ToolResult, str
         ok=True,
         status="confirmation_required",
         summary=f"确认后将把 {count} 个 RSS 条目标记为{label}",
-        data={"selected_count": count, "processed": arguments["processed"], "effects": [
-            "只更新本地 RSS 条目处理状态，不删除订阅、下载任务或文件。",
-            "正在提交或已经下载的条目不会被此动作覆盖。",
-        ]},
-        evidence=[Evidence("sqlite:rss_entries", "已只读冻结所选条目的当前状态。", _now())],
+        data={
+            "selected_count": count,
+            "processed": arguments["processed"],
+            "effects": [
+                "只更新本地 RSS 条目处理状态，不删除订阅、下载任务或文件。",
+                "正在提交或已经下载的条目不会被此动作覆盖。",
+            ],
+        },
+        evidence=[
+            Evidence("sqlite:rss_entries", "已只读冻结所选条目的当前状态。", _now())
+        ],
     ), state["fingerprint"]
 
 
-def mark_rss_entries_confirmed(arguments: dict[str, Any], expected_context: str) -> ToolResult:
+def mark_rss_entries_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
     state = _mark_snapshot(arguments)
     if not state["eligible"] or state["fingerprint"] != str(expected_context or ""):
-        raise AgentToolError("RSS 条目状态已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "RSS 条目状态已变化，请重新预检", code="confirmation_stale"
+        )
     updated = db.update_rss_entries_processed_snapshot(
         state["snapshot"], arguments["processed"]
     )
     if int(updated) != len(arguments["entry_numbers"]):
-        raise AgentToolError("RSS 条目标记发生并发冲突，请重新查看", code="confirmation_stale")
+        raise AgentToolError(
+            "RSS 条目标记发生并发冲突，请重新查看", code="confirmation_stale"
+        )
     label = "已处理" if arguments["processed"] else "未处理"
     return ToolResult(
         ok=True,
         status="completed",
         summary=f"已将 {updated} 个 RSS 条目标记为{label}",
         data={"affected": int(updated), "processed": arguments["processed"]},
-        evidence=[Evidence("sqlite:rss_entries", "已按确认时冻结的条目集合更新状态。", _now())],
+        evidence=[
+            Evidence("sqlite:rss_entries", "已按确认时冻结的条目集合更新状态。", _now())
+        ],
     )
 
 
@@ -218,15 +262,23 @@ def _submit_snapshot(arguments: dict[str, Any]) -> dict[str, Any]:
     entries: list[dict[str, Any]] = []
     for row in rows:
         method = str(row["download_method"] or "").strip().casefold() or default_method
-        if str(row["status"] or "") != "pending" or bool(row["processed"]) or method != "qb":
+        if (
+            str(row["status"] or "") != "pending"
+            or bool(row["processed"])
+            or method != "qb"
+        ):
             continue
-        entries.append({
-            "id": int(row["id"]), "rss_item_id": int(row["rss_item_id"]),
-            "title": str(row["title"] or ""), "payload": str(row["payload"] or ""),
-            "created_at": str(row["created_at"] or ""),
-            "download_method": str(row["download_method"] or ""),
-            "qb_save_path": str(row["qb_save_path"] or ""),
-        })
+        entries.append(
+            {
+                "id": int(row["id"]),
+                "rss_item_id": int(row["rss_item_id"]),
+                "title": str(row["title"] or ""),
+                "payload": str(row["payload"] or ""),
+                "created_at": str(row["created_at"] or ""),
+                "download_method": str(row["download_method"] or ""),
+                "qb_save_path": str(row["qb_save_path"] or ""),
+            }
+        )
     complete = len(entries) == len(arguments["entry_numbers"])
     fingerprint = _stable_hash(
         {
@@ -238,8 +290,11 @@ def _submit_snapshot(arguments: dict[str, Any]) -> dict[str, Any]:
         domain="rss-submit-entries-to-qb",
     )
     return {
-        "entries": entries, "runtime": runtime, "config_error": str(config_error or ""),
-        "complete": complete, "fingerprint": fingerprint,
+        "entries": entries,
+        "runtime": runtime,
+        "config_error": str(config_error or ""),
+        "complete": complete,
+        "fingerprint": fingerprint,
     }
 
 
@@ -265,22 +320,34 @@ def prepare_submit_rss_entries(arguments: dict[str, Any]) -> tuple[ToolResult, s
         ok=True,
         status="confirmation_required",
         summary=f"确认后将向 qBittorrent 提交指定的 {count} 个 RSS 条目",
-        data={"selected_count": count, "target": "qbittorrent", "effects": [
-            "所选条目将原子认领后提交到 qBittorrent。",
-            "提交结果未知的条目会进入人工核对状态，不会自动重复提交。",
-        ]},
-        evidence=[Evidence("sqlite:rss_entries", "已只读冻结精确条目集合和当前 qB 配置。", _now())],
+        data={
+            "selected_count": count,
+            "target": "qbittorrent",
+            "effects": [
+                "所选条目将原子认领后提交到 qBittorrent。",
+                "提交结果未知的条目会进入人工核对状态，不会自动重复提交。",
+            ],
+        },
+        evidence=[
+            Evidence(
+                "sqlite:rss_entries", "已只读冻结精确条目集合和当前 qB 配置。", _now()
+            )
+        ],
     ), state["fingerprint"]
 
 
-def submit_rss_entries_confirmed(arguments: dict[str, Any], expected_context: str) -> ToolResult:
+def submit_rss_entries_confirmed(
+    arguments: dict[str, Any], expected_context: str
+) -> ToolResult:
     state = _submit_snapshot(arguments)
     if (
         not state["complete"]
         or state["fingerprint"] != str(expected_context or "")
         or not state["runtime"].get("url")
     ):
-        raise AgentToolError("RSS 条目或 qB 配置已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "RSS 条目或 qB 配置已变化，请重新预检", code="confirmation_stale"
+        )
     from app.modules.rss import RSSEngine
 
     raw = RSSEngine().submit_pending_qb_snapshot(state["entries"], state["runtime"])
@@ -290,27 +357,53 @@ def submit_rss_entries_confirmed(arguments: dict[str, Any], expected_context: st
     failed = max(0, int(raw.get("failed") or 0))
     unknown = min(failed, max(0, int(raw.get("outcome_unknown") or 0)))
     if raw.get("conflict") or claimed != requested:
-        raise AgentToolError("RSS 条目在提交前发生变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "RSS 条目在提交前发生变化，请重新预检", code="confirmation_stale"
+        )
     if unknown:
         status, ok = ("partial", True) if submitted else ("review_required", False)
-        summary = f"RSS 提交结果：成功 {submitted}，待核对 {unknown}，失败 {failed - unknown}"
+        summary = (
+            f"RSS 提交结果：成功 {submitted}，待核对 {unknown}，失败 {failed - unknown}"
+        )
     elif failed and submitted:
-        status, ok, summary = "partial", True, f"RSS 条目部分提交完成：成功 {submitted}，失败 {failed}"
+        status, ok, summary = (
+            "partial",
+            True,
+            f"RSS 条目部分提交完成：成功 {submitted}，失败 {failed}",
+        )
     elif failed:
         status, ok, summary = "failed", False, f"本次 {failed} 个 RSS 条目均未成功提交"
     else:
-        status, ok, summary = "completed", True, f"已向 qBittorrent 提交 {submitted} 个 RSS 条目"
-    logger.info("Agent 精确 RSS qB 提交 requested=%s submitted=%s failed=%s", requested, submitted, failed)
+        status, ok, summary = (
+            "completed",
+            True,
+            f"已向 qBittorrent 提交 {submitted} 个 RSS 条目",
+        )
+    logger.info(
+        "Agent 精确 RSS qB 提交 requested=%s submitted=%s failed=%s",
+        requested,
+        submitted,
+        failed,
+    )
     return ToolResult(
         ok=ok,
         status=status,
         summary=summary,
         data={
-            "target": "qbittorrent", "requested": requested, "claimed": claimed,
-            "submitted": submitted, "failed": failed,
+            "target": "qbittorrent",
+            "requested": requested,
+            "claimed": claimed,
+            "submitted": submitted,
+            "failed": failed,
             **({"outcome_unknown": unknown} if unknown else {}),
         },
-        evidence=[Evidence("rss_submission", "已按确认时冻结的精确集合执行一次提交。", _now())],
-        suggestions=["请先在 qBittorrent 中核对待确认任务，勿直接重复提交。"] if unknown else [],
-        error="部分提交结果未知。" if unknown else ("RSS 条目提交未全部成功。" if failed else ""),
+        evidence=[
+            Evidence("rss_submission", "已按确认时冻结的精确集合执行一次提交。", _now())
+        ],
+        suggestions=["请先在 qBittorrent 中核对待确认任务，勿直接重复提交。"]
+        if unknown
+        else [],
+        error="部分提交结果未知。"
+        if unknown
+        else ("RSS 条目提交未全部成功。" if failed else ""),
     )

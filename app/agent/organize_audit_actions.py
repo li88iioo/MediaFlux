@@ -1,15 +1,16 @@
 """整理时间线的安全只读审计摘要。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import re
-from typing import Any
 import unicodedata
+from datetime import datetime
+from typing import Any
 from urllib.parse import unquote
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -20,9 +21,9 @@ _PUBLIC_ORIGINS = {"guangya", "local"}
 _PUBLIC_STATUSES = set(_STATUSES) - {"all"}
 _PUBLIC_MEDIA_TYPES = {"movie", "tv"}
 _SENSITIVE_PATTERNS = (
-    re.compile(r"(?:https?|magnet|ed2k)://", re.I),
+    re.compile(r"(?:https?|magnet|ed2k)://", re.IGNORECASE),
     re.compile(r"(?:^|\s)(?:/[^\s]+|[A-Za-z]:[\\/][^\s]+)"),
-    re.compile(r"(?:token|secret|password|passwd|api[_-]?key)\s*[:=]", re.I),
+    re.compile(r"(?:token|secret|password|passwd|api[_-]?key)\s*[:=]", re.IGNORECASE),
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
     re.compile(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"),
 )
@@ -137,18 +138,22 @@ def audit_organize_logs(arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="暂时无法读取整理记录摘要",
             data=_empty_data(arguments),
-            evidence=[Evidence(
-                "sqlite:organize_timeline",
-                "尝试读取整理时间线的固定脱敏视图；未读取或返回路径、标识、文件名、错误正文，也未访问网络或执行整理。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "sqlite:organize_timeline",
+                    "尝试读取整理时间线的固定脱敏视图；未读取或返回路径、标识、文件名、错误正文，也未访问网络或执行整理。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查本地数据库状态后重试。"],
             error="整理记录摘要当前不可用。",
         )
 
     raw = raw if isinstance(raw, dict) else {}
     raw_origins = raw.get("by_origin") if isinstance(raw.get("by_origin"), dict) else {}
-    raw_statuses = raw.get("by_status") if isinstance(raw.get("by_status"), dict) else {}
+    raw_statuses = (
+        raw.get("by_status") if isinstance(raw.get("by_status"), dict) else {}
+    )
     counts = _empty_counts()
     for key in counts["by_origin"]:
         counts["by_origin"][key] = _count(raw_origins.get(key))
@@ -163,16 +168,18 @@ def audit_organize_logs(arguments: dict[str, Any]) -> ToolResult:
         origin = str(raw_record.get("origin") or "").strip().lower()
         status = str(raw_record.get("status") or "").strip().lower()
         media_type = str(raw_record.get("media_type") or "").strip().lower()
-        records.append({
-            "origin": origin if origin in _PUBLIC_ORIGINS else "local",
-            "status": status if status in _PUBLIC_STATUSES else "processing",
-            "title": _safe_title(raw_record.get("title")),
-            "media_type": media_type if media_type in _PUBLIC_MEDIA_TYPES else "",
-            "year": _safe_year(raw_record.get("year")),
-            "season": _safe_positive_int(raw_record.get("season")),
-            "episode": _safe_positive_int(raw_record.get("episode")),
-            "updated_at": _safe_timestamp(raw_record.get("updated_at")),
-        })
+        records.append(
+            {
+                "origin": origin if origin in _PUBLIC_ORIGINS else "local",
+                "status": status if status in _PUBLIC_STATUSES else "processing",
+                "title": _safe_title(raw_record.get("title")),
+                "media_type": media_type if media_type in _PUBLIC_MEDIA_TYPES else "",
+                "year": _safe_year(raw_record.get("year")),
+                "season": _safe_positive_int(raw_record.get("season")),
+                "episode": _safe_positive_int(raw_record.get("episode")),
+                "updated_at": _safe_timestamp(raw_record.get("updated_at")),
+            }
+        )
 
     total = _count(raw.get("total"))
     failed = counts["by_status"]["failed"]
@@ -197,7 +204,9 @@ def audit_organize_logs(arguments: dict[str, Any]) -> ToolResult:
 
     suggestions: list[str] = []
     if failed:
-        suggestions.append("可继续查看失败记录摘要，确认是光鸭整理还是本地整理需要处理。")
+        suggestions.append(
+            "可继续查看失败记录摘要，确认是光鸭整理还是本地整理需要处理。"
+        )
     if manual:
         suggestions.append("可查看本地媒体待确认队列摘要，了解积压来源与时长。")
 
@@ -217,10 +226,12 @@ def audit_organize_logs(arguments: dict[str, Any]) -> ToolResult:
             "records": records,
             "truncated": bool(raw.get("truncated")),
         },
-        evidence=[Evidence(
-            "sqlite:organize_timeline",
-            "仅返回整理来源、规范状态、媒体标题摘要与时间；未读取或返回路径、任务标识、文件名、外部 ID、错误正文或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "sqlite:organize_timeline",
+                "仅返回整理来源、规范状态、媒体标题摘要与时间；未读取或返回路径、任务标识、文件名、外部 ID、错误正文或凭据。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

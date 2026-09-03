@@ -1,4 +1,5 @@
 """媒体追更订阅的安全摘要、自然语言路由与确认写入回归。"""
+
 from __future__ import annotations
 
 import json
@@ -6,37 +7,20 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from app import database as db
 from app.agent.action_history import action_history_owner_digest
+from app.agent.errors import AgentToolError
 from app.agent.media_subscription_actions import (
     get_media_subscription_summary,
     inspect_media_subscription_updates,
     list_media_subscription_summaries,
-    media_subscription_create_arguments,
-    media_subscription_delete_arguments,
-    media_subscription_enabled_arguments,
-    media_subscription_policy_arguments,
-    media_subscription_policy_update_arguments,
-    media_subscription_summaries_arguments,
-    media_subscription_summary_arguments,
-    media_subscription_updates_arguments,
 )
-from app.agent.orchestrator import (
-    is_library_update_check_message,
-    is_media_subscription_control_write_message,
-    is_media_subscription_delete_write_message,
-    is_media_subscription_summaries_message,
-    is_media_subscription_updates_message,
-    media_subscription_candidate_request,
-    media_subscription_control_request,
-    media_subscription_delete_request,
-    media_subscription_policy_request,
-    media_subscription_summary_request,
-    media_subscription_title_request,
-)
-from app.agent.models import ToolResult
 from app.agent.rate_limit import agent_rate_limiter
-from app.agent.registry import AgentToolError
-from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.discovery.models import MediaCard
+from tests.agent_kernel_test_harness import (
+    get_kernel_test_service as get_agent_service,
+)
+from tests.agent_kernel_test_harness import (
+    reset_kernel_test_service as reset_agent_service_for_tests,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -75,17 +59,14 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             {"subscription_id": self.sid, "enabled": enabled},
             owner="owner",
         )
-        confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="owner"
-        )
-        return prepared, confirmed
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
+        return (prepared, confirmed)
 
     @staticmethod
     def _subscription_by_identity(tmdb_id: str, media_type: str):
         with db.get_conn() as conn:
             return conn.execute(
-                "SELECT * FROM media_subscriptions WHERE tmdb_id=? AND media_type=? "
-                "AND deleted_at IS NULL",
+                "SELECT * FROM media_subscriptions WHERE tmdb_id=? AND media_type=? AND deleted_at IS NULL",
                 (tmdb_id, media_type),
             ).fetchone()
 
@@ -94,9 +75,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         revision = int(db.get_media_subscription(self.sid)["revision"])
         with db.get_conn() as conn:
             candidate = conn.execute(
-                "INSERT INTO media_subscription_candidates("
-                "subscription_id,media_key,season,episode,result_id,site_id,site_name,title,"
-                "status,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO media_subscription_candidates(subscription_id,media_key,season,episode,result_id,site_id,site_name,title,status,expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     self.sid,
                     "tv:86034:s1:e1",
@@ -114,10 +93,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             )
             candidate_id = int(candidate.lastrowid)
             conn.execute(
-                "INSERT INTO media_download_admissions("
-                "media_key,tmdb_id,media_type,season,episode,subscription_id,"
-                "subscription_revision,candidate_id,status,created_at,updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO media_download_admissions(media_key,tmdb_id,media_type,season,episode,subscription_id,subscription_revision,candidate_id,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     "tv:86034:s1:e1",
                     "86034",
@@ -133,9 +109,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 ),
             )
             conn.execute(
-                "INSERT INTO media_subscription_runs("
-                "subscription_id,trigger_type,subscription_revision,status,started_at) "
-                "VALUES(?,?,?,?,?)",
+                "INSERT INTO media_subscription_runs(subscription_id,trigger_type,subscription_revision,status,started_at) VALUES(?,?,?,?,?)",
                 (self.sid, "manual", revision, "running", stamp),
             )
 
@@ -149,10 +123,8 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(read["result"]["data"]["download_target"], "guangya")
         self.assertEqual(read["result"]["data"]["action"], "confirm")
         self.assertNotIn("private-site", repr(read))
-
         with patch(
-            "app.agent.media_subscription_actions._reload_scheduler",
-            return_value=True,
+            "app.agent.media_subscription_actions._reload_scheduler", return_value=True
         ):
             prepared = service.prepare(
                 "media.set_subscription_policy",
@@ -176,9 +148,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(after["action"], "notify")
         self.assertEqual(after["check_interval_minutes"], 120)
         with self.assertRaises(AgentToolError):
-            service.confirm(
-                prepared["action_plan"]["plan_id"], owner="owner"
-            )
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
 
     def test_subscription_policy_enforces_effective_tv_season_invariant(self) -> None:
         service = get_agent_service()
@@ -188,11 +158,8 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 {"subscription_id": self.sid, "monitor_mode": "selected"},
                 owner="owner",
             )
-
         db.update_media_subscription_config(
-            self.sid,
-            monitor_mode="selected",
-            seasons_json="[1]",
+            self.sid, monitor_mode="selected", seasons_json="[1]"
         )
         with self.assertRaises(AgentToolError):
             service.prepare(
@@ -203,23 +170,17 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         unchanged = db.get_media_subscription(self.sid)
         self.assertEqual(unchanged["monitor_mode"], "selected")
         self.assertEqual(json.loads(unchanged["seasons_json"]), [1])
-
         db.update_media_subscription_config(
-            self.sid,
-            monitor_mode="missing",
-            seasons_json="[2]",
+            self.sid, monitor_mode="missing", seasons_json="[2]"
         )
         prepared = service.prepare(
             "media.set_subscription_policy",
             {"subscription_id": self.sid, "monitor_mode": "selected"},
             owner="owner",
         )
-        self.assertEqual(
-            prepared["result"]["data"]["effective"]["seasons"], [2]
-        )
+        self.assertEqual(prepared["result"]["data"]["effective"]["seasons"], [2])
         with patch(
-            "app.agent.media_subscription_actions._reload_scheduler",
-            return_value=True,
+            "app.agent.media_subscription_actions._reload_scheduler", return_value=True
         ):
             confirmed = service.confirm(
                 prepared["action_plan"]["plan_id"], owner="owner"
@@ -229,7 +190,9 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(after["monitor_mode"], "selected")
         self.assertEqual(json.loads(after["seasons_json"]), [2])
 
-    def test_subscription_policy_rejects_movie_season_fields_without_writes(self) -> None:
+    def test_subscription_policy_rejects_movie_season_fields_without_writes(
+        self,
+    ) -> None:
         movie_id = db.add_media_subscription(
             provider="tmdb",
             external_id="99901",
@@ -258,13 +221,14 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(json.loads(after["seasons_json"]), [])
         self.assertFalse(bool(after["include_specials"]))
 
-    def test_subscription_policy_reports_irreversible_inflight_auto_dispatch(self) -> None:
+    def test_subscription_policy_reports_irreversible_inflight_auto_dispatch(
+        self,
+    ) -> None:
         db.update_media_subscription_config(self.sid, action="auto")
         self._seed_inflight_state()
         with db.get_conn() as conn:
             conn.execute(
-                "UPDATE media_download_admissions SET status='dispatching' "
-                "WHERE subscription_id=?",
+                "UPDATE media_download_admissions SET status='dispatching' WHERE subscription_id=?",
                 (self.sid,),
             )
         service = get_agent_service()
@@ -277,11 +241,10 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(preview["in_flight_dispatches_at_preflight"], 1)
         self.assertTrue(any("无法" in item for item in preview["effects"]))
         plan = prepared["action_plan"]
-        self.assertIn("无需再次确认", plan["impact"])
-        self.assertIn("提交阶段", plan["reversibility"])
+        self.assertIn("无需再次确认", plan["confirmation"]["impact"])
+        self.assertIn("提交阶段", plan["confirmation"]["reversibility"])
         with patch(
-            "app.agent.media_subscription_actions._reload_scheduler",
-            return_value=True,
+            "app.agent.media_subscription_actions._reload_scheduler", return_value=True
         ):
             confirmed = service.confirm(
                 prepared["action_plan"]["plan_id"], owner="owner"
@@ -294,12 +257,10 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         row = db.get_media_subscription(self.sid)
         with db.get_conn() as conn:
             admission = conn.execute(
-                "SELECT id FROM media_download_admissions "
-                "WHERE subscription_id=? AND status='claimed'",
+                "SELECT id FROM media_download_admissions WHERE subscription_id=? AND status='claimed'",
                 (self.sid,),
             ).fetchone()
         self.assertIsNotNone(admission)
-
         service = get_agent_service()
         prepared = service.prepare(
             "media.set_subscription_policy",
@@ -307,22 +268,19 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             owner="owner",
         )
         self.assertEqual(
-            prepared["result"]["data"]["in_flight_dispatches_at_preflight"],
-            0,
+            prepared["result"]["data"]["in_flight_dispatches_at_preflight"], 0
         )
         self.assertEqual(
-            prepared["result"]["data"]["pending_admissions_at_preflight"],
-            1,
+            prepared["result"]["data"]["pending_admissions_at_preflight"], 1
         )
-        self.assertTrue(db.begin_media_download_dispatch(
-            int(admission["id"]),
-            subscription_id=self.sid,
-            subscription_revision=int(row["revision"]),
-        ))
-
-        confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="owner"
+        self.assertTrue(
+            db.begin_media_download_dispatch(
+                int(admission["id"]),
+                subscription_id=self.sid,
+                subscription_revision=int(row["revision"]),
+            )
         )
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "conflict")
         unchanged = db.get_media_subscription(self.sid)
         self.assertEqual(unchanged["action"], "confirm")
@@ -336,216 +294,20 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             owner="owner",
         )
         db.update_media_subscription_config(self.sid, action="notify")
-        confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="owner"
-        )
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "conflict")
         self.assertEqual(
             db.get_media_subscription(self.sid)["download_target"], "guangya"
         )
-
-    def test_validators_registry_and_natural_language_are_strict(self) -> None:
-        self.assertEqual(media_subscription_summaries_arguments({}), {})
-        self.assertEqual(
-            media_subscription_policy_arguments({"subscription_id": self.sid}),
-            {"subscription_id": self.sid},
-        )
-        self.assertEqual(
-            media_subscription_policy_update_arguments({
-                "subscription_id": self.sid,
-                "download_target": "both",
-                "check_interval_minutes": 120,
-            }),
-            {
-                "subscription_id": self.sid,
-                "download_target": "both",
-                "check_interval_minutes": 120,
-            },
-        )
-        self.assertEqual(
-            media_subscription_policy_request(
-                f"查看媒体订阅 {self.sid} 的策略"
-            ),
-            ("media.get_subscription_policy", {"subscription_id": self.sid}),
-        )
-        self.assertEqual(
-            media_subscription_policy_request(
-                f"把媒体订阅 {self.sid} 的下载目标改为两边"
-            ),
-            (
-                "media.set_subscription_policy",
-                {"subscription_id": self.sid, "download_target": "both"},
-            ),
-        )
-        self.assertEqual(media_subscription_updates_arguments({}), {})
-        with self.assertRaises(AgentToolError):
-            media_subscription_updates_arguments({"refresh": True})
-        self.assertEqual(
-            media_subscription_summary_arguments({"subscription_id": self.sid}),
-            {"subscription_id": self.sid},
-        )
-        self.assertEqual(
-            media_subscription_enabled_arguments(
-                {"subscription_id": self.sid, "enabled": False}
-            ),
-            {"subscription_id": self.sid, "enabled": False},
-        )
-        for invalid in (
-            {"subscription_id": True},
-            {"subscription_id": 0},
-            {"subscription_id": str(self.sid)},
-            {"subscription_id": self.sid, "extra": True},
-        ):
-            with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
-                media_subscription_summary_arguments(invalid)
-        for invalid in (
-            {},
-            {"subscription_id": self.sid, "enabled": 1},
-            {"subscription_id": True, "enabled": False},
-            {"subscription_id": self.sid, "enabled": False, "all": True},
-        ):
-            with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
-                media_subscription_enabled_arguments(invalid)
-        self.assertEqual(
-            media_subscription_create_arguments({
-                "provider": "tmdb",
-                "external_id": "999",
-                "media_type": "tv",
-                "season": 2,
-                "check_interval_minutes": 10080,
-            }),
-            {
-                "provider": "tmdb",
-                "external_id": "999",
-                "media_type": "tv",
-                "season": 2,
-                "check_interval_minutes": 10080,
-            },
-        )
-        self.assertEqual(
-            media_subscription_delete_arguments({"subscription_id": self.sid}),
-            {"subscription_id": self.sid},
-        )
-        with self.assertRaises(AgentToolError):
-            media_subscription_create_arguments({
-                "provider": "tmdb",
-                "external_id": "999",
-                "media_type": "movie",
-                "season": 2,
-            })
-        for invalid_interval in (True, 60, 4321, "10080"):
-            with self.subTest(invalid_interval=invalid_interval), self.assertRaises(
-                AgentToolError
-            ):
-                media_subscription_create_arguments({
-                    "provider": "tmdb",
-                    "external_id": "999",
-                    "media_type": "tv",
-                    "check_interval_minutes": invalid_interval,
-                })
-
-        tools = {item["name"]: item for item in get_agent_service().capabilities()["tools"]}
-        self.assertEqual(tools["media.subscription_summaries"]["risk"], "read")
-        self.assertEqual(tools["media.subscription_updates"]["risk"], "read")
-        self.assertEqual(tools["media.get_subscription_summary"]["risk"], "read")
-        self.assertEqual(tools["media.create_subscription"]["risk"], "low_write")
-        self.assertTrue(tools["media.create_subscription"]["requires_confirmation"])
-        self.assertEqual(tools["media.delete_subscription"]["risk"], "danger")
-        self.assertTrue(tools["media.delete_subscription"]["requires_confirmation"])
-        self.assertEqual(tools["media.set_subscription_enabled"]["risk"], "low_write")
-        self.assertEqual(tools["media.get_subscription_policy"]["risk"], "read")
-        self.assertEqual(tools["media.set_subscription_policy"]["risk"], "danger")
-        self.assertTrue(tools["media.set_subscription_policy"]["requires_confirmation"])
-        self.assertTrue(tools["media.set_subscription_enabled"]["requires_confirmation"])
-
-        self.assertTrue(is_media_subscription_summaries_message("列出全部媒体追更订阅"))
-        for message in (
-            "我订阅的媒体又更新吗",
-            "订阅有更新吗",
-            "我订阅的媒体有更新吗",
-            "我的订阅更新了吗",
-            "我追的剧有没有更新",
-            "我的追番有没有更新",
-            "我追的番更新了吗",
-            "追番有新一集吗",
-        ):
-            with self.subTest(message=message):
-                self.assertTrue(is_media_subscription_updates_message(message))
-        for recommendation in (
-            "推荐几部追剧", "推荐几个追番", "最近有什么好看的追剧推荐几部",
-        ):
-            with self.subTest(recommendation=recommendation):
-                self.assertFalse(is_media_subscription_summaries_message(recommendation))
-        self.assertFalse(is_media_subscription_updates_message("RSS 订阅有更新吗"))
-        self.assertFalse(is_media_subscription_updates_message("修改媒体订阅更新间隔"))
-        for message in (
-            "我的订阅", "我的追番", "追更列表", "列出我追的剧", "查看我的追番",
-            "我的媒体订阅当前不是订阅了三个媒体吗",
-            "我的媒体订阅当前不是订阅了3个媒体吗", "我的媒体订阅有多少个",
-        ):
-            with self.subTest(summary_message=message):
-                self.assertTrue(is_media_subscription_summaries_message(message))
-        for message in ("我追的剧有没有更新", "我的追番有没有更新", "追番有新一集吗"):
-            with self.subTest(generic_title=message):
-                self.assertFalse(is_library_update_check_message(message))
-        self.assertEqual(
-            media_subscription_summary_request(f"查看媒体订阅 {self.sid} 状态"),
-            {"subscription_id": self.sid},
-        )
-        self.assertEqual(
-            media_subscription_control_request(f"暂停媒体订阅 {self.sid}"),
-            ("media.set_subscription_enabled", {"subscription_id": self.sid, "enabled": False}),
-        )
-        self.assertEqual(
-            media_subscription_control_request(f"恢复追更订阅 {self.sid}"),
-            ("media.set_subscription_enabled", {"subscription_id": self.sid, "enabled": True}),
-        )
-        self.assertIsNone(media_subscription_control_request("暂停所有媒体订阅"))
-        self.assertTrue(is_media_subscription_control_write_message("暂停所有媒体订阅"))
-        self.assertEqual(
-            media_subscription_title_request("订阅《庆余年》第 2 季"),
-            {"query": "庆余年", "season": 2, "contextual": False},
-        )
-        self.assertEqual(
-            media_subscription_title_request(
-                "帮我给光阴之外 创建一个每周刷新的订阅"
-            ),
-            {
-                "query": "光阴之外",
-                "season": None,
-                "contextual": False,
-                "check_interval_minutes": 10080,
-            },
-        )
-        self.assertEqual(
-            media_subscription_candidate_request("订阅第 2 个的第 3 季"),
-            {"position": 2, "season": 3, "contextual": False},
-        )
-        self.assertEqual(
-            media_subscription_candidate_request("订阅第 2 个，每周检查"),
-            {
-                "position": 2,
-                "season": None,
-                "contextual": False,
-                "check_interval_minutes": 10080,
-            },
-        )
-        self.assertEqual(
-            media_subscription_title_request("订阅这部剧"),
-            {"query": "", "season": None, "contextual": True},
-        )
-        self.assertEqual(
-            media_subscription_delete_request(f"删除媒体订阅 {self.sid}"),
-            {"subscription_id": self.sid},
-        )
-        self.assertTrue(is_media_subscription_delete_write_message("删除所有媒体订阅"))
 
     def test_safe_list_and_detail_do_not_expose_private_configuration(self) -> None:
         listed = list_media_subscription_summaries({}).to_dict()
         detail = get_media_subscription_summary({"subscription_id": self.sid}).to_dict()
         self.assertEqual(listed["data"]["items"][0]["subscription_number"], self.sid)
         self.assertEqual(detail["data"]["title"], "平凡职业造就世界最强")
-        serialized = json.dumps({"listed": listed, "detail": detail}, ensure_ascii=False)
+        serialized = json.dumps(
+            {"listed": listed, "detail": detail}, ensure_ascii=False
+        )
         for secret in (
             "PRIVATE_ORIGINAL_TITLE",
             "/private-poster.jpg",
@@ -555,7 +317,9 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(secret, serialized)
 
-    def test_realtime_update_query_checks_all_subscriptions_and_returns_safe_candidates(self) -> None:
+    def test_realtime_update_query_checks_all_subscriptions_and_returns_safe_candidates(
+        self,
+    ) -> None:
         second = db.add_media_subscription(
             provider="tmdb",
             external_id="218642",
@@ -566,18 +330,23 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             download_target="guangya",
             enabled=True,
         )
+
         async def _preview(subscription_id: int, **_kwargs):
             if subscription_id == self.sid:
                 return {
-                "subscription_number": self.sid,
-                "title": "平凡职业造就世界最强",
-                "media_type": "tv",
-                "enabled": True,
-                "status": "satisfied",
-                "summary": "已播剧集均已收录或正在下载",
-                "missing_count": 0,
-                "resource_search": {"status": "not_run", "truncated": False, "items": []},
-                "delivery": {"state": "no_action", "target_label": "光鸭"},
+                    "subscription_number": self.sid,
+                    "title": "平凡职业造就世界最强",
+                    "media_type": "tv",
+                    "enabled": True,
+                    "status": "satisfied",
+                    "summary": "已播剧集均已收录或正在下载",
+                    "missing_count": 0,
+                    "resource_search": {
+                        "status": "not_run",
+                        "truncated": False,
+                        "items": [],
+                    },
+                    "delivery": {"state": "no_action", "target_label": "光鸭"},
                 }
             return {
                 "subscription_number": second,
@@ -590,20 +359,24 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 "resource_search": {
                     "status": "success",
                     "truncated": False,
-                    "items": [{
-                        "label": "S01E155",
-                        "candidates": [{
-                            "result_id": "abcdefghijklmnop",
-                            "title": "师兄啊师兄 S01E155 4K",
-                            "site_id": "mikan",
-                            "site_name": "Mikan",
-                            "download_state": "ready",
-                            "download_kinds": ["magnet"],
-                            "relevance_score": 95,
-                            "confidence": "high",
-                            "match": "exact_episode",
-                        }],
-                    }],
+                    "items": [
+                        {
+                            "label": "S01E155",
+                            "candidates": [
+                                {
+                                    "result_id": "abcdefghijklmnop",
+                                    "title": "师兄啊师兄 S01E155 4K",
+                                    "site_id": "mikan",
+                                    "site_name": "Mikan",
+                                    "download_state": "ready",
+                                    "download_kinds": ["magnet"],
+                                    "relevance_score": 95,
+                                    "confidence": "high",
+                                    "match": "exact_episode",
+                                }
+                            ],
+                        }
+                    ],
                 },
                 "delivery": {
                     "state": "auto_eligible",
@@ -619,7 +392,6 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             return_value=service,
         ):
             result = inspect_media_subscription_updates({}).to_dict()
-
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "updates_available")
         self.assertEqual(result["data"]["returned"], 2)
@@ -627,14 +399,20 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["data"]["candidate_count"], 1)
         self.assertEqual(result["data"]["items"][0]["episode_label"], "S01E155")
         missing = next(
-            item for item in result["data"]["subscriptions"] if item["status"] == "missing"
+            item
+            for item in result["data"]["subscriptions"]
+            if item["status"] == "missing"
         )
         self.assertEqual(missing["delivery"]["target_label"], "光鸭")
         self.assertTrue(result["data"]["read_only"])
-        self.assertNotIn("PRIVATE_ORIGINAL_TITLE", json.dumps(result, ensure_ascii=False))
+        self.assertNotIn(
+            "PRIVATE_ORIGINAL_TITLE", json.dumps(result, ensure_ascii=False)
+        )
         self.assertEqual(preview.await_count, 2)
 
-    def test_subscription_updates_preserve_successes_when_one_item_times_out(self) -> None:
+    def test_subscription_updates_preserve_successes_when_one_item_times_out(
+        self,
+    ) -> None:
         rows = list(db.list_media_subscriptions(limit=8))
         self.assertGreaterEqual(len(rows), 1)
         good = {
@@ -655,67 +433,30 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             "status": "unavailable",
             "resource_search": {"status": "not_run", "truncated": False, "items": []},
         }
-        with patch(
-            "app.agent.media_subscription_actions.db.count_media_subscriptions",
-            return_value=2,
-        ), patch(
-            "app.agent.media_subscription_actions.db.list_media_subscriptions",
-            return_value=[rows[0], rows[0]],
-        ), patch(
-            "app.agent.media_subscription_actions._preview_media_subscription_rows",
-            new=AsyncMock(return_value=[good, unavailable]),
+        with (
+            patch(
+                "app.agent.media_subscription_actions.db.count_media_subscriptions",
+                return_value=2,
+            ),
+            patch(
+                "app.agent.media_subscription_actions.db.list_media_subscriptions",
+                return_value=[rows[0], rows[0]],
+            ),
+            patch(
+                "app.agent.media_subscription_actions._preview_media_subscription_rows",
+                new=AsyncMock(return_value=[good, unavailable]),
+            ),
         ):
             result = inspect_media_subscription_updates({}).to_dict()
-
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "partial")
         self.assertEqual(result["data"]["updates_available_count"], 1)
         self.assertEqual(result["data"]["inconclusive_count"], 1)
         self.assertEqual(len(result["data"]["subscriptions"]), 2)
 
-    def test_orchestrator_routes_subscription_update_questions_before_patrol_tools(self) -> None:
-        preview = AsyncMock(return_value={
-            "subscription_number": self.sid,
-            "title": "平凡职业造就世界最强",
-            "media_type": "tv",
-            "enabled": True,
-            "status": "missing",
-            "summary": "发现 1 集已播但尚未收录",
-            "missing_count": 1,
-            "resource_search": {
-                "status": "success",
-                "truncated": False,
-                "items": [{
-                    "label": "S01E03",
-                    "candidates": [{
-                        "result_id": "abcdefghijklmnop",
-                        "title": "平凡职业造就世界最强 S01E03",
-                        "site_id": "mikan",
-                        "site_name": "Mikan",
-                        "download_state": "ready",
-                        "download_kinds": ["magnet"],
-                    }],
-                }],
-            },
-            "delivery": {"state": "confirmation_required", "target_label": "光鸭"},
-        })
-        mocked = Mock(preview_subscription_updates=preview)
-        with patch(
-            "app.agent.media_subscription_actions.get_media_subscription_service",
-            return_value=mocked,
-        ):
-            result = get_agent_service().query(
-                "我订阅的媒体又更新吗",
-                owner="owner",
-                present=False,
-            )
-        self.assertEqual(result["tool_call"]["name"], "media.subscription_updates")
-        self.assertNotIn("patrol", result["tool_call"]["name"])
-        snapshot = get_agent_service().recent_resource_store.get(owner="owner")
-        self.assertEqual(snapshot["candidates"][0]["result_id"], "abcdefghijklmnop")
-        preview.assert_awaited_once()
-
-    def test_prepare_does_not_write_and_confirm_atomically_invalidates_inflight_rows(self) -> None:
+    def test_prepare_does_not_write_and_confirm_atomically_invalidates_inflight_rows(
+        self,
+    ) -> None:
         self._seed_inflight_state()
         before = db.get_media_subscription(self.sid)
         service = get_agent_service()
@@ -728,7 +469,6 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertEqual(int(after_prepare["enabled"]), 1)
         self.assertEqual(int(after_prepare["revision"]), int(before["revision"]))
         self.assertEqual(prepared["mode"], "confirmation_required")
-
         scheduler = Mock()
         with patch(
             "app.modules.media_subscription_scheduler.get_media_subscription_scheduler",
@@ -776,7 +516,6 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
                 "UPDATE media_subscriptions SET enabled=0,status='paused' WHERE id=?",
                 (self.sid,),
             )
-
         scheduler = Mock()
         service = get_agent_service()
         prepared = service.prepare(
@@ -795,7 +534,6 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             confirmed = service.confirm(
                 prepared["action_plan"]["plan_id"], owner="owner"
             )
-
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["data"]["expired_candidates"], 0)
         self.assertEqual(confirmed["result"]["data"]["cancelled_admissions"], 0)
@@ -832,9 +570,7 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             owner="owner",
         )
         db.update_media_subscription_config(self.sid, check_interval_minutes=120)
-        stale = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="owner"
-        )
+        stale = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertFalse(stale["result"]["ok"])
         self.assertEqual(stale["result"]["status"], "conflict")
         with self.assertRaises(AgentToolError):
@@ -859,7 +595,9 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         self.assertNotIn("subscription_id", details)
         self.assertNotIn("title", details)
 
-    def test_create_subscription_requires_confirmation_and_writes_only_after_confirm(self) -> None:
+    def test_create_subscription_requires_confirmation_and_writes_only_after_confirm(
+        self,
+    ) -> None:
         service = get_agent_service()
         discovery = Mock()
         discovery.get_detail.return_value = MediaCard(
@@ -884,7 +622,6 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             "season": 2,
             "check_interval_minutes": 10080,
         }
-
         with patch(
             "app.agent.media_subscription_actions.get_discovery_service",
             return_value=discovery,
@@ -892,29 +629,24 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             prepared = service.prepare(
                 "media.create_subscription", arguments, owner="owner"
             )
-
         self.assertEqual(prepared["mode"], "confirmation_required")
-        self.assertEqual(
-            prepared["tool_call"]["name"], "media.create_subscription"
-        )
+        self.assertEqual(prepared["tool_call"]["name"], "media.create_subscription")
         self.assertIsNone(self._subscription_by_identity("999", "tv"))
-
-        with patch(
-            "app.modules.media_subscriptions.TMDBClient.detail",
-            return_value=detail,
-        ), patch(
-            "app.modules.media_subscription_scheduler.get_media_subscription_scheduler",
-            return_value=scheduler,
+        with (
+            patch(
+                "app.modules.media_subscriptions.TMDBClient.detail", return_value=detail
+            ),
+            patch(
+                "app.modules.media_subscription_scheduler.get_media_subscription_scheduler",
+                return_value=scheduler,
+            ),
         ):
             confirmed = service.confirm(
                 prepared["action_plan"]["plan_id"], owner="owner"
             )
-
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["data"]["season"], 2)
-        self.assertEqual(
-            confirmed["result"]["data"]["check_interval_minutes"], 10080
-        )
+        self.assertEqual(confirmed["result"]["data"]["check_interval_minutes"], 10080)
         row = self._subscription_by_identity("999", "tv")
         self.assertIsNotNone(row)
         self.assertEqual(json.loads(row["seasons_json"]), [2])
@@ -927,13 +659,10 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         service = get_agent_service()
         scheduler = Mock()
         prepared = service.prepare(
-            "media.delete_subscription",
-            {"subscription_id": self.sid},
-            owner="owner",
+            "media.delete_subscription", {"subscription_id": self.sid}, owner="owner"
         )
-        self.assertEqual(prepared["action_plan"]["risk"], "danger")
+        self.assertEqual(prepared["action_plan"]["confirmation"]["risk"], "danger")
         self.assertIsNotNone(db.get_media_subscription(self.sid))
-
         with patch(
             "app.modules.media_subscription_scheduler.get_media_subscription_scheduler",
             return_value=scheduler,
@@ -941,203 +670,12 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
             confirmed = service.confirm(
                 prepared["action_plan"]["plan_id"], owner="owner"
             )
-
         self.assertTrue(confirmed["result"]["ok"])
         self.assertEqual(confirmed["result"]["data"]["expired_candidates"], 1)
         self.assertEqual(confirmed["result"]["data"]["cancelled_admissions"], 1)
         self.assertEqual(confirmed["result"]["data"]["cancelled_runs"], 1)
         self.assertIsNone(db.get_media_subscription(self.sid))
-        self.assertTrue(db.get_media_subscription(self.sid, include_deleted=True)["deleted_at"])
+        self.assertTrue(
+            db.get_media_subscription(self.sid, include_deleted=True)["deleted_at"]
+        )
         scheduler.reload.assert_called_once_with()
-
-    def test_orchestrator_uses_discovery_candidates_and_preserves_pending_season(self) -> None:
-        service = get_agent_service()
-        service.recent_discovery_store.capture(
-            owner="owner",
-            result=ToolResult(
-                True,
-                "completed",
-                "找到 2 个结果",
-                data={
-                    "query": "庆余年",
-                    "items": [
-                        {
-                            "provider": "tmdb",
-                            "external_id": "998",
-                            "media_type": "movie",
-                            "title": "庆余年特别篇",
-                            "year": "2020",
-                        },
-                        {
-                            "provider": "tmdb",
-                            "external_id": "999",
-                            "media_type": "tv",
-                            "title": "庆余年",
-                            "year": "2019",
-                        },
-                    ],
-                },
-            ),
-        )
-        discovery = Mock()
-        discovery.get_detail.return_value = MediaCard(
-            provider="tmdb",
-            external_id="999",
-            media_type="tv",
-            title="庆余年",
-            year="2019",
-        )
-        with patch(
-            "app.agent.media_subscription_actions.get_discovery_service",
-            return_value=discovery,
-        ):
-            selected = service.query(
-                "订阅第 2 个的第 2 季", owner="owner"
-            )
-        self.assertEqual(selected["mode"], "confirmation_required")
-        self.assertEqual(
-            selected["tool_call"]["name"], "media.create_subscription"
-        )
-        self.assertEqual(selected["result"]["data"]["season"], 2)
-
-        with patch(
-            "app.agent.media_subscription_actions.get_discovery_service",
-            return_value=discovery,
-        ):
-            continued = service.query(
-                "订阅第 2 个",
-                owner="owner",
-                conversation_context=[{
-                    "role": "assistant",
-                    "text": "已找到候选，请选择准确条目。",
-                    "tool_name": "discovery.search",
-                    "pending_subscription": {"season": 2},
-                }],
-            )
-        self.assertEqual(continued["result"]["data"]["season"], 2)
-
-        fake_search = {
-            "request_id": "search-subscription",
-            "mode": "read_only",
-            "tool_call": {"name": "discovery.search", "arguments": {"query": "庆余年"}},
-            "result": ToolResult(
-                True,
-                "completed",
-                "找到候选",
-                data={"query": "庆余年", "items": []},
-            ).to_dict(),
-        }
-        service.recent_discovery_store.clear_owner(owner="owner")
-        with patch.object(
-            service, "_invoke_query_read", return_value=fake_search
-        ) as search:
-            routed = service.query(
-                "订阅《庆余年》第 2 季", owner="owner"
-            )
-        search.assert_called_once_with(
-            "discovery.search", {"query": "庆余年", "limit": 20}, owner="owner"
-        )
-        self.assertEqual(
-            routed["result"]["data"]["pending_subscription"], {"season": 2}
-        )
-        self.assertIn("订阅第 2 个的第 2 季", routed["result"]["suggestions"][0])
-
-    def test_orchestrator_creates_weekly_subscription_from_natural_language(self) -> None:
-        service = get_agent_service()
-        fake_search = {
-            "request_id": "search-weekly-subscription",
-            "mode": "read_only",
-            "tool_call": {
-                "name": "discovery.search",
-                "arguments": {"query": "光阴之外", "limit": 20},
-            },
-            "result": ToolResult(
-                True,
-                "completed",
-                "找到候选",
-                data={"query": "光阴之外", "items": []},
-            ).to_dict(),
-        }
-        with patch.object(
-            service, "_invoke_query_read", return_value=fake_search
-        ) as search:
-            routed = service.query(
-                "帮我给光阴之外 创建一个每周刷新的订阅", owner="owner"
-            )
-        search.assert_called_once_with(
-            "discovery.search", {"query": "光阴之外", "limit": 20}, owner="owner"
-        )
-        self.assertEqual(
-            routed["result"]["data"]["pending_subscription"],
-            {"check_interval_minutes": 10080},
-        )
-        self.assertIn("每周检查", routed["result"]["suggestions"][0])
-
-        service.recent_discovery_store.capture(
-            owner="owner",
-            result=ToolResult(
-                True,
-                "completed",
-                "找到 1 个结果",
-                data={
-                    "query": "光阴之外",
-                    "items": [{
-                        "provider": "tmdb",
-                        "external_id": "285993",
-                        "media_type": "tv",
-                        "title": "光阴之外",
-                        "year": "2026",
-                    }],
-                },
-            ),
-        )
-        discovery = Mock()
-        discovery.get_detail.return_value = MediaCard(
-            provider="tmdb",
-            external_id="285993",
-            media_type="tv",
-            title="光阴之外",
-            year="2026",
-        )
-        with patch(
-            "app.agent.media_subscription_actions.get_discovery_service",
-            return_value=discovery,
-        ):
-            selected = service.query(
-                "订阅第 1 个",
-                owner="owner",
-                conversation_context=[{
-                    "role": "assistant",
-                    "text": "已找到候选，请选择准确条目。",
-                    "tool_name": "discovery.search",
-                    "pending_subscription": {"check_interval_minutes": 10080},
-                }],
-            )
-        self.assertEqual(selected["mode"], "confirmation_required")
-        self.assertEqual(
-            selected["tool_call"]["name"], "media.create_subscription"
-        )
-        self.assertEqual(
-            selected["result"]["data"]["check_interval_minutes"], 10080
-        )
-
-    def test_orchestrator_prepares_exact_write_and_refuses_bulk_write(self) -> None:
-        service = get_agent_service()
-        result = service.query(f"暂停媒体订阅 {self.sid}", owner="owner")
-        self.assertEqual(result["mode"], "confirmation_required")
-        self.assertEqual(result["tool_call"]["name"], "media.set_subscription_enabled")
-        bulk = service.query("暂停所有媒体订阅", owner="owner")
-        self.assertEqual(bulk["mode"], "read_only")
-        self.assertEqual(bulk["result"]["status"], "unsupported")
-        self.assertIn("一个", bulk["result"]["summary"])
-        deleted = service.query(f"删除媒体订阅 {self.sid}", owner="owner")
-        self.assertEqual(deleted["mode"], "confirmation_required")
-        self.assertEqual(
-            deleted["tool_call"]["name"], "media.delete_subscription"
-        )
-
-
-if __name__ == "__main__":
-    import unittest
-
-    unittest.main()

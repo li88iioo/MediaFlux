@@ -1,15 +1,16 @@
 """Media Agent 的媒体服务器版本与兼容槽位诊断。"""
+
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import Any
 
 from app.agent.config_actions import test_media_server
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 
 _SLOT_ORDER = ("jellyfin", "emby")
 _SLOT_LABELS = {
@@ -101,7 +102,9 @@ def _node_payload(slot: str, result: ToolResult) -> dict[str, Any]:
         "version": None,
         "major_version": None,
         "compatibility": "disabled" if not enabled else "unavailable",
-        "reason_code": _CONNECTION_REASONS.get(connection_status, "unexpected_upstream_failure"),
+        "reason_code": _CONNECTION_REASONS.get(
+            connection_status, "unexpected_upstream_failure"
+        ),
         "latency_ms": None,
     }
     if connection_status != "success":
@@ -117,23 +120,34 @@ def _node_payload(slot: str, result: ToolResult) -> dict[str, Any]:
     version, major = _safe_version(result.data.get("version"))
     compatibility, reason_code = _compatibility(slot, product, major)
     raw_latency = result.data.get("latency_ms")
-    latency_ms = raw_latency if isinstance(raw_latency, int) and not isinstance(raw_latency, bool) else None
+    latency_ms = (
+        raw_latency
+        if isinstance(raw_latency, int) and not isinstance(raw_latency, bool)
+        else None
+    )
     if latency_ms is not None:
         latency_ms = max(0, min(latency_ms, 11_500))
-    node.update({
-        "product": product,
-        "version": version,
-        "major_version": major,
-        "compatibility": compatibility,
-        "reason_code": reason_code,
-        "latency_ms": latency_ms,
-    })
+    node.update(
+        {
+            "product": product,
+            "version": version,
+            "major_version": major,
+            "compatibility": compatibility,
+            "reason_code": reason_code,
+            "latency_ms": latency_ms,
+        }
+    )
     return node
 
 
 def _probe_all() -> list[ToolResult]:
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="agent-media-server") as pool:
-        futures = [pool.submit(test_media_server, {"server_type": slot}) for slot in _SLOT_ORDER]
+    with ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="agent-media-server"
+    ) as pool:
+        futures = [
+            pool.submit(test_media_server, {"server_type": slot})
+            for slot in _SLOT_ORDER
+        ]
         return [future.result() for future in futures]
 
 
@@ -147,14 +161,22 @@ def diagnose_media_servers(arguments: dict[str, Any]) -> ToolResult:
             data={
                 "probe_mode": "configured_endpoints",
                 "network_accessed": False,
-                "counts": {"enabled": 0, "configured": 0, "online": 0, "compatible": 0, "attention": 0},
+                "counts": {
+                    "enabled": 0,
+                    "configured": 0,
+                    "online": 0,
+                    "compatible": 0,
+                    "attention": 0,
+                },
                 "nodes": [],
             },
-            evidence=[Evidence(
-                "configured_media_servers",
-                "未执行远程探测；诊断并发额度暂时已满。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "configured_media_servers",
+                    "未执行远程探测；诊断并发额度暂时已满。",
+                    _now(),
+                )
+            ],
             suggestions=["请稍后重新运行媒体服务器兼容性诊断。"],
             error="媒体服务器兼容性诊断当前繁忙。",
         )
@@ -169,14 +191,22 @@ def diagnose_media_servers(arguments: dict[str, Any]) -> ToolResult:
             data={
                 "probe_mode": "configured_endpoints",
                 "network_accessed": True,
-                "counts": {"enabled": 0, "configured": 0, "online": 0, "compatible": 0, "attention": 0},
+                "counts": {
+                    "enabled": 0,
+                    "configured": 0,
+                    "online": 0,
+                    "compatible": 0,
+                    "attention": 0,
+                },
                 "nodes": [],
             },
-            evidence=[Evidence(
-                "configured_media_servers",
-                "已尝试读取当前媒体服务器配置并执行固定系统信息探测；未返回地址、名称或访问凭据。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "configured_media_servers",
+                    "已尝试读取当前媒体服务器配置并执行固定系统信息探测；未返回地址、名称或访问凭据。",
+                    _now(),
+                )
+            ],
             suggestions=["请稍后重试，或先分别测试 Jellyfin 与兼容节点连接。"],
             error="媒体服务器兼容性诊断当前不可用。",
         )
@@ -189,8 +219,7 @@ def diagnose_media_servers(arguments: dict[str, Any]) -> ToolResult:
     online = sum(bool(node["online"]) for node in nodes)
     compatible = sum(node["compatibility"] == "compatible" for node in nodes)
     attention = sum(
-        node["enabled"] and node["compatibility"] != "compatible"
-        for node in nodes
+        node["enabled"] and node["compatibility"] != "compatible" for node in nodes
     )
     network_accessed = any(
         node["connection_status"] not in {"disabled", "not_configured"}
@@ -219,17 +248,30 @@ def diagnose_media_servers(arguments: dict[str, Any]) -> ToolResult:
     if "configuration_incomplete" in reasons:
         suggestions.append("请在设置中补全已启用节点的地址与访问凭据。")
     if "use_legacy_slot" in reasons:
-        suggestions.append("Emby 或 Jellyfin 10.x 应配置在 Emby / Jellyfin 10.x 兼容节点。")
+        suggestions.append(
+            "Emby 或 Jellyfin 10.x 应配置在 Emby / Jellyfin 10.x 兼容节点。"
+        )
     if "use_jellyfin12_slot" in reasons:
         suggestions.append("Jellyfin 12 及以上版本应配置在 Jellyfin 12 节点。")
     if reasons & {
-        "request_timeout", "connection_failed", "authentication_failed", "system_info_not_found",
-        "upstream_http_error", "invalid_system_info_response", "unexpected_upstream_failure",
+        "request_timeout",
+        "connection_failed",
+        "authentication_failed",
+        "system_info_not_found",
+        "upstream_http_error",
+        "invalid_system_info_response",
+        "unexpected_upstream_failure",
         "redirect_blocked",
     }:
         suggestions.append("请检查媒体服务器运行状态、鉴权和反向代理路径后重试。")
-    if reasons & {"version_unrecognized", "product_unrecognized", "jellyfin_major_not_classified"}:
-        suggestions.append("当前版本无法自动归类，请核对产品类型与主版本后选择正确节点。")
+    if reasons & {
+        "version_unrecognized",
+        "product_unrecognized",
+        "jellyfin_major_not_classified",
+    }:
+        suggestions.append(
+            "当前版本无法自动归类，请核对产品类型与主版本后选择正确节点。"
+        )
     if enabled == 0:
         suggestions.append("可在设置中启用 Jellyfin 12 或 Emby / Jellyfin 10.x 节点。")
 
@@ -249,11 +291,13 @@ def diagnose_media_servers(arguments: dict[str, Any]) -> ToolResult:
             },
             "nodes": nodes,
         },
-        evidence=[Evidence(
-            "configured_media_servers",
-            "使用服务端当前生效配置探测固定系统信息接口；仅返回产品类别、受限版本号和兼容性结论。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "configured_media_servers",
+                "使用服务端当前生效配置探测固定系统信息接口；仅返回产品类别、受限版本号和兼容性结论。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
         error="" if ok else summary,
     )

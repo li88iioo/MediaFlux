@@ -1,19 +1,19 @@
 """统一 Provider Gateway 的 Agent 工具入口。"""
+
 from __future__ import annotations
 
 import re
 import threading
 from typing import Any
 
+from app.agent.errors import AgentToolError
 from app.agent.models import ToolContext, ToolResult
 from app.agent.provider_gateway import ProviderGateway
 from app.agent.provider_models import ProviderGatewayError
 from app.agent.provider_operations import build_provider_catalog
 from app.agent.providers.media_server import MediaServerProviderTransport
 from app.agent.providers.qbittorrent import QBittorrentProviderTransport
-from app.agent.registry import AgentToolError
 from app.repositories.agent_provider_plans import (
-    get_latest_prepared_provider_plan,
     invalidate_provider_plans_for_owner,
 )
 
@@ -89,11 +89,11 @@ def provider_capabilities_arguments(arguments: dict[str, Any]) -> dict[str, Any]
 
 def provider_query_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict) or set(arguments) != {
-        "profile_ref", "operation", "arguments"
+        "profile_ref",
+        "operation",
+        "arguments",
     }:
-        raise AgentToolError(
-            "Provider 查询只接受 profile_ref、operation 和 arguments"
-        )
+        raise AgentToolError("Provider 查询只接受 profile_ref、operation 和 arguments")
     profile_ref = str(arguments.get("profile_ref") or "").strip()
     operation = str(arguments.get("operation") or "").strip().casefold()
     payload = arguments.get("arguments")
@@ -115,9 +115,7 @@ def list_provider_capabilities(arguments: dict[str, Any]) -> ToolResult:
     return get_provider_gateway().capabilities(**normalized)
 
 
-def query_provider(
-    arguments: dict[str, Any], context: ToolContext
-) -> ToolResult:
+def query_provider(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
     normalized = provider_query_arguments(arguments)
     try:
         return get_provider_gateway().query(context=context, **normalized)
@@ -147,20 +145,6 @@ def preview_provider_change(
         return get_provider_gateway().preview_change(context=context, **normalized)
     except ProviderGatewayError as exc:
         raise AgentToolError(exc.safe_message, code=exc.code) from exc
-
-
-def latest_provider_change_followup_arguments(
-    context: ToolContext,
-) -> dict[str, Any]:
-    """从 owner/session 私有计划仓恢复最近一次 Provider 预检引用。"""
-    if not context.owner:
-        raise AgentToolError(
-            "Provider 写计划续接需要已登录会话", code="identity_required"
-        )
-    plan = get_latest_prepared_provider_plan(
-        owner=context.owner, session_id=context.session_id
-    )
-    return {"plan_ref": str(plan["plan_ref"])}
 
 
 def prepare_provider_change_execution(

@@ -1,22 +1,22 @@
 """单条识别规则启停的参数、确认、陈旧快照与自然语言路由回归。"""
+
 from __future__ import annotations
 
 import json
 from unittest.mock import patch
 
 from app import database as db
-from app.agent.orchestrator import (
-    is_recognition_rule_control_message,
-    recognition_rule_enabled_request,
-)
 from app.agent.rate_limit import agent_rate_limiter
-from app.agent.recognition_toggle_actions import recognition_rule_enabled_arguments
-from app.agent.registry import AgentToolError
-from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.modules import (
     recognition_knowledge,
     recognition_preprocess_rules,
     tmdb_regex_rules,
+)
+from tests.agent_kernel_test_harness import (
+    get_kernel_test_service as get_agent_service,
+)
+from tests.agent_kernel_test_harness import (
+    reset_kernel_test_service as reset_agent_service_for_tests,
 )
 from tests.support import IsolatedDatabaseTestCase
 
@@ -43,40 +43,46 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
 
     @staticmethod
     def _preprocess_rule(*, disabled: bool = False) -> dict:
-        return recognition_preprocess_rules.create_rule({
-            "name": "SECRET preprocess rule",
-            "matcher_type": "text",
-            "pattern": "SECRET_PATTERN",
-            "scope": "filename",
-            "action": "replace",
-            "replacement": "SECRET_REPLACEMENT",
-            "numeric_value": None,
-            "priority": 50,
-            "disabled": disabled,
-        })
+        return recognition_preprocess_rules.create_rule(
+            {
+                "name": "SECRET preprocess rule",
+                "matcher_type": "text",
+                "pattern": "SECRET_PATTERN",
+                "scope": "filename",
+                "action": "replace",
+                "replacement": "SECRET_REPLACEMENT",
+                "numeric_value": None,
+                "priority": 50,
+                "disabled": disabled,
+            }
+        )
 
     @staticmethod
     def _regex_rule(*, disabled: bool = False) -> dict:
-        return tmdb_regex_rules.create_rule({
-            "name": "SECRET regex rule",
-            "pattern": "SECRET_REGEX",
-            "match_target": "filename",
-            "tmdb_id": "987654",
-            "media_type": "tv",
-            "season_override": 2,
-            "priority": 100,
-            "disabled": disabled,
-        })
+        return tmdb_regex_rules.create_rule(
+            {
+                "name": "SECRET regex rule",
+                "pattern": "SECRET_REGEX",
+                "match_target": "filename",
+                "tmdb_id": "987654",
+                "media_type": "tv",
+                "season_override": 2,
+                "priority": 100,
+                "disabled": disabled,
+            }
+        )
 
     @staticmethod
     def _knowledge_entry(*, disabled: bool = False) -> dict:
-        return recognition_knowledge.create_entry({
-            "knowledge_type": "release_group",
-            "canonical_value": "SecretGroup",
-            "aliases": ["Secret-Group"],
-            "source": "user",
-            "disabled": disabled,
-        })
+        return recognition_knowledge.create_entry(
+            {
+                "knowledge_type": "release_group",
+                "canonical_value": "SecretGroup",
+                "aliases": ["Secret-Group"],
+                "source": "user",
+                "disabled": disabled,
+            }
+        )
 
     @staticmethod
     def _serialized(value: object) -> str:
@@ -96,65 +102,11 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
         ):
             self.assertNotIn(private, serialized)
 
-    def test_validator_registry_and_natural_language_are_strict(self):
-        self.assertEqual(
-            recognition_rule_enabled_arguments({
-                "rule_type": "preprocess_rule",
-                "rule_id": 12,
-                "enabled": False,
-            }),
-            {"rule_type": "preprocess_rule", "rule_id": 12, "enabled": False},
-        )
-        for arguments in (
-            {},
-            {"rule_type": "preprocess_rule", "rule_id": 0, "enabled": True},
-            {"rule_type": "preprocess_rule", "rule_id": True, "enabled": True},
-            {"rule_type": "unknown", "rule_id": 1, "enabled": True},
-            {"rule_type": "preprocess_rule", "rule_id": 1, "enabled": 1},
-            {
-                "rule_type": "preprocess_rule",
-                "rule_id": 1,
-                "enabled": True,
-                "pattern": "attacker",
-            },
-        ):
-            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
-                recognition_rule_enabled_arguments(arguments)
-
-        tools = {item["name"]: item for item in get_agent_service().capabilities()["tools"]}
-        tool = tools["recognition.set_rule_enabled"]
-        self.assertEqual(tool["risk"], "low_write")
-        self.assertTrue(tool["requires_confirmation"])
-
-        self.assertEqual(
-            recognition_rule_enabled_request("启用识别预处理规则 12"),
-            {"rule_type": "preprocess_rule", "rule_id": 12, "enabled": True},
-        )
-        self.assertEqual(
-            recognition_rule_enabled_request("停用 TMDB 正则规则 ID 3"),
-            {"rule_type": "tmdb_regex_rule", "rule_id": 3, "enabled": False},
-        )
-        self.assertEqual(
-            recognition_rule_enabled_request("禁用识别知识条目第 8 条"),
-            {"rule_type": "knowledge_entry", "rule_id": 8, "enabled": False},
-        )
-        self.assertTrue(is_recognition_rule_control_message("启用预处理规则"))
-        for message in (
-            "启用全部预处理规则",
-            "启用预处理规则 1 和 2",
-            "启用并停用预处理规则 1",
-            "能不能启用预处理规则 1？",
-            "修改预处理规则 1 的优先级",
-        ):
-            with self.subTest(message=message):
-                self.assertIsNone(recognition_rule_enabled_request(message))
-
     def test_confirmed_changes_are_single_row_and_outputs_are_safe(self):
         preprocess = self._preprocess_rule()
         regex = self._regex_rule()
         knowledge = self._knowledge_entry()
         service = get_agent_service()
-
         cases = (
             ("preprocess_rule", preprocess["id"], "recognition_preprocess_rules"),
             ("tmdb_regex_rule", regex["id"], "tmdb_regex_rules"),
@@ -173,8 +125,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
                     ).fetchone()
                 self.assertEqual(int(before["disabled"]), 0)
                 confirmed = service.confirm(
-                    prepared["action_plan"]["plan_id"],
-                    owner=f"owner-{rule_type}",
+                    prepared["action_plan"]["plan_id"], owner=f"owner-{rule_type}"
                 )
                 with db.get_conn() as conn:
                     after = conn.execute(
@@ -185,10 +136,9 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
                     self.assertEqual(int(after["user_modified"]), 1)
                 self.assertEqual(confirmed["result"]["status"], "completed")
                 self.assertEqual(confirmed["result"]["data"]["affected"], 1)
-                self._assert_private_values_absent({
-                    "prepared": prepared,
-                    "confirmed": confirmed,
-                })
+                self._assert_private_values_absent(
+                    {"prepared": prepared, "confirmed": confirmed}
+                )
 
     def test_runtime_cache_is_invalidated_for_cached_rule_types(self):
         preprocess = self._preprocess_rule()
@@ -203,15 +153,12 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             owner="owner-preprocess",
         )
         with patch(
-            "app.agent.recognition_toggle_actions."
-            "recognition_preprocess_rules.invalidate_active_cache"
+            "app.agent.recognition_toggle_actions.recognition_preprocess_rules.invalidate_active_cache"
         ) as invalidate:
             service.confirm(
-                prepared["action_plan"]["plan_id"],
-                owner="owner-preprocess",
+                prepared["action_plan"]["plan_id"], owner="owner-preprocess"
             )
         invalidate.assert_called_once_with()
-
         knowledge = self._knowledge_entry()
         reset_agent_service_for_tests()
         service = get_agent_service()
@@ -225,13 +172,9 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             owner="owner-knowledge",
         )
         with patch(
-            "app.agent.recognition_toggle_actions."
-            "recognition_knowledge.invalidate_active_cache"
+            "app.agent.recognition_toggle_actions.recognition_knowledge.invalidate_active_cache"
         ) as invalidate:
-            service.confirm(
-                prepared["action_plan"]["plan_id"],
-                owner="owner-knowledge",
-            )
+            service.confirm(prepared["action_plan"]["plan_id"], owner="owner-knowledge")
         invalidate.assert_called_once_with()
 
     def test_confirmation_rejects_stale_identity_change(self):
@@ -239,11 +182,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
         service = get_agent_service()
         prepared = service.prepare(
             "recognition.set_rule_enabled",
-            {
-                "rule_type": "tmdb_regex_rule",
-                "rule_id": rule["id"],
-                "enabled": False,
-            },
+            {"rule_type": "tmdb_regex_rule", "rule_id": rule["id"], "enabled": False},
             owner="owner",
         )
         with db.get_conn() as conn:
@@ -251,9 +190,7 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
                 "UPDATE tmdb_regex_rules SET name=?,updated_at=? WHERE id=?",
                 ("SECRET changed name", db.now(), rule["id"]),
             )
-        confirmed = service.confirm(
-            prepared["action_plan"]["plan_id"], owner="owner"
-        )
+        confirmed = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
         self.assertEqual(confirmed["result"]["status"], "conflict")
         with db.get_conn() as conn:
             row = conn.execute(
@@ -261,27 +198,3 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             ).fetchone()
         self.assertEqual(int(row["disabled"]), 0)
         self.assertNotIn("SECRET changed name", self._serialized(confirmed))
-
-    def test_orchestrator_prepares_exact_target_and_clarifies_missing_id(self):
-        rule = self._preprocess_rule()
-        service = get_agent_service()
-        prepared = service.query(
-            f"停用识别预处理规则 {rule['id']}",
-            owner="owner",
-            present=False,
-        )
-        self.assertEqual(prepared["mode"], "confirmation_required")
-        self.assertEqual(
-            prepared["tool_call"]["name"], "recognition.set_rule_enabled"
-        )
-        clarified = service.query(
-            "停用识别预处理规则", owner="owner", present=False
-        )
-        self.assertEqual(clarified["result"]["status"], "clarification_required")
-        self.assertNotIn("confirmation", clarified)
-
-
-if __name__ == "__main__":
-    import unittest
-
-    unittest.main()

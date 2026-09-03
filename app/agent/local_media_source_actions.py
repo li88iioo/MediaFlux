@@ -1,15 +1,17 @@
 """本地媒体来源触发器的安全摘要与精确启停动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.local_media_scheduler import get_local_media_scheduler
 
@@ -141,8 +143,7 @@ def list_local_media_source_summaries(_arguments: dict[str, Any]) -> ToolResult:
     with db.get_conn() as conn:
         rows = _source_rows(conn)
         sources = [
-            _public_summary(conn, row, index)
-            for index, row in enumerate(rows, start=1)
+            _public_summary(conn, row, index) for index, row in enumerate(rows, start=1)
         ]
     enabled_count = sum(int(item["enabled"]) for item in sources)
     return ToolResult(
@@ -150,21 +151,25 @@ def list_local_media_source_summaries(_arguments: dict[str, Any]) -> ToolResult:
         status="healthy" if sources else "not_configured",
         summary=(
             f"共有 {len(sources)} 个本地媒体来源，{enabled_count} 个接管 qB 完成任务"
-            if sources else "尚未配置本地媒体来源"
+            if sources
+            else "尚未配置本地媒体来源"
         ),
         data={
             "total": len(sources),
             "enabled_count": enabled_count,
             "sources": sources,
         },
-        evidence=[Evidence(
-            source="local_media_configuration",
-            description="仅返回公开序号、触发状态、工作模式、媒体类型和目标分类统计；未返回来源名称、路径、下载器配置、媒体库标识或凭据。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="local_media_configuration",
+                description="仅返回公开序号、触发状态、工作模式、媒体类型和目标分类统计；未返回来源名称、路径、下载器配置、媒体库标识或凭据。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=(
             ["可按来源编号查看详情，或精确启停 qB 完成自动接管。"]
-            if sources else ["请先在本地媒体页面添加来源。"]
+            if sources
+            else ["请先在本地媒体页面添加来源。"]
         ),
     )
 
@@ -179,13 +184,17 @@ def get_local_media_source_summary(arguments: dict[str, Any]) -> ToolResult:
         status="healthy" if source["target_count"] else "attention",
         summary=f"本地媒体来源 {source_number} 的触发状态已读取",
         data=source,
-        evidence=[Evidence(
-            source="local_media_configuration",
-            description="仅读取指定公开序号的安全摘要；未返回名称、路径、下载器配置、媒体库标识或凭据。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="local_media_configuration",
+                description="仅读取指定公开序号的安全摘要；未返回名称、路径、下载器配置、媒体库标识或凭据。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=(
-            [] if source["target_count"] else ["该来源尚未配置媒体库目标，启用触发器前建议先完成目标映射。"]
+            []
+            if source["target_count"]
+            else ["该来源尚未配置媒体库目标，启用触发器前建议先完成目标映射。"]
         ),
     )
 
@@ -227,11 +236,13 @@ def prepare_set_local_media_source_trigger_enabled(
             "affected": 1,
             "effects": effects,
         },
-        evidence=[Evidence(
-            source="local_media_configuration",
-            description="仅核对公开来源序号、目标触发状态和服务端私有配置快照；未返回目录、下载器配置或凭据。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="local_media_configuration",
+                description="仅核对公开来源序号、目标触发状态和服务端私有配置快照；未返回目录、下载器配置或凭据。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=["该操作可通过相反的启停命令恢复。"],
     ), _fingerprint(snapshot)
 
@@ -295,7 +306,9 @@ def set_local_media_source_trigger_enabled_confirmed(
     operation = "启用" if requested else "停用"
     suggestions = ["如需恢复，可对同一来源和触发方式执行相反的启停操作。"]
     if not runtime_refreshed:
-        suggestions.append("设置已保存，但当前进程调度器未能立即唤醒；请稍后检查运行状态。")
+        suggestions.append(
+            "设置已保存，但当前进程调度器未能立即唤醒；请稍后检查运行状态。"
+        )
     return ToolResult(
         ok=True,
         status="completed",
@@ -308,10 +321,12 @@ def set_local_media_source_trigger_enabled_confirmed(
             "affected": 1,
             "runtime_refreshed": runtime_refreshed,
         },
-        evidence=[Evidence(
-            source="local_media_configuration",
-            description="只更新了指定来源的一项触发状态，并尝试唤醒本地媒体调度器；未修改目录、规则、目标或凭据。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="local_media_configuration",
+                description="只更新了指定来源的一项触发状态，并尝试唤醒本地媒体调度器；未修改目录、规则、目标或凭据。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=suggestions,
     )

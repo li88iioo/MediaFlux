@@ -11,9 +11,9 @@ from datetime import datetime
 from typing import Any
 
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.errors import AgentToolError
 from app.agent.guangya_workspace_actions import latest_guangya_observation_ref
 from app.agent.models import Evidence, ToolContext, ToolResult
-from app.agent.registry import AgentToolError
 from app.agent.session_context import (
     AgentContextWriteGuard,
     AgentSessionContextRepository,
@@ -31,7 +31,7 @@ from app.modules.guangya_fs_change import (
 from app.modules.guangya_workspace import (
     GuangYaWorkspaceError,
     GuangYaWorkspaceStale,
-    load_directory_observation,
+    load_directory_observation_set,
     valid_object_handle,
     valid_observation_ref,
 )
@@ -102,6 +102,7 @@ def _safe_preview(value: object) -> dict[str, Any] | None:
                 "total",
                 "rename_count",
                 "move_count",
+                "relocate_count",
                 "trash_count",
                 "create_directory_count",
             )
@@ -300,9 +301,10 @@ def guangya_fs_change_preview_arguments(arguments: dict[str, Any]) -> dict[str, 
     if ref and not valid_observation_ref(ref):
         raise AgentToolError("observation_ref 格式无效")
     raw_operations = arguments.get("operations")
-    if not isinstance(raw_operations, list) or not 1 <= len(raw_operations) <= 50:
-        raise AgentToolError("operations 必须包含 1 到 50 项操作")
+    if not isinstance(raw_operations, list) or not 1 <= len(raw_operations) <= 200:
+        raise AgentToolError("operations 必须包含 1 到 200 项操作")
     operations: list[dict[str, Any]] = []
+    effective_operation_count = 0
     for raw in raw_operations:
         if not isinstance(raw, dict):
             raise AgentToolError("光鸭变更操作必须是对象")
@@ -310,9 +312,83 @@ def guangya_fs_change_preview_arguments(arguments: dict[str, Any]) -> dict[str, 
         expected = {
             "rename": {"op", "object_ref", "new_name"},
             "move": {"op", "object_ref", "target_path"},
+            "relocate": {"op", "object_ref", "target_path", "new_name"},
             "trash": {"op", "object_ref"},
             "create_directory": {"op", "parent_path", "name"},
         }.get(op)
+        if op == "batch_relocate":
+            allowed = {
+                "op",
+                "items",
+                "target_path",
+                "title",
+                "naming",
+                "season",
+                "episode_padding",
+            }
+            if set(raw) - allowed or not {
+                "op",
+                "items",
+                "target_path",
+            }.issubset(raw):
+                raise AgentToolError("光鸭批量规整操作字段无效")
+            raw_items = raw.get("items")
+            if not isinstance(raw_items, list) or not 1 <= len(raw_items) <= 200:
+                raise AgentToolError("batch_relocate.items 必须包含 1 到 200 项")
+            items: list[dict[str, Any]] = []
+            seen_refs: set[str] = set()
+            for item in raw_items:
+                if not isinstance(item, dict) or set(item) != {
+                    "object_ref",
+                    "episode",
+                }:
+                    raise AgentToolError("批量规整条目字段无效")
+                object_ref = str(item.get("object_ref") or "").strip().upper()
+                if not valid_object_handle(object_ref) or object_ref in seen_refs:
+                    raise AgentToolError("批量规整 object_ref 无效或重复")
+                episode = item.get("episode")
+                if type(episode) is not int or not 1 <= episode <= 9999:
+                    raise AgentToolError("批量规整 episode 必须在 1 到 9999 之间")
+                seen_refs.add(object_ref)
+                items.append({"object_ref": object_ref, "episode": episode})
+            target_path = _normalize_path(raw.get("target_path"), field="target_path")
+            title = raw.get("title")
+            if title in {None, ""}:
+                title = target_path.rsplit("/", 1)[-1]
+            if not isinstance(title, str) or not 1 <= len(title.strip()) <= 180:
+                raise AgentToolError("批量规整 title 长度必须在 1 到 180 之间")
+            naming = str(raw.get("naming") or "absolute").strip().casefold()
+            if naming not in {"season_episode", "absolute"}:
+                raise AgentToolError("batch_relocate.naming 无效")
+            season = raw.get("season", 1)
+            if type(season) is not int or not 0 <= season <= 999:
+                raise AgentToolError("batch_relocate.season 必须在 0 到 999 之间")
+            episode_padding = raw.get("episode_padding", 2)
+            if type(episode_padding) is not int or not 2 <= episode_padding <= 4:
+                raise AgentToolError("episode_padding 必须在 2 到 4 之间")
+            normalized = {
+                "op": op,
+                "items": items,
+                "target_path": target_path,
+                "title": title.strip(),
+                "naming": naming,
+                "season": season,
+                "episode_padding": episode_padding,
+            }
+            operations.append(normalized)
+            effective_operation_count += len(items)
+            continue
+        if op == "create_directory" and set(raw) == {"op", "path"}:
+            path = _normalize_path(raw.get("path"), field="path")
+            if path == "/":
+                raise AgentToolError("不能把根目录作为新建目录")
+            parent_path, _, name = path.rpartition("/")
+            raw = {
+                "op": op,
+                "parent_path": parent_path or "/",
+                "name": name,
+            }
+            expected = {"op", "parent_path", "name"}
         if expected is None or set(raw) != expected:
             raise AgentToolError("光鸭变更操作字段与 op 不匹配")
         normalized: dict[str, Any] = {"op": op}
@@ -321,12 +397,12 @@ def guangya_fs_change_preview_arguments(arguments: dict[str, Any]) -> dict[str, 
             if not valid_object_handle(object_ref):
                 raise AgentToolError("object_ref 格式无效")
             normalized["object_ref"] = object_ref
-        if op == "rename":
+        if op in {"rename", "relocate"}:
             name = raw.get("new_name")
             if not isinstance(name, str) or not 1 <= len(name.strip()) <= 255:
                 raise AgentToolError("new_name 长度必须在 1 到 255 之间")
             normalized["new_name"] = name.strip()
-        elif op == "move":
+        if op in {"move", "relocate"}:
             normalized["target_path"] = _normalize_path(
                 raw.get("target_path"), field="target_path"
             )
@@ -339,6 +415,9 @@ def guangya_fs_change_preview_arguments(arguments: dict[str, Any]) -> dict[str, 
                 raise AgentToolError("name 长度必须在 1 到 255 之间")
             normalized["name"] = name.strip()
         operations.append(normalized)
+        effective_operation_count += 1
+    if effective_operation_count > 200:
+        raise AgentToolError("展开后的光鸭变更操作不能超过 200 项")
     trigger_strm = arguments.get("trigger_strm", True)
     if type(trigger_strm) is not bool:
         raise AgentToolError("trigger_strm 必须是布尔值")
@@ -364,6 +443,22 @@ def _public_error(exc: Exception) -> AgentToolError:
     return AgentToolError("光鸭变更计划当前不可用", code="unavailable")
 
 
+def _operation_object_refs(operations: list[dict[str, Any]]) -> tuple[str, ...]:
+    refs: list[str] = []
+    for operation in operations:
+        if str(operation.get("op") or "").strip().casefold() == "batch_relocate":
+            refs.extend(
+                str(item.get("object_ref") or "").strip().upper()
+                for item in operation.get("items") or ()
+                if isinstance(item, dict)
+            )
+            continue
+        object_ref = str(operation.get("object_ref") or "").strip().upper()
+        if object_ref:
+            refs.append(object_ref)
+    return tuple(dict.fromkeys(refs))
+
+
 def preview_guangya_fs_change(
     arguments: dict[str, Any], context: ToolContext
 ) -> ToolResult:
@@ -378,7 +473,11 @@ def preview_guangya_fs_change(
     client: GuangYaClient | None = None
     plan: dict[str, Any] | None = None
     try:
-        observation = load_directory_observation(ref, owner=context.owner)
+        observation = load_directory_observation_set(
+            ref,
+            owner=context.owner,
+            object_refs=_operation_object_refs(list(arguments["operations"])),
+        )
         client = GuangYaClient()
         if not client.logged_in:
             raise AgentToolError("光鸭账号尚未连接", code="precondition_failed")
@@ -403,6 +502,7 @@ def preview_guangya_fs_change(
         "total": max(0, int(stats.get("total") or 0)),
         "rename_count": max(0, int(stats.get("rename") or 0)),
         "move_count": max(0, int(stats.get("move") or 0)),
+        "relocate_count": max(0, int(stats.get("relocate") or 0)),
         "trash_count": max(0, int(stats.get("trash") or 0)),
         "create_directory_count": max(0, int(stats.get("create_directory") or 0)),
         "sample_changes": [
@@ -474,8 +574,10 @@ def prepare_guangya_fs_change_confirmation(
             expected_fingerprint=flow.fingerprint,
         )
         client = GuangYaClient()
+        raw_generation = plan.get("credential_generation")
+        expected_generation = int(raw_generation) if raw_generation is not None else -1
         if not client.logged_in or int(client.credential_generation) != int(
-            plan.get("credential_generation") or -1
+            expected_generation
         ):
             raise GuangYaFSChangeStale("光鸭登录凭据已变化，请重新预览")
     except Exception as exc:

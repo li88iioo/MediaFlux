@@ -1,8 +1,7 @@
 """服务端一次性确认票据。"""
+
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
@@ -11,10 +10,13 @@ import secrets
 import threading
 import time
 import unicodedata
-from typing import Any, Callable
+from collections.abc import Callable
+from copy import deepcopy
+from dataclasses import dataclass, field
+from typing import Any
 
 from app.agent.action_plan_id import normalize_action_plan_id
-from app.agent.registry import AgentToolError
+from app.agent.errors import AgentToolError
 from app.modules.web_secret import get_web_secret
 
 
@@ -44,10 +46,7 @@ def confirmation_context_fingerprint(value: Any, *, domain: str) -> str:
     ) as exc:
         raise ValueError("确认上下文无法稳定序列化") from exc
     message = (
-        b"mediaflux-agent-confirmation-context:v1\0"
-        + domain_bytes
-        + b"\0"
-        + payload
+        b"mediaflux-agent-confirmation-context:v1\0" + domain_bytes + b"\0" + payload
     )
     return hmac.new(
         get_web_secret().encode("utf-8"), message, hashlib.sha256
@@ -67,17 +66,48 @@ class ConfirmationTicket:
     confirmation_contract: dict[str, Any] = field(default_factory=dict)
 
 
-_CONFIRMATION_REPLY_PHRASES = frozenset({
-    "确认", "确认执行", "确定", "确定执行", "同意", "执行", "开始执行",
-    "好的", "好的执行", "好的帮我执行", "好，执行", "好,执行",
-    "确认吧", "确认执行吧", "执行吧", "可以执行", "就这样执行",
-    "ok", "yes", "confirm",
-})
-_CANCELLATION_REPLY_PHRASES = frozenset({
-    "取消", "取消执行", "算了", "不要了", "不执行", "放弃",
-    "先别执行", "别执行", "不用了", "撤销", "撤销操作", "停止执行",
-    "cancel", "no",
-})
+_CONFIRMATION_REPLY_PHRASES = frozenset(
+    {
+        "确认",
+        "确认执行",
+        "确定",
+        "确定执行",
+        "同意",
+        "执行",
+        "开始执行",
+        "好的",
+        "好的执行",
+        "好的帮我执行",
+        "好，执行",
+        "好,执行",
+        "确认吧",
+        "确认执行吧",
+        "执行吧",
+        "可以执行",
+        "就这样执行",
+        "ok",
+        "yes",
+        "confirm",
+    }
+)
+_CANCELLATION_REPLY_PHRASES = frozenset(
+    {
+        "取消",
+        "取消执行",
+        "算了",
+        "不要了",
+        "不执行",
+        "放弃",
+        "先别执行",
+        "别执行",
+        "不用了",
+        "撤销",
+        "撤销操作",
+        "停止执行",
+        "cancel",
+        "no",
+    }
+)
 
 
 def _normalize_expected_owner_generation(value: Any) -> int | None:
@@ -153,9 +183,7 @@ def _copy_ticket(
         context_fingerprint=ticket.context_fingerprint,
         expires_at=ticket.expires_at,
         owner_generation=(
-            ticket.owner_generation
-            if owner_generation is None
-            else owner_generation
+            ticket.owner_generation if owner_generation is None else owner_generation
         ),
         followup_context=deepcopy(ticket.followup_context),
         confirmation_contract=deepcopy(ticket.confirmation_contract),
@@ -209,7 +237,9 @@ class ConfirmationStore:
     ) -> ConfirmationTicket:
         owner_key = str(owner or "").strip()
         if not owner_key:
-            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+            raise AgentToolError(
+                "当前会话无法创建确认请求", code="confirmation_invalid"
+            )
         normalized_tool_name = str(tool_name or "").strip()
         if not normalized_tool_name:
             raise AgentToolError(
@@ -229,7 +259,9 @@ class ConfirmationStore:
         now = self._clock()
         with self._lock:
             self._prune_locked(now)
-            owner_generation = self._owner_generation_locked(owner_key, now=now, touch=True)
+            owner_generation = self._owner_generation_locked(
+                owner_key, now=now, touch=True
+            )
             if (
                 expected_generation is not None
                 and expected_generation != owner_generation
@@ -283,9 +315,7 @@ class ConfirmationStore:
             self._tickets[confirmation_id] = ticket
             return _copy_ticket(ticket)
 
-    def ticket_owner_match(
-        self, *, owner: str, confirmation_id: str
-    ) -> bool | None:
+    def ticket_owner_match(self, *, owner: str, confirmation_id: str) -> bool | None:
         """判断有效票据是否属于 owner；不存在/过期返回 ``None``，且不消费。"""
         owner_key = str(owner or "").strip()
         ticket_id = normalize_action_plan_id(confirmation_id)
@@ -303,8 +333,13 @@ class ConfirmationStore:
             return secrets.compare_digest(ticket.owner, owner_key)
 
     def claim_and_rotate_owner(
-        self, *, owner: str, confirmation_id: str, record_execution: bool = False,
+        self,
+        *,
+        owner: str,
+        confirmation_id: str,
+        record_execution: bool = False,
         execution_risk_for: Callable[[str], Any] | None = None,
+        execution_owner: str = "",
     ) -> ConfirmationTicket:
         """原子领取一张票据并推进 owner epoch，撤销同会话其余票据。"""
         owner_key = str(owner or "").strip()
@@ -317,11 +352,12 @@ class ConfirmationStore:
                 ticket is None
                 or not owner_key
                 or not secrets.compare_digest(ticket.owner, owner_key)
-                or ticket.owner_generation != self._owner_generation_locked(
-                    owner_key, now=now, touch=True
-                )
+                or ticket.owner_generation
+                != self._owner_generation_locked(owner_key, now=now, touch=True)
             ):
-                raise AgentToolError("确认请求无效或已过期", code="confirmation_invalid")
+                raise AgentToolError(
+                    "确认请求无效或已过期", code="confirmation_invalid"
+                )
             # 先确保 epoch 能推进，再写入执行审计；否则随机源异常会留下
             # “已领取”记录，但票据仍可重试。
             generation = self._new_owner_generation_locked()
@@ -329,17 +365,28 @@ class ConfirmationStore:
                 from app.agent.action_history import record_confirmation_claimed
                 from app.agent.models import RiskLevel
 
+                contract_risk = ticket.confirmation_contract.get("audit_risk")
+                try:
+                    default_risk = RiskLevel(str(contract_risk or "write"))
+                except ValueError:
+                    default_risk = RiskLevel.WRITE
                 record_confirmation_claimed(
-                    owner=owner_key,
+                    owner=str(execution_owner or "").strip() or owner_key,
                     confirmation_id=ticket.confirmation_id,
                     owner_generation=ticket.owner_generation,
                     tool_name=ticket.tool_name,
                     risk=(
                         execution_risk_for(ticket.tool_name)
                         if execution_risk_for is not None
-                        else RiskLevel.WRITE
+                        else default_risk
                     ),
-                    confirmation_contract=ticket.confirmation_contract,
+                    confirmation_contract=(
+                        ticket.confirmation_contract.get("audit_contract")
+                        if isinstance(
+                            ticket.confirmation_contract.get("audit_contract"), dict
+                        )
+                        else ticket.confirmation_contract
+                    ),
                     action_arguments=ticket.arguments,
                 )
             self._owner_generations[owner_key] = (generation, now)
@@ -379,7 +426,11 @@ class ConfirmationStore:
         with self._lock:
             self._prune_locked(now)
             ticket = self._tickets.get(ticket_id)
-            if ticket is None or not owner_key or not secrets.compare_digest(ticket.owner, owner_key):
+            if (
+                ticket is None
+                or not owner_key
+                or not secrets.compare_digest(ticket.owner, owner_key)
+            ):
                 return False
             self._tickets.pop(ticket_id, None)
             return True
@@ -390,7 +441,9 @@ class ConfirmationStore:
         """推进 owner epoch。默认撤销票据；查询抢占时可保留当前有效票据。"""
         owner_key = str(owner or "").strip()
         if not owner_key:
-            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+            raise AgentToolError(
+                "当前会话无法创建确认请求", code="confirmation_invalid"
+            )
         now = self._clock()
         with self._lock:
             self._prune_locked(now)
@@ -422,7 +475,9 @@ class ConfirmationStore:
     def owner_generation(self, *, owner: str) -> int:
         owner_key = str(owner or "").strip()
         if not owner_key:
-            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+            raise AgentToolError(
+                "当前会话无法创建确认请求", code="confirmation_invalid"
+            )
         with self._lock:
             now = self._clock()
             self._prune_locked(now)
@@ -434,7 +489,9 @@ class ConfirmationStore:
             self._owner_generations.clear()
 
     def _prune_locked(self, now: float) -> None:
-        expired = [key for key, ticket in self._tickets.items() if ticket.expires_at <= now]
+        expired = [
+            key for key, ticket in self._tickets.items() if ticket.expires_at <= now
+        ]
         for key in expired:
             self._tickets.pop(key, None)
         active_owners = {ticket.owner for ticket in self._tickets.values()}
@@ -475,7 +532,9 @@ class ConfirmationStore:
     def _new_owner_generation_locked(self) -> int:
         # 使用不可预测且不复用的 epoch；即使旧 tombstone 被清理，慢 prepare
         # 也无法借由 generation 回退为 0 而在 reset 后重新签发票据。
-        active_generations = {generation for generation, _ in self._owner_generations.values()}
+        active_generations = {
+            generation for generation, _ in self._owner_generations.values()
+        }
         for _ in range(8):
             generation = secrets.randbits(63) or 1
             if generation not in active_generations:
@@ -488,6 +547,7 @@ class ConfirmationStore:
             if token and token not in self._tickets:
                 return token
         raise AgentToolError("暂时无法创建确认请求", code="confirmation_unavailable")
+
 
 class SQLiteConfirmationStore(ConfirmationStore):
     """SQLite-backed confirmation tickets shared by restarts and Web workers."""
@@ -633,12 +693,15 @@ class SQLiteConfirmationStore(ConfirmationStore):
         expected_owner_generation: int | None = None,
         replace_active_ticket: bool = False,
     ) -> ConfirmationTicket:
-        from app import database as db
         import sqlite3
+
+        from app import database as db
 
         owner_key = str(owner or "").strip()
         if not owner_key:
-            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+            raise AgentToolError(
+                "当前会话无法创建确认请求", code="confirmation_invalid"
+            )
         normalized_tool_name = str(tool_name or "").strip()
         if not normalized_tool_name:
             raise AgentToolError(
@@ -673,19 +736,21 @@ class SQLiteConfirmationStore(ConfirmationStore):
                     "会话已重置，请重新生成确认请求",
                     code="confirmation_invalid",
                 )
-            count = int(conn.execute(
-                "SELECT COUNT(*) FROM agent_confirmations"
-            ).fetchone()[0] or 0)
+            count = int(
+                conn.execute("SELECT COUNT(*) FROM agent_confirmations").fetchone()[0]
+                or 0
+            )
             replaced_count = 0
             if replace_active_ticket:
-                replaced_count = int(conn.execute(
-                    "SELECT COUNT(*) FROM agent_confirmations "
-                    "WHERE owner_digest=? AND owner_generation=?",
-                    (owner_digest, owner_generation),
-                ).fetchone()[0] or 0)
-            overflow = max(
-                0, count - replaced_count + 1 - self.max_entries
-            )
+                replaced_count = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM agent_confirmations "
+                        "WHERE owner_digest=? AND owner_generation=?",
+                        (owner_digest, owner_generation),
+                    ).fetchone()[0]
+                    or 0
+                )
+            overflow = max(0, count - replaced_count + 1 - self.max_entries)
             if overflow > 0:
                 if replace_active_ticket:
                     conn.execute(
@@ -754,9 +819,7 @@ class SQLiteConfirmationStore(ConfirmationStore):
             confirmation_contract=normalized_contract,
         )
 
-    def ticket_owner_match(
-        self, *, owner: str, confirmation_id: str
-    ) -> bool | None:
+    def ticket_owner_match(self, *, owner: str, confirmation_id: str) -> bool | None:
         """跨 Worker 判断有效票据归属，不读取动作内容也不消费票据。"""
         from app import database as db
 
@@ -779,15 +842,12 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 return None
             try:
                 ticket_digest = str(row["owner_digest"] or "")
-                ticket_generation = _stored_owner_generation(
-                    row["owner_generation"]
-                )
+                ticket_generation = _stored_owner_generation(row["owner_generation"])
                 expires_at = float(row["expires_at"])
             except (KeyError, IndexError, TypeError, ValueError, OverflowError):
                 return None
             epoch = conn.execute(
-                "SELECT generation FROM agent_confirmation_epochs "
-                "WHERE owner_digest=?",
+                "SELECT generation FROM agent_confirmation_epochs WHERE owner_digest=?",
                 (ticket_digest,),
             ).fetchone()
             if epoch is None or expires_at <= now:
@@ -801,8 +861,13 @@ class SQLiteConfirmationStore(ConfirmationStore):
             return secrets.compare_digest(ticket_digest, requested_digest)
 
     def claim_and_rotate_owner(
-        self, *, owner: str, confirmation_id: str, record_execution: bool = False,
+        self,
+        *,
+        owner: str,
+        confirmation_id: str,
+        record_execution: bool = False,
         execution_risk_for: Callable[[str], Any] | None = None,
+        execution_owner: str = "",
     ) -> ConfirmationTicket:
         """在同一 SQLite 事务中领取票据、推进 epoch 并撤销同 owner 票据。"""
         from app import database as db
@@ -839,9 +904,13 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 epoch_generation = _stored_owner_generation(epoch["generation"])
             except (AgentToolError, TypeError, ValueError, OverflowError):
                 invalid_payload = True
-            if not invalid_payload and claimed_ticket is not None and (
-                claimed_ticket.expires_at <= now
-                or claimed_ticket.owner_generation != epoch_generation
+            if (
+                not invalid_payload
+                and claimed_ticket is not None
+                and (
+                    claimed_ticket.expires_at <= now
+                    or claimed_ticket.owner_generation != epoch_generation
+                )
             ):
                 raise AgentToolError(
                     "确认请求无效或已过期", code="confirmation_invalid"
@@ -851,17 +920,29 @@ class SQLiteConfirmationStore(ConfirmationStore):
                 from app.agent.models import RiskLevel
 
                 tool_name = claimed_ticket.tool_name
+                contract_risk = claimed_ticket.confirmation_contract.get("audit_risk")
+                try:
+                    default_risk = RiskLevel(str(contract_risk or "write"))
+                except ValueError:
+                    default_risk = RiskLevel.WRITE
                 record_confirmation_claimed(
-                    owner=owner_key,
+                    owner=str(execution_owner or "").strip() or owner_key,
                     confirmation_id=claimed_ticket.confirmation_id,
                     owner_generation=claimed_ticket.owner_generation,
                     tool_name=tool_name,
                     risk=(
                         execution_risk_for(tool_name)
                         if execution_risk_for is not None
-                        else RiskLevel.WRITE
+                        else default_risk
                     ),
-                    confirmation_contract=claimed_ticket.confirmation_contract,
+                    confirmation_contract=(
+                        claimed_ticket.confirmation_contract.get("audit_contract")
+                        if isinstance(
+                            claimed_ticket.confirmation_contract.get("audit_contract"),
+                            dict,
+                        )
+                        else claimed_ticket.confirmation_contract
+                    ),
                     action_arguments=claimed_ticket.arguments,
                     connection=conn,
                 )
@@ -965,7 +1046,9 @@ class SQLiteConfirmationStore(ConfirmationStore):
 
         owner_key = str(owner or "").strip()
         if not owner_key:
-            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+            raise AgentToolError(
+                "当前会话无法创建确认请求", code="confirmation_invalid"
+            )
         owner_digest = self._owner_digest(owner_key)
         now = self._clock()
         with db.get_conn() as conn:
@@ -991,7 +1074,9 @@ class SQLiteConfirmationStore(ConfirmationStore):
 
         owner_key = str(owner or "").strip()
         if not owner_key:
-            raise AgentToolError("当前会话无法创建确认请求", code="confirmation_invalid")
+            raise AgentToolError(
+                "当前会话无法创建确认请求", code="confirmation_invalid"
+            )
         owner_digest = self._owner_digest(owner_key)
         now = self._clock()
         with db.get_conn() as conn:
@@ -1019,9 +1104,10 @@ class SQLiteConfirmationStore(ConfirmationStore):
             (cutoff,),
         )
         max_epochs = max(32, self.max_entries * 4)
-        count = int(conn.execute(
-            "SELECT COUNT(*) FROM agent_confirmation_epochs"
-        ).fetchone()[0] or 0)
+        count = int(
+            conn.execute("SELECT COUNT(*) FROM agent_confirmation_epochs").fetchone()[0]
+            or 0
+        )
         overflow = count - max_epochs
         if overflow > 0:
             conn.execute(
@@ -1107,6 +1193,4 @@ class SQLiteConfirmationStore(ConfirmationStore):
             ).fetchone()
             if exists is None:
                 return generation
-        raise AgentToolError(
-            "暂时无法创建确认请求", code="confirmation_unavailable"
-        )
+        raise AgentToolError("暂时无法创建确认请求", code="confirmation_unavailable")

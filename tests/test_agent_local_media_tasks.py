@@ -1,24 +1,29 @@
 """本地媒体任务安全序号、检查、重试、精准刷新与可见性闭环。"""
+
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
-import time
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.agent.local_media_intents import local_media_task_request
+from app.agent.errors import AgentToolError
 from app.agent.local_media_task_actions import (
     LocalMediaAgentContextStore,
     _TaskRef,
     reset_local_media_agent_context_for_tests,
 )
-from app.agent.registry import AgentToolError
-from app.agent.service import get_agent_service, reset_agent_service_for_tests
 from app.agent.session_context import SQLiteAgentSessionContextRepository
 from app.agent.state_commit import AgentStateCommitBuffer, defer_agent_state_commits
 from app.modules.local_media_service import LocalMediaServiceError
 from app.modules.media_server_path_mapping import MediaServerPathMapping
+from tests.agent_kernel_test_harness import (
+    get_kernel_test_service as get_agent_service,
+)
+from tests.agent_kernel_test_harness import (
+    reset_kernel_test_service as reset_agent_service_for_tests,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -69,10 +74,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 owner="admin",
             )
         task_id = db.create_local_media_task(
-            source_id,
-            "PRIVATE-HASH",
-            "/private/downloads/SECRET.mkv",
-            owner="admin",
+            source_id, "PRIVATE-HASH", "/private/downloads/SECRET.mkv", owner="admin"
         )
         db.update_local_media_task(
             task_id,
@@ -131,12 +133,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             "digest-1",
         ):
             self.assertNotIn(secret, serialized)
-
         with self.assertRaises(AgentToolError):
             service.invoke(
-                "local_media.inspect_task",
-                {"task_number": 1},
-                owner="owner-b",
+                "local_media.inspect_task", {"task_number": 1}, owner="owner-b"
             )
 
     def test_inspection_and_preview_use_owner_bound_safe_handles(self) -> None:
@@ -157,28 +156,34 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             "suggested_query": "示例影片",
             "parsed_season": None,
             "parsed_episode": None,
-            "files": [{
-                "name": "示例影片.mkv",
-                "relative_path": "SECRET/示例影片.mkv",
-                "role": "video",
-                "size": 123,
-            }],
+            "files": [
+                {
+                    "name": "示例影片.mkv",
+                    "relative_path": "SECRET/示例影片.mkv",
+                    "role": "video",
+                    "size": 123,
+                }
+            ],
         }
         local_service.preview.return_value = {
             "status": "planned",
-            "candidates": [{
-                "tmdb_id": "PRIVATE-TMDB",
-                "title": "示例影片",
-                "year": "2026",
-                "media_type": "movie",
-                "confidence": "high",
-            }],
-            "plans": [{
-                "role": "video",
-                "action": "move",
-                "target_name": "示例影片 (2026).mkv",
-                "target_path": "/private/library/示例影片.mkv",
-            }],
+            "candidates": [
+                {
+                    "tmdb_id": "PRIVATE-TMDB",
+                    "title": "示例影片",
+                    "year": "2026",
+                    "media_type": "movie",
+                    "confidence": "high",
+                }
+            ],
+            "plans": [
+                {
+                    "role": "video",
+                    "action": "move",
+                    "target_name": "示例影片 (2026).mkv",
+                    "target_path": "/private/library/示例影片.mkv",
+                }
+            ],
             "rules_snapshot": "PRIVATE-RULES",
         }
         with patch(
@@ -236,7 +241,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             prepared = service.prepare(
                 "local_media.retry_task", {"task_number": 1}, owner="owner-a"
             )
-            self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "failed")
+            self.assertEqual(
+                db.get_local_media_task(task_id, owner="admin").status, "failed"
+            )
             confirmed = service.confirm(
                 prepared["action_plan"]["plan_id"], owner="owner-a"
             )
@@ -245,9 +252,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self.assertEqual(after.status, "waiting_stable")
         self.assertEqual(after.version, before.version + 1)
         self.assertNotEqual(after.operation_token, before.operation_token)
-        self.assertEqual(
-            db.list_local_media_task_items(task_id, owner="admin"), []
-        )
+        self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
         scheduler.reload.assert_called_once_with()
         with self.assertRaises(AgentToolError):
             service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
@@ -267,8 +272,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError) as stale:
             service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(stale.exception.code, "confirmation_stale")
-        self.assertEqual(db.get_local_media_task(task_id, owner="admin").status, "failed")
-
+        self.assertEqual(
+            db.get_local_media_task(task_id, owner="admin").status, "failed"
+        )
         reset_agent_service_for_tests()
         with db.get_conn() as conn:
             conn.execute("DELETE FROM local_media_tasks")
@@ -285,32 +291,35 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
 
     def test_precise_refresh_uses_only_bound_library_and_stales_on_drift(self) -> None:
-        task_id = self._task(
-            status="completed", bound=True, server_path="//NAS/Video",
-        )
+        task_id = self._task(status="completed", bound=True, server_path="//NAS/Video")
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
         client = Mock()
-        client.list_virtual_folders.return_value = [{"id": "private-library-id", "name": "媒体库"}]
+        client.list_virtual_folders.return_value = [
+            {"id": "private-library-id", "name": "媒体库"}
+        ]
         client.refresh_for_paths.return_value = {
             "ok": True,
             "skipped": False,
             "matched": 1,
             "scope": "item",
         }
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider",
-            return_value=client,
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             prepared = service.prepare(
-                "local_media.refresh_task_library",
-                {"task_number": 1},
-                owner="owner-a",
+                "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
             )
             self.assertNotIn("private-library-id", repr(prepared))
             self.assertNotIn("/private", repr(prepared))
@@ -326,27 +335,29 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         self.assertNotIn("private-library-id", repr(confirmed))
         self.assertNotIn("/private", repr(confirmed))
-
         reset_agent_service_for_tests()
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider",
-            return_value=client,
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             prepared = service.prepare(
                 "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
             )
             db.update_local_media_task(task_id, owner="admin", warning="binding-drift")
             with self.assertRaises(AgentToolError) as stale:
-                service.confirm(
-                    prepared["action_plan"]["plan_id"], owner="owner-a"
-                )
+                service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(stale.exception.code, "confirmation_stale")
 
     def test_refresh_validation_failure_closes_media_server_client(self) -> None:
@@ -359,19 +370,20 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         client = Mock()
         client.list_virtual_folders.return_value = []
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider",
-            return_value=client,
-        ), self.assertRaises(AgentToolError) as raised:
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
+            self.assertRaises(AgentToolError) as raised,
+        ):
             service.prepare(
-                "local_media.refresh_task_library",
-                {"task_number": 1},
-                owner="owner-a",
+                "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
             )
-
         self.assertEqual(raised.exception.code, "precondition_failed")
         client.close.assert_called_once_with()
 
@@ -379,17 +391,24 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self._task(status="completed", bound=True, media_type="movie", tmdb_id="12345")
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
         client = Mock()
-        client.list_virtual_folders.return_value = [{"id": "private-library-id", "name": "媒体库"}]
+        client.list_virtual_folders.return_value = [
+            {"id": "private-library-id", "name": "媒体库"}
+        ]
         client.has_tmdb_media.return_value = True
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider",
-            return_value=client,
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             result = service.invoke(
                 "local_media.verify_task_library_visibility",
@@ -406,25 +425,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         client.close.assert_called_once_with()
 
-    def test_natural_query_routes_list_and_retry_through_confirmation(self) -> None:
-        self._task(status="failed")
-        service = get_agent_service()
-        listed = service.query(
-            "列出失败的本地媒体任务", owner="owner-a", present=False
-        )
-        self.assertEqual(listed["tool_call"]["name"], "local_media.task_summaries")
-        prepared = service.query(
-            "重试本地媒体任务 1", owner="owner-a", present=False
-        )
-        self.assertEqual(prepared["mode"], "confirmation_required")
-        self.assertEqual(prepared["tool_call"]["name"], "local_media.retry_task")
-        service.reset_session(owner="owner-a")
-        with self.assertRaises(AgentToolError):
-            service.invoke(
-                "local_media.inspect_task", {"task_number": 1}, owner="owner-a"
-            )
-
-    def test_preview_rebuilds_process_local_inspection_after_worker_change(self) -> None:
+    def test_preview_rebuilds_process_local_inspection_after_worker_change(
+        self,
+    ) -> None:
         self._task(status="requires_manual")
         service = get_agent_service()
         service.invoke(
@@ -440,17 +443,16 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 "files": [{"role": "video", "name": "示例影片.mkv"}],
                 "task_title": "示例影片",
             },
-            {
-                "inspection_id": "worker-b-inspection",
-                "digest": "digest-1",
-            },
+            {"inspection_id": "worker-b-inspection", "digest": "digest-1"},
         ]
         local_service.preview.side_effect = [
             LocalMediaServiceError("检查记录不存在或已过期"),
             {
                 "status": "planned",
                 "candidates": [],
-                "plans": [{"role": "video", "action": "move", "target_name": "示例影片.mkv"}],
+                "plans": [
+                    {"role": "video", "action": "move", "target_name": "示例影片.mkv"}
+                ],
             },
         ]
         with patch(
@@ -470,18 +472,18 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self.assertEqual(local_service.inspect_task.call_count, 2)
         self.assertEqual(local_service.preview.call_count, 2)
         self.assertEqual(
-            local_service.preview.call_args_list[-1].args[1],
-            "worker-b-inspection",
+            local_service.preview.call_args_list[-1].args[1], "worker-b-inspection"
         )
 
-    def test_context_handles_survive_worker_recreation_and_remain_owner_bound(self) -> None:
+    def test_context_handles_survive_worker_recreation_and_remain_owner_bound(
+        self,
+    ) -> None:
         repository = SQLiteAgentSessionContextRepository(
             secret_provider=lambda: "test-secret"
         )
         task = SimpleNamespace(id=9, version=3, status="requires_manual", source_id=4)
         first = LocalMediaAgentContextStore(repository=repository)
         first.capture_tasks(owner="owner-a", tasks=[task])
-
         second = LocalMediaAgentContextStore(repository=repository)
         ref = second.task(owner="owner-a", number=1)
         self.assertEqual(ref, _TaskRef(9, 3, "requires_manual", 4))
@@ -492,7 +494,6 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             inspection_id="inspection-private",
             digest="digest-private",
         )
-
         third = LocalMediaAgentContextStore(repository=repository)
         inspection = third.inspection(owner="owner-a", number=inspection_number)
         self.assertIsNotNone(inspection)
@@ -561,11 +562,8 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             secret_provider=lambda: "test-secret"
         )
         store = LocalMediaAgentContextStore(repository=repository)
-        task = SimpleNamespace(
-            id=9, version=3, status="requires_manual", source_id=4
-        )
+        task = SimpleNamespace(id=9, version=3, status="requires_manual", source_id=4)
         buffer = AgentStateCommitBuffer(owner="owner-a")
-
         with defer_agent_state_commits(buffer):
             refs = store.capture_tasks(owner="owner-a", tasks=[task])
             self.assertEqual(store.task(owner="owner-a", number=1), refs[0])
@@ -579,7 +577,6 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             self.assertIsNotNone(
                 store.inspection(owner="owner-a", number=inspection_number)
             )
-
         self.assertIsNone(store.task(owner="owner-a", number=1))
         self.assertEqual(buffer.commit(), 1)
         restored = LocalMediaAgentContextStore(repository=repository)
@@ -594,11 +591,8 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             secret_provider=lambda: "test-secret"
         )
         store = LocalMediaAgentContextStore(repository=repository)
-        task = SimpleNamespace(
-            id=9, version=3, status="requires_manual", source_id=4
-        )
+        task = SimpleNamespace(id=9, version=3, status="requires_manual", source_id=4)
         buffer = AgentStateCommitBuffer(owner="owner-a")
-
         with defer_agent_state_commits(buffer):
             refs = store.capture_tasks(owner="owner-a", tasks=[task])
             self.assertEqual(len(refs), 1)
@@ -614,12 +608,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 ),
                 0,
             )
-
         self.assertIsNone(
             repository.get_latest(
-                owner="owner-a",
-                context_type="local_media_tasks",
-                now=time.time(),
+                owner="owner-a", context_type="local_media_tasks", now=time.time()
             )
         )
         self.assertIsNone(store.task(owner="owner-a", number=1))
@@ -630,11 +621,8 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         old_store = LocalMediaAgentContextStore(repository=repository)
         reset_store = LocalMediaAgentContextStore(repository=repository)
-        task = SimpleNamespace(
-            id=9, version=3, status="requires_manual", source_id=4
-        )
+        task = SimpleNamespace(id=9, version=3, status="requires_manual", source_id=4)
         buffer = AgentStateCommitBuffer(owner="owner-a")
-
         with defer_agent_state_commits(buffer):
             refs = old_store.capture_tasks(owner="owner-a", tasks=[task])
             old_store.capture_inspection(
@@ -644,13 +632,10 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
                 digest="digest-private",
             )
             reset_store.clear_owner(owner="owner-a")
-
         self.assertEqual(buffer.commit(), 0)
         self.assertIsNone(
             repository.get_latest(
-                owner="owner-a",
-                context_type="local_media_tasks",
-                now=time.time(),
+                owner="owner-a", context_type="local_media_tasks", now=time.time()
             )
         )
         self.assertIsNone(old_store.task(owner="owner-a", number=1))
@@ -661,20 +646,16 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         )
         old_store = LocalMediaAgentContextStore(repository=repository)
         new_store = LocalMediaAgentContextStore(repository=repository)
-        first = SimpleNamespace(
-            id=9, version=3, status="requires_manual", source_id=4
-        )
+        first = SimpleNamespace(id=9, version=3, status="requires_manual", source_id=4)
         second = SimpleNamespace(
             id=10, version=2, status="requires_manual", source_id=5
         )
         old_buffer = AgentStateCommitBuffer(owner="owner-a")
         new_buffer = AgentStateCommitBuffer(owner="owner-a")
-
         with defer_agent_state_commits(old_buffer):
             old_store.capture_tasks(owner="owner-a", tasks=[first])
         with defer_agent_state_commits(new_buffer):
             new_store.capture_tasks(owner="owner-a", tasks=[second])
-
         self.assertEqual(new_buffer.commit(), 1)
         self.assertEqual(old_buffer.commit(), 0)
         restored = LocalMediaAgentContextStore(repository=repository)
@@ -687,26 +668,38 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self._task(status="completed", bound=True)
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
         client = Mock()
         client.list_virtual_folders.return_value = [
             {"id": "private-library-id", "name": "媒体库"}
         ]
-        client.refresh_for_paths.return_value = {"ok": True, "skipped": False, "matched": 1, "scope": "item"}
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            side_effect=[[self._profile(url="http://server-a")], [self._profile(url="http://server-b")]],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider", return_value=client
+        client.refresh_for_paths.return_value = {
+            "ok": True,
+            "skipped": False,
+            "matched": 1,
+            "scope": "item",
+        }
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                side_effect=[
+                    [self._profile(url="http://server-a")],
+                    [self._profile(url="http://server-b")],
+                ],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             prepared = service.prepare(
                 "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
             )
             with self.assertRaises(AgentToolError) as stale:
-                service.confirm(
-                    prepared["action_plan"]["plan_id"], owner="owner-a"
-                )
+                service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         client.refresh_for_paths.assert_not_called()
         self.assertEqual(client.close.call_count, 2)
@@ -715,7 +708,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self._task(status="completed", bound=True)
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
         client = Mock()
         client.list_virtual_folders.return_value = [
@@ -729,22 +724,25 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             "path_mappings": (MediaServerPathMapping("/private", "/server-b"),),
             "allow_global_refresh_fallback": False,
         }
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions.configured_media_server_refresh_options",
-            side_effect=[first_options, second_options],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider", return_value=client
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions.configured_media_server_refresh_options",
+                side_effect=[first_options, second_options],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             prepared = service.prepare(
                 "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
             )
             with self.assertRaises(AgentToolError) as stale:
-                service.confirm(
-                    prepared["action_plan"]["plan_id"], owner="owner-a"
-                )
+                service.confirm(prepared["action_plan"]["plan_id"], owner="owner-a")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         client.refresh_for_paths.assert_not_called()
         self.assertEqual(client.close.call_count, 2)
@@ -753,7 +751,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self._task(status="completed", bound=True, media_type="tv", tmdb_id="12345")
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
         client = Mock()
         client.list_virtual_folders.return_value = [
@@ -762,11 +762,15 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         client.find_series_candidates_by_tmdb.return_value = SimpleNamespace(
             candidates=(SimpleNamespace(id="series-private"),), truncated=False
         )
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider", return_value=client
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             result = service.invoke(
                 "local_media.verify_task_library_visibility",
@@ -775,8 +779,7 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             )
         self.assertEqual(result["result"]["data"]["index_status"], "inconclusive")
         self.assertEqual(
-            result["result"]["data"]["reason_code"],
-            "series_indexed_episode_unverified",
+            result["result"]["data"]["reason_code"], "series_indexed_episode_unverified"
         )
         self.assertNotIn("媒体已在绑定媒体库中可见", result["result"]["summary"])
         client.list_series_episode_inventory.assert_not_called()
@@ -786,22 +789,35 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self._task(status="completed", bound=True)
         service = get_agent_service()
         service.invoke(
-            "local_media.task_summaries", {"scope": "history", "limit": 12}, owner="owner-a"
+            "local_media.task_summaries",
+            {"scope": "history", "limit": 12},
+            owner="owner-a",
         )
         client = Mock()
         client.list_virtual_folders.return_value = [
             {"id": "private-library-id", "name": "媒体库"}
         ]
-        client.refresh_for_paths.return_value = {"ok": True, "skipped": False, "matched": 1, "scope": "item"}
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider", return_value=client
+        client.refresh_for_paths.return_value = {
+            "ok": True,
+            "skipped": False,
+            "matched": 1,
+            "scope": "item",
+        }
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             tickets = [
                 service.prepare(
-                    "local_media.refresh_task_library", {"task_number": 1}, owner="owner-a"
+                    "local_media.refresh_task_library",
+                    {"task_number": 1},
+                    owner="owner-a",
                 )["action_plan"]["plan_id"]
                 for _ in range(2)
             ]
@@ -818,7 +834,9 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
         self.assertEqual(outcomes, ["confirmation_invalid", "confirmed"])
         client.refresh_for_paths.assert_called_once()
 
-    def test_cross_owner_refresh_confirmations_share_a_deduplication_lease(self) -> None:
+    def test_cross_owner_refresh_confirmations_share_a_deduplication_lease(
+        self,
+    ) -> None:
         self._task(status="completed", bound=True)
         service = get_agent_service()
         for owner in ("owner-a", "owner-b"):
@@ -837,17 +855,19 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             "matched": 1,
             "scope": "item",
         }
-        with patch(
-            "app.agent.local_media_task_actions.list_configured_profiles",
-            return_value=[self._profile()],
-        ), patch(
-            "app.agent.local_media_task_actions._client_for_provider", return_value=client
+        with (
+            patch(
+                "app.agent.local_media_task_actions.list_configured_profiles",
+                return_value=[self._profile()],
+            ),
+            patch(
+                "app.agent.local_media_task_actions._client_for_provider",
+                return_value=client,
+            ),
         ):
             tickets = {
                 owner: service.prepare(
-                    "local_media.refresh_task_library",
-                    {"task_number": 1},
-                    owner=owner,
+                    "local_media.refresh_task_library", {"task_number": 1}, owner=owner
                 )["action_plan"]["plan_id"]
                 for owner in ("owner-a", "owner-b")
             }
@@ -864,30 +884,3 @@ class AgentLocalMediaTaskTests(IsolatedDatabaseTestCase):
             allowed_library_ids=("private-library-id",),
             allow_library_fallback=False,
         )
-
-    def test_intents_cover_task_chain_without_guessing(self) -> None:
-        self.assertEqual(
-            local_media_task_request("列出失败的本地媒体任务"),
-            ("local_media.task_summaries", {"scope": "attention", "limit": 12}),
-        )
-        self.assertEqual(
-            local_media_task_request("检查本地媒体任务 2"),
-            ("local_media.inspect_task", {"task_number": 2}),
-        )
-        self.assertEqual(
-            local_media_task_request("预览本地媒体检查 3"),
-            ("local_media.preview_task", {"inspection_number": 3}),
-        )
-        self.assertEqual(
-            local_media_task_request("重试本地媒体任务 2"),
-            ("local_media.retry_task", {"task_number": 2}),
-        )
-        self.assertEqual(
-            local_media_task_request("刷新本地媒体任务 2 的媒体库"),
-            ("local_media.refresh_task_library", {"task_number": 2}),
-        )
-        self.assertEqual(
-            local_media_task_request("本地媒体任务 2 入库可见了吗"),
-            ("local_media.verify_task_library_visibility", {"task_number": 2}),
-        )
-        self.assertIsNone(local_media_task_request("刷新 /Library/Refresh"))

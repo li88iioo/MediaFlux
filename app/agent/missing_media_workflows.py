@@ -1,18 +1,20 @@
 """缺集补库流程的安全持久化与用户可读投影。"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import date, datetime
 import hashlib
 import hmac
 import re
 import secrets
-from typing import Any, Callable, Protocol
 import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date, datetime
+from typing import Any, Protocol
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import ToolContext, ToolResult
-from app.agent.registry import AgentToolError
 from app.modules.web_secret import get_web_secret
 
 _SOURCE_TOOLS = {
@@ -59,7 +61,9 @@ class MissingWorkflowRef:
 
 
 class MissingMediaWorkflowRepository(Protocol):
-    def capture_search(self, *, owner: str, tool_name: str, result: ToolResult) -> str | None: ...
+    def capture_search(
+        self, *, owner: str, tool_name: str, result: ToolResult
+    ) -> str | None: ...
 
     def select_candidate(
         self,
@@ -78,7 +82,9 @@ class MissingMediaWorkflowRepository(Protocol):
         verification_enqueued: bool,
     ) -> bool: ...
 
-    def finish_verification(self, *, request_id: int, status: str, result: str) -> bool: ...
+    def finish_verification(
+        self, *, request_id: int, status: str, result: str
+    ) -> bool: ...
 
     def release_confirmation(
         self, *, owner: str, workflow_ref: dict[str, Any]
@@ -101,7 +107,9 @@ class SQLiteMissingMediaWorkflowRepository:
     ) -> None:
         self._secret_provider = secret_provider
 
-    def capture_search(self, *, owner: str, tool_name: str, result: ToolResult) -> str | None:
+    def capture_search(
+        self, *, owner: str, tool_name: str, result: ToolResult
+    ) -> str | None:
         source_tool = str(tool_name or "").strip()
         if source_tool not in _SOURCE_TOOLS:
             return None
@@ -190,7 +198,11 @@ class SQLiteMissingMediaWorkflowRepository:
         safe_verification = _verification_projection(verification)
         safe_candidate = _safe_text(candidate_title, 300)
         safe_target = str(target or "").strip().lower()
-        if safe_verification is None or not safe_candidate or safe_target not in _TARGETS:
+        if (
+            safe_verification is None
+            or not safe_candidate
+            or safe_target not in _TARGETS
+        ):
             return None
         now = db.now()
         with db.get_conn() as conn:
@@ -282,7 +294,11 @@ class SQLiteMissingMediaWorkflowRepository:
         safe_result = str(result or "").strip().lower()
         if request is None or safe_status not in {"visible", "attention"}:
             return False
-        next_state = "visible" if safe_status == "visible" and safe_result == "visible" else "attention"
+        next_state = (
+            "visible"
+            if safe_status == "visible" and safe_result == "visible"
+            else "attention"
+        )
         error_code = "" if next_state == "visible" else "verification_attention"
         now = db.now()
         with db.get_conn() as conn:
@@ -306,9 +322,7 @@ class SQLiteMissingMediaWorkflowRepository:
                 self._refresh_workflow(conn, workflow_id=workflow_id, updated_at=now)
             return cursor.rowcount > 0
 
-    def release_confirmation(
-        self, *, owner: str, workflow_ref: dict[str, Any]
-    ) -> bool:
+    def release_confirmation(self, *, owner: str, workflow_ref: dict[str, Any]) -> bool:
         owner_digest = self._owner_digest(owner)
         ref = _workflow_ref_projection(workflow_ref)
         if ref is None:
@@ -388,17 +402,20 @@ class SQLiteMissingMediaWorkflowRepository:
             if not workflow_ids:
                 return ()
             placeholders = ",".join("?" for _ in workflow_ids)
-            return tuple(conn.execute(
-                "SELECT w.workflow_id,w.source_tool,w.title,w.tmdb_id,w.season,w.as_of,"
-                "w.state,w.revision,w.created_at,w.updated_at,"
-                "i.item_id,i.episode,i.state AS item_state,i.target,"
-                "i.download_request_id,i.last_error_code,i.updated_at AS item_updated_at "
-                "FROM agent_missing_media_workflows w "
-                "JOIN agent_missing_media_workflow_items i ON i.workflow_id=w.workflow_id "
-                f"WHERE w.owner_digest=? AND w.workflow_id IN ({placeholders}) "
-                "ORDER BY w.updated_at DESC,w.workflow_id,i.episode ASC",
-                (owner_digest, *workflow_ids),
-            ).fetchall())
+            return tuple(
+                conn.execute(
+                    "SELECT w.workflow_id,w.source_tool,w.title,w.tmdb_id,w.season,w.as_of,"
+                    "w.state,w.revision,w.created_at,w.updated_at,"
+                    "i.item_id,i.episode,i.state AS item_state,i.target,"
+                    "i.download_request_id,i.last_error_code,i.updated_at AS item_updated_at "
+                    "FROM agent_missing_media_workflows w "
+                    "JOIN agent_missing_media_workflow_items i ON i.workflow_id=w.workflow_id "
+                    f"WHERE w.owner_digest=? AND w.workflow_id IN ({placeholders}) "
+                    "ORDER BY w.updated_at DESC,w.workflow_id,i.episode ASC",
+                    (owner_digest, *workflow_ids),
+                ).fetchall()
+            )
+
     @staticmethod
     def _refresh_workflow(conn: Any, *, workflow_id: str, updated_at: str) -> None:
         states = tuple(
@@ -424,7 +441,9 @@ class SQLiteMissingMediaWorkflowRepository:
             "WHERE owner_digest=?",
             (owner_digest,),
         ).fetchone()
-        overflow = max(0, int(row["total"] if row is not None else 0) - _MAX_WORKFLOWS_PER_OWNER)
+        overflow = max(
+            0, int(row["total"] if row is not None else 0) - _MAX_WORKFLOWS_PER_OWNER
+        )
         if overflow <= 0:
             return
         # 身份迁移可能把多个旧 owner 分区合并到同一个 session owner。容量整理只能
@@ -478,27 +497,38 @@ def list_missing_workflows(
     grouped: dict[str, dict[str, Any]] = {}
     for row in rows:
         workflow_id = str(row["workflow_id"])
-        workflow = grouped.setdefault(workflow_id, {
-            "title": _safe_text(row["title"], 120),
-            "season": _positive_int(row["season"], maximum=100) or 1,
-            "state": str(row["state"] or "attention"),
-            "state_label": _STATE_LABELS.get(str(row["state"] or ""), "需要人工关注"),
-            "updated_at": _safe_timestamp(row["updated_at"]),
-            "items": [],
-        })
+        workflow = grouped.setdefault(
+            workflow_id,
+            {
+                "title": _safe_text(row["title"], 120),
+                "season": _positive_int(row["season"], maximum=100) or 1,
+                "state": str(row["state"] or "attention"),
+                "state_label": _STATE_LABELS.get(
+                    str(row["state"] or ""), "需要人工关注"
+                ),
+                "updated_at": _safe_timestamp(row["updated_at"]),
+                "items": [],
+            },
+        )
         item_state = str(row["item_state"] or "attention")
-        workflow["items"].append({
-            "episode": _positive_int(row["episode"], maximum=1000) or 1,
-            "state": item_state,
-            "state_label": _STATE_LABELS.get(item_state, "需要人工关注"),
-            "target": str(row["target"] or "") if str(row["target"] or "") in _TARGETS else "",
-            "has_download_task": bool(row["download_request_id"]),
-            "updated_at": _safe_timestamp(row["item_updated_at"]),
-        })
+        workflow["items"].append(
+            {
+                "episode": _positive_int(row["episode"], maximum=1000) or 1,
+                "state": item_state,
+                "state_label": _STATE_LABELS.get(item_state, "需要人工关注"),
+                "target": str(row["target"] or "")
+                if str(row["target"] or "") in _TARGETS
+                else "",
+                "has_download_task": bool(row["download_request_id"]),
+                "updated_at": _safe_timestamp(row["item_updated_at"]),
+            }
+        )
     workflows = list(grouped.values())[: int(arguments["limit"])]
     attention = sum(
-        1 for workflow in workflows
-        if workflow["state"] in {
+        1
+        for workflow in workflows
+        if workflow["state"]
+        in {
             "attention",
             "search_ready",
             "selection_required",
@@ -524,7 +554,10 @@ def list_missing_workflows(
                 break
         if len(suggestions) >= 3:
             break
-    if any(workflow["state"] in {"submitted", "verification_pending"} for workflow in workflows):
+    if any(
+        workflow["state"] in {"submitted", "verification_pending"}
+        for workflow in workflows
+    ):
         suggestions.append("查看刚才下载到哪了")
     data: dict[str, Any] = {
         "total": len(workflows),
@@ -532,11 +565,13 @@ def list_missing_workflows(
         "workflows": workflows,
     }
     if len(workflows) == 1:
-        data.update({
-            "title": workflows[0]["title"],
-            "media_type": "tv",
-            "season": workflows[0]["season"],
-        })
+        data.update(
+            {
+                "title": workflows[0]["title"],
+                "media_type": "tv",
+                "season": workflows[0]["season"],
+            }
+        )
     return ToolResult(
         True,
         "attention" if attention else "healthy",
@@ -582,15 +617,23 @@ def is_missing_workflow_status_message(message: str) -> bool:
     normalized = "".join(str(message or "").strip().casefold().split())
     if not normalized:
         return False
-    scope = any(token in normalized for token in ("补库", "缺集任务", "缺集下载", "入库复核"))
-    status = any(token in normalized for token in ("状态", "进度", "到哪", "完成", "情况", "结果"))
+    scope = any(
+        token in normalized for token in ("补库", "缺集任务", "缺集下载", "入库复核")
+    )
+    status = any(
+        token in normalized
+        for token in ("状态", "进度", "到哪", "完成", "情况", "结果")
+    )
     return scope and status
 
 
 def _search_projection(tool_name: str, result: ToolResult) -> dict[str, Any] | None:
     data = result.data if isinstance(result.data, dict) else {}
     verification = data.get("verification")
-    if not isinstance(verification, dict) or verification.get("verified_missing") is not True:
+    if (
+        not isinstance(verification, dict)
+        or verification.get("verified_missing") is not True
+    ):
         return None
     base = _base_verification_projection(verification)
     if base is None:
@@ -600,10 +643,14 @@ def _search_projection(tool_name: str, result: ToolResult) -> dict[str, Any] | N
         episode = _positive_int(verification.get("episode"), maximum=1000)
         if episode is None:
             return None
-        items.append({
-            "episode": episode,
-            "state": "selection_required" if _search_has_candidate(data.get("search")) else "search_ready",
-        })
+        items.append(
+            {
+                "episode": episode,
+                "state": "selection_required"
+                if _search_has_candidate(data.get("search"))
+                else "search_ready",
+            }
+        )
     else:
         episodes = data.get("episodes")
         if not isinstance(episodes, list):
@@ -614,10 +661,14 @@ def _search_projection(tool_name: str, result: ToolResult) -> dict[str, Any] | N
             episode = _positive_int(raw.get("episode"), maximum=1000)
             if episode is None or any(item["episode"] == episode for item in items):
                 continue
-            items.append({
-                "episode": episode,
-                "state": "selection_required" if _search_has_candidate(raw.get("search")) else "search_ready",
-            })
+            items.append(
+                {
+                    "episode": episode,
+                    "state": "selection_required"
+                    if _search_has_candidate(raw.get("search"))
+                    else "search_ready",
+                }
+            )
     if not items:
         return None
     return {**base, "items": items}
@@ -635,7 +686,10 @@ def _search_has_candidate(value: Any) -> bool:
     alternatives = recommendation.get("alternatives")
     return bool(
         isinstance(alternatives, list)
-        and any(isinstance(item, dict) and _safe_text(item.get("title"), 300) for item in alternatives)
+        and any(
+            isinstance(item, dict) and _safe_text(item.get("title"), 300)
+            for item in alternatives
+        )
     )
 
 
@@ -646,7 +700,12 @@ def _base_verification_projection(value: Any) -> dict[str, Any] | None:
     tmdb_id = str(value.get("tmdb_id") or "").strip()
     season = _positive_int(value.get("season"), maximum=100)
     as_of = _safe_date(value.get("as_of"))
-    if not title or not tmdb_id.isascii() or not tmdb_id.isdigit() or not 1 <= len(tmdb_id) <= 10:
+    if (
+        not title
+        or not tmdb_id.isascii()
+        or not tmdb_id.isdigit()
+        or not 1 <= len(tmdb_id) <= 10
+    ):
         return None
     if season is None or not as_of:
         return None
@@ -679,12 +738,20 @@ def _workflow_ref_projection(value: Any) -> MissingWorkflowRef | None:
 
 
 def _workflow_ref_dict(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict) or set(value) != {"workflow_id", "item_id", "revision"}:
+    if not isinstance(value, dict) or set(value) != {
+        "workflow_id",
+        "item_id",
+        "revision",
+    }:
         return None
     workflow_id = str(value.get("workflow_id") or "").strip()
     item_id = str(value.get("item_id") or "").strip()
     revision = _positive_int(value.get("revision"), maximum=2_147_483_647)
-    if not _ID_PATTERN.fullmatch(workflow_id) or not _ID_PATTERN.fullmatch(item_id) or revision is None:
+    if (
+        not _ID_PATTERN.fullmatch(workflow_id)
+        or not _ID_PATTERN.fullmatch(item_id)
+        or revision is None
+    ):
         return None
     return {"workflow_id": workflow_id, "item_id": item_id, "revision": revision}
 

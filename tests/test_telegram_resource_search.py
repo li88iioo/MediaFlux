@@ -28,12 +28,15 @@ class _Markup:
         self.buttons.extend(buttons)
 
 
-_TELEBOT = SimpleNamespace(types=SimpleNamespace(
-    InlineKeyboardMarkup=_Markup,
-    InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(
-        text=text, callback_data=callback_data,
-    ),
-))
+_TELEBOT = SimpleNamespace(
+    types=SimpleNamespace(
+        InlineKeyboardMarkup=_Markup,
+        InlineKeyboardButton=lambda text, callback_data: SimpleNamespace(
+            text=text,
+            callback_data=callback_data,
+        ),
+    )
+)
 
 
 def _items():
@@ -61,9 +64,27 @@ def _items():
 
 def _sites():
     return [
-        {"site_id": "nyaa", "site_name": "Nyaa", "status": "success", "count": 1, "message": ""},
-        {"site_id": "mikan", "site_name": "Mikan", "status": "success", "count": 1, "message": ""},
-        {"site_id": "1lou", "site_name": "1Lou", "status": "error", "count": 0, "message": "响应超时"},
+        {
+            "site_id": "nyaa",
+            "site_name": "Nyaa",
+            "status": "success",
+            "count": 1,
+            "message": "",
+        },
+        {
+            "site_id": "mikan",
+            "site_name": "Mikan",
+            "status": "success",
+            "count": 1,
+            "message": "",
+        },
+        {
+            "site_id": "1lou",
+            "site_name": "1Lou",
+            "status": "error",
+            "count": 0,
+            "message": "响应超时",
+        },
     ]
 
 
@@ -76,10 +97,11 @@ class TelegramIndexerWorkerTests(unittest.TestCase):
                 "app.modules.telegram_resource_search.config.get_bool",
                 return_value=False,
             ),
-            patch.object(worker, "_call") as call,
+            patch.object(worker, "_call") as call,self.assertRaisesRegex(
+            TelegramResourceSearchError, "资源站搜索当前已关闭"
+        )
         ):
-            with self.assertRaisesRegex(TelegramResourceSearchError, "资源站搜索当前已关闭"):
-                worker.search("Frieren")
+            worker.search("Frieren")
 
         call.assert_not_called()
         self.assertIsNone(worker._thread)
@@ -98,12 +120,14 @@ class TelegramIndexerWorkerTests(unittest.TestCase):
             captured.append(coroutine)
             return coroutine
 
-        with patch.object(worker, "_ensure_started"), patch(
-            "app.modules.telegram_resource_search.asyncio.run_coroutine_threadsafe",
-            side_effect=RuntimeError("loop stopped"),
+        with (
+            patch.object(worker, "_ensure_started"),
+            patch(
+                "app.modules.telegram_resource_search.asyncio.run_coroutine_threadsafe",
+                side_effect=RuntimeError("loop stopped"),
+            ),self.assertRaisesRegex(RuntimeError, "loop stopped")
         ):
-            with self.assertRaisesRegex(RuntimeError, "loop stopped"):
-                worker._call(factory, timeout=0.1)
+            worker._call(factory, timeout=0.1)
 
         self.assertEqual(len(captured), 1)
         self.assertIsNone(captured[0].cr_frame)
@@ -143,9 +167,7 @@ class TelegramIndexerWorkerTests(unittest.TestCase):
             self.assertTrue(worker._stopping)
 
             factory = Mock()
-            with self.assertRaisesRegex(
-                TelegramResourceSearchError, "正在关闭"
-            ):
+            with self.assertRaisesRegex(TelegramResourceSearchError, "正在关闭"):
                 worker._call(factory, timeout=0.1)
             factory.assert_not_called()
 
@@ -198,8 +220,12 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertIn("作品 A [1080p]", text)
         self.assertNotIn("作品 A 第 2 集", text)
         self.assertIn("1Lou：响应超时", text)
-        self.assertTrue(any(button.text.startswith("✓ Nyaa") for button in markup.buttons))
-        self.assertTrue(all(len(button.callback_data) <= 64 for button in markup.buttons))
+        self.assertTrue(
+            any(button.text.startswith("✓ Nyaa") for button in markup.buttons)
+        )
+        self.assertTrue(
+            all(len(button.callback_data) <= 64 for button in markup.buttons)
+        )
 
     def test_source_callback_replaces_message_with_filtered_results(self):
         action_id = self.store.create_action(
@@ -254,7 +280,9 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
             self.store.resolve_action(button.callback_data.split(":", 1)[1], "100", "9")
             for button in markup.buttons[:3]
         ]
-        self.assertEqual([item["value"]["target"] for item in resolved], ["qb", "guangya", "both"])
+        self.assertEqual(
+            [item["value"]["target"] for item in resolved], ["qb", "guangya", "both"]
+        )
         with self.assertRaisesRegex(TelegramResourceSearchError, "过期"):
             self.store.resolve_action(
                 markup.buttons[0].callback_data.split(":", 1)[1], "100", "9"
@@ -294,10 +322,13 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
             from_user=SimpleNamespace(id=9),
             message=SimpleNamespace(chat=SimpleNamespace(id=100), message_id=77),
         )
-        with patch(
-            "app.modules.telegram_resource_search.get_telegram_resource_search_store",
-            return_value=self.store,
-        ), patch("app.bot.handlers._dispatch_resource_download") as dispatch:
+        with (
+            patch(
+                "app.modules.telegram_resource_search.get_telegram_resource_search_store",
+                return_value=self.store,
+            ),
+            patch("app.bot.handlers._dispatch_resource_download") as dispatch,
+        ):
             _handle_resource_search_callback(bot, call, _TELEBOT)
         dispatch.assert_not_called()
         self.assertIn("确认提交资源下载", bot.edits[-1][0][0])
@@ -333,19 +364,26 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
             chat_id="100",
             user_id="9",
             query="作品 &amp; 特别篇",
-            items=[{
-                "result_id": "entity",
-                "site_id": "nyaa",
-                "site_name": "Nyaa",
-                "title": long_title,
-                "size_text": "1.2 GB",
-                "seeders": 3,
-                "published_at": "2026-08-04T01:00:00+00:00",
-            }],
-            sites=[{
-                "site_id": "nyaa", "site_name": "Nyaa",
-                "status": "success", "count": 1, "message": "",
-            }],
+            items=[
+                {
+                    "result_id": "entity",
+                    "site_id": "nyaa",
+                    "site_name": "Nyaa",
+                    "title": long_title,
+                    "size_text": "1.2 GB",
+                    "seeders": 3,
+                    "published_at": "2026-08-04T01:00:00+00:00",
+                }
+            ],
+            sites=[
+                {
+                    "site_id": "nyaa",
+                    "site_name": "Nyaa",
+                    "status": "success",
+                    "count": 1,
+                    "message": "",
+                }
+            ],
         )
         text, markup = _resource_search_view(
             _TELEBOT,
@@ -359,13 +397,17 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", text)
         self.assertNotIn("<script>", text)
         self.assertIn("…", text)
-        resource_button = next(button for button in markup.buttons if button.text.startswith("1. "))
+        resource_button = next(
+            button for button in markup.buttons if button.text.startswith("1. ")
+        )
         self.assertIn("作品 & 特别篇", resource_button.text)
         self.assertLessEqual(len(resource_button.text), 37)
 
 
 class TelegramResourceSearchCommandTests(unittest.TestCase):
-    def test_group_resource_search_requires_allowed_user_but_private_chat_stays_compatible(self):
+    def test_group_resource_search_requires_allowed_user_but_private_chat_stays_compatible(
+        self,
+    ):
         from app.bot import handlers
         from tests.test_production import TelegramBotTests
 
@@ -379,8 +421,15 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
 
         bot = Bot()
         values = {"TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "9"}
-        with patch("app.bot.handlers.get", side_effect=lambda key, default="": values.get(key, default)), patch(
-            "app.bot.agent_adapter.get", side_effect=lambda key, default="": values.get(key, default)
+        with (
+            patch(
+                "app.bot.handlers.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
+            patch(
+                "app.bot.agent_adapter.config.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
         ):
             denied = SimpleNamespace(
                 chat=SimpleNamespace(id=-100),
@@ -394,16 +443,23 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
                 from_user=SimpleNamespace(id=9),
                 text="/media_search 作品 A",
             )
-            self.assertFalse(handlers._reject_unauthorized_resource_search(bot, allowed))
+            self.assertFalse(
+                handlers._reject_unauthorized_resource_search(bot, allowed)
+            )
 
         private_values = {"TG_CHAT_ID": "100", "TG_AGENT_ALLOWED_USER_IDS": ""}
-        with patch("app.bot.handlers.get", side_effect=lambda key, default="": private_values.get(key, default)):
+        with patch(
+            "app.bot.handlers.get",
+            side_effect=lambda key, default="": private_values.get(key, default),
+        ):
             private = SimpleNamespace(
                 chat=SimpleNamespace(id=100),
                 from_user=SimpleNamespace(id=10),
                 text="/media_search 作品 A",
             )
-            self.assertFalse(handlers._reject_unauthorized_resource_search(bot, private))
+            self.assertFalse(
+                handlers._reject_unauthorized_resource_search(bot, private)
+            )
 
     def test_group_resource_callback_rechecks_allowlist_before_resolving_action(self):
         from app.bot import handlers
@@ -420,12 +476,20 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
         bot = Bot()
         telebot = TelegramBotTests._telebot_types()
         values = {"TG_CHAT_ID": "-100", "TG_AGENT_ALLOWED_USER_IDS": "8"}
-        with patch("app.bot.handlers.get", side_effect=lambda key, default="": values.get(key, default)), patch(
-            "app.bot.agent_adapter.get", side_effect=lambda key, default="": values.get(key, default)
+        with (
+            patch(
+                "app.bot.handlers.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
+            patch(
+                "app.bot.agent_adapter.config.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
         ):
             handlers._register_commands(bot, telebot)
             callback = next(
-                handler for filters, handler in bot.callback_handlers
+                handler
+                for filters, handler in bot.callback_handlers
                 if filters["func"](SimpleNamespace(data="mrs:opaque"))
             )
             call = SimpleNamespace(
@@ -446,11 +510,20 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
 
         bot = TelegramBotTests.FakeBot()
         telebot = TelegramBotTests._telebot_types()
-        with patch("app.bot.handlers.get", side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default):
+        with patch(
+            "app.bot.handlers.get",
+            side_effect=lambda key, default="": (
+                "100" if key == "TG_CHAT_ID" else default
+            ),
+        ):
             handlers._register_commands(bot, telebot)
-        commands = [filters.get("commands") for filters, _handler in bot.message_handlers]
+        commands = [
+            filters.get("commands") for filters, _handler in bot.message_handlers
+        ]
         self.assertIn(["media_search"], commands)
-        self.assertTrue(any(filters.get("func") for filters, _handler in bot.message_handlers))
+        self.assertTrue(
+            any(filters.get("func") for filters, _handler in bot.message_handlers)
+        )
 
     def test_media_search_without_query_replies_with_safe_actionable_example(self):
         from app.bot import handlers
@@ -460,18 +533,23 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
         telebot = TelegramBotTests._telebot_types()
         with patch(
             "app.bot.handlers.get",
-            side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default,
+            side_effect=lambda key, default="": (
+                "100" if key == "TG_CHAT_ID" else default
+            ),
         ):
             handlers._register_commands(bot, telebot)
             command_handler = next(
-                handler for filters, handler in bot.message_handlers
+                handler
+                for filters, handler in bot.message_handlers
                 if filters.get("commands") == ["media_search"]
             )
-            command_handler(SimpleNamespace(
-                chat=SimpleNamespace(id=100),
-                from_user=SimpleNamespace(id=9),
-                text="/media_search",
-            ))
+            command_handler(
+                SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    from_user=SimpleNamespace(id=9),
+                    text="/media_search",
+                )
+            )
 
         reply = bot.replies[-1][1]
         self.assertIn("请输入要搜索的媒体名称", reply)
@@ -487,23 +565,30 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
         telebot = TelegramBotTests._telebot_types()
         with patch(
             "app.bot.handlers.get",
-            side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default,
+            side_effect=lambda key, default="": (
+                "100" if key == "TG_CHAT_ID" else default
+            ),
         ):
             handlers._register_commands(bot, telebot)
             filters, handler = next(
-                (filters, handler) for filters, handler in bot.message_handlers
+                (filters, handler)
+                for filters, handler in bot.message_handlers
                 if filters.get("content_types") == ["text"]
                 and callable(filters.get("func"))
-                and filters["func"](SimpleNamespace(text="/media_search@Tencentcoding_bot"))
+                and filters["func"](
+                    SimpleNamespace(text="/media_search@Tencentcoding_bot")
+                )
             )
-            self.assertTrue(filters["func"](
-                SimpleNamespace(text="/media_search@Tencentcoding_bot")
-            ))
-            handler(SimpleNamespace(
-                chat=SimpleNamespace(id=100),
-                from_user=SimpleNamespace(id=9),
-                text="/media_search@Tencentcoding_bot",
-            ))
+            self.assertTrue(
+                filters["func"](SimpleNamespace(text="/media_search@Tencentcoding_bot"))
+            )
+            handler(
+                SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    from_user=SimpleNamespace(id=9),
+                    text="/media_search@Tencentcoding_bot",
+                )
+            )
 
         self.assertIn("请输入要搜索的媒体名称", bot.replies[-1][1])
 
@@ -513,10 +598,16 @@ class TelegramResourceSearchCommandTests(unittest.TestCase):
 
         bot = TelegramBotTests.FakeBot()
         telebot = TelegramBotTests._telebot_types()
-        with patch("app.bot.handlers.get", side_effect=lambda key, default="": "100" if key == "TG_CHAT_ID" else default):
+        with patch(
+            "app.bot.handlers.get",
+            side_effect=lambda key, default="": (
+                "100" if key == "TG_CHAT_ID" else default
+            ),
+        ):
             handlers._register_commands(bot, telebot)
             start = next(
-                handler for filters, handler in bot.message_handlers
+                handler
+                for filters, handler in bot.message_handlers
                 if filters.get("commands") == ["start"]
             )
             start(SimpleNamespace(chat=SimpleNamespace(id=100)))

@@ -1,13 +1,15 @@
 """按当前策略立即排队一次全库缺集巡检。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
-from app import config, database as db
+from app import config
+from app import database as db
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 
 
 def _now() -> str:
@@ -26,11 +28,17 @@ def _capture() -> dict[str, Any]:
     row = db.get_agent_library_patrol()
     policy = {
         "enabled": config.get_bool("AGENT_LIBRARY_PATROL_ENABLED", False),
-        "interval_hours": max(1, min(config.get_int("AGENT_LIBRARY_PATROL_INTERVAL_HOURS", 24), 168)),
-        "max_series": max(1, min(config.get_int("AGENT_LIBRARY_PATROL_MAX_SERIES", 50), 100)),
+        "interval_hours": max(
+            1, min(config.get_int("AGENT_LIBRARY_PATROL_INTERVAL_HOURS", 24), 168)
+        ),
+        "max_series": max(
+            1, min(config.get_int("AGENT_LIBRARY_PATROL_MAX_SERIES", 50), 100)
+        ),
     }
     state = {
-        "task_status": str(row["status"] or "not_scheduled") if row is not None else "not_scheduled",
+        "task_status": str(row["status"] or "not_scheduled")
+        if row is not None
+        else "not_scheduled",
         "next_run_at": str(row["next_run_at"] or "") if row is not None else "",
         "lease_generation": int(row["lease_generation"] or 0) if row is not None else 0,
     }
@@ -69,13 +77,14 @@ def prepare_trigger_patrol_now(_arguments: dict[str, Any]) -> tuple[ToolResult, 
                 "若巡检已经运行，将复用现有任务而不会创建第二个任务。",
             ],
         },
-        evidence=[Evidence(
-            "patrol_policy",
-            "已只读核对当前巡检策略和单例任务状态。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "patrol_policy",
+                "已只读核对当前巡检策略和单例任务状态。",
+                _now(),
+            )
+        ],
     ), snapshot["fingerprint"]
-
 
 
 def trigger_patrol_now_confirmed(
@@ -83,7 +92,9 @@ def trigger_patrol_now_confirmed(
 ) -> ToolResult:
     current = _capture()
     if current["fingerprint"] != str(expected_context or ""):
-        raise AgentToolError("巡检策略或任务状态已变化，请重新预检", code="confirmation_stale")
+        raise AgentToolError(
+            "巡检策略或任务状态已变化，请重新预检", code="confirmation_stale"
+        )
     if not current["policy"]["enabled"]:
         raise AgentToolError("全库缺集巡检当前未启用", code="precondition_failed")
 
@@ -108,7 +119,11 @@ def trigger_patrol_now_confirmed(
             status="accepted",
             summary="全库缺集巡检已在运行，本次未重复创建任务",
             data={"queued": False, "reused": True, "task_status": "running"},
-            evidence=[Evidence("patrol_scheduler", "已复用当前运行中的巡检单例。", _now())],
+            evidence=[
+                Evidence("patrol_scheduler", "已复用当前运行中的巡检单例。", _now())
+            ],
             suggestions=["可询问：全库巡检现在到哪了。"],
         )
-    raise AgentToolError("当前无法安排全库缺集巡检，请稍后重试", code="precondition_failed")
+    raise AgentToolError(
+        "当前无法安排全库缺集巡检，请稍后重试", code="precondition_failed"
+    )

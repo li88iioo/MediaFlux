@@ -1,61 +1,142 @@
 """Media Agent 的外部影视探索只读工具。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import math
 import re
-from typing import Any
 import unicodedata
+from datetime import datetime
+from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.discovery.models import DiscoveryPage, MediaCard, ProviderError
 from app.discovery.search import DiscoverySearchResult, get_discovery_search_service
 from app.discovery.service import get_discovery_service
 
 _ALLOWED_PROVIDERS = ("tmdb", "douban", "bangumi")
 _ALLOWED_ARGUMENTS = {
-    "query", "page", "providers", "limit", "media_type", "year", "region", "genre"
+    "query",
+    "page",
+    "providers",
+    "limit",
+    "media_type",
+    "year",
+    "region",
+    "genre",
 }
-_RECOMMEND_ARGUMENTS = {"provider", "media_type", "page", "limit", "year", "region", "genre"}
+_RECOMMEND_ARGUMENTS = {
+    "provider",
+    "media_type",
+    "page",
+    "limit",
+    "year",
+    "region",
+    "genre",
+}
 _CALENDAR_ARGUMENTS = {"weekday", "page", "limit"}
 _RECOMMEND_PROVIDERS = {"tmdb", "douban"}
 _RECOMMEND_MEDIA_TYPES = {"movie", "tv"}
-_PROVIDER_STATUSES = {"healthy", "degraded", "disabled", "unavailable", "not_configured"}
+_PROVIDER_STATUSES = {
+    "healthy",
+    "degraded",
+    "disabled",
+    "unavailable",
+    "not_configured",
+}
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
 
 _TMDB_MOVIE_GENRE_IDS = {
-    "动作": "28", "冒险": "12", "动画": "16", "动漫": "16", "喜剧": "35",
-    "犯罪": "80", "纪录片": "99", "剧情": "18", "家庭": "10751",
-    "奇幻": "14", "历史": "36", "恐怖": "27", "音乐": "10402",
-    "悬疑": "9648", "爱情": "10749", "科幻": "878", "惊悚": "53",
+    "动作": "28",
+    "冒险": "12",
+    "动画": "16",
+    "动漫": "16",
+    "喜剧": "35",
+    "犯罪": "80",
+    "纪录片": "99",
+    "剧情": "18",
+    "家庭": "10751",
+    "奇幻": "14",
+    "历史": "36",
+    "恐怖": "27",
+    "音乐": "10402",
+    "悬疑": "9648",
+    "爱情": "10749",
+    "科幻": "878",
+    "惊悚": "53",
     "战争": "10752",
 }
 _TMDB_TV_GENRE_IDS = {
-    "动作": "10759", "冒险": "10759", "动画": "16", "动漫": "16",
-    "喜剧": "35", "犯罪": "80", "纪录片": "99", "剧情": "18",
-    "家庭": "10751", "儿童": "10762", "悬疑": "9648", "科幻": "10765",
-    "奇幻": "10765", "战争": "10768", "历史": "10768",
+    "动作": "10759",
+    "冒险": "10759",
+    "动画": "16",
+    "动漫": "16",
+    "喜剧": "35",
+    "犯罪": "80",
+    "纪录片": "99",
+    "剧情": "18",
+    "家庭": "10751",
+    "儿童": "10762",
+    "悬疑": "9648",
+    "科幻": "10765",
+    "奇幻": "10765",
+    "战争": "10768",
+    "历史": "10768",
 }
 _REGION_LANGUAGE_ALIASES = {
-    "欧美": "en", "美国": "en", "英国": "en", "美剧": "en", "英剧": "en",
-    "中国": "zh", "中国大陆": "zh", "国产": "zh", "国产剧": "zh",
-    "中国香港": "zh", "中国台湾": "zh", "香港": "zh", "台湾": "zh",
-    "日本": "ja", "日剧": "ja", "韩国": "ko", "韩剧": "ko",
-    "法国": "fr", "德国": "de", "印度": "hi",
+    "欧美": "en",
+    "美国": "en",
+    "英国": "en",
+    "美剧": "en",
+    "英剧": "en",
+    "中国": "zh",
+    "中国大陆": "zh",
+    "国产": "zh",
+    "国产剧": "zh",
+    "中国香港": "zh",
+    "中国台湾": "zh",
+    "香港": "zh",
+    "台湾": "zh",
+    "日本": "ja",
+    "日剧": "ja",
+    "韩国": "ko",
+    "韩剧": "ko",
+    "法国": "fr",
+    "德国": "de",
+    "印度": "hi",
 }
 _DOUBAN_TV_REGION_TAGS = {
-    "欧美": "美剧", "美国": "美剧", "美剧": "美剧",
-    "英国": "英剧", "英剧": "英剧",
-    "日本": "日剧", "日剧": "日剧",
-    "韩国": "韩剧", "韩剧": "韩剧",
-    "中国": "国产剧", "中国大陆": "国产剧", "国产": "国产剧", "国产剧": "国产剧",
+    "欧美": "美剧",
+    "美国": "美剧",
+    "美剧": "美剧",
+    "英国": "英剧",
+    "英剧": "英剧",
+    "日本": "日剧",
+    "日剧": "日剧",
+    "韩国": "韩剧",
+    "韩剧": "韩剧",
+    "中国": "国产剧",
+    "中国大陆": "国产剧",
+    "国产": "国产剧",
+    "国产剧": "国产剧",
 }
-_DOUBAN_MOVIE_GENRES = frozenset({
-    "喜剧", "爱情", "动作", "科幻", "动画", "悬疑", "犯罪", "惊悚",
-    "冒险", "奇幻", "恐怖", "战争",
-})
+_DOUBAN_MOVIE_GENRES = frozenset(
+    {
+        "喜剧",
+        "爱情",
+        "动作",
+        "科幻",
+        "动画",
+        "悬疑",
+        "犯罪",
+        "惊悚",
+        "冒险",
+        "奇幻",
+        "恐怖",
+        "战争",
+    }
+)
 _ERROR_MESSAGES = {
     "timeout": "数据源请求超时",
     "rate_limited": "数据源请求受限",
@@ -72,7 +153,10 @@ def _now() -> str:
 
 def _visible_text(value: Any, *, limit: int) -> str:
     normalized = unicodedata.normalize("NFKC", str(value or "")).strip()
-    cleaned = "".join(" " if unicodedata.category(char).startswith("C") else char for char in normalized)
+    cleaned = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in normalized
+    )
     return " ".join(cleaned.split())[:limit]
 
 
@@ -153,7 +237,10 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         "limit": limit,
     }
     for key, value in (
-        ("media_type", media_type), ("year", year), ("region", region), ("genre", genre)
+        ("media_type", media_type),
+        ("year", year),
+        ("region", region),
+        ("genre", genre),
     ):
         if value:
             normalized[key] = value
@@ -167,7 +254,9 @@ def _effective_search_query(normalized: dict[str, Any]) -> str:
         str(normalized.get("year") or ""),
         str(normalized.get("region") or ""),
         str(normalized.get("genre") or ""),
-        {"movie": "电影", "tv": "剧集"}.get(str(normalized.get("media_type") or ""), ""),
+        {"movie": "电影", "tv": "剧集"}.get(
+            str(normalized.get("media_type") or ""), ""
+        ),
     ]
     folded = unicodedata.normalize("NFKC", query).casefold()
     additions = [item for item in suffixes if item and item.casefold() not in folded]
@@ -180,7 +269,8 @@ def _filter_search_result(
     media_type = str(normalized.get("media_type") or "")
     year = str(normalized.get("year") or "")
     items = tuple(
-        card for card in result.items
+        card
+        for card in result.items
         if (not media_type or card.media_type == media_type)
         and (not year or str(card.year or "").strip() == year)
     )
@@ -249,11 +339,17 @@ def _recommend_provider_filters(normalized: dict[str, Any]) -> dict[str, str]:
     filters: dict[str, str] = {}
     if provider == "tmdb":
         if year:
-            filters["primary_release_year" if media_type == "movie" else "first_air_date_year"] = year
+            filters[
+                "primary_release_year"
+                if media_type == "movie"
+                else "first_air_date_year"
+            ] = year
         language = _REGION_LANGUAGE_ALIASES.get(region, "")
         if language:
             filters["with_original_language"] = language
-        genre_ids = _TMDB_MOVIE_GENRE_IDS if media_type == "movie" else _TMDB_TV_GENRE_IDS
+        genre_ids = (
+            _TMDB_MOVIE_GENRE_IDS if media_type == "movie" else _TMDB_TV_GENRE_IDS
+        )
         genre_id = genre_ids.get(genre, "")
         if genre_id:
             filters["with_genres"] = genre_id
@@ -346,7 +442,11 @@ def _result_payload(
     limit: int,
     normalized: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    items = [_public_card(card) for card in result.items[:limit] if isinstance(card, MediaCard)]
+    items = [
+        _public_card(card)
+        for card in result.items[:limit]
+        if isinstance(card, MediaCard)
+    ]
     payload = {
         "query": _visible_text(result.query, limit=120),
         "page": result.page,
@@ -421,14 +521,14 @@ def search_discovery(arguments: dict[str, Any]) -> ToolResult:
                 "errors": [],
                 "items": [],
             },
-            evidence=[Evidence("discovery_search", "调用已启用的外部影视搜索服务。", _now())],
+            evidence=[
+                Evidence("discovery_search", "调用已启用的外部影视搜索服务。", _now())
+            ],
             suggestions=["请稍后重试，或改用媒体库搜索。"],
             error="外部影视数据源暂时不可用。",
         )
 
-    payload = _result_payload(
-        result, limit=normalized["limit"], normalized=normalized
-    )
+    payload = _result_payload(result, limit=normalized["limit"], normalized=normalized)
     succeeded = len(payload["providers_succeeded"])
     errors = len(payload["errors"])
     if not succeeded:
@@ -473,10 +573,13 @@ def search_discovery(arguments: dict[str, Any]) -> ToolResult:
     )
 
 
-def _recommend_payload(normalized: dict[str, Any], page: DiscoveryPage) -> dict[str, Any]:
+def _recommend_payload(
+    normalized: dict[str, Any], page: DiscoveryPage
+) -> dict[str, Any]:
     requested_year = str(normalized.get("year") or "")
     cards = [
-        card for card in tuple(page.items or ())
+        card
+        for card in tuple(page.items or ())
         if isinstance(card, MediaCard)
         and (not requested_year or str(card.year or "").strip() == requested_year)
     ]
@@ -554,17 +657,23 @@ def recommend_discovery(arguments: dict[str, Any]) -> ToolResult:
     except ProviderError as exc:
         code = exc.code if exc.code in _ERROR_MESSAGES else "unavailable"
         payload = dict(empty_payload)
-        provider_status = "not_configured" if code == "not_configured" else "unavailable"
-        payload.update({
-            "provider_status": provider_status,
-            "retry_after": _safe_retry_after(exc.retry_after),
-        })
+        provider_status = (
+            "not_configured" if code == "not_configured" else "unavailable"
+        )
+        payload.update(
+            {
+                "provider_status": provider_status,
+                "retry_after": _safe_retry_after(exc.retry_after),
+            }
+        )
         return ToolResult(
             ok=False,
             status="unavailable",
             summary="外部影视推荐源暂时不可用",
             data=payload,
-            evidence=[Evidence("discovery_recommend", "调用受控的外部影视榜单服务。", _now())],
+            evidence=[
+                Evidence("discovery_recommend", "调用受控的外部影视榜单服务。", _now())
+            ],
             suggestions=["请稍后重试，或切换另一个推荐来源。"],
             error=_ERROR_MESSAGES[code] + "。",
         )
@@ -576,7 +685,9 @@ def recommend_discovery(arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="外部影视推荐源暂时不可用",
             data=payload,
-            evidence=[Evidence("discovery_recommend", "调用受控的外部影视榜单服务。", _now())],
+            evidence=[
+                Evidence("discovery_recommend", "调用受控的外部影视榜单服务。", _now())
+            ],
             suggestions=["请稍后重试，或切换另一个推荐来源。"],
             error="外部影视推荐源暂时不可用。",
         )
@@ -595,11 +706,13 @@ def recommend_discovery(arguments: dict[str, Any]) -> ToolResult:
         status=status,
         summary=summary,
         data=payload,
-        evidence=[Evidence(
-            "discovery_recommend",
-            f"读取 {normalized['provider']} 的受控推荐列表；结果可能来自本地缓存。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_recommend",
+                f"读取 {normalized['provider']} 的受控推荐列表；结果可能来自本地缓存。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -609,13 +722,17 @@ def _public_calendar_card(card: MediaCard) -> dict[str, Any]:
     weekday = card.weekday
     item["weekday"] = (
         weekday
-        if isinstance(weekday, int) and not isinstance(weekday, bool) and 1 <= weekday <= 7
+        if isinstance(weekday, int)
+        and not isinstance(weekday, bool)
+        and 1 <= weekday <= 7
         else None
     )
     return item
 
 
-def _calendar_payload(normalized: dict[str, Any], page: DiscoveryPage) -> dict[str, Any]:
+def _calendar_payload(
+    normalized: dict[str, Any], page: DiscoveryPage
+) -> dict[str, Any]:
     cards = [card for card in tuple(page.items or ()) if isinstance(card, MediaCard)]
     limit = normalized["limit"]
     items = [_public_calendar_card(card) for card in cards[:limit]]
@@ -668,7 +785,11 @@ def bangumi_calendar(arguments: dict[str, Any]) -> ToolResult:
             error="影视探索功能未启用。",
         )
 
-    filters = {} if normalized.get("weekday") is None else {"weekday": str(normalized["weekday"])}
+    filters = (
+        {}
+        if normalized.get("weekday") is None
+        else {"weekday": str(normalized["weekday"])}
+    )
     try:
         page = get_discovery_service().list_items(
             "bangumi", "calendar", "tv", normalized["page"], filters
@@ -678,16 +799,24 @@ def bangumi_calendar(arguments: dict[str, Any]) -> ToolResult:
     except ProviderError as exc:
         code = exc.code if exc.code in _ERROR_MESSAGES else "unavailable"
         payload = dict(empty_payload)
-        payload.update({
-            "provider_status": "not_configured" if code == "not_configured" else "unavailable",
-            "retry_after": _safe_retry_after(exc.retry_after),
-        })
+        payload.update(
+            {
+                "provider_status": "not_configured"
+                if code == "not_configured"
+                else "unavailable",
+                "retry_after": _safe_retry_after(exc.retry_after),
+            }
+        )
         return ToolResult(
             ok=False,
             status="unavailable",
             summary="Bangumi 放送日历暂时不可用",
             data=payload,
-            evidence=[Evidence("bangumi_calendar", "调用受控的 Bangumi 放送日历服务。", _now())],
+            evidence=[
+                Evidence(
+                    "bangumi_calendar", "调用受控的 Bangumi 放送日历服务。", _now()
+                )
+            ],
             suggestions=["请稍后重试。"],
             error=_ERROR_MESSAGES[code] + "。",
         )
@@ -699,7 +828,11 @@ def bangumi_calendar(arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="Bangumi 放送日历暂时不可用",
             data=payload,
-            evidence=[Evidence("bangumi_calendar", "调用受控的 Bangumi 放送日历服务。", _now())],
+            evidence=[
+                Evidence(
+                    "bangumi_calendar", "调用受控的 Bangumi 放送日历服务。", _now()
+                )
+            ],
             suggestions=["请稍后重试。"],
             error="Bangumi 放送日历暂时不可用。",
         )
@@ -714,16 +847,22 @@ def bangumi_calendar(arguments: dict[str, Any]) -> ToolResult:
     else:
         status = "empty"
         summary = f"Bangumi {scope}放送日历暂无内容"
-        suggestions = ["可查看本周完整放送日历，或稍后重试。"] if weekday else ["可指定星期查看对应放送内容。"]
+        suggestions = (
+            ["可查看本周完整放送日历，或稍后重试。"]
+            if weekday
+            else ["可指定星期查看对应放送内容。"]
+        )
     return ToolResult(
         ok=True,
         status=status,
         summary=summary,
         data=payload,
-        evidence=[Evidence(
-            "bangumi_calendar",
-            "读取 Bangumi 的受控放送日历；结果可能来自本地缓存。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "bangumi_calendar",
+                "读取 Bangumi 的受控放送日历；结果可能来自本地缓存。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

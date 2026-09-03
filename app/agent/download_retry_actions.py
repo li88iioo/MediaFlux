@@ -1,15 +1,17 @@
 """下载待处理请求的受控重新提交：脱敏预检、状态指纹与一次性确认。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
-from app import config, database as db
+from app import config
+from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.modules.download_dispatcher import (
     download_resubmit_capabilities,
     resubmit_download_request,
@@ -67,7 +69,11 @@ def download_retry_submission_arguments(arguments: dict[str, Any]) -> dict[str, 
     if set(arguments) != {"request_id", "target"}:
         raise AgentToolError("重新提交只接受 request_id 与 target 参数")
     request_id = arguments.get("request_id")
-    if isinstance(request_id, bool) or not isinstance(request_id, int) or request_id < 1:
+    if (
+        isinstance(request_id, bool)
+        or not isinstance(request_id, int)
+        or request_id < 1
+    ):
         raise AgentToolError("request_id 必须是大于 0 的整数")
     target = str(arguments.get("target") or "").strip().casefold()
     if target not in _TARGET_LABELS:
@@ -86,11 +92,17 @@ def _attention_stages(row: Any) -> list[str]:
     if str(_row_value(row, "local_import_status")).casefold() == "failed":
         stages.append("本地导入")
     organize_started = _safe_int(_row_value(row, "organize_started", 0) or 0)
-    if organize_started < 0 or str(_row_value(row, "organize_status")).casefold() == "failed":
+    if (
+        organize_started < 0
+        or str(_row_value(row, "organize_status")).casefold() == "failed"
+    ):
         stages.append("媒体整理")
     if str(_row_value(row, "strm_status")).casefold() == "failed":
         stages.append("STRM")
-    if str(_row_value(row, "gy_staging_cleanup_status")).casefold() in {"retained", "failed"}:
+    if str(_row_value(row, "gy_staging_cleanup_status")).casefold() in {
+        "retained",
+        "failed",
+    }:
         stages.append("光鸭暂存清理")
     return list(dict.fromkeys(stages))
 
@@ -122,12 +134,14 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
     if row is None:
         raise AgentToolError("下载待处理记录不存在", code="precondition_failed")
     if str(_row_value(row, "attention_cleared_at")).strip():
-        raise AgentToolError("该下载记录已经处理，无需重新提交", code="precondition_failed")
+        raise AgentToolError(
+            "该下载记录已经处理，无需重新提交", code="precondition_failed"
+        )
     attention_stages = _attention_stages(row)
     if not attention_stages:
         raise AgentToolError("该下载记录当前无需处理", code="precondition_failed")
 
-    capability = (download_resubmit_capabilities(row).get(target) or {})
+    capability = download_resubmit_capabilities(row).get(target) or {}
     if not bool(capability.get("enabled")):
         raise AgentToolError(
             str(capability.get("reason") or "当前目标不可重新提交"),
@@ -141,13 +155,15 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
         "status": str(_row_value(row, "status")).strip().casefold(),
         "qb_status": str(_row_value(row, "qb_status")).strip().casefold(),
         "gy_status": str(_row_value(row, "gy_status")).strip().casefold(),
-        "local_import_status": str(_row_value(row, "local_import_status")).strip().casefold(),
+        "local_import_status": str(_row_value(row, "local_import_status"))
+        .strip()
+        .casefold(),
         "organize_started": _safe_int(_row_value(row, "organize_started", 0) or 0),
         "organize_status": str(_row_value(row, "organize_status")).strip().casefold(),
         "strm_status": str(_row_value(row, "strm_status")).strip().casefold(),
-        "gy_staging_cleanup_status": str(
-            _row_value(row, "gy_staging_cleanup_status")
-        ).strip().casefold(),
+        "gy_staging_cleanup_status": str(_row_value(row, "gy_staging_cleanup_status"))
+        .strip()
+        .casefold(),
         "attention_cleared_at": str(_row_value(row, "attention_cleared_at")).strip(),
         "updated_at": str(_row_value(row, "updated_at")).strip(),
         "attention_stages": attention_stages,
@@ -221,7 +237,9 @@ def retry_download_submission_confirmed(
             error="confirmation_stale",
             suggestions=["重新发起下载请求重投并确认最新状态。"],
         )
-    if not secrets.compare_digest(str(state["fingerprint"]), str(expected_context or "")):
+    if not secrets.compare_digest(
+        str(state["fingerprint"]), str(expected_context or "")
+    ):
         return ToolResult(
             ok=False,
             status="conflict",
@@ -234,7 +252,9 @@ def retry_download_submission_confirmed(
     succeeded = len(result.get("succeeded") or [])
     failed = len(result.get("failed") or [])
     duplicate = bool(result.get("duplicate"))
-    source_attention_preserved = bool(result.get("source_attention_preserved", not result.get("ok")))
+    source_attention_preserved = bool(
+        result.get("source_attention_preserved", not result.get("ok"))
+    )
     safe_data = {
         "target": normalized["target"],
         "status": str(result.get("status") or "failed"),

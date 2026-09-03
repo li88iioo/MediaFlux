@@ -112,7 +112,7 @@ jobs:
           import unittest
 
           modules = (
-              "tests.test_agent_browser",
+              "tests.test_agent_kernel_browser",
               "tests.test_guangya_directory_scrape_browser",
               "tests.test_guangya_directory_scrape_ui",
               "tests.test_media_profile_in_place_ui",

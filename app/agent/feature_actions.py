@@ -1,16 +1,17 @@
 """Media Agent 的非敏感功能开关预检与确认写入。"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.defaults import DEFAULT_DISCOVERY_ENABLED, DEFAULT_INDEXER_SEARCH_ENABLED
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.logger import get_logger
@@ -142,7 +143,9 @@ def _enabled_sites() -> tuple[str, ...]:
 
 def summarize_feature_states(_arguments: dict[str, Any]) -> ToolResult:
     """投影非敏感功能状态，不暴露配置键、配置值或站点明细。"""
-    discovery_enabled = config.get_bool(_FEATURES["discovery"].key, _FEATURES["discovery"].default)
+    discovery_enabled = config.get_bool(
+        _FEATURES["discovery"].key, _FEATURES["discovery"].default
+    )
     indexer_enabled = config.get_bool(
         _FEATURES["indexer_search"].key,
         _FEATURES["indexer_search"].default,
@@ -168,14 +171,16 @@ def summarize_feature_states(_arguments: dict[str, Any]) -> ToolResult:
                 reasons.append("provider_not_configured")
             availability = "blocked" if reasons else "available"
 
-        features.append({
-            "feature": feature,
-            "label": definition.label,
-            "enabled": enabled,
-            "availability": availability,
-            "reason_codes": reasons,
-            "managed_by_environment": config.has_external_override(definition.key),
-        })
+        features.append(
+            {
+                "feature": feature,
+                "label": definition.label,
+                "enabled": enabled,
+                "availability": availability,
+                "reason_codes": reasons,
+                "managed_by_environment": config.has_external_override(definition.key),
+            }
+        )
 
     available_count = sum(item["availability"] == "available" for item in features)
     disabled_count = sum(item["availability"] == "disabled" for item in features)
@@ -215,11 +220,13 @@ def summarize_feature_states(_arguments: dict[str, Any]) -> ToolResult:
             "attention_count": blocked_count,
             "features": features,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅汇总白名单功能的布尔状态、依赖可用性与环境托管标记；未返回配置键或配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅汇总白名单功能的布尔状态、依赖可用性与环境托管标记；未返回配置键或配置值。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -300,9 +307,19 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
         effects.append("重建当前进程的探索数据服务，使新状态用于后续请求")
     if definition.effect_note:
         effects.append(definition.effect_note)
-    if state["feature"] in {"douban", "resource_results"} and target and not state["discovery_enabled"]:
-        suggestions.append("媒体探索总开关当前关闭；此设置会保存，但需开启媒体探索后才会生效。")
-    if state["feature"] == "resource_results" and target and not state["indexer_enabled"]:
+    if (
+        state["feature"] in {"douban", "resource_results"}
+        and target
+        and not state["discovery_enabled"]
+    ):
+        suggestions.append(
+            "媒体探索总开关当前关闭；此设置会保存，但需开启媒体探索后才会生效。"
+        )
+    if (
+        state["feature"] == "resource_results"
+        and target
+        and not state["indexer_enabled"]
+    ):
         suggestions.append("多站资源搜索当前关闭；资源结果区域需同时开启多站资源搜索。")
     if not target:
         suggestions.append("关闭功能不会取消已经发出的外部请求。")
@@ -326,11 +343,13 @@ def _preview_feature_state(state: dict[str, Any]) -> ToolResult:
             "requested_enabled": state["requested_enabled"],
             "effects": effects,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅检查目标功能的状态与非敏感前置条件；未返回配置键或配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅检查目标功能的状态与非敏感前置条件；未返回配置键或配置值。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -367,8 +386,8 @@ def _refresh_runtime(definition: FeatureDefinition) -> bool:
     if not definition.restart_discovery:
         return True
     try:
-        from app.discovery.service import shutdown_discovery_service
         from app.discovery.search import shutdown_discovery_search_service
+        from app.discovery.service import shutdown_discovery_service
 
         shutdown_discovery_service()
         shutdown_discovery_search_service()
@@ -392,11 +411,13 @@ def verify_feature_state_write(
     suggestions = list(result.suggestions)
     evidence = list(result.evidence)
     if verified:
-        evidence.append(Evidence(
-            "server_configuration",
-            "已从服务端持久化配置快照回读目标功能状态；未返回配置键或配置值。",
-            _now(),
-        ))
+        evidence.append(
+            Evidence(
+                "server_configuration",
+                "已从服务端持久化配置快照回读目标功能状态；未返回配置键或配置值。",
+                _now(),
+            )
+        )
     else:
         message = "配置写入已提交，但持久化回读尚未确认目标状态；请刷新设置页复核。"
         if message not in suggestions:
@@ -459,7 +480,11 @@ def set_feature_state_confirmed(
         )
 
     runtime_refreshed = _refresh_runtime(definition)
-    suggestions = [] if runtime_refreshed else ["配置已保存；相关服务将在下次请求或重启后使用新状态。"]
+    suggestions = (
+        []
+        if runtime_refreshed
+        else ["配置已保存；相关服务将在下次请求或重启后使用新状态。"]
+    )
     return ToolResult(
         ok=True,
         status="completed",
@@ -471,10 +496,12 @@ def set_feature_state_confirmed(
             "runtime_refreshed": runtime_refreshed,
             "runtime_scope": "current_process",
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "使用确认票据与配置快照原子更新一个白名单功能开关。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "使用确认票据与配置快照原子更新一个白名单功能开关。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

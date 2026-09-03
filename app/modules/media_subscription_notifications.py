@@ -1,7 +1,8 @@
 """媒体订阅事务 outbox 到统一 Telegram 通知中心的可靠移交。"""
+
 from __future__ import annotations
 
-from app.agent.result_projection import sanitize_public_text
+from app.agent.public_safety import sanitize_public_text
 from app.logger import get_logger
 from app.notifier import NOTIFICATION_SECTION_BREAK, NotificationEvent
 from app.repositories.media_experience import (
@@ -88,7 +89,9 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
     delivered = True
     from app.modules.telegram_notification_center import publish_notification_event
     from app.modules.telegram_notification_policy import (
-        NotificationImportance, NotificationTopic, notifications_enabled,
+        NotificationImportance,
+        NotificationTopic,
+        notifications_enabled,
     )
 
     for item in claimed:
@@ -96,8 +99,7 @@ def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
         event_type = str(item.get("event_type") or "")
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
         missing_actionable = bool(
-            event_type == "missing"
-            and int(payload.get("auto_submitted") or 0) <= 0
+            event_type == "missing" and int(payload.get("auto_submitted") or 0) <= 0
         )
         outcome = publish_notification_event(
             f"media-subscription:{item['id']}:{event_type}",

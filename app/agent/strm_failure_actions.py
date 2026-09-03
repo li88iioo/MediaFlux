@@ -1,12 +1,13 @@
 """STRM 失败账本的安全只读分诊。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -63,22 +64,37 @@ def triage_strm_failures(_arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="暂时无法读取 STRM 失败汇总",
             data=_empty_data(),
-            evidence=[Evidence(
-                "sqlite:strm_failures",
-                "尝试读取 STRM 失败账本的固定聚合；未探测业务媒体文件系统、未访问网络，也未执行重试。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "sqlite:strm_failures",
+                    "尝试读取 STRM 失败账本的固定聚合；未探测业务媒体文件系统、未访问网络，也未执行重试。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查本地数据库状态后重试。"],
             error="STRM 失败分诊当前不可用。",
         )
 
     raw = raw if isinstance(raw, dict) else {}
-    raw_by_action = raw.get("by_action") if isinstance(raw.get("by_action"), dict) else {}
+    raw_by_action = (
+        raw.get("by_action") if isinstance(raw.get("by_action"), dict) else {}
+    )
     failures = _empty_failures()
-    for key in ("total", "open", "retrying", "resolved", "active_repeated", "active_retried"):
+    for key in (
+        "total",
+        "open",
+        "retrying",
+        "resolved",
+        "active_repeated",
+        "active_retried",
+    ):
         failures[key] = _count(raw.get(key))
     for action in ("generate", "metadata"):
-        action_raw = raw_by_action.get(action) if isinstance(raw_by_action.get(action), dict) else {}
+        action_raw = (
+            raw_by_action.get(action)
+            if isinstance(raw_by_action.get(action), dict)
+            else {}
+        )
         for key in ("total", "open", "retrying", "resolved"):
             failures["by_action"][action][key] = _count(action_raw.get(key))
 
@@ -97,9 +113,13 @@ def triage_strm_failures(_arguments: dict[str, Any]) -> ToolResult:
 
     suggestions: list[str] = []
     if failures["by_action"]["generate"]["open"]:
-        suggestions.append("存在 STRM 生成失败；请在管理页面核对来源对象与输出配置后再选择性重试。")
+        suggestions.append(
+            "存在 STRM 生成失败；请在管理页面核对来源对象与输出配置后再选择性重试。"
+        )
     if failures["by_action"]["metadata"]["open"]:
-        suggestions.append("存在元数据处理失败；请先核对元数据服务与目录权限，再选择性重试。")
+        suggestions.append(
+            "存在元数据处理失败；请先核对元数据服务与目录权限，再选择性重试。"
+        )
     if failures["active_repeated"]:
         suggestions.append("存在重复失败记录，建议先处理根因，避免连续无效重试。")
     if failures["retrying"] and not failures["open"]:
@@ -115,10 +135,12 @@ def triage_strm_failures(_arguments: dict[str, Any]) -> ToolResult:
             "filesystem_accessed": False,
             "failures": failures,
         },
-        evidence=[Evidence(
-            "sqlite:strm_failures",
-            "仅统计 STRM 失败状态与动作类别；未读取或返回来源、对象、文件、路径及错误正文，未访问网络或执行重试。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "sqlite:strm_failures",
+                "仅统计 STRM 失败状态与动作类别；未读取或返回来源、对象、文件、路径及错误正文，未访问网络或执行重试。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

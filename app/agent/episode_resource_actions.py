@@ -1,20 +1,22 @@
 """已播缺集的定向资源搜索：先审计，再复用多站安全搜索。"""
+
 from __future__ import annotations
 
-from datetime import date, datetime
 import time
 import unicodedata
+from datetime import date, datetime
 from typing import Any
 
 from app.agent.episode_audit import audit_series_episodes
-from app.agent.indexer_actions import normalize_search_sites
+from app.agent.errors import AgentToolError
+from app.agent.indexer_actions import (
+    normalize_search_sites,
+    search_resources,
+    validate_enabled_search_sites,
+)
 from app.agent.indexer_actions import search_arguments as indexer_search_arguments
-from app.agent.indexer_actions import search_resources
-from app.agent.indexer_actions import validate_enabled_search_sites
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.agent.resource_recommendation import rank_episode_search
-
 
 
 def _now() -> str:
@@ -41,7 +43,11 @@ def _visible_text(value: Any, *, name: str, maximum: int = 120) -> str:
 
 
 def _positive_int(value: Any, *, name: str, maximum: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 1 <= value <= maximum
+    ):
         raise AgentToolError(f"{name} 必须是 1 到 {maximum} 的整数")
     return value
 
@@ -55,7 +61,16 @@ def _optional_visible_text(value: Any, *, name: str, maximum: int) -> str:
 def missing_episode_resource_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     _reject_extra(
         arguments,
-        {"query", "tmdb_id", "season", "episode", "as_of", "sites", "limit", "library_name"},
+        {
+            "query",
+            "tmdb_id",
+            "season",
+            "episode",
+            "as_of",
+            "sites",
+            "limit",
+            "library_name",
+        },
     )
     query = _visible_text(arguments.get("query"), name="query")
     library_name = _optional_visible_text(
@@ -68,7 +83,9 @@ def missing_episode_resource_arguments(arguments: dict[str, Any]) -> dict[str, A
     if not isinstance(tmdb_id, str):
         raise AgentToolError("tmdb_id 必须是字符串")
     tmdb_id = tmdb_id.strip()
-    if tmdb_id and (not tmdb_id.isascii() or not tmdb_id.isdigit() or len(tmdb_id) > 10):
+    if tmdb_id and (
+        not tmdb_id.isascii() or not tmdb_id.isdigit() or len(tmdb_id) > 10
+    ):
         raise AgentToolError("tmdb_id 必须是 1 到 10 位数字")
 
     season = _positive_int(arguments.get("season"), name="season", maximum=100)
@@ -130,7 +147,9 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
     tmdb_id = tmdb_id.strip()
     if "tmdb_id" in arguments and not tmdb_id:
         raise AgentToolError("tmdb_id 必须是 1 到 10 位数字")
-    if tmdb_id and (not tmdb_id.isascii() or not tmdb_id.isdigit() or len(tmdb_id) > 10):
+    if tmdb_id and (
+        not tmdb_id.isascii() or not tmdb_id.isdigit() or len(tmdb_id) > 10
+    ):
         raise AgentToolError("tmdb_id 必须是 1 到 10 位数字")
 
     season = _positive_int(arguments.get("season"), name="season", maximum=100)
@@ -173,7 +192,9 @@ def _bounded_count(value: Any, maximum: int = 100_000) -> int:
         return 0
 
 
-def _verification(arguments: dict[str, Any], audit: ToolResult, *, verified: bool) -> dict[str, Any]:
+def _verification(
+    arguments: dict[str, Any], audit: ToolResult, *, verified: bool
+) -> dict[str, Any]:
     data = audit.data if isinstance(audit.data, dict) else {}
     title = " ".join(str(data.get("title") or arguments["query"]).split())[:120]
     tmdb_id = str(data.get("tmdb_id") or arguments.get("tmdb_id") or "")
@@ -186,13 +207,17 @@ def _verification(arguments: dict[str, Any], audit: ToolResult, *, verified: boo
         "episode": arguments["episode"],
         "as_of": arguments["as_of"],
         "audit_status": audit.status,
-        "library_name": str(data.get("library_name") or arguments.get("library_name") or "")[:80],
+        "library_name": str(
+            data.get("library_name") or arguments.get("library_name") or ""
+        )[:80],
         "missing_count": _bounded_count(data.get("missing_count")),
         "verified_missing": verified,
     }
 
 
-def _season_verification(arguments: dict[str, Any], audit: ToolResult) -> dict[str, Any]:
+def _season_verification(
+    arguments: dict[str, Any], audit: ToolResult
+) -> dict[str, Any]:
     data = audit.data if isinstance(audit.data, dict) else {}
     title = " ".join(str(data.get("title") or arguments["query"]).split())[:120]
     tmdb_id = str(data.get("tmdb_id") or arguments.get("tmdb_id") or "")
@@ -204,7 +229,9 @@ def _season_verification(arguments: dict[str, Any], audit: ToolResult) -> dict[s
         "season": arguments["season"],
         "as_of": arguments["as_of"],
         "audit_status": audit.status,
-        "library_name": str(data.get("library_name") or arguments.get("library_name") or "")[:80],
+        "library_name": str(
+            data.get("library_name") or arguments.get("library_name") or ""
+        )[:80],
         "missing_count": _bounded_count(data.get("missing_count")),
         "verified_missing": False,
     }
@@ -228,13 +255,15 @@ def _episode_search_arguments(arguments: dict[str, Any], title: str) -> dict[str
         aliases = [scoped(base, alternate), scoped(input_title, code)]
     else:
         aliases = [scoped(base, alternate), scoped(base, chinese)]
-    return indexer_search_arguments({
-        "title": scoped(base, code),
-        "aliases": aliases,
-        "media_type": "tv",
-        "sites": arguments["sites"],
-        "limit": arguments["limit"],
-    })
+    return indexer_search_arguments(
+        {
+            "title": scoped(base, code),
+            "aliases": aliases,
+            "media_type": "tv",
+            "sites": arguments["sites"],
+            "limit": arguments["limit"],
+        }
+    )
 
 
 def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
@@ -280,7 +309,9 @@ def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
         sample = [item for item in raw_sample if isinstance(item, dict)]
         if target_missing is None and target in sample:
             pass
-        elif target_missing is None and bool(audit_data.get("missing_sample_truncated")):
+        elif target_missing is None and bool(
+            audit_data.get("missing_sample_truncated")
+        ):
             return ToolResult(
                 False,
                 "inconclusive",
@@ -314,8 +345,7 @@ def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
     }
     if searched.ok:
         summary = (
-            f"已确认 {search_args['title'].rsplit(' ', 1)[-1]} 缺失；"
-            f"{searched.summary}"
+            f"已确认 {search_args['title'].rsplit(' ', 1)[-1]} 缺失；{searched.summary}"
         )
     else:
         summary = f"已确认指定集缺失，但{searched.summary}"
@@ -324,16 +354,23 @@ def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
         searched.status,
         summary,
         data=data,
-        evidence=list(audit.evidence) + list(searched.evidence) + [
+        evidence=list(audit.evidence)
+        + list(searched.evidence)
+        + [
             Evidence(
                 "agent_verification",
                 "资源站搜索仅在媒体库与 TMDB 审计确认目标为已播缺集后执行；未自动提交下载。",
                 _now(),
             )
         ],
-        suggestions=list(searched.suggestions) + ([
-            "已按季集匹配、可提交性、发布规格和站点活跃度生成只读推荐；确认后才会提交下载。"
-        ] if ranked_search.get("recommendation", {}).get("selected") else []),
+        suggestions=list(searched.suggestions)
+        + (
+            [
+                "已按季集匹配、可提交性、发布规格和站点活跃度生成只读推荐；确认后才会提交下载。"
+            ]
+            if ranked_search.get("recommendation", {}).get("selected")
+            else []
+        ),
         error=searched.error,
     )
 
@@ -435,7 +472,9 @@ def search_missing_season_resources(arguments: dict[str, Any]) -> ToolResult:
             "episode": target["episode"],
             "limit": arguments["limit_per_episode"],
         }
-        search_args = _episode_search_arguments(per_episode_arguments, verification["title"])
+        search_args = _episode_search_arguments(
+            per_episode_arguments, verification["title"]
+        )
         searched = search_resources(search_args, timeout_seconds=remaining_seconds)
         raw_search_data = searched.data if isinstance(searched.data, dict) else {}
         search_data = rank_episode_search(
@@ -449,15 +488,17 @@ def search_missing_season_resources(arguments: dict[str, Any]) -> ToolResult:
         completed += int(bool(searched.ok))
         failed += int(not searched.ok)
         episode_label = f"S{target['season']:02d}E{target['episode']:02d}"
-        episodes.append({
-            "season": target["season"],
-            "episode": target["episode"],
-            "episode_label": episode_label,
-            "ok": bool(searched.ok),
-            "status": searched.status,
-            "summary": searched.summary[:160],
-            "search": search_data,
-        })
+        episodes.append(
+            {
+                "season": target["season"],
+                "episode": target["episode"],
+                "episode_label": episode_label,
+                "ok": bool(searched.ok),
+                "status": searched.status,
+                "summary": searched.summary[:160],
+                "search": search_data,
+            }
+        )
         evidence.extend(searched.evidence)
         if time.monotonic() >= deadline_at:
             deadline_exhausted = True
@@ -500,7 +541,8 @@ def search_missing_season_resources(arguments: dict[str, Any]) -> ToolResult:
             "truncated": bool(remaining),
             "episodes": episodes,
         },
-        evidence=evidence[:16] + [
+        evidence=evidence[:16]
+        + [
             Evidence(
                 "agent_verification",
                 "批量资源站搜索仅处理本次媒体库与 TMDB 审计确认的已播缺集；未自动提交下载。",

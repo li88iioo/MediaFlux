@@ -1,16 +1,17 @@
 """本地媒体来源的受控手动扫描动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import sanitize_public_text
+from app.agent.public_safety import sanitize_public_text
 from app.modules.local_media_scheduler import get_local_media_scheduler
 
 _OWNER = "admin"
@@ -23,8 +24,12 @@ def _now() -> str:
 
 
 def local_media_scan_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict) or not set(arguments).issubset({"source_numbers", "query"}):
-        raise AgentToolError("local_media.scan_sources 只接受 source_numbers 和 query 参数")
+    if not isinstance(arguments, dict) or not set(arguments).issubset(
+        {"source_numbers", "query"}
+    ):
+        raise AgentToolError(
+            "local_media.scan_sources 只接受 source_numbers 和 query 参数"
+        )
     raw = arguments.get("source_numbers", [])
     if raw is None:
         raw = []
@@ -70,38 +75,42 @@ def _snapshot(source_numbers: list[int]) -> tuple[dict[str, Any], list[int], set
         eligible = source.mode != "preview_only" and bool(targets)
         if eligible:
             eligible_ids.add(int(source.id))
-        entries.append({
-            "source_number": number,
-            "source_id": int(source.id),
-            "name": str(source.name),
-            "local_root": str(source.local_root),
-            "mode": str(source.mode),
-            "media_type": str(source.media_type),
-            "updated_at": str(source.updated_at),
-            "targets": [
-                {
-                    "id": int(target.id),
-                    "category": str(target.category),
-                    "path": str(target.path),
-                    "provider": str(target.provider),
-                    "library_id": str(target.library_id),
-                    "server_path": str(target.server_path),
-                    "updated_at": str(target.updated_at),
-                }
-                for target in targets
-            ],
-            "eligible": eligible,
-        })
+        entries.append(
+            {
+                "source_number": number,
+                "source_id": int(source.id),
+                "name": str(source.name),
+                "local_root": str(source.local_root),
+                "mode": str(source.mode),
+                "media_type": str(source.media_type),
+                "updated_at": str(source.updated_at),
+                "targets": [
+                    {
+                        "id": int(target.id),
+                        "category": str(target.category),
+                        "path": str(target.path),
+                        "provider": str(target.provider),
+                        "library_id": str(target.library_id),
+                        "server_path": str(target.server_path),
+                        "updated_at": str(target.updated_at),
+                    }
+                    for target in targets
+                ],
+                "eligible": eligible,
+            }
+        )
     return {"sources": entries}, public_numbers, eligible_ids
 
 
 def _fingerprint(snapshot: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(
-        snapshot,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def prepare_scan_local_media_sources(
@@ -133,11 +142,13 @@ def prepare_scan_local_media_sources(
                 "仅预览来源和未配置归档目标的来源会被安全跳过。",
             ],
         },
-        evidence=[Evidence(
-            "local_media_configuration",
-            "已冻结所选来源及其归档目标配置；路径和媒体库内部标识不会展示给模型或用户。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "local_media_configuration",
+                "已冻结所选来源及其归档目标配置；路径和媒体库内部标识不会展示给模型或用户。",
+                _now(),
+            )
+        ],
     ), _fingerprint(snapshot)
 
 
@@ -147,9 +158,7 @@ def scan_local_media_sources_confirmed(
     normalized = local_media_scan_arguments(arguments)
     snapshot, public_numbers, eligible_ids = _snapshot(normalized["source_numbers"])
     snapshot["query"] = normalized["query"]
-    if not secrets.compare_digest(
-        _fingerprint(snapshot), str(expected_context or "")
-    ):
+    if not secrets.compare_digest(_fingerprint(snapshot), str(expected_context or "")):
         raise AgentToolError(
             "本地媒体来源或归档目标已变化，请重新预检",
             code="confirmation_stale",
@@ -181,13 +190,16 @@ def scan_local_media_sources_confirmed(
             "queued_tasks": queued,
             "runtime_started": started,
         },
-        evidence=[Evidence(
-            "local_media_scheduler",
-            "已按确认快照扫描配置来源并唤醒本地媒体调度器；未返回路径、文件名或任务内部标识。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "local_media_scheduler",
+                "已按确认快照扫描配置来源并唤醒本地媒体调度器；未返回路径、文件名或任务内部标识。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["可继续查看本地媒体任务或待确认队列。"]
-            if queued else ["当前所选来源没有发现可入队的媒体候选。"]
+            if queued
+            else ["当前所选来源没有发现可入队的媒体候选。"]
         ),
     )

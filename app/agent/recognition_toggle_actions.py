@@ -3,17 +3,19 @@
 该模块只允许按公开规则类型和正整数 ID 切换 enabled 状态。它不会返回规则名、
 匹配表达式、TMDB ID、别名、证据或其它业务内容，也不支持批量修改。
 """
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.modules import recognition_knowledge, recognition_preprocess_rules
 
 _RULE_TYPES = {
@@ -103,21 +105,43 @@ def _digest_fields(row: Any, fields: tuple[str, ...]) -> str:
 def _snapshot(row: Any, *, rule_type: str, rule_id: int) -> dict[str, Any]:
     if rule_type == "preprocess_rule":
         identity_fields = (
-            "name", "matcher_type", "pattern", "scope", "action", "replacement",
-            "numeric_value", "priority", "builtin_key", "created_at",
+            "name",
+            "matcher_type",
+            "pattern",
+            "scope",
+            "action",
+            "replacement",
+            "numeric_value",
+            "priority",
+            "builtin_key",
+            "created_at",
         )
     elif rule_type == "tmdb_regex_rule":
         identity_fields = (
-            "name", "pattern", "match_target", "tmdb_id", "media_type",
-            "season_override", "priority", "created_at",
+            "name",
+            "pattern",
+            "match_target",
+            "tmdb_id",
+            "media_type",
+            "season_override",
+            "priority",
+            "created_at",
         )
     else:
         # hit/success/conflict 计数和 updated_at 会被正常识别流程更新，不纳入快照，
         # 避免用户确认期间因无关统计变化产生虚假冲突。
         identity_fields = (
-            "knowledge_key", "knowledge_type", "canonical_value", "normalized_value",
-            "aliases_json", "source", "confidence", "user_modified", "seed_revision",
-            "evidence_json", "created_at",
+            "knowledge_key",
+            "knowledge_type",
+            "canonical_value",
+            "normalized_value",
+            "aliases_json",
+            "source",
+            "confidence",
+            "user_modified",
+            "seed_revision",
+            "evidence_json",
+            "created_at",
         )
     return {
         "rule_type": rule_type,
@@ -178,11 +202,13 @@ def prepare_set_recognition_rule_enabled(
                 "不会批量影响其它识别规则。",
             ],
         },
-        evidence=[Evidence(
-            source="recognition_configuration",
-            description="仅核对目标规则的类型、编号、启停状态和私有快照；未返回规则内容。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="recognition_configuration",
+                description="仅核对目标规则的类型、编号、启停状态和私有快照；未返回规则内容。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=["该操作可通过相反的启停命令恢复。"],
     )
     return preview, _fingerprint(snapshot)
@@ -277,10 +303,12 @@ def set_recognition_rule_enabled_confirmed(
             "enabled": requested,
             "affected": 1,
         },
-        evidence=[Evidence(
-            source="recognition_configuration",
-            description="只更新了目标规则的启停状态，并刷新当前进程相关缓存。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="recognition_configuration",
+                description="只更新了目标规则的启停状态，并刷新当前进程相关缓存。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=["如需恢复，可对同一规则编号执行相反的启停操作。"],
     )

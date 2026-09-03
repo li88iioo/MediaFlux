@@ -42,12 +42,14 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 side_effect=lambda key, default="": values.get(key, default),
             ),
             patch(
-                "app.bot.agent_adapter.get",
+                "app.bot.agent_adapter.config.get",
                 side_effect=lambda key, default="": values.get(key, default),
             ),
         )
 
-    def test_group_write_guard_requires_allowed_user_but_private_chat_stays_compatible(self):
+    def test_group_write_guard_requires_allowed_user_but_private_chat_stays_compatible(
+        self,
+    ):
         from app.bot import handlers
         from tests.test_production import TelegramBotTests
 
@@ -131,9 +133,11 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot = TelegramBotTests.FakeBot()
         telebot = TelegramBotTests._telebot_types()
         first, second = self._patch_values(self._values())
-        with first, second, patch(
-            "app.modules.download_dispatcher.create_request"
-        ) as create_request:
+        with (
+            first,
+            second,
+            patch("app.modules.download_dispatcher.create_request") as create_request,
+        ):
             handlers._register_commands(bot, telebot)
             receive_link = next(
                 registered
@@ -172,11 +176,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             user_id=9,
             text="http://192.168.0.195:1258/guangya/offline",
         )
-        with first, second, patch(
-            "app.modules.download_dispatcher.create_request"
-        ) as create_request, patch(
-            "app.bot.agent_adapter.handle_agent_message", return_value=False,
-        ) as handle_agent_message:
+        with (
+            first,
+            second,
+            patch("app.modules.download_dispatcher.create_request") as create_request,
+            patch(
+                "app.bot.agent_adapter.handle_agent_message",
+                return_value=False,
+            ) as handle_agent_message,
+        ):
             handlers._register_commands(bot, telebot)
             receive_link = next(
                 registered
@@ -216,29 +224,39 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 message_id=23,
             ),
         )
-        store = SimpleNamespace(claim=lambda *args, **kwargs: {
-            "operation": "download_request",
-            "decision": "confirm",
-            "value": {"request_id": 77, "target": "guangya"},
-        })
+        store = SimpleNamespace(
+            claim=lambda *args, **kwargs: {
+                "operation": "download_request",
+                "decision": "confirm",
+                "value": {"request_id": 77, "target": "guangya"},
+            }
+        )
         row = {
             "id": 77,
             "status": "pending",
             "kind": "http",
             "source_value": "http://192.168.0.195:1258/guangya/offline",
         }
-        with patch(
-            "app.modules.telegram_write_confirmations.get_telegram_write_confirmation_store",
-            return_value=store,
-        ), patch(
-            "app.bot.handlers.db.bind_pending_download_request_owner", return_value=row,
-        ), patch(
-            "app.bot.handlers.db.claim_download_request", return_value=True,
-        ) as claim_request, patch(
-            "app.bot.handlers.db.update_download_request",
-        ) as update_request, patch(
-            "app.bot.handlers._dispatch_download_callback",
-        ) as dispatch:
+        with (
+            patch(
+                "app.modules.telegram_write_confirmations.get_telegram_write_confirmation_store",
+                return_value=store,
+            ),
+            patch(
+                "app.bot.handlers.db.bind_pending_download_request_owner",
+                return_value=row,
+            ),
+            patch(
+                "app.bot.handlers.db.claim_download_request",
+                return_value=True,
+            ) as claim_request,
+            patch(
+                "app.bot.handlers.db.update_download_request",
+            ) as update_request,
+            patch(
+                "app.bot.handlers._dispatch_download_callback",
+            ) as dispatch,
+        ):
             handlers._handle_write_confirmation_callback(bot, call, SimpleNamespace())
 
         dispatch.assert_not_called()
@@ -254,10 +272,13 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot = TelegramBotTests.FakeBot()
         telebot = TelegramBotTests._telebot_types()
         values = {"TG_CHAT_ID": "100", "TG_AGENT_ALLOWED_USER_IDS": ""}
-        with patch(
-            "app.bot.handlers.get",
-            side_effect=lambda key, default="": values.get(key, default),
-        ), patch("app.bot.handlers._handle_share_callback") as share:
+        with (
+            patch(
+                "app.bot.handlers.get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
+            patch("app.bot.handlers._handle_share_callback") as share,
+        ):
             handlers._register_commands(bot, telebot)
             callback = next(
                 registered
@@ -283,13 +304,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         bot = Bot()
         telebot = TelegramBotTests._telebot_types()
         first, second = self._patch_values(self._values())
-        with first, second, patch(
-            "app.bot.handlers._handle_share_callback"
-        ) as share, patch(
-            "app.bot.handlers._handle_organize_confirmation_callback"
-        ) as organize, patch(
-            "app.bot.handlers._dispatch_download_callback"
-        ) as dispatch:
+        with (
+            first,
+            second,
+            patch("app.bot.handlers._handle_share_callback") as share,
+            patch(
+                "app.bot.handlers._handle_organize_confirmation_callback"
+            ) as organize,
+            patch("app.bot.handlers._dispatch_download_callback") as dispatch,
+        ):
             handlers._register_commands(bot, telebot)
             for prefix in ("gys:", "orgc:", "dl:"):
                 callback = next(
@@ -336,9 +359,13 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             "TG_AGENT_ALLOWED_USER_IDS": "9,10",
         }
         first, second = self._patch_values(values)
-        with first, second, patch(
-            "app.modules.download_dispatcher.create_request",
-            return_value={"created": True, "id": 77, "status": "pending"},
+        with (
+            first,
+            second,
+            patch(
+                "app.modules.download_dispatcher.create_request",
+                return_value={"created": True, "id": 77, "status": "pending"},
+            ),
         ):
             handlers._register_commands(bot, telebot)
             receive_link = next(
@@ -346,17 +373,21 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 for filters, registered in bot.message_handlers
                 if filters.get("content_types") == ["text"]
                 and filters.get("func") is not None
-                and filters["func"](self._message(
+                and filters["func"](
+                    self._message(
+                        chat_id=-100,
+                        user_id=9,
+                        text="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+                    )
+                )
+            )
+            receive_link(
+                self._message(
                     chat_id=-100,
                     user_id=9,
                     text="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
-                ))
+                )
             )
-            receive_link(self._message(
-                chat_id=-100,
-                user_id=9,
-                text="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
-            ))
             callback_data = bot.replies[-1][2]["reply_markup"].buttons[0].callback_data
             self.assertTrue(callback_data.startswith("tgc:"))
             callback = next(
@@ -364,15 +395,17 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 for filters, registered in bot.callback_handlers
                 if filters["func"](SimpleNamespace(data=callback_data))
             )
-            callback(SimpleNamespace(
-                id="foreign-choice",
-                data=callback_data,
-                from_user=SimpleNamespace(id=10),
-                message=SimpleNamespace(
-                    chat=SimpleNamespace(id=-100),
-                    message_id=23,
-                ),
-            ))
+            callback(
+                SimpleNamespace(
+                    id="foreign-choice",
+                    data=callback_data,
+                    from_user=SimpleNamespace(id=10),
+                    message=SimpleNamespace(
+                        chat=SimpleNamespace(id=-100),
+                        message_id=23,
+                    ),
+                )
+            )
 
         self.assertIn("不属于", bot.answers[-1][0][1])
         self.assertEqual(bot.edits, [])
@@ -402,18 +435,23 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             "chat_id": "100",
             "user_id": "9",
         }
-        with first, second, patch(
-            "app.modules.download_dispatcher.create_request",
-            return_value={
-                "created": False,
-                "id": 77,
-                "status": "pending",
-                "title": "已保存任务",
-            },
-        ), patch(
-            "app.bot.handlers.db.bind_pending_download_request_owner",
-            return_value=persisted,
-        ) as bind_owner:
+        with (
+            first,
+            second,
+            patch(
+                "app.modules.download_dispatcher.create_request",
+                return_value={
+                    "created": False,
+                    "id": 77,
+                    "status": "pending",
+                    "title": "已保存任务",
+                },
+            ),
+            patch(
+                "app.bot.handlers.db.bind_pending_download_request_owner",
+                return_value=persisted,
+            ) as bind_owner,
+        ):
             handlers._register_commands(bot, telebot)
             message = self._message(
                 chat_id=100,
@@ -433,9 +471,13 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
         self.assertIn("原确认已失效", bot.replies[-1][1])
         buttons = bot.replies[-1][2]["reply_markup"].buttons
         self.assertTrue(buttons)
-        self.assertTrue(all(button.callback_data.startswith("tgc:") for button in buttons))
+        self.assertTrue(
+            all(button.callback_data.startswith("tgc:") for button in buttons)
+        )
 
-    def test_legacy_download_callback_only_reissues_confirmation_and_never_dispatches(self):
+    def test_legacy_download_callback_only_reissues_confirmation_and_never_dispatches(
+        self,
+    ):
         from app.bot import handlers
         from app.modules.telegram_write_confirmations import (
             reset_telegram_write_confirmation_store_for_tests,
@@ -461,12 +503,15 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             "chat_id": "100",
             "user_id": "9",
         }
-        with first, second, patch(
-            "app.bot.handlers.db.bind_pending_download_request_owner",
-            return_value=row,
-        ) as bind_owner, patch(
-            "app.bot.handlers._dispatch_download_callback"
-        ) as dispatch:
+        with (
+            first,
+            second,
+            patch(
+                "app.bot.handlers.db.bind_pending_download_request_owner",
+                return_value=row,
+            ) as bind_owner,
+            patch("app.bot.handlers._dispatch_download_callback") as dispatch,
+        ):
             handlers._register_commands(bot, telebot)
             callback = next(
                 registered
@@ -495,7 +540,6 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 for button in bot.replies[-1][2]["reply_markup"].buttons
             )
         )
-
 
 
 if __name__ == "__main__":

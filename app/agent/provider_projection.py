@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from app.agent.result_projection import (
+from app.agent.public_safety import (
     sanitize_public_text,
     sanitize_untrusted_filename,
 )

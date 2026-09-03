@@ -1,20 +1,22 @@
 """Agent 下载完成后的持久化媒体库复核调度器。"""
+
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timedelta
-import threading
-from typing import Callable
 
 from app import database as db
 from app.agent.episode_audit import invalidate_episode_audit_cache
-from app.agent.models import ToolResult
 from app.agent.feature_gate import (
     AgentRuntimeDisabled,
     agent_runtime_effect_admission,
     agent_runtime_generation_is_current,
     current_agent_runtime_generation,
 )
+from app.agent.models import ToolResult
 from app.agent.owner_routes import (
     parse_telegram_owner_route,
     telegram_owner_route_is_currently_authorized,
@@ -26,18 +28,23 @@ from app.agent.recent_download_submissions import (
     build_recent_download_status,
 )
 from app.logger import get_logger
-from app.notifier import TelegramSendResult
 from app.modules.agent_download_verification_notifications import (
     dump_download_verification_payload,
     load_download_verification_payload,
     notify_download_verification_terminal_result,
 )
+from app.notifier import TelegramSendResult
 
 logger = get_logger(__name__)
 
 _ACTIVE_PHASES = {
-    "pending", "submitting", "submitted", "downloading", "post_processing",
-    "partial_in_progress", "accepted",
+    "pending",
+    "submitting",
+    "submitted",
+    "downloading",
+    "post_processing",
+    "partial_in_progress",
+    "accepted",
 }
 _RETRY_DELAYS = (60, 180, 300, 600, 900)
 _RUNNING_LEASE_SECONDS = 30 * 60
@@ -64,7 +71,9 @@ class DownloadLibraryVerificationScheduler:
         terminal_notifier: Callable[..., object] | None = None,
     ) -> None:
         self._audit_executor = audit_executor or self._default_audit_executor
-        self._terminal_notifier = terminal_notifier or notify_download_verification_terminal_result
+        self._terminal_notifier = (
+            terminal_notifier or notify_download_verification_terminal_result
+        )
         self._terminal_notifier_uses_request_id = terminal_notifier is None
         self._notification_enabled_override = terminal_notifier is not None
         self.interval = max(0.1, float(interval))
@@ -132,11 +141,12 @@ class DownloadLibraryVerificationScheduler:
             int(job["request_id"]),
             status="pending",
             result=str(job["result"] or ""),
-            attempts=int(job["attempts"] or 0) if attempts is None else max(0, int(attempts)),
+            attempts=int(job["attempts"] or 0)
+            if attempts is None
+            else max(0, int(attempts)),
             next_check_at=current,
             last_checked_at=(
-                job["last_checked_at"]
-                if last_checked_at is None else last_checked_at
+                job["last_checked_at"] if last_checked_at is None else last_checked_at
             ),
             expected_lease_generation=int(job["lease_generation"]),
         )
@@ -184,7 +194,8 @@ class DownloadLibraryVerificationScheduler:
                 not self._runtime_allows(runtime_generation)
                 or self.dispatch_notification_once(
                     runtime_generation=runtime_generation
-                ) == 0
+                )
+                == 0
             ):
                 break
         return processed
@@ -233,9 +244,7 @@ class DownloadLibraryVerificationScheduler:
                         int(cleanup.get("bytes") or 0),
                     )
             except Exception as exc:
-                logger.warning(
-                    "%s清理失败 type=%s", label, type(exc).__name__
-                )
+                logger.warning("%s清理失败 type=%s", label, type(exc).__name__)
         try:
             deleted = db.purge_expired_agent_task_history(
                 current_time=self._format(current),
@@ -389,7 +398,9 @@ class DownloadLibraryVerificationScheduler:
                 position=1,
             )
             projected_data = projected.data if isinstance(projected.data, dict) else {}
-            verification_result = str(projected_data.get("verification") or "inconclusive")
+            verification_result = str(
+                projected_data.get("verification") or "inconclusive"
+            )
             if verification_result not in {"visible", "missing", "inconclusive"}:
                 verification_result = "inconclusive"
         except Exception as exc:
@@ -474,7 +485,10 @@ class DownloadLibraryVerificationScheduler:
         try:
             lease_generation = int(job["lease_generation"] or 0)
             latest = db.get_agent_download_verification(request_id)
-            if latest is not None and int(latest["lease_generation"] or 0) != lease_generation:
+            if (
+                latest is not None
+                and int(latest["lease_generation"] or 0) != lease_generation
+            ):
                 return
             current_job = latest or job
             attempts = max(0, int(current_job["attempts"] or 0))
@@ -555,11 +569,14 @@ class DownloadLibraryVerificationScheduler:
                 type(exc).__name__,
             )
 
-    def dispatch_notification_once(self, *, runtime_generation: int | None = None) -> int:
+    def dispatch_notification_once(
+        self, *, runtime_generation: int | None = None
+    ) -> int:
         """投递一条到期通知；失败进入持久退避，不影响核验终态。"""
         generation_guard = (
             current_agent_runtime_generation()
-            if runtime_generation is None else int(runtime_generation)
+            if runtime_generation is None
+            else int(runtime_generation)
         )
         with self._notification_gate:
             if not self._runtime_allows(generation_guard):
@@ -609,7 +626,9 @@ class DownloadLibraryVerificationScheduler:
                 db.discard_agent_download_verification_notification(
                     notification_id,
                     expected_lease_generation=generation,
-                    error_type="MissingRoute" if not owner and not chat_id else "InvalidRoute",
+                    error_type="MissingRoute"
+                    if not owner and not chat_id
+                    else "InvalidRoute",
                 )
                 return 1
             if not telegram_owner_route_is_currently_authorized(
@@ -640,16 +659,21 @@ class DownloadLibraryVerificationScheduler:
                         return 0
                     if self._terminal_notifier_uses_request_id:
                         raw_result = self._terminal_notifier(
-                            owner=owner, chat_id=chat_id,
-                            request_id=int(item["request_id"]), **payload,
+                            owner=owner,
+                            chat_id=chat_id,
+                            request_id=int(item["request_id"]),
+                            **payload,
                         )
                     else:
                         # 外部注入器沿用既有公开签名，避免插件被内部关联 ID 破坏。
                         raw_result = self._terminal_notifier(
-                            owner=owner, chat_id=chat_id, **payload,
+                            owner=owner,
+                            chat_id=chat_id,
+                            **payload,
                         )
                 result = (
-                    raw_result if isinstance(raw_result, TelegramSendResult)
+                    raw_result
+                    if isinstance(raw_result, TelegramSendResult)
                     else TelegramSendResult(
                         ok=bool(raw_result),
                         error="" if raw_result else "DeliveryFailed",
@@ -690,7 +714,9 @@ class DownloadLibraryVerificationScheduler:
                     error_type="DeliveryOutcomeUnknown",
                 )
             elif result.error in {
-                "NotificationsDisabled", "AuthorizationRevoked", "InvalidRoute",
+                "NotificationsDisabled",
+                "AuthorizationRevoked",
+                "InvalidRoute",
             }:
                 db.discard_agent_download_verification_notification(
                     notification_id,
@@ -713,7 +739,11 @@ class DownloadLibraryVerificationScheduler:
             return 1
 
     def _retry_notification(
-        self, item, *, error_type: str, delay_override: int = 0,
+        self,
+        item,
+        *,
+        error_type: str,
+        delay_override: int = 0,
     ) -> None:
         attempts = max(0, int(item["attempts"] or 0))
         if attempts + 1 >= _NOTIFICATION_MAX_ATTEMPTS:
@@ -723,9 +753,12 @@ class DownloadLibraryVerificationScheduler:
                 error_type=error_type,
             )
             return
-        delay = max(0, int(delay_override or 0)) or _NOTIFICATION_RETRY_DELAYS[
-            min(attempts, len(_NOTIFICATION_RETRY_DELAYS) - 1)
-        ]
+        delay = (
+            max(0, int(delay_override or 0))
+            or _NOTIFICATION_RETRY_DELAYS[
+                min(attempts, len(_NOTIFICATION_RETRY_DELAYS) - 1)
+            ]
+        )
         db.retry_agent_download_verification_notification(
             int(item["id"]),
             expected_lease_generation=int(item["lease_generation"]),
@@ -737,7 +770,6 @@ class DownloadLibraryVerificationScheduler:
         if self._notification_enabled_override:
             return True
         from app import config
-
         from app.modules.telegram_notification_policy import notifications_enabled
 
         return (
@@ -776,15 +808,15 @@ class DownloadLibraryVerificationScheduler:
         return self._format(self._clock())
 
     def _after(self, seconds: float) -> str:
-        return self._format(
-            self._clock() + timedelta(seconds=max(0.0, seconds))
-        )
+        return self._format(self._clock() + timedelta(seconds=max(0.0, seconds)))
 
     @staticmethod
     def _default_audit_executor(arguments: dict) -> tuple[ToolResult, int]:
-        from app.agent.service import get_agent_service
+        from app.agent.library_episode_audit import audit_library_episodes_batch
 
-        return get_agent_service().registry.execute("library.audit_episodes", arguments)
+        started = time.monotonic()
+        result = audit_library_episodes_batch(arguments)
+        return result, max(0, int((time.monotonic() - started) * 1000))
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():
@@ -802,5 +834,7 @@ class DownloadLibraryVerificationScheduler:
 _scheduler = DownloadLibraryVerificationScheduler()
 
 
-def get_download_library_verification_scheduler() -> DownloadLibraryVerificationScheduler:
+def get_download_library_verification_scheduler() -> (
+    DownloadLibraryVerificationScheduler
+):
     return _scheduler

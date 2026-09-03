@@ -1,19 +1,21 @@
 """媒体反代的安全摘要、固定目标探测与受确认启停动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import re
 import secrets
-from typing import Any, Mapping
+from collections.abc import Mapping
+from datetime import datetime
+from typing import Any
 
 import httpx
 
 from app import database as db
 from app.agent.async_bridge import run_awaitable_sync
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.media_proxy import (
     clear_signed_url_cache,
@@ -55,7 +57,9 @@ def media_proxy_test_arguments(arguments: dict[str, Any]) -> dict[str, int]:
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) != {"instance_number"}:
         raise AgentToolError("media_proxy.test_instance 只接受 instance_number 参数")
-    return {"instance_number": _strict_instance_number(arguments.get("instance_number"))}
+    return {
+        "instance_number": _strict_instance_number(arguments.get("instance_number"))
+    }
 
 
 def media_proxy_enabled_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -263,7 +267,9 @@ def _fingerprint(payload: dict[str, Any]) -> str:
 
 
 def _digest(value: Any) -> str:
-    return hashlib.sha256(str(value or "").encode("utf-8", errors="replace")).hexdigest()
+    return hashlib.sha256(
+        str(value or "").encode("utf-8", errors="replace")
+    ).hexdigest()
 
 
 def _snapshot(row: Any, *, instance_number: int) -> dict[str, Any]:
@@ -353,9 +359,7 @@ def set_media_proxy_instance_enabled_confirmed(
                 error="确认快照已失效。",
             )
         state = _snapshot(row, instance_number=instance_number)
-        if not secrets.compare_digest(
-            _fingerprint(state), str(expected_context or "")
-        ):
+        if not secrets.compare_digest(_fingerprint(state), str(expected_context or "")):
             return ToolResult(
                 ok=False,
                 status="conflict",
@@ -381,9 +385,7 @@ def set_media_proxy_instance_enabled_confirmed(
     try:
         runtime_refreshed = bool(get_media_proxy_manager().request_reconcile())
     except Exception as exc:
-        logger.warning(
-            "媒体反代配置已保存但热重载排队失败 type=%s", type(exc).__name__
-        )
+        logger.warning("媒体反代配置已保存但热重载排队失败 type=%s", type(exc).__name__)
         runtime_refreshed = False
     action_label = "启用" if requested else "停用"
     return ToolResult(
@@ -415,9 +417,7 @@ def set_media_proxy_instance_enabled_confirmed(
 
 def media_proxy_restart_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict) or set(arguments) != {"instance_number"}:
-        raise AgentToolError(
-            "media_proxy.restart_instance 只接受 instance_number 参数"
-        )
+        raise AgentToolError("media_proxy.restart_instance 只接受 instance_number 参数")
     instance_number = arguments.get("instance_number")
     if isinstance(instance_number, bool) or not isinstance(instance_number, int):
         raise AgentToolError("instance_number 必须是正整数")
@@ -438,7 +438,9 @@ def prepare_restart_media_proxy_instance(
     try:
         row = rows[instance_number - 1]
     except IndexError:
-        raise AgentToolError("指定的媒体反代实例不存在", code="precondition_failed") from None
+        raise AgentToolError(
+            "指定的媒体反代实例不存在", code="precondition_failed"
+        ) from None
     state = _snapshot(row, instance_number=instance_number)
     if not bool(state["enabled"]):
         raise AgentToolError("该媒体反代实例当前未启用", code="precondition_failed")
@@ -454,11 +456,13 @@ def prepare_restart_media_proxy_instance(
                 "实例会继续使用当前已保存配置启动。",
             ],
         },
-        evidence=[Evidence(
-            "media_proxy_configuration",
-            "已冻结实例启用状态与配置摘要；未展示地址、端口、路径或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_proxy_configuration",
+                "已冻结实例启用状态与配置摘要；未展示地址、端口、路径或凭据。",
+                _now(),
+            )
+        ],
     ), _fingerprint(state)
 
 
@@ -474,7 +478,9 @@ def restart_media_proxy_instance_confirmed(
     try:
         row = rows[instance_number - 1]
     except IndexError:
-        raise AgentToolError("实例列表已变化，请重新预检", code="confirmation_stale") from None
+        raise AgentToolError(
+            "实例列表已变化，请重新预检", code="confirmation_stale"
+        ) from None
     state = _snapshot(row, instance_number=instance_number)
     if not secrets.compare_digest(_fingerprint(state), str(expected_context or "")):
         raise AgentToolError("实例配置已变化，请重新预检", code="confirmation_stale")
@@ -488,7 +494,8 @@ def restart_media_proxy_instance_confirmed(
         status="accepted" if accepted else "unavailable",
         summary=(
             f"媒体反代实例 {instance_number} 已进入重启队列"
-            if accepted else f"媒体反代实例 {instance_number} 暂时无法热重启"
+            if accepted
+            else f"媒体反代实例 {instance_number} 暂时无法热重启"
         ),
         data={
             "operation": "restart",
@@ -496,14 +503,17 @@ def restart_media_proxy_instance_confirmed(
             "accepted": accepted,
             "cache_entries_cleared": int(cleared),
         },
-        evidence=[Evidence(
-            "media_proxy_runtime",
-            "已清理该实例短时直链缓存并请求重建运行时；未修改实例配置。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_proxy_runtime",
+                "已清理该实例短时直链缓存并请求重建运行时；未修改实例配置。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["稍后可再次检查实例状态和连接延迟。"]
-            if accepted else ["请重启 MediaFlux 后再检查该实例。"]
+            if accepted
+            else ["请重启 MediaFlux 后再检查该实例。"]
         ),
         error="" if accepted else "媒体反代运行时当前未启动。",
     )
@@ -515,11 +525,17 @@ def media_proxy_failure_summary_arguments(arguments: dict[str, Any]) -> dict[str
     if set(arguments) - {"hours", "instance_number"}:
         raise AgentToolError("播放故障摘要只接受 hours 和 instance_number")
     hours = arguments.get("hours", 24)
-    if isinstance(hours, bool) or not isinstance(hours, int) or hours not in {1, 6, 24, 72}:
+    if (
+        isinstance(hours, bool)
+        or not isinstance(hours, int)
+        or hours not in {1, 6, 24, 72}
+    ):
         raise AgentToolError("hours 仅支持 1、6、24 或 72")
     result: dict[str, Any] = {"hours": hours}
     if "instance_number" in arguments:
-        result["instance_number"] = _strict_instance_number(arguments["instance_number"])
+        result["instance_number"] = _strict_instance_number(
+            arguments["instance_number"]
+        )
     return result
 
 
@@ -558,20 +574,25 @@ def summarize_media_proxy_playback_failures(arguments: dict[str, Any]) -> ToolRe
     failed = int(summary["failed"])
     return ToolResult(
         True,
-        "attention" if failed else ("empty" if not summary["total_recorded"] else "completed"),
+        "attention"
+        if failed
+        else ("empty" if not summary["total_recorded"] else "completed"),
         (
             f"最近 {summary['window_hours']} 小时已记录 {failed} 次媒体反代失败"
-            if failed else f"最近 {summary['window_hours']} 小时未记录到媒体反代失败"
+            if failed
+            else f"最近 {summary['window_hours']} 小时未记录到媒体反代失败"
         ),
         data={
             "instance_number": instance_number,
             "server_type": server_type,
             **summary,
         },
-        evidence=[Evidence(
-            "sqlite:media_proxy_playback_records",
-            "仅聚合反代诊断记录中的状态、失败阶段、路由类别与时延；不返回媒体名、用户、会话、文件标识、URL、路径或错误正文。记录为 best-effort，不能代表媒体服务器全部播放请求。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "sqlite:media_proxy_playback_records",
+                "仅聚合反代诊断记录中的状态、失败阶段、路由类别与时延；不返回媒体名、用户、会话、文件标识、URL、路径或错误正文。记录为 best-effort，不能代表媒体服务器全部播放请求。",
+                _now(),
+            )
+        ],
         suggestions=["可按失败阶段继续检查对应媒体反代实例连接。"] if failed else [],
     )

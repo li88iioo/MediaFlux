@@ -1,13 +1,14 @@
 """工作区统一待办的本地、只读、安全聚合。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
-from app.agent.result_projection import public_followup_prompt
+from app.agent.public_safety import public_followup_prompt
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -97,28 +98,37 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
         local_media = raw_local_media if isinstance(raw_local_media, dict) else {}
     except Exception as exc:
         unavailable_sources.append("local_media")
-        logger.warning("Agent 工作区待办读取本地媒体汇总失败 type=%s", type(exc).__name__)
+        logger.warning(
+            "Agent 工作区待办读取本地媒体汇总失败 type=%s", type(exc).__name__
+        )
 
     try:
         raw_persistent = db.get_agent_persistent_health_summary()
         persistent_health = raw_persistent if isinstance(raw_persistent, dict) else {}
     except Exception as exc:
         unavailable_sources.append("agent_persistent")
-        logger.warning("Agent 工作区待办读取持久自动化汇总失败 type=%s", type(exc).__name__)
+        logger.warning(
+            "Agent 工作区待办读取持久自动化汇总失败 type=%s", type(exc).__name__
+        )
 
     areas: list[dict[str, Any]] = []
     if automation is None:
-        areas.extend(_unavailable_area(source, next_tool) for source, next_tool in _AREA_SPECS[:4])
+        areas.extend(
+            _unavailable_area(source, next_tool)
+            for source, next_tool in _AREA_SPECS[:4]
+        )
     else:
         downloads_review = _count(automation.get("downloads_review"))
         downloads_active = _count(automation.get("downloads_active"))
-        areas.append(_area(
-            "downloads",
-            "downloads.diagnose_queue",
-            attention=downloads_review,
-            active=downloads_active,
-            reason_codes=["download_needs_review"] if downloads_review else [],
-        ))
+        areas.append(
+            _area(
+                "downloads",
+                "downloads.diagnose_queue",
+                attention=downloads_review,
+                active=downloads_active,
+                reason_codes=["download_needs_review"] if downloads_review else [],
+            )
+        )
 
         rss_failed = _count(automation.get("rss_failed"))
         rss_pending = _count(automation.get("rss_pending"))
@@ -127,26 +137,37 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             rss_reasons.append("rss_failed")
         if rss_pending:
             rss_reasons.append("rss_pending")
-        areas.append(_area(
-            "rss",
-            "rss.diagnose",
-            attention=rss_failed,
-            waiting=rss_pending,
-            reason_codes=rss_reasons,
-        ))
+        areas.append(
+            _area(
+                "rss",
+                "rss.diagnose",
+                attention=rss_failed,
+                waiting=rss_pending,
+                reason_codes=rss_reasons,
+            )
+        )
 
         organize_issues = _count(automation.get("organize_issues"))
-        areas.append(_area(
-            "organize",
-            "guangya.organize.status",
-            attention=organize_issues,
-            reason_codes=["organize_issue"] if organize_issues else [],
-        ))
+        areas.append(
+            _area(
+                "organize",
+                "guangya.organize.status",
+                attention=organize_issues,
+                reason_codes=["organize_issue"] if organize_issues else [],
+            )
+        )
 
         strm_failures = _count(automation.get("strm_failures"))
-        strm_last_status = str(automation.get("strm_last_status") or "").strip().casefold()
+        strm_last_status = (
+            str(automation.get("strm_last_status") or "").strip().casefold()
+        )
         strm_last_failed = strm_last_status in {
-            "failed", "error", "interrupted", "partial_failed", "revert_failed", "cancelled",
+            "failed",
+            "error",
+            "interrupted",
+            "partial_failed",
+            "revert_failed",
+            "cancelled",
         }
         strm_running = strm_last_status in {"running", "started", "queued"}
         strm_attention = strm_failures or int(strm_last_failed)
@@ -157,13 +178,15 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             strm_reasons.append("strm_last_run_failed")
         if strm_running:
             strm_reasons.append("strm_running")
-        areas.append(_area(
-            "strm",
-            "strm.triage_failures",
-            attention=strm_attention,
-            active=int(strm_running),
-            reason_codes=strm_reasons,
-        ))
+        areas.append(
+            _area(
+                "strm",
+                "strm.triage_failures",
+                attention=strm_attention,
+                active=int(strm_running),
+                reason_codes=strm_reasons,
+            )
+        )
 
     if local_media is None:
         areas.append(_unavailable_area("local_media", "local_media.diagnose"))
@@ -188,14 +211,16 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             local_reasons.append("local_media_active")
         if waiting:
             local_reasons.append("local_media_waiting")
-        areas.append(_area(
-            "local_media",
-            "local_media.diagnose",
-            attention=requires_manual + failed + missing_target,
-            active=active,
-            waiting=waiting,
-            reason_codes=local_reasons,
-        ))
+        areas.append(
+            _area(
+                "local_media",
+                "local_media.diagnose",
+                attention=requires_manual + failed + missing_target,
+                active=active,
+                waiting=waiting,
+                reason_codes=local_reasons,
+            )
+        )
 
     if persistent_health is None:
         areas.extend(
@@ -226,11 +251,13 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             waiting=verification_pending + verification_retry,
             reason_codes=verification_reasons,
         )
-        verification_area.update({
-            "pending_count": verification_pending,
-            "retry_wait_count": verification_retry,
-            "visible_count": _count(verification.get("visible")),
-        })
+        verification_area.update(
+            {
+                "pending_count": verification_pending,
+                "retry_wait_count": verification_retry,
+                "visible_count": _count(verification.get("visible")),
+            }
+        )
         areas.append(verification_area)
 
         raw_patrol = persistent_health.get("library_patrol")
@@ -240,13 +267,21 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             patrol_status = "not_created"
         patrol_outcome = str(patrol.get("outcome") or "").strip().casefold()
         if patrol_outcome not in {
-            "", "updates_available", "up_to_date", "inconclusive",
-            "not_configured", "unavailable", "failed",
+            "",
+            "updates_available",
+            "up_to_date",
+            "inconclusive",
+            "not_configured",
+            "unavailable",
+            "failed",
         }:
             patrol_outcome = ""
         updates_available = _count(patrol.get("updates_available_count"))
         patrol_failed = patrol_outcome in {
-            "inconclusive", "not_configured", "unavailable", "failed",
+            "inconclusive",
+            "not_configured",
+            "unavailable",
+            "failed",
         }
         patrol_attention = max(updates_available, int(patrol_failed))
         patrol_reasons: list[str] = []
@@ -266,16 +301,18 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             waiting=int(patrol_status == "retry_wait"),
             reason_codes=patrol_reasons,
         )
-        patrol_area.update({
-            "task_status": patrol_status,
-            "outcome": patrol_outcome,
-            "checked_series_count": _count(patrol.get("checked_series_count")),
-            "updates_available_count": updates_available,
-            "missing_episode_count": _count(patrol.get("missing_episode_count")),
-            "inconclusive_count": _count(patrol.get("inconclusive_count")),
-            "unmapped_series_count": _count(patrol.get("unmapped_series_count")),
-            "findings_truncated": bool(_count(patrol.get("findings_truncated"))),
-        })
+        patrol_area.update(
+            {
+                "task_status": patrol_status,
+                "outcome": patrol_outcome,
+                "checked_series_count": _count(patrol.get("checked_series_count")),
+                "updates_available_count": updates_available,
+                "missing_episode_count": _count(patrol.get("missing_episode_count")),
+                "inconclusive_count": _count(patrol.get("inconclusive_count")),
+                "unmapped_series_count": _count(patrol.get("unmapped_series_count")),
+                "findings_truncated": bool(_count(patrol.get("findings_truncated"))),
+            }
+        )
         areas.append(patrol_area)
 
     attention_total = sum(item["attention_count"] for item in areas)
@@ -296,23 +333,29 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
 
     evidence: list[Evidence] = []
     if automation is not None:
-        evidence.append(Evidence(
-            "automation_database",
-            "读取下载、RSS、整理与 STRM 的本地安全计数；未访问外部服务或启动任务。",
-            _now(),
-        ))
+        evidence.append(
+            Evidence(
+                "automation_database",
+                "读取下载、RSS、整理与 STRM 的本地安全计数；未访问外部服务或启动任务。",
+                _now(),
+            )
+        )
     if local_media is not None:
-        evidence.append(Evidence(
-            "local_media_database",
-            "读取本地媒体安全计数；未扫描媒体文件系统或启动任务。",
-            _now(),
-        ))
+        evidence.append(
+            Evidence(
+                "local_media_database",
+                "读取本地媒体安全计数；未扫描媒体文件系统或启动任务。",
+                _now(),
+            )
+        )
     if persistent_health is not None:
-        evidence.append(Evidence(
-            "agent_persistent_database",
-            "读取下载后核验与媒体库巡检的匿名状态计数；未读取标题、路径、任务标识或错误正文。",
-            _now(),
-        ))
+        evidence.append(
+            Evidence(
+                "agent_persistent_database",
+                "读取下载后核验与媒体库巡检的匿名状态计数；未读取标题、路径、任务标识或错误正文。",
+                _now(),
+            )
+        )
 
     if areas and all(item["status"] == "unavailable" for item in areas):
         return ToolResult(
@@ -320,11 +363,13 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="暂时无法读取工作区待办",
             data=data,
-            evidence=[Evidence(
-                "workspace_database",
-                "尝试读取本地安全聚合；未访问网络、文件系统或启动任务。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "workspace_database",
+                    "尝试读取本地安全聚合；未访问网络、文件系统或启动任务。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查本地数据库状态后重试。"],
             error="工作区待办当前不可用。",
         )

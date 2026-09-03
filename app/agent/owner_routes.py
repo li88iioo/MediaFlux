@@ -1,4 +1,5 @@
 """Agent owner 的低层、安全通知路由解析。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -10,26 +11,13 @@ from app import config
 _TELEGRAM_OWNER_RE = re.compile(r"^tg:v1:(-?[1-9][0-9]*)\x1f([1-9][0-9]*)$")
 
 
-def web_agent_owner(csrf_owner: object, *, session_id: object) -> str:
-    """为 Web Agent 会话派生不可逆且会话隔离的 owner。"""
-    normalized_owner = str(csrf_owner or "").strip()
-    normalized_session = str(session_id or "").strip()
+def web_kernel_owner(login_identity: object) -> str:
+    """由已认证登录身份派生跨浏览器会话稳定、不可逆的 Web principal。"""
+    normalized_owner = str(login_identity or "").strip()
     if not normalized_owner or len(normalized_owner) > 512:
         raise ValueError("Web Agent owner 无效")
-    if (
-        not normalized_session
-        or len(normalized_session) > 64
-        or not normalized_session.isascii()
-        or re.fullmatch(r"[A-Za-z0-9_-]{16,64}", normalized_session) is None
-    ):
-        raise ValueError("Web Agent session_id 无效")
-    payload = (
-        b"mediaflux-agent-web-session:v1\0"
-        + normalized_owner.encode("utf-8")
-        + b"\0"
-        + normalized_session.encode("ascii")
-    )
-    return f"web:v1:{hashlib.sha256(payload).hexdigest()}"
+    payload = b"mediaflux-agent-web-kernel:v1\0" + normalized_owner.encode("utf-8")
+    return f"webk:v1:{hashlib.sha256(payload).hexdigest()}"
 
 
 @dataclass(frozen=True)

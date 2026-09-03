@@ -1,17 +1,18 @@
 """Agent 受确认动作的脱敏审计记录与只读查询。"""
+
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import hashlib
 import hmac
 import json
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from app import database as db
 from app.agent.confirmation_contract import sanitize_confirmation_contract
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, RiskLevel, ToolContext, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.web_secret import get_web_secret
 
@@ -70,123 +71,286 @@ _TOOL_LABELS = {
 
 _SAFE_FIELDS = {
     "downloads.retry_submission": {
-        "target", "status", "created", "duplicate", "succeeded", "failed",
+        "target",
+        "status",
+        "created",
+        "duplicate",
+        "succeeded",
+        "failed",
         "source_attention_preserved",
     },
     "provider.change.execute": {
-        "provider", "operation", "status", "affected", "accepted",
-        "delete_files", "global_refresh", "plan_ref",
+        "provider",
+        "operation",
+        "status",
+        "affected",
+        "accepted",
+        "delete_files",
+        "global_refresh",
+        "plan_ref",
     },
     "rss.mark_entries": {"affected", "processed"},
     "rss.submit_entries_to_qb": {
-        "target", "requested", "claimed", "submitted", "failed", "outcome_unknown",
+        "target",
+        "requested",
+        "claimed",
+        "submitted",
+        "failed",
+        "outcome_unknown",
     },
     "rss.submit_pending_to_qb": {
-        "target", "requested", "claimed", "submitted", "failed", "outcome_unknown",
+        "target",
+        "requested",
+        "claimed",
+        "submitted",
+        "failed",
+        "outcome_unknown",
     },
     "rss.retry_failed_to_qb": {
-        "target", "requested", "claimed", "submitted", "failed", "outcome_unknown",
+        "target",
+        "requested",
+        "claimed",
+        "submitted",
+        "failed",
+        "outcome_unknown",
     },
     "rss.refresh_subscription": {"subscription_id", "total", "new", "skipped"},
     "rss.refresh_subscriptions": {
-        "requested", "refreshed", "failed", "total", "new", "skipped",
+        "requested",
+        "refreshed",
+        "failed",
+        "total",
+        "new",
+        "skipped",
     },
     "rss.create_subscription": {
-        "operation", "subscription_id", "affected", "name", "url_count", "action",
-        "enabled", "refresh_interval_minutes", "download_method", "media_tmdb_id",
-        "media_default_season", "skip_existing_episodes", "runtime_refreshed",
-    },
-    "rss.update_subscription": {
-        "operation", "affected", "changed_field_count",
+        "operation",
+        "subscription_id",
+        "affected",
+        "name",
+        "url_count",
+        "action",
+        "enabled",
+        "refresh_interval_minutes",
+        "download_method",
+        "media_tmdb_id",
+        "media_default_season",
+        "skip_existing_episodes",
         "runtime_refreshed",
     },
-    "rss.delete_subscription": {"operation", "affected", "deleted_entries", "runtime_refreshed"},
+    "rss.update_subscription": {
+        "operation",
+        "affected",
+        "changed_field_count",
+        "runtime_refreshed",
+    },
+    "rss.delete_subscription": {
+        "operation",
+        "affected",
+        "deleted_entries",
+        "runtime_refreshed",
+    },
     "media.create_subscription": {
-        "operation", "subscription_number", "affected", "created", "season",
-        "check_interval_minutes", "runtime_refreshed",
+        "operation",
+        "subscription_number",
+        "affected",
+        "created",
+        "season",
+        "check_interval_minutes",
+        "runtime_refreshed",
     },
     "media.delete_subscription": {
-        "operation", "subscription_number", "affected", "expired_candidates",
-        "cancelled_admissions", "cancelled_runs", "runtime_refreshed",
+        "operation",
+        "subscription_number",
+        "affected",
+        "expired_candidates",
+        "cancelled_admissions",
+        "cancelled_runs",
+        "runtime_refreshed",
     },
     "media.set_subscription_enabled": {
-        "operation", "subscription_number", "enabled", "affected",
-        "expired_candidates", "cancelled_admissions", "cancelled_runs", "runtime_refreshed",
+        "operation",
+        "subscription_number",
+        "enabled",
+        "affected",
+        "expired_candidates",
+        "cancelled_admissions",
+        "cancelled_runs",
+        "runtime_refreshed",
     },
     "media.set_subscription_policy": {
-        "subscription_number", "updated_fields", "expired_candidates", "runtime_refreshed",
+        "subscription_number",
+        "updated_fields",
+        "expired_candidates",
+        "runtime_refreshed",
     },
     "media.set_preferences": {
-        "operation", "affected", "preferred_server", "preferred_download_target",
+        "operation",
+        "affected",
+        "preferred_server",
+        "preferred_download_target",
     },
     "media.clear_preferences": {"operation", "affected"},
     "media.set_subscription_notification_rule": {
-        "operation", "subscription_number", "affected", "enabled",
+        "operation",
+        "subscription_number",
+        "affected",
+        "enabled",
     },
     "media.reset_subscription_notification_rule": {
-        "operation", "subscription_number", "affected",
+        "operation",
+        "subscription_number",
+        "affected",
     },
     "config.set_feature_state": {
-        "feature", "enabled", "runtime_refreshed", "verification_state",
+        "feature",
+        "enabled",
+        "runtime_refreshed",
+        "verification_state",
     },
     "config.set_indexer_sites": {
-        "site_count", "runtime_refreshed", "verification_state",
+        "site_count",
+        "runtime_refreshed",
+        "verification_state",
     },
     "config.set_safe_policy": {"policy", "runtime_refreshed"},
     "telegram.send_test_notification": {"sent"},
-    "media_proxy.set_instance_enabled": {"operation", "instance_number", "enabled", "affected", "runtime_refreshed"},
+    "media_proxy.set_instance_enabled": {
+        "operation",
+        "instance_number",
+        "enabled",
+        "affected",
+        "runtime_refreshed",
+    },
     "media_proxy.restart_instance": {
-        "operation", "instance_number", "accepted", "cache_entries_cleared",
+        "operation",
+        "instance_number",
+        "accepted",
+        "cache_entries_cleared",
     },
     "local_media.scan_sources": {
-        "operation", "source_numbers", "scanned_sources", "candidates",
-        "queued_tasks", "runtime_started",
+        "operation",
+        "source_numbers",
+        "scanned_sources",
+        "candidates",
+        "queued_tasks",
+        "runtime_started",
     },
     "local_media.set_source_trigger_enabled": {
-        "operation", "source_number", "trigger", "enabled", "affected", "runtime_refreshed",
+        "operation",
+        "source_number",
+        "trigger",
+        "enabled",
+        "affected",
+        "runtime_refreshed",
     },
     "local_media.retry_task": {
-        "operation", "task_number", "affected", "runtime_refreshed",
+        "operation",
+        "task_number",
+        "affected",
+        "runtime_refreshed",
     },
     "local_media.refresh_task_library": {
-        "operation", "task_number", "refreshed", "matched_paths",
+        "operation",
+        "task_number",
+        "refreshed",
+        "matched_paths",
     },
-    "recognition.set_rule_enabled": {"operation", "rule_type", "rule_id", "enabled", "affected"},
-    "discovery.confirm_mapping": {"affected", "provider", "media_type", "candidate_number", "mapping_confirmed"},
+    "recognition.set_rule_enabled": {
+        "operation",
+        "rule_type",
+        "rule_id",
+        "enabled",
+        "affected",
+    },
+    "discovery.confirm_mapping": {
+        "affected",
+        "provider",
+        "media_type",
+        "candidate_number",
+        "mapping_confirmed",
+    },
     "discovery.add_watchlist": {"operation", "watchlist_number", "affected"},
     "discovery.remove_watchlist": {"operation", "watchlist_number", "affected"},
     "strm.retry_failures": {
-        "scope", "requested", "matched", "resolved", "failed", "missing", "stale",
+        "scope",
+        "requested",
+        "matched",
+        "resolved",
+        "failed",
+        "missing",
+        "stale",
     },
     "strm.run_once": {"accepted", "trigger"},
     "strm.set_schedule_policy": {"runtime_refreshed"},
     "guangya.organize.set_schedule_policy": {"runtime_refreshed"},
     "guangya.fs.change.execute": {
-        "queued", "queue_position", "replayed", "operation_ref", "total",
-        "rename_count", "move_count", "trash_count", "create_directory_count",
-        "trigger_strm", "requires_manual",
+        "queued",
+        "queue_position",
+        "replayed",
+        "operation_ref",
+        "total",
+        "rename_count",
+        "move_count",
+        "relocate_count",
+        "trash_count",
+        "create_directory_count",
+        "trigger_strm",
+        "requires_manual",
     },
     "guangya.rename.execute": {
-        "queued", "queue_position", "replayed", "rename_count", "requires_manual",
+        "queued",
+        "queue_position",
+        "replayed",
+        "rename_count",
+        "requires_manual",
     },
-    "guangya.directory_scrape.run": {"queued", "queue_position", "replayed", "plan_count"},
+    "guangya.directory_scrape.run": {
+        "queued",
+        "queue_position",
+        "replayed",
+        "plan_count",
+    },
     "guangya.organize.run_once": {"trigger_type", "source_count"},
     "guangya.organize.cleanup.execute": {
-        "queued", "queue_position", "replayed", "empty_dir_count",
-        "residual_dir_count", "selected_count", "kept_count", "requires_manual",
+        "queued",
+        "queue_position",
+        "replayed",
+        "empty_dir_count",
+        "residual_dir_count",
+        "selected_count",
+        "kept_count",
+        "requires_manual",
     },
     "guangya.organize.stop": {"accepted"},
     "ingest.submit": {
-        "source_type", "target", "status", "created", "succeeded", "failed",
-        "duplicate", "total", "selected_count", "request_number",
+        "source_type",
+        "target",
+        "status",
+        "created",
+        "succeeded",
+        "failed",
+        "duplicate",
+        "total",
+        "selected_count",
+        "request_number",
     },
     "library.set_patrol_policy": {"runtime_refreshed"},
     "library.trigger_patrol_now": {"queued", "reused", "task_status"},
     "library.start_episode_audit": {
-        "accepted", "created", "reused", "max_series", "progress_current", "progress_total",
+        "accepted",
+        "created",
+        "reused",
+        "max_series",
+        "progress_current",
+        "progress_total",
     },
     "agent.cancel_job": {
-        "accepted", "cancelled", "cancel_requested", "progress_current", "progress_total",
+        "accepted",
+        "cancelled",
+        "cancel_requested",
+        "progress_current",
+        "progress_total",
     },
 }
 
@@ -215,29 +379,82 @@ _SAFE_ERROR_CODES = {
     "execution_interrupted",
 }
 _COUNT_FIELDS = {
-    "requested", "claimed", "submitted", "failed", "matched", "resolved", "missing",
-    "stale", "source_count", "succeeded", "cleaned", "subscription_id",
-    "total", "new", "skipped", "site_count", "affected",
-    "refresh_interval_minutes", "deleted_entries", "changed_field_count",
-    "max_series", "progress_current", "progress_total", "instance_number", "rule_id",
-    "subscription_number", "watchlist_number", "source_number", "task_number", "season",
-    "candidate_number", "queue_position", "plan_count", "outcome_unknown",
-    "rename_count", "empty_dir_count", "residual_dir_count", "selected_count",
+    "requested",
+    "claimed",
+    "submitted",
+    "failed",
+    "matched",
+    "resolved",
+    "missing",
+    "stale",
+    "source_count",
+    "succeeded",
+    "cleaned",
+    "subscription_id",
+    "total",
+    "new",
+    "skipped",
+    "site_count",
+    "affected",
+    "refresh_interval_minutes",
+    "deleted_entries",
+    "changed_field_count",
+    "max_series",
+    "progress_current",
+    "progress_total",
+    "instance_number",
+    "rule_id",
+    "subscription_number",
+    "watchlist_number",
+    "source_number",
+    "task_number",
+    "season",
+    "candidate_number",
+    "queue_position",
+    "plan_count",
+    "outcome_unknown",
+    "rename_count",
+    "empty_dir_count",
+    "residual_dir_count",
+    "selected_count",
     "kept_count",
-    "expired_candidates", "cancelled_admissions", "cancelled_runs", "refreshed", "matched_paths",
+    "expired_candidates",
+    "cancelled_admissions",
+    "cancelled_runs",
+    "refreshed",
+    "matched_paths",
 }
 _BOOL_FIELDS = {
-    "accepted", "enabled", "runtime_refreshed", "created", "duplicate", "delete_files",
-    "reused", "cancelled", "cancel_requested", "sent", "processed", "queued",
-    "replayed", "mapping_confirmed", "global_refresh",
+    "accepted",
+    "enabled",
+    "runtime_refreshed",
+    "created",
+    "duplicate",
+    "delete_files",
+    "reused",
+    "cancelled",
+    "cancel_requested",
+    "sent",
+    "processed",
+    "queued",
+    "replayed",
+    "mapping_confirmed",
+    "global_refresh",
     "requires_manual",
     "source_attention_preserved",
 }
 _ENUM_FIELDS = {
     "target": {"qb", "qbittorrent", "guangya", "both"},
     "feature": {
-        "discovery", "douban", "resource_results", "indexer_search", "web_search",
-        "offline_magnet", "offline_ed2k", "offline_http", "strm_metadata",
+        "discovery",
+        "douban",
+        "resource_results",
+        "indexer_search",
+        "web_search",
+        "offline_magnet",
+        "offline_ed2k",
+        "offline_http",
+        "strm_metadata",
         "download_verification_notify",
     },
     "policy": {
@@ -263,15 +480,39 @@ _ENUM_FIELDS = {
     "media_type": {"movie", "tv"},
     "task_status": {"pending", "running", "retry_wait", "not_scheduled"},
     "operation": {
-        "pause", "resume", "delete", "enable", "disable", "set_interval", "update",
-        "add", "remove", "create", "restore", "retry", "precise_refresh",
-        "set_preferences", "clear_preferences", "set_notification_rule",
-        "reset_notification_rule", "media.library.refresh", "media.item.refresh",
-        "qb.torrents.pause", "qb.torrents.resume", "qb.torrents.delete_task",
+        "pause",
+        "resume",
+        "delete",
+        "enable",
+        "disable",
+        "set_interval",
+        "update",
+        "add",
+        "remove",
+        "create",
+        "restore",
+        "retry",
+        "precise_refresh",
+        "set_preferences",
+        "clear_preferences",
+        "set_notification_rule",
+        "reset_notification_rule",
+        "media.library.refresh",
+        "media.item.refresh",
+        "qb.torrents.pause",
+        "qb.torrents.resume",
+        "qb.torrents.delete_task",
     },
     "status": {
-        "accepted", "submitted", "completed", "partial", "failed", "duplicate",
-        "succeeded", "stale", "outcome_unknown",
+        "accepted",
+        "submitted",
+        "completed",
+        "partial",
+        "failed",
+        "duplicate",
+        "succeeded",
+        "stale",
+        "outcome_unknown",
     },
 }
 
@@ -281,7 +522,12 @@ def action_history_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if extra:
         raise AgentToolError(f"不支持的工具参数：{', '.join(sorted(extra))}")
     raw_limit = arguments.get("limit", 20)
-    if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit < 1 or raw_limit > 50:
+    if (
+        isinstance(raw_limit, bool)
+        or not isinstance(raw_limit, int)
+        or raw_limit < 1
+        or raw_limit > 50
+    ):
         raise AgentToolError("历史条数必须为 1 到 50 的整数")
     outcome = str(arguments.get("outcome", "all") or "all").strip().lower()
     if outcome not in _OUTCOME_LABELS:
@@ -349,7 +595,7 @@ def _contract_storage_projection(value: dict[str, Any] | None) -> dict[str, Any]
             continue
         text = str(item or "").strip()
         if text:
-            stored[storage_key] = text[:_CONTRACT_STORAGE_LIMITS.get(public_key, 128)]
+            stored[storage_key] = text[: _CONTRACT_STORAGE_LIMITS.get(public_key, 128)]
     return stored
 
 
@@ -415,9 +661,7 @@ def action_history_owner_digest(owner: str) -> str:
     """将服务端 owner 派生为不可逆、部署绑定的审计分区键。"""
     normalized = str(owner or "").strip()
     if not normalized:
-        raise AgentToolError(
-            "无法确认当前 Agent 身份", code="identity_required"
-        )
+        raise AgentToolError("无法确认当前 Agent 身份", code="identity_required")
     return hmac.new(
         get_web_secret().encode("utf-8"),
         b"mediaflux-agent-action-history:v1\0" + normalized.encode("utf-8"),
@@ -512,11 +756,17 @@ def record_confirmation_interrupted(
         )
 
 
-def record_confirmed_result(*, owner: str, tool_name: str, risk: RiskLevel,
-                            result: ToolResult, elapsed_ms: int,
-                            confirmation_contract: dict[str, Any] | None = None,
-                            confirmation_id: str = "",
-                            owner_generation: int = 0) -> None:
+def record_confirmed_result(
+    *,
+    owner: str,
+    tool_name: str,
+    risk: RiskLevel,
+    result: ToolResult,
+    elapsed_ms: int,
+    confirmation_contract: dict[str, Any] | None = None,
+    confirmation_id: str = "",
+    owner_generation: int = 0,
+) -> None:
     """尽力记录已确认动作；审计失败不能改变副作用执行结果。"""
     started_at, finished_at = _timestamps(elapsed_ms)
     safe_tool = _safe_tool_name(tool_name)
@@ -541,14 +791,22 @@ def record_confirmed_result(*, owner: str, tool_name: str, risk: RiskLevel,
             finalize_only=bool(confirmation_id),
         )
     except Exception as exc:
-        logger.warning("Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__)
+        logger.warning(
+            "Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__
+        )
 
 
-def record_confirmation_error(*, owner: str, tool_name: str, risk: RiskLevel,
-                              code: str, elapsed_ms: int = 0,
-                              confirmation_contract: dict[str, Any] | None = None,
-                              confirmation_id: str = "",
-                              owner_generation: int = 0) -> None:
+def record_confirmation_error(
+    *,
+    owner: str,
+    tool_name: str,
+    risk: RiskLevel,
+    code: str,
+    elapsed_ms: int = 0,
+    confirmation_contract: dict[str, Any] | None = None,
+    confirmation_id: str = "",
+    owner_generation: int = 0,
+) -> None:
     """记录票据已消费、但在执行前因稳定确认错误码终止的动作。"""
     stable_code = _safe_error_code(code) or "confirmation_stale"
     safe_tool = _safe_tool_name(tool_name)
@@ -574,7 +832,9 @@ def record_confirmation_error(*, owner: str, tool_name: str, risk: RiskLevel,
             finalize_only=bool(confirmation_id),
         )
     except Exception as exc:
-        logger.warning("Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__)
+        logger.warning(
+            "Agent 动作审计写入失败 tool=%s type=%s", tool_name, type(exc).__name__
+        )
 
 
 def list_action_history(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
@@ -627,10 +887,14 @@ def list_action_history(arguments: dict[str, Any], context: ToolContext) -> Tool
         status="success",
         summary=f"最近 {len(items)} 条 Agent {outcome_label}操作记录",
         data={"items": items, "count": len(items), "outcome": arguments["outcome"]},
-        evidence=[Evidence(
-            "sqlite:agent_action_history",
-            "仅返回受确认动作的服务端脱敏审计投影，不包含对话、票据、凭据或原始参数。",
-            datetime.now().astimezone().isoformat(timespec="seconds"),
-        )],
-        suggestions=[] if items else ["完成一次需要确认的 Agent 动作后，可在这里查看执行记录。"],
+        evidence=[
+            Evidence(
+                "sqlite:agent_action_history",
+                "仅返回受确认动作的服务端脱敏审计投影，不包含对话、票据、凭据或原始参数。",
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            )
+        ],
+        suggestions=[]
+        if items
+        else ["完成一次需要确认的 Agent 动作后，可在这里查看执行记录。"],
     )

@@ -1,4 +1,5 @@
 """Owner 隔离、可恢复、可取消的 Agent 长任务数据访问。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -9,7 +10,7 @@ import secrets
 import sqlite3
 from typing import TYPE_CHECKING, Any
 
-from app.agent.registry import AgentToolError
+from app.agent.errors import AgentToolError
 from app.modules.web_secret import get_web_secret
 
 if TYPE_CHECKING:
@@ -25,7 +26,7 @@ _MAX_ERROR_CODE_LENGTH = 80
 _MAX_HISTORY_PER_OWNER = 50
 
 
-def _database() -> "ModuleType":
+def _database() -> ModuleType:
     from app import database
 
     return database
@@ -52,6 +53,8 @@ def agent_job_owner_digest(owner: str) -> str:
         b"mediaflux-agent-durable-job:v1\0" + normalized.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+
+
 def _safe_job_type(value: object) -> str:
     job_type = str(value or "").strip()
     if job_type not in _ALLOWED_JOB_TYPES:
@@ -94,7 +97,9 @@ def _safe_error_code(value: object) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]", "", str(value or ""))[:_MAX_ERROR_CODE_LENGTH]
 
 
-def _select_job(conn: sqlite3.Connection, *, owner_digest: str, job_id: str) -> sqlite3.Row | None:
+def _select_job(
+    conn: sqlite3.Connection, *, owner_digest: str, job_id: str
+) -> sqlite3.Row | None:
     return conn.execute(
         "SELECT * FROM agent_jobs WHERE owner_digest=? AND job_id=?",
         (owner_digest, job_id),
@@ -209,11 +214,14 @@ def list_agent_jobs(
         values.append(_safe_job_type(job_type))
     values.append(safe_limit)
     with get_conn() as conn:
-        return list(conn.execute(
-            "SELECT * FROM agent_jobs WHERE owner_digest=?" + clause +
-            " ORDER BY updated_at DESC,job_id DESC LIMIT ?",
-            tuple(values),
-        ).fetchall())
+        return list(
+            conn.execute(
+                "SELECT * FROM agent_jobs WHERE owner_digest=?"
+                + clause
+                + " ORDER BY updated_at DESC,job_id DESC LIMIT ?",
+                tuple(values),
+            ).fetchall()
+        )
 
 
 def find_active_agent_job(
@@ -288,7 +296,9 @@ def claim_due_agent_job(
         )
         if cur.rowcount != 1:
             return None
-        return conn.execute("SELECT * FROM agent_jobs WHERE job_id=?", (job_id,)).fetchone()
+        return conn.execute(
+            "SELECT * FROM agent_jobs WHERE job_id=?", (job_id,)
+        ).fetchone()
 
 
 def renew_agent_job_lease(

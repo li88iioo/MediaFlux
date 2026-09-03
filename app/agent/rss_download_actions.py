@@ -1,20 +1,23 @@
 """Media Agent 的待处理 RSS 条目受控 qB 提交动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import database as db
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
 
 _DEFAULT_LIMIT = 10
 _MAX_ITEMS = 20
+
+
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -25,7 +28,11 @@ def rss_pending_download_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if set(arguments) - {"limit"}:
         raise AgentToolError("rss.submit_pending_to_qb 只接受 limit 参数")
     limit = arguments.get("limit", _DEFAULT_LIMIT)
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= _MAX_ITEMS:
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= _MAX_ITEMS
+    ):
         raise AgentToolError("limit 必须是 1 到 20 的整数")
     return {"limit": limit}
 
@@ -110,11 +117,13 @@ def _preview_rss_pending_download(
             ],
             "limits": {"max_items": _MAX_ITEMS, "pending_only": True},
         },
-        evidence=[Evidence(
-            "rss_database",
-            "只读核对本地待处理 RSS 条目；未刷新订阅、未认领条目、未访问下载器。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "只读核对本地待处理 RSS 条目；未刷新订阅、未认领条目、未访问下载器。",
+                _now(),
+            )
+        ],
         suggestions=["确认前请核对提交数量；如数量过多，请使用更小的 limit。"],
     )
 
@@ -200,20 +209,22 @@ def _submit_pending_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
             "failed": failed,
             **({"outcome_unknown": outcome_unknown} if outcome_unknown else {}),
         },
-        evidence=[Evidence(
-            "rss_submission",
-            "已按确认时冻结的集合与 qB 配置执行一次有界提交；响应仅包含聚合计数。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_submission",
+                "已按确认时冻结的集合与 qB 配置执行一次有界提交；响应仅包含聚合计数。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["请先核对 qBittorrent 中是否已存在对应任务，勿直接重复提交。"]
-            if outcome_unknown else
-            ([] if failed == 0 else ["请在 RSS 订阅页和下载任务页核对失败项。"])
+            if outcome_unknown
+            else ([] if failed == 0 else ["请在 RSS 订阅页和下载任务页核对失败项。"])
         ),
         error=(
             "部分提交结果未知，请先核对 qBittorrent，勿直接重试。"
-            if outcome_unknown else
-            ("RSS 条目提交未全部成功。" if failed else "")
+            if outcome_unknown
+            else ("RSS 条目提交未全部成功。" if failed else "")
         ),
     )
 

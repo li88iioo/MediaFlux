@@ -1,11 +1,12 @@
 """从工作区安全待办快照派生可执行的只读下一步。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.agent.workspace_todo_actions import summarize_workspace_todo
 
 _ACTION_SPECS: dict[str, dict[str, str]] = {
@@ -64,42 +65,54 @@ _ALLOWED_REASON_CODES: dict[str, frozenset[str]] = {
     "downloads": frozenset({"download_needs_review"}),
     "rss": frozenset({"rss_failed", "rss_pending"}),
     "organize": frozenset({"organize_issue"}),
-    "strm": frozenset({
-        "strm_open_failure",
-        "strm_last_run_failed",
-        "strm_running",
-    }),
-    "local_media": frozenset({
-        "local_media_requires_manual",
-        "local_media_failed",
-        "local_media_missing_target",
-        "local_media_active",
-        "local_media_waiting",
-    }),
-    "download_verification": frozenset({
-        "download_verification_attention",
-        "download_verification_running",
-        "download_verification_pending",
-        "download_verification_retry_wait",
-    }),
-    "library_patrol": frozenset({
-        "library_patrol_updates_available",
-        "library_patrol_inconclusive",
-        "library_patrol_not_configured",
-        "library_patrol_unavailable",
-        "library_patrol_failed",
-        "library_patrol_running",
-        "library_patrol_retry_wait",
-    }),
+    "strm": frozenset(
+        {
+            "strm_open_failure",
+            "strm_last_run_failed",
+            "strm_running",
+        }
+    ),
+    "local_media": frozenset(
+        {
+            "local_media_requires_manual",
+            "local_media_failed",
+            "local_media_missing_target",
+            "local_media_active",
+            "local_media_waiting",
+        }
+    ),
+    "download_verification": frozenset(
+        {
+            "download_verification_attention",
+            "download_verification_running",
+            "download_verification_pending",
+            "download_verification_retry_wait",
+        }
+    ),
+    "library_patrol": frozenset(
+        {
+            "library_patrol_updates_available",
+            "library_patrol_inconclusive",
+            "library_patrol_not_configured",
+            "library_patrol_unavailable",
+            "library_patrol_failed",
+            "library_patrol_running",
+            "library_patrol_retry_wait",
+        }
+    ),
 }
 
-_SNAPSHOT_STATUSES = frozenset({
-    "attention", "active", "waiting", "empty", "partial", "unavailable",
-})
-_ACTION_BY_KEY = {
-    spec["action_key"]: spec
-    for spec in _ACTION_SPECS.values()
-}
+_SNAPSHOT_STATUSES = frozenset(
+    {
+        "attention",
+        "active",
+        "waiting",
+        "empty",
+        "partial",
+        "unavailable",
+    }
+)
+_ACTION_BY_KEY = {spec["action_key"]: spec for spec in _ACTION_SPECS.values()}
 
 
 def _now() -> str:
@@ -141,7 +154,9 @@ def resolve_workspace_action_handoff(arguments: dict[str, Any]) -> dict[str, Any
             "当前无法核对工作区行动，请稍后重试",
             code="precondition_failed",
         )
-    raw_actions = snapshot.data.get("actions") if isinstance(snapshot.data, dict) else []
+    raw_actions = (
+        snapshot.data.get("actions") if isinstance(snapshot.data, dict) else []
+    )
     actions = raw_actions if isinstance(raw_actions, list) else []
     if not any(
         isinstance(action, dict) and action.get("action_key") == action_key
@@ -173,7 +188,11 @@ def _project_action(area: Any) -> dict[str, Any] | None:
     source = str(area.get("source") or "").strip()
     spec = _ACTION_SPECS.get(source)
     attention_count = _count(area.get("attention_count"))
-    if spec is None or str(area.get("status") or "") != "attention" or not attention_count:
+    if (
+        spec is None
+        or str(area.get("status") or "") != "attention"
+        or not attention_count
+    ):
         return None
     allowed_reasons = _ALLOWED_REASON_CODES[source]
     raw_reasons = area.get("reason_codes")
@@ -233,11 +252,13 @@ def summarize_workspace_next_actions(_arguments: dict[str, Any]) -> ToolResult:
         "unavailable_areas": unavailable_areas,
         "actions": actions,
     }
-    evidence = [Evidence(
-        "workspace_todo_projection",
-        "从工作区本地安全待办快照生成只读行动卡；未访问网络、文件系统，也未执行诊断、预检或写操作。",
-        _now(),
-    )]
+    evidence = [
+        Evidence(
+            "workspace_todo_projection",
+            "从工作区本地安全待办快照生成只读行动卡；未访问网络、文件系统，也未执行诊断、预检或写操作。",
+            _now(),
+        )
+    ]
 
     if not todo.ok or snapshot_status == "unavailable":
         return ToolResult(

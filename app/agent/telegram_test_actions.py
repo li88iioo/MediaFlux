@@ -3,26 +3,24 @@
 该工具只向服务端已经配置的 Telegram 会话发送一条固定测试消息。工具参数为空，
 不会接受或返回 Bot Token、Chat ID、任意消息正文或 Telegram 响应对象。
 """
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import hmac
 import re
+from datetime import datetime
 from typing import Any
 
 import requests
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import configure_telebot_logging, get_logger
 
 logger = get_logger(__name__)
-_FIXED_TEST_MESSAGE = (
-    "<b>MediaFlux 连接测试</b>\n"
-    "Telegram Bot 通知通道工作正常。"
-)
+_FIXED_TEST_MESSAGE = "<b>MediaFlux 连接测试</b>\nTelegram Bot 通知通道工作正常。"
 _CHAT_ID_PATTERN = re.compile(r"^-?\d{1,63}$")
 _SEND_TIMEOUT_SECONDS = 8
 
@@ -59,14 +57,16 @@ def _private_state() -> dict[str, Any]:
 
 
 def _fingerprint(state: dict[str, Any]) -> str:
-    payload = "\0".join((
-        "telegram-test-v1",
-        "1" if state["configured"] else "0",
-        "1" if state["token_valid"] else "0",
-        "1" if state["chat_id_valid"] else "0",
-        str(state["token_digest"]),
-        str(state["chat_digest"]),
-    ))
+    payload = "\0".join(
+        (
+            "telegram-test-v1",
+            "1" if state["configured"] else "0",
+            "1" if state["token_valid"] else "0",
+            "1" if state["chat_id_valid"] else "0",
+            str(state["token_digest"]),
+            str(state["chat_digest"]),
+        )
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -104,11 +104,13 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
                 "不会修改 Telegram Agent、通知策略或其它项目配置。",
             ],
         },
-        evidence=[Evidence(
-            source="server_configuration",
-            description="仅核对 Telegram 通知配置是否完整及其不可逆摘要；未返回凭据或会话标识。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="server_configuration",
+                description="仅核对 Telegram 通知配置是否完整及其不可逆摘要；未返回凭据或会话标识。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=["发送后的消息无法由 MediaFlux 撤回，但可在 Telegram 中手动删除。"],
     )
 
@@ -194,11 +196,13 @@ def send_telegram_test_notification_confirmed(
         status="completed",
         summary="Telegram 测试消息已发送",
         data={"sent": True},
-        evidence=[Evidence(
-            source="server_configuration",
-            description="使用一次性确认票据向当前已配置会话发送固定连接测试消息；未记录或返回凭据与会话标识。",
-            collected_at=_now(),
-        )],
+        evidence=[
+            Evidence(
+                source="server_configuration",
+                description="使用一次性确认票据向当前已配置会话发送固定连接测试消息；未记录或返回凭据与会话标识。",
+                collected_at=_now(),
+            )
+        ],
         suggestions=["如未收到消息，请检查 Bot 会话权限、通知静音状态与网络代理。"],
     )
 

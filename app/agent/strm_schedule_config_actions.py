@@ -1,15 +1,16 @@
 """Media Agent 的 STRM 定时同步策略读取与确认写入。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.scheduler import STRMScheduler
 
@@ -106,11 +107,13 @@ def summarize_strm_schedule_policy(_arguments: dict[str, Any]) -> ToolResult:
             "managed_by_environment": bool(managed),
             "managed_fields": managed,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅返回 STRM 定时同步的三项白名单策略与环境托管标记；未返回目录、地址或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅返回 STRM 定时同步的三项白名单策略与环境托管标记；未返回目录、地址或凭据。",
+                _now(),
+            )
+        ],
         suggestions=[
             "修改策略需要先预检并使用一次性确认票据。",
             "策略修改只会重新安排后续定时同步，不会立即启动或中断同步任务。",
@@ -184,16 +187,22 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
     requested = state["requested"]
     effects: list[str] = []
     if current["enabled"] != requested["enabled"]:
-        effects.append(f"{'开启' if requested['enabled'] else '关闭'}后续 STRM 定时同步")
+        effects.append(
+            f"{'开启' if requested['enabled'] else '关闭'}后续 STRM 定时同步"
+        )
     if current["cron"] != requested["cron"]:
         effects.append(f"将后续同步计划表达式改为 {requested['cron']}")
     if current["notify_enabled"] != requested["notify_enabled"]:
-        effects.append(f"{'开启' if requested['notify_enabled'] else '关闭'} STRM 任务通知")
+        effects.append(
+            f"{'开启' if requested['notify_enabled'] else '关闭'} STRM 任务通知"
+        )
     effects.append("刷新当前进程调度器，并按新策略重新计算下一次运行时间")
 
     suggestions = ["本次写入不会立即执行 STRM 同步，也不会中断正在运行的任务。"]
     if requested["enabled"]:
-        suggestions.append("只有 STRM 源目录、播放地址等运行配置完整时，计划任务才会实际执行。")
+        suggestions.append(
+            "只有 STRM 源目录、播放地址等运行配置完整时，计划任务才会实际执行。"
+        )
     return effects, suggestions
 
 
@@ -212,11 +221,13 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
             "changed_fields": list(state["changed_keys"]),
             "effects": effects,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅比较 STRM 定时同步白名单策略与配置快照；未返回其他配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅比较 STRM 定时同步白名单策略与配置快照；未返回其他配置值。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -303,10 +314,12 @@ def set_strm_schedule_policy_confirmed(
             "runtime_refreshed": runtime_refreshed,
             "runtime_scope": "current_process",
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "使用一次性确认票据与配置快照原子更新 STRM 定时同步白名单策略。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "使用一次性确认票据与配置快照原子更新 STRM 定时同步白名单策略。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

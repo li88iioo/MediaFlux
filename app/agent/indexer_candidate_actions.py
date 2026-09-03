@@ -1,8 +1,10 @@
 """按 owner 绑定候选序号提交资源；内部 result_id 不再成为 Agent 工具参数。"""
+
 from __future__ import annotations
 
 from typing import Any
 
+from app.agent.errors import AgentToolError
 from app.agent.indexer_actions import (
     prepare_submit_resource,
     prepare_submit_resource_batch,
@@ -14,7 +16,6 @@ from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     normalize_resource_search_id,
 )
-from app.agent.registry import AgentToolError
 from app.agent.state_commit import active_agent_resource_candidates
 
 
@@ -62,7 +63,9 @@ class IndexerCandidateActions:
         else:
             # 同一请求内刚产生的候选必须覆盖旧的跨请求 latest；只有没有 staged
             # 结果时，才读取持久化的最近快照。
-            snapshot = staged if isinstance(staged, dict) else self.store.get(owner=owner)
+            snapshot = (
+                staged if isinstance(staged, dict) else self.store.get(owner=owner)
+            )
             if snapshot is None:
                 raise AgentToolError(
                     "最近资源候选不存在或已过期，请重新搜索",
@@ -125,11 +128,15 @@ class IndexerCandidateActions:
         )
         position = int(arguments["position"])
         if position > len(candidates):
-            raise AgentToolError("最近资源候选中没有这个序号", code="precondition_failed")
+            raise AgentToolError(
+                "最近资源候选中没有这个序号", code="precondition_failed"
+            )
         candidate = candidates[position - 1]
         result_id = str(candidate.get("result_id") or "").strip()
         if not result_id:
-            raise AgentToolError("资源候选已过期，请重新搜索", code="precondition_failed")
+            raise AgentToolError(
+                "资源候选已过期，请重新搜索", code="precondition_failed"
+            )
         return {"result_id": result_id, "target": str(arguments["target"])}, candidate
 
     def _resolve_batch(
@@ -155,7 +162,9 @@ class IndexerCandidateActions:
             candidate = candidates[int(position) - 1]
             result_id = str(candidate.get("result_id") or "").strip()
             if not result_id:
-                raise AgentToolError("部分资源候选已过期，请重新搜索", code="precondition_failed")
+                raise AgentToolError(
+                    "部分资源候选已过期，请重新搜索", code="precondition_failed"
+                )
             selected.append(candidate)
             result_ids.append(result_id)
         return {"result_ids": result_ids, "target": str(arguments["target"])}, selected

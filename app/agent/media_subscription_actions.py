@@ -1,19 +1,20 @@
 """媒体追更订阅的安全摘要与单条启停动作。"""
+
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
 import hashlib
 import json
 import re
 import secrets
-from typing import Any
 import unicodedata
+from datetime import datetime
+from typing import Any
 
 from app import database as db
 from app.agent.async_bridge import AsyncBridgeUnavailable, ensure_sync_bridge_available
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.agent.workspace_actions import _safe_title
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.service import get_discovery_service
@@ -73,8 +74,12 @@ def media_subscription_summary_arguments(arguments: dict[str, Any]) -> dict[str,
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) != {"subscription_id"}:
-        raise AgentToolError("media.get_subscription_summary 只接受 subscription_id 参数")
-    return {"subscription_id": _strict_subscription_id(arguments.get("subscription_id"))}
+        raise AgentToolError(
+            "media.get_subscription_summary 只接受 subscription_id 参数"
+        )
+    return {
+        "subscription_id": _strict_subscription_id(arguments.get("subscription_id"))
+    }
 
 
 def media_subscription_enabled_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -96,15 +101,15 @@ def media_subscription_enabled_arguments(arguments: dict[str, Any]) -> dict[str,
 def _subscription_identity(
     provider: Any, external_id: Any, media_type: Any
 ) -> tuple[str, str, str]:
-    normalized_provider = unicodedata.normalize(
-        "NFKC", str(provider or "")
-    ).strip().casefold()
+    normalized_provider = (
+        unicodedata.normalize("NFKC", str(provider or "")).strip().casefold()
+    )
     normalized_external_id = unicodedata.normalize(
         "NFKC", str(external_id or "")
     ).strip()
-    normalized_media_type = unicodedata.normalize(
-        "NFKC", str(media_type or "")
-    ).strip().casefold()
+    normalized_media_type = (
+        unicodedata.normalize("NFKC", str(media_type or "")).strip().casefold()
+    )
     if normalized_provider not in _ALLOWED_PROVIDERS:
         raise AgentToolError("provider 仅支持 tmdb、douban 或 bangumi")
     if not _PUBLIC_ID_RE.fullmatch(normalized_external_id):
@@ -117,9 +122,15 @@ def _subscription_identity(
 def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
-    if not set(arguments).issubset({
-        "provider", "external_id", "media_type", "season", "check_interval_minutes",
-    }):
+    if not set(arguments).issubset(
+        {
+            "provider",
+            "external_id",
+            "media_type",
+            "season",
+            "check_interval_minutes",
+        }
+    ):
         raise AgentToolError(
             "media.create_subscription 只接受 provider、external_id、media_type、"
             "可选 season 和 check_interval_minutes 参数"
@@ -133,7 +144,11 @@ def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, 
     )
     season = arguments.get("season")
     if season is not None:
-        if isinstance(season, bool) or not isinstance(season, int) or not 1 <= season <= 100:
+        if (
+            isinstance(season, bool)
+            or not isinstance(season, int)
+            or not 1 <= season <= 100
+        ):
             raise AgentToolError("season 必须是 1 到 100 的整数")
         if media_type != "tv":
             raise AgentToolError("电影订阅不支持季度筛选")
@@ -143,7 +158,9 @@ def media_subscription_create_arguments(arguments: dict[str, Any]) -> dict[str, 
         or not isinstance(check_interval_minutes, int)
         or check_interval_minutes not in _ALLOWED_CHECK_INTERVALS
     ):
-        raise AgentToolError("check_interval_minutes 仅支持 4320（每 3 天）或 10080（每 7 天）")
+        raise AgentToolError(
+            "check_interval_minutes 仅支持 4320（每 3 天）或 10080（每 7 天）"
+        )
     normalized = {
         "provider": provider,
         "external_id": external_id,
@@ -161,7 +178,9 @@ def media_subscription_delete_arguments(arguments: dict[str, Any]) -> dict[str, 
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) != {"subscription_id"}:
         raise AgentToolError("media.delete_subscription 只接受 subscription_id 参数")
-    return {"subscription_id": _strict_subscription_id(arguments.get("subscription_id"))}
+    return {
+        "subscription_id": _strict_subscription_id(arguments.get("subscription_id"))
+    }
 
 
 def _media_type_label(value: Any) -> str:
@@ -205,11 +224,13 @@ def list_media_subscription_summaries(_arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="暂时无法读取媒体追更订阅",
             data={"total": 0, "returned": 0, "truncated": False, "items": []},
-            evidence=[Evidence(
-                "media_subscription_database",
-                "尝试读取本地媒体追更安全摘要；未读取站点、下载目标、路径或凭据。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "media_subscription_database",
+                    "尝试读取本地媒体追更安全摘要；未读取站点、下载目标、路径或凭据。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查本地数据库状态后重试。"],
             error="媒体追更订阅当前不可用。",
         )
@@ -233,11 +254,13 @@ def list_media_subscription_summaries(_arguments: dict[str, Any]) -> ToolResult:
             "truncated": int(total or 0) > returned,
             "items": items,
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "只读取本地媒体追更编号、标题、类型、启用状态和缺失数量。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "只读取本地媒体追更编号、标题、类型、启用状态和缺失数量。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -301,7 +324,8 @@ async def _preview_media_subscription_rows(rows: list[Any]) -> list[dict[str, An
             except Exception as exc:
                 logger.warning(
                     "Agent 媒体订阅实时核对失败 subscription=%s type=%s",
-                    row["id"], type(exc).__name__,
+                    row["id"],
+                    type(exc).__name__,
                 )
                 return _preview_failure(
                     row,
@@ -323,7 +347,13 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
             ok=False,
             status="unavailable",
             summary="暂时无法读取媒体追更订阅",
-            data={"total": 0, "returned": 0, "truncated": False, "subscriptions": [], "items": []},
+            data={
+                "total": 0,
+                "returned": 0,
+                "truncated": False,
+                "subscriptions": [],
+                "items": [],
+            },
             error="媒体追更订阅当前不可用。",
         )
     if not total:
@@ -331,7 +361,13 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
             ok=True,
             status="not_configured",
             summary="尚未创建媒体追更订阅",
-            data={"total": 0, "returned": 0, "truncated": False, "subscriptions": [], "items": []},
+            data={
+                "total": 0,
+                "returned": 0,
+                "truncated": False,
+                "subscriptions": [],
+                "items": [],
+            },
             suggestions=["可直接说：订阅《片名》，再从搜索结果中选择准确条目。"],
         )
 
@@ -370,12 +406,16 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
             for candidate in searched.get("candidates", []):
                 if not isinstance(candidate, dict):
                     continue
-                candidate_items.append({
-                    **candidate,
-                    "media_title": str(subscription.get("title") or "")[:120],
-                    "episode_label": label,
-                    "subscription_number": int(subscription.get("subscription_number") or 0),
-                })
+                candidate_items.append(
+                    {
+                        **candidate,
+                        "media_title": str(subscription.get("title") or "")[:120],
+                        "episode_label": label,
+                        "subscription_number": int(
+                            subscription.get("subscription_number") or 0
+                        ),
+                    }
+                )
                 if len(candidate_items) >= _MAX_UPDATE_CANDIDATES:
                     break
             if len(candidate_items) >= _MAX_UPDATE_CANDIDATES:
@@ -414,11 +454,15 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
     elif uncertain:
         status = "partial"
         ok = True
-        summary = f"已核对 {len(subscriptions)} 个媒体追更订阅，{uncertain} 个暂无法确认"
+        summary = (
+            f"已核对 {len(subscriptions)} 个媒体追更订阅，{uncertain} 个暂无法确认"
+        )
     else:
         status = "up_to_date"
         ok = True
-        summary = f"已实时核对 {len(subscriptions)} 个媒体追更订阅，当前未发现新的已播缺失"
+        summary = (
+            f"已实时核对 {len(subscriptions)} 个媒体追更订阅，当前未发现新的已播缺失"
+        )
 
     suggestions: list[str] = []
     if candidate_items:
@@ -432,7 +476,9 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
     if uncertain:
         suggestions.append("暂无法确认的订阅应先检查 TMDB、媒体服务器或资源站连通性。")
     elif partial_searches:
-        suggestions.append("部分资源站查询未完成；已返回候选仍可查看，未返回不代表没有资源。")
+        suggestions.append(
+            "部分资源站查询未完成；已返回候选仍可查看，未返回不代表没有资源。"
+        )
     return ToolResult(
         ok=ok,
         status=status,
@@ -454,9 +500,21 @@ def inspect_media_subscription_updates(_arguments: dict[str, Any]) -> ToolResult
             "read_only": True,
         },
         evidence=[
-            Evidence("media_subscription_database", "读取当前媒体追更订阅及其安全策略摘要。", _now()),
-            Evidence("media_servers+tmdb", "实时比较 TMDB 已播清单与 Jellyfin/Emby 本地库存。", _now()),
-            Evidence("indexer_service", "仅对确认缺失项执行有界多站搜索；未提交下载。", _now()),
+            Evidence(
+                "media_subscription_database",
+                "读取当前媒体追更订阅及其安全策略摘要。",
+                _now(),
+            ),
+            Evidence(
+                "media_servers+tmdb",
+                "实时比较 TMDB 已播清单与 Jellyfin/Emby 本地库存。",
+                _now(),
+            ),
+            Evidence(
+                "indexer_service",
+                "仅对确认缺失项执行有界多站搜索；未提交下载。",
+                _now(),
+            ),
         ],
         suggestions=suggestions,
         error="部分订阅暂无法确认。" if uncertain and not ok else "",
@@ -482,11 +540,13 @@ def get_media_subscription_summary(arguments: dict[str, int]) -> ToolResult:
         status="completed",
         summary=f"媒体追更订阅 {item['subscription_number']}：{item['status']}",
         data=item,
-        evidence=[Evidence(
-            "media_subscription_database",
-            "只读取指定订阅的安全摘要；未读取站点、下载目标、路径或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "只读取指定订阅的安全摘要；未读取站点、下载目标、路径或凭据。",
+                _now(),
+            )
+        ],
         suggestions=["可明确说“暂停媒体订阅编号”或“恢复媒体订阅编号”。"],
     )
 
@@ -533,15 +593,19 @@ def _capture(subscription_id: int) -> dict[str, Any]:
 
 def _fingerprint(state: dict[str, Any]) -> str:
     return hashlib.sha256(
-        json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
-            "utf-8"
-        )
+        json.dumps(
+            state, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
     ).hexdigest()
 
 
 def _resolved_tmdb_id(provider: str, external_id: str, media_type: str) -> str:
     if provider == "tmdb":
-        if not external_id.isascii() or not external_id.isdigit() or int(external_id) <= 0:
+        if (
+            not external_id.isascii()
+            or not external_id.isdigit()
+            or int(external_id) <= 0
+        ):
             raise AgentToolError("TMDB 媒体 ID 无效", code="precondition_failed")
         return external_id
     mapping = db.get_media_external_id(provider, external_id, media_type)
@@ -622,9 +686,13 @@ def prepare_create_media_subscription(
             "暂时无法核对该影视条目", code="confirmation_unavailable"
         ) from exc
     if not isinstance(card, MediaCard) or (
-        card.provider, card.external_id, card.media_type
+        card.provider,
+        card.external_id,
+        card.media_type,
     ) != (provider, external_id, media_type):
-        raise AgentToolError("影视数据源返回的条目标识不一致", code="precondition_failed")
+        raise AgentToolError(
+            "影视数据源返回的条目标识不一致", code="precondition_failed"
+        )
     title = _safe_title(card.title, fallback="该媒体")
     year = str(card.year or "").strip()[:12]
     season_label = f"第 {int(season)} 季" if season is not None else "全部缺失内容"
@@ -650,7 +718,9 @@ def prepare_create_media_subscription(
             "monitor_scope": season_label,
             "season": int(season) if season is not None else None,
             "check_interval_minutes": check_interval_minutes,
-            "check_interval": "每 7 天" if check_interval_minutes == 10080 else "每 3 天",
+            "check_interval": "每 7 天"
+            if check_interval_minutes == 10080
+            else "每 3 天",
             "affected": 1,
             "effects": [
                 "确认后只会创建或恢复本地追更订阅，不会立即下载资源。",
@@ -658,11 +728,13 @@ def prepare_create_media_subscription(
                 "检查缺失内容，候选下载仍需按策略确认。",
             ],
         },
-        evidence=[Evidence(
-            "discovery_provider",
-            "预检时核对精确影视条目及已确认 TMDB 身份；未搜索资源或提交下载。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "discovery_provider",
+                "预检时核对精确影视条目及已确认 TMDB 身份；未搜索资源或提交下载。",
+                _now(),
+            )
+        ],
         suggestions=["确认票据只可使用一次；确认前请核对片名、类型和季度范围。"],
     ), _encode_create_context(context)
 
@@ -678,7 +750,8 @@ def create_media_subscription_confirmed(
     )
     if (
         context.get("operation") != "create"
-        or identity != (
+        or identity
+        != (
             str(context.get("provider") or ""),
             str(context.get("external_id") or ""),
             str(context.get("media_type") or ""),
@@ -744,12 +817,15 @@ def create_media_subscription_confirmed(
             error="订阅服务暂时不可用。",
         )
     subscription = (
-        created_result.get("subscription")
-        if isinstance(created_result, dict) else None
+        created_result.get("subscription") if isinstance(created_result, dict) else None
     )
     subscription = subscription if isinstance(subscription, dict) else {}
     subscription_id = int(subscription.get("id") or 0)
-    created = bool(created_result.get("created")) if isinstance(created_result, dict) else False
+    created = (
+        bool(created_result.get("created"))
+        if isinstance(created_result, dict)
+        else False
+    )
     runtime_refreshed = _reload_scheduler()
     return ToolResult(
         ok=True,
@@ -762,16 +838,20 @@ def create_media_subscription_confirmed(
             "media_type": _media_type_label(identity[2]),
             "season": int(season) if season is not None else None,
             "check_interval_minutes": check_interval_minutes,
-            "check_interval": "每 7 天" if check_interval_minutes == 10080 else "每 3 天",
+            "check_interval": "每 7 天"
+            if check_interval_minutes == 10080
+            else "每 3 天",
             "affected": 1,
             "created": created,
             "runtime_refreshed": runtime_refreshed,
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "已使用一次性确认票据创建本地追更订阅；未立即搜索或下载资源。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "已使用一次性确认票据创建本地追更订阅；未立即搜索或下载资源。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["订阅已进入后台调度，可继续查看媒体订阅更新。"]
             if runtime_refreshed
@@ -806,11 +886,13 @@ def prepare_delete_media_subscription(
                 "未提交候选、待处理准入和运行中检查会失效；已提交下载和媒体文件不会删除。",
             ],
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "只核对目标订阅及未完成工作数量；不会删除下载任务或媒体文件。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "只核对目标订阅及未完成工作数量；不会删除下载任务或媒体文件。",
+                _now(),
+            )
+        ],
         suggestions=["删除属于高风险操作；确认票据只可使用一次。"],
     ), _fingerprint(state)
 
@@ -851,11 +933,13 @@ def delete_media_subscription_confirmed(
             "cancelled_runs": int(state.get("running_checks") or 0),
             "runtime_refreshed": runtime_refreshed,
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "已使用一次性确认票据软删除订阅；已提交下载与媒体文件未被删除。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "已使用一次性确认票据软删除订阅；已提交下载与媒体文件未被删除。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["订阅已删除，后续不会再安排检查。"]
             if runtime_refreshed
@@ -897,11 +981,13 @@ def prepare_set_media_subscription_enabled(
             "affected": 1,
             "effects": effects,
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "仅核对本地订阅状态和待失效记录数量；未访问资源网站或下载器。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "仅核对本地订阅状态和待失效记录数量；未访问资源网站或下载器。",
+                _now(),
+            )
+        ],
         suggestions=["确认票据只可使用一次；订阅状态变化后需要重新预检。"],
     )
     return preview, _fingerprint(state)
@@ -909,12 +995,16 @@ def prepare_set_media_subscription_enabled(
 
 def _reload_scheduler() -> bool:
     try:
-        from app.modules.media_subscription_scheduler import get_media_subscription_scheduler
+        from app.modules.media_subscription_scheduler import (
+            get_media_subscription_scheduler,
+        )
 
         get_media_subscription_scheduler().reload()
         return True
     except Exception as exc:
-        logger.warning("Agent 媒体追更配置已保存但调度器刷新失败 type=%s", type(exc).__name__)
+        logger.warning(
+            "Agent 媒体追更配置已保存但调度器刷新失败 type=%s", type(exc).__name__
+        )
         return False
 
 
@@ -939,7 +1029,13 @@ def set_media_subscription_enabled_confirmed(
         cur = conn.execute(
             "UPDATE media_subscriptions SET enabled=?,status=?,next_check_at=?,last_error='',"
             "revision=revision+1,updated_at=? WHERE id=? AND deleted_at IS NULL",
-            (1 if requested else 0, "new" if requested else "paused", stamp, stamp, subscription_id),
+            (
+                1 if requested else 0,
+                "new" if requested else "paused",
+                stamp,
+                stamp,
+                subscription_id,
+            ),
         )
         if cur.rowcount != 1:
             return ToolResult(
@@ -983,11 +1079,13 @@ def set_media_subscription_enabled_confirmed(
             "cancelled_runs": max(0, int(cancelled_runs or 0)),
             "runtime_refreshed": runtime_refreshed,
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "已使用一次性确认票据原子更新订阅；未操作已提交下载任务或媒体文件。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "已使用一次性确认票据原子更新订阅；未操作已提交下载任务或媒体文件。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["追更已恢复，下一次调度会重新检查媒体库。"]
             if requested and runtime_refreshed
@@ -1013,8 +1111,13 @@ def media_subscription_policy_update_arguments(
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     allowed = {
-        "subscription_id", "monitor_mode", "seasons", "include_specials",
-        "action", "download_target", "check_interval_minutes",
+        "subscription_id",
+        "monitor_mode",
+        "seasons",
+        "include_specials",
+        "action",
+        "download_target",
+        "check_interval_minutes",
     }
     if not set(arguments).issubset(allowed) or "subscription_id" not in arguments:
         raise AgentToolError("媒体追更策略参数无效")
@@ -1034,7 +1137,11 @@ def media_subscription_policy_update_arguments(
             raise AgentToolError("seasons 必须是最多 20 项的季度数组")
         seasons: list[int] = []
         for value in raw_seasons:
-            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or not 1 <= value <= 100
+            ):
                 raise AgentToolError("季度编号必须是 1 到 100 的整数")
             if value not in seasons:
                 seasons.append(value)
@@ -1096,7 +1203,9 @@ def _policy_projection(row: Any) -> dict[str, Any]:
         "include_specials": bool(row["include_specials"]),
         "action": str(row["action"] or "confirm"),
         "download_target": str(row["download_target"] or "guangya"),
-        "check_interval_minutes": max(5, min(int(row["check_interval_minutes"] or 4320), 10080)),
+        "check_interval_minutes": max(
+            5, min(int(row["check_interval_minutes"] or 4320), 10080)
+        ),
         "site_count": len(_json_string_list(row["sites_json"])),
     }
 
@@ -1121,12 +1230,16 @@ def get_media_subscription_policy(arguments: dict[str, int]) -> ToolResult:
         "completed",
         f"已读取《{policy['title']}》的追更策略",
         data=policy,
-        evidence=[Evidence(
-            "media_subscription_database",
-            "只读取追更范围、动作模式、下载目标和检查周期；不返回站点明细或凭据。",
-            _now(),
-        )],
-        suggestions=[f"如需修改，请明确说媒体订阅 {policy['subscription_number']} 要改哪些策略。"],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "只读取追更范围、动作模式、下载目标和检查周期；不返回站点明细或凭据。",
+                _now(),
+            )
+        ],
+        suggestions=[
+            f"如需修改，请明确说媒体订阅 {policy['subscription_number']} 要改哪些策略。"
+        ],
     )
 
 
@@ -1152,7 +1265,9 @@ def _effective_subscription_policy(
     snapshot: dict[str, Any], normalized: dict[str, Any]
 ) -> dict[str, Any]:
     return {
-        "monitor_mode": normalized.get("monitor_mode", snapshot.get("monitor_mode", "missing")),
+        "monitor_mode": normalized.get(
+            "monitor_mode", snapshot.get("monitor_mode", "missing")
+        ),
         "seasons": list(normalized.get("seasons", snapshot.get("seasons", [])) or []),
         "include_specials": bool(
             normalized.get("include_specials", snapshot.get("include_specials", False))
@@ -1206,8 +1321,8 @@ def _active_admission_state(conn: Any, subscription_id: int) -> dict[str, Any]:
         digest.update(
             (
                 f"{int(row['id'])}:{int(row['subscription_revision'] or 0)}:"
-                f"{status}:{str(row['updated_at'] or '')}\n"
-            ).encode("utf-8")
+                f"{status}:{row['updated_at'] or ''!s}\n"
+            ).encode()
         )
     return {
         **counts,
@@ -1219,9 +1334,7 @@ def _active_admission_state(conn: Any, subscription_id: int) -> dict[str, Any]:
 def _policy_confirmation_snapshot(conn: Any, subscription_id: int) -> dict[str, Any]:
     snapshot = _policy_snapshot(conn, subscription_id)
     if snapshot.get("exists"):
-        snapshot["_active_admissions"] = _active_admission_state(
-            conn, subscription_id
-        )
+        snapshot["_active_admissions"] = _active_admission_state(conn, subscription_id)
     return snapshot
 
 
@@ -1238,9 +1351,7 @@ def _policy_preview_effects(
             "guangya": "光鸭",
             "both": "qBittorrent 和光鸭",
         }.get(str(effective["download_target"]), "所选下载目标")
-        effects.append(
-            f"后续调度确认匹配后会无需再次人工确认，自动提交到{target}"
-        )
+        effects.append(f"后续调度确认匹配后会无需再次人工确认，自动提交到{target}")
     else:
         effects.append("后续匹配资源仍会按通知或人工确认模式处理")
     if snapshot.get("action") == "auto" or dispatching:
@@ -1263,7 +1374,9 @@ def prepare_set_media_subscription_policy(
     if not snapshot.get("exists"):
         raise AgentToolError("未找到指定的媒体追更订阅", code="precondition_failed")
     effective = _validate_effective_subscription_policy(snapshot, normalized)
-    requested = {key: value for key, value in normalized.items() if key != "subscription_id"}
+    requested = {
+        key: value for key, value in normalized.items() if key != "subscription_id"
+    }
     preview = ToolResult(
         True,
         "confirmation_required",
@@ -1282,11 +1395,13 @@ def prepare_set_media_subscription_policy(
                 dispatching=dispatching,
             ),
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "已读取订阅修订号和当前安全策略，尚未修改数据库。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "已读取订阅修订号和当前安全策略，尚未修改数据库。",
+                _now(),
+            )
+        ],
         suggestions=["确认票据只可使用一次；策略变化后需要重新预检。"],
     )
     return preview, _fingerprint(snapshot)
@@ -1303,11 +1418,18 @@ def set_media_subscription_policy_confirmed(
         if not snapshot.get("exists") or not secrets.compare_digest(
             _fingerprint(snapshot), str(expected_context or "")
         ):
-            return ToolResult(False, "conflict", "追更策略已变化，请重新预检", error="确认快照已失效。")
+            return ToolResult(
+                False,
+                "conflict",
+                "追更策略已变化，请重新预检",
+                error="确认快照已失效。",
+            )
         try:
             effective = _validate_effective_subscription_policy(snapshot, normalized)
         except AgentToolError as exc:
-            return ToolResult(False, "conflict", exc.public_message, error=exc.public_message)
+            return ToolResult(
+                False, "conflict", exc.public_message, error=exc.public_message
+            )
         dispatching = int(
             snapshot.get("_active_admissions", {}).get("dispatching") or 0
         )
@@ -1316,10 +1438,14 @@ def set_media_subscription_policy_confirmed(
             fields["seasons_json" if key == "seasons" else key] = (
                 json.dumps(value, ensure_ascii=False, separators=(",", ":"))
                 if key == "seasons"
-                else int(value) if key == "include_specials" else value
+                else int(value)
+                if key == "include_specials"
+                else value
             )
         if not fields:
-            return ToolResult(False, "conflict", "没有可修改的追更策略", error="请求为空。")
+            return ToolResult(
+                False, "conflict", "没有可修改的追更策略", error="请求为空。"
+            )
         fields["next_check_at"] = db.now()
         fields["status"] = "new" if snapshot["enabled"] else "paused"
         fields["last_error"] = ""
@@ -1331,7 +1457,12 @@ def set_media_subscription_policy_confirmed(
             (*fields.values(), stamp, subscription_id, snapshot["revision"]),
         )
         if cur.rowcount != 1:
-            return ToolResult(False, "conflict", "追更策略已变化，请重新预检", error="目标订阅已变化。")
+            return ToolResult(
+                False,
+                "conflict",
+                "追更策略已变化，请重新预检",
+                error="目标订阅已变化。",
+            )
         expired = conn.execute(
             "UPDATE media_subscription_candidates SET status='expired',updated_at=? "
             "WHERE subscription_id=? AND status='available'",
@@ -1360,11 +1491,13 @@ def set_media_subscription_policy_confirmed(
             "effective_action": effective["action"],
             "runtime_refreshed": refreshed,
         },
-        evidence=[Evidence(
-            "media_subscription_database",
-            "使用一次性确认票据和修订号原子更新策略；未立即检查或下载。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "media_subscription_database",
+                "使用一次性确认票据和修订号原子更新策略；未立即检查或下载。",
+                _now(),
+            )
+        ],
         suggestions=[
             "策略已保存，下一次调度会按新策略重新检查。",
             *(

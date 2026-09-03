@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import RiskLevel, ToolContext, ToolResult
 from app.agent.provider_catalog import ProviderCatalog
 from app.agent.provider_gateway import _PROVIDER_WRITE_LOCK, ProviderGateway
@@ -17,7 +18,6 @@ from app.agent.provider_models import (
     ProviderPayload,
     ProviderProfileView,
 )
-from app.agent.registry import AgentToolError
 from app.repositories.agent_provider_plans import (
     claim_provider_plan,
     create_provider_plan,
@@ -147,9 +147,7 @@ def test_provider_owner_reset_treats_missing_plan_table_as_empty(
         db.configure_database(previous_path, test_mode=previous_test_mode)
 
 
-def _insert_provider_executing_audit(
-    plan_ref: str, confirmation_id: str
-) -> None:
+def _insert_provider_executing_audit(plan_ref: str, confirmation_id: str) -> None:
     stamp = db.now()
     db.add_agent_action_history(
         owner_digest="a" * 64,
@@ -175,7 +173,11 @@ def _insert_provider_executing_audit(
     ],
 )
 def test_provider_terminal_transaction_converges_existing_action_audit(
-    isolated_provider_db, status, error_code, expected_error, expected_ok,
+    isolated_provider_db,
+    status,
+    error_code,
+    expected_error,
+    expected_ok,
 ):
     plan = create_provider_plan(
         owner="owner-a",
@@ -850,12 +852,15 @@ def test_latest_provider_plan_uses_creation_order_with_second_precision_timestam
         "target_snapshot": {"id": "target"},
         "context_fingerprint": "fingerprint",
     }
-    with patch(
-        "app.repositories.agent_provider_plans.now",
-        return_value="2026-09-01 12:00:00",
-    ), patch(
-        "app.repositories.agent_provider_plans.secrets.token_hex",
-        side_effect=("1" * 24, "0" * 24),
+    with (
+        patch(
+            "app.repositories.agent_provider_plans.now",
+            return_value="2026-09-01 12:00:00",
+        ),
+        patch(
+            "app.repositories.agent_provider_plans.secrets.token_hex",
+            side_effect=("1" * 24, "0" * 24),
+        ),
     ):
         first = create_provider_plan(
             **common, arguments={"value": "first"}, summary="first"
@@ -993,9 +998,8 @@ def test_change_status_translates_writer_lock_failure(
         _PROVIDER_WRITE_LOCK,
         "acquire",
         side_effect=OSError("sensitive lock directory"),
-    ):
-        with pytest.raises(ProviderGatewayError) as failure:
-            gateway.change_status(plan_ref=plan_ref, context=context)
+    ), pytest.raises(ProviderGatewayError) as failure:
+        gateway.change_status(plan_ref=plan_ref, context=context)
 
     assert failure.value.code == "provider_unavailable"
     assert "lock directory" not in str(failure.value)

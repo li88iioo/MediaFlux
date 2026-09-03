@@ -1,15 +1,16 @@
 """Media Agent 的全库缺集巡检策略读取与确认写入。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
 from app import config
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -72,9 +73,7 @@ def patrol_policy_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def _current_policy() -> dict[str, Any]:
     return {
         "enabled": config.get_bool(_TARGETS["enabled"][0], False),
-        "notify_enabled": config.get_bool(
-            _TARGETS["notify_enabled"][0], False
-        ),
+        "notify_enabled": config.get_bool(_TARGETS["notify_enabled"][0], False),
         "interval_hours": max(
             1,
             min(config.get_int(_TARGETS["interval_hours"][0], 24), 168),
@@ -120,11 +119,13 @@ def summarize_patrol_policy(_arguments: dict[str, Any]) -> ToolResult:
             "managed_by_environment": bool(managed),
             "managed_fields": managed,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅返回全库缺集巡检的四项白名单策略与环境托管标记；未返回其他配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅返回全库缺集巡检的四项白名单策略与环境托管标记；未返回其他配置值。",
+                _now(),
+            )
+        ],
         suggestions=[
             "修改策略需要先预检并使用一次性确认票据。",
             "策略修改不会同步执行巡检；当前进程只会重新安排下一次后台检查。",
@@ -142,10 +143,7 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
         "snapshot": snapshot,
         "snapshot_present": snapshot is not None,
         "snapshot_sha256": hashlib.sha256(snapshot or b"").hexdigest(),
-        "persisted": {
-            key: values.get(key, "<unset>")
-            for key in _TARGET_KEYS
-        },
+        "persisted": {key: values.get(key, "<unset>") for key in _TARGET_KEYS},
         "current": current,
         "requested": requested,
         "requested_keys": requested_keys,
@@ -203,7 +201,9 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
     if current["enabled"] != requested["enabled"]:
         effects.append(f"{'开启' if requested['enabled'] else '关闭'}后台全库缺集巡检")
     if current["notify_enabled"] != requested["notify_enabled"]:
-        effects.append(f"{'开启' if requested['notify_enabled'] else '关闭'}巡检结果通知")
+        effects.append(
+            f"{'开启' if requested['notify_enabled'] else '关闭'}巡检结果通知"
+        )
     if current["interval_hours"] != requested["interval_hours"]:
         effects.append(f"将巡检间隔改为 {requested['interval_hours']} 小时")
     if current["max_series"] != requested["max_series"]:
@@ -212,7 +212,9 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
 
     suggestions = ["本次写入不会同步执行巡检、搜索资源或下载。"]
     if not requested["notify_enabled"]:
-        suggestions.append("通知关闭时，若存在尚未发送的巡检通知积压，将被丢弃且无法恢复。")
+        suggestions.append(
+            "通知关闭时，若存在尚未发送的巡检通知积压，将被丢弃且无法恢复。"
+        )
     return effects, suggestions
 
 
@@ -231,11 +233,13 @@ def _preview_from_state(state: dict[str, Any]) -> ToolResult:
             "changed_fields": list(state["changed_keys"]),
             "effects": effects,
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "仅比较全库缺集巡检白名单策略与配置快照；未返回其他配置值。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "仅比较全库缺集巡检白名单策略与配置快照；未返回其他配置值。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )
 
@@ -309,9 +313,7 @@ def set_patrol_policy_confirmed(
         get_agent_library_patrol_scheduler().reload(immediate=False)
     except Exception as exc:
         runtime_refreshed = False
-        logger.warning(
-            "Agent 全库缺集巡检运行时刷新失败 type=%s", type(exc).__name__
-        )
+        logger.warning("Agent 全库缺集巡检运行时刷新失败 type=%s", type(exc).__name__)
 
     policy = _current_policy()
     _effects_value, suggestions = _effects(state)
@@ -327,10 +329,12 @@ def set_patrol_policy_confirmed(
             "runtime_refreshed": runtime_refreshed,
             "runtime_scope": "current_process",
         },
-        evidence=[Evidence(
-            "server_configuration",
-            "使用一次性确认票据与配置快照原子更新全库缺集巡检白名单策略。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "server_configuration",
+                "使用一次性确认票据与配置快照原子更新全库缺集巡检白名单策略。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

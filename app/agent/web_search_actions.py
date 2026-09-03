@@ -1,4 +1,5 @@
 """受控通用网页搜索（Tavily）。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -7,8 +8,9 @@ import json
 import re
 import time
 import unicodedata
+from collections.abc import Callable
 from datetime import date
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -19,9 +21,8 @@ from app.agent.async_bridge import (
     ensure_sync_bridge_available,
     run_awaitable_sync,
 )
-from app.sensitive_data import contains_sensitive_credential
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.config import get
 from app.indexers.errors import (
     IndexerError,
@@ -31,6 +32,7 @@ from app.indexers.errors import (
 )
 from app.indexers.http import FixedHostHttpClient
 from app.logger import get_logger
+from app.sensitive_data import contains_sensitive_credential
 
 logger = get_logger(__name__)
 
@@ -50,7 +52,10 @@ def _int_config(name: str, default: int, *, minimum: int, maximum: int) -> int:
 
 def _enabled() -> bool:
     return str(get("WEB_SEARCH_ENABLED", "0") or "").strip().lower() in {
-        "1", "true", "yes", "on"
+        "1",
+        "true",
+        "yes",
+        "on",
     }
 
 
@@ -87,11 +92,13 @@ def web_search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     }
     if "time_range" in arguments and arguments.get("time_range") not in (None, ""):
         time_range = arguments.get("time_range")
-        if not isinstance(time_range, str) or time_range.strip().lower() not in _ALLOWED_TIME_RANGES:
+        if (
+            not isinstance(time_range, str)
+            or time_range.strip().lower() not in _ALLOWED_TIME_RANGES
+        ):
             raise AgentToolError("time_range 仅支持 day、week、month 或 year")
         normalized["time_range"] = time_range.strip().lower()
     return normalized
-
 
 
 def _safe_text(value: Any, maximum: int) -> str:
@@ -124,14 +131,22 @@ def _safe_url(value: Any) -> str:
         return ""
     if port is not None and port not in {80, 443}:
         return ""
-    return urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path, parsed.query, ""))[:800]
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc, parsed.path, parsed.query, "")
+    )[:800]
 
 
 def _cache_key(arguments: dict[str, Any], depth: str) -> str:
     encoded = json.dumps(
-        [arguments["query"].casefold(), arguments["max_results"],
-         arguments["topic"], arguments.get("time_range", ""), depth],
-        ensure_ascii=False, separators=(",", ":"),
+        [
+            arguments["query"].casefold(),
+            arguments["max_results"],
+            arguments["topic"],
+            arguments.get("time_range", ""),
+            depth,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(b"mediaflux-web-search-cache:v1\0" + encoded).hexdigest()
 
@@ -143,15 +158,19 @@ def _cached(key: str) -> ToolResult | None:
     evidence = []
     for item in payload.get("evidence") or []:
         if isinstance(item, dict):
-            evidence.append(Evidence(
-                str(item.get("source") or ""),
-                str(item.get("description") or ""),
-                str(item.get("collected_at") or ""),
-            ))
+            evidence.append(
+                Evidence(
+                    str(item.get("source") or ""),
+                    str(item.get("description") or ""),
+                    str(item.get("collected_at") or ""),
+                )
+            )
     return ToolResult(
-        bool(payload.get("ok")), str(payload.get("status") or ""),
+        bool(payload.get("ok")),
+        str(payload.get("status") or ""),
         str(payload.get("summary") or ""),
-        data=dict(payload.get("data") or {}), evidence=evidence,
+        data=dict(payload.get("data") or {}),
+        evidence=evidence,
         suggestions=[str(item) for item in payload.get("suggestions") or []],
         error=str(payload.get("error") or ""),
     )
@@ -179,7 +198,9 @@ def _provider_error(status_code: int) -> ToolResult:
     return ToolResult(False, "unavailable", "网页搜索服务暂时不可用")
 
 
-def _map_response(payload: Any, arguments: dict[str, Any], elapsed_ms: int) -> ToolResult:
+def _map_response(
+    payload: Any, arguments: dict[str, Any], elapsed_ms: int
+) -> ToolResult:
     if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
         return ToolResult(False, "invalid_response", "网页搜索服务返回了无法识别的数据")
     results: list[dict[str, Any]] = []
@@ -208,7 +229,9 @@ def _map_response(payload: Any, arguments: dict[str, Any], elapsed_ms: int) -> T
         if published:
             item["published_date"] = published
         results.append(item)
-        evidence.append(Evidence("web_search", f"{title}（{host}）", date.today().isoformat()))
+        evidence.append(
+            Evidence("web_search", f"{title}（{host}）", date.today().isoformat())
+        )
     if not results:
         return ToolResult(
             True,
@@ -242,7 +265,9 @@ async def _search_tavily(
 ) -> ToolResult:
     client = client_factory(
         allowed_hosts={"api.tavily.com"},
-        timeout_seconds=_int_config("TAVILY_TIMEOUT_SECONDS", 10, minimum=2, maximum=30),
+        timeout_seconds=_int_config(
+            "TAVILY_TIMEOUT_SECONDS", 10, minimum=2, maximum=30
+        ),
         max_response_bytes=512 * 1024,
         max_redirects=0,
         user_agent="MediaFlux-Agent/1.0",
@@ -277,7 +302,9 @@ async def _search_tavily(
         try:
             payload = json.loads(response.text)
         except (TypeError, ValueError):
-            return ToolResult(False, "invalid_response", "网页搜索服务返回了无法识别的数据")
+            return ToolResult(
+                False, "invalid_response", "网页搜索服务返回了无法识别的数据"
+            )
         return _map_response(payload, arguments, elapsed_ms)
     except httpx.TimeoutException:
         return ToolResult(False, "timeout", "网页搜索服务响应超时")
@@ -331,7 +358,9 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
             error="请从同步 Agent 查询入口调用网页搜索。",
         )
 
-    daily_limit = _int_config("TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000)
+    daily_limit = _int_config(
+        "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
+    )
     cost = 2 if depth == "advanced" else 1
     usage_date = date.today().isoformat()
     if not db.reserve_agent_web_search_credits(
@@ -351,12 +380,14 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
         )
         if result.ok:
             result.data = dict(result.data)
-            result.data.update({
-                "provider": "tavily",
-                "search_depth": depth,
-                "credits_used": cost,
-                "cached": False,
-            })
+            result.data.update(
+                {
+                    "provider": "tavily",
+                    "search_depth": depth,
+                    "credits_used": cost,
+                    "cached": False,
+                }
+            )
             _store_cache(key, result)
             charged = False
         return result

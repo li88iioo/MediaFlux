@@ -1,4 +1,5 @@
 """RSS 订阅的受控管理动作：精确 ID、原子预检快照、一次性确认。"""
+
 from __future__ import annotations
 
 import hashlib
@@ -8,8 +9,8 @@ from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 from app.modules.rss import rss_subscription_refresh_revision, validate_rss_source_urls
 from app.modules.rss_subscription_config import (
@@ -38,18 +39,20 @@ def _strict_subscription_id(value: Any) -> int:
     return value
 
 
-_RSS_CONFIG_KEYS = frozenset({
-    "name",
-    "urls",
-    "exclude_keywords",
-    "action",
-    "enabled",
-    "refresh_interval_minutes",
-    "download_method",
-    "media_tmdb_id",
-    "media_default_season",
-    "skip_existing_episodes",
-})
+_RSS_CONFIG_KEYS = frozenset(
+    {
+        "name",
+        "urls",
+        "exclude_keywords",
+        "action",
+        "enabled",
+        "refresh_interval_minutes",
+        "download_method",
+        "media_tmdb_id",
+        "media_default_season",
+        "skip_existing_episodes",
+    }
+)
 _RSS_UPDATE_KEYS = _RSS_CONFIG_KEYS
 _RSS_INTERNAL_CREATE_KEYS = _RSS_CONFIG_KEYS | {
     "refresh_cron",
@@ -103,11 +106,14 @@ def _agent_config_payload(arguments: dict[str, Any], *, create: bool) -> dict[st
     if not create and set(arguments) == {"subscription_id"}:
         raise AgentToolError("至少需要修改一个 RSS 订阅字段")
 
-    payload = {key: value for key, value in arguments.items() if key != "subscription_id"}
+    payload = {
+        key: value for key, value in arguments.items() if key != "subscription_id"
+    }
     if normalized_create:
-        if any(str(payload.get(key) or "").strip() for key in (
-            "qb_save_path", "gy_target_dir", "gy_target_dir_name"
-        )):
+        if any(
+            str(payload.get(key) or "").strip()
+            for key in ("qb_save_path", "gy_target_dir", "gy_target_dir_name")
+        ):
             raise AgentToolError("Agent 不接受任意下载路径或云端目录标识")
         # ToolRegistry 会在预检和确认阶段各规范化一次。数据库字段使用
         # 0/1，而公开工具契约使用 JSON boolean，因此在第二次规范化前
@@ -118,9 +124,7 @@ def _agent_config_payload(arguments: dict[str, Any], *, create: bool) -> dict[st
         payload["urls"] = _agent_urls(payload.get("urls"), allow_normalized=True)
         return payload
     if "urls" in payload:
-        payload["urls"] = _agent_urls(
-            payload["urls"], allow_normalized=not create
-        )
+        payload["urls"] = _agent_urls(payload["urls"], allow_normalized=not create)
     return payload
 
 
@@ -146,7 +150,9 @@ def rss_delete_subscription_arguments(arguments: dict[str, Any]) -> dict[str, in
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) != {"subscription_id"}:
         raise AgentToolError("rss.delete_subscription 只接受 subscription_id 参数")
-    return {"subscription_id": _strict_subscription_id(arguments.get("subscription_id"))}
+    return {
+        "subscription_id": _strict_subscription_id(arguments.get("subscription_id"))
+    }
 
 
 def _snapshot(row: Any, *, operation: str, entry_count: int = 0) -> dict[str, Any]:
@@ -174,7 +180,9 @@ def _snapshot(row: Any, *, operation: str, entry_count: int = 0) -> dict[str, An
 
 def _capture(subscription_id: int, *, operation: str) -> dict[str, Any]:
     with db.get_conn() as conn:
-        row = conn.execute("SELECT * FROM rss_items WHERE id=?", (subscription_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM rss_items WHERE id=?", (subscription_id,)
+        ).fetchone()
         count = 0
         if row is not None and operation == "delete":
             count_row = conn.execute(
@@ -209,17 +217,28 @@ def _row_value(row: Any, key: str, default: Any = "") -> Any:
 
 def _config_revision(row: Any) -> str:
     fields = (
-        "id", "name", "enabled", "refresh_cron", "refresh_interval_minutes",
-        "urls", "parser", "exclude_keywords", "action", "download_method",
-        "qb_save_path", "gy_target_dir", "gy_target_dir_name", "media_tmdb_id",
-        "media_default_season", "skip_existing_episodes", "updated_at",
+        "id",
+        "name",
+        "enabled",
+        "refresh_cron",
+        "refresh_interval_minutes",
+        "urls",
+        "parser",
+        "exclude_keywords",
+        "action",
+        "download_method",
+        "qb_save_path",
+        "gy_target_dir",
+        "gy_target_dir_name",
+        "media_tmdb_id",
+        "media_default_season",
+        "skip_existing_episodes",
+        "updated_at",
     )
     return _fingerprint({key: _row_value(row, key) for key in fields})
 
 
-def _changed_config_fields(
-    current: Any, fields: dict[str, Any]
-) -> dict[str, Any]:
+def _changed_config_fields(current: Any, fields: dict[str, Any]) -> dict[str, Any]:
     """只保留真实变化，避免同一配置动作生成无效确认票据。"""
     changed: dict[str, Any] = {}
     for key, value in fields.items():
@@ -262,11 +281,13 @@ def _prepare_create(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
                 "不会立即刷新订阅，也不会自动提交历史条目。",
             ],
         },
-        evidence=[Evidence(
-            "rss_configuration",
-            "已校验订阅配置；确认页不返回订阅地址、下载路径或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_configuration",
+                "已校验订阅配置；确认页不返回订阅地址、下载路径或凭据。",
+                _now(),
+            )
+        ],
         suggestions=["确认票据只可使用一次；Agent 不接受任意下载路径或云端目录标识。"],
     )
     return preview, _fingerprint({"operation": "create", "fields": fields})
@@ -277,7 +298,9 @@ def _prepare_update(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
     current = db.get_rss_subscription(subscription_id)
     if current is None:
         raise _missing()
-    payload = {key: value for key, value in arguments.items() if key != "subscription_id"}
+    payload = {
+        key: value for key, value in arguments.items() if key != "subscription_id"
+    }
     try:
         fields = normalize_rss_subscription_update(
             payload,
@@ -327,11 +350,13 @@ def _prepare_update(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
         status="confirmation_required",
         summary="确认后将更新 1 个 RSS 订阅",
         data=preview_data,
-        evidence=[Evidence(
-            "rss_database",
-            "已生成订阅配置快照；确认页不返回订阅地址、下载路径或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "已生成订阅配置快照；确认页不返回订阅地址、下载路径或凭据。",
+                _now(),
+            )
+        ],
         suggestions=["订阅配置变化后，当前确认票据会自动失效。"],
     ), _fingerprint(context)
 
@@ -383,11 +408,13 @@ def _confirmed_create(arguments: dict[str, Any], expected_context: str) -> ToolR
             "runtime_refreshed": runtime_refreshed,
             **persisted_summary,
         },
-        evidence=[Evidence(
-            "rss_database",
-            "已使用一次性确认票据保存订阅配置；未立即刷新或创建下载任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "已使用一次性确认票据保存订阅配置；未立即刷新或创建下载任务。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["订阅已保存，调度器已重新加载。"]
             if runtime_refreshed
@@ -425,9 +452,7 @@ def _confirmed_config_update(
             raise AgentToolError(str(exc)) from exc
         fields = _changed_config_fields(current, fields)
         if not fields:
-            raise AgentToolError(
-                "RSS 订阅配置没有变化", code="precondition_failed"
-            )
+            raise AgentToolError("RSS 订阅配置没有变化", code="precondition_failed")
         context = {
             "operation": "update",
             "subscription_id": subscription_id,
@@ -457,11 +482,13 @@ def _confirmed_config_update(
             "changed_field_count": len(fields),
             "runtime_refreshed": runtime_refreshed,
         },
-        evidence=[Evidence(
-            "rss_database",
-            "已使用一次性确认票据更新订阅配置；未立即刷新或创建下载任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "已使用一次性确认票据更新订阅配置；未立即刷新或创建下载任务。",
+                _now(),
+            )
+        ],
         suggestions=(
             ["订阅配置已生效。"]
             if runtime_refreshed
@@ -488,11 +515,13 @@ def _prepare_delete(arguments: dict[str, int]) -> tuple[ToolResult, str]:
                 "不会删除已经创建的下载任务或已下载文件。",
             ],
         },
-        evidence=[Evidence(
-            "rss_database",
-            "仅统计本地关联条目数量；未返回订阅名称、地址、过滤词、条目标题或凭据。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "仅统计本地关联条目数量；未返回订阅名称、地址、过滤词、条目标题或凭据。",
+                _now(),
+            )
+        ],
         suggestions=["删除不可撤销；如只想停止定时刷新，建议改为停用订阅。"],
     )
     return preview, _fingerprint(state)
@@ -506,7 +535,9 @@ def _confirmed_delete(arguments: dict[str, int], expected_context: str) -> ToolR
     subscription_id = int(arguments["subscription_id"])
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute("SELECT * FROM rss_items WHERE id=?", (subscription_id,)).fetchone()
+        row = conn.execute(
+            "SELECT * FROM rss_items WHERE id=?", (subscription_id,)
+        ).fetchone()
         count_row = conn.execute(
             "SELECT COUNT(*) AS total FROM rss_entries WHERE rss_item_id=?",
             (subscription_id,),
@@ -536,11 +567,13 @@ def _confirmed_delete(arguments: dict[str, int], expected_context: str) -> ToolR
             "deleted_entries": entry_count,
             "runtime_refreshed": runtime_refreshed,
         },
-        evidence=[Evidence(
-            "rss_database",
-            "已删除订阅与本地条目记录；未操作下载器，也未删除已下载文件。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "rss_database",
+                "已删除订阅与本地条目记录；未操作下载器，也未删除已下载文件。",
+                _now(),
+            )
+        ],
         suggestions=[
             "删除已完成；已有下载任务和文件不会受影响。"
             if runtime_refreshed
@@ -549,7 +582,9 @@ def _confirmed_delete(arguments: dict[str, int], expected_context: str) -> ToolR
     )
 
 
-def prepare_create_rss_subscription(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
+def prepare_create_rss_subscription(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
     return _prepare_create(arguments)
 
 
@@ -559,7 +594,9 @@ def create_rss_subscription_confirmed(
     return _confirmed_create(arguments, expected_context)
 
 
-def prepare_update_rss_subscription(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
+def prepare_update_rss_subscription(
+    arguments: dict[str, Any],
+) -> tuple[ToolResult, str]:
     return _prepare_update(arguments)
 
 
@@ -569,7 +606,9 @@ def update_rss_subscription_confirmed(
     return _confirmed_config_update(arguments, expected_context)
 
 
-def prepare_delete_rss_subscription(arguments: dict[str, int]) -> tuple[ToolResult, str]:
+def prepare_delete_rss_subscription(
+    arguments: dict[str, int],
+) -> tuple[ToolResult, str]:
     return _prepare_delete(arguments)
 
 

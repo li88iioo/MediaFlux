@@ -1,19 +1,22 @@
 """Telegram 写操作对统一 Agent 一次性确认票据的传输适配。"""
+
 from __future__ import annotations
 
 import json
 import re
 import secrets
 import time
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from app.agent.action_plan_id import normalize_action_plan_id
 from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
-from app.agent.registry import AgentToolError
-
+from app.agent.errors import AgentToolError
 
 _TELEGRAM_WRITE_TOOL = "telegram.write_action"
-_CALLBACK_ID_RE = re.compile(r"(?P<ticket>[A-Za-z0-9_-]{16,56})\.(?P<index>[0-9]{1,4})\Z")
+_CALLBACK_ID_RE = re.compile(
+    r"(?P<ticket>[A-Za-z0-9_-]{16,56})\.(?P<index>[0-9]{1,4})\Z"
+)
 
 
 class TelegramWriteConfirmationError(ValueError):
@@ -129,8 +132,7 @@ class TelegramWriteConfirmationStore:
             replace_active_ticket=True,
         )
         return tuple(
-            f"{ticket.confirmation_id}.{index}"
-            for index in range(len(normalized))
+            f"{ticket.confirmation_id}.{index}" for index in range(len(normalized))
         )
 
     def create_pair(
@@ -169,9 +171,7 @@ class TelegramWriteConfirmationStore:
         if owner_match is False:
             raise TelegramWriteConfirmationError("该确认不属于当前用户")
         if owner_match is None:
-            raise TelegramWriteConfirmationError(
-                "确认已过期或已处理，请重新发起"
-            )
+            raise TelegramWriteConfirmationError("确认已过期或已处理，请重新发起")
         try:
             ticket = self._store.claim_and_rotate_owner(
                 owner=owner,

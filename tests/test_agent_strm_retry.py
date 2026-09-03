@@ -1,23 +1,23 @@
 """Media Agent STRM 失败安全重试的确认、脱敏与路由回归。"""
+
 from __future__ import annotations
 
 import json
-import re
 from unittest.mock import patch
 
-from fastapi.testclient import TestClient
-
 from app import database as db
-from app.agent.orchestrator import strm_failure_retry_request
-from app.agent.rate_limit import agent_rate_limiter
-from app.agent.registry import AgentToolError
-from app.agent.service import get_agent_service, reset_agent_service_for_tests
+from app.agent.errors import AgentToolError
 from app.agent.strm_retry_actions import (
     prepare_strm_failure_retry,
     retry_strm_failure_records_confirmed,
     strm_failure_retry_arguments,
 )
-from app.main import create_app
+from tests.agent_kernel_test_harness import (
+    get_kernel_test_service as get_agent_service,
+)
+from tests.agent_kernel_test_harness import (
+    reset_kernel_test_service as reset_agent_service_for_tests,
+)
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -27,7 +27,14 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM strm_failures")
         reset_agent_service_for_tests()
         self.runtime_config = {
-            "sources": [{"id": "source", "name": "Source", "source_key": "source", "rel_prefix": ""}],
+            "sources": [
+                {
+                    "id": "source",
+                    "name": "Source",
+                    "source_key": "source",
+                    "rel_prefix": "",
+                }
+            ],
             "strm_root": "/safe/strm",
             "base_url": "http://media.local",
         }
@@ -66,8 +73,9 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
         ):
             with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
                 strm_failure_retry_arguments(invalid)
-
-        tools = {item["name"]: item for item in get_agent_service().capabilities()["tools"]}
+        tools = {
+            item["name"]: item for item in get_agent_service().capabilities()["tools"]
+        }
         spec = tools["strm.retry_failures"]
         self.assertEqual(spec["risk"], "danger")
         self.assertTrue(spec["requires_confirmation"])
@@ -77,7 +85,9 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             ["all", "generate", "metadata"],
         )
         with self.assertRaises(AgentToolError) as direct:
-            get_agent_service().registry.execute("strm.retry_failures", {"scope": "all"})
+            get_agent_service().registry.execute(
+                "strm.retry_failures", {"scope": "all"}
+            )
         self.assertEqual(direct.exception.code, "confirmation_required")
 
     def test_preview_is_read_only_bounded_and_never_projects_sensitive_rows(self):
@@ -90,9 +100,14 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.data["by_action"], {"generate": 1, "metadata": 1})
         retry.assert_not_called()
         serialized = json.dumps(result.to_dict(), ensure_ascii=False)
-        for secret in ("secret-source", "private-file", "/private", "SECRET", "private.example"):
+        for secret in (
+            "secret-source",
+            "private-file",
+            "/private",
+            "SECRET",
+            "private.example",
+        ):
             self.assertNotIn(secret, serialized)
-
         for index in range(3, 103):
             self._record(index)
         limited, _context = prepare_strm_failure_retry({"scope": "all"})
@@ -117,10 +132,10 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "failures": [{"filename": "private.mkv"}],
         }
         with patch("app.modules.strm.retry_strm_failures", return_value=raw) as retry:
-            result = retry_strm_failure_records_confirmed(
-                {"scope": "all"}, fingerprint
-            )
-        retry.assert_called_once_with([second, first], "agent", runtime_config=self.runtime_config)
+            result = retry_strm_failure_records_confirmed({"scope": "all"}, fingerprint)
+        retry.assert_called_once_with(
+            [second, first], "agent", runtime_config=self.runtime_config
+        )
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
         self.assertEqual(
@@ -146,8 +161,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
         from app.agent import strm_retry_actions
 
         with patch(
-            "app.agent.strm_retry_actions._capture",
-            wraps=strm_retry_actions._capture,
+            "app.agent.strm_retry_actions._capture", wraps=strm_retry_actions._capture
         ) as capture:
             prepared = get_agent_service().prepare(
                 "strm.retry_failures", {"scope": "all"}, owner="owner-token"
@@ -198,9 +212,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "stale": 0,
         }
         with patch("app.modules.strm.retry_strm_failures", return_value=raw):
-            result = retry_strm_failure_records_confirmed(
-                {"scope": "all"}, fingerprint
-            )
+            result = retry_strm_failure_records_confirmed({"scope": "all"}, fingerprint)
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "partial")
         self.assertIn("状态已变化", result.summary)
@@ -218,9 +230,7 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
             "stale": 0,
         }
         with patch("app.modules.strm.retry_strm_failures", return_value=raw):
-            result = retry_strm_failure_records_confirmed(
-                {"scope": "all"}, fingerprint
-            )
+            result = retry_strm_failure_records_confirmed({"scope": "all"}, fingerprint)
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "conflict")
         self.assertEqual(result.data["matched"], 0)
@@ -242,171 +252,3 @@ class StrmFailureRetryUnitTests(IsolatedDatabaseTestCase):
                 service.confirm(confirmation_id, owner="owner-token")
         self.assertEqual(stale.exception.code, "confirmation_stale")
         retry.assert_not_called()
-
-    def test_retry_intent_extracts_safe_scope_and_rejects_destructive_requests(self):
-        self.assertEqual(strm_failure_retry_request("重试 STRM 失败记录"), {"scope": "all"})
-        self.assertEqual(strm_failure_retry_request("只重试 STRM 生成失败"), {"scope": "generate"})
-        self.assertEqual(strm_failure_retry_request("重新处理 STRM 字幕错误"), {"scope": "metadata"})
-        for message in (
-            "删除 STRM 失败记录",
-            "修复 STRM 错误",
-            "重试并删除 STRM 失败",
-            "重试并恢复 STRM 失败记录",
-            "不要重试 STRM 失败记录",
-            "不用重试 STRM 失败记录",
-            "能否重试 STRM 失败记录",
-            "是否可以重试 STRM 失败记录",
-            "如何重试 STRM 失败记录？",
-            "重试 STRM 失败记录吗？",
-            "如果重试 STRM 失败记录会怎样",
-            "查看 STRM 失败重试状态",
-            "STRM 失败重试情况怎么样",
-        ):
-            self.assertIsNone(strm_failure_retry_request(message), message)
-
-
-class StrmFailureRetryAPITests(IsolatedDatabaseTestCase):
-    def setUp(self):
-        with db.get_conn() as conn:
-            conn.execute("DELETE FROM strm_failures")
-        reset_agent_service_for_tests()
-        agent_rate_limiter.reset()
-        self.runtime_config = {
-            "sources": [{"id": "source", "name": "Source", "source_key": "source", "rel_prefix": ""}],
-            "strm_root": "/safe/strm",
-            "base_url": "http://media.local",
-        }
-        self.runtime_patcher = patch(
-            "app.modules.strm.capture_strm_retry_runtime_config",
-            return_value=(self.runtime_config, ""),
-        )
-        self.runtime_patcher.start()
-        self.client = TestClient(create_app(start_background=False), raise_server_exceptions=False)
-        self.client.__enter__()
-
-    def tearDown(self):
-        self.client.__exit__(None, None, None)
-        self.runtime_patcher.stop()
-        reset_agent_service_for_tests()
-        agent_rate_limiter.reset()
-
-    @staticmethod
-    def _token(html: str) -> str:
-        matched = re.search(r'name="csrf_token"\s+(?:value|content)="([^"]+)"', html)
-        if not matched:
-            matched = re.search(r'<meta\s+name="csrf-token"\s+content="([^"]+)"', html)
-        if not matched:
-            raise AssertionError("CSRF token missing")
-        return matched.group(1)
-
-    def _login(self) -> str:
-        token = self._token(self.client.get("/login").text)
-        response = self.client.post(
-            "/login",
-            data={"username": "admin", "password": "123456", "csrf_token": token},
-            follow_redirects=False,
-        )
-        self.assertEqual(response.status_code, 302, response.text)
-        return self._token(self.client.get("/settings").text)
-
-    @staticmethod
-    def _record() -> int:
-        return db.record_strm_failure(
-            source_id="secret-source",
-            source_name="Secret Source",
-            file_id="private-file",
-            parent_id="private-parent",
-            filename="private.mkv",
-            action="generate",
-            rel_dir="/private/source",
-            target_rel_path="/private/target.strm",
-            error="token=SECRET https://private.example/resource",
-        )
-
-    def test_query_prepare_confirm_replay_and_direct_call_are_gated(self):
-        failure_id = self._record()
-        csrf = self._login()
-        headers = {"X-CSRF-Token": csrf}
-        raw = {
-            "ok": True,
-            "requested": 1,
-            "matched": 1,
-            "resolved": 1,
-            "failed": 0,
-            "missing": 0,
-            "stale": 0,
-            "error": "token=SECRET /private/path",
-        }
-        with patch("app.modules.strm.retry_strm_failures", return_value=raw) as retry:
-            prepared = self.client.post(
-                "/api/agent/query",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "message": "只重试 STRM 生成失败"},
-            )
-            self.assertEqual(prepared.status_code, 200, prepared.text)
-            body = prepared.json()
-            self.assertEqual(body["mode"], "confirmation_required")
-            self.assertEqual(body["result"]["data"]["selected_count"], 1)
-            confirmation_id = body["action_plan"]["plan_id"]
-            retry.assert_not_called()
-
-            direct = self.client.post(
-                "/api/agent/tools/strm.retry_failures",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "arguments": {"scope": "generate"}},
-            )
-            self.assertEqual(direct.status_code, 409, direct.text)
-            retry.assert_not_called()
-
-            confirmed = self.client.post(
-                "/api/agent/actions/confirm",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
-            )
-            self.assertEqual(confirmed.status_code, 200, confirmed.text)
-            self.assertEqual(confirmed.json()["result"]["status"], "completed")
-            retry.assert_called_once_with([failure_id], "agent", runtime_config=self.runtime_config)
-
-            replay = self.client.post(
-                "/api/agent/actions/confirm",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "plan_id": confirmation_id},
-            )
-            self.assertEqual(replay.status_code, 409, replay.text)
-            retry.assert_called_once()
-
-        serialized = prepared.text + confirmed.text
-        for secret in ("secret-source", "private-file", "/private", "SECRET", "private.example"):
-            self.assertNotIn(secret, serialized)
-
-    def test_prepare_is_strict_and_query_shares_three_per_minute_limit(self):
-        self._record()
-        csrf = self._login()
-        headers = {"X-CSRF-Token": csrf}
-        rejected = self.client.post(
-            "/api/agent/actions/strm.retry_failures/prepare",
-            headers=headers,
-            json={"session_id": "test_session_identifier_0001", "arguments": {"scope": "all", "ids": [1]}},
-        )
-        self.assertEqual(rejected.status_code, 400, rejected.text)
-        agent_rate_limiter.reset()
-
-        for _ in range(3):
-            response = self.client.post(
-                "/api/agent/query",
-                headers=headers,
-                json={"session_id": "test_session_identifier_0001", "message": "重试 STRM 失败记录"},
-            )
-            self.assertEqual(response.status_code, 200, response.text)
-        limited = self.client.post(
-            "/api/agent/actions/strm.retry_failures/prepare",
-            headers=headers,
-            json={"session_id": "test_session_identifier_0001", "arguments": {"scope": "all"}},
-        )
-        self.assertEqual(limited.status_code, 429, limited.text)
-
-
-if __name__ == "__main__":
-    import unittest
-
-    unittest.main()

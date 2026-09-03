@@ -4,6 +4,7 @@
 owner 绑定的短期内存快照中；模型和公开确认参数只接触来源类型、候选序号
 与下载目标。非 Agent Telegram 继续使用原有独立 handler/store。
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -13,13 +14,15 @@ import threading
 import time
 import unicodedata
 from collections import OrderedDict
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 from app import database as db
 from app.agent.download_actions import download_request_public_summary
+from app.agent.errors import AgentToolError
 from app.agent.indexer_actions import download_target_readiness
 from app.agent.indexer_candidate_actions import IndexerCandidateActions
 from app.agent.models import Evidence, ToolContext, ToolResult
@@ -27,7 +30,6 @@ from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     normalize_resource_search_id,
 )
-from app.agent.registry import AgentToolError
 from app.logger import redact_sensitive_text
 from app.modules.download_dispatcher import (
     DownloadInput,
@@ -44,7 +46,9 @@ from app.modules.share_transfer import (
     inspect_share_for_transfer,
 )
 
-_INGEST_SOURCE_TYPES = frozenset({"auto", "direct_url", "guangya_share", "resource_candidates"})
+_INGEST_SOURCE_TYPES = frozenset(
+    {"auto", "direct_url", "guangya_share", "resource_candidates"}
+)
 _SUBMIT_SOURCE_TYPES = frozenset({"direct_url", "guangya_share", "resource_candidates"})
 _TARGETS = frozenset({"qb", "guangya", "both"})
 _MAX_RESOURCE_POSITIONS = 12
@@ -57,7 +61,9 @@ def _now() -> str:
 
 def _safe_text(value: Any, maximum: int = 240) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
-    text = "".join(" " if unicodedata.category(char).startswith("C") else char for char in text)
+    text = "".join(
+        " " if unicodedata.category(char).startswith("C") else char for char in text
+    )
     text = " ".join(text.split())
     return redact_sensitive_text(text)[:maximum]
 
@@ -114,7 +120,8 @@ class AgentIngestSessionStore:
 
     def _prune_locked(self, now: float) -> None:
         for owner in [
-            owner for owner, snapshot in self._entries.items()
+            owner
+            for owner, snapshot in self._entries.items()
             if snapshot.expires_at <= now
         ]:
             self._discard_locked(owner)
@@ -153,12 +160,14 @@ class AgentIngestSessionStore:
             source_type=source_type,
             public=deepcopy(public),
             private=deepcopy(private),
-            fingerprint=_fingerprint({
-                "session_id": session_id,
-                "owner": owner_key,
-                "source_type": source_type,
-                "identity": identity,
-            }),
+            fingerprint=_fingerprint(
+                {
+                    "session_id": session_id,
+                    "owner": owner_key,
+                    "source_type": source_type,
+                    "identity": identity,
+                }
+            ),
             expires_at=now + self.ttl_seconds,
         )
         with self._lock:
@@ -171,9 +180,7 @@ class AgentIngestSessionStore:
                 self._discard_locked(oldest)
         return deepcopy(snapshot)
 
-    def get(
-        self, *, owner: str, source_type: str = ""
-    ) -> IngestSessionSnapshot | None:
+    def get(self, *, owner: str, source_type: str = "") -> IngestSessionSnapshot | None:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return None
@@ -203,7 +210,9 @@ class AgentIngestSessionStore:
 
 
 def ingest_inspect_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict) or not set(arguments).issubset({"source_type", "input"}):
+    if not isinstance(arguments, dict) or not set(arguments).issubset(
+        {"source_type", "input"}
+    ):
         raise AgentToolError("资源检查参数无效")
     source_type = str(arguments.get("source_type") or "auto").strip().lower()
     if source_type not in _INGEST_SOURCE_TYPES:
@@ -219,9 +228,7 @@ def ingest_inspect_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"source_type": source_type, "input": value}
 
 
-def _positions(
-    value: Any, *, maximum: int, required: bool
-) -> list[int]:
+def _positions(value: Any, *, maximum: int, required: bool) -> list[int]:
     if value is None or (isinstance(value, list) and not value):
         if not required:
             return []
@@ -244,7 +251,9 @@ def ingest_submit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         raise AgentToolError("资源提交参数无效")
     source_type = str(arguments.get("source_type") or "").strip().lower()
     if source_type not in _SUBMIT_SOURCE_TYPES:
-        raise AgentToolError("source_type 仅支持 direct_url、guangya_share 或 resource_candidates")
+        raise AgentToolError(
+            "source_type 仅支持 direct_url、guangya_share 或 resource_candidates"
+        )
     target = str(arguments.get("target") or "").strip().lower()
     if source_type == "guangya_share":
         target = target or "guangya"
@@ -307,9 +316,7 @@ class IngestActions:
             raise AgentToolError("请先登录后使用资源接入", code="precondition_failed")
         return owner
 
-    def inspect(
-        self, arguments: dict[str, Any], context: ToolContext
-    ) -> ToolResult:
+    def inspect(self, arguments: dict[str, Any], context: ToolContext) -> ToolResult:
         owner = self._owner(context)
         source_type = arguments["source_type"]
         value = arguments["input"]
@@ -329,11 +336,15 @@ class IngestActions:
                     "size_text": _safe_text(item.get("size_text"), 64),
                     "download_state": _safe_text(item.get("download_state"), 24),
                 }
-                for index, item in enumerate(candidates[:_MAX_RESOURCE_POSITIONS], start=1)
+                for index, item in enumerate(
+                    candidates[:_MAX_RESOURCE_POSITIONS], start=1
+                )
                 if isinstance(item, dict) and str(item.get("result_id") or "").strip()
             ]
             if not public_candidates:
-                raise AgentToolError("最近资源候选已失效，请重新搜索", code="precondition_failed")
+                raise AgentToolError(
+                    "最近资源候选已失效，请重新搜索", code="precondition_failed"
+                )
             return ToolResult(
                 True,
                 "success",
@@ -344,11 +355,13 @@ class IngestActions:
                     "count": len(public_candidates),
                     "items": public_candidates,
                 },
-                evidence=[Evidence(
-                    "agent_resource_candidates",
-                    "读取当前会话最近一次资源搜索的安全候选序号；未返回下载句柄或链接。",
-                    _now(),
-                )],
+                evidence=[
+                    Evidence(
+                        "agent_resource_candidates",
+                        "读取当前会话最近一次资源搜索的安全候选序号；未返回下载句柄或链接。",
+                        _now(),
+                    )
+                ],
                 suggestions=["选择候选序号和 qB、光鸭或两边后可进入提交确认。"],
             )
 
@@ -360,7 +373,9 @@ class IngestActions:
             source_type = "guangya_share" if routed == "guangya_share" else "direct_url"
         if source_type == "guangya_share":
             if routed != "guangya_share":
-                raise AgentToolError("这不是可识别的光鸭官方分享链接", code="precondition_failed")
+                raise AgentToolError(
+                    "这不是可识别的光鸭官方分享链接", code="precondition_failed"
+                )
             try:
                 inspected = inspect_share_for_transfer(
                     value,
@@ -369,7 +384,9 @@ class IngestActions:
                     store=self.store.share_store,
                 )
             except Exception as exc:
-                raise AgentToolError("光鸭分享暂时无法解析", code="unavailable") from exc
+                raise AgentToolError(
+                    "光鸭分享暂时无法解析", code="unavailable"
+                ) from exc
             share_files = [
                 item
                 for item in (inspected.get("files") or [])
@@ -393,10 +410,14 @@ class IngestActions:
                 "source_type": "guangya_share",
                 "count": len(files),
                 "items": files,
-                "target_name": _safe_text(inspected.get("target_name") or "根目录", 120),
+                "target_name": _safe_text(
+                    inspected.get("target_name") or "根目录", 120
+                ),
                 "expires_in": min(
                     self.store.ttl_seconds,
-                    _nonnegative_int(inspected.get("expires_in"), maximum=self.store.ttl_seconds),
+                    _nonnegative_int(
+                        inspected.get("expires_in"), maximum=self.store.ttl_seconds
+                    ),
                 ),
             }
             session = self.store.capture(
@@ -405,15 +426,19 @@ class IngestActions:
                 public=public,
                 private={
                     "preview_id": str(inspected.get("preview_id") or ""),
-                    "file_ids": [str(item.get("id") or "").strip() for item in share_files],
+                    "file_ids": [
+                        str(item.get("id") or "").strip() for item in share_files
+                    ],
                     "target_id": str(inspected.get("target_id") or "0"),
                     "target_name": str(inspected.get("target_name") or "根目录"),
                 },
-                identity=_fingerprint({
-                    "preview": inspected.get("preview_id"),
-                    "share": inspected.get("share_id"),
-                    "files": [item.get("id") for item in share_files],
-                }),
+                identity=_fingerprint(
+                    {
+                        "preview": inspected.get("preview_id"),
+                        "share": inspected.get("share_id"),
+                        "files": [item.get("id") for item in share_files],
+                    }
+                ),
             )
             public["expires_in"] = max(0, int(session.expires_at - time.monotonic()))
             return ToolResult(
@@ -421,17 +446,21 @@ class IngestActions:
                 "success",
                 f"光鸭分享已解析：{len(files)} 项可转存",
                 data=public,
-                evidence=[Evidence(
-                    "guangya_share",
-                    "服务端已解析分享并保存 owner 绑定的短期私有快照；未返回 access token、file_id 或分享链接。",
-                    _now(),
-                )],
+                evidence=[
+                    Evidence(
+                        "guangya_share",
+                        "服务端已解析分享并保存 owner 绑定的短期私有快照；未返回 access token、file_id 或分享链接。",
+                        _now(),
+                    )
+                ],
                 suggestions=["可选择序号后转存；不提供序号时默认转存全部项目。"],
             )
 
         if routed in {"guangya_share", "web"}:
             if routed == "guangya_share":
-                raise AgentToolError("该链接应按光鸭分享解析", code="precondition_failed")
+                raise AgentToolError(
+                    "该链接应按光鸭分享解析", code="precondition_failed"
+                )
             raise AgentToolError(
                 "这是普通网页链接，不会创建离线下载任务",
                 code="precondition_failed",
@@ -459,11 +488,13 @@ class IngestActions:
             "success",
             "下载资源已识别，等待选择目标并确认",
             data=public,
-            evidence=[Evidence(
-                "download_dispatcher",
-                "服务端已校验下载协议并保存 owner 绑定的短期私有快照；未返回链接或哈希。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "download_dispatcher",
+                    "服务端已校验下载协议并保存 owner 绑定的短期私有快照；未返回链接或哈希。",
+                    _now(),
+                )
+            ],
             suggestions=["选择 qB、光鸭或两边后可进入提交确认。"],
         )
 
@@ -488,7 +519,11 @@ class IngestActions:
         owner = self._owner(context)
         snapshot = self.store.get(owner=owner, source_type=arguments["source_type"])
         if snapshot is None:
-            label = "光鸭分享" if arguments["source_type"] == "guangya_share" else "下载链接"
+            label = (
+                "光鸭分享"
+                if arguments["source_type"] == "guangya_share"
+                else "下载链接"
+            )
             raise AgentToolError(
                 f"最近{label}检查不存在或已过期，请重新发送链接",
                 code="precondition_failed",
@@ -499,13 +534,15 @@ class IngestActions:
     def _submission_context(
         snapshot: IngestSessionSnapshot, arguments: dict[str, Any]
     ) -> str:
-        return _fingerprint({
-            "snapshot": snapshot.fingerprint,
-            "source_type": arguments["source_type"],
-            "target": arguments["target"],
-            "positions": arguments["positions"],
-            "backends": download_target_readiness(arguments["target"]),
-        })
+        return _fingerprint(
+            {
+                "snapshot": snapshot.fingerprint,
+                "source_type": arguments["source_type"],
+                "target": arguments["target"],
+                "positions": arguments["positions"],
+                "backends": download_target_readiness(arguments["target"]),
+            }
+        )
 
     def prepare_submit(
         self, arguments: dict[str, Any], context: ToolContext
@@ -513,20 +550,26 @@ class IngestActions:
         if arguments["source_type"] == "resource_candidates":
             internal = self._resource_arguments(arguments)
             if len(arguments["positions"]) == 1:
-                result, inner_context = self.candidate_actions.prepare_one(internal, context)
+                result, inner_context = self.candidate_actions.prepare_one(
+                    internal, context
+                )
             else:
-                result, inner_context = self.candidate_actions.prepare_batch(internal, context)
+                result, inner_context = self.candidate_actions.prepare_batch(
+                    internal, context
+                )
             # 候选解析器把本轮实际使用的 search_id 写回 internal；这里再冻结进
             # ToolRegistry 的 normalized 参数，使确认只能回到同一份快照。
             arguments["search_id"] = internal["search_id"]
             if isinstance(result.data, dict):
                 result.data["source_type"] = "resource_candidates"
                 result.data["search_id"] = internal["search_id"]
-            return result, _fingerprint({
-                "source_type": "resource_candidates",
-                "arguments": arguments,
-                "inner_context": inner_context,
-            })
+            return result, _fingerprint(
+                {
+                    "source_type": "resource_candidates",
+                    "arguments": arguments,
+                    "inner_context": inner_context,
+                }
+            )
 
         snapshot = self._snapshot(arguments, context)
         readiness = download_target_readiness(arguments["target"])
@@ -553,13 +596,19 @@ class IngestActions:
                     "title": snapshot.public.get("title"),
                     "target": arguments["target"],
                     "backends": readiness,
-                    "effects": ["创建幂等下载请求", "提交到所选下载后端", "保留后续整理与 STRM 跟踪"],
+                    "effects": [
+                        "创建幂等下载请求",
+                        "提交到所选下载后端",
+                        "保留后续整理与 STRM 跟踪",
+                    ],
                 },
-                evidence=[Evidence(
-                    "agent_ingest_snapshot",
-                    "已复核 owner 绑定的短期资源快照和下载后端状态；未返回原始链接或哈希。",
-                    _now(),
-                )],
+                evidence=[
+                    Evidence(
+                        "agent_ingest_snapshot",
+                        "已复核 owner 绑定的短期资源快照和下载后端状态；未返回原始链接或哈希。",
+                        _now(),
+                    )
+                ],
                 suggestions=["请核对资源标题和下载目标后再确认。"],
             )
             return result, self._submission_context(snapshot, arguments)
@@ -567,9 +616,12 @@ class IngestActions:
         file_ids = list(snapshot.private.get("file_ids") or [])
         positions = arguments["positions"] or list(range(1, len(file_ids) + 1))
         if not positions or any(position > len(file_ids) for position in positions):
-            raise AgentToolError("分享候选序号不存在，请重新解析", code="precondition_failed")
+            raise AgentToolError(
+                "分享候选序号不存在，请重新解析", code="precondition_failed"
+            )
         items = [
-            item for item in snapshot.public.get("items", [])
+            item
+            for item in snapshot.public.get("items", [])
             if isinstance(item, dict) and int(item.get("position") or 0) in positions
         ]
         frozen_arguments = dict(arguments)
@@ -585,13 +637,19 @@ class IngestActions:
                 "target": "guangya",
                 "target_name": snapshot.public.get("target_name"),
                 "backends": readiness,
-                "effects": ["按所选序号转存分享内容", "创建幂等转存请求", "按现有配置继续后处理"],
+                "effects": [
+                    "按所选序号转存分享内容",
+                    "创建幂等转存请求",
+                    "按现有配置继续后处理",
+                ],
             },
-            evidence=[Evidence(
-                "agent_ingest_snapshot",
-                "已锁定 owner 绑定的分享快照、文件序号和目标目录；未返回 access token 或 file_id。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "agent_ingest_snapshot",
+                    "已锁定 owner 绑定的分享快照、文件序号和目标目录；未返回 access token 或 file_id。",
+                    _now(),
+                )
+            ],
             suggestions=["请核对项目和目标目录后再确认。"],
         )
         return result, self._submission_context(snapshot, frozen_arguments)
@@ -611,38 +669,57 @@ class IngestActions:
             internal = self._resource_arguments(arguments)
             # 只按 ticket 已冻结的 search_id 重新生成底层上下文；不得回落到 latest。
             if len(arguments["positions"]) == 1:
-                _preview, inner_context = self.candidate_actions.prepare_one(internal, context)
+                _preview, inner_context = self.candidate_actions.prepare_one(
+                    internal, context
+                )
             else:
-                _preview, inner_context = self.candidate_actions.prepare_batch(internal, context)
-            current = _fingerprint({
-                "source_type": "resource_candidates",
-                "arguments": arguments,
-                "inner_context": inner_context,
-            })
+                _preview, inner_context = self.candidate_actions.prepare_batch(
+                    internal, context
+                )
+            current = _fingerprint(
+                {
+                    "source_type": "resource_candidates",
+                    "arguments": arguments,
+                    "inner_context": inner_context,
+                }
+            )
             if not secrets.compare_digest(current, str(expected_context or "")):
-                raise AgentToolError("资源候选或下载目标已变化，请重新预检", code="confirmation_stale")
+                raise AgentToolError(
+                    "资源候选或下载目标已变化，请重新预检", code="confirmation_stale"
+                )
             if len(arguments["positions"]) == 1:
-                result = self.candidate_actions.confirm_one(internal, inner_context, context)
+                result = self.candidate_actions.confirm_one(
+                    internal, inner_context, context
+                )
             else:
-                result = self.candidate_actions.confirm_batch(internal, inner_context, context)
+                result = self.candidate_actions.confirm_batch(
+                    internal, inner_context, context
+                )
             if isinstance(result.data, dict):
                 result.data["source_type"] = "resource_candidates"
             return result
 
         snapshot = self._snapshot(arguments, context)
         frozen_arguments = dict(arguments)
-        if arguments["source_type"] == "guangya_share" and not frozen_arguments["positions"]:
+        if (
+            arguments["source_type"] == "guangya_share"
+            and not frozen_arguments["positions"]
+        ):
             frozen_arguments["positions"] = list(
                 range(1, len(snapshot.private.get("file_ids") or []) + 1)
             )
         current = self._submission_context(snapshot, frozen_arguments)
         if not secrets.compare_digest(current, str(expected_context or "")):
-            raise AgentToolError("资源快照或提交目标已变化，请重新预检", code="confirmation_stale")
+            raise AgentToolError(
+                "资源快照或提交目标已变化，请重新预检", code="confirmation_stale"
+            )
 
         if arguments["source_type"] == "direct_url":
             item = snapshot.private.get("download_input")
             if not isinstance(item, DownloadInput):
-                raise AgentToolError("下载资源快照已失效，请重新发送链接", code="confirmation_stale")
+                raise AgentToolError(
+                    "下载资源快照已失效，请重新发送链接", code="confirmation_stale"
+                )
             created = create_request(item, "", "", origin="agent")
             request_number = int(created["id"])
             dispatched = dispatch_request(request_number, arguments["target"])
@@ -661,12 +738,14 @@ class IngestActions:
             status = str(public.get("status") or "failed")
             summary = (
                 f"下载请求 #{request_number} 已提交"
-                if ok else
-                f"下载请求 #{request_number} 未完成提交"
+                if ok
+                else f"下载请求 #{request_number} 未完成提交"
             )
             result_status = (
-                "accepted" if status in {"submitted", "partial"}
-                else "conflict" if status == "duplicate"
+                "accepted"
+                if status in {"submitted", "partial"}
+                else "conflict"
+                if status == "duplicate"
                 else "unavailable"
             )
             return ToolResult(
@@ -674,11 +753,13 @@ class IngestActions:
                 result_status,
                 summary,
                 data=data,
-                evidence=[Evidence(
-                    "download_dispatcher",
-                    "通过统一幂等下载请求与既有后端分发器执行；未返回链接、哈希或后端任务标识。",
-                    _now(),
-                )],
+                evidence=[
+                    Evidence(
+                        "download_dispatcher",
+                        "通过统一幂等下载请求与既有后端分发器执行；未返回链接、哈希或后端任务标识。",
+                        _now(),
+                    )
+                ],
                 suggestions=[f"可查询资源请求 #{request_number} 的状态。"],
                 error=str(public.get("error") or ""),
             )
@@ -686,7 +767,9 @@ class IngestActions:
         file_ids = list(snapshot.private.get("file_ids") or [])
         positions = frozen_arguments["positions"]
         if not positions or any(position > len(file_ids) for position in positions):
-            raise AgentToolError("分享候选序号已变化，请重新解析", code="confirmation_stale")
+            raise AgentToolError(
+                "分享候选序号已变化，请重新解析", code="confirmation_stale"
+            )
         selected_ids = [file_ids[position - 1] for position in positions]
         try:
             result = create_share_request(
@@ -717,33 +800,41 @@ class IngestActions:
             "failed": [] if success or duplicate else ["guangya"],
             "created": bool(result.get("created")),
             "duplicate": duplicate,
-            "target_name": _safe_text(result.get("target_dir_name") or snapshot.public.get("target_name"), 120),
+            "target_name": _safe_text(
+                result.get("target_dir_name") or snapshot.public.get("target_name"), 120
+            ),
         }
         row = db.get_download_request(request_number) if request_number else None
         if row is not None:
             data["request"] = download_request_public_summary(row)
-        ok = success or (duplicate and status in {"pending", "submitting", "submitted", "downloading", "completed"})
+        ok = success or (
+            duplicate
+            and status
+            in {"pending", "submitting", "submitted", "downloading", "completed"}
+        )
         return ToolResult(
             ok,
             "accepted" if ok else status,
             (
                 f"光鸭分享转存请求 #{request_number} 已受理"
-                if ok else
-                f"光鸭分享转存请求 #{request_number} 未完成"
+                if ok
+                else f"光鸭分享转存请求 #{request_number} 未完成"
             ),
             data=data,
-            evidence=[Evidence(
-                "share_transfer",
-                "通过独立的 Agent 分享快照与既有幂等转存服务执行；未返回分享令牌或云端 file_id。",
-                _now(),
-            )],
-            suggestions=([f"可查询资源请求 #{request_number} 的状态。"] if request_number else []),
+            evidence=[
+                Evidence(
+                    "share_transfer",
+                    "通过独立的 Agent 分享快照与既有幂等转存服务执行；未返回分享令牌或云端 file_id。",
+                    _now(),
+                )
+            ],
+            suggestions=(
+                [f"可查询资源请求 #{request_number} 的状态。"] if request_number else []
+            ),
             error=_safe_text(result.get("error"), 240),
         )
 
-    def status(
-        self, arguments: dict[str, Any], _context: ToolContext
-    ) -> ToolResult:
+    def status(self, arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
         row = db.get_download_request(arguments["request_number"])
         if row is None:
             return ToolResult(
@@ -758,10 +849,12 @@ class IngestActions:
             "success",
             f"资源请求 #{item['request_number']} 当前状态：{item['status']}",
             data={"request": item},
-            evidence=[Evidence(
-                "download_requests",
-                "读取统一下载请求的脱敏阶段状态；未返回链接、路径、哈希或后端任务标识。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "download_requests",
+                    "读取统一下载请求的脱敏阶段状态；未返回链接、路径、哈希或后端任务标识。",
+                    _now(),
+                )
+            ],
             suggestions=[],
         )

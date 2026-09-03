@@ -1,18 +1,24 @@
 """媒体自动化链路的本地、只读诊断。"""
+
 from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
 
 _FAILURE_STATUSES = {
-    "failed", "error", "interrupted", "partial_failed", "revert_failed", "cancelled",
+    "failed",
+    "error",
+    "interrupted",
+    "partial_failed",
+    "revert_failed",
+    "cancelled",
 }
 _SUCCESS_STATUSES = {"success", "completed"}
 _ACTIVE_STATUSES = {"running", "started", "queued"}
@@ -96,11 +102,13 @@ def diagnose_automation_pipeline(_arguments: dict[str, Any]) -> ToolResult:
             status="unavailable",
             summary="暂时无法读取媒体自动化状态",
             data=_empty_data(),
-            evidence=[Evidence(
-                "automation_database",
-                "尝试读取本地自动化汇总；未访问外部服务或启动任务。",
-                _now(),
-            )],
+            evidence=[
+                Evidence(
+                    "automation_database",
+                    "尝试读取本地自动化汇总；未访问外部服务或启动任务。",
+                    _now(),
+                )
+            ],
             suggestions=["请检查本地数据库状态后重试。"],
             error="自动化链路诊断当前不可用。",
         )
@@ -113,7 +121,9 @@ def diagnose_automation_pipeline(_arguments: dict[str, Any]) -> ToolResult:
     organize_issues = _count(aggregate.get("organize_issues"))
     strm_failures = _count(aggregate.get("strm_failures"))
 
-    downloads_status = "attention" if downloads_review else ("active" if downloads_active else "idle")
+    downloads_status = (
+        "attention" if downloads_review else ("active" if downloads_active else "idle")
+    )
     if rss_failed:
         rss_status = "attention"
     elif not rss_subscriptions:
@@ -139,16 +149,18 @@ def diagnose_automation_pipeline(_arguments: dict[str, Any]) -> ToolResult:
     if strm_stage["last_run"] == "failed" and not strm_failures:
         blockers.append({"code": "strm_last_run_failed", "stage": "strm", "count": 1})
     attention_total = sum(item["count"] for item in blockers)
-    observed = any((
-        downloads_active,
-        downloads_review,
-        rss_subscriptions,
-        rss_pending,
-        rss_failed,
-        organize_issues,
-        strm_failures,
-        str(aggregate.get("strm_last_status") or "").strip(),
-    ))
+    observed = any(
+        (
+            downloads_active,
+            downloads_review,
+            rss_subscriptions,
+            rss_pending,
+            rss_failed,
+            organize_issues,
+            strm_failures,
+            str(aggregate.get("strm_last_status") or "").strip(),
+        )
+    )
 
     if attention_total:
         status = "attention"
@@ -168,7 +180,9 @@ def diagnose_automation_pipeline(_arguments: dict[str, Any]) -> ToolResult:
     if organize_issues:
         suggestions.append("光鸭整理存在历史异常记录，请在整理页面核对最近任务。")
     if strm_failures:
-        suggestions.append("STRM 存在未关闭失败记录，请运行 STRM 诊断后再决定是否修复。")
+        suggestions.append(
+            "STRM 存在未关闭失败记录，请运行 STRM 诊断后再决定是否修复。"
+        )
     elif strm_stage["last_run"] == "failed":
         suggestions.append("最近一次 STRM 运行失败，请运行 STRM 诊断查看当前状态。")
     if status == "not_configured":
@@ -201,10 +215,12 @@ def diagnose_automation_pipeline(_arguments: dict[str, Any]) -> ToolResult:
             },
             "attention": {"total": attention_total, "blockers": blockers},
         },
-        evidence=[Evidence(
-            "automation_database",
-            "读取本地自动化汇总；未访问外部服务或启动任务。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "automation_database",
+                "读取本地自动化汇总；未访问外部服务或启动任务。",
+                _now(),
+            )
+        ],
         suggestions=suggestions,
     )

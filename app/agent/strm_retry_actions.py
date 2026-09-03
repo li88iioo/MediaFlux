@@ -1,15 +1,17 @@
 """Media Agent 的 STRM 失败项受控重试动作。"""
+
 from __future__ import annotations
 
-from datetime import datetime
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from typing import Any
 
-from app import config, database as db
+from app import config
+from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.registry import AgentToolError
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -27,6 +29,8 @@ _STRM_CONFIRMATION_KEYS = (
     "STRM_NOTIFY_ENABLED",
     "GY_ORGANIZE_STRM_DETAIL_NOTIFY",
 )
+
+
 def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -37,7 +41,11 @@ def strm_failure_retry_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if set(arguments) - {"scope"}:
         raise AgentToolError("strm.retry_failures 只接受 scope 参数")
     scope = arguments.get("scope", "all")
-    if not isinstance(scope, str) or scope != scope.strip() or scope not in _ALLOWED_SCOPES:
+    if (
+        not isinstance(scope, str)
+        or scope != scope.strip()
+        or scope not in _ALLOWED_SCOPES
+    ):
         raise AgentToolError("scope 必须是 all、generate 或 metadata")
     return {"scope": scope}
 
@@ -147,11 +155,13 @@ def _preview_strm_failure_retry(
             ],
             "limits": {"maximum_items": _MAX_RETRY_ITEMS},
         },
-        evidence=[Evidence(
-            "sqlite:strm_failures",
-            "仅读取失败项的内部标识、动作类型、聚合版本计数与更新时间用于确认绑定；未返回明细、未访问网络、未扫描云盘、未执行重试。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "sqlite:strm_failures",
+                "仅读取失败项的内部标识、动作类型、聚合版本计数与更新时间用于确认绑定；未返回明细、未访问网络、未扫描云盘、未执行重试。",
+                _now(),
+            )
+        ],
         suggestions=["确认前请先处理重复失败的根因，避免连续无效重试。"],
     )
 
@@ -200,7 +210,12 @@ def _retry_strm_failure_records_state(state: dict[str, Any]) -> ToolResult:
     counts = {
         key: _safe_count(raw, key)
         for key in (
-            "requested", "matched", "resolved", "failed", "missing", "stale",
+            "requested",
+            "matched",
+            "resolved",
+            "failed",
+            "missing",
+            "stale",
             "deferred",
         )
     }
@@ -211,8 +226,12 @@ def _retry_strm_failure_records_state(state: dict[str, Any]) -> ToolResult:
             status="conflict" if busy else "not_configured",
             summary="STRM 重试未执行" if busy else "STRM 重试配置当前不可用",
             data=counts,
-            error="STRM 同步或重试任务正在运行。" if busy else "请检查 STRM 配置后重新预检。",
-            suggestions=["可询问：查看 STRM 同步进度。"] if busy else ["可询问：为什么 STRM 配置不可用？"],
+            error="STRM 同步或重试任务正在运行。"
+            if busy
+            else "请检查 STRM 配置后重新预检。",
+            suggestions=["可询问：查看 STRM 同步进度。"]
+            if busy
+            else ["可询问：为什么 STRM 配置不可用？"],
         )
     if counts["requested"] > 0 and counts["matched"] == 0:
         return ToolResult(
@@ -226,8 +245,11 @@ def _retry_strm_failure_records_state(state: dict[str, Any]) -> ToolResult:
 
     logger.info(
         "Agent STRM 失败重试完成 scope=%s requested=%s matched=%s resolved=%s failed=%s",
-        state["scope"], counts["requested"], counts["matched"],
-        counts["resolved"], counts["failed"],
+        state["scope"],
+        counts["requested"],
+        counts["matched"],
+        counts["resolved"],
+        counts["failed"],
     )
     summary = f"STRM 重试完成：已解决 {counts['resolved']} 条"
     if counts["failed"]:
@@ -239,14 +261,18 @@ def _retry_strm_failure_records_state(state: dict[str, Any]) -> ToolResult:
         summary += f"，{changed} 条状态已变化未重试"
     return ToolResult(
         ok=True,
-        status="partial" if counts["failed"] or counts["deferred"] or changed else "completed",
+        status="partial"
+        if counts["failed"] or counts["deferred"] or changed
+        else "completed",
         summary=summary,
         data={**counts, "scope": state["scope"]},
-        evidence=[Evidence(
-            "strm_retry",
-            "已通过一次性确认票据重试冻结的失败项集合；仅返回聚合计数，不返回来源、对象、文件、路径或错误正文。",
-            _now(),
-        )],
+        evidence=[
+            Evidence(
+                "strm_retry",
+                "已通过一次性确认票据重试冻结的失败项集合；仅返回聚合计数，不返回来源、对象、文件、路径或错误正文。",
+                _now(),
+            )
+        ],
         suggestions=["可再次询问：查看 STRM 失败状态。"],
     )
 
