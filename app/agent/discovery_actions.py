@@ -374,7 +374,7 @@ def _result_payload(
 
 def search_discovery(arguments: dict[str, Any]) -> ToolResult:
     normalized = search_arguments(arguments)
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return ToolResult(
             ok=False,
             status="disabled",
@@ -529,7 +529,7 @@ def recommend_discovery(arguments: dict[str, Any]) -> ToolResult:
         },
         "items": [],
     }
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return ToolResult(
             ok=False,
             status="disabled",
@@ -657,7 +657,7 @@ def bangumi_calendar(arguments: dict[str, Any]) -> ToolResult:
         "retry_after": 0,
         "items": [],
     }
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return ToolResult(
             ok=False,
             status="disabled",

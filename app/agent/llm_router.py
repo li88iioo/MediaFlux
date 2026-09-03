@@ -89,6 +89,7 @@ from app.clients.openai_compatible import (
     text_stream_request_body,
 )
 from app.config import get
+from app.defaults import DEFAULT_AGENT_LLM_ENABLED
 from app.indexers.errors import IndexerError
 from app.indexers.http import FixedHostHttpClient
 from app.logger import get_logger
@@ -511,7 +512,7 @@ class _NativeProtocolState:
 
 
 def _enabled() -> bool:
-    return str(get("AGENT_LLM_ENABLED", "0") or "").strip().lower() in {"1", "true", "yes", "on"}
+    return str(get("AGENT_LLM_ENABLED", str(DEFAULT_AGENT_LLM_ENABLED)) or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def conversation_summary_enabled() -> bool:

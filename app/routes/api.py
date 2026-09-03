@@ -12,6 +12,7 @@ from fastapi import APIRouter, Body, Request
 from app import config
 from app.clients.douban_authenticated import normalize_dbcl2
 from app.defaults import (
+    DEFAULT_AGENT_LLM_ENABLED,
     DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
@@ -111,7 +112,7 @@ _CONFIG_UI_MANAGED_KEYS = (
 )
 _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_ENABLED": "0",
-    "AGENT_LLM_ENABLED": "0",
+    "AGENT_LLM_ENABLED": "1" if DEFAULT_AGENT_LLM_ENABLED else "0",
     "AGENT_LLM_PROTOCOL": "auto",
     "AGENT_LLM_TIMEOUT_SECONDS": "12",
     "AGENT_LLM_REQUESTS_PER_MINUTE": "6",

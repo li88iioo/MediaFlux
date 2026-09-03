@@ -659,6 +659,8 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         barrier = threading.Barrier(2)
 
         class _PartiallyFailingOrganizer:
+            post_action_calls = []
+
             def __init__(self, client=None):
                 self.client = client if client is not None else object()
 
@@ -669,7 +671,8 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
                     bucket.append(value)
 
             @staticmethod
-            def trigger_post_actions(*_args, **_kwargs):
+            def trigger_post_actions(*args, **kwargs):
+                _PartiallyFailingOrganizer.post_action_calls.append((args, kwargs))
                 return None
 
             @staticmethod
@@ -695,7 +698,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
                     "moved": 1,
                     "failed": 0,
                     "scan_errors": [],
-                    "strm_changes": [],
+                    "strm_changes": [{"operation": "upsert", "path": "B.mkv"}],
                 }
 
             def close(self):
@@ -732,12 +735,25 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
             )
 
         final = manager.task_status()
-        self.assertEqual(final["status"], "failed")
+        self.assertEqual(final["status"], "partial")
         self.assertEqual(final["stats"]["moved"], 1)
+        self.assertEqual(final["stats"]["source_failures"], 1)
         self.assertEqual(
-            [item["id"] for item in final["source_results"]], ["source-b"]
+            [item["id"] for item in final["source_results"]],
+            ["source-a", "source-b"],
         )
-        self.assertNotIn("private provider failure", final["error"])
+        self.assertEqual(final["source_results"][0]["status"], "failed")
+        self.assertNotIn(
+            "private provider failure",
+            repr((final.get("error", ""), final["stats"], final["source_results"])),
+        )
+        self.assertEqual(len(_PartiallyFailingOrganizer.post_action_calls), 1)
+        post_stats = _PartiallyFailingOrganizer.post_action_calls[0][0][0]
+        self.assertEqual(post_stats["moved"], 1)
+        self.assertEqual(
+            post_stats["strm_changes"],
+            [{"operation": "upsert", "path": "B.mkv"}],
+        )
 
 
 if __name__ == "__main__":

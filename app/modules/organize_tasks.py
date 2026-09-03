@@ -126,7 +126,12 @@ def _merge_source_stats(aggregate: dict[str, object], stats: dict[str, Any]) -> 
             aggregate.setdefault(key, []).extend(
                 item for item in values if isinstance(item, dict)
             )
-    for key in ("confirmations", "skip_reasons", "empty_dir_cleanup_reasons"):
+    for key in (
+        "confirmations",
+        "skip_reasons",
+        "empty_dir_cleanup_reasons",
+        "scan_errors",
+    ):
         for value in stats.get(key) or []:
             Organizer._append_reason(aggregate, key, value, limit=10)
 
@@ -1893,8 +1898,35 @@ class OrganizeTaskManager:
                             wait=True, cancel_futures=True,
                         )
 
+            failed_sources: dict[int, dict[str, object]] = {}
+            if source_failures:
+                source_failures.sort(key=lambda item: item[0])
+                for index, failed_source, failure in source_failures:
+                    source_name = str(
+                        failed_source.get("name") or failed_source.get("id") or "未知来源"
+                    )
+                    failed_sources[index] = {
+                        **failed_source,
+                        "status": "failed",
+                    }
+                    Organizer._append_reason(
+                        aggregate,
+                        "scan_errors",
+                        f"来源「{source_name}」整理失败，请查看运行日志后重试",
+                        limit=10,
+                    )
+                    logger.error(
+                        "来源整理失败 task_id=%s source=%s type=%s",
+                        task_id,
+                        source_name,
+                        type(failure).__name__,
+                        exc_info=(type(failure), failure, failure.__traceback__),
+                    )
+                aggregate["source_failures"] = len(source_failures)
+
             source_results.extend(
-                completed_sources[index] for index in sorted(completed_sources)
+                completed_sources.get(index) or failed_sources[index]
+                for index in sorted(completed_sources.keys() | failed_sources.keys())
             )
             aggregate["organize_worker_budget"] = worker_budget
             aggregate["source_workers"] = source_worker_count
@@ -1902,8 +1934,7 @@ class OrganizeTaskManager:
             aggregate["media_probe_workers_per_source"] = (
                 source_probe_worker_budget
             )
-            if source_failures:
-                source_failures.sort(key=lambda item: item[0])
+            if source_failures and not completed_sources:
                 _index, failed_source, failure = source_failures[0]
                 current_source = str(
                     failed_source.get("name") or failed_source.get("id") or ""

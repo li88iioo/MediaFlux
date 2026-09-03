@@ -1333,7 +1333,7 @@ def build_tool_registry(
             data={
                 "agent_enabled": is_agent_enabled(),
                 "telegram_enabled": config.get_bool("TG_AGENT_ENABLED", False),
-                "model_routing_enabled": config.get_bool("AGENT_LLM_ENABLED", True),
+                "model_routing_enabled": config.get_bool("AGENT_LLM_ENABLED"),
             },
             evidence=[Evidence(
                 "agent_runtime",

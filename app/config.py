@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.env_file import read_env_bytes as _read_env_bytes
-from app.defaults import DEFAULT_WEB_PORT
+from app.defaults import DEFAULT_BOOL_CONFIG_VALUES, DEFAULT_WEB_PORT
 from app.runtime_paths import get_runtime_paths
 
 # 程序目录仅供读取；运行数据统一由 RuntimePaths 指定。
@@ -168,8 +168,11 @@ def get_int(key: str, default: int = 0) -> int:
         return default
 
 
-def get_bool(key: str, default: bool = False) -> bool:
-    v = get(key, str(default)).strip().lower()
+def get_bool(key: str, default: bool | None = None) -> bool:
+    """读取布尔配置；已登记键在未显式配置时使用唯一权威默认值。"""
+    if default is None:
+        default = DEFAULT_BOOL_CONFIG_VALUES.get(key, False)
+    v = get(key, str(bool(default))).strip().lower()
     return v in ("1", "true", "yes", "on", "y")
 
 

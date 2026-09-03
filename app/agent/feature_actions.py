@@ -11,6 +11,7 @@ from typing import Any
 from app import config
 from app.agent.models import Evidence, ToolResult
 from app.agent.registry import AgentToolError
+from app.defaults import DEFAULT_DISCOVERY_ENABLED, DEFAULT_INDEXER_SEARCH_ENABLED
 from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
 from app.logger import get_logger
 
@@ -32,7 +33,7 @@ _FEATURES: dict[str, FeatureDefinition] = {
     "discovery": FeatureDefinition(
         key="DISCOVERY_ENABLED",
         label="媒体探索",
-        default=True,
+        default=DEFAULT_DISCOVERY_ENABLED,
         restart_discovery=True,
     ),
     "douban": FeatureDefinition(
@@ -50,7 +51,7 @@ _FEATURES: dict[str, FeatureDefinition] = {
     "indexer_search": FeatureDefinition(
         key="INDEXER_SEARCH_ENABLED",
         label="多站资源搜索",
-        default=True,
+        default=DEFAULT_INDEXER_SEARCH_ENABLED,
         requires_indexer_sites=True,
     ),
     "web_search": FeatureDefinition(
@@ -240,8 +241,8 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
         "requested_enabled": arguments["enabled"],
         "external_override": config.has_external_override(definition.key),
         "enabled_site_count": len(sites),
-        "discovery_enabled": config.get_bool("DISCOVERY_ENABLED", True),
-        "indexer_enabled": config.get_bool("INDEXER_SEARCH_ENABLED", True),
+        "discovery_enabled": config.get_bool("DISCOVERY_ENABLED"),
+        "indexer_enabled": config.get_bool("INDEXER_SEARCH_ENABLED"),
         "tavily_configured": bool(str(config.get("TAVILY_API_KEY", "") or "").strip()),
     }
 

@@ -115,7 +115,7 @@ def _row_summary(row: Any) -> dict[str, Any]:
 
 
 def list_watchlist_summaries(_arguments: dict[str, Any]) -> ToolResult:
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled()
     rows = db.list_media_watchlist(limit=20)
     items = [_row_summary(row) for row in rows]
@@ -137,7 +137,7 @@ def list_watchlist_summaries(_arguments: dict[str, Any]) -> ToolResult:
 
 
 def get_watchlist_summary(arguments: dict[str, Any]) -> ToolResult:
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled()
     number = int(arguments["watchlist_number"])
     row = db.get_media_watchlist_by_id(number)
@@ -215,7 +215,7 @@ def _canonical_card(card: MediaCard, expected: tuple[str, str, str]) -> dict[str
 
 
 def prepare_add_watchlist(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled(), ""
     identity = (
         str(arguments["provider"]),
@@ -340,7 +340,7 @@ def add_watchlist_confirmed(arguments: dict[str, Any], expected_context: str) ->
 
 
 def prepare_remove_watchlist(arguments: dict[str, Any]) -> tuple[ToolResult, str]:
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled(), ""
     number = int(arguments["watchlist_number"])
     row = db.get_media_watchlist_by_id(number)

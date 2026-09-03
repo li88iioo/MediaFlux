@@ -427,7 +427,7 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
     provider_error = False
     web_fallback_attempted = False
 
-    if config.get_bool("DISCOVERY_ENABLED", False):
+    if config.get_bool("DISCOVERY_ENABLED"):
         try:
             search_result = get_discovery_search_service().search(query, 1, ["douban"])
             selected = _select_card(

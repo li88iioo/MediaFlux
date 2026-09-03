@@ -30,7 +30,7 @@ from app.web import api_error, api_response, require_api_login
 
 
 def _require_enabled() -> None:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         raise HTTPException(status_code=404, detail="not found")
 
 

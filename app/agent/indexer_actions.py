@@ -85,7 +85,7 @@ def normalize_search_sites(raw_sites: Any) -> list[str]:
 
 def validate_enabled_search_sites(sites: list[str]) -> None:
     """在访问上游前确认指定站点属于当前启用集合。"""
-    if not sites or not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not sites or not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return
     service = get_indexer_service()
     enabled = set(getattr(service, "enabled_site_ids", ()))
@@ -223,7 +223,7 @@ def search_resources(
     *,
     timeout_seconds: float | None = None,
 ) -> ToolResult:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return ToolResult(
             ok=False,
             status="disabled",
@@ -387,7 +387,7 @@ def _resource_confirmation_payload(
 
 
 def _capture_submit_resource(arguments: dict[str, str]) -> dict[str, Any]:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return {"enabled": False, "fingerprint": "disabled"}
     try:
         service, item = _stored_resource(arguments)
@@ -494,7 +494,7 @@ def prepare_submit_resource(
 def _submit_resource(
     arguments: dict[str, str], *, service: Any | None = None
 ) -> ToolResult:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return ToolResult(
             False,
             "conflict",
@@ -598,28 +598,8 @@ def submit_resource_confirmed(
         raise AgentToolError("资源或下载配置已变化，请重新预检", code="confirmation_stale")
     return _submit_resource(arguments, service=state.get("service"))
 
-def submit_batch_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    _reject_extra(arguments, {"result_ids", "target"})
-    raw_ids = arguments.get("result_ids")
-    if not isinstance(raw_ids, list) or not 2 <= len(raw_ids) <= 12:
-        raise AgentToolError("result_ids 必须包含 2 到 12 个资源")
-    result_ids: list[str] = []
-    for raw in raw_ids:
-        if not isinstance(raw, str) or not _RESULT_ID_RE.fullmatch(raw.strip()):
-            raise AgentToolError("result_id 无效")
-        value = raw.strip()
-        if value not in result_ids:
-            result_ids.append(value)
-    if len(result_ids) < 2:
-        raise AgentToolError("批量提交至少需要 2 个不同资源")
-    target = str(arguments.get("target") or "").strip().lower()
-    if target not in _TARGETS:
-        raise AgentToolError("target 仅支持 qb、guangya 或 both")
-    return {"result_ids": result_ids, "target": target}
-
-
 def _capture_submit_resource_batch(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return {"enabled": False, "fingerprint": "disabled"}
     service = get_indexer_service()
     resources: list[dict[str, Any]] = []
@@ -748,7 +728,7 @@ def prepare_submit_resource_batch(
 def _submit_resource_batch(
     arguments: dict[str, Any], *, service: Any | None = None
 ) -> ToolResult:
-    if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+    if not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return ToolResult(
             False,
             "conflict",

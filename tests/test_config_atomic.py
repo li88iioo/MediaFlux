@@ -44,6 +44,21 @@ class ConfigAtomicWriteTests(unittest.TestCase):
     def test_web_port_defaults_to_project_default_when_unconfigured(self):
         self.assertEqual(config.flask_port(), 1258)
 
+    def test_shared_feature_defaults_are_consistent_when_unconfigured(self):
+        for key in (
+            "DISCOVERY_ENABLED",
+            "INDEXER_SEARCH_ENABLED",
+            "AGENT_LLM_ENABLED",
+        ):
+            os.environ[key] = ""
+
+        self.assertFalse(config.get_bool("DISCOVERY_ENABLED"))
+        self.assertTrue(config.get_bool("INDEXER_SEARCH_ENABLED"))
+        self.assertFalse(config.get_bool("AGENT_LLM_ENABLED"))
+        # 非登记键继续保持历史默认 False，显式默认仍可由调用方覆盖。
+        self.assertFalse(config.get_bool("UNREGISTERED_FEATURE"))
+        self.assertTrue(config.get_bool("UNREGISTERED_FEATURE", True))
+
     def test_replace_publish_failure_keeps_final_absent_and_does_not_update_runtime_state(self):
         with patch(
             "app.config._publish_noreplace",

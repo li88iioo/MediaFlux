@@ -92,7 +92,7 @@ def _feature_disabled() -> ToolResult:
 
 
 def get_discovery_detail(arguments: dict[str, Any], _context: ToolContext) -> ToolResult:
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled()
     card = get_discovery_service().get_detail(
         arguments["provider"], arguments["media_type"], arguments["external_id"]
@@ -372,7 +372,7 @@ def _get_snapshot(owner: str) -> _MappingSnapshot | None:
 def get_discovery_mapping_candidates(arguments: dict[str, Any], context: ToolContext) -> ToolResult:
     if not context.owner:
         raise AgentToolError("映射候选需要已登录会话", code="precondition_failed")
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         return _feature_disabled()
     try:
         guard = _begin_snapshot(context.owner)

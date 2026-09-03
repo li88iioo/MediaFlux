@@ -15,7 +15,7 @@ from app.web import api_error, api_response, require_api_login
 
 
 def _require_discovery_enabled() -> None:
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         raise HTTPException(status_code=404, detail="not found")
 
 

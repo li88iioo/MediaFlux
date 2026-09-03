@@ -294,31 +294,16 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
         self.assertNotIn("library.search", str(vague))
 
         all_sites = agent.query("把所有站点都打开", owner="owner")
-        self.assertEqual(all_sites["mode"], "confirmation_required")
-        self.assertEqual(all_sites["tool_call"]["name"], "config.set_indexer_sites")
-        self.assertEqual(
-            [
-                site["site_id"]
-                for site in all_sites["result"]["data"]["requested_sites"]
-            ],
-            list(DEFAULT_INDEXER_SITE_IDS),
-        )
-        self.assertTrue(all_sites["result"]["data"]["requested_enable_search"])
+        self.assertEqual(all_sites["mode"], "conversation")
+        self.assertIsNone(all_sites["tool_call"])
+        self.assertIn("无需重复修改", all_sites["result"]["summary"])
 
         exact_indexer = agent.query(
             "你可以启用全部索引站搜索", owner="owner"
         )
-        self.assertEqual(exact_indexer["mode"], "confirmation_required")
-        self.assertEqual(
-            exact_indexer["tool_call"]["name"], "config.set_indexer_sites"
-        )
-        self.assertEqual(
-            [
-                site["site_id"]
-                for site in exact_indexer["result"]["data"]["requested_sites"]
-            ],
-            list(DEFAULT_INDEXER_SITE_IDS),
-        )
+        self.assertEqual(exact_indexer["mode"], "conversation")
+        self.assertIsNone(exact_indexer["tool_call"])
+        self.assertIn("无需重复修改", exact_indexer["result"]["summary"])
 
         adult_sites = agent.query("把所有站点包括成人站点都打开", owner="owner")
         self.assertEqual(adult_sites["mode"], "confirmation_required")
@@ -430,7 +415,7 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                 [site["site_id"] for site in summary.data["sites"]],
                 ["nyaa", "mikan"],
             )
-            self.assertFalse(summary.data["search_enabled"])
+            self.assertTrue(summary.data["search_enabled"])
             self.assertEqual(len(context), 64)
 
 

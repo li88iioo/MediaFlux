@@ -1479,11 +1479,30 @@ class MultiVersionConfigApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(rendered["conflict_decision"], "coexist")
         self.assertIn("同版本仍按冲突策略处理", rendered["conflict_note"])
         self.assertEqual(organizer.organize.call_count, 2)
+        self.assertEqual(organizer.close.call_count, 2)
         for call in organizer.organize.call_args_list:
             self.assertEqual(
                 call.kwargs["protected_source_ids"],
                 {"source", "nested-source"},
             )
+
+    def test_preview_api_closes_organizer_when_preview_fails(self):
+        organizer = Mock()
+        organizer.organize.side_effect = RuntimeError("private preview failure")
+
+        with patch("app.modules.organize.Organizer", return_value=organizer):
+            response = self.client.post(
+                "/api/guangya/organize/preview",
+                json={
+                    "source_dirs": [{"id": "source", "name": "源"}],
+                    "rules": {},
+                },
+                headers=self.headers,
+            )
+
+        self.assertEqual(response.status_code, 500)
+        self.assertNotIn("private preview failure", response.text)
+        organizer.close.assert_called_once_with()
 
 
 class MultiVersionUiTests(unittest.TestCase):

@@ -352,7 +352,7 @@ def build_global_search(value: str) -> dict:
         ("downloads", lambda: _downloads_section(query)),
         ("logs", lambda: _logs_section(query)),
     ]
-    if app_config.get_bool("DISCOVERY_ENABLED", False):
+    if app_config.get_bool("DISCOVERY_ENABLED"):
         jobs.insert(1, ("discovery", lambda: _discovery_section(query)))
 
     sections_by_key: dict[str, dict] = {}

@@ -765,7 +765,3 @@ class IngestActions:
             )],
             suggestions=[],
         )
-
-
-def confirmation_required(_arguments: dict[str, Any]) -> ToolResult:
-    raise AgentToolError("资源提交需要用户确认", code="confirmation_required")

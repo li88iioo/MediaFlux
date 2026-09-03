@@ -11540,8 +11540,7 @@ class AgentOrchestrator:
                     LOGIN_REQUIRED_CONFIG_ACTION,
                     [CONFIRM_CHANGE_IN_AGENT],
                 )
-            return self.prepare(
-                "config.set_indexer_sites",
+            return self._prepare_indexer_site_configuration(
                 {"site_ids": target_site_ids, "enable_search": True},
                 owner=owner,
                 followup_context={
@@ -11558,8 +11557,7 @@ class AgentOrchestrator:
                     LOGIN_REQUIRED_CONFIG_ACTION,
                     [CONFIRM_CHANGE_IN_AGENT],
                 )
-            return self.prepare(
-                "config.set_indexer_sites",
+            return self._prepare_indexer_site_configuration(
                 {**indexer_site_request, "enable_search": True},
                 owner=owner,
             )
@@ -11598,8 +11596,7 @@ class AgentOrchestrator:
                     LOGIN_REQUIRED_CONFIG_ACTION,
                     [CONFIRM_CHANGE_IN_AGENT],
                 )
-            return self.prepare(
-                "config.set_indexer_sites",
+            return self._prepare_indexer_site_configuration(
                 {"site_ids": target_site_ids, "enable_search": True},
                 owner=owner,
             )
@@ -11914,6 +11911,29 @@ class AgentOrchestrator:
         if llm_usage is not None:
             response["llm_usage"] = dict(llm_usage)
         return result_projection.attach_public_display(response)
+
+    def _prepare_indexer_site_configuration(
+        self,
+        arguments: dict[str, Any],
+        *,
+        owner: str,
+        followup_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """统一处理资源站配置确认；目标已满足时直接给出稳定答复。"""
+        try:
+            return self.prepare(
+                "config.set_indexer_sites",
+                arguments,
+                owner=owner,
+                followup_context=followup_context,
+            )
+        except AgentToolError as exc:
+            if exc.code != "precondition_failed" or "没有变化" not in str(exc):
+                raise
+            return self._conversation_response(
+                "当前资源站点和多站搜索开关已经是目标配置，无需重复修改。",
+                ["查看当前启用的资源站点"],
+            )
 
     def _continue_narrow_followup(
         self,

@@ -396,16 +396,19 @@ def organize_preview(request: Request, data: dict | None = Body(default=None)):
                 break
             source_rules = rules.for_source(str(source.get("id") or ""))
             organizer = Organizer()
-            organizer._validate_target_outside_source(
-                source["id"], source_rules.target_dir_id
-            )
-            plans, stats = organizer.organize(
-                source["id"],
-                source_rules,
-                dry_run=True,
-                max_files=remaining if max_files else 0,
-                protected_source_ids=protected_source_ids,
-            )
+            try:
+                organizer._validate_target_outside_source(
+                    source["id"], source_rules.target_dir_id
+                )
+                plans, stats = organizer.organize(
+                    source["id"],
+                    source_rules,
+                    dry_run=True,
+                    max_files=remaining if max_files else 0,
+                    protected_source_ids=protected_source_ids,
+                )
+            finally:
+                organizer.close()
             for plan in plans:
                 all_plans.append((source, plan))
             for key, value in stats.items():

@@ -25,6 +25,21 @@ class FeatureSummaryUnitTests(IsolatedDatabaseTestCase):
             with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
                 feature_summary_arguments(arguments)  # type: ignore[arg-type]
 
+    def test_agent_runtime_uses_the_same_disabled_llm_default(self):
+        def get_bool(key: str, default: bool | None = None) -> bool:
+            if key == "AGENT_LLM_ENABLED":
+                return False
+            return bool(default)
+
+        with patch(
+            "app.agent.tools.config.get_bool", side_effect=get_bool
+        ), patch("app.agent.tools.is_agent_enabled", return_value=False):
+            result, _elapsed = build_tool_registry().execute(
+                "agent.runtime_status", {}
+            )
+
+        self.assertFalse(result.data["model_routing_enabled"])
+
     def test_summary_projects_dependency_state_without_values(self):
         values = {
             "DISCOVERY_ENABLED": False,

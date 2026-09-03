@@ -480,6 +480,150 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(uncertain_rss["failure_retryable"], 0)
 
+    def test_rss_claim_migration_merges_preexisting_unified_requests(self) -> None:
+        hashes = {
+            "gy_into_qb": "c" * 40,
+            "qb_into_gy": "d" * 40,
+            "uncertain_qb": "e" * 40,
+        }
+        subscription_id = db.add_rss_subscription(
+            name="Legacy mixed backends",
+            urls="https://example.com/legacy.xml",
+            download_method="both",
+        )
+        entry_ids: dict[str, int] = {}
+        request_ids: dict[str, int] = {}
+        for label, infohash in hashes.items():
+            entry_id = db.add_rss_entry(
+                subscription_id,
+                label,
+                f"legacy-{label}",
+                payload=json.dumps({
+                    "torrent_url": f"magnet:?xt=urn:btih:{infohash}"
+                }),
+            )
+            assert entry_id is not None
+            entry_ids[label] = entry_id
+            if label != "uncertain_qb":
+                db.update_rss_entry_status(entry_id, "downloaded")
+            else:
+                db.update_rss_entry_status(entry_id, "submitting")
+
+            canonical_key = hashlib.sha256(
+                f"btih:{infohash}".encode("utf-8")
+            ).hexdigest()
+            request_id, created = db.create_download_request(
+                canonical_key,
+                "magnet",
+                title=label,
+                source_value=f"magnet:?xt=urn:btih:{infohash}",
+                origin=f"rss:{subscription_id}",
+            )
+            self.assertTrue(created)
+            request_ids[label] = request_id
+
+        db.update_download_request(
+            request_ids["gy_into_qb"],
+            targets="qb",
+            status="completed",
+            qb_status="completed",
+            local_import_status="completed",
+            completed_at="2026-08-02 00:00:00",
+        )
+        db.update_download_request(
+            request_ids["qb_into_gy"],
+            targets="guangya",
+            status="completed",
+            gy_status="completed",
+            organize_started=1,
+            organize_status="completed",
+            completed_at="2026-08-02 00:00:00",
+        )
+        db.update_download_request(
+            request_ids["uncertain_qb"],
+            targets="qb",
+            status="completed",
+            qb_status="completed",
+            local_import_status="completed",
+            error="现有完成态不得被旧未知 claim 覆盖",
+            completed_at="2026-08-02 00:00:00",
+        )
+
+        with db.get_conn() as conn:
+            conn.executescript(
+                "CREATE TABLE rss_qb_download_claims ("
+                "infohash TEXT PRIMARY KEY,first_entry_id INTEGER NOT NULL,"
+                "lease_token TEXT NOT NULL,status TEXT NOT NULL,"
+                "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);"
+                "CREATE TABLE rss_guangya_download_claims ("
+                "infohash TEXT PRIMARY KEY,first_entry_id INTEGER NOT NULL,"
+                "lease_token TEXT NOT NULL,status TEXT NOT NULL,"
+                "created_at TEXT NOT NULL,updated_at TEXT NOT NULL);"
+            )
+            conn.executemany(
+                "INSERT INTO rss_qb_download_claims VALUES(?,?,?,?,?,?)",
+                [
+                    (
+                        hashes["qb_into_gy"], entry_ids["qb_into_gy"],
+                        "lease-qb", "submitted", "2026-08-01 00:00:00",
+                        "2026-08-01 00:00:01",
+                    ),
+                    (
+                        hashes["uncertain_qb"], entry_ids["uncertain_qb"],
+                        "lease-unknown", "unknown", "2026-08-01 00:00:00",
+                        "2026-08-01 00:00:01",
+                    ),
+                ],
+            )
+            conn.execute(
+                "INSERT INTO rss_guangya_download_claims VALUES(?,?,?,?,?,?)",
+                (
+                    hashes["gy_into_qb"], entry_ids["gy_into_qb"],
+                    "lease-gy", "submitted", "2026-08-01 00:00:00",
+                    "2026-08-01 00:00:01",
+                ),
+            )
+
+            db._migrate_unify_rss_download_requests_v20(conn)
+
+            rows = {
+                str(row["title"]): row
+                for row in conn.execute(
+                    "SELECT * FROM download_requests WHERE id IN (?,?,?)",
+                    tuple(request_ids.values()),
+                ).fetchall()
+            }
+            request_count = int(conn.execute(
+                "SELECT COUNT(*) FROM download_requests WHERE id IN (?,?,?)",
+                tuple(request_ids.values()),
+            ).fetchone()[0])
+
+        self.assertEqual(request_count, 3)
+        gy_into_qb = rows["gy_into_qb"]
+        self.assertEqual(gy_into_qb["targets"], "both")
+        self.assertEqual(gy_into_qb["status"], "completed")
+        self.assertEqual(gy_into_qb["qb_status"], "completed")
+        self.assertEqual(gy_into_qb["gy_status"], "completed")
+        self.assertEqual(gy_into_qb["organize_status"], "skipped")
+
+        qb_into_gy = rows["qb_into_gy"]
+        self.assertEqual(qb_into_gy["targets"], "both")
+        self.assertEqual(qb_into_gy["status"], "completed")
+        self.assertEqual(qb_into_gy["qb_status"], "completed")
+        self.assertEqual(qb_into_gy["gy_status"], "completed")
+        self.assertEqual(qb_into_gy["qb_task_id"], hashes["qb_into_gy"])
+        self.assertEqual(qb_into_gy["local_import_status"], "skipped")
+        self.assertEqual(qb_into_gy["organize_status"], "completed")
+
+        uncertain = rows["uncertain_qb"]
+        self.assertEqual(uncertain["targets"], "qb")
+        self.assertEqual(uncertain["status"], "completed")
+        self.assertEqual(uncertain["qb_status"], "completed")
+        self.assertEqual(uncertain["local_import_status"], "completed")
+        self.assertEqual(
+            uncertain["error"], "现有完成态不得被旧未知 claim 覆盖"
+        )
+
     def test_fresh_database_contains_complete_v10_schema(self) -> None:
         with db.get_conn() as conn:
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])

@@ -25,7 +25,7 @@ def _page(request: Request, template: str, active: str, **context):
     redirect = require_page_login(request)
     if redirect:
         return redirect
-    context.setdefault("discovery_enabled", config.get_bool("DISCOVERY_ENABLED", False))
+    context.setdefault("discovery_enabled", config.get_bool("DISCOVERY_ENABLED"))
     return render_template(request, template, active=active, **context)
 
 
@@ -43,7 +43,7 @@ def dashboard(request: Request):
         automation=build_automation_summary(),
         server_urls=get_media_server_urls(),
         active="dashboard",
-        discovery_enabled=config.get_bool("DISCOVERY_ENABLED", False),
+        discovery_enabled=config.get_bool("DISCOVERY_ENABLED"),
     )
 
 
@@ -80,7 +80,7 @@ def global_search(request: Request):
         active="global_search",
         result=result,
         search_error=error,
-        discovery_enabled=config.get_bool("DISCOVERY_ENABLED", False),
+        discovery_enabled=config.get_bool("DISCOVERY_ENABLED"),
         resource_results_enabled=config.get_bool(
             "DISCOVERY_RESOURCE_RESULTS_ENABLED",
             True,
@@ -110,7 +110,7 @@ def media_recent(request: Request):
                 sources=[], items=[], selected_server=selected_server,
                 selected_type=selected_type, query=raw_query, errors=[],
                 search_error=str(exc), has_sources=False, all_sources_failed=False,
-                discovery_enabled=config.get_bool("DISCOVERY_ENABLED", False),
+                discovery_enabled=config.get_bool("DISCOVERY_ENABLED"),
             )
 
     sources = build_recent_media()
@@ -152,7 +152,7 @@ def media_recent(request: Request):
         search_error="",
         has_sources=bool(sources),
         all_sources_failed=bool(filtered_sources) and all(source.get("error") for source in filtered_sources),
-        discovery_enabled=config.get_bool("DISCOVERY_ENABLED", False),
+        discovery_enabled=config.get_bool("DISCOVERY_ENABLED"),
     )
 
 
@@ -335,7 +335,7 @@ def media_libraries(request: Request):
 
 @router.get("/discovery", name="pages.discovery")
 def discovery(request: Request):
-    if not config.get_bool("DISCOVERY_ENABLED", False):
+    if not config.get_bool("DISCOVERY_ENABLED"):
         raise HTTPException(status_code=404, detail="not found")
     return _page(
         request,

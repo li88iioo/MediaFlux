@@ -63,7 +63,7 @@ def _empty_data(*, enabled: bool | None) -> dict[str, Any]:
 
 def diagnose_indexer_readiness(_arguments: dict[str, Any]) -> ToolResult:
     try:
-        enabled = config.get_bool("INDEXER_SEARCH_ENABLED", True)
+        enabled = config.get_bool("INDEXER_SEARCH_ENABLED")
     except Exception as exc:
         logger.warning("Agent 索引器就绪诊断读取开关失败 type=%s", type(exc).__name__)
         return ToolResult(

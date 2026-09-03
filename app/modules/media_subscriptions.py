@@ -1322,7 +1322,7 @@ class MediaSubscriptionService:
         max_search_episodes: int,
         limit_per_media: int,
     ) -> dict[str, Any]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
             return self._empty_preview_search("disabled")
         service = get_indexer_service()
         sites = _resolve_search_sites(_loads(row["sites_json"], []), detail, service)
@@ -1410,7 +1410,7 @@ class MediaSubscriptionService:
         *,
         limit_per_media: int,
     ) -> dict[str, Any]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
             return self._empty_preview_search("disabled")
         service = get_indexer_service()
         request = IndexerMediaSearchRequest.create(
@@ -1491,7 +1491,7 @@ class MediaSubscriptionService:
         search_rotation: dict[str, int] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> tuple[int, int, dict[str, int] | None]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
             return 0, 0, search_rotation
         original = str(detail.get("original_name") or row["original_title"] or "")
         aliases = [value for value in (str(row["title"]), original) if value]
@@ -1590,7 +1590,7 @@ class MediaSubscriptionService:
         *,
         cancel_event: threading.Event | None = None,
     ) -> tuple[int, int]:
-        if not config.get_bool("INDEXER_SEARCH_ENABLED", True):
+        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
             return 0, 0
         revision = int(row["revision"] or 1)
         self._ensure_active_check(int(row["id"]), revision, cancel_event)

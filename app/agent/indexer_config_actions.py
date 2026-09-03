@@ -125,7 +125,7 @@ def summarize_indexer_sites(_arguments: dict[str, Any]) -> ToolResult:
         data={
             "site_count": len(site_ids),
             "sites": _site_projection(site_ids),
-            "search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED", False),
+            "search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED"),
             "managed_by_environment": any(
                 config.has_external_override(key) for key in _TARGET_KEYS
             ),
@@ -154,7 +154,7 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
         "persisted_search": values.get("INDEXER_SEARCH_ENABLED", "<unset>"),
         "persisted_sites": values.get("INDEXER_ENABLED_SITES", "<unset>"),
         "persisted_sukebei": values.get("INDEXER_SUKEBEI_ENABLED", "<unset>"),
-        "current_search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED", False),
+        "current_search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED"),
         "current_site_ids": current,
         "requested_site_ids": requested,
         "requested_enable_search": arguments.get("enable_search"),
@@ -355,7 +355,7 @@ def set_indexer_sites_confirmed(
         ),
         data={
             "site_count": len(site_ids),
-            "search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED", False),
+            "search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED"),
             "sites": _site_projection(site_ids),
             "runtime_refreshed": runtime_refreshed,
             "runtime_refresh": runtime_refresh,

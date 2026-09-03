@@ -2771,8 +2771,34 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
             "created_at", "submitted_at",
         } <= entry_columns
     )
-    migrated_request_ids: set[int] = set()
     migration_stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def merge_target(current: object, backend: str) -> str:
+        normalized = str(current or "").strip().lower()
+        if normalized == backend or normalized == "both":
+            return normalized
+        if normalized in {"qb", "guangya"}:
+            return "both"
+        return backend
+
+    def legacy_backend_status(
+        current: object,
+        incoming: str,
+    ) -> tuple[str, bool]:
+        """合并旧 claim，未知结果不得覆盖已确认或正在推进的状态。"""
+        normalized = str(current or "").strip().lower()
+        if normalized == incoming:
+            return normalized, False
+        ambiguous = {"", "pending", "submitting", "outcome_unknown", "manual_review"}
+        if incoming == "completed" and normalized in ambiguous:
+            return incoming, True
+        if incoming == "manual_review" and normalized in {
+            "", "pending", "submitting", "outcome_unknown"
+        }:
+            return incoming, True
+        # 旧迁移记录不能覆盖当前下载链路已经推进到 submitted、
+        # downloading、failed、cancelled 等更明确的事实。
+        return normalized, False
 
     for table, backend in (
         ("rss_qb_download_claims", "qb"),
@@ -2867,30 +2893,68 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                         list(values.values()),
                     )
                     request_id = int(created.lastrowid)
-                    migrated_request_ids.add(request_id)
                 else:
                     request_id = int(existing[0])
-                    if request_id in migrated_request_ids:
-                        current = conn.execute(
-                            "SELECT targets,status FROM download_requests WHERE id=?",
-                            (request_id,),
-                        ).fetchone()
-                        current_target = str(current[0] or "") if current else ""
-                        merged_target = (
-                            current_target
-                            if current_target == backend
-                            else "both"
-                            if current_target in {"qb", "guangya", "both"}
-                            else backend
-                        )
-                        updates = {
-                            "targets": merged_target,
-                            f"{backend if backend == 'qb' else 'gy'}_status": backend_status,
-                            "updated_at": updated_at,
-                        }
-                        if backend == "qb" and btih:
-                            updates["qb_task_id"] = btih
-                        if backend == "qb" and certain_completed:
+                    current = conn.execute(
+                        "SELECT targets,status,qb_status,gy_status,qb_task_id,"
+                        "local_import_status,organize_started,organize_status,error,"
+                        "updated_at,completed_at FROM download_requests WHERE id=?",
+                        (request_id,),
+                    ).fetchone()
+                    if current is None:
+                        continue
+                    merged_target = merge_target(current["targets"], backend)
+                    backend_column = "qb_status" if backend == "qb" else "gy_status"
+                    merged_backend_status, claim_applied = legacy_backend_status(
+                        current[backend_column],
+                        backend_status,
+                    )
+                    merged_statuses = {
+                        "qb": (
+                            merged_backend_status
+                            if backend == "qb" else str(current["qb_status"] or "")
+                        ),
+                        "guangya": (
+                            merged_backend_status
+                            if backend == "guangya" else str(current["gy_status"] or "")
+                        ),
+                    }
+                    target_backends = (
+                        ("qb", "guangya")
+                        if merged_target == "both" else (merged_target,)
+                    )
+                    target_statuses = [
+                        merged_statuses[item]
+                        for item in target_backends
+                        if item in merged_statuses
+                    ]
+                    current_root_status = str(current["status"] or "")
+                    merged_root_status = current_root_status
+                    if (
+                        target_statuses
+                        and all(value == "completed" for value in target_statuses)
+                        and current_root_status not in {"partial", "failed", "cancelled"}
+                    ):
+                        merged_root_status = "completed"
+                    elif (
+                        "manual_review" in target_statuses
+                        and current_root_status not in {"partial", "failed", "cancelled"}
+                    ):
+                        merged_root_status = "manual_review"
+
+                    effective_updated_at = max(
+                        str(current["updated_at"] or ""), updated_at
+                    )
+                    updates: dict[str, object] = {
+                        "targets": merged_target,
+                        backend_column: merged_backend_status,
+                        "status": merged_root_status,
+                        "updated_at": effective_updated_at,
+                    }
+                    if backend == "qb" and btih and not str(current["qb_task_id"] or ""):
+                        updates["qb_task_id"] = btih
+                    if backend == "qb" and certain_completed and claim_applied:
+                        if not str(current["local_import_status"] or ""):
                             updates.update({
                                 "local_import_status": "skipped",
                                 "local_import_error": (
@@ -2898,23 +2962,31 @@ def _migrate_unify_rss_download_requests_v20(conn: sqlite3.Connection) -> None:
                                 ),
                                 "local_import_completed_at": updated_at,
                             })
-                        if backend == "guangya" and certain_completed:
+                    if backend == "guangya" and certain_completed and claim_applied:
+                        if not str(current["organize_status"] or ""):
                             updates.update({
-                                "organize_started": 1,
+                                "organize_started": max(
+                                    1, int(current["organize_started"] or 0)
+                                ),
                                 "organize_status": "skipped",
                                 "organize_finished_at": updated_at,
                             })
-                        if not certain_completed:
-                            updates.update({
-                                "status": "manual_review",
-                                "error": error,
-                                "completed_at": updated_at,
-                            })
-                        sets = ",".join(f"{name}=?" for name in updates)
-                        conn.execute(
-                            f"UPDATE download_requests SET {sets} WHERE id=?",
-                            [*updates.values(), request_id],
-                        )
+                    if (
+                        merged_root_status == "manual_review"
+                        and claim_applied
+                        and not str(current["error"] or "")
+                    ):
+                        updates["error"] = error
+                    if (
+                        merged_root_status in {"completed", "manual_review"}
+                        and not str(current["completed_at"] or "")
+                    ):
+                        updates["completed_at"] = updated_at
+                    sets = ",".join(f"{name}=?" for name in updates)
+                    conn.execute(
+                        f"UPDATE download_requests SET {sets} WHERE id=?",
+                        [*updates.values(), request_id],
+                    )
 
                 conn.executemany(
                     "INSERT OR IGNORE INTO download_request_keys("
