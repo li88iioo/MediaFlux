@@ -4,6 +4,30 @@
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-09-03
+
+### Added
+- 整理规划器现可按独立媒体组动态并行执行识别与媒体探测，并通过有序单写阶段统一处理冲突、移动、STRM 与通知；单个大目录及多个来源目录均可共享空闲 Worker，同时保留停止、快照校验和确定性提交边界（[`71f7c54`](https://github.com/li88iioo/MediaFlux/commit/71f7c54)、[`288224b`](https://github.com/li88iioo/MediaFlux/commit/288224b)）。
+- Media Agent 新增统一 Provider 能力网关、服务端实时读取、一次性人工确认和受控写入执行，光鸭、qBittorrent、媒体服务器、资源下载与订阅动作收敛到同一计划/票据/审计模型（[`d36ddbe`](https://github.com/li88iioo/MediaFlux/commit/d36ddbe)、[`f66ba0c`](https://github.com/li88iioo/MediaFlux/commit/f66ba0c)、[`f2b812c`](https://github.com/li88iioo/MediaFlux/commit/f2b812c)、[`f9bc28c`](https://github.com/li88iioo/MediaFlux/commit/f9bc28c)、[`40a9fe2`](https://github.com/li88iioo/MediaFlux/commit/40a9fe2)、[`670b84c`](https://github.com/li88iioo/MediaFlux/commit/670b84c)）。
+- 剧集识别新增绝对集号自动换季与 TMDB 季界刷新重算，支持被发布组错误标成单季的跨季长篇动画，并补齐短尾越界集号的保守识别与人工确认边界（[`2e6f8c0`](https://github.com/li88iioo/MediaFlux/commit/2e6f8c0)、[`ca150ec`](https://github.com/li88iioo/MediaFlux/commit/ca150ec)）。
+- 媒体订阅支持按周检查周期，并继续沿用统一资源检索、下载请求与整理联动链路（[`84909c6`](https://github.com/li88iioo/MediaFlux/commit/84909c6)）。
+
+### Changed
+- Agent 的资源摄取、确认后动作、订阅与下载流程统一到单一执行链路，移除残留旧工具入口，并加强真实用户意图、上下文续接、Provider/RSS 实时状态与失效计划处理；配套确认契约测试已同步收口（[`3a4f444`](https://github.com/li88iioo/MediaFlux/commit/3a4f444)、[`886aee1`](https://github.com/li88iioo/MediaFlux/commit/886aee1)、[`43bb4a6`](https://github.com/li88iioo/MediaFlux/commit/43bb4a6)、[`6a98b5c`](https://github.com/li88iioo/MediaFlux/commit/6a98b5c)、[`de4be27`](https://github.com/li88iioo/MediaFlux/commit/de4be27)、[`d2fc3cb`](https://github.com/li88iioo/MediaFlux/commit/d2fc3cb)）。
+- RSS 的 qB/光鸭下载认领、幂等、完成跟踪与本地整理联动改用统一下载请求生命周期，旧专用协调表在数据库升级时保守迁移后退休（[`aac8b5b`](https://github.com/li88iioo/MediaFlux/commit/aac8b5b)）。
+- 运行时权威路径、Telegram 通知、STRM 媒体库刷新交接、TMDB 并发缓存和静态资源版本统一收口；客户端关闭、发现缓存和媒体刷新状态均改为有界、可恢复实现（[`998118e`](https://github.com/li88iioo/MediaFlux/commit/998118e)、[`9ba155b`](https://github.com/li88iioo/MediaFlux/commit/9ba155b)、[`3bc3bfd`](https://github.com/li88iioo/MediaFlux/commit/3bc3bfd)）。
+- 资源检索把同一剧集的单集结果聚合为剧集卡并延迟加载海报；订阅、下载和整理页刷新保留稳定占位，媒体卡元数据避免重复显示年份（[`ed0bbc6`](https://github.com/li88iioo/MediaFlux/commit/ed0bbc6)、[`f5ebf4a`](https://github.com/li88iioo/MediaFlux/commit/f5ebf4a)、[`368dbb1`](https://github.com/li88iioo/MediaFlux/commit/368dbb1)）。
+- Agent 人工确认卡统一视觉层级、状态提示与移动端布局；README 与维护文档同步到当前功能和部署契约（[`3e88347`](https://github.com/li88iioo/MediaFlux/commit/3e88347)、[`03bd551`](https://github.com/li88iioo/MediaFlux/commit/03bd551)）。
+
+### Fixed
+- 修复整理候选完成后汇总卡不更新、旧确认状态覆盖新状态、人工确认终态重复或过早结束输入提示，以及 Telegram 分享转存与普通网页链接分流错误（[`025979a`](https://github.com/li88iioo/MediaFlux/commit/025979a)、[`316fc3f`](https://github.com/li88iioo/MediaFlux/commit/316fc3f)、[`9eb5162`](https://github.com/li88iioo/MediaFlux/commit/9eb5162)）。
+- 修复升级与发布冒烟中的预期 ready 重试噪声、pytest 收集边界和 STRM 等待者隔离，保持普通 `main` 验证与正式标签多架构发布契约一致（[`339e833`](https://github.com/li88iioo/MediaFlux/commit/339e833)、[`b617ba2`](https://github.com/li88iioo/MediaFlux/commit/b617ba2)、[`0c140aa`](https://github.com/li88iioo/MediaFlux/commit/0c140aa)）。
+- 移除已并入正式业务页面的残留工具 UI，并修复整理页加载闪变与旧入口误导（[`a06c773`](https://github.com/li88iioo/MediaFlux/commit/a06c773)）。
+- 统一媒体探索、资源站搜索与 Agent LLM 的未配置默认值，修复 Agent 状态、页面守卫和真实执行路径不一致，以及目标配置已满足时仍要求确认的问题（[`cd911b8`](https://github.com/li88iioo/MediaFlux/commit/cd911b8)）。
+- 修复并行整理部分来源失败时成功来源不再执行 STRM/媒体库后处理的问题；任务现保留成功结果并以部分完成收口，同时避免把内部异常暴露到公开状态（[`cd911b8`](https://github.com/li88iioo/MediaFlux/commit/cd911b8)）。
+- 修复旧 RSS claim 合并到既有统一下载请求时丢失后端完成态、可能重复提交下载的问题，并确保光鸭整理预览始终释放客户端资源（[`cd911b8`](https://github.com/li88iioo/MediaFlux/commit/cd911b8)）。
+- 修正 Docker 构建信息的时间戳、平台和包类型来源，使正式镜像元数据可复现且与发布文档、系列标签说明一致（[`4a7aa0e`](https://github.com/li88iioo/MediaFlux/commit/4a7aa0e)）。
+
 ## [0.1.10] - 2026-08-30
 
 ### Added
@@ -203,7 +227,8 @@ MediaFlux 首个正式开源版本发布！致力于为家庭媒体中心提供�
 - **本地运行与零遥测**：100% 独立运行在用户设备，无任何远程遥测或数据上报，所有凭据与数据库均保存在本地。
 - **严格安全防护**：全局 CSRF 防护、Session 防篡改、首启绑定本地回环与生产密钥强制校验。
 
-[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.10...HEAD
+[Unreleased]: https://github.com/li88iioo/MediaFlux/compare/v0.1.11...HEAD
+[0.1.11]: https://github.com/li88iioo/MediaFlux/compare/v0.1.10...v0.1.11
 [0.1.10]: https://github.com/li88iioo/MediaFlux/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/li88iioo/MediaFlux/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/li88iioo/MediaFlux/compare/v0.1.7...v0.1.8
