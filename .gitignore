@@ -30,7 +30,8 @@ db/
 /mediaflux.pid
 /guangya_token.json
 /.guangya_token.json.generation
-
+/agent-guangya-cleanup
+/agent-guangya-rename
 # Generated media pointers and local artifacts
 /build/
 /dist/

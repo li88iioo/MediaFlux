@@ -642,9 +642,12 @@
 
     function cardMeta(item) {
         const parts = [];
-        if (item.year) parts.push(String(item.year));
+        const year = String(item.year || '').trim();
+        const releaseDate = String(item.release_date || '').trim();
+        const releaseYear = releaseDate.match(/^(\d{4})(?:[-/.年]|$)/)?.[1] || '';
+        if (year && year !== releaseYear) parts.push(year);
         if (item.weekday) parts.push(String(item.weekday));
-        if (item.release_date) parts.push(String(item.release_date));
+        if (releaseDate) parts.push(releaseDate);
         if (!parts.length) parts.push(mediaLabel(item.media_type));
         return parts.slice(0, 2).join(' / ');
     }

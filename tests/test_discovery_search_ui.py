@@ -101,6 +101,16 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             re.compile(r"state\.mode\s*=\s*'search'.*?elements\.grid\.hidden\s*=\s*false", re.S),
         )
 
+    def test_card_meta_deduplicates_year_already_present_in_release_date(self):
+        self.assertIn("const year = String(item.year || '').trim();", self.script)
+        self.assertIn("const releaseDate = String(item.release_date || '').trim();", self.script)
+        self.assertIn(
+            "const releaseYear = releaseDate.match(/^(\\d{4})(?:[-/.年]|$)/)?.[1] || '';",
+            self.script,
+        )
+        self.assertIn("if (year && year !== releaseYear) parts.push(year);", self.script)
+        self.assertNotIn("if (item.year) parts.push(String(item.year));", self.script)
+
     def test_media_detail_deep_link_reuses_dialog_and_cleans_url_on_close(self):
         for contract in (
             "function detailIdentityFromLocation()",
