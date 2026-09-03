@@ -77,6 +77,7 @@ from app.modules.scraper import (
     implicit_season_conflicts_with_candidate_title,
     infer_tmdb_season_from_title_evidence,
     parse_release_position,
+    target_season_year_evidence_matches_detail,
     verified_automatic_identity_proof,
 )
 from app.modules.recognition.resolver import (
@@ -90,6 +91,7 @@ from app.modules.special_media import (
     has_fractional_episode_position,
     is_special_directory_name,
     is_special_media_name,
+    is_special_path,
     special_media_position,
     strip_special_media_markers,
     title_hint_from_path,
@@ -199,6 +201,8 @@ _SPECIAL_FILENAME_IDENTITY_MARKER_RE = re.compile(
     r"s\d{1,3}[ ._-]*e(?:p)?[ ._-]*0{1,3}|"
     r"s0{1,3}[ ._-]*e(?:p)?[ ._-]*\d{1,3}|"
     r"nc(?:op|ed)(?:[ ._-]*\d{1,3})?|"
+    r"(?:pv|cm|promo|trailer)(?:[ ._-]*\d{1,3})?|"
+    r"mini[ ._-]*(?:animations?|anime)(?:[ ._-]*\d{1,3})?|"
     r"(?:ova|oav|oad|specials?|sps?|omnibus)(?:[ ._-]*\d{1,3})?|"
     r"(?:op|ed)(?:[ ._-]*\d{1,3})?"
     r")(?![a-z0-9])"
@@ -1079,6 +1083,89 @@ class Organizer:
             return False
         return isinstance(fixed_match, MatchResult)
 
+    @staticmethod
+    def _trusted_position_only_tmdb_identity(
+        match: MatchResult | None,
+        *,
+        automatic_threshold: float,
+    ) -> str:
+        """返回仅被 TMDB 季集位置约束拦截的高置信原生搜索身份。"""
+        if (
+            match is None
+            or not bool(getattr(match, "need_confirm", False))
+            or str(getattr(match, "status", "") or "").strip().lower()
+            != "low_confidence"
+            or str(getattr(match, "provider", "") or "").strip().lower()
+            != "tmdb"
+            or str(getattr(match, "media_type", "") or "").strip().lower()
+            != "tv"
+            or str(getattr(match, "matched_by", "") or "").strip().lower()
+            != "search"
+        ):
+            return ""
+        tmdb_id = str(getattr(match, "tmdb_id", "") or "").strip()
+        external_id = str(getattr(match, "external_id", "") or "").strip()
+        if not tmdb_id or (external_id and external_id != tmdb_id):
+            return ""
+        try:
+            confidence = float(getattr(match, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if not 0.0 <= confidence <= 1.0 or confidence < automatic_threshold:
+            return ""
+        decision = dict(getattr(match, "threshold_decision", None) or {})
+        if not decision.get("passed") or str(decision.get("reason") or "") != "score_met":
+            return ""
+        constraints = {
+            str(item or "").strip()
+            for item in (getattr(match, "rejected_constraints", None) or [])
+            if str(item or "").strip()
+        }
+        recoverable_constraints = {
+            "tmdb_position_season_not_found",
+            "tmdb_position_episode_out_of_range",
+        }
+        if len(constraints) != 1 or not constraints.issubset(recoverable_constraints):
+            return ""
+        return tmdb_id
+
+    @classmethod
+    def _trusted_tmdb_mapping_identity(
+        cls,
+        match: MatchResult | None,
+        *,
+        automatic_threshold: float,
+    ) -> str:
+        """返回可进入保守季集映射、但不能直接跨文件缓存的作品身份。"""
+        position_only = cls._trusted_position_only_tmdb_identity(
+            match, automatic_threshold=automatic_threshold
+        )
+        if position_only:
+            return position_only
+        if (
+            match is None
+            or bool(getattr(match, "need_confirm", False))
+            or str(getattr(match, "status", "") or "").strip().lower()
+            != "matched"
+            or str(getattr(match, "provider", "") or "").strip().lower()
+            != "tmdb"
+            or str(getattr(match, "media_type", "") or "").strip().lower()
+            != "tv"
+            or str(getattr(match, "matched_by", "") or "").strip().lower()
+            != "search"
+            or list(getattr(match, "rejected_constraints", None) or [])
+        ):
+            return ""
+        try:
+            confidence = float(getattr(match, "confidence", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if not 0.0 <= confidence <= 1.0 or confidence < automatic_threshold:
+            return ""
+        tmdb_id = str(getattr(match, "tmdb_id", "") or "").strip()
+        external_id = str(getattr(match, "external_id", "") or "").strip()
+        return tmdb_id if tmdb_id and (not external_id or external_id == tmdb_id) else ""
+
     def _recoverable_directory_identity_probe_position_failure(
         self,
         match: MatchResult | None,
@@ -1098,43 +1185,13 @@ class Organizer:
         """
         if (
             not recognition_identity_only
-            or match is None
             or directory_evidence is None
             or not directory_evidence.contiguous
             or directory_evidence.episode_count < 3
-            or not bool(getattr(match, "need_confirm", False))
-            or str(getattr(match, "status", "") or "").strip().lower()
-            != "low_confidence"
-            or self._match_provider(match) != "tmdb"
-            or str(getattr(match, "media_type", "") or "").strip().lower()
-            != "tv"
-            or str(getattr(match, "matched_by", "") or "").strip().lower()
-            != "search"
+            or not self._trusted_position_only_tmdb_identity(
+                match, automatic_threshold=automatic_threshold
+            )
         ):
-            return False
-        tmdb_id = str(getattr(match, "tmdb_id", "") or "").strip()
-        external_id = str(getattr(match, "external_id", "") or "").strip()
-        if not tmdb_id or (external_id and external_id != tmdb_id):
-            return False
-        try:
-            confidence = float(getattr(match, "confidence", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            return False
-        if not 0.0 <= confidence <= 1.0 or confidence < automatic_threshold:
-            return False
-        decision = dict(getattr(match, "threshold_decision", None) or {})
-        if not decision.get("passed") or str(decision.get("reason") or "") != "score_met":
-            return False
-        constraints = {
-            str(item or "").strip()
-            for item in (getattr(match, "rejected_constraints", None) or [])
-            if str(item or "").strip()
-        }
-        recoverable_constraints = {
-            "tmdb_position_season_not_found",
-            "tmdb_position_episode_out_of_range",
-        }
-        if len(constraints) != 1 or not constraints.issubset(recoverable_constraints):
             return False
         if source_position is None or len(source_position) != 2:
             return False
@@ -1269,6 +1326,8 @@ class Organizer:
         directory_member_count: int,
         automatic: bool,
         explicit_tmdb_id: str,
+        source_year: str = "",
+        automatic_threshold: float = 0.9,
     ) -> EpisodeMappingPlan:
         """以当前 TMDB 详情统一解析发布方季集位置。
 
@@ -1364,9 +1423,24 @@ class Organizer:
                 or directory_episode_evidence.range_end == merged_target_count
             )
         )
+        merged_source_year = str(source_year or "").strip()
+        merged_year_evidence = bool(
+            re.fullmatch(r"(?:19|20)\d{2}", merged_source_year)
+        )
+        merged_identity_evidence = bool(
+            automatic
+            and self._trusted_tmdb_mapping_identity(
+                match, automatic_threshold=automatic_threshold
+            )
+        )
         if (
             (automatic or self._uses_fixed_match_identity())
-            and (explicit_tmdb_id or merged_cour_directory_evidence)
+            and (
+                explicit_tmdb_id
+                or merged_cour_directory_evidence
+                or merged_year_evidence
+                or merged_identity_evidence
+            )
             and source_season >= 2
         ):
             # 发布组可能把分割放送写成 S02/S03...，而 TMDB 仍合并在
@@ -1392,6 +1466,7 @@ class Organizer:
                     detail=detail,
                     season_detail=season_detail,
                     directory_evidence=directory_episode_evidence,
+                    source_year=merged_source_year,
                 )
                 cour_validation = self.scraper.validate_position(
                     detail,
@@ -1399,15 +1474,17 @@ class Organizer:
                     cour_mapping.target_season,
                     cour_mapping.target_episode,
                 )
-                reset_position_proven = bool(
+                position_semantics_proven = bool(
                     merged_cour_directory_evidence
+                    or cour_mapping.reason
+                    == "publisher_absolute_season_mapped_to_merged_tmdb_season"
                     or (
                         cour_mapping.range_start is not None
                         and source_episode < cour_mapping.range_start
                     )
                 )
                 if (
-                    reset_position_proven
+                    position_semantics_proven
                     and cour_mapping.changed
                     and cour_mapping.confidence >= 0.9
                     and cour_validation.get("required")
@@ -2309,13 +2386,15 @@ class Organizer:
         # 本次源扫描内的普通剧集已经通过严格自动校验时，可为“自身也独立
         # 命中同一 TMDB、仅因特殊内容标题残片而被拦截”的 OVA/NCOP/Extra
         # 复用作品身份。这里只复用身份，不复用季集位置；特殊内容仍由稳定
-        # 的 S00E## 分配器独立编号。特殊文件自身没有命中相同 ID 时失败关闭。
+        # 的 S00E## 分配器独立编号。专用特典子目录仅在同包恰有一个可信
+        # 正片身份且自身完全无搜索结果时允许唯一回退，其余情况失败关闭。
         if automatic and isinstance(self.scraper, TMDBScraper) and not rules.nsfw_enabled:
             trusted_by_scope_and_tmdb: dict[tuple[str, str], MatchResult] = {}
+            trusted_ids_by_scope: dict[str, set[str]] = {}
             for donor_item, donor_plan in zip(scanned_videos, plans):
                 if donor_item.special or donor_plan.action != "move":
                     continue
-                donor_id = self._trusted_directory_tv_identity(
+                donor_id = self._trusted_same_scan_special_donor(
                     donor_plan.match,
                     threshold=automatic_match_policy(
                         rules.automatic_match_preset
@@ -2324,18 +2403,17 @@ class Organizer:
                 )
                 if not donor_id:
                     continue
+                donor_scope = self._physical_source_root(donor_item)
                 trusted_by_scope_and_tmdb.setdefault(
-                    (
-                        self._physical_source_root(donor_item),
-                        donor_id,
-                    ),
-                    copy.deepcopy(donor_plan.match),
+                    (donor_scope, donor_id), copy.deepcopy(donor_plan.match)
                 )
+                trusted_ids_by_scope.setdefault(donor_scope, set()).add(donor_id)
 
             for index, (item, original_plan) in enumerate(zip(scanned_videos, plans)):
                 if not item.special or original_plan.action != "skip":
                     continue
-                if not is_special_media_name(item.file.name):
+                special_by_path = is_special_path(item.relative_dir)
+                if not (is_special_media_name(item.file.name) or special_by_path):
                     continue
                 binding_parent_context = recognition_parent_paths.get(
                     item.file.file_id, item.recognition_parent_path
@@ -2344,19 +2422,37 @@ class Organizer:
                     f"{item.file.name} {binding_parent_context}"
                 ):
                     continue
+                donor_scope = self._physical_source_root(item)
                 special_tmdb_id = str(
                     getattr(original_plan.match, "tmdb_id", "") or ""
                 ).strip()
                 donor_match = trusted_by_scope_and_tmdb.get((
-                    self._physical_source_root(item),
-                    special_tmdb_id,
+                    donor_scope, special_tmdb_id,
                 ))
+                binding_tmdb_id = special_tmdb_id
+                if donor_match is None and special_by_path and donor_scope != "__root__":
+                    # 专用特典子目录中的弱文件名可能完全搜不到作品。只有该
+                    # 首层发布包在本次扫描内恰好存在一个已验证正片身份时，
+                    # 才允许把唯一身份作为供体；根目录混放与多作品包不推断。
+                    scope_ids = trusted_ids_by_scope.get(donor_scope, set())
+                    if len(scope_ids) == 1:
+                        binding_tmdb_id = next(iter(scope_ids))
+                        donor_match = trusted_by_scope_and_tmdb.get((
+                            donor_scope, binding_tmdb_id,
+                        ))
                 if donor_match is None:
                     continue
+                allow_explicit_special_path = (
+                    special_by_path and donor_scope != "__root__"
+                )
                 if not self._special_match_can_bind_identity(
-                    original_plan.match, special_tmdb_id
+                    original_plan.match,
+                    binding_tmdb_id,
+                    allow_path_no_result=allow_explicit_special_path,
+                    allow_path_title_fragment=allow_explicit_special_path,
                 ):
                     continue
+                special_tmdb_id = binding_tmdb_id
                 identity_match = self._identity_only_directory_match(donor_match)
                 parent_context = recognition_parent_paths.get(
                     item.file.file_id, item.recognition_parent_path
@@ -4795,13 +4891,83 @@ class Organizer:
             return ""
         return tmdb_id
 
+    @classmethod
+    def _trusted_same_scan_special_donor(
+        cls,
+        match: MatchResult | None,
+        *,
+        threshold: float = 0.9,
+        automatic_preset: str = "balanced",
+    ) -> str:
+        """返回仅供同包特典复用的、已完成集级终检的 TV 身份。"""
+        trusted = cls._trusted_directory_tv_identity(
+            match, threshold=threshold, automatic_preset=automatic_preset
+        )
+        if trusted:
+            return trusted
+        if (
+            match is None
+            or bool(getattr(match, "need_confirm", False))
+            or bool(getattr(match, "locked", False))
+            or getattr(match, "regex_rule_id", None) is not None
+            or str(getattr(match, "matched_by", "") or "").strip().lower()
+            != "search"
+            or str(getattr(match, "provider", "") or "").strip().lower()
+            != "tmdb"
+            or str(getattr(match, "media_type", "") or "").strip().lower()
+            != "tv"
+            or str(getattr(match, "status", "") or "").strip().lower()
+            != "matched"
+            or float(getattr(match, "confidence", 0.0) or 0.0) < float(threshold)
+        ):
+            return ""
+        tmdb_id = str(getattr(match, "tmdb_id", "") or "").strip()
+        external_id = str(getattr(match, "external_id", "") or "").strip()
+        if not tmdb_id or (external_id and external_id != tmdb_id):
+            return ""
+        final_validation = dict(
+            (getattr(match, "metadata", None) or {}).get(
+                "final_position_validation"
+            ) or {}
+        )
+        if not (
+            final_validation.get("required")
+            and final_validation.get("passed")
+            and str(final_validation.get("reason") or "") == "episode_verified"
+        ):
+            return ""
+        return tmdb_id
+
     @staticmethod
     def _special_match_can_bind_identity(
-        match: MatchResult | None, donor_tmdb_id: str
+        match: MatchResult | None,
+        donor_tmdb_id: str,
+        *,
+        allow_path_no_result: bool = False,
+        allow_path_title_fragment: bool = False,
     ) -> bool:
-        """仅接受已独立命中同一作品、因标题残片转人工的特殊内容。"""
+        """校验特殊内容可否复用同包、同 TMDB 的可信作品身份。
+
+        特典文件常使用 ``01.mkv``、``menu.mkv`` 等弱标题，或带有不属于
+        TMDB 正片季的本地编号。只允许可解释的拦截继续绑定：标题仅部分
+        命中、季集位置不存在/越界；明确特典子目录还可接受“同 ID 但缺少
+        作品标题特征词”，或在同包只有唯一可信身份时接受完全无搜索结果。
+        其它歧义仍失败关闭。
+        """
         if match is None or not bool(getattr(match, "need_confirm", False)):
             return False
+        tmdb_id = str(getattr(match, "tmdb_id", "") or "").strip()
+        external_id = str(getattr(match, "external_id", "") or "").strip()
+        if not tmdb_id:
+            return bool(
+                allow_path_no_result
+                and not external_id
+                and not list(getattr(match, "candidates", None) or [])
+                and str(getattr(match, "status", "") or "").strip().lower()
+                == "no_result"
+                and str(getattr(match, "error", "") or "").strip()
+                == "TMDB 无搜索结果"
+            )
         if str(getattr(match, "provider", "") or "").strip().lower() != "tmdb":
             return False
         if str(getattr(match, "media_type", "") or "").strip().lower() != "tv":
@@ -4810,11 +4976,23 @@ class Organizer:
             return False
         if float(getattr(match, "confidence", 0.0) or 0.0) < 0.82:
             return False
-        tmdb_id = str(getattr(match, "tmdb_id", "") or "").strip()
-        external_id = str(getattr(match, "external_id", "") or "").strip()
         if tmdb_id != donor_tmdb_id or (external_id and external_id != donor_tmdb_id):
             return False
-        return "候选仅命中部分标题" in str(getattr(match, "error", "") or "")
+        error = str(getattr(match, "error", "") or "")
+        rejected = {
+            str(reason or "").strip()
+            for reason in (getattr(match, "rejected_constraints", None) or [])
+            if str(reason or "").strip()
+        }
+        allowed_constraints = {
+            "tmdb_position_season_not_found",
+            "tmdb_position_episode_out_of_range",
+        }
+        if allow_path_title_fragment:
+            allowed_constraints.add("distinctive_title_tokens_missing")
+        if rejected:
+            return rejected <= allowed_constraints
+        return "候选仅命中部分标题" in error
 
     @staticmethod
     def _physical_source_root(item: _ScannedVideo) -> str:
@@ -6146,6 +6324,25 @@ class Organizer:
                     **dict(getattr(match, "metadata", None) or {}),
                     _DIRECTORY_PACKAGE_IDENTITY_PROOF_KEY: directory_package_proof,
                 }
+        position_only_mapping_recovery_candidate = False
+        if (
+            automatic
+            and self._trusted_position_only_tmdb_identity(
+                match, automatic_threshold=automatic_policy.threshold
+            )
+            and isinstance(source_position_override, (tuple, list))
+            and len(source_position_override) == 2
+            and not any(isinstance(value, bool) for value in source_position_override)
+        ):
+            try:
+                recovery_source_season = int(source_position_override[0])
+                recovery_source_episode = int(source_position_override[1])
+            except (TypeError, ValueError):
+                pass
+            else:
+                position_only_mapping_recovery_candidate = bool(
+                    recovery_source_season >= 2 and recovery_source_episode >= 1
+                )
         identity_probe_position_recovery_candidate = bool(
             automatic
             and self._recoverable_directory_identity_probe_position_failure(
@@ -6162,6 +6359,7 @@ class Organizer:
             and directory_package_proof is None
             and directory_identity_attestation is None
             and not identity_probe_position_recovery_candidate
+            and not position_only_mapping_recovery_candidate
         ):
             plan.action = "skip"
             plan.note = match.error or "媒体匹配结果需人工确认"
@@ -6175,6 +6373,7 @@ class Organizer:
             and directory_package_proof is None
             and directory_identity_attestation is None
             and not identity_probe_position_recovery_candidate
+            and not position_only_mapping_recovery_candidate
         ):
             plan.action = "skip"
             plan.note = automatic_match_confirmation_message(
@@ -6498,6 +6697,8 @@ class Organizer:
                 directory_member_count=directory_episode_member_count,
                 automatic=automatic,
                 explicit_tmdb_id=explicit_tmdb_id,
+                source_year=_recognition_identity_year(file.name, parent_path),
+                automatic_threshold=automatic_policy.threshold,
             )
             plan.episode_mapping = mapping
             plan.source_season = mapping.source_season
@@ -6562,6 +6763,10 @@ class Organizer:
                             directory_member_count=directory_episode_member_count,
                             automatic=automatic,
                             explicit_tmdb_id=explicit_tmdb_id,
+                            source_year=_recognition_identity_year(
+                                file.name, parent_path
+                            ),
+                            automatic_threshold=automatic_policy.threshold,
                         )
                     elif cached_bare_absolute_episode is not None:
                         # 裸绝对集号没有发布季号；旧映射失效后仍可沿用已经
@@ -6631,7 +6836,10 @@ class Organizer:
                 plan.season = parsed_season
                 plan.episode = parsed_episode
                 return plan
-            if identity_probe_position_recovery_candidate:
+            if (
+                identity_probe_position_recovery_candidate
+                or position_only_mapping_recovery_candidate
+            ):
                 mapping = plan.episode_mapping
                 recovered_tmdb_id = str(
                     getattr(match, "tmdb_id", "") or ""
@@ -6657,7 +6865,11 @@ class Organizer:
                     == "episode_verified"
                 )
                 if not recovery_accepted:
-                    message = "目录身份探针的位置错误无法由安全映射消解，需人工确认"
+                    message = (
+                        "目录身份探针的位置错误无法由安全映射消解，需人工确认"
+                        if identity_probe_position_recovery_candidate
+                        else "文件季集位置无法由安全映射消解，需人工确认"
+                    )
                     match.need_confirm = True
                     match.status = "low_confidence"
                     match.error = message
@@ -6679,12 +6891,19 @@ class Organizer:
                     if str(item or "").strip() not in recoverable_constraints
                 ]
                 match.directory_identity_cache_eligible = bool(
-                    str(getattr(match, "matched_by", "") or "").strip().lower()
-                    == "search"
+                    identity_probe_position_recovery_candidate
+                    and str(
+                        getattr(match, "matched_by", "") or ""
+                    ).strip().lower() == "search"
+                )
+                recovery_metadata_key = (
+                    "directory_identity_probe_position_recovery"
+                    if identity_probe_position_recovery_candidate
+                    else "position_only_tmdb_mapping_recovery"
                 )
                 match.metadata = {
                     **dict(getattr(match, "metadata", None) or {}),
-                    "directory_identity_probe_position_recovery": {
+                    recovery_metadata_key: {
                         "tmdb_id": recovered_tmdb_id,
                         "mapping": mapping.to_dict(),
                         "position_validation": dict(validation),
@@ -6773,30 +6992,23 @@ class Organizer:
                 )
                 season_year_detail_valid = True
                 if season_year_evidence is not None:
-                    season_year_detail_valid = False
-                    if isinstance(season_year_evidence, dict):
-                        expected_year = str(
-                            season_year_evidence.get("expected_year") or ""
-                        ).strip()
-                        evidence_air_date = str(
-                            season_year_evidence.get("season_air_date") or ""
-                        ).strip()
-                        current_season = next((
-                            item for item in (detail.get("seasons") or [])
-                            if isinstance(item, dict)
-                            and safe_int(item.get("season_number"), None, minimum=0)
-                            == proof_season
-                        ), None)
-                        current_air_date = str(
-                            current_season.get("air_date") or ""
-                        ).strip() if isinstance(current_season, dict) else ""
-                        season_year_detail_valid = bool(
-                            re.fullmatch(r"(?:19|20)\d{2}", expected_year)
-                            and current_air_date[:4] == expected_year
-                            and evidence_air_date[:4] == expected_year
-                            and str(season_year_evidence.get("tmdb_id") or "").strip()
-                            == proof_tmdb_id
+                    season_detail = None
+                    if (
+                        isinstance(season_year_evidence, dict)
+                        and str(
+                            season_year_evidence.get("date_scope") or "season"
+                        ).strip().lower() == "segment"
+                    ):
+                        season_detail = self._tv_season_detail_for_match(
+                            match, proof_season
                         )
+                    season_year_detail_valid = (
+                        target_season_year_evidence_matches_detail(
+                            season_year_evidence,
+                            detail,
+                            season_detail=season_detail,
+                        )
+                    )
 
                 # 合成目录探针只证明作品身份，不能把探针中的 E01 当成
                 # 当前文件的真实位置。真实位置已从源文件恢复、经统一映射，

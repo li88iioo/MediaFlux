@@ -55,7 +55,11 @@ from app.modules.recognition.cleaner import (
 )
 from app.modules.recognition.extractors.deterministic import (
     _ANGLE_EPISODE_TOKEN,
+    _BARE_EPISODE_SUFFIX,
     _DUAL_EPISODE_PATTERNS,
+    _ORDINAL_SEASON_LOCAL_TOTAL_TOKEN,
+    _SEASON_BARE_EPISODE_SUFFIX,
+    _UNDERSCORE_DUAL_EPISODE_TOKEN,
     _extract_episode,
     _extract_explicit_season,
     _extract_special_episode,
@@ -153,7 +157,7 @@ _NOISE = re.compile(
     r'hdr|hdr10|hdr10plus|dolby|atmos|truehd|'
     r'(?:ddp|eac3|aac|dts|flac|opus)[ ._-]?(?:1|2|3|5|7)[ ._-]?[01]|'
     r'ddp|ddp5|ddp7|eac3|ac3|aac|dts|dts-hd|dts-ma|flac|mp3|opus|(?:2|3|5|7)[ ._-]?1|'
-    r'h[ ._-]?264|h[ ._-]?265|x264|x265|hevc|avc|vp9|av1|10bit|10-bit|8bit|'
+    r'h[ ._-]?264|h[ ._-]?265|x264|x265|hevc|avc|nvenc|vp9|av1|10bit|10-bit|8bit|'
     r'23\.976fps|24fps|25fps|30fps|60fps|fps|'
     r'netflix|nf|amazon|amzn|disney|dsnp|hbo[ ._-]?max|hbo|hulu|atvp|'
     r'apple[ ._-]?tv\+?|apple|itunes|catchplay|bilibili|baha|'
@@ -522,11 +526,6 @@ _AVAILABILITY_TAG = re.compile(
     r"[^()（）\[\]【】]{1,24}(?:[\)）\]】]|$)",
     re.IGNORECASE,
 )
-_BARE_EPISODE_SUFFIX = re.compile(
-    r"(?i)(?:^|\s+-\s+|[._]+)(\d{1,4})(?:v\d+)?"
-    r"(?:[._]+)?(?:\s*(?:fin(?:al)?|end|complete|完结|完))?"
-    r"(?=\s*(?:[\[【(（]|$))"
-)
 _BRACKET_EPISODE_TOKEN = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]")
 _BRACKET_EPISODE_SUFFIX = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]\s*$")
 _BRACKET_EPISODE_RANGE = re.compile(
@@ -569,7 +568,7 @@ _STRUCTURED_EPISODE_POSITION = re.compile(
     r"(?i)(?<![A-Za-z0-9])s\d{1,2}e\d{1,4}(?:v\d+)?(?![A-Za-z0-9])"
 )
 _BRACKET_RELEASE_META_NOISE = re.compile(
-    r"(?i)^(?:cr|iq|adn|repack|readnfo|rartv|multi(?:-?subs?)?|msubs?|"
+    r"(?i)^(?:cr|iq|adn|repack|readnfo|rartv|multi(?:-?subs?)?|msubs?|subs?|"
     r"subfrench|vostfr|jpn?|jap|rus|tver|tv|(?:tv|тв)\s*-\s*(?:0[1-9]|[1-9]\d?)|"
     r"bd|fhd|mpeg2|vhsrip|audio|b[ ._-]?hmt|version[ ._-]*light|final)$"
 )
@@ -1294,8 +1293,13 @@ _GUESSIT_CJK_EPISODE_WORD_COLLISION = re.compile(
     r"第\s*(?:\d{1,4}|[零〇一二两三四五六七八九十]{1,3})\s*"
     r"(?:集|[话話])(?=[\u3040-\u30ff\u3400-\u9fff])"
 )
-
-
+# 动画发布常在明确集号后附带本集标题，例如 ``第25話「ただそれだけ」``。
+# 只有数字与已解析 episode 一致、且副标题使用成对引号时才移除，避免把
+# 作品正式名称中的“第X话题”等普通文本误当作集标题。
+_CJK_EPISODE_TITLE_SUFFIX = re.compile(
+    r"第\s*(\d{1,4})\s*(?:集|[话話])\s*"
+    r"(?:「[^」\r\n]{1,180}」|『[^』\r\n]{1,180}』|“[^”\r\n]{1,180}”)"
+)
 
 
 def _strip_known_episode_suffix(
@@ -1314,7 +1318,35 @@ def _strip_known_episode_suffix(
             return match.group(0)
 
     cleaned = str(value or "")
+
+    def strip_episode_title(match: re.Match[str]) -> str:
+        try:
+            return " " if int(match.group(1)) == int(episode) else match.group(0)
+        except (TypeError, ValueError):
+            return match.group(0)
+
+    cleaned = _CJK_EPISODE_TITLE_SUFFIX.sub(strip_episode_title, cleaned)
     cleaned = _ANGLE_EPISODE_TOKEN.sub(" ", cleaned)
+
+    def strip_ordinal_total(match: re.Match[str]) -> str:
+        try:
+            same_episode = int(match.group("episode")) == int(episode)
+            same_season = season is None or int(match.group("season")) == int(season)
+        except (TypeError, ValueError):
+            return match.group(0)
+        return " " if same_episode and same_season else match.group(0)
+
+    cleaned = _ORDINAL_SEASON_LOCAL_TOTAL_TOKEN.sub(strip_ordinal_total, cleaned)
+
+    def strip_season_bare(match: re.Match[str]) -> str:
+        try:
+            same_episode = int(match.group("episode")) == int(episode)
+            same_season = season is None or int(match.group("season")) == int(season)
+        except (TypeError, ValueError):
+            return match.group(0)
+        return " " if same_episode and same_season else match.group(0)
+
+    cleaned = _SEASON_BARE_EPISODE_SUFFIX.sub(strip_season_bare, cleaned)
     for pattern in _DUAL_EPISODE_PATTERNS:
         cleaned = pattern.sub(replace, cleaned)
     compact = _parse_release_x_position(cleaned)
@@ -1495,7 +1527,7 @@ def _is_bracket_noise(content: str) -> bool:
         (r"(?i)\b10[ ._-]?bit\b", "10bit"),
         (r"(?i)\b8[ ._-]?bit\b", "8bit"),
         (r"(?i)\bdual[ ._-]+audio\b", "audio"),
-        (r"(?i)\baacx\d{1,2}\b", "aac"),
+        (r"(?i)\b(?:aac|flac)x\d{1,2}\b", "aac"),
         (r"(?i)\b(?:ddp|eac3|ac3|aac|dts|flac|opus)[ ._-]?(?:1|2|5|7)[ ._-]?[01]\b", "aac"),
     ):
         token_source = re.sub(pattern, replacement, token_source)
@@ -2078,6 +2110,15 @@ def extract_recognition_context(filename: str, parent_path: str = "") -> Recogni
     guessed_season = _season_number(guessed.get("season"))
     has_season_range = bool(_SEASON_RANGE_TOKEN.search(stem))
     if has_season_range:
+        guessed_season = None
+    if (
+        explicit_episode is None
+        and _UNDERSCORE_DUAL_EPISODE_TOKEN.search(stem)
+    ):
+        # GuessIt 会把未知语义的 ``[19_91]`` 猜成第 19 集。确定性解析器
+        # 只有在同一标题存在明确季度时才接受这种“季内_绝对”双编号；缺少
+        # 季度证据时同步丢弃 GuessIt 的位置，避免把尺寸/私有发布标签入库。
+        guessed_episode = None
         guessed_season = None
     untrusted_guessed_episode = _guessit_episode_is_untrusted(
         stem,
@@ -2845,14 +2886,9 @@ def _validated_target_season_year_evidence(
     if (
         source_season != context.season
         or source_episode != context.episode
-        or target_season != context.season
-        or target_episode != context.episode
         or target_season < 1
         or target_episode < 1
     ):
-        return None
-    season_air_date = str(evidence.get("season_air_date") or "").strip()
-    if season_air_date[:4] != expected:
         return None
     validation = evidence.get("position_validation")
     if not isinstance(validation, dict):
@@ -2869,7 +2905,7 @@ def _validated_target_season_year_evidence(
     except (TypeError, ValueError):
         return None
     mapping = evidence.get("episode_mapping")
-    if not isinstance(mapping, dict) or mapping.get("changed") is not False:
+    if not isinstance(mapping, dict):
         return None
     try:
         if int(mapping.get("source_season")) != source_season:
@@ -2882,6 +2918,43 @@ def _validated_target_season_year_evidence(
             return None
     except (TypeError, ValueError):
         return None
+    mapping_changed = bool(
+        source_season != target_season or source_episode != target_episode
+    )
+    if mapping.get("changed") is not mapping_changed:
+        return None
+
+    date_scope = str(evidence.get("date_scope") or "season").strip().lower()
+    target_air_date = str(
+        evidence.get("target_air_date")
+        or evidence.get("season_air_date")
+        or ""
+    ).strip()
+    if target_air_date[:4] != expected:
+        return None
+    if date_scope == "season":
+        if mapping_changed:
+            return None
+        if str(evidence.get("season_air_date") or "").strip() != target_air_date:
+            return None
+    elif date_scope == "segment":
+        if not mapping_changed:
+            return None
+        try:
+            range_start = int(mapping.get("range_start"))
+            range_end = int(mapping.get("range_end"))
+            year_anchor_episode = int(evidence.get("year_anchor_episode"))
+        except (TypeError, ValueError):
+            return None
+        if (
+            range_start < 1
+            or range_end < range_start
+            or year_anchor_episode != range_start
+            or not range_start <= target_episode <= range_end
+        ):
+            return None
+    else:
+        return None
     return dict(evidence)
 
 
@@ -2892,8 +2965,9 @@ def _build_target_season_year_evidence(
     context: RecognitionContext,
     expected_year: str,
     mapping: EpisodeMappingPlan,
+    season_detail: dict | None = None,
 ) -> dict[str, object] | None:
-    """从 TMDB 剧集详情构造严格绑定源 SxxExx 的目标季年份证据。"""
+    """构造绑定源位置、目标位置与 TMDB 播出时间的年份证据。"""
     expected = str(expected_year or "").strip()
     if (
         context.media_type != "tv"
@@ -2909,34 +2983,73 @@ def _build_target_season_year_evidence(
     if detail_id != str(tmdb_id).strip():
         return None
     if (
-        mapping.changed
-        or mapping.source_season != context.season
+        mapping.source_season != context.season
         or mapping.source_episode != context.episode
-        or mapping.target_season != context.season
-        or mapping.target_episode != context.episode
+        or mapping.target_season is None
+        or mapping.target_season < 1
+        or mapping.target_episode is None
+        or mapping.target_episode < 1
     ):
         return None
-    seasons = detail.get("seasons") if isinstance(detail, dict) else None
-    if not isinstance(seasons, list):
-        return None
-    target = next((
-        item for item in seasons
-        if isinstance(item, dict)
-        and _strict_non_negative_int(item.get("season_number")) == context.season
-    ), None)
-    if not isinstance(target, dict):
-        return None
-    season_air_date = str(target.get("air_date") or "").strip()
-    if season_air_date[:4] != expected:
-        return None
     validation = _validate_tmdb_position(
-        detail, "tv", context.season, context.episode,
+        detail, "tv", mapping.target_season, mapping.target_episode,
     )
     if (
         not bool(validation.get("required"))
         or not bool(validation.get("passed"))
         or str(validation.get("reason") or "") != "episode_verified"
     ):
+        return None
+    season_air_date = ""
+    target_air_date = ""
+    date_scope = "season"
+    year_anchor_episode: int | None = None
+    if mapping.changed:
+        if (
+            not isinstance(season_detail, dict)
+            or _strict_non_negative_int(season_detail.get("season_number"))
+            != mapping.target_season
+            or mapping.range_start is None
+            or mapping.range_end is None
+            or not mapping.range_start
+            <= mapping.target_episode
+            <= mapping.range_end
+        ):
+            return None
+        episodes = season_detail.get("episodes")
+        if not isinstance(episodes, list):
+            return None
+        year_anchor_episode = mapping.range_start
+        anchor = next((
+            item for item in episodes
+            if isinstance(item, dict)
+            and _strict_non_negative_int(item.get("episode_number"))
+            == year_anchor_episode
+        ), None)
+        target_air_date = str(
+            anchor.get("air_date") or ""
+        ).strip() if isinstance(anchor, dict) else ""
+        date_scope = "segment"
+    else:
+        if (
+            mapping.target_season != context.season
+            or mapping.target_episode != context.episode
+        ):
+            return None
+        seasons = detail.get("seasons") if isinstance(detail, dict) else None
+        if not isinstance(seasons, list):
+            return None
+        target = next((
+            item for item in seasons
+            if isinstance(item, dict)
+            and _strict_non_negative_int(item.get("season_number"))
+            == mapping.target_season
+        ), None)
+        if not isinstance(target, dict):
+            return None
+        season_air_date = str(target.get("air_date") or "").strip()
+        target_air_date = season_air_date
+    if target_air_date[:4] != expected:
         return None
     return {
         "kind": _TARGET_SEASON_YEAR_EVIDENCE_KIND,
@@ -2945,9 +3058,15 @@ def _build_target_season_year_evidence(
         "expected_year": expected,
         "source_season": context.season,
         "source_episode": context.episode,
-        "target_season": context.season,
-        "target_episode": context.episode,
+        "target_season": mapping.target_season,
+        "target_episode": mapping.target_episode,
+        "date_scope": date_scope,
+        "target_air_date": target_air_date,
         "season_air_date": season_air_date,
+        **(
+            {"year_anchor_episode": year_anchor_episode}
+            if year_anchor_episode is not None else {}
+        ),
         "position_validation": dict(validation),
         "episode_mapping": mapping.to_dict(),
     }
@@ -2994,11 +3113,7 @@ def _validated_target_season_year_proof_evidence(
         or evidence_source_episode != source_episode
         or evidence_target_season != target_season
         or evidence_target_episode != target_episode
-        or source_season != target_season
-        or source_episode != target_episode
     ):
-        return None
-    if str(evidence.get("season_air_date") or "").strip()[:4] != expected:
         return None
 
     validation = evidence.get("position_validation")
@@ -3017,8 +3132,12 @@ def _validated_target_season_year_proof_evidence(
         except (TypeError, ValueError):
             return None
 
-    for mapping in (evidence.get("episode_mapping"), proof_episode_mapping):
-        if not isinstance(mapping, dict) or mapping.get("changed") is not False:
+    mapping_changed = bool(
+        source_season != target_season or source_episode != target_episode
+    )
+    mappings = (evidence.get("episode_mapping"), proof_episode_mapping)
+    for mapping in mappings:
+        if not isinstance(mapping, dict) or mapping.get("changed") is not mapping_changed:
             return None
         try:
             if int(mapping.get("source_season")) != source_season:
@@ -3031,7 +3150,134 @@ def _validated_target_season_year_proof_evidence(
                 return None
         except (TypeError, ValueError):
             return None
+    date_scope = str(evidence.get("date_scope") or "season").strip().lower()
+    target_air_date = str(
+        evidence.get("target_air_date")
+        or evidence.get("season_air_date")
+        or ""
+    ).strip()
+    if target_air_date[:4] != expected:
+        return None
+    if date_scope == "season":
+        if mapping_changed:
+            return None
+        if str(evidence.get("season_air_date") or "").strip() != target_air_date:
+            return None
+    elif date_scope == "segment":
+        if not mapping_changed:
+            return None
+        try:
+            evidence_mapping = mappings[0]
+            range_start = int(evidence_mapping.get("range_start"))
+            range_end = int(evidence_mapping.get("range_end"))
+            proof_range_start = int(mappings[1].get("range_start"))
+            proof_range_end = int(mappings[1].get("range_end"))
+            year_anchor_episode = int(evidence.get("year_anchor_episode"))
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            (range_start, range_end) != (proof_range_start, proof_range_end)
+            or range_start < 1
+            or range_end < range_start
+            or year_anchor_episode != range_start
+            or not range_start <= target_episode <= range_end
+        ):
+            return None
+    else:
+        return None
     return dict(evidence)
+
+
+def target_season_year_evidence_matches_detail(
+    evidence: object,
+    detail: dict | None,
+    *,
+    season_detail: dict | None = None,
+) -> bool:
+    """确认年份证据仍与最新 TMDB 详情一致。
+
+    普通季度复核 ``seasons[].air_date``；TMDB 合并季复核映射段首集的
+    ``air_date``。网络层只负责提供快照，证据结构与比较规则集中在此处，
+    避免识别层和整理层形成两套判断。
+    """
+    if not isinstance(evidence, dict) or not isinstance(detail, dict):
+        return False
+    tmdb_id = str(evidence.get("tmdb_id") or "").strip()
+    if not tmdb_id or str(detail.get("id") or "").strip() != tmdb_id:
+        return False
+    expected_year = str(evidence.get("expected_year") or "").strip()
+    target_air_date = str(
+        evidence.get("target_air_date")
+        or evidence.get("season_air_date")
+        or ""
+    ).strip()
+    if (
+        not re.fullmatch(r"(?:19|20)\d{2}", expected_year)
+        or target_air_date[:4] != expected_year
+    ):
+        return False
+    try:
+        target_season = int(evidence.get("target_season"))
+        target_episode = int(evidence.get("target_episode"))
+    except (TypeError, ValueError):
+        return False
+    validation = _validate_tmdb_position(
+        detail, "tv", target_season, target_episode,
+    )
+    if (
+        not validation.get("required")
+        or not validation.get("passed")
+        or validation.get("reason") != "episode_verified"
+    ):
+        return False
+
+    date_scope = str(evidence.get("date_scope") or "season").strip().lower()
+    if date_scope == "season":
+        current_season = next((
+            item for item in (detail.get("seasons") or [])
+            if isinstance(item, dict)
+            and _strict_non_negative_int(item.get("season_number"))
+            == target_season
+        ), None)
+        current_air_date = str(
+            current_season.get("air_date") or ""
+        ).strip() if isinstance(current_season, dict) else ""
+        return bool(
+            current_air_date == target_air_date
+            and str(evidence.get("season_air_date") or "").strip()
+            == target_air_date
+        )
+    if date_scope != "segment" or not isinstance(season_detail, dict):
+        return False
+    if (
+        _strict_non_negative_int(season_detail.get("season_number"))
+        != target_season
+    ):
+        return False
+    mapping = evidence.get("episode_mapping")
+    if not isinstance(mapping, dict) or mapping.get("changed") is not True:
+        return False
+    try:
+        range_start = int(mapping.get("range_start"))
+        range_end = int(mapping.get("range_end"))
+        year_anchor_episode = int(evidence.get("year_anchor_episode"))
+    except (TypeError, ValueError):
+        return False
+    if (
+        year_anchor_episode != range_start
+        or not range_start <= target_episode <= range_end
+    ):
+        return False
+    current_anchor = next((
+        item for item in (season_detail.get("episodes") or [])
+        if isinstance(item, dict)
+        and _strict_non_negative_int(item.get("episode_number"))
+        == year_anchor_episode
+    ), None)
+    current_air_date = str(
+        current_anchor.get("air_date") or ""
+    ).strip() if isinstance(current_anchor, dict) else ""
+    return current_air_date == target_air_date
 
 
 def score_candidate(context: RecognitionContext, candidate: dict) -> CandidateScoreBreakdown:
@@ -3502,8 +3748,6 @@ def _build_verified_automatic_identity_proof(
         selected_raw, context, expected_year,
     )
     if season_year_evidence is not None:
-        if mapping.changed:
-            return None
         try:
             if int(season_year_evidence.get("target_season")) != target_season:
                 return None
@@ -4930,12 +5174,31 @@ class TMDBScraper:
             detail=detail,
             mode="auto",
         )
+        season_detail: dict | None = None
+        counts = season_episode_counts(detail)
+        if (
+            not mapping.changed
+            and len(counts) == 1
+            and context.season not in counts
+        ):
+            target_season = next(iter(counts))
+            season_detail = self.get_tv_season_detail(tmdb_id, target_season)
+            merged_mapping = infer_merged_season_cour_mapping(
+                source_season=context.season,
+                source_episode=context.episode,
+                detail=detail,
+                season_detail=season_detail,
+                source_year=expected,
+            )
+            if merged_mapping.changed and merged_mapping.confidence >= 0.9:
+                mapping = merged_mapping
         evidence = _build_target_season_year_evidence(
             detail=detail,
             tmdb_id=tmdb_id,
             context=context,
             expected_year=expected,
             mapping=mapping,
+            season_detail=season_detail,
         )
         if evidence is None:
             return False
@@ -5065,7 +5328,12 @@ class TMDBScraper:
 
             if (
                 not validation.get("passed")
-                and mapping_source_season == 2
+                and isinstance(mapping_source_season, int)
+                and mapping_source_season >= 2
+                and (
+                    mapping_source_season == 2
+                    or bool(re.fullmatch(r"(?:19|20)\d{2}", source_year))
+                )
             ):
                 counts = season_episode_counts(verified_detail)
                 # 发布方把分割放送写成 S02，而 TMDB 可能仍保留为唯一的
@@ -5095,6 +5363,7 @@ class TMDBScraper:
                         source_episode=context.episode,
                         detail=verified_detail,
                         season_detail=season_detail,
+                        source_year=source_year,
                     )
                     cour_validation = _validate_tmdb_position(
                         verified_detail,
@@ -5609,6 +5878,7 @@ class TMDBScraper:
                         source_episode=context.episode,
                         detail=detail,
                         season_detail=season_detail,
+                        source_year=expected_year,
                     )
                     if cour_mapping.changed and cour_mapping.confidence >= 0.9:
                         cour_position = _validate_tmdb_position(
@@ -7032,6 +7302,7 @@ class TMDBScraper:
                         source_episode=ai_context.episode,
                         detail=detail,
                         season_detail=season_detail,
+                        source_year=source_year,
                     )
                     if cour_mapping.changed and cour_mapping.confidence >= 0.9:
                         cour_position = _validate_tmdb_position(

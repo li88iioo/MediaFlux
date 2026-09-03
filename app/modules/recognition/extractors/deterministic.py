@@ -78,6 +78,22 @@ _SPECIAL_EPISODE_TOKEN = re.compile(
 
 _BARE_EPISODE_SUFFIX = re.compile(
     r"(?i)(?:^|\s+-\s+|[._]+)(\d{1,4})(?:v\d+)?"
+    # 多语种整季包常写成 ``Show - 01 MULTI [1080p]``。MULTI 只在
+    # 已有发布分隔符、明确裸集号且后接技术括号/结尾时消费，不能作为
+    # 全局噪声删除，否则 ``The Multi`` 一类正式标题会被破坏。
+    r"(?:\s+multi)?"
+    r"(?:[._]+)?(?:\s*(?:fin(?:al)?|end|complete|完结|完))?"
+    r"(?=\s*(?:[\[【(（]|$))"
+)
+
+# 多季合集里的文件常写成 ``Show - S2 08 MULTI [1080p]``：S2 是季号，
+# 后续裸数字是季内集号。必须同时具备独立 S 标记、集号、发布尾部边界，
+# 避免把标题中的普通字母数字组合或分辨率解释成季集。
+_SEASON_BARE_EPISODE_SUFFIX = re.compile(
+    r"(?i)(?:^|\s+-\s+|[._]+)"
+    r"s(?P<season>\d{1,2})[ ._-]+"
+    r"(?P<episode>\d{1,4})(?:v\d+)?"
+    r"(?:\s+multi)?"
     r"(?:[._]+)?(?:\s*(?:fin(?:al)?|end|complete|完结|完))?"
     r"(?=\s*(?:[\[【(（]|$))"
 )
@@ -95,6 +111,9 @@ _ANGLE_EPISODE_TOKEN = re.compile(
 # 动画发布常同时给出季内编号与绝对编号：``20(92)``、``[01(64)]``。
 # 两者都应以第一个数字作为当前季集号，括号内数字仅作为绝对编号证据；
 # 否则通用括号规则会错误地把 ``[01(64)]`` 识别成第 64 集。
+_UNDERSCORE_DUAL_EPISODE_TOKEN = re.compile(
+    r"(?i)[\[【]\s*(\d{1,4})(?:v\d+)?\s*_\s*(\d{1,4})\s*[\]】]"
+)
 _DUAL_EPISODE_PATTERNS = (
     re.compile(
         r"(?i)[\[【]\s*(\d{1,4})(?:v\d+)?\s*[（(]\s*"
@@ -105,6 +124,18 @@ _DUAL_EPISODE_PATTERNS = (
         r"[（(]\s*(\d{1,4})\s*[）)]"
         r"(?=\s*(?:[\[【(（]|$))"
     ),
+    _UNDERSCORE_DUAL_EPISODE_TOKEN,
+)
+
+# 少量发布把季度与季内集号放在一个括号，再以相邻括号给出绝对集号：
+# ``[4th - 12][總第78]``。三段证据必须同时存在，避免把普通 ``4th``、
+# 日期或技术编号猜成季集位置。
+_ORDINAL_SEASON_LOCAL_TOTAL_TOKEN = re.compile(
+    r"(?ix)[\[【(（]\s*"
+    r"(?P<season>\d{1,2})(?:st|nd|rd|th)\s*[-_.:：]\s*"
+    r"(?P<episode>\d{1,4})(?:v\d+)?\s*[\]】)）]\s*"
+    r"[\[【(（]\s*(?:总|總)\s*第?\s*"
+    r"(?P<absolute>\d{1,4})\s*[\]】)）]"
 )
 
 _RELEASE_X_POSITION = re.compile(
@@ -193,6 +224,12 @@ def _has_unaccepted_release_x_position(value: str) -> bool:
     )
 
 def _extract_explicit_season(text: str, *, episode_context: bool = False) -> int | None:
+    ordinal_total = _ORDINAL_SEASON_LOCAL_TOTAL_TOKEN.search(text or "")
+    if ordinal_total:
+        return int(ordinal_total.group("season"))
+    season_bare = _SEASON_BARE_EPISODE_SUFFIX.search(text or "")
+    if season_bare:
+        return int(season_bare.group("season"))
     # ``S01-S03`` / ``第一-三季`` 是整季范围，不是单个 Season 01。
     # 在数据模型尚未表达季范围前保持未知，防止整个合集误归档到第一季。
     if _SEASON_RANGE_TOKEN.search(text or ""):
@@ -237,6 +274,21 @@ def _extract_episode(text: str) -> int | None:
     # 成第 5 集；其最终整数位置由特别篇统一分配器决定。
     if fractional_episode_position(text) is not None:
         return None
+    ordinal_total = _ORDINAL_SEASON_LOCAL_TOTAL_TOKEN.search(text or "")
+    if ordinal_total:
+        local_episode = int(ordinal_total.group("episode"))
+        absolute_episode = int(ordinal_total.group("absolute"))
+        if (
+            _valid_unlabeled_episode(local_episode)
+            and _valid_unlabeled_episode(absolute_episode)
+            and absolute_episode >= local_episode
+        ):
+            return local_episode
+    season_bare = _SEASON_BARE_EPISODE_SUFFIX.search(text or "")
+    if season_bare:
+        bare_episode = int(season_bare.group("episode"))
+        if _valid_unlabeled_episode(bare_episode):
+            return bare_episode
     explicit = _extract_number(_EPISODE_TOKEN, text)
     if explicit is not None:
         return explicit
@@ -255,6 +307,15 @@ def _extract_episode(text: str) -> int | None:
     for pattern in _DUAL_EPISODE_PATTERNS:
         dual = pattern.search(source)
         if not dual:
+            continue
+        if pattern is _UNDERSCORE_DUAL_EPISODE_TOKEN and not (
+            _SEASON_TOKEN.search(source)
+            or _BRACKET_TV_SEASON_TOKEN.search(source)
+            or _CHINESE_SEASON_TOKEN.search(source)
+            or _ENGLISH_ORDINAL_SEASON_TOKEN.search(source)
+        ):
+            # ``[720_1080]`` 等尺寸/编码私有标签不能在没有明确季度证据时
+            # 被解释为双集号。
             continue
         local_episode, absolute_episode = (int(value) for value in dual.groups())
         if (

@@ -527,6 +527,49 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         self.assertEqual(context.cleaned_components["release_versions"], ["v2"])
         self.assertEqual(context.cleaned_components["language_tags"], ["JPTC"])
 
+    def test_unknown_release_group_with_modern_encoder_bundle_is_cleaned(self):
+        scraper = self.recognition_module()
+
+        context = scraper.extract_recognition_context(
+            "[Feibanyama] ReZERO Starting Life in Another World S04E11 "
+            "[IQIYI WebRip 2160p NVENC AAC Multi-Audio Multi-Subs].mkv"
+        )
+
+        self.assertEqual(
+            context.normalized_title,
+            "ReZERO Starting Life in Another World",
+        )
+        self.assertEqual((context.season, context.episode), (4, 11))
+        self.assertEqual(
+            context.cleaned_components["candidate_release_groups"],
+            ["Feibanyama"],
+        )
+
+    def test_flac_track_count_does_not_pollute_bracketed_anime_title(self):
+        scraper = self.recognition_module()
+
+        context = scraper.extract_recognition_context(
+            "[DBD-Raws][Re Zero kara Hajimeru Isekai Seikatsu S3]"
+            "[01][1080P][BDRip][HEVC-10bit][FLACx2].mkv"
+        )
+
+        self.assertEqual(
+            context.normalized_title,
+            "Re Zero kara Hajimeru Isekai Seikatsu",
+        )
+        self.assertEqual((context.season, context.episode), (3, 1))
+
+    def test_cjk_episode_subtitle_is_removed_after_confirmed_episode_number(self):
+        scraper = self.recognition_module()
+
+        context = scraper.extract_recognition_context(
+            "[DMG] Reゼロから始める異世界生活 "
+            "第25話「ただそれだけの物語」 [BDRip][1080P][CHS].mp4"
+        )
+
+        self.assertEqual(context.normalized_title, "Reゼロから始める異世界生活")
+        self.assertEqual((context.season, context.episode), (None, 25))
+
     def test_broadcaster_technical_brackets_create_clean_release_candidate(self):
         scraper = self.recognition_module()
         cases = (
@@ -1438,6 +1481,16 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
                 "[WebRip 1080p HEVC-10bit AAC][简繁外挂字幕].mkv",
                 (4, 20),
             ),
+            (
+                "[BeanSub][Tensei Shitara Slime Datta Ken S4]"
+                "[19_91][CHS][1080P][x264_AAC].mp4",
+                (4, 19),
+            ),
+            (
+                "[晚街與燈][Re Zero kara Hajimeru Isekai Seikatsu]"
+                "[4th - 12][總第78][1080p].mkv",
+                (4, 12),
+            ),
         )
 
         for filename, expected in samples:
@@ -1450,9 +1503,51 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
                 self.assertEqual(
                     (position["season"], position["episode"]), expected
                 )
-                self.assertNotRegex(context.normalized_title, r"(?:20\(92\)|01\(64\))")
+                self.assertNotRegex(
+                    context.normalized_title,
+                    r"(?:20\(92\)|01\(64\)|19[ _]91|4th\s*-\s*12|總第78)",
+                )
                 if "间谍过家家Season" in filename:
                     self.assertEqual(context.normalized_title, "间谍过家家")
+
+    def test_mikan_multi_release_suffix_keeps_title_and_episode_clean(self):
+        scraper = self.recognition_module()
+        parser = scraper.TMDBScraper()
+        samples = (
+            ("[IssouCorp] Scissor Seven - 01 MULTI [1080p].mkv", (None, 1)),
+            ("[IssouCorp] Scissor Seven - S2 08 MULTI [1080p].mkv", (2, 8)),
+        )
+
+        for filename, expected in samples:
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename, "")
+                parsed = _parse_fields(parser, filename)
+                position = scraper.parse_release_position(filename)
+
+                self.assertEqual(context.normalized_title, "Scissor Seven")
+                self.assertEqual((context.season, context.episode), expected)
+                self.assertEqual(
+                    (parsed["season"], parsed["episode"]), expected
+                )
+                self.assertEqual(
+                    (position["season"], position["episode"]), expected
+                )
+                self.assertNotIn("MULTI", context.normalized_title.upper())
+
+    def test_underscore_pair_without_safe_season_evidence_is_not_an_episode(self):
+        scraper = self.recognition_module()
+        samples = (
+            "[Encode] Example Show [19_91] [x264].mkv",
+            "[Encode] Example Show S04 [720_1080] [x264].mkv",
+            "[Encode] Example Show S04 [19_18] [x264].mkv",
+        )
+
+        for filename in samples:
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename, "")
+                position = scraper.parse_release_position(filename)
+                self.assertIsNone(context.episode)
+                self.assertIsNone(position["episode"])
 
     def test_mikan_final_season_separator_is_not_a_numeric_season(self):
         scraper = self.recognition_module()
@@ -2391,6 +2486,24 @@ class _QueryDeterministicClient(_DeterministicClient):
     def search(self, title, year, media_type):
         self.search_calls.append((title, year, media_type))
         return list(self.candidates_by_query.get(str(title), []))
+
+
+def _merged_four_season_timeline() -> dict:
+    episodes = []
+    for start, end, aired_from in (
+        (1, 25, date(2016, 4, 4)),
+        (26, 50, date(2020, 7, 8)),
+        (51, 66, date(2024, 10, 2)),
+        (67, 85, date(2026, 4, 1)),
+    ):
+        for number in range(start, end + 1):
+            episodes.append({
+                "episode_number": number,
+                "air_date": (
+                    aired_from + timedelta(days=7 * (number - start))
+                ).isoformat(),
+            })
+    return {"season_number": 1, "episodes": episodes}
 
 
 class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
@@ -4174,6 +4287,59 @@ class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
         self.assertIsInstance(evidence, dict)
         self.assertEqual(evidence["expected_year"], "2024")
         self.assertEqual((evidence["target_season"], evidence["target_episode"]), (3, 2))
+
+    def test_merged_tmdb_season_uses_formal_segment_year_evidence(self):
+        scraper_module = self.recognition_module()
+        client = _DeterministicClient([{
+            "id": 65942,
+            "name": "Example Show",
+            "first_air_date": "2016-04-04",
+            "media_type": "tv",
+        }], {
+            "65942": {
+                "id": 65942,
+                "name": "Example Show",
+                "first_air_date": "2016-04-04",
+                "seasons": [{"season_number": 1, "episode_count": 85}],
+            },
+        })
+        tmdb = scraper_module.TMDBScraper(client=client)
+        tmdb.match_mode = "strict"
+        tmdb.get_tv_season_detail = Mock(
+            return_value=_merged_four_season_timeline()
+        )
+
+        result = tmdb.deterministic_recognize(
+            "Example.Show.2020.S02E25.1080p.mkv"
+        )
+
+        self.assertEqual((result.status, result.need_confirm), ("matched", False))
+        self.assertEqual(result.tmdb_id, "65942")
+        evidence = result.metadata.get("target_season_year_evidence")
+        self.assertIsInstance(evidence, dict)
+        self.assertEqual(evidence["date_scope"], "segment")
+        self.assertEqual(evidence["year_anchor_episode"], 26)
+        self.assertEqual(
+            (evidence["target_season"], evidence["target_episode"]),
+            (1, 50),
+        )
+        self.assertEqual(
+            result.metadata["episode_mapping"]["reason"],
+            "publisher_season_mapped_to_merged_tmdb_season",
+        )
+        detail = client.details["65942"]
+        season_detail = _merged_four_season_timeline()
+        self.assertTrue(
+            scraper_module.target_season_year_evidence_matches_detail(
+                evidence, detail, season_detail=season_detail,
+            )
+        )
+        season_detail["episodes"][25]["air_date"] = "2021-07-08"
+        self.assertFalse(
+            scraper_module.target_season_year_evidence_matches_detail(
+                evidence, detail, season_detail=season_detail,
+            )
+        )
 
     def test_target_season_air_year_accepts_unique_exact_alias_over_derivative_title(self):
         scraper_module = self.recognition_module()

@@ -5,8 +5,14 @@ import re
 from decimal import Decimal, InvalidOperation
 
 _SPECIAL_DIR = re.compile(
-    r"(?i)^(?:extras?|specials?|sps?|ova|oad|bonus|featurettes?|"
-    r"特别篇|番外篇?|特典|花絮)$"
+    r"(?ix)^(?:"
+    r"extras?|specials?|sps?|ova|oad|bonus|featurettes?|"
+    r"menus?|pvs?|cms?|promos?|promotional[ ._-]*videos?|trailers?|"
+    r"ncop|nced|ncop[ ._&+/-]*nced|"
+    r"clean[ ._-]*(?:openings?|closings?)|"
+    r"mini[ ._-]*(?:animations?|anime)|"
+    r"特别篇|番外篇?|特典|花絮|迷你动画|短篇动画|ミニアニメ"
+    r")$"
 )
 # TMDB 标记可以临时追加在目录或文件名末尾。特别篇判定必须先忽略
 # 这些身份标记，否则 ``Extra tmdb123``、``Clean Opening ... tmdb123``
@@ -24,7 +30,10 @@ _EXPLICIT_TMDB_BARE_RE = re.compile(
 )
 _SPECIAL_MEDIA_NAME = re.compile(
     r"(?i)(?:^|[ ._\-\[\(【])(?:omnibus|picture[ ._-]*drama|"
-    r"pvs?[ ._-]*cms?|ova|oav|oad|specials?|sps?)(?=$|[ ._\-\]\)】])"
+    r"pvs?(?:[ ._-]*\d{1,3})?|cms?(?:[ ._-]*\d{1,3})?|"
+    r"promos?(?:[ ._-]*\d{1,3})?|trailers?(?:[ ._-]*\d{1,3})?|"
+    r"mini[ ._-]*(?:animations?|anime)(?:[ ._-]*\d{1,3})?|"
+    r"ova|oav|oad|specials?|sps?)(?=$|[ ._\-\]\)】])"
 )
 _SP_SPECIAL_POSITION = re.compile(
     r"(?i)(?<![a-z0-9])sp(?:[ ._-]*(?P<episode>\d{1,3}))?(?![a-z0-9])"
@@ -123,7 +132,11 @@ def split_path(value: str) -> list[str]:
 
 def is_special_directory_name(value: str) -> bool:
     markerless = _strip_explicit_tmdb_markers(value)
-    return bool(_SPECIAL_DIR.fullmatch(markerless.strip()))
+    normalized = markerless.strip()
+    wrapper_pairs = {("[", "]"), ("【", "】"), ("(", ")"), ("（", "）")}
+    if len(normalized) >= 2 and (normalized[0], normalized[-1]) in wrapper_pairs:
+        normalized = normalized[1:-1].strip()
+    return bool(_SPECIAL_DIR.fullmatch(normalized))
 
 
 def is_special_path(value: str) -> bool:
@@ -210,6 +223,11 @@ def strip_special_media_markers(value: str) -> str:
     """移除特殊集位置标记，避免它们残留在作品标题中。"""
     cleaned = _ZERO_EPISODE_SPECIAL.sub(" ", str(value or ""))
     cleaned = _PROLOGUE_SPECIAL.sub(" ", cleaned)
+    cleaned = _ADJACENT_BRACKET_SPECIAL_POSITION.sub(" ", cleaned)
+    cleaned = _SPECIAL_MEDIA_NAME.sub(" ", cleaned)
+    cleaned = _SP_SPECIAL_POSITION.sub(" ", cleaned)
+    cleaned = _NC_SPECIAL_POSITION.sub(" ", cleaned)
+    cleaned = _BARE_OP_ED_POSITION.sub(" ", cleaned)
     for pattern in _FRACTIONAL_EPISODE_PATTERNS:
         cleaned = pattern.sub(" ", cleaned)
     return cleaned

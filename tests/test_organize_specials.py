@@ -10,7 +10,7 @@ from app.modules.organize import (
     Organizer,
     _special_filename_identity_hint,
 )
-from app.modules.scraper import MatchResult, TMDBScraper
+from app.modules.scraper import MatchResult, RecognitionResult, TMDBScraper
 from app.modules.directory_scrape import FixedMatchScraper
 from app.modules.organize_scan import ScannedVideo
 from tests.support import IsolatedDatabaseTestCase, release_parse_result
@@ -23,6 +23,7 @@ from app.modules.special_media import (
     is_special_media_name,
     special_media_position,
     special_parent_context,
+    strip_special_media_markers,
 )
 
 
@@ -212,6 +213,25 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
             error="候选仅命中部分标题，完整标题仍有显著片段未匹配，需要人工确认",
         )
 
+    @staticmethod
+    def _position_blocked_special_match(
+        tmdb_id="4242", *, reason="tmdb_position_season_not_found"
+    ):
+        return RecognitionResult(
+            tmdb_id=str(tmdb_id),
+            external_id=str(tmdb_id),
+            provider="tmdb",
+            title="Example Show",
+            year="2020",
+            media_type="tv",
+            confidence=0.88,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            error="文件季集位置不在 TMDB 记录范围内，需要人工确认",
+            rejected_constraints=[reason],
+        )
+
     def _same_directory_special_result(self, special_tmdb_id="4242"):
         client = _TreeClient()
         client.tree["source"][0].name = "[Group] Example Show Season 1"
@@ -246,6 +266,40 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
         )
         return organizer.organize("source", rules, dry_run=True, automatic=True)
 
+    def _same_package_path_special_result(self, special_match):
+        client = _TreeClient()
+        client.tree["source"][0].name = "[Group] Example Show Season 1"
+        client.info["show"] = client.tree["source"][0]
+        assets = GuangYaFile("assets", "PV", True, parent_id="show")
+        client.tree["show"] = [
+            GuangYaFile(
+                "episode", "Example Show - 01 [1080p].mkv",
+                False, 1024, "episode-etag", "show",
+            ),
+            assets,
+        ]
+        client.tree["assets"] = [
+            GuangYaFile(
+                "special", "01.mkv", False, 512, "special-etag", "assets"
+            )
+        ]
+        client.info["assets"] = assets
+        scraper = TMDBScraper(client=_ExactTVClient())
+
+        def match(filename, _parent_path="", **_kwargs):
+            if filename.startswith("[Group]"):
+                return special_match
+            return self._strict_tmdb_match()
+
+        scraper.match = Mock(side_effect=match)
+        organizer = Organizer(client=client, scraper=scraper)
+        rules = OrganizeRules(
+            target_dir_id="archive", small_file_mb=0,
+            region_split=False, year_split=False, clean_empty=False,
+            link_strm=False, notify_enabled=False,
+        )
+        return organizer.organize("source", rules, dry_run=True, automatic=True)
+
     def test_special_reuses_strict_same_directory_tmdb_identity(self):
         plans, stats = self._same_directory_special_result()
         by_id = {plan.file_id: plan for plan in plans}
@@ -263,6 +317,127 @@ class AutomaticSpecialsTests(IsolatedDatabaseTestCase):
                 "tmdb_id": "4242",
                 "source": "verified_regular_same_scan",
             },
+        )
+
+    def test_path_only_special_reuses_same_package_identity_after_position_rejection(self):
+        plans, stats = self._same_package_path_special_result(
+            self._position_blocked_special_match()
+        )
+        by_id = {plan.file_id: plan for plan in plans}
+
+        self.assertEqual(by_id["episode"].action, "move")
+        self.assertEqual(by_id["special"].action, "move")
+        self.assertTrue(by_id["special"].target_path.endswith("/Specials"))
+        self.assertIn("S00E01", by_id["special"].new_name)
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(stats["directory_special_identity_bindings"], 1)
+
+    def test_path_only_special_reuses_same_id_when_title_tokens_are_missing(self):
+        plans, stats = self._same_package_path_special_result(
+            RecognitionResult(
+                tmdb_id="4242",
+                external_id="4242",
+                provider="tmdb",
+                title="Example Show",
+                year="2020",
+                media_type="tv",
+                confidence=0.88,
+                threshold=0.9,
+                status="low_confidence",
+                need_confirm=True,
+                error="文件季集位置不在 TMDB 记录范围内，需要人工确认",
+                rejected_constraints=["distinctive_title_tokens_missing"],
+            )
+        )
+        by_id = {plan.file_id: plan for plan in plans}
+
+        self.assertEqual(by_id["episode"].action, "move")
+        self.assertEqual(by_id["special"].action, "move")
+        self.assertTrue(by_id["special"].target_path.endswith("/Specials"))
+        self.assertIn("S00E01", by_id["special"].new_name)
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(stats["directory_special_identity_bindings"], 1)
+
+    def test_title_token_only_rejection_requires_explicit_special_path(self):
+        match = RecognitionResult(
+            tmdb_id="4242",
+            external_id="4242",
+            provider="tmdb",
+            title="Example Show",
+            year="2020",
+            media_type="tv",
+            confidence=0.88,
+            threshold=0.9,
+            status="low_confidence",
+            need_confirm=True,
+            rejected_constraints=["distinctive_title_tokens_missing"],
+        )
+
+        self.assertFalse(
+            Organizer._special_match_can_bind_identity(match, "4242")
+        )
+        self.assertTrue(
+            Organizer._special_match_can_bind_identity(
+                match, "4242", allow_path_title_fragment=True
+            )
+        )
+
+    def test_path_only_special_reuses_unique_package_identity_when_search_has_no_result(self):
+        plans, stats = self._same_package_path_special_result(
+            RecognitionResult(
+                media_type="tv",
+                need_confirm=True,
+                error="TMDB 无搜索结果",
+                status="no_result",
+                matched_by="search",
+                threshold=0.9,
+            )
+        )
+        by_id = {plan.file_id: plan for plan in plans}
+
+        self.assertEqual(by_id["episode"].action, "move")
+        self.assertEqual(by_id["special"].action, "move")
+        self.assertEqual(by_id["special"].match.tmdb_id, "4242")
+        self.assertTrue(by_id["special"].target_path.endswith("/Specials"))
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual(stats["directory_special_identity_bindings"], 1)
+
+    def test_mapped_episode_with_final_validation_can_donate_to_same_package_special(self):
+        donor = self._strict_tmdb_match()
+        donor.matched_by = "search"
+        donor.metadata = {
+            "verified_automatic_identity_proof": {"kind": "target_season_year"},
+            "final_position_validation": {
+                "required": True,
+                "passed": True,
+                "reason": "episode_verified",
+            },
+        }
+
+        self.assertEqual(
+            Organizer._trusted_directory_tv_identity(donor), ""
+        )
+        self.assertEqual(
+            Organizer._trusted_same_scan_special_donor(donor), "4242"
+        )
+
+    def test_special_identity_binding_rejects_unrelated_constraint(self):
+        match = self._position_blocked_special_match(
+            reason="ambiguous_near_tie"
+        )
+
+        self.assertFalse(
+            Organizer._special_match_can_bind_identity(match, "4242")
+        )
+
+    def test_special_identity_binding_rejects_mixed_unrelated_constraint(self):
+        match = self._position_blocked_special_match()
+        match.rejected_constraints.append("ambiguous_near_tie")
+
+        self.assertFalse(
+            Organizer._special_match_can_bind_identity(
+                match, "4242", allow_path_title_fragment=True
+            )
         )
 
     def test_special_does_not_reuse_different_tmdb_identity(self):
@@ -753,6 +928,27 @@ class SpecialMediaTokenTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertFalse(is_special_media_name(filename))
                 self.assertIsNone(special_media_position(filename))
+
+    def test_anime_disc_asset_directories_are_exact_special_containers(self):
+        for directory in (
+            "Menu", "[PV]", "NCOP&NCED", "Mini Animation", "ミニアニメ",
+        ):
+            with self.subTest(directory=directory):
+                self.assertTrue(is_special_directory_name(directory))
+        for directory in ("Preview", "Movie Menu Collection", "Animation"):
+            with self.subTest(directory=directory):
+                self.assertFalse(is_special_directory_name(directory))
+
+    def test_pv_cm_and_mini_animation_markers_preserve_owner_title(self):
+        for filename in (
+            "Example Show [PV01].mkv",
+            "Example Show - CM 02.mkv",
+            "Example Show Mini Animation 03.mkv",
+        ):
+            with self.subTest(filename=filename):
+                self.assertTrue(is_special_media_name(filename))
+                cleaned = strip_special_media_markers(filename.rsplit(".", 1)[0])
+                self.assertEqual(re.sub(r"\s+", " ", cleaned).strip(" -[]"), "Example Show")
 
     def test_fractional_episode_detection_avoids_quality_and_size_tokens(self):
         for filename in (

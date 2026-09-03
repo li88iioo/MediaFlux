@@ -128,6 +128,78 @@ def season_episode_counts(detail: dict | None) -> dict[int, int]:
     return result
 
 
+def _single_regular_season_timeline(
+    detail: dict | None,
+    season_detail: dict | None,
+) -> tuple[int, list[tuple[int, date]]] | None:
+    """返回 TMDB 唯一常规季的完整、单调逐集时间线。
+
+    合并季映射的所有推断都必须共享这一份严格输入校验，避免年份证明、
+    cour 映射和 Organizer 最终映射各自容忍不同的脏数据。
+    """
+    counts = season_episode_counts(detail)
+    if len(counts) != 1 or not isinstance(season_detail, dict):
+        return None
+    target_season, declared_count = next(iter(counts.items()))
+    if declared_count < 1:
+        return None
+    if _positive_int(season_detail.get("season_number")) != target_season:
+        return None
+    raw_episodes = season_detail.get("episodes")
+    if not isinstance(raw_episodes, list) or len(raw_episodes) != declared_count:
+        return None
+
+    aired: list[tuple[int, date]] = []
+    seen: set[int] = set()
+    for item in raw_episodes:
+        if not isinstance(item, dict):
+            return None
+        number = _positive_int(item.get("episode_number"))
+        raw_air_date = str(item.get("air_date") or "").strip()
+        if number is None or number < 1 or number in seen or not raw_air_date:
+            return None
+        try:
+            aired_on = date.fromisoformat(raw_air_date)
+        except ValueError:
+            return None
+        seen.add(number)
+        aired.append((number, aired_on))
+    aired.sort(key=lambda item: item[0])
+    if [number for number, _aired_on in aired] != list(range(1, declared_count + 1)):
+        return None
+    if any(aired[index][1] < aired[index - 1][1] for index in range(1, len(aired))):
+        return None
+    return target_season, aired
+
+
+def _airing_segments(
+    aired: list[tuple[int, date]], *, minimum_hiatus_days: int,
+) -> list[tuple[int, int]]:
+    """按停播间隔切分连续时间线；同日批量上线保持在同一段。"""
+    if not aired:
+        return []
+    segments: list[tuple[int, int]] = []
+    segment_start = aired[0][0]
+    for index in range(1, len(aired)):
+        previous_number, previous_date = aired[index - 1]
+        current_number, current_date = aired[index]
+        if (current_date - previous_date).days >= minimum_hiatus_days:
+            segments.append((segment_start, previous_number))
+            segment_start = current_number
+    segments.append((segment_start, aired[-1][0]))
+    return segments
+
+
+def _segment_start_year(
+    aired: list[tuple[int, date]], segment: tuple[int, int],
+) -> str:
+    start, _end = segment
+    for number, aired_on in aired:
+        if number == start:
+            return str(aired_on.year)
+    return ""
+
+
 def infer_merged_season_cour_mapping(
     *,
     source_season: int | None,
@@ -135,18 +207,20 @@ def infer_merged_season_cour_mapping(
     detail: dict | None,
     season_detail: dict | None,
     directory_evidence: DirectoryEpisodeEvidence | None = None,
+    source_year: str = "",
     minimum_hiatus_days: int = 42,
+    formal_season_hiatus_days: int = 180,
 ) -> EpisodeMappingPlan:
     """把发布方分季编号映射到 TMDB 合并季中的绝对位置。
 
-    部分动画发布方把半年番/分割放送写作 ``S02E06``，而 TMDB 仍把两段
-    放送合并为单一的 Season 01。仅凭季集数量无法证明正确目标：S02E06
-    既不能直接写入不存在的第二季，也不能简单退化为 S01E06。这里要求
-    TMDB 只有一个常规季、该季集数与逐集详情完整连续，并以至少 42 天的
-    播出间隔作为分割季边界，才把第二段第 6 集映射为合并季中的对应集。
+    统一处理两类可证明场景：
 
-    调用方仍必须对返回目标执行 TMDB 最终季集校验；任何缺失或歧义均保持
-    原位置并以零置信度失败关闭。
+    * split-cour：TMDB 单季只被短期停播切成与发布季号完全相同的段数；
+    * 正式多季合并：TMDB 把多年发布的正式季度合并为一个 Season，使用
+      至少 180 天的长停播边界，并由来源年份或同目录连续集证据证明。
+
+    任何不完整时间线、段数歧义或目录编号冲突都保持原位置。调用方仍必须
+    对返回目标执行 TMDB 最终季集校验。
     """
     season = _positive_int(source_season)
     episode = _positive_int(source_episode)
@@ -158,84 +232,112 @@ def infer_merged_season_cour_mapping(
     )
     if season is None or season < 2 or episode is None or episode < 1:
         return identity
-    if isinstance(minimum_hiatus_days, bool) or minimum_hiatus_days < 1:
+    if (
+        isinstance(minimum_hiatus_days, bool)
+        or isinstance(formal_season_hiatus_days, bool)
+        or minimum_hiatus_days < 1
+        or formal_season_hiatus_days <= minimum_hiatus_days
+    ):
         return identity
 
-    counts = season_episode_counts(detail)
-    if len(counts) != 1:
+    timeline = _single_regular_season_timeline(detail, season_detail)
+    if timeline is None:
         return identity
-    target_season, declared_count = next(iter(counts.items()))
-    if declared_count < 1 or not isinstance(season_detail, dict):
-        return identity
-    season_number = _positive_int(season_detail.get("season_number"))
-    if season_number != target_season:
-        return identity
-    raw_episodes = season_detail.get("episodes")
-    if not isinstance(raw_episodes, list) or len(raw_episodes) != declared_count:
+    target_season, aired = timeline
+    declared_count = len(aired)
+
+    evidence = directory_evidence
+    evidence_valid = bool(
+        evidence is not None
+        and evidence.contiguous
+        and evidence.episode_count >= 3
+        and evidence.source_season == season
+        and evidence.range_start <= episode <= evidence.range_end
+    )
+
+    # 长停播优先表达正式季度。它不会把同一正式季内部常见的 1-cour
+    # 停播误切成额外季；来源年份只锚定该正式段的首播年，不要求跨年季中
+    # 每一集都重复使用自己的播出年。
+    formal_segments = _airing_segments(
+        aired, minimum_hiatus_days=formal_season_hiatus_days,
+    )
+    if len(formal_segments) >= season:
+        segment = formal_segments[season - 1]
+        range_start, range_end = segment
+        segment_length = range_end - range_start + 1
+        expected_year = str(source_year or "").strip()
+        ordinal_proven = len(formal_segments) == season
+        year_proven = bool(
+            re.fullmatch(r"(?:19|20)\d{2}", expected_year)
+            and _segment_start_year(aired, segment) == expected_year
+        )
+        reset_range_proven = bool(
+            evidence_valid
+            and evidence is not None
+            and evidence.range_start == 1
+            and evidence.range_end <= segment_length
+        )
+        absolute_range_proven = bool(
+            evidence_valid
+            and evidence is not None
+            and range_start <= evidence.range_start <= evidence.range_end <= range_end
+        )
+        if (
+            ordinal_proven
+            or year_proven
+            or reset_range_proven
+            or absolute_range_proven
+        ):
+            if (
+                absolute_range_proven
+                or (year_proven and range_start <= episode <= range_end)
+                or (ordinal_proven and range_start <= episode <= range_end)
+            ):
+                target_episode = episode
+                reason = "publisher_absolute_season_mapped_to_merged_tmdb_season"
+            else:
+                target_episode = range_start + episode - 1
+                reason = (
+                    "publisher_cour_mapped_to_merged_tmdb_season"
+                    if ordinal_proven
+                    else "publisher_season_mapped_to_merged_tmdb_season"
+                )
+            if range_start <= target_episode <= range_end <= declared_count:
+                return EpisodeMappingPlan(
+                    season, episode, target_season, target_episode,
+                    mode="absolute",
+                    reason=reason,
+                    confidence=1.0,
+                    range_start=range_start,
+                    range_end=range_end,
+                )
+        # 已检测到足以覆盖源季号的正式季度边界，但总段数并不以当前源季
+        # 结束，且当前文件没有年份或连续包证据。此时不能再把同一批长停播
+        # 边界降级为 cour 证据，否则后续正式季会被错配到更早分段。
         return identity
 
-    aired: list[tuple[int, date]] = []
-    seen: set[int] = set()
-    for item in raw_episodes:
-        if not isinstance(item, dict):
-            return identity
-        number = _positive_int(item.get("episode_number"))
-        raw_air_date = str(item.get("air_date") or "").strip()
-        if number is None or number < 1 or number in seen or not raw_air_date:
-            return identity
-        try:
-            aired_on = date.fromisoformat(raw_air_date)
-        except ValueError:
-            return identity
-        seen.add(number)
-        aired.append((number, aired_on))
-    aired.sort(key=lambda item: item[0])
-    if [number for number, _aired_on in aired] != list(range(1, declared_count + 1)):
-        return identity
-
-    segments: list[tuple[int, int]] = []
-    segment_start = 1
-    for index in range(1, len(aired)):
-        previous_number, previous_date = aired[index - 1]
-        current_number, current_date = aired[index]
-        # TMDB/兼容数据源偶尔会把同批上线的连续集写成相同播出日。
-        # 同日不破坏顺序，也不能成为分割季边界；只有日期倒退才说明
-        # 逐集时间线不可信并失败关闭。
-        if current_date < previous_date:
-            return identity
-        if (current_date - previous_date).days >= minimum_hiatus_days:
-            segments.append((segment_start, previous_number))
-            segment_start = current_number
-    segments.append((segment_start, declared_count))
-
-    # 只有“发布季号 == 可证明的停播分段总数”时，第 N 季与第 N 段才是
-    # 唯一对应。若 TMDB 单季里还有更多分段（例如前面的发布季本身也分
-    # cour），机械取 ``segments[season - 1]`` 会把后续季映射到更早分段。
+    # 没有正式季证明时保留既有 split-cour 规则：只有总分段数恰好等于
+    # 发布季号，才能唯一地把第 N 发布季对应到第 N 个 cour。
+    segments = _airing_segments(aired, minimum_hiatus_days=minimum_hiatus_days)
     if len(segments) != season:
         return identity
     range_start, range_end = segments[season - 1]
-
-    evidence = directory_evidence
     absolute_segment_proven = bool(
-        evidence is not None
-        and evidence.contiguous
-        and evidence.source_season == season
+        evidence_valid
+        and evidence is not None
         and evidence.range_start == range_start
         and evidence.range_end == range_end
         and evidence.episode_count == range_end - range_start + 1
-        and range_start <= episode <= range_end
     )
     if absolute_segment_proven:
         target_episode = episode
         reason = "publisher_absolute_cour_mapped_to_merged_tmdb_season"
     elif evidence is not None and evidence.range_start > 1:
-        # 目录从大于 1 的集号开始时，它表达的是绝对编号候选；若没有完整
-        # 覆盖目标分段，不能再把同一个数字二次解释成“季内第 N 集”。
         return identity
     else:
         target_episode = range_start + episode - 1
         reason = "publisher_cour_mapped_to_merged_tmdb_season"
-    if target_episode > range_end:
+    if not range_start <= target_episode <= range_end:
         return identity
     return EpisodeMappingPlan(
         season, episode, target_season, target_episode,

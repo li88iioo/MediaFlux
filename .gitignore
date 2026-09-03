@@ -32,6 +32,7 @@ db/
 /.guangya_token.json.generation
 /agent-guangya-cleanup
 /agent-guangya-rename
+/agent-guangya-workspace
 # Generated media pointers and local artifacts
 /build/
 /dist/

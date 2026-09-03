@@ -515,6 +515,26 @@ class EpisodeMappingTests(unittest.TestCase):
             })
         return {"season_number": 1, "episodes": episodes}
 
+    @staticmethod
+    def _multi_release_seasons_merged_into_one_tmdb_season():
+        """四个正式季度被 TMDB 合并为单一 Season 01 的时间线。"""
+        episodes = []
+        segments = (
+            (1, 25, date(2016, 4, 4)),
+            (26, 50, date(2020, 7, 8)),
+            (51, 66, date(2024, 10, 2)),
+            (67, 85, date(2026, 4, 1)),
+        )
+        for start, end, aired_from in segments:
+            for number in range(start, end + 1):
+                episodes.append({
+                    "episode_number": number,
+                    "air_date": (
+                        aired_from + timedelta(days=7 * (number - start))
+                    ).isoformat(),
+                })
+        return {"season_number": 1, "episodes": episodes}
+
     def test_explicit_publisher_second_cour_maps_into_merged_tmdb_season(self):
         mapping = infer_merged_season_cour_mapping(
             source_season=2,
@@ -631,6 +651,112 @@ class EpisodeMappingTests(unittest.TestCase):
             source_season=2, source_episode=14,
             detail={"seasons": [{"season_number": 1, "episode_count": 25}]},
             season_detail=self._split_cour_season_detail(),
+        )
+
+        self.assertFalse(mapping.changed)
+        self.assertEqual(mapping.confidence, 0.0)
+
+    def test_formal_second_season_year_maps_reset_numbering(self):
+        mapping = infer_merged_season_cour_mapping(
+            source_season=2,
+            source_episode=25,
+            source_year="2020",
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
+        )
+
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 50))
+        self.assertEqual((mapping.range_start, mapping.range_end), (26, 50))
+        self.assertEqual(
+            mapping.reason,
+            "publisher_season_mapped_to_merged_tmdb_season",
+        )
+        self.assertEqual(mapping.confidence, 1.0)
+
+    def test_complete_third_season_pack_maps_without_source_year(self):
+        evidence = build_directory_episode_evidence([
+            ("season3", "Example Show S3", 3, episode)
+            for episode in range(1, 17)
+        ])["season3"]
+
+        mapping = infer_merged_season_cour_mapping(
+            source_season=3,
+            source_episode=16,
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
+            directory_evidence=evidence,
+        )
+
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 66))
+        self.assertEqual((mapping.range_start, mapping.range_end), (51, 66))
+
+    def test_partial_fourth_season_pack_maps_with_contiguous_directory_evidence(self):
+        evidence = build_directory_episode_evidence([
+            ("season4", "Example Show S04 | 01-11", 4, episode)
+            for episode in range(1, 12)
+        ])["season4"]
+
+        mapping = infer_merged_season_cour_mapping(
+            source_season=4,
+            source_episode=11,
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
+            directory_evidence=evidence,
+        )
+
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 77))
+        self.assertEqual((mapping.range_start, mapping.range_end), (67, 85))
+
+    def test_formal_fourth_season_accepts_year_proven_absolute_episode(self):
+        mapping = infer_merged_season_cour_mapping(
+            source_season=4,
+            source_episode=69,
+            source_year="2026",
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
+        )
+
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 69))
+        self.assertEqual(
+            mapping.reason,
+            "publisher_absolute_season_mapped_to_merged_tmdb_season",
+        )
+
+    def test_terminal_formal_season_ordinal_maps_reset_number_without_year(self):
+        mapping = infer_merged_season_cour_mapping(
+            source_season=4,
+            source_episode=11,
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
+        )
+
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 77))
+        self.assertEqual((mapping.range_start, mapping.range_end), (67, 85))
+        self.assertEqual(
+            mapping.reason,
+            "publisher_cour_mapped_to_merged_tmdb_season",
+        )
+
+    def test_terminal_formal_season_ordinal_detects_absolute_number_without_year(self):
+        mapping = infer_merged_season_cour_mapping(
+            source_season=4,
+            source_episode=69,
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
+        )
+
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 69))
+        self.assertEqual(
+            mapping.reason,
+            "publisher_absolute_season_mapped_to_merged_tmdb_season",
+        )
+
+    def test_formal_season_mapping_fails_closed_without_year_or_pack_evidence(self):
+        mapping = infer_merged_season_cour_mapping(
+            source_season=3,
+            source_episode=11,
+            detail={"seasons": [{"season_number": 1, "episode_count": 85}]},
+            season_detail=self._multi_release_seasons_merged_into_one_tmdb_season(),
         )
 
         self.assertFalse(mapping.changed)
