@@ -1377,6 +1377,8 @@ def build_tool_registry(
         llm_domains=("media_library", "downloads", "system"),
         llm_source_kind="provider_catalog",
         llm_freshness="snapshot",
+        llm_workflow="provider_change",
+        llm_workflow_stage=10,
         llm_examples=(
             "查看 Jellyfin 可以读取哪些信息",
             "查看 qBittorrent 可用能力",
@@ -1409,6 +1411,8 @@ def build_tool_registry(
         llm_source_kind="provider_api",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="provider_change",
+        llm_workflow_stage=20,
         llm_examples=(
             "读取 Jellyfin 媒体库",
             "在媒体服务器中搜索一部剧",
@@ -1445,6 +1449,8 @@ def build_tool_registry(
         llm_source_kind="provider_change_plan",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="provider_change",
+        llm_workflow_stage=30,
         llm_examples=(
             "预览刷新刚才选中的媒体库",
             "预览暂停刚才选中的 qB 下载任务",
@@ -1476,6 +1482,8 @@ def build_tool_registry(
         llm_source_kind="provider_change_plan",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="provider_change",
+        llm_workflow_stage=40,
         llm_examples=("确认执行刚才的 Provider 写计划",),
     ))
     registry.register(ToolSpec(
@@ -2838,8 +2846,9 @@ def build_tool_registry(
         llm_read=True,
         llm_read_plan=True,
         llm_examples=(
-            "光鸭整理任务现在正常吗",
-            "查看光鸭整理和调度状态",
+            "查看 STRM 当前同步状态",
+            "有哪些 STRM 来源可以同步",
+            "STRM 同步到哪里了",
         ),
     ))
     registry.register(ToolSpec(
@@ -3010,6 +3019,8 @@ def build_tool_registry(
         llm_source_kind="guangya_snapshot",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="guangya_cleanup",
+        llm_workflow_stage=10,
         llm_examples=(
             "检查并清理光鸭整理来源里的空目录",
             "按文件名分批检查整理后只剩图片的残留目录",
@@ -3061,6 +3072,8 @@ def build_tool_registry(
         llm_source_kind="guangya_cleanup_plan",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="guangya_cleanup",
+        llm_workflow_stage=20,
         llm_examples=(
             "把刚才候选逐项判断为隔离或保留",
             "保留第 2 个残留候选，其余按现有判断",
@@ -3085,6 +3098,8 @@ def build_tool_registry(
         llm_source_kind="guangya_cleanup_plan",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="guangya_cleanup",
+        llm_workflow_stage=30,
         llm_examples=(
             "确认执行刚才的光鸭残留清理计划",
             "按预览把空目录回收并隔离垃圾残留目录",
@@ -3208,6 +3223,8 @@ def build_tool_registry(
         llm_freshness="live",
         llm_parallel_safe=False,
         confirmation_followup="guangya.fs.change.execute",
+        llm_workflow="guangya_fs_change",
+        llm_workflow_stage=10,
         llm_examples=(
             "把刚才光鸭目录中的垃圾目录移入回收站，先预览",
             "把这些对象移动到 /整理，先生成确认计划",
@@ -3231,6 +3248,8 @@ def build_tool_registry(
         llm_source_kind="guangya_fs_change_plan",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="guangya_fs_change",
+        llm_workflow_stage=20,
         llm_examples=(
             "确认执行刚才的光鸭文件变更计划",
             "按预览把这些垃圾目录移入回收站",
@@ -3307,6 +3326,8 @@ def build_tool_registry(
         llm_freshness="live",
         llm_parallel_safe=False,
         confirmation_followup="guangya.rename.execute",
+        llm_workflow="guangya_rename",
+        llm_workflow_stage=10,
         llm_examples=(
             "去掉 /整理/动漫 下面文件名中的 Mbps 码率字段",
             "递归替换光鸭目录文件名中的旧片名",
@@ -3329,6 +3350,8 @@ def build_tool_registry(
         llm_domains=("cloud_files", "organize", "media_naming", "adult_media", "strm"),
         llm_source_kind="frozen_write_plan",
         llm_parallel_safe=False,
+        llm_workflow="guangya_rename",
+        llm_workflow_stage=20,
         llm_examples=(
             "执行刚才的光鸭批量名称转换预览",
             "确认应用刚才去除码率的计划",
@@ -3339,8 +3362,9 @@ def build_tool_registry(
     registry.register(ToolSpec(
         name="guangya.directory_scrape.inspect",
         description=(
-            "按当前整理规则只读检查一个精确光鸭绝对路径、目录 ID 或视频文件 ID，"
-            "并在当前会话保存短期检查上下文；路径只在服务端解析，不向外返回对象 ID。"
+            "按当前整理规则只读检查一个需要规整、刮削或重新归档的精确光鸭绝对路径、"
+            "目录 ID 或视频文件 ID，并在当前会话保存短期检查上下文；后续可搜索 TMDB、"
+            "预览新归档目录与批量编号方案。路径只在服务端解析，不向外返回对象 ID。"
         ),
         risk=RiskLevel.READ,
         parameters={
@@ -3363,8 +3387,11 @@ def build_tool_registry(
         llm_domains=("organize", "media_identity", "cloud_files"),
         llm_source_kind="system_state",
         llm_parallel_safe=False,
+        llm_workflow="guangya_directory_scrape",
+        llm_workflow_stage=10,
         llm_examples=(
             "检查并整理光鸭 /待整理/某剧，只生成预览",
+            "规整光鸭根目录/动漫中的某部剧并创建新的归档目录",
             "检查光鸭目录 123 是否能刮削",
             "检查光鸭文件 abc123",
         ),
@@ -3388,11 +3415,16 @@ def build_tool_registry(
         llm_domains=("organize", "media_identity", "discovery"),
         llm_source_kind="metadata_catalog",
         llm_parallel_safe=False,
+        llm_workflow="guangya_directory_scrape",
+        llm_workflow_stage=20,
         llm_examples=("给刚才的光鸭目录搜索匹配", "用刚才识别出的标题搜索刮削候选"),
     ))
     registry.register(ToolSpec(
         name="guangya.directory_scrape.preview",
-        description="按当前会话最近的匹配候选生成安全刮削预览；只做 dry-run，不移动、重命名或删除云盘文件。",
+        description=(
+            "按当前会话最近的匹配候选生成安全刮削预览，展示将创建的归档目录、TMDB "
+            "绝对集数或季度编号映射以及批量重命名结果；只做 dry-run，不移动、重命名或删除云盘文件。"
+        ),
         risk=RiskLevel.READ,
         parameters={
             "type": "object",
@@ -3414,7 +3446,12 @@ def build_tool_registry(
         llm_source_kind="system_state",
         llm_parallel_safe=False,
         confirmation_followup="guangya.directory_scrape.run",
-        llm_examples=("预览刚才第 1 个刮削候选",),
+        llm_workflow="guangya_directory_scrape",
+        llm_workflow_stage=30,
+        llm_examples=(
+            "预览刚才第 1 个刮削候选",
+            "按 TMDB 绝对集数 1-85 预览刚才的目录规整方案",
+        ),
     ))
     registry.register(ToolSpec(
         name="guangya.directory_scrape.run",
@@ -3429,6 +3466,8 @@ def build_tool_registry(
         llm_domains=("organize", "media_identity"),
         llm_source_kind="frozen_write_plan",
         llm_parallel_safe=False,
+        llm_workflow="guangya_directory_scrape",
+        llm_workflow_stage=40,
         llm_examples=("执行刚才的光鸭刮削预览", "确认整理刚才检查的光鸭目录"),
     ))
 
@@ -3442,6 +3481,8 @@ def build_tool_registry(
         llm_read=True,
         llm_read_plan=True,
         confirmation_followup="guangya.organize.run_once",
+        llm_workflow="guangya_organize",
+        llm_workflow_stage=10,
     ))
     registry.register(ToolSpec(
         name="guangya.organize.run_once",
@@ -3453,6 +3494,8 @@ def build_tool_registry(
         context_confirmed_handler=ToolSpec.context_free_confirmed_handler(run_guangya_organize_once_confirmed),
         context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(prepare_guangya_organize_run_once),
         llm_confirmation=True,
+        llm_workflow="guangya_organize",
+        llm_workflow_stage=20,
         llm_examples=(
             "执行一次光鸭整理",
             "开始整理光鸭云盘",
@@ -3502,6 +3545,8 @@ def build_tool_registry(
             "联网查公开网页信息",
             "核对某部动画官方最新更新到第几集",
             "查询官方平台目前播到哪里",
+            "最近有什么推荐的国漫",
+            "今年或指定年份有哪些新剧",
         ),
     ))
     registry.register(ToolSpec(
@@ -3621,6 +3666,8 @@ def build_tool_registry(
         context_handler=get_discovery_mapping_candidates,
         validator=discovery_mapping_candidates_arguments,
         llm_read=True,
+        llm_workflow="discovery_mapping",
+        llm_workflow_stage=10,
         llm_examples=("查看刚才第 2 个的 TMDB 映射候选",),
     ))
     registry.register(ToolSpec(
@@ -3638,6 +3685,8 @@ def build_tool_registry(
         context_confirmation_preparer=prepare_confirm_discovery_mapping,
         context_confirmed_handler=confirm_discovery_mapping_confirmed,
         llm_confirmation=True,
+        llm_workflow="discovery_mapping",
+        llm_workflow_stage=20,
         llm_examples=("确认第 1 个映射",),
     ))
 
@@ -3737,6 +3786,13 @@ def build_tool_registry(
         handler=recommend_discovery,
         validator=discovery_recommend_arguments,
         llm_read=True,
+        llm_examples=(
+            "最近想看点科幻",
+            "最近有什么推荐的国漫",
+            "推荐几部电影",
+            "推荐今年中国大陆的新动画剧集",
+            "今年或指定年份有哪些新剧",
+        ),
     ))
     registry.register(ToolSpec(
         name="bangumi.calendar",
@@ -3820,7 +3876,7 @@ def build_tool_registry(
             "帮我下载《某片》",
             "下载某部电视剧",
             "核对某部连载动画的资源索引跟进到第几集",
-            "查看动画更新到第几集的资源索引旁证",
+            "检查订阅更新并在需要时搜索资源",
         ),
     ))
     registry.register(ToolSpec(
@@ -3851,6 +3907,8 @@ def build_tool_registry(
         llm_source_kind="ingest_snapshot",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="ingest_submit",
+        llm_workflow_stage=10,
         llm_examples=("解析这个光鸭分享链接", "检查这个磁力链接能否下载", "查看刚才搜索到的资源候选"),
     ))
     registry.register(ToolSpec(
@@ -3886,6 +3944,8 @@ def build_tool_registry(
         llm_source_kind="ingest_snapshot",
         llm_freshness="live",
         llm_parallel_safe=False,
+        llm_workflow="ingest_submit",
+        llm_workflow_stage=20,
         llm_examples=("把刚才的磁力提交到 qB", "把这个光鸭分享全部转存", "把刚才第 1、3 个资源提交到两边"),
     ))
     registry.register(ToolSpec(

@@ -49,6 +49,7 @@ _RESOURCE_MARKERS = (
 )
 _LIBRARY_MARKERS = (
     "媒体库", "本地库", "jellyfin", "emby", "入库", "本地收录", "缺集", "漏集",
+    "本地有", "本地多少", "本地几集",
 )
 _DOMAIN_MARKERS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("system", ("系统状态", "运行状态", "系统正常", "项目正常", "系统健康", "系统简报")),
@@ -143,7 +144,7 @@ def infer_media_intent(value: object) -> MediaIntentProfile:
 
     if "只查官方" in text or "只看官方" in text or "只要官方" in text:
         forbidden_sources.extend(("local_library", "resource_index"))
-    elif release_status:
+    elif official_progress:
         if not local_library:
             forbidden_sources.append("local_library")
         if not resource_search:
@@ -205,6 +206,12 @@ def capability_semantics(capability: Mapping[str, Any]) -> dict[str, Any]:
     evidence_role = str(raw.get("evidence_role") or "primary").strip().lower()
     freshness = str(raw.get("freshness") or "snapshot").strip().lower()
     parallel_safe = raw.get("parallel_safe") is not False
+    workflow = str(raw.get("workflow") or "").strip().lower()
+    try:
+        workflow_stage = int(raw.get("workflow_stage") or 0)
+    except (TypeError, ValueError):
+        workflow_stage = 0
+    confirmation_followup = str(raw.get("confirmation_followup") or "").strip()
     inferred_from_name = not domains
 
     if not domains:
@@ -271,6 +278,9 @@ def capability_semantics(capability: Mapping[str, Any]) -> dict[str, Any]:
         "evidence_role": evidence_role,
         "freshness": freshness,
         "parallel_safe": parallel_safe,
+        "workflow": workflow,
+        "workflow_stage": workflow_stage,
+        "confirmation_followup": confirmation_followup,
     }
 
 

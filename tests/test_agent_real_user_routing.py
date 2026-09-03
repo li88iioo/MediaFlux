@@ -44,27 +44,31 @@ class AgentRealUserRoutingTests(unittest.TestCase):
             registry.register(_read_tool(name, calls))
         return AgentOrchestrator(registry), calls
 
-    def test_mixed_rss_and_media_subscription_summary_executes_both_reads(self):
+    def test_mixed_subscription_summary_falls_back_to_both_reads(self):
         agent, calls = self._agent(
             "rss.subscription_summaries",
             "media.subscription_summaries",
         )
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             response = agent.query(
                 "我配置了哪些 RSS 订阅源？再列出媒体追更订阅",
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        model.assert_called_once()
         self.assertEqual(response["tool_call"]["name"], "agent.read_plan")
         self.assertEqual(calls, [
             ("rss.subscription_summaries", {}),
             ("media.subscription_summaries", {}),
         ])
 
-    def test_local_and_guangya_failure_questions_do_not_get_stolen_by_model(self):
+    def test_local_and_guangya_failure_questions_keep_deterministic_fallback(self):
         agent, calls = self._agent("local_media.diagnose", "organize.audit_logs")
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             local = agent.query(
                 "本地整理最近有没有失败或待确认？",
                 owner="web-owner",
@@ -75,7 +79,7 @@ class AgentRealUserRoutingTests(unittest.TestCase):
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        self.assertEqual(model.call_count, 2)
         self.assertEqual(local["tool_call"]["name"], "local_media.diagnose")
         self.assertEqual(guangya["tool_call"]["name"], "organize.audit_logs")
         self.assertEqual(guangya["tool_call"]["arguments"], {
@@ -85,7 +89,9 @@ class AgentRealUserRoutingTests(unittest.TestCase):
 
     def test_guangya_root_and_followup_directory_browse_use_read_only_list(self):
         agent, calls = self._agent("guangya.fs.query")
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             root = agent.query(
                 "帮我看下光鸭云盘根目录有哪些文件夹",
                 owner="web-owner",
@@ -102,7 +108,7 @@ class AgentRealUserRoutingTests(unittest.TestCase):
                 trusted_conversation_context=True,
                 present=False,
             )
-        model.assert_not_called()
+        self.assertEqual(model.call_count, 2)
         self.assertEqual(root["tool_call"]["arguments"]["path"], "/")
         self.assertEqual(child["tool_call"]["arguments"]["path"], "/3")
         self.assertEqual([name for name, _args in calls], [
@@ -173,13 +179,15 @@ class AgentRealUserRoutingTests(unittest.TestCase):
 
     def test_arbitrary_guangya_cleanup_starts_with_read_only_frozen_preview(self):
         agent, calls = self._agent("guangya.organize.cleanup.preview")
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             response = agent.query(
                 "清理光鸭根目录 3 中的空目录和垃圾残余",
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        model.assert_called_once()
         self.assertEqual(
             response["tool_call"]["name"],
             "guangya.organize.cleanup.preview",
@@ -191,13 +199,15 @@ class AgentRealUserRoutingTests(unittest.TestCase):
 
     def test_media_metadata_wording_and_ordinal_rating_keep_discovery_context(self):
         agent, _calls = self._agent("discovery.search", "discovery.lookup_rating")
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             response = agent.query(
                 "搜索《暗芝居》的影视资料",
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        model.assert_called_once()
         self.assertEqual(response["tool_call"]["name"], "discovery.search")
         self.assertEqual(response["tool_call"]["arguments"]["query"], "暗芝居")
 
@@ -233,13 +243,15 @@ class AgentRealUserRoutingTests(unittest.TestCase):
 
     def test_year_specific_new_donghua_recommendation_runs_catalog_and_public_web(self):
         agent, calls = self._agent("discovery.recommend", "web.search")
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             response = agent.query(
                 "2026 年有哪些新国漫？",
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        model.assert_called_once()
         self.assertEqual(response["tool_call"]["name"], "agent.read_plan")
         self.assertEqual(calls[0], (
             "discovery.recommend",
@@ -327,7 +339,9 @@ class AgentRealUserRoutingTests(unittest.TestCase):
             "local_media.task_summaries",
             "local_media.diagnose",
         )
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             sources = agent.query(
                 "本地整理配置了哪些来源？哪些开启了 qB 完成自动接管？",
                 owner="web-owner",
@@ -338,7 +352,7 @@ class AgentRealUserRoutingTests(unittest.TestCase):
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        self.assertEqual(model.call_count, 2)
         self.assertEqual(sources["tool_call"]["name"], "local_media.source_summaries")
         self.assertEqual(tasks["tool_call"]["name"], "local_media.task_summaries")
         self.assertEqual(tasks["tool_call"]["arguments"]["scope"], "attention")
@@ -353,7 +367,9 @@ class AgentRealUserRoutingTests(unittest.TestCase):
             "agent.capabilities",
             "config.safe_policy_summary",
         )
-        with patch.object(agent, "_query_with_model_tools") as model:
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=None
+        ) as model:
             runtime = agent.query(
                 "Agent、Telegram 接入和模型路由现在是否启用？",
                 owner="web-owner",
@@ -369,7 +385,7 @@ class AgentRealUserRoutingTests(unittest.TestCase):
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        self.assertEqual(model.call_count, 3)
         self.assertEqual(runtime["tool_call"]["name"], "agent.runtime_status")
         self.assertEqual(indexers["tool_call"]["name"], "config.indexer_sites_summary")
         self.assertEqual(safety["tool_call"]["name"], "agent.read_plan")
@@ -446,7 +462,7 @@ class AgentRealUserRoutingTests(unittest.TestCase):
             }
 
         with patch.object(agent, "prepare", side_effect=prepared), patch.object(
-            agent, "_query_with_model_tools"
+            agent, "_query_with_model_tools", return_value=None
         ) as model:
             telegram = agent.query(
                 "给我的 Telegram 发送一条测试通知",
@@ -458,7 +474,7 @@ class AgentRealUserRoutingTests(unittest.TestCase):
                 owner="web-owner",
                 present=False,
             )
-        model.assert_not_called()
+        self.assertEqual(model.call_count, 2)
         self.assertEqual(telegram["tool_call"]["name"], "telegram.send_test_notification")
         self.assertEqual(restart["tool_call"]["name"], "media_proxy.restart_instance")
         self.assertEqual(calls, [

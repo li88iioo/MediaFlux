@@ -29,6 +29,7 @@ logger = get_logger(__name__)
 _NATIVE_ALIAS_RE = re.compile(r"^mf_[A-Za-z0-9_-]{1,61}$")
 _LLM_EXAMPLE_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _LLM_SEMANTIC_LABEL_RE = re.compile(r"^[a-z][a-z0-9_]{1,47}$")
+_LLM_WORKFLOW_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 class AgentToolError(ValueError):
@@ -101,6 +102,16 @@ class ToolRegistry:
             raise ValueError(f"invalid LLM capability freshness: {name}")
         if not isinstance(spec.llm_parallel_safe, bool):
             raise ValueError(f"invalid LLM capability parallel flag: {name}")
+        workflow = str(spec.llm_workflow or "").strip()
+        if workflow and not _LLM_WORKFLOW_RE.fullmatch(workflow):
+            raise ValueError(f"invalid LLM capability workflow: {name}")
+        if (
+            isinstance(spec.llm_workflow_stage, bool)
+            or not isinstance(spec.llm_workflow_stage, int)
+            or not 0 <= spec.llm_workflow_stage <= 100
+            or (spec.llm_workflow_stage and not workflow)
+        ):
+            raise ValueError(f"invalid LLM capability workflow stage: {name}")
         if spec.llm_confirmation and (
             spec.risk is RiskLevel.READ
             or not spec.requires_confirmation

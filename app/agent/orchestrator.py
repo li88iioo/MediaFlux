@@ -25,8 +25,7 @@ from app.agent.action_history import (
     record_confirmation_interrupted,
     record_confirmed_result,
 )
-from app.agent.capability_retrieval import capability_semantics, infer_media_intent
-from app.agent.objective_contract import infer_agent_objective
+from app.agent.capability_retrieval import infer_media_intent
 from app.agent.confirmation import (
     ConfirmationStore,
     SQLiteConfirmationStore,
@@ -6027,6 +6026,55 @@ _GENERIC_MEDIA_LIBRARY_REFRESH_RE = re.compile(
     re.IGNORECASE,
 )
 
+_AGENT_CONTROL_GUIDANCE_RE = re.compile(
+    r"^(?:请|帮我|请帮我|我想|我想要|我要|我需要|想|要)?\s*"
+    r"(?:开启|打开|启用|关闭|停用|禁用)\s*(?:agent|智能助手)(?:吧|呢|啊)?[。！？!?]?$",
+    re.IGNORECASE,
+)
+_HOST_DRIVE_MAINTENANCE_RE = re.compile(
+    r"(?:扫描|检查|清理|整理).{0,24}(?:[a-z]\s*[:：]?\s*盘|系统盘|宿主机磁盘)|"
+    r"(?:[a-z]\s*[:：]?\s*盘|系统盘|宿主机磁盘).{0,24}(?:扫描|检查|清理|整理)",
+    re.IGNORECASE,
+)
+_AMBIGUOUS_LIBRARY_SYNC_RE = re.compile(
+    r"^(?:(?:请|麻烦)?(?:帮我)?(?:同步|刷新|扫描|更新)(?:一下|一次)?"
+    r"(?:媒体库|本地媒体库|jellyfin|emby)(?:吧|呢|啊)?[。！？!?]?)$",
+    re.IGNORECASE,
+)
+_STRM_SOURCE_LIST_RE = re.compile(
+    r"(?:有哪些|哪些|列出|查看|看看|显示).{0,20}strm.{0,16}(?:来源|目录)|"
+    r"strm.{0,16}(?:有哪些|哪些|来源列表|目录列表|可同步)",
+    re.IGNORECASE,
+)
+_AGENT_RUNTIME_STATUS_RE = re.compile(
+    r"^(?:查看|检查|看看)?\s*(?:agent|智能助手).{0,18}(?:状态|能力|能做什么|操作历史|任务)|"
+    r"^(?:agent|智能助手).{0,10}(?:开启了吗|启用了吗|正常吗)$|"
+    r"(?:telegram|tg|机器人|bot).{0,18}(?:通知|消息|agent)?.{0,12}"
+    r"(?:状态|开启了吗|启用了吗|是否开启|是否启用|正常吗|能用吗)|"
+    r"(?:查看|检查|确认).{0,12}(?:telegram|tg|机器人|bot).{0,12}(?:状态|配置)",
+    re.IGNORECASE,
+)
+
+
+def _is_agent_control_guidance_message(message: str) -> bool:
+    return bool(_AGENT_CONTROL_GUIDANCE_RE.fullmatch(str(message or "").strip()))
+
+
+def _is_host_drive_maintenance_message(message: str) -> bool:
+    return bool(_HOST_DRIVE_MAINTENANCE_RE.search(str(message or "")))
+
+
+def _is_ambiguous_library_sync_message(message: str) -> bool:
+    return bool(_AMBIGUOUS_LIBRARY_SYNC_RE.fullmatch(str(message or "").strip()))
+
+
+def _is_strm_source_list_message(message: str) -> bool:
+    return bool(_STRM_SOURCE_LIST_RE.search(str(message or "")))
+
+
+def _is_agent_runtime_status_message(message: str) -> bool:
+    return bool(_AGENT_RUNTIME_STATUS_RE.search(str(message or "").strip()))
+
 
 def is_ambiguous_media_library_refresh_message(message: str) -> bool:
     """泛媒体库刷新没有安全目标，必须先让用户选择具体库。"""
@@ -8819,12 +8867,8 @@ class AgentOrchestrator:
         replay_steps: list[tuple[str, dict[str, Any]]] = []
         suggestions: list[str] = []
         total_elapsed_ms = 0
-        objective = infer_agent_objective(message)
-        required_sources = set(objective.required_sources)
         succeeded = 0
-        required_source_successes: set[str] = set()
-        required_step_failures = 0
-        supporting_failed = 0
+        failed = 0
         for position, execution in enumerate(executions, start=1):
             tool_name = str(execution.get("tool_name") or "").strip()
             arguments = execution.get("arguments")
@@ -8862,26 +8906,10 @@ class AgentOrchestrator:
                 ).to_dict()
             else:
                 result = deepcopy(result)
-            semantics = capability_semantics(
-                self.registry.llm_capability_for(tool_name)
-                if self.registry.has(tool_name)
-                else {"name": tool_name}
-            )
-            source_kind = str(semantics.get("source_kind") or "")
-            objective_tools = frozenset(objective.allowed_tools)
-            is_required = (
-                not required_sources
-                or tool_name in objective_tools
-                or source_kind in required_sources
-            )
             if result.get("ok") is True:
                 succeeded += 1
-                if required_sources and source_kind in required_sources:
-                    required_source_successes.add(source_kind)
-            elif is_required:
-                required_step_failures += 1
             else:
-                supporting_failed += 1
+                failed += 1
             for item in result.get("suggestions", []):
                 text = result_projection.sanitize_public_text(item, limit=240)
                 if text and text not in suggestions:
@@ -8898,30 +8926,21 @@ class AgentOrchestrator:
             if text and text not in suggestions:
                 suggestions.append(text)
 
-        failed = len(public_steps) - succeeded
-        missing_required_sources = required_sources - required_source_successes
-        required_failed = (
-            len(missing_required_sources) + required_step_failures
-            if required_sources else failed
-        )
-        required_evidence_complete = (
-            not missing_required_sources and required_step_failures == 0
-            if required_sources else failed == 0
-        )
-        fully_completed = bool(completed and required_evidence_complete)
+        # 不再根据中央意图合同猜测模型“本应”调用哪些来源。是否已完整
+        # 回答由原生循环的最终状态与真实执行结果共同决定；失败步骤仍完整保留。
+        fully_completed = bool(completed and succeeded > 0)
+        required_failed = 0 if fully_completed else failed
+        supporting_failed = failed if fully_completed else 0
         if fully_completed:
             summary = f"综合检查完成：{succeeded} 项已获得结果"
-            if supporting_failed:
-                summary += f"，{supporting_failed} 项辅助检查未返回"
+            if failed:
+                summary += f"，{failed} 项检查未返回"
             error = ""
-        elif required_failed:
+        elif failed:
             summary = (
                 f"综合检查完成：{succeeded} 项已获得结果，"
-                f"{required_failed} 项关键检查需要关注"
+                f"{failed} 项检查需要关注"
             )
-            error = "关键检查未能完整返回。"
-        elif failed:
-            summary = f"综合检查完成：{succeeded} 项已获得结果，{failed} 项需要关注"
             error = "部分检查未能正常完成。"
         else:
             summary = f"已保留 {succeeded} 项检查结果，但后续归纳未完整结束"
@@ -8990,15 +9009,9 @@ class AgentOrchestrator:
         emit_agent_progress("model_wait")
         rate_identity = llm_tool_rate_identity or llm_rate_owner or owner
         action_request = is_agent_action_request(message)
-        objective = infer_agent_objective(message)
-        allow_confirmation_plans = bool(
-            owner
-            and not read_only
-            and (
-                action_request
-                or objective.task_kind in {"strm_source_sync", "organize_object"}
-            )
-        )
+        # 已认证且非只读的会话始终可让模型看到受控动作能力。自然语言是否
+        # 表达写意图由模型依据工具说明判断；服务端永远只会生成一张确认票据。
+        allow_confirmation_plans = bool(owner and not read_only)
         model_conversation_context = self._append_action_plan_context(
             conversation_context,
             self._active_action_plan_context(owner=owner),
@@ -9097,10 +9110,6 @@ class AgentOrchestrator:
             _NATIVE_RESOURCE_CAPTURE.reset(native_capture_token)
 
         if native_reply is None:
-            if objective.max_capabilities <= 0:
-                # 明确的说明/方案咨询应交给无工具对话回答，不能再回退到
-                # 旧单工具选择器并被“推荐”等词误路由到媒体发现能力。
-                return None
             # 原生认知循环已经优先尝试。对“怎么回事/关注一下”这类依赖
             # 上下文的开放追问，不再交给旧单工具选择器猜测；由后置窄续句
             # 解释或澄清，避免 broad briefing 被误路由成任意单工具。
@@ -10591,7 +10600,7 @@ class AgentOrchestrator:
             )
         if is_strm_failure_triage_message(lower):
             return self._invoke_query_read("strm.triage_failures", {})
-        if infer_agent_objective(message).task_kind == "strm_source_catalog":
+        if _is_strm_source_list_message(message):
             return self._invoke_query_read(
                 "strm.status", {}, owner=owner,
                 rate_identity=query_tool_rate_identity,
@@ -10770,13 +10779,12 @@ class AgentOrchestrator:
                 ],
             )
 
-        initial_objective = infer_agent_objective(message)
-        if initial_objective.task_kind == "agent_control_guidance":
+        if _is_agent_control_guidance_message(message):
             return self._conversation_response(
                 "Agent 开关由独立控制面管理。请发送 /agent 查看当前状态，再选择开启或关闭。",
                 ["传统整理、STRM、RSS、搜索与状态命令不受 Agent 开关影响。"],
             )
-        if initial_objective.task_kind == "host_drive_guidance":
+        if _is_host_drive_maintenance_message(message):
             return self._conversation_response(
                 "我不能直接扫描宿主机的 C 盘或系统盘。MediaFlux 只能检查已经挂载到容器、"
                 "并配置为本地媒体来源的目录。",
@@ -10785,7 +10793,7 @@ class AgentOrchestrator:
                     "先在 Docker volumes 中挂载目标目录，再添加为本地媒体来源",
                 ],
             )
-        if initial_objective.task_kind == "library_sync_clarification":
+        if _is_ambiguous_library_sync_message(message):
             return self._clarification_response(
                 "“同步媒体库”可能指不同动作，请先选一个范围，我不会替你猜测并执行。",
                 [
@@ -10795,8 +10803,7 @@ class AgentOrchestrator:
                 ],
             )
         if (
-            initial_objective.task_kind == "media_library_refresh"
-            and is_ambiguous_media_library_refresh_message(message)
+            is_ambiguous_media_library_refresh_message(message)
         ):
             return self._clarification_response(
                 "刷新媒体库需要指定一个具体的 Jellyfin / Emby 媒体库；Agent 不会把泛指请求扩成全库扫描。",
@@ -10864,23 +10871,7 @@ class AgentOrchestrator:
         )
         deterministic_qb_realtime = bool(_QB_REALTIME_STATUS_PATTERN.search(message))
         deterministic_media_counts = bool(_MEDIA_LIBRARY_TOTAL_PATTERN.search(message))
-        deterministic_agent_runtime = initial_objective.task_kind in {
-            "agent_status", "telegram_status",
-        }
-        deterministic_telegram_test = is_telegram_test_notification_message(message)
-        deterministic_rss_refresh = is_rss_subscription_refresh_write_message(message)
-        deterministic_rss_binding = bool(
-            deterministic_rss_refresh
-            or (
-                not _is_dangerous_action_discussion(message)
-                and (
-                rss_subscription_control_request(message) is not None
-                or rss_subscription_control_name_request(message) is not None
-                or rss_subscription_refresh_request(message) is not None
-                or rss_subscription_refresh_name(message) is not None
-                )
-            )
-        )
+        deterministic_agent_runtime = _is_agent_runtime_status_message(message)
         deterministic_local_specific = bool(
             local_media_intents.local_media_task_request(message) is not None
             or local_media_intents.local_media_source_summary_request(message) is not None
@@ -10930,64 +10921,26 @@ class AgentOrchestrator:
             self.registry.has("local_media.diagnose")
             and local_media_intents.is_local_media_diagnosis_message(message)
         )
-        deterministic_organize_audit = (
-            organize_audit_request(message)
-            if self.registry.has("organize.audit_logs")
-            else None
-        )
         deterministic_mixed_subscriptions = (
             self.registry.has("rss.subscription_summaries")
             and self.registry.has("media.subscription_summaries")
             and is_mixed_subscription_summary_message(message)
         )
-        deterministic_discovery_metadata_search = (
-            self.registry.has("discovery.search")
-            and is_discovery_search_message(message)
-            and any(token in lower for token in ("影视资料", "影视信息", "条目资料", "条目信息"))
-        )
-        deterministic_new_donghua_recommend = (
-            self.registry.has("discovery.recommend")
-            and is_discovery_recommend_message(message)
-            and "新" in lower
-            and any(token in lower for token in ("国漫", "国创", "国产动画"))
-        )
-        deterministic_indexer_change = (
-            indexer_site_change_request(lower)
-            if "索引站" in lower
-            and any(token in lower for token in ("启用", "开启", "打开", "停用", "禁用", "关闭"))
-            else None
-        )
-        skip_model_for_exact_route = bool(
-            deterministic_qb_realtime
-            or deterministic_media_counts
-            or deterministic_agent_runtime
-            or deterministic_telegram_test
-            or deterministic_rss_binding
-            or deterministic_local_specific
-            or deterministic_indexer_summary
-            or deterministic_safe_policy_summary
-            or deterministic_agent_safety
-            or deterministic_media_proxy_restart
-            or deterministic_playback_compound
-            or deterministic_indexer_change is not None
+        # 普通业务请求一律先由模型阅读完整能力目录并自主编排。下面这些
+        # 确定性解析结果仅在 Provider 不可用、返回非法工具选择或无法完成时
+        # 作为兼容降级；它们不再决定正常链路能看到哪些工具。这里只保留两类
+        # 模型前置边界：owner 作用域内的资源续接、分页游标，以及必须由
+        # 服务端把名称绑定到真实订阅对象的操作，避免模型猜测内部 ID 或
+        # observation_ref。它们属于上下文完整性约束，不是业务意图白名单。
+        has_bound_context_route = bool(
+            has_deterministic_media_subscription_binding
             or deterministic_guangya_page is not None
-            or deterministic_guangya_browse is not None
-            or deterministic_guangya_cleanup_preview is not None
-            or deterministic_local_diagnosis
-            or deterministic_organize_audit is not None
-            or deterministic_mixed_subscriptions
-            or deterministic_discovery_metadata_search
-            or deterministic_new_donghua_recommend
         )
-        # 已认证会话默认由模型先理解当前目标；服务端注册表仍决定工具是只读
-        # 执行还是只能生成行动计划。仅保留需要服务端把媒体名称精确绑定到订阅
-        # 编号的路径，避免模型猜测对象；其余确定性解析器只作为 Provider 降级。
-        model_routing_attempted = has_deterministic_media_subscription_binding
+        model_routing_attempted = has_bound_context_route
         if (
             allow_model_routing
             and not has_resource_continuation
-            and not has_deterministic_media_subscription_binding
-            and not skip_model_for_exact_route
+            and not has_bound_context_route
         ):
             model_routing_attempted = True
             model_read = self._query_with_model_tools(
@@ -11704,7 +11657,15 @@ class AgentOrchestrator:
             arguments = _discovery_recommend_arguments_with_context(
                 message, conversation_context
             )
-            if "public_web" in initial_objective.required_sources:
+            explicit_year = str(arguments.get("year") or "").strip()
+            needs_current_web = any(
+                token in lower
+                for token in ("最近", "最新", "今年", "新剧", "新番", "定档", "上线")
+            ) or (
+                explicit_year.isdigit()
+                and int(explicit_year) >= date.today().year
+            )
+            if needs_current_web and self.registry.has("web.search"):
                 web_terms = [
                     str(arguments.get(key) or "").strip()
                     for key in ("year", "region", "genre")

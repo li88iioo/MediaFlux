@@ -17,12 +17,10 @@ class AgentCapabilityRetrievalTests(unittest.TestCase):
             for item in _native_read_capabilities(self.registry, message)
         }
 
-    def test_official_progress_covers_web_library_and_indexer_evidence(self):
+    def test_official_progress_uses_public_web_as_primary_evidence(self):
         names = self._names("沧元图官方更新到多集啦？")
 
-        self.assertIn("web.search", names)
-        self.assertIn("library.check_updates", names)
-        self.assertIn("indexer.search_resources", names)
+        self.assertEqual(names, {"web.search"})
 
     def test_official_only_scope_excludes_local_and_resource_sources(self):
         profile = infer_media_intent("只查官方：沧元图现在播到第几集，不要本地和资源")
@@ -38,7 +36,7 @@ class AgentCapabilityRetrievalTests(unittest.TestCase):
         names = self._names("搜索沧元图第三季第22集资源")
 
         self.assertEqual(profile.presentation_hint, "resource_candidates")
-        self.assertIn("indexer.search_resources", names)
+        self.assertIn("library.search_missing_episode_resources", names)
         self.assertNotIn("web.search", names)
 
     def test_media_hygiene_recalls_nsfw_filename_cleanup(self):
@@ -75,12 +73,11 @@ class AgentCapabilityRetrievalTests(unittest.TestCase):
 
         self.assertIn("guangya.fs.change.preview", names)
 
-    def test_exact_guangya_residual_cleanup_recalls_generic_query_and_targeted_cleanup(self):
+    def test_exact_guangya_residual_cleanup_recalls_targeted_safe_preview(self):
         names = self._names("清理光鸭根目录 3 文件夹中的垃圾残余目录")
 
-        self.assertIn("guangya.fs.query", names)
         self.assertIn("guangya.organize.cleanup.preview", names)
-        self.assertIn("guangya.fs.change.preview", names)
+        self.assertNotIn("guangya.organize.cleanup.execute", names)
 
     def test_guangya_recycle_bin_followup_recalls_generic_change_plan(self):
         names = self._names("把刚才看到的对象移入光鸭回收站")

@@ -114,6 +114,10 @@ class ToolSpec:
     llm_evidence_role: str = "primary"
     llm_freshness: str = "snapshot"
     llm_parallel_safe: bool = True
+    # 多阶段能力只需在工具注册处声明一次工作流关系。路由器仅补齐模型
+    # 所选阶段之前的必要步骤，不自动暴露后续写阶段，也不维护自然语言合同。
+    llm_workflow: str = ""
+    llm_workflow_stage: int = 0
     # 只用于模型候选召回与能力说明，不参与权限、风险、确认或限流判定。
     llm_examples: tuple[str, ...] = ()
 
@@ -171,5 +175,8 @@ class ToolSpec:
             "evidence_role": self.llm_evidence_role,
             "freshness": self.llm_freshness,
             "parallel_safe": self.llm_parallel_safe,
+            "workflow": self.llm_workflow,
+            "workflow_stage": self.llm_workflow_stage,
+            "confirmation_followup": self.confirmation_followup,
         }
         return capability

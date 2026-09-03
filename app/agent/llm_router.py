@@ -9,7 +9,7 @@ import secrets
 import unicodedata
 from collections.abc import Mapping
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any, AsyncIterator, Callable
 
@@ -37,6 +37,7 @@ from app.agent.prompts import (
     conversation_stream_system_prompt,
     conversation_summary_system_prompt,
     draft_rewrite_system_prompt,
+    native_capability_selection_system_prompt,
     native_read_system_prompt,
     orchestration_route_instruction,
     read_plan_system_prompt,
@@ -53,10 +54,6 @@ from app.agent.token_budget import (
     resolve_context_window,
 )
 from app.agent.media_case import normalize_media_case_stage
-from app.agent.objective_contract import (
-    AgentObjectiveContract,
-    infer_agent_objective,
-)
 from app.agent.media_facts import media_facts_for_llm
 from app.agent.models import LLMToolDisposition, ToolResult
 from app.agent.registry import AgentToolError, ToolRegistry
@@ -98,6 +95,10 @@ from app.sensitive_data import contains_sensitive_credential
 logger = get_logger(__name__)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STREAM_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_JSON_FENCE_RE = re.compile(
+    r"\A\s*```(?:json)?\s*(.*?)\s*```\s*\Z",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _llm_status_outcome(status_code: int) -> str:
@@ -286,7 +287,8 @@ _NATIVE_MAX_PROVIDER_CALLS = 6
 _NATIVE_MAX_TOOL_ROUNDS = 5
 _NATIVE_MAX_TOOL_CALLS = 8
 _NATIVE_MAX_CAPABILITIES = 14
-_NATIVE_RELATIVE_CAPABILITY_FLOOR = 0.20
+_NATIVE_MAX_CAPABILITY_SELECTIONS = 10
+_NATIVE_RELATIVE_CAPABILITY_FLOOR = 0.35
 _NATIVE_MAX_CONCURRENT_READ_TOOLS = 4
 _LLM_MAX_PROVIDER_CALLS_PER_QUERY = 8
 _STREAM_MAX_ANSWER_CHARS = 1800
@@ -326,6 +328,13 @@ class LLMToolSelection:
 @dataclass(frozen=True, slots=True)
 class LLMReadPlan:
     steps: tuple[LLMToolSelection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LLMCapabilitySelection:
+    """模型从完整能力目录中选择的内部工具名称。"""
+
+    tool_names: tuple[str, ...]
 
 
 @dataclass(slots=True)
@@ -602,6 +611,19 @@ def _provider() -> tuple[object, str] | None:
     return location, protocol
 
 
+def _decode_structured_json_content(content: str) -> object:
+    """解码结构化响应，并兼容只包裹单个 JSON 代码块的兼容网关。
+
+    不从解释性文本中猜取子串：只有完整正文是 JSON，或完整正文恰好是一个
+    ``json``/无语言标记代码块时才接受，之后仍由调用方执行严格 schema 校验。
+    """
+    text = str(content or "").strip()
+    fenced = _JSON_FENCE_RE.fullmatch(text)
+    if fenced is not None:
+        text = fenced.group(1).strip()
+    return json.loads(text)
+
+
 async def _request_structured_json(
     *,
     system_prompt: str,
@@ -734,7 +756,7 @@ async def _request_structured_json(
                     protocol, model, outcome="invalid_response", elapsed_ms=elapsed_ms
                 )
                 return None
-            parsed = json.loads(content)
+            parsed = _decode_structured_json_content(content)
             usage = extract_provider_usage(envelope, protocol)
             if usage is not None and usage_out is not None:
                 usage_out.append(usage)
@@ -922,6 +944,114 @@ def _parse_read_plan(payload: Any, allowed_names: set[str]) -> LLMReadPlan | Non
         seen_names.add(selection.tool_name)
         steps.append(selection)
     return LLMReadPlan(tuple(steps))
+
+
+def _parse_capability_selection(
+    payload: Any,
+    allowed_names: set[str],
+) -> LLMCapabilitySelection | None:
+    """校验能力目录选择；兼容对象包装与部分网关返回的裸数组。
+
+    两种载荷最终都经过同一注册表名称、去重和数量校验，因此协议兼容不会
+    扩大模型权限。空数组表示模型判断本轮不需要项目工具。
+    """
+    if isinstance(payload, dict) and set(payload) == {"tool_names"}:
+        raw_names = payload.get("tool_names")
+    elif isinstance(payload, list):
+        raw_names = payload
+    else:
+        return None
+    if not isinstance(raw_names, list):
+        return None
+    if len(raw_names) > _NATIVE_MAX_CAPABILITY_SELECTIONS:
+        return None
+    names: list[str] = []
+    for raw_name in raw_names:
+        if not isinstance(raw_name, str):
+            return None
+        name = raw_name.strip()
+        if name not in allowed_names or name in names:
+            return None
+        names.append(name)
+    return LLMCapabilitySelection(tuple(names))
+
+
+def _capability_selection_catalog(
+    capabilities: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """生成无参数 schema 的完整能力目录，避免把工具召回重新做成正则合同。"""
+    catalog: list[dict[str, Any]] = []
+    for item in capabilities:
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        semantics = capability_semantics(item)
+        entry: dict[str, Any] = {
+            "name": name,
+            # 能力发现阶段只需要“能做什么”，参数 schema、来源提示和完整示例
+            # 留到第二阶段再提供，否则 100+ 工具会挤占模型上下文。
+            "description": str(item.get("description") or "").strip()[:120],
+            "operation": (
+                "prepare_confirmation"
+                if item.get("requires_confirmation")
+                else "read"
+            ),
+        }
+        examples = _capability_examples(item)
+        if examples:
+            entry["example"] = examples[0]
+        workflow = str(semantics.get("workflow") or "").strip()
+        if workflow:
+            entry["workflow"] = workflow
+            entry["stage"] = int(semantics.get("workflow_stage") or 0)
+        catalog.append(entry)
+    return catalog
+
+
+async def _request_capability_selection(
+    message: str,
+    capabilities: list[dict[str, Any]],
+    *,
+    client_factory: Callable[..., FixedHostHttpClient] = FixedHostHttpClient,
+    fallback_budget: Callable[[], bool] | None = None,
+    usage_out: list[ProviderUsage] | None = None,
+) -> LLMCapabilitySelection | None:
+    """由模型阅读完整能力目录并选择本轮工具，不生成参数或执行动作。"""
+    names = [
+        str(item.get("name") or "").strip()
+        for item in capabilities
+        if str(item.get("name") or "").strip()
+    ]
+    if not names:
+        return LLMCapabilitySelection(())
+    schema = {
+        "type": "object",
+        "required": ["tool_names"],
+        "properties": {
+            "tool_names": {
+                "type": "array",
+                "minItems": 0,
+                "maxItems": _NATIVE_MAX_CAPABILITY_SELECTIONS,
+                "items": {"type": "string", "enum": names},
+            },
+        },
+        "additionalProperties": False,
+    }
+    payload = await _request_structured_json(
+        system_prompt=native_capability_selection_system_prompt(
+            _capability_selection_catalog(capabilities),
+            max_tools=_NATIVE_MAX_CAPABILITY_SELECTIONS,
+        ),
+        user_content=message,
+        schema_name="mediaflux_agent_capability_selection",
+        schema=schema,
+        max_tokens=600,
+        client_factory=client_factory,
+        max_content_length=8_192,
+        fallback_budget=fallback_budget,
+        usage_out=usage_out,
+    )
+    return _parse_capability_selection(payload, set(names))
 
 
 async def _request_selection(
@@ -1609,25 +1739,17 @@ async def stream_existing_answer(
         yield delta
 
 
-# 没有可辨识语义词时仍给模型一个受限的“常用只读工具箱”。
-# 这让“列出列表”“现在什么情况”一类自然续问可以由模型结合最近上下文
-# 自主选择工具，同时避免把全量工具 schema 注入每次请求。
-_NATIVE_DEFAULT_READ_TOOLS = (
-    "workspace.briefing",
-    "workspace.health",
-    "config.feature_summary",
-    "config.indexer_sites_summary",
-    "rss.subscription_summaries",
-    "rss.recent_activity",
-    "downloads.diagnose_queue",
-    "indexer.diagnose_readiness",
-    "library.search",
-    "library.count_series_episodes",
-    "discovery.search",
-    "discovery.lookup_rating",
-    "indexer.search_resources",
-    "web.search",
-)
+# 通用动作词不应单独把某个业务域召回。例如“推荐一个 Docker 部署方式”
+# 不能因为“推荐”二字就暴露影视发现工具；真正的业务名词、对象和上下文才
+# 构成能力锚点。该集合只影响候选相关性，不授予或撤销任何工具权限。
+_NATIVE_SEMANTIC_STOP_TOKENS = frozenset({
+    "一个", "一下", "一些", "这个", "那个", "帮我", "麻烦", "请问",
+    "查看", "看看", "看下", "检查", "查询", "搜索", "推荐", "创建",
+    "新增", "修改", "调整", "删除", "执行", "开始", "然后", "按照",
+    "方式", "怎么", "如何", "什么", "哪些", "当前", "现在", "是否",
+    "有没有", "需要", "可以", "能否", "规整", "整理", "了吗", "有吗",
+    "没有", "了没",
+})
 _NATIVE_FULL_LIBRARY_MARKERS = (
     "全库", "全部剧集", "所有剧集", "整个媒体库", "全媒体库", "缺集巡检",
 )
@@ -1677,53 +1799,6 @@ def _native_context_text(
     return unicodedata.normalize("NFKC", " ".join(parts)).casefold()
 
 
-def _objective_with_entities(
-    objective: AgentObjectiveContract, entities: tuple[str, ...]
-) -> AgentObjectiveContract:
-    if objective.task_kind != "official_release_status":
-        return replace(objective, entity_terms=entities)
-    provider_budget = min(4, max(2, len(entities) + 1))
-    return replace(
-        objective,
-        entity_terms=entities,
-        max_provider_requests=provider_budget,
-        max_tool_rounds=max(1, provider_budget - 1),
-        max_tool_calls=max(1, min(3, len(entities) or 2)),
-    )
-
-
-def _resolved_agent_objective(
-    message: str,
-    conversation_context: list[dict[str, Any]] | None = None,
-    reply_context: dict[str, Any] | None = None,
-) -> AgentObjectiveContract:
-    """以当前消息确定任务，只从最近安全上下文补齐缺失的媒体实体。"""
-    objective = infer_agent_objective(message)
-    if objective.task_kind == "general" or objective.entity_terms:
-        return objective
-
-    safe_reply = _safe_reply_context_for_llm(reply_context)
-    if safe_reply:
-        media = safe_reply.get("media_context") or {}
-        title = sanitize_public_text(
-            media.get("title") or media.get("name") or media.get("media_title"),
-            limit=80,
-        )
-        if title:
-            return _objective_with_entities(objective, (title,))
-
-    for item in reversed(conversation_context or []):
-        if not isinstance(item, dict) or str(item.get("role") or "").lower() != "user":
-            continue
-        text = " ".join(str(item.get("text") or "").split()).strip()
-        if not text or contains_sensitive_credential(text):
-            continue
-        previous = infer_agent_objective(text)
-        if previous.entity_terms:
-            return _objective_with_entities(objective, previous.entity_terms)
-    return objective
-
-
 def _semantic_tokens(value: object) -> frozenset[str]:
     """生成稳定的中英文词项；不依赖外部分词器。"""
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
@@ -1741,7 +1816,7 @@ def _semantic_tokens(value: object) -> frozenset[str]:
                 run[index:index + size]
                 for index in range(len(run) - size + 1)
             )
-    return frozenset(tokens)
+    return frozenset(token for token in tokens if token not in _NATIVE_SEMANTIC_STOP_TOKENS)
 
 
 def _parameter_semantic_text(parameters: object) -> str:
@@ -1810,26 +1885,35 @@ def _score_read_capabilities(
     total_documents = len(documents)
     ranked: list[tuple[float, str, dict[str, Any]]] = []
     for item, document in zip(eligible, documents):
-        score = capability_intent_boost(item, intent)
-        if score <= -1000.0:
+        intent_score = capability_intent_boost(item, intent)
+        if intent_score <= -1000.0:
             continue
+        # 领域画像只做轻量排序；真正进入候选必须由用户原话或安全上下文
+        # 与工具自身说明产生词义交集，避免再次演化成隐形意图合同。
+        score = min(8.0, max(0.0, intent_score) * 0.2)
+        lexical_matches = 0
         for token in query_tokens:
             weight = document.get(token)
             if weight is None:
                 continue
+            lexical_matches += 1
             inverse_frequency = math.log(
                 (total_documents + 1) / (document_frequency.get(token, 0) + 1)
             ) + 1.0
             score += weight * inverse_frequency
+        exact_example = False
         for example in _capability_examples(item):
             normalized_example = unicodedata.normalize("NFKC", example).casefold()
             if normalized_example and (
                 normalized_example in normalized_context
                 or normalized_context in normalized_example
             ):
+                exact_example = True
                 score += 12.0
         name = str(item.get("name") or "").strip()
-        if score > 0 and name:
+        # 领域画像只能软排序已经被用户原话或安全上下文锚定的能力，
+        # 不能凭一个中央意图分类结果凭空把整类工具塞给模型。
+        if name and (lexical_matches > 0 or exact_example):
             ranked.append((score, name, item))
     ranked.sort(key=lambda entry: (-entry[0], entry[1]))
     return ranked
@@ -1913,18 +1997,9 @@ def _rank_read_capabilities(
             if score >= minimum_score
         ][:max_candidates])
 
-    by_name = {
-        str(item.get("name") or "").strip(): item
-        for item in eligible
-    }
-    defaults = [
-        by_name[name] for name in _NATIVE_DEFAULT_READ_TOOLS if name in by_name
-    ]
-    if defaults:
-        return finalize(defaults[:max_candidates])
-    return finalize(sorted(
-        eligible, key=lambda item: str(item.get("name") or "")
-    )[:max_candidates])
+    # 没有可靠词义锚点时不猜业务工具；仅保留媒体证据策略明确要求的
+    # 数据源（例如“是否上线”所需公开网页）。普通对话仍可直接回答。
+    return finalize([])
 
 
 def _capability_prompt_description(
@@ -1937,103 +2012,119 @@ def _capability_prompt_description(
     hint = capability_prompt_hint(capability)
     if hint:
         description += " " + hint
+    if str(capability_semantics(capability).get("workflow") or "").strip():
+        description += (
+            " 工作流提示：与本轮提供的同组能力按出现顺序使用，先满足前置上下文，"
+            "再进入预览或人工确认。"
+        )
     return description[:limit]
 
 
-def _ensure_objective_source_coverage(
+def _ensure_workflow_coverage(
     selected: list[dict[str, Any]],
     eligible: list[dict[str, Any]],
-    objective: AgentObjectiveContract,
     *,
     max_candidates: int,
 ) -> list[dict[str, Any]]:
-    """按本轮合同补齐必需数据源，不把辅助工具挤进目标能力面。"""
+    """按工具声明补齐已选阶段的必要前置能力，不解析用户意图。
+
+    工作流关系跟随 :class:`ToolSpec` 注册。模型选中某一阶段后，服务端只补齐
+    同组中阶段号不高于它的能力；绝不因为一次只读查询自动暴露后续写阶段。
+    确认型成员仍须由模型明确选中，且只有调用方已将其放进 ``eligible`` 时才
+    可见，真实写入继续由注册表转换为唯一人工确认预检。
+    """
+    if not selected or max_candidates <= 0:
+        return []
+
+    by_workflow: dict[str, list[dict[str, Any]]] = {}
+    for item in eligible:
+        workflow = str(capability_semantics(item).get("workflow") or "").strip()
+        if workflow:
+            by_workflow.setdefault(workflow, []).append(item)
+    for members in by_workflow.values():
+        members.sort(key=lambda item: (
+            int(capability_semantics(item).get("workflow_stage") or 0),
+            str(item.get("name") or ""),
+        ))
+
     chosen = list(selected[:max_candidates])
-    chosen_names = {str(item.get("name") or "").strip() for item in chosen}
-    required = tuple(dict.fromkeys(objective.required_sources))
-    for source_kind in required:
-        if any(
-            capability_semantics(item)["source_kind"] == source_kind
-            for item in chosen
-        ):
+    represented: list[tuple[str, int]] = []
+    for item in chosen:
+        semantics = capability_semantics(item)
+        workflow = str(semantics.get("workflow") or "").strip()
+        if not workflow:
             continue
-        candidate = next((
-            item for item in eligible
+        stage = int(semantics.get("workflow_stage") or 0)
+        for index, (known_workflow, known_stage) in enumerate(represented):
+            if known_workflow == workflow:
+                represented[index] = (workflow, max(stage, known_stage))
+                break
+        else:
+            represented.append((workflow, stage))
+
+    expanded: set[str] = set()
+    for workflow, selected_stage in represented:
+        required = [
+            item for item in by_workflow.get(workflow, ())
+            if int(capability_semantics(item).get("workflow_stage") or 0)
+            <= selected_stage
+        ]
+        chosen_names = {
+            str(item.get("name") or "").strip() for item in chosen
+        }
+        missing = [
+            item for item in required
             if str(item.get("name") or "").strip() not in chosen_names
-            and capability_semantics(item)["source_kind"] == source_kind
-        ), None)
-        if candidate is None:
+        ]
+        if not missing:
+            expanded.add(workflow)
             continue
-        if len(chosen) < max_candidates:
-            chosen.append(candidate)
-        else:
-            replace_at = next((
-                index for index in range(len(chosen) - 1, -1, -1)
-                if capability_semantics(chosen[index])["source_kind"] not in required
-            ), None)
-            if replace_at is None:
-                continue
-            chosen_names.discard(str(chosen[replace_at].get("name") or "").strip())
-            chosen[replace_at] = candidate
-        chosen_names.add(str(candidate.get("name") or "").strip())
-    return chosen
 
-
-def _ensure_objective_workflow_coverage(
-    selected: list[dict[str, Any]],
-    eligible: list[dict[str, Any]],
-    objective: AgentObjectiveContract,
-    *,
-    max_candidates: int,
-) -> list[dict[str, Any]]:
-    """补齐 Provider 原生读写链的固定阶段，避免只召回查询却无法完成确认。"""
-    required_by_task = {
-        "download_status": ("provider.capabilities", "provider.query"),
-        "qb_realtime_status": ("provider.capabilities", "provider.query"),
-        "media_library_counts": ("provider.capabilities", "provider.query"),
-        "download_control": (
-            "provider.capabilities",
-            "provider.query",
-            "provider.change.preview",
-            "provider.change.execute",
-        ),
-        "media_library_refresh": (
-            "provider.capabilities",
-            "provider.query",
-            "provider.change.preview",
-            "provider.change.execute",
-        ),
-    }
-    required_names = required_by_task.get(objective.task_kind, ())
-    if not required_names:
-        return selected[:max_candidates]
-    by_name = {
-        str(item.get("name") or "").strip(): item
-        for item in eligible
-    }
-    required_names = tuple(name for name in required_names if name in by_name)
-    chosen = list(selected[:max_candidates])
-    chosen_names = {str(item.get("name") or "").strip() for item in chosen}
-    protected = set(required_names)
-    for name in required_names:
-        if name in chosen_names:
-            continue
-        candidate = by_name[name]
-        if len(chosen) < max_candidates:
-            chosen.append(candidate)
-        else:
-            replace_at = next((
+        overflow = max(0, len(chosen) + len(missing) - max_candidates)
+        if overflow:
+            removable = [
                 index for index in range(len(chosen) - 1, -1, -1)
-                if str(chosen[index].get("name") or "").strip() not in protected
-            ), None)
-            if replace_at is None:
-                continue
-            chosen_names.discard(
-                str(chosen[replace_at].get("name") or "").strip()
+                if not str(
+                    capability_semantics(chosen[index]).get("workflow") or ""
+                ).strip()
+            ]
+            removable.extend(
+                index for index in range(len(chosen) - 1, -1, -1)
+                if str(
+                    capability_semantics(chosen[index]).get("workflow") or ""
+                ).strip() not in expanded | {workflow}
+                and index not in removable
             )
-            chosen[replace_at] = candidate
-        chosen_names.add(name)
-    return chosen
+            for index in sorted(removable[:overflow], reverse=True):
+                chosen.pop(index)
+        if len(chosen) + len(missing) > max_candidates:
+            # 容量不足时保留模型原始选择，不额外暴露残缺前置链。
+            continue
+        chosen.extend(missing)
+        expanded.add(workflow)
+
+    # 把已补齐的工作流按阶段放回首次命中位置，方便模型按前置顺序调用。
+    ordered: list[dict[str, Any]] = []
+    emitted_names: set[str] = set()
+    emitted_workflows: set[str] = set()
+    final_names = {
+        str(item.get("name") or "").strip() for item in chosen
+    }
+    for item in chosen:
+        name = str(item.get("name") or "").strip()
+        workflow = str(capability_semantics(item).get("workflow") or "").strip()
+        if workflow in expanded and workflow not in emitted_workflows:
+            emitted_workflows.add(workflow)
+            for member in by_workflow.get(workflow, ()):
+                member_name = str(member.get("name") or "").strip()
+                if member_name in final_names and member_name not in emitted_names:
+                    ordered.append(member)
+                    emitted_names.add(member_name)
+            continue
+        if name and name not in emitted_names:
+            ordered.append(item)
+            emitted_names.add(name)
+    return ordered[:max_candidates]
 
 
 def _native_read_capabilities(
@@ -2048,42 +2139,98 @@ def _native_read_capabilities(
     context_text = _native_context_text(
         message, conversation_context, reply_context
     )
-    objective = _resolved_agent_objective(
-        message, conversation_context, reply_context
-    )
-    if objective.max_capabilities <= 0:
-        record_agent_capabilities(())
-        return []
     eligible = orchestration_tool_capabilities(
         registry, include_confirmations=include_confirmations
     )
-    # 目标合同只约束完整的内置注册表。插件或测试可提供更小的独立注册表；
-    # 若合同工具并未完整注册，继续使用工具自身语义召回，避免前缀无关能力被清空。
-    if objective.allowed_tools and all(
-        registry.has(name) for name in objective.allowed_tools
-    ):
-        allowed = frozenset(objective.allowed_tools)
-        eligible = [
-            item for item in eligible
-            if str(item.get("name") or "").strip() in allowed
-        ]
-    max_candidates = min(_NATIVE_MAX_CAPABILITIES, objective.max_capabilities)
+    max_candidates = _NATIVE_MAX_CAPABILITIES
     selected = _rank_read_capabilities(
         eligible,
         context_text,
         max_candidates=max_candidates,
     )
-    selected = _ensure_objective_source_coverage(
-        selected, eligible, objective, max_candidates=max_candidates
-    )
-    selected = _ensure_objective_workflow_coverage(
-        selected, eligible, objective, max_candidates=max_candidates
+    selected = _ensure_workflow_coverage(
+        selected, eligible, max_candidates=max_candidates
     )
     record_agent_capabilities(
         str(item.get("name") or "").strip() for item in selected
     )
     capabilities: list[dict[str, Any]] = []
     for item in selected:
+        tool_name = str(item.get("name") or "").strip()
+        alias = registry.native_alias_for(tool_name)
+        parameters = item.get("parameters")
+        if not alias or not isinstance(parameters, dict):
+            continue
+        capabilities.append({
+            "name": alias,
+            "description": _capability_prompt_description(item, limit=600),
+            "parameters": parameters,
+        })
+    return capabilities
+
+
+async def _resolve_native_capabilities(
+    registry: ToolRegistry,
+    message: str,
+    *,
+    conversation_context: list[dict[str, Any]] | None = None,
+    reply_context: dict[str, Any] | None = None,
+    include_confirmations: bool = False,
+    client_factory: Callable[..., FixedHostHttpClient] = FixedHostHttpClient,
+    fallback_budget: Callable[[], bool] | None = None,
+    usage_out: list[ProviderUsage] | None = None,
+) -> list[dict[str, Any]]:
+    """优先让模型从完整目录选能力；本地词义召回只作兼容降级。"""
+    eligible = orchestration_tool_capabilities(
+        registry, include_confirmations=include_confirmations
+    )
+    if not eligible:
+        record_agent_capabilities(())
+        return []
+
+    if len(eligible) <= _NATIVE_MAX_CAPABILITIES:
+        selected = list(eligible)
+    else:
+        selection = await _request_capability_selection(
+            _conversation_user_content(
+                message, conversation_context, reply_context
+            ),
+            eligible,
+            client_factory=client_factory,
+            fallback_budget=fallback_budget,
+            usage_out=usage_out,
+        )
+        if selection is None:
+            # Provider 不支持结构化能力选择、上下文预算不足或返回非法结果时，
+            # 才使用本地词义召回维持可用性。该降级结果不参与授权判断。
+            return _native_read_capabilities(
+                registry,
+                message,
+                conversation_context,
+                reply_context,
+                include_confirmations=include_confirmations,
+            )
+        by_name = {
+            str(item.get("name") or "").strip(): item
+            for item in eligible
+            if str(item.get("name") or "").strip()
+        }
+        selected = [
+            by_name[name]
+            for name in selection.tool_names
+            if name in by_name
+        ]
+        selected = _ensure_workflow_coverage(
+            selected,
+            eligible,
+            max_candidates=_NATIVE_MAX_CAPABILITIES,
+        )
+
+    record_agent_capabilities(
+        str(item.get("name") or "").strip() for item in selected
+    )
+    capabilities: list[dict[str, Any]] = []
+    for item in selected[:_NATIVE_MAX_CAPABILITIES]:
         tool_name = str(item.get("name") or "").strip()
         alias = registry.native_alias_for(tool_name)
         parameters = item.get("parameters")
@@ -2230,62 +2377,6 @@ def _native_tool_error_response(
     }
 
 
-def _normalized_identity_text(value: object) -> str:
-    return re.sub(
-        r"[^0-9a-z\u4e00-\u9fff]+",
-        "",
-        unicodedata.normalize("NFKC", str(value or "")).casefold(),
-    )
-
-
-def _validate_objective_tool_call(
-    objective: AgentObjectiveContract,
-    tool_name: str,
-    arguments: Mapping[str, Any],
-    *,
-    registry: ToolRegistry | None = None,
-) -> None:
-    """在注册表校验之后执行本轮目标与媒体身份连续性复核。"""
-    if objective.allowed_tools and tool_name not in objective.allowed_tools:
-        raise AgentToolError(
-            "该工具不属于用户当前明确目标", code="scope_mismatch"
-        )
-    semantics = capability_semantics(
-        registry.llm_capability_for(tool_name)
-        if registry is not None
-        else {"name": tool_name}
-    )
-    source_kind = str(semantics.get("source_kind") or "")
-    if source_kind in objective.forbidden_sources:
-        raise AgentToolError(
-            "该数据源不属于用户当前明确范围", code="scope_mismatch"
-        )
-
-    if objective.task_kind not in {
-        "series_update_audit", "series_missing_download_plan"
-    }:
-        return
-    anchors = tuple(
-        item for item in (
-            _normalized_identity_text(term) for term in objective.entity_terms
-        ) if len(item) >= 2
-    )
-    if not anchors or tool_name == "web.search":
-        return
-    raw_identity = next((
-        arguments.get(key)
-        for key in ("query", "title", "media_title", "name")
-        if str(arguments.get(key) or "").strip()
-    ), "")
-    if not raw_identity or str(arguments.get("tmdb_id") or "").strip():
-        return
-    identity = _normalized_identity_text(raw_identity)
-    if identity and not any(anchor in identity or identity in anchor for anchor in anchors):
-        raise AgentToolError(
-            "媒体名称与本轮已锁定目标不一致", code="identity_mismatch"
-        )
-
-
 def _native_tool_output(
     call: Any, response_payload: dict[str, Any]
 ) -> tuple[Any, str]:
@@ -2311,7 +2402,6 @@ async def _execute_native_tool_turn(
     state: _NativeLoopState,
     allowed_aliases: frozenset[str],
     allow_confirmations: bool,
-    objective: AgentObjectiveContract | None = None,
 ) -> list[tuple[Any, str]]:
     """并发执行独立只读调用；确认预检保持串行且结果严格保序。"""
     prepared: list[dict[str, Any]] = []
@@ -2337,10 +2427,6 @@ async def _execute_native_tool_turn(
             disposition, normalized_arguments = registry.validate_llm_orchestration_call(
                 tool_name, call.arguments
             )
-            if objective is not None:
-                _validate_objective_tool_call(
-                    objective, tool_name, normalized_arguments, registry=registry
-                )
         except AgentToolError as exc:
             if _native_tool_error_is_fatal(exc):
                 raise
@@ -2432,8 +2518,7 @@ async def _execute_native_tool_turn(
     parallel_batch: list[dict[str, Any]] = []
     for item in read_items:
         if (
-            (objective is None or objective.parallel_reads)
-            and registry.llm_parallel_safe_for(item["tool_name"])
+            registry.llm_parallel_safe_for(item["tool_name"])
         ):
             parallel_batch.append(item)
             continue
@@ -2473,47 +2558,6 @@ async def _execute_native_tool_turn(
     return outputs
 
 
-def _append_native_synthesis_instruction(
-    protocol: str, history: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """证据齐备后显式要求生成结论，适配各 Provider 的工具续写行为。"""
-    text = (
-        "本轮必需数据源已经全部成功返回。停止检索，不要再次调用任何工具；"
-        "请仅根据已有结果直接回答用户，并清楚区分已上线、已定档与待确认信息。"
-    )
-    updated = list(history)
-    if protocol == "responses":
-        updated.append({
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}],
-        })
-    elif protocol == "chat_completions":
-        updated.append({"role": "user", "content": text})
-    else:
-        updated.append({
-            "role": "user",
-            "content": [{"type": "text", "text": text}],
-        })
-    return updated
-
-
-
-def _objective_evidence_is_complete(
-    objective: AgentObjectiveContract, state: _NativeLoopState
-) -> bool:
-    """已获得推荐所需证据后关闭工具面，避免模型重复检索拖慢答复。"""
-    required = {
-        str(item).strip()
-        for item in objective.required_sources
-        if str(item).strip()
-    }
-    return bool(
-        objective.task_kind == "media_recommendation"
-        and required
-        and required.issubset(state.successful_source_kinds)
-    )
-
-
 async def _request_native_read_agent(
     message: str,
     registry: ToolRegistry,
@@ -2526,28 +2570,31 @@ async def _request_native_read_agent(
     fallback_budget: Callable[[], bool] | None = None,
 ) -> LLMConversationReply | None:
     provider = _provider()
-    objective = _resolved_agent_objective(
-        message, conversation_context, reply_context
-    )
     model = str(get("AGENT_LLM_MODEL", "") or "").strip()
-    native_capabilities = _native_read_capabilities(
-        registry,
-        message,
-        conversation_context,
-        reply_context,
-        include_confirmations=include_confirmations,
-    )
-    read_only_capabilities = _native_read_only_subset(
-        registry, native_capabilities
-    )
     if (
         provider is None
         or not model
         or len(model) > 200
         or _CONTROL_RE.search(model)
-        or not native_capabilities
     ):
         return None
+
+    capability_usage: list[ProviderUsage] = []
+    native_capabilities = await _resolve_native_capabilities(
+        registry,
+        message,
+        conversation_context=conversation_context,
+        reply_context=reply_context,
+        include_confirmations=include_confirmations,
+        client_factory=client_factory,
+        fallback_budget=fallback_budget,
+        usage_out=capability_usage,
+    )
+    if not native_capabilities:
+        return None
+    read_only_capabilities = _native_read_only_subset(
+        registry, native_capabilities
+    )
 
     location, configured_protocol = provider
     protocols = protocol_attempts(configured_protocol)
@@ -2563,7 +2610,6 @@ async def _request_native_read_agent(
     )
     system_prompt = native_read_system_prompt(
         include_confirmations=include_confirmations,
-        objective_instruction=objective.prompt_instruction(),
     )
     allowed_aliases = frozenset(
         str(item.get("name") or "").strip()
@@ -2577,9 +2623,11 @@ async def _request_native_read_agent(
     overall_timeout = min(60, max(timeout_seconds, timeout_seconds * 4))
     deadline = overall_started + overall_timeout
     state = _NativeLoopState(
-        max_provider_requests=min(_NATIVE_MAX_PROVIDER_CALLS, objective.max_provider_requests),
-        max_tool_calls=min(_NATIVE_MAX_TOOL_CALLS, objective.max_tool_calls),
+        max_provider_requests=_NATIVE_MAX_PROVIDER_CALLS,
+        max_tool_calls=_NATIVE_MAX_TOOL_CALLS,
     )
+    for usage in capability_usage:
+        state.record_usage(usage)
     last_protocol = configured_protocol
 
     async def _run() -> LLMConversationReply | None:
@@ -2627,7 +2675,7 @@ async def _request_native_read_agent(
                     user_content=fitted_user_content,
                 ),
                 tools=tools,
-                max_tool_rounds=min(_NATIVE_MAX_TOOL_ROUNDS, objective.max_tool_rounds),
+                max_tool_rounds=_NATIVE_MAX_TOOL_ROUNDS,
             )
             fallback_to_next = False
             for request_index in range(state.max_provider_requests):
@@ -2645,10 +2693,7 @@ async def _request_native_read_agent(
                     include_confirmations and not state.confirmation_prepared
                 )
                 request_tools = tools if confirmations_available else read_only_tools
-                if (
-                    state.provider_requests >= state.max_provider_requests
-                    or _objective_evidence_is_complete(objective, state)
-                ):
+                if state.provider_requests >= state.max_provider_requests:
                     request_tools = []
                 request_body = native_tool_request_body(
                     protocol=protocol,
@@ -2733,21 +2778,6 @@ async def _request_native_read_agent(
                         forbidden_names=registry.native_aliases()
                         | frozenset(item["name"] for item in read_tool_capabilities(registry)),
                     )
-                    required_sources = {
-                        str(item).strip()
-                        for item in objective.required_sources
-                        if str(item).strip()
-                    }
-                    if required_sources and not required_sources.issubset(
-                        state.successful_source_kinds
-                    ):
-                        logger.info(
-                            "Agent LLM native event outcome=required_evidence_missing "
-                            "task=%s missing=%s",
-                            objective.task_kind,
-                            ",".join(sorted(required_sources - state.successful_source_kinds)),
-                        )
-                        return state.partial("required_evidence_missing")
                     if answer:
                         return LLMConversationReply(
                             answer=answer,
@@ -2787,7 +2817,6 @@ async def _request_native_read_agent(
                     state=state,
                     allowed_aliases=allowed_aliases,
                     allow_confirmations=confirmations_available,
-                    objective=objective,
                 )
                 state.tools_ms += max(
                     0, int((monotonic() - tools_started) * 1000)
@@ -2795,10 +2824,6 @@ async def _request_native_read_agent(
                 protocol_state.history = append_native_tool_results(
                     protocol, protocol_state.history, turn, outputs
                 )
-                if _objective_evidence_is_complete(objective, state):
-                    protocol_state.history = _append_native_synthesis_instruction(
-                        protocol, protocol_state.history
-                    )
 
             if fallback_to_next:
                 continue

@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 from app import database as db
-from app.agent.llm_router import _native_read_capabilities, is_agent_action_request
+from app.agent.llm_router import is_agent_action_request
 from app.agent.local_media_scan_actions import (
     local_media_scan_arguments,
     prepare_scan_local_media_sources,
@@ -18,7 +18,6 @@ from app.agent.media_proxy_actions import (
     prepare_restart_media_proxy_instance,
     restart_media_proxy_instance_confirmed,
 )
-from app.agent.objective_contract import infer_agent_objective
 from app.agent.registry import AgentToolError
 from app.agent.service import reset_agent_service_for_tests
 from app.agent.tools import build_tool_registry
@@ -38,7 +37,7 @@ class AgentGeneralistOperationTests(IsolatedDatabaseTestCase):
     def tearDown(self) -> None:
         reset_agent_service_for_tests()
 
-    def test_registry_and_objectives_cover_cross_module_operations(self) -> None:
+    def test_registry_exposes_cross_module_operations_without_intent_contract(self) -> None:
         registry = build_tool_registry()
         capabilities = {
             item["name"]: item for item in registry.capabilities()
@@ -54,73 +53,43 @@ class AgentGeneralistOperationTests(IsolatedDatabaseTestCase):
                 self.assertEqual(capabilities[name]["risk"], risk)
 
         cases = {
-            "扫描全部本地媒体来源": (
-                "local_media_scan", "local_media.scan_sources"
-            ),
-            "通知 Jellyfin 扫描动漫库": (
-                "media_library_refresh", "provider.change.execute"
-            ),
-            "重启 Jellyfin 反代实例 1": (
-                "media_proxy_restart", "media_proxy.restart_instance"
-            ),
-            "暂停第 1 个下载任务": (
-                "download_control", "provider.change.execute"
-            ),
-            "把 STRM 同步改为每 7 天": (
-                "strm_schedule_policy", "strm.set_schedule_policy"
-            ),
-            "重试 STRM 失败项": (
-                "strm_failure_workflow", "strm.retry_failures"
-            ),
-            "把媒体库巡检改为每 3 天": (
-                "library_patrol_control", "library.set_patrol_policy"
-            ),
-            "立即巡检整个媒体库缺集": (
-                "library_wide_episode_audit", "library.start_episode_audit"
-            ),
+            "扫描全部本地媒体来源": "local_media.scan_sources",
+            "通知 Jellyfin 扫描动漫库": "provider.change.execute",
+            "重启 Jellyfin 反代实例 1": "media_proxy.restart_instance",
+            "暂停第 1 个下载任务": "provider.change.execute",
+            "把 STRM 同步改为每 7 天": "strm.set_schedule_policy",
+            "重试 STRM 失败项": "strm.retry_failures",
+            "把媒体库巡检改为每 3 天": "library.set_patrol_policy",
+            "立即巡检整个媒体库缺集": "library.start_episode_audit",
             "启用本地媒体来源 2 的 qB 完成触发": (
-                "local_media_source_control",
-                "local_media.set_source_trigger_enabled",
+                "local_media.set_source_trigger_enabled"
             ),
-            "停用媒体反代实例 2": (
-                "media_proxy_control", "media_proxy.set_instance_enabled"
-            ),
-            "发送 Telegram 测试通知": (
-                "telegram_test_notification", "telegram.send_test_notification"
-            ),
-            "将第 2 和第 4 条 RSS 提交到 qB": (
-                "rss_workflow", "rss.submit_entries_to_qb"
-            ),
-            "删除 RSS 订阅源 3": (
-                "rss_workflow", "rss.delete_subscription"
-            ),
+            "停用媒体反代实例 2": "media_proxy.set_instance_enabled",
+            "发送 Telegram 测试通知": "telegram.send_test_notification",
+            "将第 2 和第 4 条 RSS 提交到 qB": "rss.submit_entries_to_qb",
+            "删除 RSS 订阅源 3": "rss.delete_subscription",
             "清理光鸭整理来源里的严格垃圾图片": (
-                "guangya_cleanup_workflow",
-                "guangya.organize.cleanup.preview",
+                "guangya.organize.cleanup.preview"
             ),
-            "把光鸭某个目录名称里的垃圾前缀去掉": (
-                "guangya_rename_workflow", "guangya.rename.preview"
-            ),
+            "把光鸭某个目录名称里的垃圾前缀去掉": "guangya.rename.preview",
         }
-        for message, (task_kind, tool_name) in cases.items():
+        orchestration_names = {
+            item["name"]
+            for item in registry.llm_orchestration_capabilities(
+                include_confirmations=True
+            )
+        }
+        for message, tool_name in cases.items():
             with self.subTest(message=message):
-                objective = infer_agent_objective(message)
-                self.assertEqual(objective.task_kind, task_kind)
-                self.assertIn(tool_name, objective.allowed_tools)
+                self.assertIn(tool_name, orchestration_names)
                 self.assertTrue(is_agent_action_request(message))
-                names = {
-                    registry.native_tool_name(item["name"])
-                    for item in _native_read_capabilities(
-                        registry, message, include_confirmations=True
-                    )
-                }
-                self.assertIn(tool_name, names)
 
         for message in ("关闭 Agent", "我想关闭 Agent", "我要开启智能助手"):
             with self.subTest(message=message):
-                control = infer_agent_objective(message)
-                self.assertEqual(control.task_kind, "agent_control_guidance")
-                self.assertEqual(control.allowed_tools, ())
+                self.assertNotIn(
+                    "agent.set_enabled",
+                    orchestration_names,
+                )
 
         read_cases = {
             "检查系统运行状态和最近失败任务": (
@@ -139,20 +108,13 @@ class AgentGeneralistOperationTests(IsolatedDatabaseTestCase):
                 "telegram_status", "agent.runtime_status"
             ),
         }
-        for message, (task_kind, tool_name) in read_cases.items():
+        for message, (_task_kind, tool_name) in read_cases.items():
             with self.subTest(message=message):
-                objective = infer_agent_objective(message)
-                self.assertEqual(objective.task_kind, task_kind)
-                self.assertIn(tool_name, objective.allowed_tools)
+                self.assertIn(tool_name, orchestration_names)
                 self.assertFalse(is_agent_action_request(message))
 
-        combined = infer_agent_objective(
-            "检查某剧第二季现在多少集了，有更新吗，推送更新到光鸭"
-        )
-        self.assertEqual(combined.task_kind, "series_missing_download_plan")
-        self.assertEqual(combined.entity_terms, ("某剧",))
-        self.assertIn("library.check_updates", combined.allowed_tools)
-        self.assertIn("indexer.search_resources", combined.allowed_tools)
+        self.assertIn("library.check_updates", orchestration_names)
+        self.assertIn("indexer.search_resources", orchestration_names)
 
     def test_local_media_scan_is_limited_to_confirmed_configured_sources(self) -> None:
         self.assertEqual(

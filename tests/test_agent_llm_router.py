@@ -22,7 +22,9 @@ from app.agent.llm_router import (
     _native_context_text,
     _native_read_capabilities,
     _native_read_only_subset,
+    _parse_capability_selection,
     _parse_selection,
+    _resolve_native_capabilities,
     _request_native_read_agent,
     _request_result_narrative,
     _request_selection,
@@ -753,11 +755,107 @@ class AgentLLMSelectionTests(unittest.TestCase):
         default_names = {
             registry.native_tool_name(item["name"]) for item in default_caps
         }
-        self.assertTrue(default_names)
-        self.assertIn("workspace.briefing", default_names)
-        self.assertIn("library.search", default_names)
-        self.assertNotIn("library.audit_library_episodes", default_names)
-        self.assertLessEqual(len(default_caps), 14)
+        self.assertEqual(default_names, set())
+
+    def test_model_selects_from_full_catalog_and_workflow_is_expanded(self):
+        registry = build_tool_registry()
+        captured = {"body": None, "closed": False}
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def post_json(self, url, *, json, headers, max_redirects):
+                captured["body"] = json
+                content = "```json\n" + json_module.dumps([
+                    "guangya.directory_scrape.run",
+                ]) + "\n```"
+                return IndexerHttpResponse(
+                    url=url,
+                    status_code=200,
+                    headers={"content-type": "application/json"},
+                    body=json_module.dumps({
+                        "choices": [{"message": {"content": content}}],
+                    }).encode(),
+                )
+
+            async def aclose(self):
+                captured["closed"] = True
+
+        values = {
+            "AGENT_LLM_API_URL": "https://ai.invalid/v1/chat/completions",
+            "AGENT_LLM_MODEL": "compatible-model",
+            "AGENT_LLM_PROTOCOL": "chat_completions",
+            "AGENT_LLM_CONTEXT_WINDOW": "32768",
+        }
+        with patch(
+            "app.agent.llm_router.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.agent.llm_router._native_read_capabilities",
+            side_effect=AssertionError("正常链路不应依赖本地意图合同"),
+        ):
+            capabilities = asyncio.run(_resolve_native_capabilities(
+                registry,
+                (
+                    "规整光鸭根目录/动漫里的从零开始的异世界生活，"
+                    "创建新目录并按 TMDB 1-85 集重命名"
+                ),
+                include_confirmations=True,
+                client_factory=FakeClient,
+                fallback_budget=lambda: True,
+            ))
+
+        names = [
+            registry.native_tool_name(item["name"]) for item in capabilities
+        ]
+        self.assertEqual(names[:4], [
+            "guangya.directory_scrape.inspect",
+            "guangya.directory_scrape.search",
+            "guangya.directory_scrape.preview",
+            "guangya.directory_scrape.run",
+        ])
+        system_prompt = captured["body"]["messages"][0]["content"]
+        self.assertIn("完整能力目录", system_prompt)
+        self.assertIn("guangya.directory_scrape.run", system_prompt)
+        self.assertNotIn("allowed_tools", system_prompt)
+        self.assertTrue(captured["closed"])
+
+    def test_capability_selection_accepts_safe_bare_array_from_compatible_gateway(self):
+        allowed = {
+            "guangya.directory_scrape.inspect",
+            "guangya.directory_scrape.preview",
+        }
+
+        parsed = _parse_capability_selection(
+            ["guangya.directory_scrape.inspect"], allowed
+        )
+
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            parsed.tool_names, ("guangya.directory_scrape.inspect",)
+        )
+        self.assertIsNone(
+            _parse_capability_selection(["unknown.tool"], allowed)
+        )
+        for malformed in (
+            {"tool_names": None},
+            {"tool_names": "guangya.directory_scrape.inspect"},
+            {"tool_names": {}},
+        ):
+            with self.subTest(malformed=malformed):
+                self.assertIsNone(
+                    _parse_capability_selection(malformed, allowed)
+                )
+        self.assertIsNone(
+            _parse_capability_selection(
+                [
+                    "guangya.directory_scrape.inspect",
+                    "guangya.directory_scrape.inspect",
+                ],
+                allowed,
+            )
+        )
 
     def test_action_detection_distinguishes_commands_from_information_queries(self):
         for message in (
@@ -853,8 +951,8 @@ class AgentLLMSelectionTests(unittest.TestCase):
             )
         }
         self.assertIn("web.search", official_progress_names)
-        self.assertIn("library.check_updates", official_progress_names)
-        self.assertIn("indexer.search_resources", official_progress_names)
+        self.assertNotIn("library.check_updates", official_progress_names)
+        self.assertNotIn("indexer.search_resources", official_progress_names)
 
         calendar_names = {
             registry.native_tool_name(item["name"])
@@ -1379,7 +1477,7 @@ class AgentLLMSelectionTests(unittest.TestCase):
             captured["bodies"][1]["messages"][-1]["role"], "tool"
         )
 
-    def test_native_recommendation_closes_tools_after_required_sources_succeed(self):
+    def test_native_recommendation_keeps_model_free_to_finish_or_query_more(self):
         captured = {"bodies": [], "closed": False}
         registry = ToolRegistry()
         for name, source_kind in (
@@ -1489,11 +1587,8 @@ class AgentLLMSelectionTests(unittest.TestCase):
         self.assertTrue(reply.completed)
         self.assertEqual(len(captured["bodies"]), 2)
         self.assertIn("tools", captured["bodies"][0])
-        self.assertNotIn("tools", captured["bodies"][1])
-        self.assertEqual(captured["bodies"][1]["messages"][-1]["role"], "user")
-        self.assertIn(
-            "停止检索", captured["bodies"][1]["messages"][-1]["content"]
-        )
+        self.assertIn("tools", captured["bodies"][1])
+        self.assertEqual(captured["bodies"][1]["messages"][-1]["role"], "tool")
         self.assertEqual(
             [name for name, _arguments in executed],
             ["discovery.recommend", "web.search"],
@@ -3184,6 +3279,62 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
 
         self.assertEqual(planner.call_count, 3)
 
+    def test_exact_business_reads_use_model_before_legacy_fast_paths(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        planned = {
+            "mode": "read_only",
+            "tool_call": {"name": "provider.query", "arguments": {}},
+            "result": ToolResult(True, "success", "模型已完成查询").to_dict(),
+        }
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner, patch.object(
+            agent, "_invoke_default_provider_read"
+        ) as deterministic:
+            response = agent.query(
+                "查看 qBittorrent 当前实时任务",
+                owner="web-session",
+                present=False,
+            )
+
+        self.assertIs(response, planned)
+        planner.assert_called_once()
+        self.assertTrue(planner.call_args.kwargs["read_only"])
+        deterministic.assert_not_called()
+
+    def test_guangya_directory_reorganization_uses_model_before_legacy_parser(self):
+        agent = AgentOrchestrator(ToolRegistry())
+        planned = {
+            "mode": "confirmation_required",
+            "tool_call": {
+                "name": "guangya.directory_scrape.run",
+                "arguments": {},
+            },
+            "result": ToolResult(
+                True, "confirmation_required", "规整计划等待确认"
+            ).to_dict(),
+            "action_plan": _pending_action_plan(),
+        }
+        message = (
+            "规整一下光鸭根目录/动漫里的从零开始的异世界生活，"
+            "创建一个新目录，然后按照 TMDB 1-85 集的方式重命名规整"
+        )
+
+        with patch.object(
+            agent, "_query_with_model_tools", return_value=planned
+        ) as planner, patch.object(
+            agent, "_handle_automation_and_missing_resource_requests"
+        ) as deterministic:
+            response = agent.query(
+                message, owner="web-session", present=False
+            )
+
+        self.assertIs(response, planned)
+        planner.assert_called_once()
+        self.assertFalse(planner.call_args.kwargs["read_only"])
+        deterministic.assert_not_called()
+
     def test_safe_media_control_gets_planner_before_deterministic_fallback(self):
         agent = AgentOrchestrator(ToolRegistry())
         planned = {
@@ -3732,12 +3883,12 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         native_agent.assert_called_once()
         fallback_selector.assert_not_called()
 
-    def test_non_action_question_hides_confirmation_tools_from_model(self):
+    def test_authenticated_model_may_see_confirmation_tools_but_cannot_execute(self):
         registry = _confirmation_registry()
 
         def native(_message, selected_registry, _execute_tool, **kwargs):
             self.assertIs(selected_registry, registry)
-            self.assertFalse(kwargs["include_confirmations"])
+            self.assertTrue(kwargs["include_confirmations"])
             return None
 
         with patch(
@@ -3754,7 +3905,7 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
             )
 
         self.assertIsNone(response)
-        self.assertEqual(selector.call_args.kwargs["owner"], "")
+        self.assertEqual(selector.call_args.kwargs["owner"], "web-session")
 
     def test_native_confirmation_replaces_premature_execution_claim(self):
         registry = _confirmation_registry()
@@ -3954,8 +4105,9 @@ class AgentLLMOrchestratorTests(unittest.TestCase):
         self.assertEqual(response["mode"], "read_plan")
         self.assertEqual(response["tool_call"]["name"], "agent.read_plan")
         self.assertEqual(response["tool_call"]["elapsed_ms"], 10)
-        self.assertFalse(response["result"]["ok"])
-        self.assertEqual(response["result"]["status"], "partial")
+        self.assertTrue(response["result"]["ok"])
+        self.assertEqual(response["result"]["status"], "completed")
+        self.assertEqual(response["result"]["data"]["supporting_failed"], 1)
         self.assertEqual(response["result"]["data"]["step_count"], 2)
         self.assertEqual(
             [step["tool_name"] for step in response["result"]["data"]["steps"]],

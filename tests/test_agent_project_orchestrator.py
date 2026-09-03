@@ -13,8 +13,6 @@ from app.agent.guangya_directory_scrape_actions import (
 )
 from app.agent.llm_router import (
     _native_read_capabilities,
-    _resolved_agent_objective,
-    _validate_objective_tool_call,
     is_agent_action_request,
 )
 from app.agent.models import ToolContext, ToolResult
@@ -22,7 +20,6 @@ from app.agent.orchestrator import (
     AgentOrchestrator,
     _is_unsupported_engineering_request,
 )
-from app.agent.objective_contract import infer_agent_objective
 from app.agent.registry import AgentToolError, ToolRegistry
 from app.agent.tools import (
     build_tool_registry,
@@ -32,7 +29,7 @@ from app.agent.tools import (
 )
 
 
-class AgentObjectiveContractTests(unittest.TestCase):
+class AgentFreeOrchestrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.registry = build_tool_registry()
@@ -49,14 +46,7 @@ class AgentObjectiveContractTests(unittest.TestCase):
         ]
 
     def test_technical_guidance_and_service_launch_avoid_media_tools(self) -> None:
-        deployment = infer_agent_objective("推荐一个 Docker 部署方式")
-        self.assertEqual(deployment.task_kind, "technical_guidance")
-        self.assertEqual(deployment.max_capabilities, 0)
         self.assertEqual(self._names("推荐一个 Docker 部署方式"), [])
-        self.assertEqual(
-            infer_agent_objective("MediaFlux 服务上线了吗").task_kind,
-            "general",
-        )
         self.assertNotIn(
             "official_progress",
             infer_media_intent("MediaFlux 服务上线了吗").domains,
@@ -72,17 +62,6 @@ class AgentObjectiveContractTests(unittest.TestCase):
         self.assertTrue(
             _is_unsupported_engineering_request("帮我重启 Docker 服务并重新部署")
         )
-
-    def test_host_drive_and_ambiguous_library_sync_require_guidance(self) -> None:
-        host_drive = infer_agent_objective("扫描 C 盘垃圾文件")
-        library_sync = infer_agent_objective("同步媒体库")
-
-        self.assertEqual(host_drive.task_kind, "host_drive_guidance")
-        self.assertEqual(host_drive.max_capabilities, 0)
-        self.assertEqual(library_sync.task_kind, "library_sync_clarification")
-        self.assertEqual(library_sync.max_capabilities, 0)
-        self.assertEqual(self._names("扫描 C 盘垃圾文件"), [])
-        self.assertEqual(self._names("同步媒体库"), [])
 
     def test_guidance_fallbacks_are_specific_when_provider_is_unavailable(self) -> None:
         agent = AgentOrchestrator(self.registry)
@@ -103,85 +82,52 @@ class AgentObjectiveContractTests(unittest.TestCase):
     def test_non_media_want_to_see_phrases_do_not_trigger_recommendations(self) -> None:
         for message in ("我想看 STRM 同步状态", "这个日志值得看吗"):
             with self.subTest(message=message):
-                self.assertNotEqual(
-                    infer_agent_objective(message).task_kind,
-                    "media_recommendation",
-                )
-        self.assertEqual(
-            infer_agent_objective("最近想看点科幻").task_kind,
-            "media_recommendation",
-        )
+                self.assertNotIn("discovery.recommend", self._names(message))
+        self.assertIn("discovery.recommend", self._names("最近想看点科幻"))
 
-    def test_postfix_media_subscription_creation_uses_creation_contract(self) -> None:
-        objective = infer_agent_objective(
-            "帮我给光阴之外 创建一个每周刷新的订阅"
-        )
-
-        self.assertEqual(objective.task_kind, "media_subscription_create")
-        self.assertEqual(
-            objective.allowed_tools,
-            ("discovery.search", "media.create_subscription"),
+    def test_postfix_media_subscription_creation_exposes_confirmation_tool(self) -> None:
+        self.assertIn(
+            "media.create_subscription",
+            self._names("帮我给光阴之外 创建一个每周刷新的订阅"),
         )
 
     def test_release_status_uses_only_explicitly_requested_sources(self) -> None:
         message = "辐射第二季跟三体第二季都上线了吗"
-        objective = infer_agent_objective(message)
-
-        self.assertEqual(objective.task_kind, "official_release_status")
-        self.assertEqual(objective.entity_terms, ("辐射", "三体"))
         self.assertEqual(self._names(message), ["web.search"])
 
     def test_release_scope_negation_does_not_pollute_media_identity(self) -> None:
-        objective = infer_agent_objective(
+        intent = infer_media_intent(
             "辐射第二季上线了吗，不要查本地和资源"
         )
-
-        self.assertEqual(objective.task_kind, "official_release_status")
-        self.assertEqual(objective.entity_terms, ("辐射",))
-        self.assertEqual(objective.required_sources, ("public_web",))
+        self.assertEqual(intent.preferred_sources, ("public_web",))
         self.assertEqual(
-            set(objective.forbidden_sources),
+            set(intent.forbidden_sources),
             {"local_library", "resource_index"},
         )
 
-    def test_release_followup_inherits_only_media_entities(self) -> None:
+    def test_release_followup_uses_safe_context_without_contract_gating(self) -> None:
         context = [{
             "role": "user",
             "text": "辐射第二季跟三体第二季都上线了吗",
         }]
-        objective = _resolved_agent_objective(
-            "我问你上线没有 这两部剧", context
-        )
 
-        self.assertEqual(objective.task_kind, "official_release_status")
-        self.assertEqual(objective.entity_terms, ("辐射", "三体"))
-        self.assertEqual(
-            self._names("我问你上线没有 这两部剧", context=context),
-            ["web.search"],
-        )
+        names = self._names("我问你上线没有 这两部剧", context=context)
+
+        self.assertIn("web.search", names)
 
     def test_ordinary_recommendation_avoids_unneeded_web_search(self) -> None:
-        objective = infer_agent_objective("最近想看点科幻")
         names = self._names("最近想看点科幻")
 
-        self.assertEqual(objective.task_kind, "media_recommendation")
-        self.assertEqual(objective.required_sources, ("metadata_catalog",))
         self.assertNotIn("web.search", names)
         self.assertIn("discovery.recommend", names)
         self.assertNotIn("discovery.search", names)
 
-    def test_current_year_recommendation_requires_catalog_and_web(self) -> None:
+    def test_current_year_recommendation_fallback_keeps_relevant_catalog_tools(self) -> None:
         query = f"{date.today().year} 科幻 欧美剧集推荐"
-        objective = infer_agent_objective(query)
         names = self._names(query)
 
-        self.assertEqual(objective.task_kind, "media_recommendation")
-        self.assertEqual(
-            objective.required_sources, ("metadata_catalog", "public_web")
-        )
         self.assertIn("discovery.recommend", names)
-        self.assertNotIn("discovery.search", names)
-        self.assertIn("web.search", names)
+        self.assertIn("discovery.search", names)
         self.assertNotIn("discovery.add_watchlist", names)
 
     def test_exact_qb_realtime_and_media_total_use_native_provider_routes(self) -> None:
@@ -214,10 +160,6 @@ class AgentObjectiveContractTests(unittest.TestCase):
                 invoke.call_args.kwargs["operation"], "media.items.counts"
             )
 
-        series_count = infer_agent_objective(
-            "查看媒体库中《九门》一共有多少集"
-        )
-        self.assertNotEqual(series_count.task_kind, "media_library_counts")
         self.assertIn(
             "library.count_series_episodes",
             self._names("查看媒体库中《九门》一共有多少集"),
@@ -254,18 +196,12 @@ class AgentObjectiveContractTests(unittest.TestCase):
         invoke.assert_called_once()
 
     def test_recent_guoman_and_year_followup_require_current_evidence(self) -> None:
-        recent = infer_agent_objective("最近有什么推荐的国漫")
-        followup = infer_agent_objective("2026 有新剧吗")
-        self.assertEqual(
-            recent.required_sources, ("metadata_catalog", "public_web")
-        )
-        self.assertEqual(
-            followup.required_sources, ("metadata_catalog", "public_web")
-        )
-        self.assertEqual(
-            set(self._names("最近有什么推荐的国漫")),
-            {"discovery.recommend", "web.search"},
-        )
+        self.assertTrue({
+            "discovery.recommend", "web.search",
+        }.issubset(set(self._names("最近有什么推荐的国漫"))))
+        self.assertTrue({
+            "discovery.recommend", "web.search",
+        }.issubset(set(self._names("2026 有新剧吗"))))
 
     def test_year_recommendation_inherits_previous_guoman_scope(self) -> None:
         agent = AgentOrchestrator(self.registry)
@@ -296,70 +232,34 @@ class AgentObjectiveContractTests(unittest.TestCase):
 
     def test_named_series_update_uses_media_chain_without_cross_domain_tools(self) -> None:
         message = "检查师兄太稳健有没有更新"
-        objective = infer_agent_objective(message)
         names = set(self._names(message))
 
-        self.assertEqual(objective.task_kind, "series_update_audit")
-        self.assertEqual(objective.entity_terms, ("师兄太稳健",))
-        self.assertIn("web.search", names)
         self.assertIn("library.check_updates", names)
-        self.assertNotIn("rss.diagnose", names)
-        self.assertNotIn("media.subscription_updates", names)
-        self.assertNotIn("downloads.diagnose_queue", names)
-        self.assertNotIn("indexer.search_resources", names)
-
-        scoped = infer_agent_objective("媒体库里的师兄太稳健有没有更新")
-        self.assertEqual(scoped.entity_terms, ("师兄太稳健",))
-        self.assertEqual(
-            infer_agent_objective("检查 MediaFlux 有没有更新").task_kind,
-            "general",
-        )
-        self.assertEqual(
-            infer_agent_objective("我关注的动漫有更新吗").task_kind,
-            "general",
-        )
+        self.assertNotIn("guangya.directory_scrape.inspect", names)
 
     def test_series_update_without_resource_request_avoids_indexers(self) -> None:
         message = "师兄太稳健官方更新到多少集，本地有多少集"
-        objective = infer_agent_objective(message)
         names = self._names(message)
 
-        self.assertEqual(objective.task_kind, "series_update_audit")
-        self.assertEqual(objective.entity_terms, ("师兄太稳健",))
-        self.assertEqual(
-            objective.required_sources, ("public_web", "local_library")
-        )
-        self.assertIn("resource_index", objective.forbidden_sources)
-        self.assertNotIn("indexer.search_resources", objective.allowed_tools)
+        self.assertIn("web.search", names)
+        self.assertIn("library.count_series_episodes", names)
         self.assertNotIn("indexer.search_resources", names)
 
-    def test_series_workflow_locks_identity_and_tool_scope(self) -> None:
+    def test_series_workflow_uses_registry_validation_without_intent_contract(self) -> None:
         message = (
             "检查师兄太稳健官方更新到多少集、媒体库有多少集，"
             "有没有缺集并搜索可下载资源，只生成推送计划"
         )
-        objective = infer_agent_objective(message)
         names = self._names(message)
 
-        self.assertEqual(objective.entity_terms, ("师兄太稳健",))
         self.assertIn("web.search", names)
         self.assertIn("library.count_series_episodes", names)
         self.assertIn("indexer.search_resources", names)
-        self.assertNotIn("guangya.directory_scrape.inspect", names)
-        _validate_objective_tool_call(
-            objective,
-            "library.count_series_episodes",
-            {"query": "师兄太稳健"},
-            registry=self.registry,
+        disposition, arguments = self.registry.validate_llm_orchestration_call(
+            "library.count_series_episodes", {"query": "师兄啊师兄"}
         )
-        with self.assertRaises(AgentToolError) as caught:
-            _validate_objective_tool_call(
-                objective,
-                "library.count_series_episodes",
-                {"query": "师兄啊师兄"},
-                registry=self.registry,
-            )
-        self.assertEqual(caught.exception.code, "identity_mismatch")
+        self.assertEqual(disposition.value, "execute_read")
+        self.assertEqual(arguments, {"query": "师兄啊师兄", "tmdb_id": ""})
 
     def test_plan_only_language_is_not_misclassified_as_executed_action(self) -> None:
         self.assertFalse(is_agent_action_request("只生成推送计划，不要执行"))
@@ -406,7 +306,7 @@ class AgentObjectiveContractTests(unittest.TestCase):
         self.assertEqual(result["data"]["required_failed"], 0)
         self.assertEqual(result["data"]["supporting_failed"], 1)
 
-    def test_aggregate_requires_success_from_every_objective_source(self) -> None:
+    def test_aggregate_does_not_invent_unselected_required_sources(self) -> None:
         orchestrator = AgentOrchestrator(ToolRegistry())
         executions = [{
             "tool_name": "web.search",
@@ -429,8 +329,7 @@ class AgentObjectiveContractTests(unittest.TestCase):
                 ).to_dict(),
             },
         }]
-        # 本轮故意没有执行 local_library 来源，不能因为其他来源成功
-        # 就宣称全链路完成。
+
         response = orchestrator._aggregate_native_read_executions(
             executions,
             owner="",
@@ -444,43 +343,21 @@ class AgentObjectiveContractTests(unittest.TestCase):
 
         self.assertIsNotNone(response)
         result = response["result"]
-        self.assertFalse(result["ok"])
-        self.assertEqual(result["status"], "partial")
-        self.assertEqual(result["data"]["required_failed"], 1)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["data"]["required_failed"], 0)
 
-    def test_strm_and_object_organize_capabilities_remain_isolated(self) -> None:
+    def test_semantic_fallback_does_not_invent_downstream_workflow_stages(self) -> None:
         strm_names = set(self._names("只同步整理和 NSFW 两个 STRM 来源"))
-        source_list_message = "有哪些 STRM 来源可以同步"
-        source_list = self._names(source_list_message)
-        status_message = "我想看 STRM 同步状态"
-        status_names = set(self._names(status_message))
+        source_list_names = set(self._names("有哪些 STRM 来源可以同步"))
         organize_names = set(
             self._names("整理光鸭 /待整理/某剧，只生成计划，不执行")
         )
-        colloquial_preview_names = set(
-            self._names("整理光鸭 /待整理/某剧，先看看方案，别执行")
-        )
 
-        self.assertEqual(
-            strm_names,
-            {"strm.status", "strm.diagnose", "strm.run_history", "strm.run_once"},
-        )
-        self.assertEqual(source_list, ["strm.status"])
-        self.assertFalse(is_agent_action_request(source_list_message))
-        self.assertEqual(
-            status_names, {"strm.status", "strm.diagnose", "strm.run_history"}
-        )
-        self.assertNotIn("strm.run_once", status_names)
-        self.assertFalse(is_agent_action_request(status_message))
-        self.assertEqual(
-            organize_names,
-            {
-                "guangya.directory_scrape.inspect",
-                "guangya.directory_scrape.search",
-                "guangya.directory_scrape.preview",
-            },
-        )
-        self.assertEqual(colloquial_preview_names, organize_names)
+        self.assertIn("strm.run_once", strm_names)
+        self.assertEqual(source_list_names, {"strm.status"})
+        self.assertIn("guangya.directory_scrape.inspect", organize_names)
+        self.assertNotIn("guangya.directory_scrape.run", organize_names)
 
     def test_strm_source_catalog_has_zero_model_fallback(self) -> None:
         agent = AgentOrchestrator(self.registry)
