@@ -640,6 +640,14 @@ class DirectoryScrapeService:
         with self._lifecycle_condition:
             return self._closed, self._closing, self._active_operations
 
+    def _runtime_credentials_current(self) -> bool:
+        """检查长生命周期光鸭客户端是否仍绑定最新持久凭据。"""
+        current = getattr(self.client, "credentials_current", None)
+        if current is None:
+            # 兼容测试替身和没有持久凭据概念的注入客户端。
+            return True
+        return bool(current() if callable(current) else current)
+
     def close(self) -> bool:
         """释放内部客户端；在途刮削结束前不抢先拆除共享资源。"""
         with self._close_call_lock:
@@ -2201,12 +2209,35 @@ def get_directory_scrape_service() -> DirectoryScrapeService:
 
         closed, closing, active = service._lifecycle_state()
         if not closed and not closing:
-            return service
+            credentials_current = getattr(
+                service, "_runtime_credentials_current", None
+            )
+            if not callable(credentials_current) or credentials_current():
+                return service
         if closing and active:
             raise DirectoryScrapeRequestError("目录刮削运行时正在切换，请稍后重试")
-        if not closed and not service.close():
-            raise DirectoryScrapeRequestError("目录刮削运行时尚未完成关闭，请稍后重试")
+
+        # 多个请求可能同时发现凭据已变化。切换必须在全局槽锁内复核并完成，
+        # 否则同一旧实例会被重复 close，并产生重复重建日志。
         with _service_lock:
+            if _service is not service:
+                continue
+            closed, closing, active = service._lifecycle_state()
+            if not closed and not closing:
+                credentials_current = getattr(
+                    service, "_runtime_credentials_current", None
+                )
+                if not callable(credentials_current) or credentials_current():
+                    return service
+                logger.info("光鸭凭据已变化，重建目录刮削运行时")
+            if closing and active:
+                raise DirectoryScrapeRequestError(
+                    "目录刮削运行时正在切换，请稍后重试"
+                )
+            if not closed and not service.close():
+                raise DirectoryScrapeRequestError(
+                    "目录刮削运行时尚未完成关闭，请稍后重试"
+                )
             if _service is service:
                 _service = None
 

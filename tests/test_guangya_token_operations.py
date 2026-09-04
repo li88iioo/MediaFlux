@@ -590,11 +590,17 @@ class GuangYaTokenClientTests(unittest.TestCase):
             with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
                 refresher = GuangYaClient(token_file=token_file)
                 old_client = GuangYaClient(token_file=token_file)
+                old_raw = old_client._raw
                 before = refresher.credential_generation
+                self.assertTrue(refresher.credentials_current)
+                self.assertTrue(old_client.credentials_current)
 
                 refresher.refresh_now()
 
                 self.assertEqual(refresher.credential_generation, before)
+                self.assertTrue(refresher.credentials_current)
+                self.assertFalse(old_client.credentials_current)
+                self.assertIs(old_client._raw, old_raw)
                 self.assertFalse(old_client.logged_in)
 
     def test_persisted_generation_invalidates_client_from_isolated_module_state(self):

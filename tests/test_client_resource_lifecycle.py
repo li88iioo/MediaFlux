@@ -1,6 +1,7 @@
 """短生命周期 HTTP 客户端和整理服务的所有权回归测试。"""
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import time
@@ -59,6 +60,28 @@ class _LoginRaw:
         self.token = "access"
         self.refresh_token_value = "refresh"
         self.token_expires_at = 1_900_000_000
+
+
+class _RotatingCredentialRaw:
+    def __init__(self, access_token=None, refresh_token=None, device_id=None) -> None:
+        self.token = str(access_token or "")
+        self.refresh_token_value = str(refresh_token or "")
+        self.device_id = str(device_id or "test-device")
+        self.token_expires_at = None
+
+    def refresh_token(self, _refresh_token=None):
+        self.token = "rotated-access"
+        self.refresh_token_value = "rotated-refresh"
+        self.token_expires_at = 1_900_000_000
+        return {
+            "access_token": self.token,
+            "refresh_token": self.refresh_token_value,
+            "expires_at": self.token_expires_at,
+        }
+
+    @staticmethod
+    def close() -> None:
+        pass
 
 
 class ClientResourceLifecycleTests(unittest.TestCase):
@@ -518,6 +541,120 @@ class ClientResourceLifecycleTests(unittest.TestCase):
                 local_media_module._service = saved_local
             with directory_scrape_module._service_lock:
                 directory_scrape_module._service = saved_directory
+
+    def test_directory_service_getter_rebuilds_stale_credential_runtime_once(self) -> None:
+        class StaleService:
+            def __init__(self) -> None:
+                self.close_calls = 0
+
+            @staticmethod
+            def _lifecycle_state():
+                return False, False, 0
+
+            @staticmethod
+            def _runtime_credentials_current():
+                return False
+
+            def close(self):
+                self.close_calls += 1
+                return True
+
+        class HealthyReplacement:
+            @staticmethod
+            def _lifecycle_state():
+                return False, False, 0
+
+            @staticmethod
+            def _runtime_credentials_current():
+                return True
+
+        stale = StaleService()
+        replacement = HealthyReplacement()
+        with directory_scrape_module._service_lock:
+            saved = directory_scrape_module._service
+            directory_scrape_module._service = stale
+
+        try:
+            results = []
+            with patch.object(
+                directory_scrape_module,
+                "DirectoryScrapeService",
+                return_value=replacement,
+            ) as factory:
+                threads = [
+                    threading.Thread(
+                        target=lambda: results.append(
+                            directory_scrape_module.get_directory_scrape_service()
+                        )
+                    )
+                    for _ in range(4)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=2)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(results, [replacement] * 4)
+            self.assertEqual(stale.close_calls, 1)
+            factory.assert_called_once_with(store=directory_scrape_module._store)
+        finally:
+            with directory_scrape_module._service_lock:
+                directory_scrape_module._service = saved
+
+    def test_directory_service_reloads_after_another_client_rotates_token(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = Path(directory) / "guangya-token.json"
+            token_file.write_text(
+                json.dumps({
+                    "access_token": "initial-access",
+                    "refresh_token": "initial-refresh",
+                    "device_id": "test-device",
+                    "expires_at": 1_900_000_000,
+                }),
+                encoding="utf-8",
+            )
+            replacement = None
+            refresher = None
+            stale = None
+            with patch(
+                "app.clients.guangya._load_raw",
+                return_value=_RotatingCredentialRaw,
+            ), patch.object(
+                directory_scrape_module,
+                "GuangYaClient",
+                side_effect=lambda: GuangYaClient(token_file=token_file),
+            ), patch.object(
+                directory_scrape_module,
+                "TMDBScraper",
+                return_value=Mock(),
+            ):
+                stale = DirectoryScrapeService(
+                    store=directory_scrape_module._store,
+                )
+                refresher = GuangYaClient(token_file=token_file)
+                with directory_scrape_module._service_lock:
+                    saved = directory_scrape_module._service
+                    directory_scrape_module._service = stale
+                try:
+                    refresher.refresh_now()
+                    self.assertFalse(stale.client.credentials_current)
+
+                    replacement = directory_scrape_module.get_directory_scrape_service()
+
+                    self.assertIsNot(replacement, stale)
+                    self.assertIs(replacement.store, directory_scrape_module._store)
+                    self.assertTrue(replacement.client.credentials_current)
+                    self.assertEqual(stale._lifecycle_state(), (True, False, 0))
+                finally:
+                    with directory_scrape_module._service_lock:
+                        current = directory_scrape_module._service
+                        directory_scrape_module._service = saved
+                    if current is not saved:
+                        current.close()
+                    refresher.close()
+                    if stale is not None and not stale._closed:
+                        stale.close()
 
     def test_local_media_preview_serializes_shared_organizer_state(self) -> None:
         service = LocalMediaService(scraper=Mock())

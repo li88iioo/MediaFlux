@@ -1277,6 +1277,20 @@ class GuangYaClient:
             return 0
         return _token_generation(token_file)
 
+    @property
+    def credentials_current(self) -> bool:
+        """当前实例是否仍绑定磁盘上的最新凭据快照。
+
+        长生命周期服务可用该只读状态在开始新操作前重建客户端；这里故意
+        不调用 ``_invalidate_if_stale``，避免健康检查提前拆除仍被在途操作
+        使用的 SDK 连接。
+        """
+        lock = getattr(self, "_token_lock", None)
+        if lock is None:
+            return self._credentials_current()
+        with lock:
+            return self._credentials_current()
+
     # ===== 登录凭证 =====
     def login_init(self, phone: str) -> dict:
         """初始化短信登录，返回可能需要的 captcha 信息。"""
