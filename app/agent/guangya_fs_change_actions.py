@@ -312,6 +312,7 @@ def guangya_fs_change_preview_arguments(arguments: dict[str, Any]) -> dict[str, 
         expected = {
             "rename": {"op", "object_ref", "new_name"},
             "move": {"op", "object_ref", "target_path"},
+            "copy": {"op", "object_ref", "target_path"},
             "relocate": {"op", "object_ref", "target_path", "new_name"},
             "trash": {"op", "object_ref"},
             "create_directory": {"op", "parent_path", "name"},
@@ -402,7 +403,7 @@ def guangya_fs_change_preview_arguments(arguments: dict[str, Any]) -> dict[str, 
             if not isinstance(name, str) or not 1 <= len(name.strip()) <= 255:
                 raise AgentToolError("new_name 长度必须在 1 到 255 之间")
             normalized["new_name"] = name.strip()
-        if op in {"move", "relocate"}:
+        if op in {"move", "relocate", "copy"}:
             normalized["target_path"] = _normalize_path(
                 raw.get("target_path"), field="target_path"
             )
@@ -503,6 +504,7 @@ def preview_guangya_fs_change(
         "rename_count": max(0, int(stats.get("rename") or 0)),
         "move_count": max(0, int(stats.get("move") or 0)),
         "relocate_count": max(0, int(stats.get("relocate") or 0)),
+        "copy_count": max(0, int(stats.get("copy") or 0)),
         "trash_count": max(0, int(stats.get("trash") or 0)),
         "create_directory_count": max(0, int(stats.get("create_directory") or 0)),
         "sample_changes": [
@@ -593,7 +595,7 @@ def prepare_guangya_fs_change_confirmation(
             **flow.preview_safe,
             "effects": [
                 "只执行刚才冻结的对象、名称和目标目录，不会扩大范围。",
-                "移动和改名会在写前重新检查快照与同名冲突。",
+                "移动、复制和改名会在写前重新检查快照与同名冲突。",
                 "trash 只调用 Provider 回收站语义，不提供永久删除。",
                 "每项写入后都会重新读取目录或对象状态验证真实结果。",
                 *(

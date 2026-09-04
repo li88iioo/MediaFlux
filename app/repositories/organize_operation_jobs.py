@@ -40,7 +40,7 @@ _ALLOWED_RESULT_STATS = {
     "empty_dir_cleanup_failed", "source_dir_cleanup_failed", "audit_failures",
     "strm_triggered", "strm_trigger_failed",
     "quarantined", "empty_deleted", "verification_failed",
-    "precondition_failed", "trashed", "created",
+    "precondition_failed", "trashed", "created", "copied",
 }
 
 logger = logging.getLogger(__name__)

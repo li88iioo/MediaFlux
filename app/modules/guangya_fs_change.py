@@ -788,7 +788,14 @@ def build_fs_change_plan(
         if not isinstance(raw, dict):
             raise GuangYaFSChangeError("光鸭变更操作格式无效")
         op = str(raw.get("op") or "").strip().casefold()
-        if op not in {"rename", "move", "relocate", "trash", "create_directory"}:
+        if op not in {
+            "rename",
+            "move",
+            "relocate",
+            "copy",
+            "trash",
+            "create_directory",
+        }:
             raise GuangYaFSChangeError("不支持的光鸭变更操作")
         if op == "create_directory":
             parent_path = _normalize_path(raw.get("parent_path"))
@@ -852,29 +859,37 @@ def build_fs_change_plan(
             if _name_conflict(cache[parent_id], new_name, exclude_id=current.file_id):
                 raise GuangYaFSChangeError("改名目标已被同目录对象占用")
             base["new_name"] = new_name
-        if op in {"move", "relocate"}:
+        if op in {"move", "relocate", "copy"}:
             target_path = _normalize_path(raw.get("target_path"))
             pending_target = pending_targets.get(target_path)
             if pending_target is None:
                 target_id, target_snapshot = _resolve_directory(client, target_path)
                 if target_id == parent_id:
-                    raise GuangYaFSChangeError("移动目标与当前目录相同")
+                    raise GuangYaFSChangeError(
+                        "复制目标与当前目录相同"
+                        if op == "copy"
+                        else "移动目标与当前目录相同"
+                    )
             else:
                 target_id, target_snapshot = "", None
             source_path = str(base["source_path"])
             if current.is_dir and (
                 target_path == source_path or target_path.startswith(source_path + "/")
             ):
-                raise GuangYaFSChangeError("不能把目录移动到自身或其子目录")
+                raise GuangYaFSChangeError(
+                    "不能把目录复制到自身或其子目录"
+                    if op == "copy"
+                    else "不能把目录移动到自身或其子目录"
+                )
             target_name = str(base.get("new_name") or current.name)
             planned_names = planned_target_names.setdefault(target_path, set())
             if target_name.casefold() in planned_names:
-                raise GuangYaFSChangeError("计划在移动目标中生成了重复名称")
+                raise GuangYaFSChangeError("计划在目标目录中生成了重复名称")
             planned_names.add(target_name.casefold())
             if pending_target is None:
                 target_items = _list_map(client, target_id, cache)
                 if _name_conflict(target_items, target_name):
-                    raise GuangYaFSChangeError("移动目标中已有同名对象")
+                    raise GuangYaFSChangeError("目标目录中已有同名对象")
             base.update(
                 target_path=target_path,
                 target_id=target_id,
@@ -901,7 +916,15 @@ def build_fs_change_plan(
                 )
 
     counts = {
-        key: 0 for key in ("rename", "move", "relocate", "trash", "create_directory")
+        key: 0
+        for key in (
+            "rename",
+            "move",
+            "relocate",
+            "copy",
+            "trash",
+            "create_directory",
+        )
     }
     samples: list[str] = []
     for item in frozen:
@@ -919,6 +942,10 @@ def build_fs_change_plan(
             samples.append(
                 f"移动并改名：{item['source']['name']} → "
                 f"{Path(str(item['target_path'])).name or '根目录'} / {item['new_name']}"
+            )
+        elif op == "copy":
+            samples.append(
+                f"复制：{item['source']['name']} → {Path(str(item['target_path'])).name or '根目录'}"
             )
         elif op == "trash":
             samples.append(f"移入回收站：{item['source']['name']}")
@@ -1042,7 +1069,7 @@ def _preflight_operation(
             exclude_id=str(source.get("file_id") or ""),
         ):
             raise GuangYaFSChangeStale("改名目标已被占用，请重新预览")
-    elif op in {"move", "relocate"}:
+    elif op in {"move", "relocate", "copy"}:
         target_id = _target_id(
             item,
             created_targets,
@@ -1053,13 +1080,13 @@ def _preflight_operation(
         if not item.get("target_create_path") and not _verify_directory_snapshot(
             client, target_id, item.get("target_snapshot")
         ):
-            raise GuangYaFSChangeStale("移动目标目录已变化，请重新预览")
+            raise GuangYaFSChangeStale("目标目录已变化，请重新预览")
         siblings = {str(row.file_id): row for row in client.list_dir(target_id)}
         target_name = str(
             item.get("new_name") if op == "relocate" else source.get("name") or ""
         )
         if _name_conflict(siblings, target_name):
-            raise GuangYaFSChangeStale("移动目标中已有同名对象，请重新预览")
+            raise GuangYaFSChangeStale("目标目录中已有同名对象，请重新预览")
 
 
 def _verify_after(
@@ -1101,6 +1128,23 @@ def _verify_after(
             str(row.file_id) == file_id and row.name == target_name
             for row in client.list_dir(target_id)
         )
+    if op == "copy":
+        target_id = _target_id(item, created_targets)
+        target_name = str(source.get("name") or "")
+        for row in client.list_dir(target_id):
+            if row.name != target_name or bool(row.is_dir) != bool(source.get("is_dir")):
+                continue
+            expected_size = max(0, int(source.get("size") or 0))
+            if not row.is_dir and expected_size and int(row.size or 0) != expected_size:
+                continue
+            expected_etag = str(source.get("etag") or "")
+            if not row.is_dir and expected_etag and str(row.etag or "") not in {
+                "",
+                expected_etag,
+            }:
+                continue
+            return True
+        return False
     return False
 
 
@@ -1164,6 +1208,7 @@ def _operation_stat_key(operation: str) -> str:
             "rename": "renamed",
             "move": "moved",
             "relocate": "relocated",
+            "copy": "copied",
             "trash": "trashed",
             "create_directory": "created",
         }[operation]
@@ -1205,6 +1250,7 @@ def execute_fs_change_plan(
         "renamed": 0,
         "moved": 0,
         "relocated": 0,
+        "copied": 0,
         "trashed": 0,
         "created": 0,
         "failed": 0,
@@ -1274,6 +1320,11 @@ def execute_fs_change_plan(
                         [str(source.get("file_id") or "")],
                         _target_id(item, created_targets),
                     )
+                elif op == "copy":
+                    client.copy(
+                        [str(source.get("file_id") or "")],
+                        _target_id(item, created_targets),
+                    )
                 elif op == "trash":
                     execute_recycle_bin_delete(
                         client,
@@ -1294,12 +1345,26 @@ def execute_fs_change_plan(
                     )
                 else:  # _operation_stat_key 已阻止未知操作
                     raise GuangYaFSChangeError("光鸭变更计划包含未知操作")
-                if not _verify_after(
+                verified = _verify_after(
                     client,
                     item,
                     created_id,
                     created_targets=created_targets,
-                ):
+                )
+                if op == "copy" and not verified:
+                    # Provider 的复制接口可能先返回异步任务；持久任务在线程中
+                    # 等待短暂可见性窗口，避免立即把已受理复制误判为失败。
+                    for _attempt in range(20):
+                        time.sleep(0.5)
+                        if _verify_after(
+                            client,
+                            item,
+                            created_id,
+                            created_targets=created_targets,
+                        ):
+                            verified = True
+                            break
+                if not verified:
                     stats["verification_failed"] += 1
                     raise GuangYaFSChangeError("写入后的云端状态校验失败")
                 if op == "create_directory":
@@ -1345,9 +1410,9 @@ def execute_fs_change_plan(
                         persistence_uncertain = True
                 else:
                     stats["failed"] += 1
-                    if op == "relocate" and provider_write_started:
-                        # Relocate is a two-call Provider operation. A transport failure
-                        # between rename and move may leave a safe but partial remote state.
+                    if op in {"relocate", "copy"} and provider_write_started:
+                        # relocate 是两次 Provider 写入，copy 则可能异步完成；
+                        # 二者在传输/可见性异常后都不能安全盲重试。
                         persistence_uncertain = True
                     status = "failed"
             try:
@@ -1377,6 +1442,7 @@ def execute_fs_change_plan(
             stats["renamed"]
             + stats["moved"]
             + stats["relocated"]
+            + stats["copied"]
             + stats["trashed"]
             + stats["created"]
         )

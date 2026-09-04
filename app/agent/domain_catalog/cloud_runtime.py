@@ -75,6 +75,7 @@ def guangya_organize_status(
         "empty_dir_cleanup_failed",
         "source_dir_cleanup_failed",
         "audit_failures",
+        "copied",
     }
     stats = (
         {

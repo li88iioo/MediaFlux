@@ -76,6 +76,18 @@ class FakeGatewayClient:
             self.directories.setdefault(str(parent_id), []).append(item)
         return True
 
+    def copy(self, file_ids, parent_id):
+        for file_id in file_ids:
+            source = self.file_info(str(file_id))
+            if source is None:
+                raise RuntimeError("missing")
+            self.counter += 1
+            copied = deepcopy(source)
+            copied.file_id = f"copied-{self.counter}"
+            copied.parent_id = str(parent_id)
+            self.directories.setdefault(str(parent_id), []).append(copied)
+        return f"copy-task-{self.counter}"
+
     def delete(self, file_ids):
         for file_id in file_ids:
             item = self._pop(str(file_id))
@@ -504,6 +516,46 @@ class GuangYaFSGatewayTests(unittest.TestCase):
         )
         self.assertEqual(
             {item.name for item in client.directories["target"]}, {"Move.mp4", "新目录"}
+        )
+
+    def test_copy_keeps_source_and_verifies_new_target_object(self):
+        client = FakeGatewayClient()
+        observed = self._query(client)
+        source_ref = next(
+            item["object_ref"]
+            for item in observed.data["entries"]
+            if item["object_name"] == "Move.mp4"
+        )
+        observation = guangya_workspace.load_directory_observation(
+            observed.data["observation_ref"], owner="owner"
+        )
+        plan = guangya_fs_change.build_fs_change_plan(
+            client,
+            owner="owner",
+            observation=observation,
+            trigger_strm=False,
+            operations=[
+                {
+                    "op": "copy",
+                    "object_ref": source_ref,
+                    "target_path": "/target",
+                }
+            ],
+        )
+        self.assertEqual(plan["stats"]["copy"], 1)
+        guangya_fs_change.confirm_fs_change_plan(
+            plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
+        )
+
+        result = guangya_fs_change.execute_fs_change_plan(
+            self._queued_payload(plan), client_factory=lambda: client
+        )
+
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["stats"]["copied"], 1)
+        self.assertIsNotNone(client.file_info("move"))
+        self.assertEqual(
+            [item.name for item in client.directories["target"]], ["Move.mp4"]
         )
 
     def test_execution_rejects_stale_snapshot_before_any_write(self):

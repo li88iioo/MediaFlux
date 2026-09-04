@@ -316,6 +316,16 @@ def _validate_write_response(response, *, operation: str) -> None:
 
     success_codes = {"0", "200", "success", "ok"}
     success_messages = {"success", "ok", "成功"}
+    failure_message_markers = (
+        "失败",
+        "未成功",
+        "不成功",
+        "错误",
+        "异常",
+        "拒绝",
+        "不可用",
+        "不能",
+    )
     codes: list[str] = []
     messages: list[str] = []
     success_flags: list[bool] = []
@@ -336,13 +346,32 @@ def _validate_write_response(response, *, operation: str) -> None:
     failure_code = next(
         (code for code in codes if code.casefold() not in success_codes), "",
     )
+    def failed_message(message: str) -> bool:
+        normalized = message.casefold()
+        return any(marker in normalized for marker in failure_message_markers)
+
+    def successful_message(message: str) -> bool:
+        normalized = message.casefold()
+        return not failed_message(normalized) and (
+            normalized in success_messages or normalized.endswith("成功")
+        )
+
     failure_message = next(
-        (message for message in messages if message.casefold() not in success_messages),
+        (message for message in messages if not successful_message(message)),
         messages[0] if messages else "",
     )
     if failure_code:
         raise GuangYaWriteRejected(
             operation, code=failure_code, message=failure_message,
+        )
+    explicit_failure_message = next(
+        (message for message in messages if failed_message(message)), ""
+    )
+    if explicit_failure_message:
+        raise GuangYaWriteRejected(
+            operation,
+            code=codes[0] if codes else "",
+            message=explicit_failure_message,
         )
     if any(flag is False for flag in success_flags):
         raise GuangYaWriteRejected(
@@ -350,11 +379,27 @@ def _validate_write_response(response, *, operation: str) -> None:
         )
     has_explicit_success = bool(codes) or any(success_flags)
     if messages and not has_explicit_success and all(
-        message.casefold() not in success_messages for message in messages
+        not successful_message(message) for message in messages
     ):
         raise GuangYaWriteRejected(
             operation, code="", message=failure_message,
         )
+
+
+def _extract_task_id(response: object) -> str:
+    """从 SDK 多版本响应中提取异步任务编号，不把整个响应交给上层。"""
+    if not isinstance(response, dict):
+        return ""
+    payloads = [response]
+    data = response.get("data")
+    if isinstance(data, dict):
+        payloads.append(data)
+    for payload in payloads:
+        for key in ("taskId", "taskID", "task_id", "id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                return value[:256]
+    return ""
 
 
 @dataclass
@@ -1519,6 +1564,20 @@ class GuangYaClient:
         _validate_write_response(response, operation="move")
         return True
 
+    def copy(self, file_ids: list[str], parent_id: str) -> str:
+        """复制明确指定的对象并返回 Provider 异步任务编号（若有）。"""
+        ids = list(
+            dict.fromkeys(str(item).strip() for item in file_ids if str(item).strip())
+        )
+        if not ids:
+            raise ValueError("至少选择一个要复制的光鸭对象")
+        response = self.raw.fs_copy(
+            ids,
+            None if str(parent_id or "0") == "0" else str(parent_id),
+        )
+        _validate_write_response(response, operation="copy")
+        return _extract_task_id(response)
+
     def rename(self, file_id: str, new_name: str) -> bool:
         response = self.raw.fs_rename(file_id, new_name)
         _validate_write_response(response, operation="rename")
@@ -1532,6 +1591,77 @@ class GuangYaClient:
         response = self.raw.fs_delete(ids)
         _validate_write_response(response, operation="delete")
         return True
+
+    def iter_recycle(
+        self,
+        *,
+        page_size: int = 200,
+        max_items: int = 20_000,
+    ) -> Iterator[GuangYaFile]:
+        """完整、安全地分页读取回收站；超过预算时显式失败而非静默截断。"""
+        safe_page_size = max(1, min(int(page_size or 200), 200))
+        safe_limit = max(1, min(int(max_items or 20_000), 100_000))
+        page = 0
+        yielded = 0
+        seen_ids: set[str] = set()
+        while True:
+            response = self._call_read(
+                "list_recycle",
+                lambda page=page: self.raw.fs_recycle_files(
+                    page=page,
+                    page_size=safe_page_size,
+                ),
+            )
+            metrics = self._active_read_metrics()
+            if metrics is not None:
+                metrics.record_page()
+            items = self._extract_list(response)
+            new_count = 0
+            for raw_item in items:
+                item = _to_file(raw_item)
+                if item.file_id and item.file_id in seen_ids:
+                    continue
+                if yielded >= safe_limit:
+                    raise RuntimeError(
+                        f"光鸭回收站对象超过安全上限 {safe_limit}，已停止读取"
+                    )
+                if item.file_id:
+                    seen_ids.add(item.file_id)
+                yielded += 1
+                new_count += 1
+                yield item
+            if len(items) < safe_page_size:
+                return
+            if new_count == 0:
+                raise RuntimeError("光鸭回收站分页未推进，已停止读取")
+            page += 1
+
+    def list_recycle(self, *, max_items: int = 20_000) -> list[GuangYaFile]:
+        return list(self.iter_recycle(max_items=max_items))
+
+    def restore_from_recycle(self, file_ids: list[str]) -> str:
+        ids = list(
+            dict.fromkeys(str(item).strip() for item in file_ids if str(item).strip())
+        )
+        if not ids:
+            raise ValueError("至少选择一个要恢复的光鸭对象")
+        response = self.raw.fs_recycle(ids)
+        _validate_write_response(response, operation="recycle_restore")
+        return _extract_task_id(response)
+
+    def clear_recycle_bin(self) -> str:
+        response = self.raw.fs_clear_recycle_bin()
+        _validate_write_response(response, operation="recycle_clear")
+        return _extract_task_id(response)
+
+    def task_status(self, task_id: str) -> dict:
+        normalized = str(task_id or "").strip()
+        if not normalized:
+            raise ValueError("光鸭任务编号不能为空")
+        response = self._call_read(
+            "task_status", lambda: self.raw.get_task_status(normalized)
+        )
+        return response if isinstance(response, dict) else {}
 
     @property
     def supports_atomic_empty_directory_delete(self) -> bool:
@@ -1733,6 +1863,132 @@ class GuangYaClient:
             ),
             "count": 0,
         }
+
+    def account_info(self) -> dict:
+        """读取账号资料；调用方必须对白名单字段做公开投影。"""
+        response = self._call_read("account_info", lambda: self.raw.user_info())
+        return response if isinstance(response, dict) else {}
+
+    def list_user_shares(self, *, max_items: int = 2_000) -> list[dict]:
+        """完整读取当前账号创建的分享，保留原始结构供领域层私有解析。"""
+        safe_limit = max(1, min(int(max_items or 2_000), 10_000))
+        page_size = 100
+        page = 0
+        result: list[dict] = []
+        seen: set[str] = set()
+        while True:
+            response = self._call_read(
+                "list_user_shares",
+                lambda page=page: self.raw.share_user_list(
+                    page=page,
+                    page_size=page_size,
+                ),
+            )
+            metrics = self._active_read_metrics()
+            if metrics is not None:
+                metrics.record_page()
+            items = self._extract_list(response)
+            new_count = 0
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                share_id = str(
+                    item.get("shareId")
+                    or item.get("shareID")
+                    or item.get("share_id")
+                    or item.get("id")
+                    or ""
+                ).strip()
+                identity = share_id or hashlib.sha256(
+                    json.dumps(
+                        item,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
+                if identity in seen:
+                    continue
+                if len(result) >= safe_limit:
+                    raise RuntimeError(
+                        f"光鸭分享数量超过安全上限 {safe_limit}，已停止读取"
+                    )
+                seen.add(identity)
+                result.append(dict(item))
+                new_count += 1
+            if len(items) < page_size:
+                return result
+            if new_count == 0:
+                raise RuntimeError("光鸭分享分页未推进，已停止读取")
+            page += 1
+
+    def create_user_share(
+        self,
+        file_ids: list[str],
+        *,
+        title: str,
+        validate_duration: int = 0,
+        code: str = "",
+        auto_fill_code: bool = True,
+        max_restore_count: int = 0,
+        allow_download: bool = True,
+    ) -> dict:
+        ids = list(
+            dict.fromkeys(str(item).strip() for item in file_ids if str(item).strip())
+        )
+        if not ids:
+            raise ValueError("至少选择一个要分享的光鸭对象")
+        normalized_code = str(code or "").strip()
+        response = self.raw.share_create(
+            ids,
+            title=str(title or "").strip(),
+            validate_duration=max(0, int(validate_duration or 0)),
+            code=normalized_code,
+            auto_fill_code=bool(auto_fill_code) and not bool(normalized_code),
+            max_restore_count=max(0, int(max_restore_count or 0)),
+            download_type=1 if allow_download else 0,
+        )
+        _validate_write_response(response, operation="share_create")
+        return response if isinstance(response, dict) else {}
+
+    def delete_user_shares(self, share_ids: list[str]) -> bool:
+        ids = list(
+            dict.fromkeys(str(item).strip() for item in share_ids if str(item).strip())
+        )
+        if not ids:
+            raise ValueError("至少选择一个要撤销的光鸭分享")
+        response = self.raw.share_delete(ids)
+        _validate_write_response(response, operation="share_delete")
+        return True
+
+    def upload_local_file(
+        self,
+        file_path: str | Path,
+        *,
+        name: str = "",
+        parent_id: str = "0",
+        chunk_size: int = 5 * 1024 * 1024,
+    ) -> dict:
+        """执行 SDK 上传/秒传全流程；调用方负责路径白名单与快照校验。"""
+        path = Path(file_path)
+        response = self.raw.file_upload(
+            path,
+            name=str(name or "").strip() or path.name,
+            parent_id=None if str(parent_id or "0") == "0" else str(parent_id),
+            chunk_size=max(1024 * 1024, min(int(chunk_size), 64 * 1024 * 1024)),
+        )
+        # ``file_upload`` 在服务端仍处理时可能返回“文件上传中”，不能把它
+        # 当作明确失败；最终成功由领域任务读取目标目录验证。
+        if isinstance(response, dict):
+            explicit = any(
+                key in response for key in ("code", "success")
+            ) or isinstance(response.get("data"), dict) and any(
+                key in response["data"] for key in ("code", "success")
+            )
+            if explicit:
+                _validate_write_response(response, operation="upload")
+            return response
+        return {}
 
     # ===== 秒传 JSON =====
     def generate_gcid_json(self, source_dir_id: str, source_name: str = "") -> dict:

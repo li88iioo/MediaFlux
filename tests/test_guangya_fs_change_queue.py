@@ -103,11 +103,12 @@ class GuangYaFSChangeQueueTests(unittest.TestCase):
         result = sanitize_organize_operation_result(
             {
                 "stats": {
-                    "total": 4,
+                    "total": 5,
                     "moved": 1,
                     "trashed": 1,
                     "created": 1,
                     "renamed": 1,
+                    "copied": 1,
                     "file_id": 999,
                 }
             }
@@ -115,11 +116,12 @@ class GuangYaFSChangeQueueTests(unittest.TestCase):
         self.assertEqual(
             result["stats"],
             {
-                "total": 4,
+                "total": 5,
                 "moved": 1,
                 "trashed": 1,
                 "created": 1,
                 "renamed": 1,
+                "copied": 1,
             },
         )
 

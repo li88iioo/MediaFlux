@@ -10,6 +10,7 @@ from app.agent.models import ToolSpec
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 
 from .cloud import register_specs as register_cloud_specs
+from .cloud_sdk import register_specs as register_cloud_sdk_specs
 from .discovery import register_specs as register_discovery_specs
 from .download import register_specs as register_download_specs
 from .library import register_specs as register_library_specs
@@ -43,6 +44,7 @@ _REGISTRARS = (
     register_playback_specs,
     register_strm_specs,
     register_cloud_specs,
+    register_cloud_sdk_specs,
     register_discovery_specs,
     register_resource_specs,
     register_workspace_specs,

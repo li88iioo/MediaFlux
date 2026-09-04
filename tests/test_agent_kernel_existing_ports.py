@@ -18,6 +18,7 @@ from app.agent.kernel.state import (
     SessionState,
 )
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
+from app.clients.guangya import GuangYaFile
 
 
 async def context_for(state, *, owner="owner", session="session"):
@@ -42,7 +43,7 @@ async def context_for(state, *, owner="owner", session="session"):
 class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_existing_atomic_tools_can_be_declared_to_kernel(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
-        self.assertEqual(len(catalog), 142)
+        self.assertEqual(len(catalog), 150)
         self.assertFalse(catalog.has("agent.cancel_pending_action"))
         selection = CapabilityRetriever().retrieve(
             "规整光鸭云盘动漫目录并按 TMDB 集数重命名",
@@ -146,6 +147,110 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("provider.capabilities", selection.names)
         self.assertIn("provider.query", selection.names)
 
+    async def test_guangya_sdk_p1_p3_capabilities_are_retrievable(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        cases = {
+            "我的光鸭还剩多少空间": {"guangya.account.status"},
+            "看看光鸭回收站并恢复第一个文件": {
+                "guangya.recycle.list",
+                "guangya.recycle.restore",
+            },
+            "清空光鸭回收站": {"guangya.recycle.clear"},
+            "列出我创建的光鸭分享": {"guangya.share.list"},
+            "把刚才选中的文件创建 7 天分享链接": {"guangya.share.create"},
+            "撤销刚才第一个分享": {"guangya.share.revoke"},
+            "把刚才这个文件复制到备份目录": {"guangya.fs.change.preview"},
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                selected = set(
+                    CapabilityRetriever().retrieve(message, catalog).names
+                )
+                self.assertTrue(expected <= selected, (message, selected))
+
+        self.assertFalse(catalog.has("guangya.upload"))
+        self.assertFalse(catalog.has("guangya.upload.status"))
+
+    async def test_guangya_directory_browse_and_correction_prioritize_fs_query(
+        self,
+    ) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        state = SessionState(
+            owner="owner",
+            session_id="session",
+            conversation=[
+                {
+                    "role": "user",
+                    "content": "先不整理，你可以上我云盘根目录/电视剧目录看下",
+                },
+                {
+                    "role": "assistant",
+                    "content": "尝试检查目录。",
+                    "tool_calls": [
+                        {
+                            "call_id": "scrape-1",
+                            "name": "guangya.directory_scrape.inspect",
+                            "arguments": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "目录刮削当前不可用",
+                    "tool_call_id": "scrape-1",
+                    "tool_name": "guangya.directory_scrape.inspect",
+                },
+                {"role": "user", "content": "是叫你看目录，没叫你刮削检查"},
+                {
+                    "role": "assistant",
+                    "content": "尝试检查目录。",
+                    "tool_calls": [
+                        {
+                            "call_id": "cleanup-1",
+                            "name": "guangya.organize.cleanup.preview",
+                            "arguments": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "扫描到 3 个目录",
+                    "tool_call_id": "cleanup-1",
+                    "tool_name": "guangya.organize.cleanup.preview",
+                },
+            ],
+        )
+        cases = (
+            (
+                "先不整理，你可以上我云盘根目录/电视剧目录看下",
+                None,
+            ),
+            (
+                "是叫你看目录，没叫你刮削检查",
+                AgentSession._capability_retrieval_context(state),
+            ),
+            (
+                "你看不到子目录名称吗",
+                AgentSession._capability_retrieval_context(state),
+            ),
+        )
+
+        for message, context in cases:
+            with self.subTest(message=message):
+                selection = CapabilityRetriever().retrieve(
+                    message,
+                    catalog,
+                    context=context,
+                )
+                self.assertEqual(selection.names[0], "guangya.fs.query")
+                if "没叫你刮削" in message:
+                    self.assertFalse(
+                        any(
+                            name.startswith("guangya.directory_scrape.")
+                            for name in selection.names
+                        )
+                    )
+
     async def test_existing_read_action_executes_through_new_pipeline_only(
         self,
     ) -> None:
@@ -161,6 +266,84 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.outcome.public_content["ok"])
         self.assertIn("agent_enabled", result.outcome.public_content["data"])
 
+    async def test_guangya_recycle_reference_and_confirmation_close_the_loop(
+        self,
+    ) -> None:
+        class RecycleClient:
+            logged_in = True
+            credential_generation = 7
+
+            def __init__(self) -> None:
+                self.items = [
+                    GuangYaFile(
+                        "private-file-id",
+                        "待恢复.mkv",
+                        False,
+                        size=123,
+                        parent_id="source",
+                    )
+                ]
+
+            def list_recycle(self, **_kwargs):
+                return list(self.items)
+
+            def restore_from_recycle(self, file_ids):
+                selected = {str(item) for item in file_ids}
+                self.items = [
+                    item for item in self.items if item.file_id not in selected
+                ]
+                return "private-task-id"
+
+            def close(self):
+                return True
+
+        client = RecycleClient()
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        state = InMemorySessionStateStore()
+        pipeline = ToolPipeline(catalog=catalog, state_store=state)
+        context = await context_for(state)
+
+        with (
+            patch(
+                "app.agent.guangya_recycle_actions.GuangYaClient",
+                return_value=client,
+            ),
+            patch("app.agent.guangya_recycle_actions.time.sleep", return_value=None),
+        ):
+            listed = await pipeline.execute(
+                "guangya.recycle.list",
+                {"page": 1, "page_size": 50},
+                context=context,
+            )
+            reference = listed.outcome.public_content["reference_arguments"][
+                "guangya_recycle_items_ref"
+            ]
+            self.assertNotIn(
+                "private-file-id", str(listed.outcome.public_content)
+            )
+
+            preview = await pipeline.execute(
+                "guangya.recycle.restore",
+                {
+                    "guangya_recycle_items_ref": reference,
+                    "indices": [1],
+                },
+                context=context,
+            )
+            self.assertIsNotNone(preview.effect_plan)
+            self.assertEqual(len(client.items), 1)
+
+            completed = await pipeline.execute_confirmed(
+                preview.effect_plan.plan_id,
+                context=context,
+            )
+
+        self.assertTrue(completed.outcome.public_content["data"]["verified"])
+        self.assertEqual(client.items, [])
+        self.assertNotIn(
+            "private-task-id", str(completed.outcome.public_content)
+        )
+
     async def test_agent_capabilities_returns_compact_domain_summary(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
         state = InMemorySessionStateStore()
@@ -171,7 +354,7 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         )
 
         public = result.outcome.public_content
-        self.assertEqual(public["data"]["total_tools"], 142)
+        self.assertEqual(public["data"]["total_tools"], 150)
         self.assertGreaterEqual(len(public["data"]["groups"]), 6)
         self.assertNotIn("tools", public["data"])
         self.assertNotIn("parameters", str(public))
