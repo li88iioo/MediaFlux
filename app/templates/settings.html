@@ -349,6 +349,17 @@
                                         </label>
                                     </div>
 
+                                    <div class="metadata-option">
+                                        <span>
+                                            <strong>Agent 主动复核</strong>
+                                            <small>待确认时只读核对冻结候选；通过确定性快照与季集边界校验后复用原确认执行器，不确定则保留人工按钮</small>
+                                        </span>
+                                        <label class="toggle">
+                                            <input type="checkbox" data-key="AGENT_RECOGNITION_REVIEW_ENABLED" data-bool="1" aria-label="启用 Agent 主动识别复核">
+                                            <span class="toggle-slider"></span>
+                                        </label>
+                                    </div>
+
                                     <label class="metadata-field metadata-field-wide">
                                         <span class="field-label">
                                             <span class="name">AI 线索可信门槛</span>

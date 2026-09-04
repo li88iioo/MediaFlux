@@ -139,6 +139,7 @@ def _task_payload(task) -> dict:
         "numbering_mode": getattr(task, "numbering_mode", "auto") or "auto",
         "clearable": task.status not in LOCAL_BUSY_TASK_STATUSES,
         "error": task.error, "warning": task.warning,
+        "confirmation_actor": getattr(task, "confirmation_actor", "") or "",
         "created_at": task.created_at, "updated_at": task.updated_at,
         "completed_at": task.completed_at,
     }

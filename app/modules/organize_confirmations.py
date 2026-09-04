@@ -56,11 +56,17 @@ _dispatch_stop = threading.Event()
 _dispatch_wakeup = threading.Event()
 _dispatch_thread: threading.Thread | None = None
 _dispatch_accepting = False
+_review_guard = threading.Lock()
+_review_stop = threading.Event()
+_review_wakeup = threading.Event()
+_review_thread: threading.Thread | None = None
+_review_accepting = False
 _rollup_guard = threading.Lock()
 _TERMINAL_CONFIRMATION_STATUSES = frozenset({
     "completed", "failed", "expired", "cancelled",
 })
 _RETRY_SELECTED_INDEX_KEY = "_retry_selected_index"
+_NOTIFICATION_SUPPRESSED_KEY = "_notification_suppressed"
 
 
 class ConfirmationRetryableError(RuntimeError):
@@ -196,7 +202,7 @@ def _fingerprint(payload: dict) -> str:
         for key, value in payload.items()
         if key not in {
             "organize_task_id", "organize_rollup", "_telegram_message_id",
-            _RETRY_SELECTED_INDEX_KEY,
+            _RETRY_SELECTED_INDEX_KEY, _NOTIFICATION_SUPPRESSED_KEY,
         }
     }
     encoded = json.dumps(
@@ -213,29 +219,55 @@ def _confirmation_kind(payload: dict) -> str:
     return kind
 
 
+def _recognition_review_is_enabled() -> bool:
+    """延迟读取配置，避免整理模块与 Agent Kernel 形成启动期耦合。"""
+    try:
+        from app.modules.agent_recognition_review import recognition_review_enabled
+
+        return recognition_review_enabled()
+    except Exception as exc:  # noqa: BLE001 - 自动复核不可影响人工链路
+        logger.warning(
+            "读取 Agent 主动复核配置失败 type=%s", type(exc).__name__
+        )
+        return False
+
+
 def _persist_confirmation_actions(
-    payload: dict, *, chat_id: str = ""
+    payload: dict,
+    *,
+    chat_id: str = "",
+    review_ready: bool = False,
+    notification_suppressed: bool = False,
 ) -> tuple[NotificationAction, ...]:
-    candidates = [dict(item) for item in (payload.get("candidates") or [])]
-    files = list(payload.get("files") or [])
-    allow_skip_terminal = bool(payload.get("allow_skip_terminal"))
+    persisted_payload = dict(payload)
+    if notification_suppressed:
+        persisted_payload[_NOTIFICATION_SUPPRESSED_KEY] = True
+    candidates = [
+        dict(item) for item in (persisted_payload.get("candidates") or [])
+    ]
+    files = list(persisted_payload.get("files") or [])
+    allow_skip_terminal = bool(persisted_payload.get("allow_skip_terminal"))
     if not files or (not candidates and not allow_skip_terminal):
         return ()
     resolved_chat = str(chat_id or get("TG_CHAT_ID", "") or "").strip()
     token = secrets.token_urlsafe(12)
     db.create_organize_confirmation(
         token=token,
-        fingerprint=_fingerprint(payload),
+        fingerprint=_fingerprint(persisted_payload),
         chat_id=resolved_chat,
-        source_name=str(payload.get("source_name") or ""),
-        directory_path=str(payload.get("directory") or "/"),
-        payload=payload,
+        source_name=str(persisted_payload.get("source_name") or ""),
+        directory_path=str(persisted_payload.get("directory") or "/"),
+        payload=persisted_payload,
         expires_at=_timestamp(
             datetime.now(timezone.utc).astimezone()
             + timedelta(hours=_CONFIRMATION_TTL_HOURS)
         ),
-        organize_task_id=str(payload.get("organize_task_id") or ""),
+        organize_task_id=str(persisted_payload.get("organize_task_id") or ""),
+        review_requested=_recognition_review_is_enabled(),
+        review_ready=review_ready,
     )
+    if review_ready:
+        wake_recognition_review_dispatcher()
     actions = [
         NotificationAction(_safe_label(candidate, index), f"orgc:{token}:{index}")
         for index, candidate in enumerate(candidates)
@@ -313,14 +345,26 @@ def publish_confirmation_event(
         NotificationImportance.RESULT if terminal else
         NotificationImportance.ACTION
     )
-    result = publish_notification_thread(
-        f"confirmation:{resolved_token}",
-        event,
-        topic=NotificationTopic.CONFIRMATION,
-        importance=importance,
-        chat_id=chat_id,
-        preferred_message_id=int(message_id or 0),
-    )
+    try:
+        result = publish_notification_thread(
+            f"confirmation:{resolved_token}",
+            event,
+            topic=NotificationTopic.CONFIRMATION,
+            importance=importance,
+            chat_id=chat_id,
+            preferred_message_id=int(message_id or 0),
+        )
+    finally:
+        if not terminal:
+            try:
+                if db.activate_organize_confirmation_review(resolved_token):
+                    wake_recognition_review_dispatcher()
+            except Exception as exc:  # noqa: BLE001 - 自动复核不得破坏人工通知
+                logger.warning(
+                    "候选卡发布后激活 Agent 复核失败 token=%s type=%s",
+                    resolved_token[:6],
+                    type(exc).__name__,
+                )
     return bool(result)
 
 
@@ -398,6 +442,8 @@ def create_confirmation_actions(
     *,
     source_name: str = "",
     chat_id: str = "",
+    review_ready: bool = False,
+    notification_suppressed: bool = False,
 ) -> tuple[NotificationAction, ...]:
     """持久化候选组；无元数据时仍返回可终结待确认状态的跳过按钮。"""
     candidates = [
@@ -434,7 +480,12 @@ def create_confirmation_actions(
     if organize_task_id and isinstance(organize_rollup, dict):
         payload["organize_task_id"] = organize_task_id
         payload["organize_rollup"] = dict(organize_rollup)
-    return _persist_confirmation_actions(payload, chat_id=chat_id)
+    return _persist_confirmation_actions(
+        payload,
+        chat_id=chat_id,
+        review_ready=review_ready,
+        notification_suppressed=notification_suppressed,
+    )
 
 
 def create_local_media_confirmation_actions(
@@ -444,6 +495,8 @@ def create_local_media_confirmation_actions(
     *,
     owner: str = "admin",
     chat_id: str = "",
+    review_ready: bool = False,
+    notification_suppressed: bool = False,
 ) -> tuple[NotificationAction, ...]:
     """为本地待确认任务生成与光鸭相同协议的 TG 候选按钮。"""
     if task is None or source is None or str(getattr(task, "status", "")) != "requires_manual":
@@ -543,7 +596,70 @@ def create_local_media_confirmation_actions(
         "episode_override": getattr(task, "episode_override", None),
         "numbering_mode": str(getattr(task, "numbering_mode", "auto") or "auto"),
     }
-    return _persist_confirmation_actions(payload, chat_id=chat_id)
+    return _persist_confirmation_actions(
+        payload,
+        chat_id=chat_id,
+        review_ready=review_ready,
+        notification_suppressed=notification_suppressed,
+    )
+
+
+def schedule_guangya_recognition_reviews(
+    stats: dict,
+    rules: OrganizeRules,
+    *,
+    source_name: str = "",
+    chat_id: str = "",
+) -> int:
+    """在通知关闭时也持久化 Agent 复核；人工日志仍保持原有待确认状态。"""
+    if not _recognition_review_is_enabled():
+        return 0
+    groups, _actionable_count = Organizer._validated_task_confirmation_groups(stats)
+    scheduled = 0
+    for group in groups:
+        if not list(group.get("candidates") or []):
+            continue
+        try:
+            actions = create_confirmation_actions(
+                group,
+                rules,
+                source_name=source_name,
+                chat_id=chat_id,
+                review_ready=True,
+                notification_suppressed=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 单组失败不能阻断整理终态
+            logger.warning(
+                "光鸭 Agent 复核任务创建失败 type=%s", type(exc).__name__
+            )
+            continue
+        if actions:
+            scheduled += 1
+    return scheduled
+
+
+def schedule_local_media_recognition_review(
+    task,
+    source,
+    preview: dict,
+    *,
+    owner: str = "admin",
+    chat_id: str = "",
+) -> bool:
+    """为无通知或静默本地任务创建同一冻结确认记录。"""
+    if not _recognition_review_is_enabled():
+        return False
+    return bool(
+        create_local_media_confirmation_actions(
+            task,
+            source,
+            preview,
+            owner=owner,
+            chat_id=chat_id,
+            review_ready=True,
+            notification_suppressed=True,
+        )
+    )
 
 
 def _decode_row(row) -> dict:
@@ -557,7 +673,7 @@ def _decode_row(row) -> dict:
 
 
 def _finalize_guangya_manual_logs(
-    payload: dict, *, status: str, error: str,
+    payload: dict, *, status: str, error: str, confirmation_actor: str = "human",
 ) -> None:
     """同步确认终态到光鸭整理时间线；本地媒体使用自身任务状态机。"""
     try:
@@ -570,7 +686,11 @@ def _finalize_guangya_manual_logs(
         ]
         if file_ids:
             db.finalize_pending_organize_logs(
-                "guangya", file_ids, status=status, error=error,
+                "guangya",
+                file_ids,
+                status=status,
+                error=error,
+                confirmation_actor=confirmation_actor,
             )
     except Exception as exc:
         # 确认操作的终态已经持久化，日志投影同步失败只能降级告警，
@@ -757,17 +877,23 @@ def _publish_expired_confirmation(row) -> bool:
     chat_id = str(row["chat_id"] or "")
     token = str(row["token"] or "")
     event = _expired_confirmation_event(payload, row)
+    delivery_enabled = _confirmation_delivery_enabled(payload)
     expired = db.expire_organize_confirmation_with_delivery(
         token,
         event_json=serialize_notification_event(event),
         chat_id=chat_id,
         message_id=_confirmation_message_id(payload),
+        enqueue_delivery=delivery_enabled,
     )
     if expired is None:
         return False
-    _dispatch_due_confirmation_delivery(token)
+    if delivery_enabled:
+        _dispatch_due_confirmation_delivery(token)
     _finalize_guangya_manual_logs(
-        payload, status="skipped", error="人工确认已过期",
+        payload,
+        status="skipped",
+        error="人工确认已过期",
+        confirmation_actor="",
     )
     _maybe_update_parent_organize_rollup(
         str(row["organize_task_id"] or ""), chat_id=chat_id,
@@ -836,14 +962,17 @@ def cancel_confirmation(
         ),
         layout="relaxed",
     )
+    delivery_enabled = _confirmation_delivery_enabled(payload)
     db.cancel_organize_confirmation(
         token,
         chat_id=chat_id,
         event_json=serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
+        enqueue_delivery=delivery_enabled,
         resolution="deferred",
     )
-    _dispatch_due_confirmation_delivery(token)
+    if delivery_enabled:
+        _dispatch_due_confirmation_delivery(token)
     _finalize_guangya_manual_logs(
         payload, status="skipped", error="用户选择暂不处理",
     )
@@ -892,16 +1021,19 @@ def skip_confirmation(
         ),
         layout="relaxed",
     )
+    delivery_enabled = _confirmation_delivery_enabled(payload)
     db.cancel_organize_confirmation(
         token,
         chat_id=chat_id,
         event_json=serialize_notification_event(terminal_event),
         message_id=resolved_message_id or None,
+        enqueue_delivery=delivery_enabled,
         resolution="skipped",
     )
     reason = "用户选择跳过：暂无可用元数据"
     _finalize_guangya_manual_logs(payload, status="skipped", error=reason)
-    _dispatch_due_confirmation_delivery(token)
+    if delivery_enabled:
+        _dispatch_due_confirmation_delivery(token)
     try:
         _maybe_update_parent_organize_rollup(
             str(current["organize_task_id"] or ""), chat_id=str(chat_id or ""),
@@ -952,6 +1084,8 @@ def _dispatch_confirmation_token(token: str) -> dict:
         payload, candidate, selected_index = _selected_candidate(row)
     except Exception as exc:
         message = "确认任务数据损坏，请重新执行整理"
+        raw_payload = _decode_json_object(row["payload_json"])
+        delivery_enabled = _confirmation_delivery_enabled(raw_payload)
         failure_event = NotificationEvent(
             "❌ Telegram 确认整理失败",
             fields=(
@@ -970,8 +1104,10 @@ def _dispatch_confirmation_token(token: str) -> dict:
             chat_id=chat_id,
             message_id=None,
             retryable=False,
+            enqueue_delivery=delivery_enabled,
         )
-        _dispatch_due_confirmation_delivery(token)
+        if delivery_enabled:
+            _dispatch_due_confirmation_delivery(token)
         logger.warning(
             "Telegram 排队整理数据损坏 token=%s type=%s",
             str(token)[:6],
@@ -994,13 +1130,16 @@ def _dispatch_confirmation_token(token: str) -> dict:
         payload.get("directory") or payload.get("source_name") or "待确认媒体"
     )
     chat_id = str(row["chat_id"] or "")
+    actor = str(row["confirmation_actor"] or "human").strip().lower()
+    if actor not in {"human", "agent"}:
+        actor = "human"
     try:
         task = get_organize_manager().start_operation(
-            "Telegram 确认整理",
+            "Agent 确认整理" if actor == "agent" else "Telegram 确认整理",
             reference,
             lambda: _execute_confirmation(
                 token, payload, candidate,
-                selected_index=selected_index, chat_id=chat_id,
+                selected_index=selected_index, chat_id=chat_id, actor=actor,
             ),
         )
     except Exception as exc:
@@ -1147,6 +1286,179 @@ def _confirmation_dispatch_loop() -> None:
         _dispatch_wakeup.clear()
 
 
+def _process_recognition_review_row(row) -> str:
+    """处理一条已领取记录；只返回审计状态，不暴露模型上下文。"""
+    token = str(row["token"] or "")
+    if not _recognition_review_is_enabled():
+        db.complete_organize_confirmation_review(
+            token,
+            status="cancelled",
+            result={
+                "reason_code": "disabled",
+                "summary": "Agent 主动复核已关闭，保留人工确认",
+            },
+        )
+        return "cancelled"
+    payload = _decode_row(row)
+    from app.modules.agent_recognition_review import review_confirmation_payload
+
+    decision = review_confirmation_payload(payload)
+    audit = decision.audit_payload()
+    if not decision.approved:
+        db.complete_organize_confirmation_review(
+            token, status=decision.status, result=audit
+        )
+        return decision.status
+
+    # 用户可能在模型复核期间关闭开关。执行所有权竞争前再读取一次配置，
+    # 保证关闭动作立即阻止新的自动确认，而不是等下一条任务才生效。
+    if not _recognition_review_is_enabled():
+        db.complete_organize_confirmation_review(
+            token,
+            status="cancelled",
+            result={
+                **audit,
+                "reason_code": "disabled_before_confirmation",
+                "summary": "Agent 主动复核已关闭，保留人工确认",
+            },
+        )
+        return "cancelled"
+
+    # 先保存不含工具原始载荷的最小审计，再由数据库原子竞争 pending
+    # 所有权。人工若已确认，Agent 会安全退出。
+    if not db.stage_organize_confirmation_review_result(token, audit):
+        logger.info(
+            "Agent 识别复核审计落库时已失去所有权 token=%s", token[:6]
+        )
+        return "ownership_lost"
+    try:
+        start_confirmation(
+            token,
+            int(decision.candidate_index),
+            chat_id=str(row["chat_id"] or ""),
+            actor="agent",
+        )
+    except ValueError as exc:
+        current = db.get_organize_confirmation(token)
+        if (
+            current is not None
+            and str(current["review_status"] or "") == "running"
+        ):
+            db.complete_organize_confirmation_review(
+                token,
+                status="cancelled",
+                result={
+                    **audit,
+                    "reason_code": "ownership_lost",
+                    "summary": "人工操作或快照变化已先完成，Agent 未执行",
+                },
+            )
+        logger.info(
+            "Agent 识别复核未取得执行权 token=%s reason=%s",
+            token[:6],
+            str(exc)[:120],
+        )
+        return "ownership_lost"
+    logger.info(
+        "Agent 识别复核已提交 token=%s candidate=%s confidence=%.3f",
+        token[:6],
+        decision.candidate_index,
+        decision.confidence,
+    )
+    return "approved"
+
+
+def _recognition_review_loop() -> None:
+    try:
+        recovered = db.recover_interrupted_organize_confirmation_reviews()
+        if recovered:
+            logger.info("恢复 Agent 主动识别复核 count=%s", recovered)
+    except Exception as exc:  # noqa: BLE001 - 启动恢复失败不影响人工确认
+        logger.warning(
+            "恢复 Agent 主动识别复核失败 type=%s", type(exc).__name__
+        )
+
+    while not _review_stop.is_set():
+        token = ""
+        try:
+            row = db.claim_next_organize_confirmation_review()
+            if row is None:
+                _review_wakeup.wait(_DISPATCH_POLL_SECONDS)
+                _review_wakeup.clear()
+                continue
+            token = str(row["token"] or "")
+            _process_recognition_review_row(row)
+        except Exception as exc:  # noqa: BLE001 - 失败关闭，保留人工按钮
+            logger.warning(
+                "Agent 主动识别复核队列异常 type=%s",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            if token:
+                try:
+                    db.complete_organize_confirmation_review(
+                        token,
+                        status="failed",
+                        result={
+                            "reason_code": "worker_error",
+                            "summary": "Agent 复核异常，已保留人工确认",
+                            "failure_code": type(exc).__name__,
+                        },
+                    )
+                except Exception:
+                    logger.warning(
+                        "Agent 复核失败回执保存异常 token=%s",
+                        token[:6],
+                        exc_info=True,
+                    )
+        _review_wakeup.wait(_DISPATCH_POLL_SECONDS)
+        _review_wakeup.clear()
+
+def start_recognition_review_dispatcher() -> None:
+    """启动独立只读复核消费者；不占用文件整理执行线程。"""
+    global _review_thread, _review_accepting
+    with _review_guard:
+        _review_accepting = True
+        _review_stop.clear()
+        if _review_thread is None or not _review_thread.is_alive():
+            _review_thread = threading.Thread(
+                target=_recognition_review_loop,
+                name="agent-recognition-review",
+                daemon=True,
+            )
+            _review_thread.start()
+    _review_wakeup.set()
+
+
+def wake_recognition_review_dispatcher() -> bool:
+    """唤醒复核消费者；应用关闭期间不会擅自重建线程。"""
+    with _review_guard:
+        if not _review_accepting or _review_stop.is_set():
+            return False
+        thread = _review_thread
+        if thread is None or not thread.is_alive():
+            return False
+        _review_wakeup.set()
+        return True
+
+
+def stop_recognition_review_dispatcher(timeout: float = 2.0) -> bool:
+    """停止复核消费者；未处理记录在下次启动时恢复。"""
+    global _review_thread, _review_accepting
+    with _review_guard:
+        _review_accepting = False
+        _review_stop.set()
+        _review_wakeup.set()
+        thread = _review_thread
+    if thread and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(max(0.0, float(timeout)))
+    stopped = thread is None or not thread.is_alive()
+    with _review_guard:
+        if _review_thread is thread and stopped:
+            _review_thread = None
+    return stopped
+
+
 def start_confirmation_dispatcher() -> None:
     """在应用启动阶段启用持久化确认队列消费者；重复调用安全。"""
     global _dispatch_thread, _dispatch_accepting
@@ -1161,6 +1473,7 @@ def start_confirmation_dispatcher() -> None:
             )
             _dispatch_thread.start()
     _dispatch_wakeup.set()
+    start_recognition_review_dispatcher()
 
 
 def wake_confirmation_dispatcher() -> bool:
@@ -1189,7 +1502,8 @@ def stop_confirmation_dispatcher(timeout: float = 2.0) -> bool:
     with _dispatch_guard:
         if _dispatch_thread is thread and stopped:
             _dispatch_thread = None
-    return stopped
+    review_stopped = stop_recognition_review_dispatcher(timeout=timeout)
+    return bool(stopped and review_stopped)
 
 
 def start_confirmation(
@@ -1197,8 +1511,12 @@ def start_confirmation(
     selected_index: int,
     *,
     chat_id: str,
+    actor: str = "human",
 ) -> dict:
-    """持久化用户选择；空闲时立即执行，繁忙时按 FIFO 自动排队。"""
+    """持久化确认选择；人工与 Agent 竞争同一个一次性 pending 所有权。"""
+    normalized_actor = str(actor or "human").strip().lower()
+    if normalized_actor not in {"human", "agent"}:
+        raise ValueError("确认执行者无效")
     preview = db.get_organize_confirmation(token)
     if preview is None:
         raise ValueError("确认操作不存在或已失效")
@@ -1223,6 +1541,11 @@ def start_confirmation(
     status = str(preview["status"] or "pending")
 
     if status in {"queued", "running", "completed"}:
+        if (
+            normalized_actor == "agent"
+            and str(preview["confirmation_actor"] or "") != "agent"
+        ):
+            raise ValueError("人工操作已先取得确认所有权")
         if int(preview["selected_index"] if preview["selected_index"] is not None else -1) != selected_index:
             raise ValueError("该媒体已选择其他候选，不能重复修改")
         return _confirmation_result(
@@ -1233,13 +1556,21 @@ def start_confirmation(
 
     try:
         row = db.claim_organize_confirmation(
-            token, chat_id=chat_id, selected_index=selected_index
+            token,
+            chat_id=chat_id,
+            selected_index=selected_index,
+            actor=normalized_actor,
         )
     except ValueError:
         # 两个相同回调可同时读到 pending；数据库只允许一个认领成功。
         # 失败方重新读取真实状态，同候选按幂等重放处理，不误报“已处理”。
         current = db.get_organize_confirmation(token)
         if current is not None and str(current["status"] or "") in {"queued", "running", "completed"}:
+            if (
+                normalized_actor == "agent"
+                and str(current["confirmation_actor"] or "") != "agent"
+            ):
+                raise ValueError("人工操作已先取得确认所有权")
             current_index = int(
                 current["selected_index"]
                 if current["selected_index"] is not None else -1
@@ -1487,7 +1818,7 @@ def _confirmation_unresolved_error(stats: dict) -> str:
 
 
 def _confirmation_result_event(
-    payload: dict, candidate: dict, stats: dict
+    payload: dict, candidate: dict, stats: dict, *, actor: str = "human"
 ) -> NotificationEvent:
     moved = safe_int(stats.get("moved"), 0, minimum=0)
     metadata = safe_int(stats.get("metadata_moved"), 0, minimum=0)
@@ -1515,8 +1846,9 @@ def _confirmation_result_event(
     )
     if unresolved:
         result_label += f" · 待确认 {unresolved}"
+    actor_label = "Agent 确认" if actor == "agent" else "人工确认"
     return NotificationEvent(
-        "⚠️ 人工确认整理部分完成" if partial else "✅ 人工确认整理完成",
+        f"⚠️ {actor_label}整理部分完成" if partial else f"✅ {actor_label}整理完成",
         fields=(
             ("目标媒体", _candidate_display_name(candidate)),
             ("源文件目录", payload.get("directory") or payload.get("source_name") or "/"),
@@ -1539,16 +1871,32 @@ def _confirmation_message_id(payload: dict) -> int | None:
     return message_id if message_id > 0 else None
 
 
+def _confirmation_delivery_enabled(payload: dict) -> bool:
+    return not bool(payload.get(_NOTIFICATION_SUPPRESSED_KEY))
+
+
 def _local_confirmation_result_event(
-    payload: dict, candidate: dict, result: dict
+    payload: dict, candidate: dict, result: dict, *, actor: str = "human"
 ) -> NotificationEvent:
     moved = len(list(result.get("moved") or []))
     deleted = len(list(result.get("deleted_junk") or []))
     warnings = len(list(result.get("warnings") or []))
     refresh_status = str(result.get("media_refresh_status") or "")
     partial = bool(warnings or refresh_status == "failed")
+    if actor == "agent":
+        event_title = (
+            "⚠️ 本地媒体 Agent 确认整理部分完成"
+            if partial
+            else "✅ 本地媒体 Agent 确认整理完成"
+        )
+    else:
+        event_title = (
+            "⚠️ 本地媒体确认整理部分完成"
+            if partial
+            else "✅ 本地媒体确认整理完成"
+        )
     return NotificationEvent(
-        "⚠️ 本地媒体确认整理部分完成" if partial else "✅ 本地媒体确认整理完成",
+        event_title,
         fields=(
             ("目标媒体", _candidate_display_name(candidate)),
             ("存储来源", payload.get("source_name") or "本地媒体"),
@@ -1564,10 +1912,12 @@ def _local_confirmation_result_event(
 
 
 def _execute_local_media_confirmation(
-    token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
+    token: str, payload: dict, candidate: dict, *,
+    selected_index: int, chat_id: str, actor: str = "human"
 ) -> dict:
     claimed_task = False
     task_id = safe_int(payload.get("local_task_id"), 0, minimum=0)
+    delivery_enabled = _confirmation_delivery_enabled(payload)
     qb_client = None
     try:
         if task_id <= 0:
@@ -1612,6 +1962,7 @@ def _execute_local_media_confirmation(
             numbering_mode=str(payload.get("numbering_mode") or "auto"),
             title=str(candidate.get("title") or ""),
             year=str(candidate.get("year") or ""),
+            confirmation_actor=actor,
         ):
             raise ValueError("本地媒体任务已被其他操作认领，请前往 Web 查看最新状态")
         claimed_task = True
@@ -1636,15 +1987,19 @@ def _execute_local_media_confirmation(
                 task_id,
                 type(exc).__name__,
             )
-        terminal_event = _local_confirmation_result_event(payload, candidate, result)
+        terminal_event = _local_confirmation_result_event(
+            payload, candidate, result, actor=actor
+        )
         db.complete_organize_confirmation_with_delivery(
             token,
             result_json=json.dumps(result, ensure_ascii=False, default=str),
             event_json=serialize_notification_event(terminal_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
+            enqueue_delivery=delivery_enabled,
         )
-        _dispatch_due_confirmation_delivery(token)
+        if delivery_enabled:
+            _dispatch_due_confirmation_delivery(token)
         return {"candidate": candidate, "stats": result, "local_task_id": task_id}
     except Exception as exc:
         message = str(exc or "本地媒体确认整理失败").strip() or "本地媒体确认整理失败"
@@ -1685,7 +2040,9 @@ def _execute_local_media_confirmation(
             type(exc).__name__,
         )
         failure_event = NotificationEvent(
-            "❌ 本地媒体确认整理失败",
+            "❌ 本地媒体 Agent 确认整理失败"
+            if actor == "agent"
+            else "❌ 本地媒体确认整理失败",
             fields=(
                 ("目标文件", payload.get("directory") or "本地媒体"),
                 ("候选媒体", _candidate_display_name(candidate, "")),
@@ -1702,8 +2059,10 @@ def _execute_local_media_confirmation(
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
             retryable=False,
+            enqueue_delivery=delivery_enabled,
         )
-        _dispatch_due_confirmation_delivery(token)
+        if delivery_enabled:
+            _dispatch_due_confirmation_delivery(token)
         raise
     finally:
         close = getattr(qb_client, "close", None)
@@ -1719,7 +2078,8 @@ def _execute_local_media_confirmation(
 
 
 def _execute_confirmation(
-    token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
+    token: str, payload: dict, candidate: dict, *,
+    selected_index: int, chat_id: str, actor: str = "human"
 ) -> dict:
     try:
         if _confirmation_kind(payload) == "local_media":
@@ -1729,6 +2089,7 @@ def _execute_confirmation(
                 candidate,
                 selected_index=selected_index,
                 chat_id=chat_id,
+                actor=actor,
             )
         return _execute_guangya_confirmation(
             token,
@@ -1736,6 +2097,7 @@ def _execute_confirmation(
             candidate,
             selected_index=selected_index,
             chat_id=chat_id,
+            actor=actor,
         )
     finally:
         # 成功、不可重试失败都在各自执行器内先落终态；由唯一出口尝试
@@ -1802,7 +2164,8 @@ def _confirmation_notification_threads(
 
 
 def _execute_guangya_confirmation(
-    token: str, payload: dict, candidate: dict, *, selected_index: int, chat_id: str
+    token: str, payload: dict, candidate: dict, *,
+    selected_index: int, chat_id: str, actor: str = "human"
 ) -> dict:
     # running 状态由 claim_queued_organize_confirmation 原子授予；worker 不得
     # 无条件重新取得所有权，否则重启恢复后的 failed 终态会被迟到执行覆盖。
@@ -1810,6 +2173,8 @@ def _execute_guangya_confirmation(
     scraper = None
     organizer = None
     write_started = False
+    operation_token = f"recognition-confirm:{token}"
+    delivery_enabled = _confirmation_delivery_enabled(payload)
     try:
         source_dir_id = str(payload.get("source_dir_id") or "").strip()
         current_rules = OrganizeRules.from_config().for_source(source_dir_id)
@@ -1890,26 +2255,36 @@ def _execute_guangya_confirmation(
             require_complete_scan=True,
             # 执行阶段只读缓存，保持与确认预览一致；缓存由预览阶段预热。
             media_probe_cache_only=True,
+            operation_token=operation_token,
         )
-        if provider == "tmdb":
+        db.mark_organize_logs_confirmation_actor(operation_token, actor)
+        if provider == "tmdb" and actor == "human":
             learning_warnings = _record_confirmation_learning(
                 scraper, payload, candidate, match
             )
             if learning_warnings:
                 stats.setdefault("warnings", []).extend(learning_warnings)
-        scope_name = str(payload.get("directory") or payload.get("source_name") or "TG 人工确认")
+        scope_name = str(
+            payload.get("directory")
+            or payload.get("source_name")
+            or ("Agent 确认" if actor == "agent" else "TG 人工确认")
+        )
         confirm_debounce = _confirmation_strm_debounce_seconds(payload)
-        terminal_event = _confirmation_result_event(payload, candidate, stats)
+        terminal_event = _confirmation_result_event(
+            payload, candidate, stats, actor=actor
+        )
         db.complete_organize_confirmation_with_delivery(
             token,
             result_json=json.dumps(stats, ensure_ascii=False, default=str),
             event_json=serialize_notification_event(terminal_event),
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
+            enqueue_delivery=delivery_enabled,
         )
         # 先把候选卡收敛为整理终态，再排队 STRM；即使 debounce=0，
         # 后续刷新也只会在同一条终态消息上补字段，不会被较旧内容覆盖。
-        _dispatch_due_confirmation_delivery(token)
+        if delivery_enabled:
+            _dispatch_due_confirmation_delivery(token)
         try:
             Organizer.trigger_post_actions(
                 stats,
@@ -1918,8 +2293,12 @@ def _execute_guangya_confirmation(
                 chat_id=chat_id,
                 notify_result=False,
                 strm_debounce_seconds=confirm_debounce,
-                notification_threads=_confirmation_notification_threads(
-                    token, payload, chat_id=chat_id,
+                notification_threads=(
+                    _confirmation_notification_threads(
+                        token, payload, chat_id=chat_id,
+                    )
+                    if delivery_enabled
+                    else []
                 ),
             )
         except Exception as post_exc:
@@ -1929,14 +2308,15 @@ def _execute_guangya_confirmation(
                 token,
                 result_json=json.dumps(stats, ensure_ascii=False, default=str),
             )
-            update_confirmation_lifecycle_downstream(
-                token,
-                chat_id=chat_id,
-                strm_status="启动失败",
-                media_refresh="未触发",
-                partial=True,
-                error=warning,
-            )
+            if delivery_enabled:
+                update_confirmation_lifecycle_downstream(
+                    token,
+                    chat_id=chat_id,
+                    strm_status="启动失败",
+                    media_refresh="未触发",
+                    partial=True,
+                    error=warning,
+                )
             organize_task_id = str(
                 payload.get("organize_task_id") or ""
             ).strip()
@@ -1976,6 +2356,8 @@ def _execute_guangya_confirmation(
             not write_started
             and not isinstance(exc, (DirectoryScrapeConflictError, ValueError))
         )
+        if write_started:
+            db.mark_organize_logs_confirmation_actor(operation_token, actor)
         logger.warning(
             "Telegram 确认整理失败 token=%s type=%s retryable=%s",
             token[:6],
@@ -1983,7 +2365,9 @@ def _execute_guangya_confirmation(
             retryable,
         )
         terminal_failure_event = NotificationEvent(
-            "❌ Telegram 确认整理失败",
+            "❌ Agent 确认整理失败"
+            if actor == "agent"
+            else "❌ Telegram 确认整理失败",
             fields=(
                 ("所在目录", payload.get("directory") or "/"),
                 ("候选媒体", _candidate_display_name(candidate, "")),
@@ -1994,7 +2378,7 @@ def _execute_guangya_confirmation(
             layout="relaxed",
         )
         actions: tuple[NotificationAction, ...] = ()
-        if retryable:
+        if retryable and delivery_enabled:
             try:
                 _retry_token, retry_action = _persist_confirmation_retry(
                     payload,
@@ -2028,11 +2412,13 @@ def _execute_guangya_confirmation(
             chat_id=chat_id,
             message_id=_confirmation_message_id(payload),
             retryable=False,
+            enqueue_delivery=delivery_enabled,
         )
-        _dispatch_due_confirmation_delivery(token)
+        if delivery_enabled:
+            _dispatch_due_confirmation_delivery(token)
         if not actions:
             _finalize_guangya_manual_logs(
-                payload, status="failed", error=message,
+                payload, status="failed", error=message, confirmation_actor=actor,
             )
         raise
     finally:

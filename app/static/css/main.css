@@ -2831,6 +2831,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .revert-btn { padding: 6px 11px; color: var(--warning); background: var(--bg-input); border: 1px solid var(--border); font-size: 10px; }
 .revert-btn:hover:not(:disabled) { border-color: var(--warning); }
 .tag-mini.is-warning { color: var(--warning); background: var(--warning-soft); }
+.tag-mini.is-agent-confirm { color: var(--success); background: var(--accent-soft); }
 .organize-detail-dialog { width: min(1020px, calc(100vw - 32px)); height: min(780px, calc(100vh - 40px)); max-height: min(780px, calc(100dvh - 40px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))); display: flex; flex-direction: column; min-height: 0; padding: 0; overflow: hidden; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--modal-radius, 14px); box-shadow: var(--shadow); animation: modal-in .35s var(--ease-out) both; }
 .organize-detail-dialog [hidden] { display: none !important; }
 .organize-detail-head { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 18px; min-height: 64px; padding: 14px 22px; border-bottom: 1px solid var(--border-soft); }

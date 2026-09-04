@@ -222,6 +222,44 @@ def build_local_media_event(
     )
 
 
+def schedule_local_media_task_review(
+    task_id: int,
+    result: Mapping[str, Any] | None,
+    *,
+    owner: str = "admin",
+    chat_id: str = "",
+) -> bool:
+    """无通知或静默任务也可进入同一冻结 Agent 复核队列。"""
+    preview = _value(result, "preview", {})
+    if not isinstance(preview, Mapping):
+        return False
+    task = db.get_local_media_task(task_id, owner=owner)
+    if task is None or str(getattr(task, "status", "")) != "requires_manual":
+        return False
+    source = db.get_local_media_source(task.source_id, owner=owner)
+    if source is None:
+        return False
+    try:
+        from app.modules.organize_confirmations import (
+            schedule_local_media_recognition_review,
+        )
+
+        return schedule_local_media_recognition_review(
+            task,
+            source,
+            dict(preview),
+            owner=owner,
+            chat_id=chat_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - 自动复核不可阻断人工链路
+        logger.warning(
+            "本地媒体 Agent 复核调度失败 task=%s type=%s",
+            task_id,
+            type(exc).__name__,
+        )
+        return False
+
+
 def notify_local_media_task(
     task_id: int,
     result: Mapping[str, Any] | None = None,
@@ -231,9 +269,13 @@ def notify_local_media_task(
     chat_id: str = "",
 ) -> bool:
     """读取任务上下文并发送通知；任务不存在时静默跳过。"""
-    if not config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True) or not config.get_bool(
-        "GY_ORGANIZE_LIBRARY_NOTIFY", True
-    ):
+    notifications_enabled = config.get_bool(
+        "GY_ORGANIZE_NOTIFY_ENABLED", True
+    ) and config.get_bool("GY_ORGANIZE_LIBRARY_NOTIFY", True)
+    if not notifications_enabled:
+        schedule_local_media_task_review(
+            task_id, result, owner=owner, chat_id=chat_id
+        )
         return False
     task = db.get_local_media_task(task_id, owner=owner)
     if task is None:

@@ -89,6 +89,7 @@ _AGENT_LIBRARY_PATROL_KEYS = {
     "AGENT_LIBRARY_PATROL_INTERVAL_HOURS",
     "AGENT_LIBRARY_PATROL_MAX_SERIES",
     "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED",
+    "AGENT_RECOGNITION_REVIEW_ENABLED",
 }
 
 _AGENT_SETTINGS_MANAGED_KEYS = (
@@ -125,6 +126,7 @@ _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_LIBRARY_PATROL_ENABLED": "0",
     "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED": "0",
     "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED": "1",
+    "AGENT_RECOGNITION_REVIEW_ENABLED": "0",
     "AGENT_LIBRARY_PATROL_INTERVAL_HOURS": "24",
     "AGENT_LIBRARY_PATROL_MAX_SERIES": "50",
 }
@@ -1028,6 +1030,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
         "STRM_VIDEO_EXTS", "STRM_SKIP_THRESHOLD_MB", "STRM_METADATA_ENABLED",
         "STRM_METADATA_EXTS", "STRM_SCHEDULE_ENABLED", "STRM_SCHEDULE_CRON",
         "STRM_NOTIFY_ENABLED", "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED",
+        "AGENT_RECOGNITION_REVIEW_ENABLED",
         "AGENT_LIBRARY_PATROL_ENABLED", "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED",
         "AGENT_LIBRARY_PATROL_INTERVAL_HOURS",
         "AGENT_LIBRARY_PATROL_MAX_SERIES",
@@ -1140,6 +1143,7 @@ def save_config(request: Request, data: Any = Body(default=None)):
     for key in (
         "AGENT_LIBRARY_PATROL_ENABLED",
         "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED",
+        "AGENT_RECOGNITION_REVIEW_ENABLED",
     ):
         if key not in data:
             continue
@@ -1673,6 +1677,18 @@ def save_config(request: Request, data: Any = Body(default=None)):
             )
         finally:
             patrol_reload_ms = max(1, round((time.perf_counter() - patrol_reload_started) * 1000))
+    if "AGENT_RECOGNITION_REVIEW_ENABLED" in changed_keys:
+        try:
+            from app.modules.organize_confirmations import (
+                wake_recognition_review_dispatcher,
+            )
+
+            wake_recognition_review_dispatcher()
+        except Exception as exc:
+            logger.warning(
+                "Agent 主动识别复核配置热加载失败 type=%s",
+                type(exc).__name__,
+            )
     if agent_download_verification_keys:
         try:
             from app.modules.agent_download_verification_scheduler import (

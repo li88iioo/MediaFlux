@@ -41,7 +41,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -196,6 +196,8 @@ CREATE TABLE IF NOT EXISTS organize_log (
     operation_token TEXT DEFAULT '',
     version INTEGER DEFAULT 1,
     legacy_incomplete INTEGER DEFAULT 0,
+    confirmation_actor TEXT NOT NULL DEFAULT ''
+        CHECK(confirmation_actor IN ('','human','agent')),
     created_at TEXT NOT NULL,
     updated_at TEXT,
     FOREIGN KEY (parent_log_id) REFERENCES organize_log(id)
@@ -223,6 +225,14 @@ CREATE TABLE IF NOT EXISTS organize_confirmations (
     rollup_applied INTEGER NOT NULL DEFAULT 0 CHECK(rollup_applied IN (0,1)),
     result_json TEXT DEFAULT '',
     error TEXT DEFAULT '',
+    review_status TEXT NOT NULL DEFAULT ''
+        CHECK(review_status IN ('','waiting','pending','running','approved','abstained','failed','cancelled')),
+    review_attempts INTEGER NOT NULL DEFAULT 0 CHECK(review_attempts >= 0),
+    review_result_json TEXT DEFAULT '',
+    review_started_at TEXT,
+    review_completed_at TEXT,
+    confirmation_actor TEXT NOT NULL DEFAULT ''
+        CHECK(confirmation_actor IN ('','human','agent')),
     expires_at TEXT NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -234,6 +244,8 @@ CREATE INDEX IF NOT EXISTS idx_organize_confirmations_fingerprint
     ON organize_confirmations(fingerprint, id DESC);
 CREATE INDEX IF NOT EXISTS idx_organize_confirmations_organize_task
     ON organize_confirmations(organize_task_id, id);
+CREATE INDEX IF NOT EXISTS idx_organize_confirmations_review_queue
+    ON organize_confirmations(review_status, status, id);
 
 CREATE TABLE IF NOT EXISTS organize_confirmation_delivery_outbox (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1236,6 +1248,8 @@ CREATE TABLE IF NOT EXISTS local_media_tasks (
     version INTEGER NOT NULL DEFAULT 1,
     error TEXT DEFAULT '',
     warning TEXT DEFAULT '',
+    confirmation_actor TEXT NOT NULL DEFAULT ''
+        CHECK(confirmation_actor IN ('','human','agent')),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     completed_at TEXT,
@@ -3104,6 +3118,56 @@ def _migrate_agent_kernel_v21(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_agent_recognition_review_v22(conn: sqlite3.Connection) -> None:
+    """为整理识别的 Agent 主动复核增加持久队列与最小审计字段。"""
+
+    def add_missing_columns(table: str, columns: dict[str, str]) -> None:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+        ).fetchone() is None:
+            return
+        existing = {
+            str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {definition}"
+                )
+
+    add_missing_columns(
+        "organize_confirmations",
+        {
+            "review_status": "TEXT NOT NULL DEFAULT '' CHECK(review_status IN ('','waiting','pending','running','approved','abstained','failed','cancelled'))",
+            "review_attempts": "INTEGER NOT NULL DEFAULT 0 CHECK(review_attempts >= 0)",
+            "review_result_json": "TEXT DEFAULT ''",
+            "review_started_at": "TEXT",
+            "review_completed_at": "TEXT",
+            "confirmation_actor": "TEXT NOT NULL DEFAULT '' CHECK(confirmation_actor IN ('','human','agent'))",
+        },
+    )
+    add_missing_columns(
+        "organize_log",
+        {
+            "confirmation_actor": "TEXT NOT NULL DEFAULT '' CHECK(confirmation_actor IN ('','human','agent'))",
+        },
+    )
+    add_missing_columns(
+        "local_media_tasks",
+        {
+            "confirmation_actor": "TEXT NOT NULL DEFAULT '' CHECK(confirmation_actor IN ('','human','agent'))",
+        },
+    )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='organize_confirmations'"
+    ).fetchone() is not None:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_organize_confirmations_review_queue "
+            "ON organize_confirmations(review_status,status,id)"
+        )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -3126,6 +3190,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     18: _migrate_strm_refresh_outbox_v19,
     19: _migrate_unify_rss_download_requests_v20,
     20: _migrate_agent_kernel_v21,
+    21: _migrate_agent_recognition_review_v22,
 }
 
 
@@ -4280,6 +4345,7 @@ def finalize_pending_organize_logs(
     *,
     status: str,
     error: str = "",
+    confirmation_actor: str = "",
 ) -> int:
     """结束仍待人工处理的整理日志；用于取消或不可重试失败。"""
     normalized_status = str(status or "").strip()
@@ -4296,6 +4362,9 @@ def finalize_pending_organize_logs(
     placeholders = ",".join("?" for _ in normalized_ids)
     stamp = now()
     message = str(error or "").strip()
+    actor = str(confirmation_actor or "").strip().lower()
+    if actor not in {"", "human", "agent"}:
+        raise ValueError("确认执行者无效")
     with get_conn() as conn:
         rows = conn.execute(
             f"SELECT id FROM organize_log WHERE source=? AND file_id IN ({placeholders}) "
@@ -4309,9 +4378,10 @@ def finalize_pending_organize_logs(
             return 0
         log_placeholders = ",".join("?" for _ in log_ids)
         conn.execute(
-            f"UPDATE organize_log SET status=?,error=?,version=version+1,updated_at=? "
+            f"UPDATE organize_log SET status=?,error=?,confirmation_actor=?,"
+            f"version=version+1,updated_at=? "
             f"WHERE id IN ({log_placeholders})",
-            (normalized_status, message, stamp, *log_ids),
+            (normalized_status, message, actor, stamp, *log_ids),
         )
         conn.execute(
             f"UPDATE organize_log_items SET status=?,error=?,updated_at=? "
@@ -4319,6 +4389,23 @@ def finalize_pending_organize_logs(
             (normalized_status, message, stamp, *log_ids),
         )
         return len(log_ids)
+
+
+def mark_organize_logs_confirmation_actor(
+    operation_token: str, actor: str
+) -> int:
+    """给一次确认执行新产生的光鸭日志标记来源，不改变业务状态。"""
+    token = str(operation_token or "").strip()
+    normalized_actor = str(actor or "").strip().lower()
+    if not token or normalized_actor not in {"human", "agent"}:
+        return 0
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE organize_log SET confirmation_actor=?,updated_at=? "
+            "WHERE operation_token=?",
+            (normalized_actor, now(), token),
+        )
+        return int(cursor.rowcount)
 
 
 def _organize_log_filters(
@@ -4449,7 +4536,9 @@ def _organize_timeline_query(
                 l.year AS year, l.season AS season, l.episode AS episode,
                 '' AS trigger, l.error AS error, '' AS warning,
                 l.created_at AS created_at, COALESCE(l.updated_at,l.created_at) AS updated_at,
-                '' AS completed_at, l.version AS version, l.legacy_incomplete AS legacy_incomplete
+                '' AS completed_at, l.version AS version,
+                l.legacy_incomplete AS legacy_incomplete,
+                l.confirmation_actor AS confirmation_actor
             FROM organize_log l
             WHERE l.status<>'confirmed' AND NOT (
                 (
@@ -4488,7 +4577,7 @@ def _organize_timeline_query(
                 t.trigger AS trigger, t.error AS error, t.warning AS warning,
                 t.created_at AS created_at, t.updated_at AS updated_at,
                 COALESCE(t.completed_at,'') AS completed_at, t.version AS version,
-                0 AS legacy_incomplete
+                0 AS legacy_incomplete, t.confirmation_actor AS confirmation_actor
             FROM local_media_tasks t
             LEFT JOIN local_media_sources s ON s.id=t.source_id AND s.owner=t.owner
             WHERE t.owner=?
@@ -6221,6 +6310,8 @@ def create_organize_confirmation(
     payload: dict,
     expires_at: str,
     organize_task_id: str = "",
+    review_requested: bool = False,
+    review_ready: bool = False,
 ) -> int:
     """持久化一组 Telegram 整理候选，并使同指纹旧按钮失效。"""
     timestamp = now()
@@ -6230,10 +6321,15 @@ def create_organize_confirmation(
         conn.execute(
             "UPDATE organize_confirmations SET status='expired',"
             "result_json=?,error='新的候选卡已替代本次确认',"
+            "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+            "THEN 'cancelled' ELSE review_status END,"
+            "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+            "THEN ? ELSE review_completed_at END,"
             "completed_at=COALESCE(completed_at,?),rollup_applied=0,updated_at=? "
             "WHERE fingerprint=? AND status='pending'",
             (
                 json.dumps({"resolution": "superseded"}, ensure_ascii=False),
+                timestamp,
                 timestamp,
                 timestamp,
                 str(fingerprint),
@@ -6242,8 +6338,8 @@ def create_organize_confirmation(
         cursor = conn.execute(
             "INSERT INTO organize_confirmations("
             "token,fingerprint,chat_id,source_name,directory_path,payload_json,status,"
-            "organize_task_id,rollup_applied,expires_at,created_at,updated_at"
-            ") VALUES(?,?,?,?,?,?,'pending',?,0,?,?,?)",
+            "organize_task_id,rollup_applied,review_status,expires_at,created_at,updated_at"
+            ") VALUES(?,?,?,?,?,?,'pending',?,0,?,?,?,?)",
             (
                 str(token),
                 str(fingerprint),
@@ -6252,6 +6348,7 @@ def create_organize_confirmation(
                 str(directory_path or ""),
                 encoded,
                 str(organize_task_id or ""),
+                ("pending" if review_ready else "waiting") if review_requested else "",
                 str(expires_at),
                 timestamp,
                 timestamp,
@@ -6266,6 +6363,128 @@ def get_organize_confirmation(token: str) -> sqlite3.Row | None:
             "SELECT * FROM organize_confirmations WHERE token=?",
             (str(token or ""),),
         ).fetchone()
+
+
+def activate_organize_confirmation_review(token: str) -> bool:
+    """人工候选卡已可靠入队后，才允许后台 Agent 领取复核。"""
+    timestamp = now()
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE organize_confirmations SET review_status='pending',updated_at=? "
+            "WHERE token=? AND status='pending' AND review_status='waiting' "
+            "AND expires_at>?",
+            (timestamp, str(token or ""), timestamp),
+        )
+        return cursor.rowcount == 1
+
+
+def recover_interrupted_organize_confirmation_reviews() -> int:
+    """进程重启后恢复未决复核；连续中断三次后永久回退人工。"""
+    timestamp = now()
+    with get_conn() as conn:
+        failed = conn.execute(
+            "UPDATE organize_confirmations SET review_status='failed',"
+            "review_result_json=?,review_completed_at=?,updated_at=? "
+            "WHERE review_status='running' AND status='pending' "
+            "AND review_attempts>=3",
+            (
+                json.dumps(
+                    {
+                        "reason_code": "repeated_interruption",
+                        "summary": "Agent 复核连续中断，已保留人工确认",
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                timestamp,
+                timestamp,
+            ),
+        )
+        recovered = conn.execute(
+            "UPDATE organize_confirmations SET review_status='pending',"
+            "review_started_at=NULL,updated_at=? "
+            "WHERE review_status='running' AND status='pending' "
+            "AND review_attempts<3",
+            (timestamp,),
+        )
+        return int(failed.rowcount) + int(recovered.rowcount)
+
+
+def claim_next_organize_confirmation_review() -> sqlite3.Row | None:
+    """原子领取最早的待确认识别复核；只读模型调用不占用整理写队列。"""
+    timestamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id FROM organize_confirmations "
+            "WHERE review_status='pending' AND status='pending' "
+            "AND review_attempts<3 AND expires_at>? "
+            "ORDER BY id ASC LIMIT 1",
+            (timestamp,),
+        ).fetchone()
+        if row is None:
+            return None
+        cursor = conn.execute(
+            "UPDATE organize_confirmations SET review_status='running',"
+            "review_attempts=review_attempts+1,review_started_at=?,"
+            "review_completed_at=NULL,updated_at=? "
+            "WHERE id=? AND review_status='pending' AND status='pending'",
+            (timestamp, timestamp, int(row["id"])),
+        )
+        if cursor.rowcount != 1:
+            return None
+        return conn.execute(
+            "SELECT * FROM organize_confirmations WHERE id=?",
+            (int(row["id"]),),
+        ).fetchone()
+
+
+def stage_organize_confirmation_review_result(
+    token: str, result: dict | None = None
+) -> bool:
+    """在 Agent 竞争执行所有权前保存最小审计，不改变确认状态。"""
+    encoded = json.dumps(
+        result or {}, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE organize_confirmations SET review_result_json=?,updated_at=? "
+            "WHERE token=? AND review_status='running' AND status='pending'",
+            (encoded, now(), str(token or "")),
+        )
+        return cursor.rowcount == 1
+
+
+def complete_organize_confirmation_review(
+    token: str,
+    *,
+    status: str,
+    result: dict | None = None,
+) -> bool:
+    """保存最小复核回执；模型上下文与工具原始载荷不会持久化。"""
+    normalized_status = str(status or "").strip().lower()
+    if normalized_status not in {
+        "approved", "abstained", "failed", "cancelled"
+    }:
+        raise ValueError("Agent 复核状态无效")
+    timestamp = now()
+    encoded = json.dumps(
+        result or {}, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    with get_conn() as conn:
+        cursor = conn.execute(
+            "UPDATE organize_confirmations SET review_status=?,review_result_json=?,"
+            "review_completed_at=?,updated_at=? "
+            "WHERE token=? AND review_status='running'",
+            (
+                normalized_status,
+                encoded,
+                timestamp,
+                timestamp,
+                str(token or ""),
+            ),
+        )
+        return cursor.rowcount == 1
 
 
 def list_organize_confirmations_for_task(
@@ -6362,9 +6581,12 @@ def bind_organize_confirmation_message(
 
 
 def claim_organize_confirmation(
-    token: str, *, chat_id: str, selected_index: int
+    token: str, *, chat_id: str, selected_index: int, actor: str = "human"
 ) -> sqlite3.Row:
     """原子认领待确认按钮；过期、越权和重放统一拒绝。"""
+    normalized_actor = str(actor or "human").strip().lower()
+    if normalized_actor not in {"human", "agent"}:
+        raise ValueError("确认执行者无效")
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -6387,9 +6609,14 @@ def claim_organize_confirmation(
             conn.execute(
                 "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
                 "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
+                "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+                "THEN 'cancelled' ELSE review_status END,"
+                "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+                "THEN ? ELSE review_completed_at END,"
                 "completed_at=?,rollup_applied=0,updated_at=? WHERE id=?",
                 (
                     json.dumps({"resolution": "expired"}, ensure_ascii=False),
+                    timestamp,
                     timestamp,
                     timestamp,
                     int(row["id"]),
@@ -6399,8 +6626,24 @@ def claim_organize_confirmation(
         else:
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='queued',selected_index=?,"
-                "queued_at=?,updated_at=? WHERE id=? AND status='pending'",
-                (int(selected_index), queued_at, timestamp, int(row["id"])),
+                "queued_at=?,confirmation_actor=?,"
+                "review_status=CASE "
+                "WHEN ?='agent' THEN 'approved' "
+                "WHEN ?='human' AND review_status IN ('waiting','pending','running') THEN 'cancelled' "
+                "ELSE review_status END,"
+                "review_completed_at=CASE "
+                "WHEN ?='agent' THEN ? "
+                "WHEN ?='human' AND review_status IN ('waiting','pending','running') THEN ? "
+                "ELSE review_completed_at END,updated_at=? "
+                "WHERE id=? AND status='pending' "
+                "AND (?<>'agent' OR review_status='running')",
+                (
+                    int(selected_index), queued_at, normalized_actor,
+                    normalized_actor, normalized_actor,
+                    normalized_actor, timestamp,
+                    normalized_actor, timestamp,
+                    timestamp, int(row["id"]), normalized_actor,
+                ),
             )
             if cursor.rowcount != 1:
                 raise ValueError("该确认操作已处理")
@@ -6440,9 +6683,14 @@ def cancel_organize_confirmation(
             conn.execute(
                 "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
                 "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
+                "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+                "THEN 'cancelled' ELSE review_status END,"
+                "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+                "THEN ? ELSE review_completed_at END,"
                 "completed_at=?,rollup_applied=0,updated_at=? WHERE id=?",
                 (
                     json.dumps({"resolution": "expired"}, ensure_ascii=False),
+                    timestamp,
                     timestamp,
                     timestamp,
                     int(row["id"]),
@@ -6452,7 +6700,12 @@ def cancel_organize_confirmation(
         else:
             cursor = conn.execute(
                 "UPDATE organize_confirmations SET status='cancelled',selected_index=NULL,"
-                "queued_at=NULL,task_id='',result_json=?,error='',completed_at=?,updated_at=? "
+                "queued_at=NULL,task_id='',result_json=?,error='',"
+                "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+                "THEN 'cancelled' ELSE review_status END,"
+                "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+                "THEN ? ELSE review_completed_at END,"
+                "completed_at=?,updated_at=? "
                 "WHERE id=? AND status='pending'",
                 (
                     json.dumps(
@@ -6462,6 +6715,7 @@ def cancel_organize_confirmation(
                         },
                         ensure_ascii=False,
                     ),
+                    timestamp,
                     timestamp,
                     timestamp,
                     int(row["id"]),
@@ -6514,6 +6768,7 @@ def expire_organize_confirmation_with_delivery(
     event_json: str,
     chat_id: str,
     message_id: int | None,
+    enqueue_delivery: bool = True,
 ) -> sqlite3.Row | None:
     """原子失效一张到期候选卡，并写入统一通知中心的事务桥。"""
     timestamp = now()
@@ -6522,10 +6777,15 @@ def expire_organize_confirmation_with_delivery(
         cursor = conn.execute(
             "UPDATE organize_confirmations SET status='expired',selected_index=NULL,"
             "queued_at=NULL,task_id='',result_json=?,error='确认操作已过期',"
+            "review_status=CASE WHEN review_status IN ('waiting','pending','running') "
+            "THEN 'cancelled' ELSE review_status END,"
+            "review_completed_at=CASE WHEN review_status IN ('waiting','pending','running') "
+            "THEN ? ELSE review_completed_at END,"
             "completed_at=?,rollup_applied=0,updated_at=? "
             "WHERE token=? AND status='pending' AND expires_at<=?",
             (
                 json.dumps({"resolution": "expired"}, ensure_ascii=False),
+                timestamp,
                 timestamp,
                 timestamp,
                 str(token or ""),
@@ -6534,14 +6794,15 @@ def expire_organize_confirmation_with_delivery(
         )
         if cursor.rowcount != 1:
             return None
-        _enqueue_organize_confirmation_delivery(
-            conn,
-            token=token,
-            event_json=event_json,
-            chat_id=chat_id,
-            message_id=message_id,
-            timestamp=timestamp,
-        )
+        if enqueue_delivery:
+            _enqueue_organize_confirmation_delivery(
+                conn,
+                token=token,
+                event_json=event_json,
+                chat_id=chat_id,
+                message_id=message_id,
+                timestamp=timestamp,
+            )
         return conn.execute(
             "SELECT * FROM organize_confirmations WHERE token=?",
             (str(token or ""),),
@@ -6611,7 +6872,11 @@ def requeue_organize_confirmation(token: str, error: str = "") -> None:
 
 
 def update_organize_confirmation(token: str, **fields) -> None:
-    allowed = {"status", "task_id", "result_json", "error", "completed_at"}
+    allowed = {
+        "status", "task_id", "result_json", "error", "completed_at",
+        "review_status", "review_result_json", "review_started_at",
+        "review_completed_at", "confirmation_actor",
+    }
     sets: list[str] = []
     values: list[object] = []
     for key, value in fields.items():
@@ -8701,7 +8966,7 @@ def prepare_manual_local_media_task(
                 "stable_since='',snapshot_digest='',"
                 "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
                 "season_override=?,episode_override=?,numbering_mode=?,title='',year='',"
-                "operation_token=?,error='',warning='',completed_at=NULL,"
+                "operation_token=?,confirmation_actor='',error='',warning='',completed_at=NULL,"
                 "version=version+1,updated_at=? WHERE id=? AND owner=? AND status IN ('failed','requires_manual')",
                 (
                     safe_path,
@@ -8762,7 +9027,7 @@ def claim_local_media_task(
     with get_conn() as conn:
         cur = conn.execute(
             "UPDATE local_media_tasks SET status=?,attempts=attempts+1,version=version+1,"
-            "error='',updated_at=? WHERE id=? AND owner=? AND status=?",
+            "confirmation_actor='',error='',updated_at=? WHERE id=? AND owner=? AND status=?",
             (next_status, timestamp, int(task_id), _local_media_owner(owner), expected),
         )
         return cur.rowcount == 1
@@ -8782,6 +9047,7 @@ def claim_local_media_confirmation_task(
     numbering_mode: str = "auto",
     title: str = "",
     year: str = "",
+    confirmation_actor: str = "human",
 ) -> bool:
     """把仍然有效的本地待确认任务原子转换为执行态。"""
     normalized_type = str(media_type or "").strip().lower()
@@ -8794,6 +9060,9 @@ def claim_local_media_confirmation_task(
     normalized_numbering_mode = normalize_numbering_mode(raw_numbering_mode)
     if not normalized_tmdb_id or normalized_type not in {"movie", "tv"}:
         raise ValueError("候选媒体参数无效")
+    normalized_actor = str(confirmation_actor or "human").strip().lower()
+    if normalized_actor not in {"human", "agent"}:
+        raise ValueError("确认执行者无效")
     if isinstance(expected_version, bool) or int(expected_version) <= 0:
         raise ValueError("本地媒体任务版本无效")
     for value, minimum, maximum, label in (
@@ -8821,6 +9090,7 @@ def claim_local_media_confirmation_task(
         normalized_numbering_mode,
         str(title or ""),
         str(year or ""),
+        normalized_actor,
         now(),
         int(task_id),
         _local_media_owner(owner),
@@ -8835,7 +9105,8 @@ def claim_local_media_confirmation_task(
             "UPDATE local_media_tasks SET status='recognizing',attempts=attempts+1,"
             "recognition_summary='',rules_snapshot=?,tmdb_id=?,media_type=?,"
             "season_override=?,episode_override=?,numbering_mode=?,"
-            "title=?,year=?,error='',warning='',completed_at=NULL,version=version+1,updated_at=? "
+            "title=?,year=?,confirmation_actor=?,error='',warning='',completed_at=NULL,"
+            "version=version+1,updated_at=? "
             f"WHERE {where}",
             params,
         )
@@ -8862,6 +9133,7 @@ def update_local_media_task(task_id: int, *, owner: str = "admin", **fields) -> 
         "year",
         "error",
         "warning",
+        "confirmation_actor",
         "completed_at",
     }
     sets: list[str] = []
@@ -9155,6 +9427,7 @@ def reset_local_media_task(
         "title=''",
         "year=''",
         "operation_token=?",
+        "confirmation_actor=''",
         "error=''",
         "warning=''",
         "completed_at=NULL",

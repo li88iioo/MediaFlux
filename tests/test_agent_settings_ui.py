@@ -81,6 +81,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             "AGENT_LIBRARY_PATROL_ENABLED",
             "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED",
             "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED",
+            "AGENT_RECOGNITION_REVIEW_ENABLED",
             "AGENT_LIBRARY_PATROL_INTERVAL_HOURS",
             "AGENT_LIBRARY_PATROL_MAX_SERIES",
             "TAVILY_CACHE_TTL_SECONDS",
@@ -99,11 +100,14 @@ class AgentSettingsUiTests(unittest.TestCase):
             "TAVILY_TIMEOUT_SECONDS:'10'",
             "AGENT_LIBRARY_PATROL_ENABLED:'0'",
             "AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED:'1'",
+            "AGENT_RECOGNITION_REVIEW_ENABLED:'0'",
             "AGENT_LIBRARY_PATROL_INTERVAL_HOURS:'24'",
             "AGENT_LIBRARY_PATROL_MAX_SERIES:'50'",
         ):
             self.assertIn(default, html)
         self.assertIn("不会立即扫描全库", html)
+        self.assertIn("Agent 主动复核", html)
+        self.assertIn("不确定则保留人工按钮", html)
         self.assertNotIn("password-toggle-btn", html)
         self.assertIn('id="testQbBtn"', html)
         self.assertIn("/api/downloads/qb/test", html)

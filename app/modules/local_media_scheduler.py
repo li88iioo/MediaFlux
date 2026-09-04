@@ -623,6 +623,23 @@ class LocalMediaScheduler:
                         "本地媒体失败通知发送异常 task=%s type=%s",
                         task.id, type(notify_exc).__name__,
                     )
+            elif current is not None and current.status == "requires_manual":
+                try:
+                    from app.modules.local_media_notifications import (
+                        schedule_local_media_task_review,
+                    )
+
+                    schedule_local_media_task_review(
+                        task.id,
+                        self._rebuild_manual_review_result(current),
+                        owner=self.owner,
+                    )
+                except Exception as review_exc:
+                    logger.warning(
+                        "静默本地媒体 Agent 复核调度异常 task=%s type=%s",
+                        task.id,
+                        type(review_exc).__name__,
+                    )
             return False
         else:
             captured_result = (
@@ -648,6 +665,21 @@ class LocalMediaScheduler:
                     logger.warning(
                         "本地媒体完成通知发送异常 task=%s type=%s",
                         task.id, type(notify_exc).__name__,
+                    )
+            elif captured_result is not None:
+                try:
+                    from app.modules.local_media_notifications import (
+                        schedule_local_media_task_review,
+                    )
+
+                    schedule_local_media_task_review(
+                        task.id, captured_result, owner=self.owner
+                    )
+                except Exception as review_exc:
+                    logger.warning(
+                        "静默本地媒体 Agent 复核调度异常 task=%s type=%s",
+                        task.id,
+                        type(review_exc).__name__,
                     )
             return True
         finally:

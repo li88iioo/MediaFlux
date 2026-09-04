@@ -3093,6 +3093,10 @@ class Organizer:
                 "skipped": True,
                 "error": "整理存在失败项且没有已确认的变更清单，已停止 STRM 同步",
             }
+        if not rules.notify_enabled or not rules.library_notify:
+            self._schedule_agent_recognition_reviews(
+                stats, rules, source_name=source_name
+            )
         self._publish_or_update_task_summary(stats, rules, source_name=source_name)
 
     # ===== 整理主流程 =====
@@ -3982,6 +3986,10 @@ class Organizer:
                 "skipped": True,
                 "error": "整理存在失败项且没有已确认的变更清单，已停止 STRM 同步",
             }
+        if not rules.notify_enabled or not rules.library_notify:
+            Organizer._schedule_agent_recognition_reviews(
+                stats, rules, source_name=source_name, chat_id=chat_id
+            )
         if notify_result:
             Organizer._publish_or_update_task_summary(
                 stats, rules, source_name=source_name, chat_id=chat_id
@@ -4284,6 +4292,29 @@ class Organizer:
         if strm:
             return "启动失败", "未触发"
         return "未启用或无变更", "未触发"
+
+    @staticmethod
+    def _schedule_agent_recognition_reviews(
+        stats: dict,
+        rules: OrganizeRules,
+        *,
+        source_name: str = "",
+        chat_id: str = "",
+    ) -> int:
+        """通知关闭时仍将冻结候选交给独立 Agent 复核队列。"""
+        try:
+            from app.modules.organize_confirmations import (
+                schedule_guangya_recognition_reviews,
+            )
+
+            return schedule_guangya_recognition_reviews(
+                stats, rules, source_name=source_name, chat_id=chat_id
+            )
+        except Exception as exc:  # noqa: BLE001 - 不能影响整理主结果
+            logger.warning(
+                "光鸭 Agent 复核调度失败 type=%s", type(exc).__name__
+            )
+            return 0
 
     @staticmethod
     def notify_directory_results(stats: dict, rules: OrganizeRules,

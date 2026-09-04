@@ -661,6 +661,10 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
                     "PRAGMA table_info(organize_confirmations)"
                 )
             }
+            organize_log_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(organize_log)")
+            }
             rss_indexes = {
                 str(row["name"]): int(row["unique"])
                 for row in conn.execute("PRAGMA index_list(rss_entries)")
@@ -681,6 +685,7 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertIn("server_path", target_columns)
         self.assertIn("season_override", task_columns)
         self.assertIn("episode_override", task_columns)
+        self.assertIn("confirmation_actor", task_columns)
         self.assertIn("session_id", playback_columns)
         self.assertIn("version", mapping_columns)
         self.assertIn("trust_forwarded_headers", proxy_instance_columns)
@@ -691,12 +696,25 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         self.assertEqual(rss_indexes.get("idx_rss_entries_item_guid"), 1)
         self.assertEqual(rss_indexes.get("idx_rss_entries_failure_retry"), 0)
         self.assertTrue(
-            {"organize_task_id", "rollup_applied"}.issubset(
+            {
+                "organize_task_id",
+                "rollup_applied",
+                "review_status",
+                "review_attempts",
+                "review_result_json",
+                "review_started_at",
+                "review_completed_at",
+                "confirmation_actor",
+            }.issubset(
                 confirmation_columns
             )
         )
+        self.assertIn("confirmation_actor", organize_log_columns)
         self.assertIn(
             "idx_organize_confirmations_organize_task", schema_objects
+        )
+        self.assertIn(
+            "idx_organize_confirmations_review_queue", schema_objects
         )
         self.assertTrue({
             "media_title_aliases",

@@ -611,7 +611,7 @@
             field.dataset.managedByEnvironment = managed ? 'true' : 'false';
             field.disabled = managed || field.dataset.initiallyDisabled === 'true';
             const managedContainer = field.closest(
-                '.agent-field, .agent-settings-option, .agent-settings-master-toggle, .form-row'
+                '.agent-field, .agent-settings-option, .agent-settings-master-toggle, .metadata-option, .form-row'
             );
             managedContainer?.classList.toggle('is-managed', managed);
             field.title = managed

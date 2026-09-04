@@ -61,6 +61,9 @@ def test_logs_template_markup_contract():
     assert "parent_directory:'父目录'" in content
     assert "release_context:'发布信息'" in content
     assert "explicit_marker:'显式标记'" in content
+    assert "confirmation_actor==='agent'" in content
+    assert "data.confirmation_actor==='agent' ? 'Agent 确认'" in content
+    assert "Agent 确认" in content
 
 
 def test_logs_responsive_css_contract():
@@ -86,6 +89,7 @@ def test_logs_responsive_css_contract():
     assert ".organize-flow-hero { grid-template-columns: 1fr; gap: 8px; }" in css
     assert ".organize-flow-connector svg { transform: rotate(90deg); }" in css
     assert ".organize-meta-chip { min-width: 0; white-space: normal; overflow-wrap: anywhere; }" in css
+    assert ".tag-mini.is-agent-confirm" in css
 
     # 实时日志移动端需包含级别+搜索框并排、控制条整行两端并排
     assert ".runtime-log-filterbar" in css

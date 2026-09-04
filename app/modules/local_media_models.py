@@ -170,6 +170,7 @@ class LocalMediaTask:
     version: int
     error: str
     warning: str
+    confirmation_actor: str
     stable_since: str
     created_at: str
     updated_at: str
@@ -197,7 +198,9 @@ class LocalMediaTask:
             title=str(_value(row, "title")), year=str(_value(row, "year")),
             attempts=int(_value(row, "attempts", 0)),
             version=int(_value(row, "version", 1)), error=str(_value(row, "error")),
-            warning=str(_value(row, "warning")), stable_since=str(_value(row, "stable_since")),
+            warning=str(_value(row, "warning")),
+            confirmation_actor=str(_value(row, "confirmation_actor")),
+            stable_since=str(_value(row, "stable_since")),
             created_at=str(row["created_at"]), updated_at=str(_value(row, "updated_at")),
             completed_at=str(_value(row, "completed_at")),
         )
