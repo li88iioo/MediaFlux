@@ -474,14 +474,19 @@ Season 1 / S01E01
             return rect.top + rect.height / 2;
           };
           const prompt = document.querySelector('#agentPrompt');
+          const promptStyle = getComputedStyle(prompt);
           return {
-            promptDisplay: getComputedStyle(prompt).display,
+            promptDisplay: promptStyle.display,
+            promptPaddingTop: parseFloat(promptStyle.paddingTop),
+            promptPaddingBottom: parseFloat(promptStyle.paddingBottom),
             promptCenter: centerY('#agentPrompt'),
             settingsCenter: centerY('#agentSettings'),
             sendCenter: centerY('#agentSend'),
           };
         }""")
         self.assertEqual(layout["promptDisplay"], "block")
+        self.assertEqual(layout["promptPaddingTop"], 9)
+        self.assertEqual(layout["promptPaddingBottom"], 7)
         self.assertAlmostEqual(
             layout["promptCenter"], layout["settingsCenter"], delta=0.5
         )
@@ -501,6 +506,9 @@ Season 1 / S01E01
         )
         page.locator("#agentPrompt").fill("执行一个较长的只读巡检")
         before = page.locator(".agent-submit-slot").bounding_box()
+        send_before = page.locator("#agentSend").bounding_box()
+        self.assertAlmostEqual(send_before["width"], send_before["height"], delta=0.5)
+        self.assertAlmostEqual(send_before["width"], before["width"], delta=0.5)
         page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
         page.locator("#agentStop").wait_for(state="visible")
         during = page.locator(".agent-submit-slot").bounding_box()

@@ -1540,7 +1540,8 @@ body.agent-page-body::after { display: none; }
 .agent-console.is-empty .agent-composer { width: min(calc(100% - 40px), 680px); min-height: 54px; margin: 0 auto; padding: 6px 7px 6px 12px; flex-direction: row; align-items: center; gap: 7px; border-color: color-mix(in srgb, var(--border-strong) 54%, transparent); border-radius: 999px; box-shadow: none; }
 .agent-console.is-empty .agent-composer:focus-within { border-color: color-mix(in srgb, var(--accent) 24%, var(--border-strong)); box-shadow: none; }
 .agent-console.is-empty .agent-composer-input-wrap { order: 0; flex: 1 1 auto; width: auto; }
-.agent-console.is-empty .agent-composer textarea { min-height: 38px; max-height: 112px; padding: 8px 4px; line-height: 22px; }
+/* 中文 placeholder 的字形重心略偏上，非对称内边距做 1px 光学校正。 */
+.agent-console.is-empty .agent-composer textarea { min-height: 38px; max-height: 112px; padding: 9px 4px 7px; line-height: 22px; }
 .agent-console.is-empty .agent-composer-header { display: contents !important; }
 .agent-console.is-empty .agent-composer-actions { order: -1; }
 .agent-console.is-empty .agent-composer-actions-right { order: 1; }
@@ -1765,7 +1766,7 @@ body.agent-page-body::after { display: none; }
     .agent-action-btn { flex-basis: 44px; width: 44px; height: 44px; }
     .agent-action-btn.agent-resume-session { flex-basis: auto; width: auto; padding-inline: 11px; }
     .agent-submit-slot { width: 44px; height: 44px; min-width: 44px; flex-basis: 44px; }
-    .agent-send, .agent-stop { flex-basis: 44px; width: 44px; height: 44px; }
+    .agent-send, .agent-stop { flex-basis: 44px; width: 44px; min-width: 44px; max-width: 44px; height: 44px; }
     .agent-retry-draft, .agent-retry-immediate { min-height: 44px; padding-inline: 14px; }
     .agent-history-drawer { width: min(92vw, 380px); }
     .agent-confirmation-card { padding: 18px 17px 16px; border-radius: 15px; }
