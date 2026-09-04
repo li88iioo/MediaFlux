@@ -10,6 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app import database as db
+from app.clients.qbittorrent import TorrentAddResult
 from app.config import web_credentials
 from app.main import create_app
 from app.modules import download_dispatcher
@@ -272,6 +273,108 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
             request_id,
             {int(row["id"]) for row in db.list_active_download_requests()},
         )
+
+    def test_http_qb_resubmit_preserves_persisted_torrent_identity(self):
+        infohash = "7" * 40
+        item = download_dispatcher.DownloadInput(
+            kind="http",
+            title="RSS episode",
+            source_value="https://example.invalid/download?id=episode",
+            identity_hint=f"btih:{infohash}",
+        )
+        created = download_dispatcher.create_request(
+            item,
+            "",
+            "rss-original",
+            origin="rss:1",
+        )
+        request_id = int(created["id"])
+        db.update_download_request(
+            request_id,
+            targets="qb",
+            status="manual_review",
+            qb_status="manual_review",
+            qb_task_id=infohash,
+        )
+        values = {
+            "QB_URL": "http://qb.local",
+            "QB_USERNAME": "",
+            "QB_PASSWORD": "",
+            "QB_API_KEY": "token",
+        }
+
+        with (
+            patch.object(
+                download_dispatcher,
+                "get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
+            patch.object(download_dispatcher, "QBittorrentClient") as client_cls,
+        ):
+            client_cls.return_value.add_torrent_detailed.return_value = TorrentAddResult(True)
+            result = download_dispatcher.resubmit_download_request(request_id, "qb")
+
+        self.assertTrue(result["ok"])
+        successor = db.get_download_request(int(result["request_id"]))
+        self.assertEqual(successor["qb_task_id"], infohash)
+        self.assertEqual(successor["qb_status"], "submitted")
+        canonical = download_dispatcher.request_key(
+            download_dispatcher.DownloadInput(
+                kind="magnet",
+                title="",
+                source_value=f"magnet:?xt=urn:btih:{infohash}",
+            )
+        )
+        self.assertEqual(
+            int(db.get_download_request_by_request_key(canonical)["id"]),
+            int(result["request_id"]),
+        )
+        task = SimpleNamespace(hash=infohash, name="qB canonical title")
+        self.assertIs(DownloadTracker._match_qb(successor, [task]), task)
+
+    def test_http_qb_resubmit_recovers_torrent_identity_from_url(self):
+        infohash = "8" * 40
+        item = download_dispatcher.DownloadInput(
+            kind="http",
+            title="Legacy RSS episode",
+            source_value=f"https://mikanani.me/Download/day/{infohash}.torrent",
+        )
+        created = download_dispatcher.create_request(
+            item,
+            "",
+            "rss-legacy",
+            origin="rss:1",
+        )
+        request_id = int(created["id"])
+        db.update_download_request(
+            request_id,
+            targets="qb",
+            status="manual_review",
+            qb_status="manual_review",
+            qb_task_id="",
+        )
+        values = {
+            "QB_URL": "http://qb.local",
+            "QB_USERNAME": "",
+            "QB_PASSWORD": "",
+            "QB_API_KEY": "token",
+        }
+
+        with (
+            patch.object(
+                download_dispatcher,
+                "get",
+                side_effect=lambda key, default="": values.get(key, default),
+            ),
+            patch.object(download_dispatcher, "QBittorrentClient") as client_cls,
+        ):
+            client_cls.return_value.add_torrent_detailed.return_value = TorrentAddResult(True)
+            result = download_dispatcher.resubmit_download_request(request_id, "qb")
+
+        self.assertTrue(result["ok"])
+        successor = db.get_download_request(int(result["request_id"]))
+        self.assertEqual(successor["qb_task_id"], infohash)
+        self.assertEqual(successor["qb_status"], "submitted")
 
     def test_cleaned_torrent_is_recovered_from_qb_5_export_for_resubmit(self):
         item = download_dispatcher.torrent_download_input(

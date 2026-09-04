@@ -19,7 +19,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import feedparser
 import httpx
@@ -710,15 +710,9 @@ class RSSEngine:
         direct = magnet_infohash(value)
         if direct:
             return direct.lower()
-        try:
-            path = unquote(urlsplit(str(value or "")).path)
-        except Exception:
-            return ""
-        for part in reversed([item for item in path.split("/") if item]):
-            match = re.fullmatch(r"(?i)([0-9a-f]{40})(?:\.torrent)?", part)
-            if match:
-                return match.group(1).lower()
-        return ""
+        from app.modules.download_dispatcher import http_torrent_infohash_hint
+
+        return http_torrent_infohash_hint(value)
 
     @staticmethod
     def _entry_method(entry) -> str:

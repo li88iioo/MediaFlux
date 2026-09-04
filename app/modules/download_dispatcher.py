@@ -212,6 +212,19 @@ _BTIH_BASE32_RE = re.compile(r"^[A-Z2-7]{32}$", re.IGNORECASE)
 _BTMH_SHA256_RE = re.compile(r"^1220[0-9a-fA-F]{64}$")
 
 
+def http_torrent_infohash_hint(value: str) -> str:
+    """读取 HTTP 种子地址路径中显式携带的 v1 infohash。"""
+    try:
+        path = unquote(urlparse(str(value or "")).path)
+    except ValueError:
+        return ""
+    for part in reversed([item for item in path.split("/") if item]):
+        match = re.fullmatch(r"(?i)([0-9a-f]{40})(?:\.torrent)?", part)
+        if match:
+            return match.group(1).lower()
+    return ""
+
+
 def _hash_request_identity(canonical: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -643,6 +656,14 @@ def resubmit_download_request(
     source_kind = str(source_row["kind"] or "")
     source_value = str(source_row["source_value"] or "").strip()
     source_torrent_data = source_row["torrent_data"]
+    source_qb_task_id = str(source_row["qb_task_id"] or "").strip().lower()
+    qb_task_id_hint = ""
+    if source_kind == "http":
+        qb_task_id_hint = (
+            source_qb_task_id
+            if _QB_TORRENT_ID_RE.fullmatch(source_qb_task_id)
+            else http_torrent_infohash_hint(source_value)
+        )
     item_kind = source_kind
     item_torrent_data = source_torrent_data
     if source_kind == "torrent":
@@ -657,7 +678,7 @@ def resubmit_download_request(
         # 光鸭优先使用 MediaFlux 缓存，避免无意义依赖 qB；qB/both 在已有远端
         # 任务时优先从 qB 5.x 导出，以验证重新提交不依赖本地长期保存 BLOB。
         exported_torrent = None
-        qb_task_id = str(source_row["qb_task_id"] or "").strip().lower()
+        qb_task_id = source_qb_task_id
         should_export_first = targets in {"qb", "both"}
         if _QB_TORRENT_ID_RE.fullmatch(qb_task_id) and (
             should_export_first or not local_torrent_valid
@@ -686,6 +707,7 @@ def resubmit_download_request(
         title=str(source_row["title"] or ""),
         source_value=str(source_row["source_value"] or ""),
         torrent_data=item_torrent_data,
+        identity_hint=f"btih:{qb_task_id_hint}" if qb_task_id_hint else "",
     )
     source_status = str(source_row["status"] or "").strip().lower()
     created = create_request(
@@ -711,7 +733,10 @@ def resubmit_download_request(
             "error": "同一资源已有下载任务正在处理",
         }
 
-    result = dispatch_request(successor_id, targets)
+    dispatch_kwargs: dict[str, str] = {}
+    if qb_task_id_hint and targets in {"qb", "both"}:
+        dispatch_kwargs["qb_task_id_hint"] = qb_task_id_hint
+    result = dispatch_request(successor_id, targets, **dispatch_kwargs)
     if result.get("ok"):
         db.mark_download_request_resubmitted(
             int(source_request_id),
