@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from app.bot.telegram_markdown import render_telegram_markdown
+from app.bot.telegram_markdown import (
+    render_telegram_markdown,
+    split_telegram_html,
+    telegram_html_text_length,
+)
 
 
 class TelegramMarkdownTests(unittest.TestCase):
@@ -46,6 +50,41 @@ class TelegramMarkdownTests(unittest.TestCase):
         self.assertEqual(rendered.count("<b>"), rendered.count("</b>"))
         self.assertIn("<b>输出中</b>", rendered)
         self.assertIn("**尚未闭合", rendered)
+
+    def test_long_html_is_split_with_balanced_inline_tags(self):
+        rendered = "<b>" + ("😀 加粗内容。" * 900) + "</b>"
+
+        chunks = split_telegram_html(rendered, limit=3900)
+
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(
+            all(telegram_html_text_length(chunk) <= 3900 for chunk in chunks)
+        )
+        for chunk in chunks:
+            self.assertEqual(chunk.count("<b>"), chunk.count("</b>"))
+
+    def test_long_quote_and_code_blocks_remain_valid_after_splitting(self):
+        rendered = (
+            "<blockquote>"
+            + "\n".join("引用内容" * 50 for _ in range(40))
+            + "</blockquote>\n"
+            + "<pre><code>"
+            + "\n".join(f"line-{index} " + ("x" * 120) for index in range(60))
+            + "</code></pre>"
+        )
+
+        chunks = split_telegram_html(rendered, limit=3900)
+
+        self.assertGreater(len(chunks), 2)
+        self.assertTrue(
+            all(telegram_html_text_length(chunk) <= 3900 for chunk in chunks)
+        )
+        for chunk in chunks:
+            self.assertEqual(
+                chunk.count("<blockquote>"), chunk.count("</blockquote>")
+            )
+            self.assertEqual(chunk.count("<pre>"), chunk.count("</pre>"))
+            self.assertEqual(chunk.count("<code>"), chunk.count("</code>"))
 
 
 if __name__ == "__main__":

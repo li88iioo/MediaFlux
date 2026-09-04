@@ -1283,6 +1283,51 @@ body.agent-page-body::after { display: none; }
     font-size: 11px;
     line-height: 1.6;
 }
+.agent-confirmation-scope {
+    display: grid;
+    gap: 8px;
+    margin-top: 14px;
+    padding: 13px 14px;
+    color: var(--text-secondary);
+    background: var(--control-tint);
+    border: 1px solid var(--agent-line);
+    border-radius: 12px;
+}
+.agent-confirmation-scope h4 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: 10px;
+    font-weight: 720;
+    line-height: 1.4;
+}
+.agent-confirmation-list {
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding: 0 0 0 17px;
+    font-size: 10.5px;
+    line-height: 1.55;
+}
+.agent-confirmation-list li { min-width: 0; overflow-wrap: anywhere; }
+.agent-confirmation-list li::marker { color: var(--accent); }
+.agent-confirmation-list li.is-muted { color: var(--text-muted); }
+.agent-confirmation-details {
+    display: grid;
+    gap: 7px;
+    margin: 12px 0 0;
+    padding: 0;
+}
+.agent-confirmation-detail {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: 74px minmax(0, 1fr);
+    gap: 12px;
+    color: var(--text-muted);
+    font-size: 10px;
+    line-height: 1.5;
+}
+.agent-confirmation-detail dt { font-weight: 680; }
+.agent-confirmation-detail dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text-secondary); }
 .agent-confirmation-status {
     display: flex;
     align-items: center;
@@ -1435,7 +1480,31 @@ body.agent-page-body::after { display: none; }
 .agent-stream-steps { min-height: 24px; margin-top: 8px; display: grid; gap: 4px; }
 .agent-stream-step { display: flex; align-items: center; gap: 7px; min-height: 20px; color: var(--text-muted); font-size: 11px; line-height: 1.35; }
 .agent-stream-step svg { width: 13px; height: 13px; flex: 0 0 auto; color: var(--success); }
+.agent-stream-step.is-pending svg { color: var(--accent); animation: agent-spin .8s linear infinite; }
 .agent-stream-step.is-warning svg { color: var(--warning); }
+.agent-tool-trace {
+    margin-top: 14px;
+    padding-top: 10px;
+    border-top: 1px solid var(--agent-line);
+}
+.agent-tool-trace-summary {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    min-height: 28px;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 10.5px;
+    font-weight: 650;
+    line-height: 1.4;
+    list-style: none;
+    user-select: none;
+}
+.agent-tool-trace-summary::-webkit-details-marker { display: none; }
+.agent-tool-trace-summary > svg { width: 13px; height: 13px; flex: 0 0 13px; color: var(--accent); }
+.agent-tool-trace-summary > svg:last-child { margin-left: auto; color: var(--text-muted); }
+.agent-tool-trace[open] .agent-tool-trace-summary > svg:last-child { transform: rotate(180deg); }
+.agent-tool-trace > .agent-stream-steps { min-height: 0; margin: 5px 0 0; padding-left: 20px; }
 .agent-streaming .agent-stream-text:empty::after {
     content: "";
     display: inline-block;
@@ -1707,6 +1776,8 @@ body.agent-page-body::after { display: none; }
     .agent-confirmation-intro { margin-top: 10px; }
     .agent-confirmation-facts { margin-top: 14px; }
     .agent-confirmation-fact { grid-template-columns: 76px minmax(0, 1fr); gap: 12px; padding: 10px 1px; }
+    .agent-confirmation-scope { margin-top: 12px; padding: 12px; }
+    .agent-confirmation-detail { grid-template-columns: 62px minmax(0, 1fr); gap: 9px; }
     .agent-confirmation-status { min-height: 0; align-items: flex-start; flex-direction: column; gap: 6px; padding-top: 9px; }
     .agent-confirmation-copy { width: 100%; justify-content: flex-start; text-align: left; }
     .agent-confirmation-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%; gap: 8px; }
@@ -1719,7 +1790,8 @@ body.agent-page-body::after { display: none; }
     .agent-send.is-busy svg,
     .agent-stream-head .lucide-loader-circle { animation: none !important; }
     .agent-streaming .agent-stream-text:empty::after { animation: none !important; }
-    .agent-confirmation-executing-mark svg { animation: none !important; }
+    .agent-confirmation-executing-mark svg,
+    .agent-stream-step.is-pending svg { animation: none !important; }
     .agent-overview-action, .agent-next-action-button, .agent-search-item, .agent-web-result, .agent-resource-action, .agent-config-action, .agent-episode-chip, .agent-new-session, .agent-icon-action, .agent-send, .agent-stop { transition: none !important; }
     .agent-send:hover,
     .agent-stop:hover { transform: none !important; filter: none !important; }

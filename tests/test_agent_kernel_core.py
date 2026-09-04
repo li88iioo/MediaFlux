@@ -21,6 +21,7 @@ from app.agent.kernel.model import (
 )
 from app.agent.kernel.pipeline import ToolCallContext, ToolPipeline, ToolPipelineError
 from app.agent.kernel.projection import ReferenceValue, ToolOutcome
+from app.agent.kernel.provider_model import ModelProviderError
 from app.agent.kernel.session import AgentSession, SessionLimits
 from app.agent.kernel.state import (
     AgentInput,
@@ -105,6 +106,77 @@ class CapabilityRetrieverTests(unittest.TestCase):
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_admission_failure_still_emits_a_terminal_event(self) -> None:
+        class RejectingAdmission:
+            async def begin(self, agent_input):
+                del agent_input
+                raise ToolPipelineError("Agent 身份无效", code="authorization_denied")
+
+            async def is_current(self, token, agent_input):
+                del token, agent_input
+                return False
+
+        catalog = ToolCatalog([read_tool("agent.status", domain="agent")])
+        state = InMemorySessionStateStore()
+        model = ScriptedModel([])
+        session = AgentSession(
+            model=model,
+            catalog=catalog,
+            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state),
+            state_store=state,
+            turn_admission=RejectingAdmission(),
+        )
+
+        events = await collect(
+            session.run(
+                AgentInput(
+                    message="你会做什么",
+                    owner="invalid-owner",
+                    session_id="session-1",
+                )
+            )
+        )
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].type, AgentEventType.TURN_FAILED)
+        self.assertEqual(events[0].payload["code"], "authorization_denied")
+        self.assertEqual(model.requests, [])
+
+    async def test_provider_failure_has_specific_retryable_public_error(self) -> None:
+        class FailingProviderModel:
+            async def stream(self, request, *, cancellation):
+                del request, cancellation
+                raise ModelProviderError("Provider 请求失败（HTTP 503）")
+                if False:  # pragma: no cover - async generator contract
+                    yield None
+
+        catalog = ToolCatalog([read_tool("agent.status", domain="agent")])
+        state = InMemorySessionStateStore()
+        session = AgentSession(
+            model=FailingProviderModel(),
+            catalog=catalog,
+            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state),
+            state_store=state,
+        )
+
+        events = await collect(
+            session.run(
+                AgentInput(
+                    message="你会做什么",
+                    owner="owner-1",
+                    session_id="session-1",
+                )
+            )
+        )
+
+        self.assertEqual(events[-1].type, AgentEventType.TURN_FAILED)
+        self.assertEqual(events[-1].payload["code"], "model_provider_error")
+        self.assertEqual(
+            events[-1].payload["message"], "模型服务暂时不可用，请稍后重试。"
+        )
+
     async def test_single_read_uses_one_loop_and_streams_real_events(self) -> None:
         async def count(_arguments, _context):
             return {
@@ -395,6 +467,10 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             [event.type for event in confirmed_events],
         )
         self.assertEqual(confirmed_events[-1].payload["status"], "effect_completed")
+        stored = await state.load(owner="owner-1", session_id="session-1")
+        confirmed_result = stored.conversation[-1]
+        self.assertIn("可信系统结果", confirmed_result["content"])
+        self.assertEqual(confirmed_result["public_content"], "✅ 已暂停任务 job-7")
 
         await collect(
             session.run(

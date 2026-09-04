@@ -208,6 +208,10 @@ class AgentKernelApiTests(unittest.TestCase):
                         "tool_name": "download.pause",
                         "effect": "WRITE",
                         "preview": {"summary": "暂停任务", "data": {"task": "示例"}},
+                        "confirmation": {
+                            "action": "暂停下载任务",
+                            "impact": "任务将停止传输。",
+                        },
                         "expires_at": "2026-09-03T12:05:00+00:00",
                     },
                     "result": {"summary": "预检通过"},
@@ -224,6 +228,49 @@ class AgentKernelApiTests(unittest.TestCase):
         self.assertEqual(payload["pending_approval"]["plan_id"], "plan-restore-0001")
         self.assertEqual(payload["pending_approval"]["tool_name"], "download.pause")
         self.assertEqual(payload["pending_approval"]["preview"]["summary"], "暂停任务")
+        self.assertEqual(
+            payload["pending_approval"]["confirmation"]["action"], "暂停下载任务"
+        )
+
+    def test_session_restore_filters_intermediate_tool_turns_and_uses_public_result(self):
+        self.runtime.store.state = types.SimpleNamespace(
+            generation=5,
+            conversation=[
+                {"role": "user", "content": "搜索并推送 4K 版"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"call_id": "call-1", "name": "indexer.search_resources"}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "内部工具结果",
+                    "tool_name": "indexer.search_resources",
+                },
+                {
+                    "role": "assistant",
+                    "content": "已确认操作的可信系统结果（不是待执行计划）：\n{\"request_id\":54}",
+                    "tool_name": "ingest.submit",
+                    "public_content": "⚠️ 批量提交完成：2 个已受理，1 个未受理",
+                },
+            ],
+            pending_effect_plan_id="",
+        )
+
+        response = self.client.get("/api/agent/sessions/session_1234567890")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        messages = response.json()["messages"]
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[-1]["content"], "⚠️ 批量提交完成：2 个已受理，1 个未受理")
+        self.assertEqual(
+            messages[-1]["tools"],
+            ["indexer.search_resources", "ingest.submit"],
+        )
+        self.assertNotIn("request_id", response.text)
+        self.assertNotIn("查询已完成", response.text)
 
     def test_query_rate_limit_returns_429(self):
         with patch.object(

@@ -5,11 +5,11 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import logging
 import math
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Optional
 
@@ -99,6 +99,7 @@ class MediaItem:
     episode_number: int | None = None
     last_played: str = ""
     progress: float = 0.0
+    genres: tuple[str, ...] = ()
 
     @property
     def display_name(self) -> str:
@@ -366,8 +367,19 @@ class MediaServerClient:
         return self._recent_added(limit=max(1, min(int(limit or 60), 200)))
 
     def continue_watching(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
-        """按显式上游用户读取继续观看；不得回退管理员用户。"""
+        """按已经确定的上游用户读取继续观看。"""
         raise NotImplementedError
+
+    def recently_played(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
+        """按已经确定的上游用户读取真实播放历史；不得用 Resume 列表代替。"""
+        raise NotImplementedError
+
+    def enrich_media_genres(
+        self, user_id: str, items: list[MediaItem]
+    ) -> list[MediaItem]:
+        """尽力补齐播放条目的作品题材；不支持时保留原结果。"""
+        del user_id
+        return items
 
     def search_media(self, query: str, limit: int = 12) -> list[MediaItem]:
         """按标题搜索媒体服务器内容。"""
@@ -656,7 +668,7 @@ class MediaServerClient:
     def _recent_added(self, limit: int = 8) -> list[MediaItem]:
         raise NotImplementedError
 
-    def _recent_played(self) -> list[MediaItem]:
+    def _recent_played(self, limit: int = 12) -> list[MediaItem]:
         return []
 
     def _total_items(self) -> int:

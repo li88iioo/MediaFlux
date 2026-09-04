@@ -5,8 +5,8 @@
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import quote
 
@@ -262,6 +262,14 @@ class JellyfinClient(MediaServerClient):
             image_tags = item.get("ImageTags")
         raw_user_data = item.get("UserData")
         user_data = raw_user_data if isinstance(raw_user_data, dict) else {}
+        raw_genres = item.get("Genres")
+        genres = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in (raw_genres if isinstance(raw_genres, list) else [])
+                if str(value or "").strip()
+            )
+        )[:12]
         return MediaItem(
             id=item_id,
             name=item.get("Name", ""),
@@ -285,6 +293,7 @@ class JellyfinClient(MediaServerClient):
                 if bool(user_data.get("Played"))
                 else normalize_playback_progress(user_data.get("PlayedPercentage"))
             ),
+            genres=genres,
         )
 
     def _recent_added(self, limit: int = 8) -> list[MediaItem]:
@@ -299,7 +308,7 @@ class JellyfinClient(MediaServerClient):
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
                     "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
-                    "ProductionYear,UserData"
+                    "ProductionYear,Genres,UserData"
                 ),
                 "SortBy": "DateCreated",
                 "SortOrder": "Descending",
@@ -341,7 +350,7 @@ class JellyfinClient(MediaServerClient):
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
                     "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
-                    "ProductionYear,RunTimeTicks,UserData"
+                    "ProductionYear,RunTimeTicks,Genres,UserData"
                 ),
                 "SortBy": "SortName",
                 "SortOrder": "Ascending",
@@ -400,7 +409,7 @@ class JellyfinClient(MediaServerClient):
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
                     "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
-                    "ProductionYear,UserData"
+                    "ProductionYear,Genres,UserData"
                 ),
                 "EnableUserData": "true",
                 "EnableTotalRecordCount": "false",
@@ -442,7 +451,7 @@ class JellyfinClient(MediaServerClient):
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
                     "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
-                    "ProductionYear,UserData"
+                    "ProductionYear,Genres,UserData"
                 ),
                 "SortBy": "DatePlayed",
                 "SortOrder": "Descending",
@@ -472,18 +481,71 @@ class JellyfinClient(MediaServerClient):
                 break
         return items
 
-    def _recent_played(self, limit: int = 12) -> list[MediaItem]:
-        """读取真实播放历史；不可用时兼容旧版 DatePlayed 查询。"""
-        user_id = self._user_id()
+    def recently_played(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
+        """读取显式用户的真实播放历史；不可用时兼容 DatePlayed 查询。"""
+        selected = normalize_explicit_media_user_id(user_id)
         normalized_limit = max(1, min(int(limit or 12), 50))
         try:
-            return self._recent_played_from_activity(user_id, normalized_limit)
+            return self._recent_played_from_activity(selected, normalized_limit)
         except Exception as exc:
             logger.debug(
                 "[Jellyfin] 活动日志不可用，降级 DatePlayed 查询 type=%s",
                 type(exc).__name__,
             )
-            return self._recent_played_from_user_data(user_id, normalized_limit)
+            return self._recent_played_from_user_data(selected, normalized_limit)
+
+    def enrich_media_genres(
+        self, user_id: str, items: list[MediaItem]
+    ) -> list[MediaItem]:
+        selected = normalize_explicit_media_user_id(user_id)
+        series_ids = tuple(
+            dict.fromkeys(
+                item.series_id
+                for item in items
+                if not item.genres and item.series_id
+            )
+        )
+        if not series_ids:
+            return items
+        try:
+            data = self._request(
+                "/Items",
+                params={
+                    "UserId": selected,
+                    "Ids": ",".join(series_ids),
+                    "Fields": "Genres",
+                    "EnableImages": "false",
+                    "EnableUserData": "false",
+                    "EnableTotalRecordCount": "false",
+                },
+            )
+            raw_items = data.get("Items") or [] if isinstance(data, dict) else []
+            genres_by_id = {
+                str(raw.get("Id") or ""): tuple(
+                    dict.fromkeys(
+                        str(value or "").strip()
+                        for value in (
+                            raw.get("Genres")
+                            if isinstance(raw.get("Genres"), list)
+                            else []
+                        )
+                        if str(value or "").strip()
+                    )
+                )[:12]
+                for raw in raw_items
+                if isinstance(raw, dict) and str(raw.get("Id") or "")
+            }
+            for item in items:
+                if not item.genres and item.series_id in genres_by_id:
+                    item.genres = genres_by_id[item.series_id]
+        except Exception as exc:
+            logger.debug(
+                "[Jellyfin] 补齐播放历史题材失败 type=%s", type(exc).__name__
+            )
+        return items
+
+    def _recent_played(self, limit: int = 12) -> list[MediaItem]:
+        return self.recently_played(self._user_id(), limit=limit)
 
     def _total_items(self) -> int:
         user_id = self._user_id()
@@ -526,7 +588,7 @@ class JellyfinClient(MediaServerClient):
                 "MediaTypes": "Video",
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,ProductionYear,RunTimeTicks,UserData"
+                    "ParentIndexNumber,ImageTags,ProductionYear,RunTimeTicks,Genres,UserData"
                 ),
             },
         )

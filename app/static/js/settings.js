@@ -97,9 +97,14 @@
     let configReady=false;
     form.setAttribute('aria-busy','true');
 
+    function revealConfigFields(){
+        delete document.documentElement.dataset.settingsConfig;
+    }
+
     function setConfigReady(){
         configReady=true;
         form.setAttribute('aria-busy','false');
+        revealConfigFields();
         saveButtons.forEach(button=>{
             button.disabled=false;
             button.setAttribute('aria-disabled','false');
@@ -112,6 +117,7 @@
 
     function setConfigLoadError(){
         form.setAttribute('aria-busy','false');
+        revealConfigFields();
         saveButtons.forEach(button=>{
             button.disabled=true;
             button.setAttribute('aria-disabled','true');

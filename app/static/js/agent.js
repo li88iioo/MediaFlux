@@ -606,7 +606,7 @@
             steps,
             rounds: new Map(),
             currentRound: 0,
-            completedTools: new Set(),
+            toolSteps: new Map(),
             approvalNode: null,
             pendingMarkdown: '',
             markdownTimer: null,
@@ -621,20 +621,56 @@
         renderIcons(turn.head);
     }
 
-    function toolLabel(tool) {
+    function toolLabel(tool, label = '') {
+        const explicit = String(label || '').trim();
+        if (explicit) return explicit;
         const prefix = String(tool || '').split('.', 1)[0].toLowerCase();
         return TOOL_LABELS[prefix] || '调用项目能力';
     }
 
-    function addStep(turn, key, label, {warning = false, pending = false} = {}) {
-        if (!turn?.steps || turn.completedTools.has(key)) return;
-        turn.completedTools.add(key);
-        const row = element('div', `agent-stream-step${warning ? ' is-warning' : ''}`);
-        row.dataset.stepKey = key;
-        row.append(icon(pending ? 'loader-circle' : warning ? 'triangle-alert' : 'check'), element('span', '', label));
-        turn.steps.append(row);
+    function updateStep(turn, key, label, {warning = false, pending = false} = {}) {
+        if (!turn?.steps || !key) return;
+        let row = turn.toolSteps.get(key);
+        if (!row) {
+            row = element('div', 'agent-stream-step');
+            row.dataset.stepKey = key;
+            turn.toolSteps.set(key, row);
+            turn.steps.append(row);
+        }
+        row.classList.toggle('is-warning', warning);
+        row.classList.toggle('is-pending', pending);
+        row.replaceChildren(
+            icon(pending ? 'loader-circle' : warning ? 'triangle-alert' : 'check'),
+            element('span', '', label),
+        );
         renderIcons(row);
         scrollToBottom();
+    }
+
+    function buildToolTrace(turn) {
+        if (!turn?.steps || !turn.steps.childElementCount) {
+            turn?.steps?.remove();
+            return null;
+        }
+        const trace = element('details', 'agent-tool-trace');
+        const summary = element('summary', 'agent-tool-trace-summary');
+        summary.append(
+            icon('list-checks'),
+            element('span', '', `执行过程 · ${turn.steps.childElementCount} 步`),
+            icon('chevron-down'),
+        );
+        trace.append(summary, turn.steps);
+        renderIcons(trace);
+        return trace;
+    }
+
+    function addRecoveredToolTrace(turn, tools, labels = []) {
+        if (!Array.isArray(tools)) return;
+        for (const [index, name] of tools.entries()) {
+            const normalized = String(name || '').trim();
+            if (!normalized) continue;
+            updateStep(turn, `recovered:${index}:${normalized}`, `${toolLabel(normalized, labels[index])}完成`);
+        }
     }
 
     function publicSummary(value) {
@@ -648,12 +684,19 @@
 
     function finalizeAnswer(turn, text) {
         cancelTurnMarkdownRender(turn);
+        const answer = String(text || '').trim();
+        if (!answer) {
+            turn.item?.remove();
+            setConsoleEmpty(!transcript?.childElementCount);
+            return;
+        }
         turn.card.classList.remove('agent-streaming', 'is-interrupted');
         turn.card.classList.add('has-narrative', 'is-conversation');
         turn.head.remove();
-        turn.steps.remove();
         turn.text.className = 'agent-narrative agent-rich-text';
-        replaceRichText(turn.text, text || '查询已完成。');
+        replaceRichText(turn.text, answer);
+        const trace = buildToolTrace(turn);
+        if (trace) turn.card.append(trace);
         scrollToBottom(true);
     }
 
@@ -663,20 +706,100 @@
         turn.card.classList.add(cancelled ? 'agent-cancelled' : 'is-interrupted');
         setTurnStatus(turn, cancelled ? '已停止' : '未能完成', cancelled ? 'circle-stop' : 'triangle-alert');
         turn.text.textContent = message || (cancelled ? '本次任务已停止。' : 'Agent 暂时无法完成该请求。');
-        turn.steps.replaceChildren();
+        const trace = buildToolTrace(turn);
+        if (trace) turn.card.append(trace);
         scrollToBottom(true);
     }
 
-    function scalarPreviewRows(data) {
+    function approvalTargetLabel(value) {
+        const target = String(value || '').trim().toLowerCase();
+        return ({guangya: '光鸭云盘', qb: 'qBittorrent', qbittorrent: 'qBittorrent'})[target] || target;
+    }
+
+    function scalarPreviewRows(data, confirmation = {}) {
         if (!data || typeof data !== 'object' || Array.isArray(data)) return [];
         const rows = [];
-        for (const [key, value] of Object.entries(data)) {
-            if (rows.length >= 8 || value === null || typeof value === 'object') continue;
-            const text = String(value).trim();
-            if (!text) continue;
-            rows.push([key.slice(0, 60), text.slice(0, 320)]);
+        const object = String(confirmation.object || '').trim();
+        if (object) rows.push(['操作对象', object.slice(0, 320)]);
+        const target = approvalTargetLabel(data.target);
+        if (target) rows.push(['目标', target.slice(0, 80)]);
+        const count = Number.isInteger(data.count) ? data.count : Number.isInteger(data.total) ? data.total : null;
+        if (count !== null) rows.push(['数量', `${count} 项`]);
+        for (const [key, label] of [['selected', '已选择'], ['review_required', '待复核']]) {
+            if (Number.isInteger(data[key])) rows.push([label, `${data[key]} 项`]);
         }
-        return rows;
+        return rows.slice(0, 6);
+    }
+
+    function approvalListItem(value) {
+        if (typeof value === 'string') return value.trim();
+        if (!value || typeof value !== 'object') return '';
+        for (const key of ['title', 'summary', 'action', 'description', 'name']) {
+            if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
+        }
+        return '';
+    }
+
+    function buildApprovalScope(data) {
+        if (!data || typeof data !== 'object') return null;
+        const resources = Array.isArray(data.resources) ? data.resources : [];
+        const effects = Array.isArray(data.effects) ? data.effects : [];
+        if (!resources.length && !effects.length) return null;
+        const scope = element('div', 'agent-confirmation-scope');
+        if (resources.length) {
+            scope.append(element('h4', '', '将处理'));
+            const list = element('ul', 'agent-confirmation-list');
+            for (const item of resources.slice(0, 8)) {
+                if (!item || typeof item !== 'object') continue;
+                const title = approvalListItem(item) || '未命名资源';
+                const site = String(item.site_name || '').trim();
+                const position = Number.isInteger(item.position) ? `#${item.position} · ` : '';
+                list.append(element('li', '', `${position}${title}${site ? ` · ${site}` : ''}`));
+            }
+            if (resources.length > 8) list.append(element('li', 'is-muted', `另有 ${resources.length - 8} 项`));
+            if (list.childElementCount) scope.append(list);
+        }
+        if (effects.length) {
+            scope.append(element('h4', '', '执行内容'));
+            const list = element('ul', 'agent-confirmation-list');
+            for (const item of effects.slice(0, 5)) {
+                const text = approvalListItem(item);
+                if (text) list.append(element('li', '', text));
+            }
+            if (list.childElementCount) scope.append(list);
+        }
+        return scope.childElementCount ? scope : null;
+    }
+
+    function formatEffectResult(result) {
+        const summary = publicSummary(result) || '操作已完成并通过写后校验。';
+        if (!result || typeof result !== 'object') return `✅ ${summary}`;
+        const status = String(result.status || '').toLowerCase();
+        const iconPrefix = result.ok === false || ['failed', 'error'].includes(status)
+            ? '❌'
+            : ['partial', 'degraded', 'incomplete', 'attention'].includes(status) ? '⚠️' : '✅';
+        const lines = [`${iconPrefix} ${summary}`];
+        const data = result.data;
+        if (data && typeof data === 'object' && !Array.isArray(data)) {
+            const target = approvalTargetLabel(data.target);
+            if (target) lines.push(`- 目标：${target}`);
+            for (const [key, label] of [['total', '请求'], ['succeeded', '已受理'], ['created', '已创建'], ['review_required', '待复核'], ['duplicate', '已存在'], ['failed', '未完成'], ['skipped', '已跳过']]) {
+                if (Number.isInteger(data[key])) lines.push(`- ${label}：${data[key]} 项`);
+            }
+            if (Array.isArray(data.items)) {
+                const errors = [];
+                for (const item of data.items) {
+                    const value = item && item.ok === false ? String(item.error || '').trim() : '';
+                    if (value && !errors.includes(value)) errors.push(value);
+                    if (errors.length >= 3) break;
+                }
+                for (const value of errors) lines.push(`- 失败原因：${value}`);
+            }
+        }
+        if (typeof result.error === 'string' && result.error.trim() && !lines.join('\n').includes(result.error.trim())) {
+            lines.push(`- 说明：${result.error.trim()}`);
+        }
+        return lines.join('\n');
     }
 
     function buildApproval(approval) {
@@ -688,20 +811,33 @@
         const head = element('div', 'agent-confirmation-head');
         const heading = element('div', 'agent-confirmation-heading');
         const title = element('div', 'agent-confirmation-title');
-        title.append(element('span', '', '行动计划'), element('strong', '', '确认后执行变更'));
+        const confirmation = approval.confirmation && typeof approval.confirmation === 'object' ? approval.confirmation : {};
+        title.append(
+            element('span', '', '安全执行计划'),
+            element('strong', '', String(confirmation.action || '确认后执行变更')),
+        );
         heading.append(title);
         const risk = element('span', 'agent-confirmation-risk', String(approval.effect || 'WRITE').toUpperCase() === 'DANGER' ? '高风险' : '需确认');
         if (String(approval.effect || '').toUpperCase() === 'DANGER') risk.classList.add('is-danger');
         head.append(heading, risk);
 
         const intro = element('div', 'agent-confirmation-intro');
-        intro.append(parseTextBlocks(publicSummary(approval.preview) || publicSummary(approval.result) || '预检已完成。'));
+        intro.append(parseTextBlocks(String(confirmation.preflight_summary || '').trim() || publicSummary(approval.preview) || publicSummary(approval.result) || '预检已完成。'));
         const facts = element('dl', 'agent-confirmation-facts');
         const previewData = approval.preview?.data;
-        for (const [key, value] of scalarPreviewRows(previewData)) {
+        for (const [key, value] of scalarPreviewRows(previewData, confirmation)) {
             const row = element('div', 'agent-confirmation-fact');
             row.append(element('dt', '', key), element('dd', '', value));
             facts.append(row);
+        }
+        const scope = buildApprovalScope(previewData);
+        const details = element('dl', 'agent-confirmation-details');
+        for (const [label, value] of [['执行影响', confirmation.impact], ['如何撤销', confirmation.reversibility]]) {
+            const text = String(value || '').trim();
+            if (!text) continue;
+            const row = element('div', 'agent-confirmation-detail');
+            row.append(element('dt', '', label), element('dd', '', text));
+            details.append(row);
         }
         const status = element('div', 'agent-confirmation-status');
         const preflight = element('p', 'agent-confirmation-preflight');
@@ -722,6 +858,8 @@
         actions.append(cancel, confirm);
         card.append(head, intro);
         if (facts.childElementCount) card.append(facts);
+        if (scope) card.append(scope);
+        if (details.childElementCount) card.append(details);
         card.append(status, actions);
         renderIcons(card);
         return card;
@@ -729,6 +867,11 @@
 
     function showApproval(turn, approval) {
         const card = buildApproval(approval);
+        const trace = buildToolTrace(turn);
+        if (trace) {
+            const status = card.querySelector('.agent-confirmation-status');
+            card.insertBefore(trace, status || null);
+        }
         // 确认卡包含真实写操作按钮，不应继承消息入场位移动画；否则在快速
         // 预检完成时按钮会短暂移动，既影响触控，也会造成自动化点击不稳定。
         turn.item?.classList.add('is-confirmation');
@@ -781,15 +924,15 @@
         }
         case 'model.tool_call': {
             const key = `call:${payload.call_id || event.sequence}`;
-            addStep(turn, key, `${toolLabel(payload.tool)}…`, {pending: true});
+            updateStep(turn, key, `${toolLabel(payload.tool, payload.label)}…`, {pending: true});
             cancelTurnMarkdownRender(turn);
             turn.pendingMarkdown = '';
             turn.text.replaceChildren();
-            setTurnStatus(turn, toolLabel(payload.tool));
+            setTurnStatus(turn, toolLabel(payload.tool, payload.label));
             break;
         }
         case 'tool.started':
-            setTurnStatus(turn, toolLabel(payload.tool));
+            setTurnStatus(turn, toolLabel(payload.tool, payload.label));
             break;
         case 'tool.progress': {
             const summary = publicSummary(payload);
@@ -797,10 +940,10 @@
             break;
         }
         case 'tool.completed':
-            addStep(turn, `done:${payload.call_id || event.sequence}`, `${toolLabel(payload.tool)}完成`);
+            updateStep(turn, `call:${payload.call_id || event.sequence}`, `${toolLabel(payload.tool, payload.label)}完成`);
             break;
         case 'tool.failed':
-            addStep(turn, `failed:${payload.call_id || event.sequence}`, '当前方法不可用，已交回模型调整', {warning: true});
+            updateStep(turn, `call:${payload.call_id || event.sequence}`, `${toolLabel(payload.tool, payload.label)}未完成，正在调整`, {warning: true});
             setTurnStatus(turn, '正在调整方案');
             break;
         case 'effect.preview_started':
@@ -808,12 +951,18 @@
             break;
         case 'effect.approval_required':
             if (payload.plan) {
+                updateStep(
+                    turn,
+                    `call:${payload.call_id || event.sequence}`,
+                    `${toolLabel(payload.tool, payload.label)}预检完成`,
+                );
                 showApproval(turn, {
                     plan_id: payload.plan.plan_id,
                     tool_name: payload.plan.tool_name || payload.tool,
                     effect: payload.plan.effect,
                     preview: payload.plan.preview || {},
                     result: payload.result || {},
+                    confirmation: payload.plan.confirmation || {},
                     expires_at: payload.plan.expires_at || '',
                 });
             }
@@ -825,9 +974,9 @@
             turn.effectError = payload.message || '确认执行失败。';
             break;
         case 'turn.completed':
-            if (payload.status === 'success') finalizeAnswer(turn, payload.answer || '查询已完成。');
+            if (payload.status === 'success') finalizeAnswer(turn, payload.answer || '');
             else if (payload.status === 'effect_completed') {
-                finalizeAnswer(turn, publicSummary(turn.effectResult) || '操作已完成并通过写后校验。');
+                finalizeAnswer(turn, formatEffectResult(turn.effectResult));
             }
             break;
         case 'turn.failed':
@@ -1009,7 +1158,7 @@
                     error = event.payload?.message || error;
                 }
             });
-            replaceApprovalWithResult(card, error || publicSummary(result) || '操作已完成并通过写后校验。', {error: Boolean(error)});
+            replaceApprovalWithResult(card, error || formatEffectResult(result), {error: Boolean(error)});
         } catch (error) {
             replaceApprovalWithResult(card, error?.message || '确认执行失败，请重新查询状态。', {error: true});
         } finally {
@@ -1118,6 +1267,7 @@
                 if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true});
                 else if (message.role === 'assistant') {
                     const turn = createAssistantTurn({recovered: true});
+                    addRecoveredToolTrace(turn, message.tools, message.tool_labels);
                     finalizeAnswer(turn, String(message.content || ''));
                 }
             }

@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 from app.clients.openai_compatible import (
     extract_provider_usage,
     native_tool_definitions,
@@ -38,6 +40,8 @@ class ModelProviderError(RuntimeError):
 
 
 _MODEL_IDLE_TIMEOUT_FLOOR_SECONDS = 30
+_RETRYABLE_MODEL_STATUS_CODES = frozenset({408, 425, 500, 502, 503, 504})
+_MODEL_RETRY_DELAY_SECONDS = 0.25
 
 
 def _network_idle_timeout_seconds(configured_timeout_seconds: int) -> int:
@@ -50,6 +54,22 @@ def _network_idle_timeout_seconds(configured_timeout_seconds: int) -> int:
 def _stream_deadline_seconds(network_timeout_seconds: int) -> int:
     """流式响应使用网络空闲超时，同时保留独立的总时限保险丝。"""
     return min(300, max(60, int(network_timeout_seconds) * 4))
+
+
+def _retryable_provider_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.TransportError, OSError)):
+        return True
+    if isinstance(exc, ModelProviderError):
+        reason = str(exc or "")
+        return any(
+            marker in reason
+            for marker in (
+                "流在完成事件前中断",
+                "API 未完整结束",
+                "暂时不可用",
+            )
+        )
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -632,85 +652,99 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                         max_tokens=request.max_output_tokens,
                         stream=True,
                     )
-                    try:
-                        async with client.stream_post_json(
-                            location.endpoint(protocol),
-                            json=body,
-                            headers=provider_headers(
-                                protocol,
-                                self.settings.api_key,
-                                stream=True,
-                            ),
-                            max_redirects=0,
-                        ) as response:
-                            if (
-                                response.status_code < 200
-                                or response.status_code >= 300
-                            ):
-                                if emitted:
-                                    raise ModelProviderError(
-                                        "Provider 在输出后返回错误"
-                                    )
-                                last_error = ModelProviderError(
-                                    f"Provider 请求失败（HTTP {response.status_code}）"
-                                )
-                                continue
-                            content_type = str(
-                                response.headers.get("content-type") or ""
-                            ).lower()
-                            if "text/event-stream" in content_type:
-                                async for event in iter_protocol_model_events(
-                                    response.aiter_bytes(), protocol=protocol
+                    for attempt in range(2):
+                        try:
+                            async with client.stream_post_json(
+                                location.endpoint(protocol),
+                                json=body,
+                                headers=provider_headers(
+                                    protocol,
+                                    self.settings.api_key,
+                                    stream=True,
+                                ),
+                                max_redirects=0,
+                            ) as response:
+                                if (
+                                    response.status_code < 200
+                                    or response.status_code >= 300
                                 ):
-                                    cancellation.raise_if_cancelled()
+                                    if emitted:
+                                        raise ModelProviderError(
+                                            "Provider 在输出后返回错误"
+                                        )
+                                    last_error = ModelProviderError(
+                                        f"Provider 请求失败（HTTP {response.status_code}）"
+                                    )
+                                    if (
+                                        response.status_code
+                                        in _RETRYABLE_MODEL_STATUS_CODES
+                                        and attempt == 0
+                                    ):
+                                        await asyncio.sleep(_MODEL_RETRY_DELAY_SECONDS)
+                                        continue
+                                    break
+                                content_type = str(
+                                    response.headers.get("content-type") or ""
+                                ).lower()
+                                if "text/event-stream" in content_type:
+                                    async for event in iter_protocol_model_events(
+                                        response.aiter_bytes(), protocol=protocol
+                                    ):
+                                        cancellation.raise_if_cancelled()
+                                        emitted = True
+                                        yield event
+                                    return
+                                raw = bytearray()
+                                async for chunk in response.aiter_bytes():
+                                    raw.extend(chunk)
+                                try:
+                                    envelope = json.loads(raw.decode("utf-8"))
+                                    turn = parse_native_tool_turn(envelope, protocol)
+                                except (
+                                    UnicodeDecodeError,
+                                    json.JSONDecodeError,
+                                    ValueError,
+                                ) as exc:
+                                    last_error = ModelProviderError(
+                                        "Provider 返回格式无效"
+                                    )
+                                    if emitted:
+                                        raise last_error from exc
+                                    break
+                                if turn.text:
                                     emitted = True
-                                    yield event
+                                    yield ModelEvent(
+                                        ModelEventType.TEXT_DELTA, text=turn.text
+                                    )
+                                for call in turn.tool_calls:
+                                    emitted = True
+                                    yield ModelEvent(
+                                        ModelEventType.TOOL_CALL_COMPLETED,
+                                        tool_call=ModelToolCall(
+                                            call_id=call.call_id,
+                                            name=call.name,
+                                            arguments=call.arguments,
+                                        ),
+                                    )
+                                if turn.usage is not None:
+                                    yield ModelEvent(
+                                        ModelEventType.USAGE,
+                                        usage=turn.usage.to_dict(),
+                                    )
+                                yield ModelEvent(
+                                    ModelEventType.FINISH, finish_reason="stop"
+                                )
                                 return
-                            raw = bytearray()
-                            async for chunk in response.aiter_bytes():
-                                raw.extend(chunk)
-                            try:
-                                envelope = json.loads(raw.decode("utf-8"))
-                                turn = parse_native_tool_turn(envelope, protocol)
-                            except (
-                                UnicodeDecodeError,
-                                json.JSONDecodeError,
-                                ValueError,
-                            ) as exc:
-                                last_error = ModelProviderError("Provider 返回格式无效")
-                                if emitted:
-                                    raise last_error from exc
-                                continue
-                            if turn.text:
-                                emitted = True
-                                yield ModelEvent(
-                                    ModelEventType.TEXT_DELTA, text=turn.text
-                                )
-                            for call in turn.tool_calls:
-                                emitted = True
-                                yield ModelEvent(
-                                    ModelEventType.TOOL_CALL_COMPLETED,
-                                    tool_call=ModelToolCall(
-                                        call_id=call.call_id,
-                                        name=call.name,
-                                        arguments=call.arguments,
-                                    ),
-                                )
-                            if turn.usage is not None:
-                                yield ModelEvent(
-                                    ModelEventType.USAGE, usage=turn.usage.to_dict()
-                                )
-                            yield ModelEvent(
-                                ModelEventType.FINISH, finish_reason="stop"
-                            )
-                            return
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        last_error = exc
-                        if emitted:
+                        except asyncio.CancelledError:
                             raise
-                        continue
+                        except Exception as exc:
+                            last_error = exc
+                            if emitted:
+                                raise
+                            if attempt == 0 and _retryable_provider_exception(exc):
+                                await asyncio.sleep(_MODEL_RETRY_DELAY_SECONDS)
+                                continue
+                            break
         except TimeoutError as exc:
             raise ModelProviderError("Provider 请求超时") from exc
         finally:

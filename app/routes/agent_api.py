@@ -13,6 +13,7 @@ from fastapi.responses import StreamingResponse
 from app import config
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime
+from app.agent.kernel.public_view import public_conversation_messages
 from app.agent.kernel.transports import (
     EffectEnvelope,
     QueryEnvelope,
@@ -281,11 +282,7 @@ async def get_session(request: Request, session_id: str):
             owner=_owner(request),
             session_id=normalized,
         )
-        messages = [
-            {"role": item.get("role"), "content": item.get("content", "")}
-            for item in state.conversation
-            if isinstance(item, dict) and item.get("role") in {"user", "assistant"}
-        ]
+        messages = public_conversation_messages(state.conversation)
         pending_approval = None
         if state.pending_effect_plan_id:
             events = await get_agent_kernel_runtime().store.list_events(
@@ -316,6 +313,9 @@ async def get_session(request: Request, session_id: str):
                         else {},
                         "result": payload.get("result")
                         if isinstance(payload.get("result"), dict)
+                        else {},
+                        "confirmation": plan.get("confirmation")
+                        if isinstance(plan.get("confirmation"), dict)
                         else {},
                         "expires_at": str(plan.get("expires_at") or ""),
                     }

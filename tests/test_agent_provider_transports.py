@@ -32,6 +32,9 @@ class _FakeMediaClient:
     def server_identity(self):
         return "Dev Jellyfin", "Jellyfin", "12.0.0"
 
+    def _user_id(self):
+        return "viewer-1"
+
     def get_media_counts(self):
         return {
             "total_items": 166,
@@ -54,6 +57,61 @@ class _FakeMediaClient:
         assert query == "暗芝居"
         assert limit == 5
         return [MediaItem(id="item-1", name="暗芝居", type="Series", year="2013")]
+
+    def recent_media(self, limit=8):
+        assert limit == 4
+        return [
+            MediaItem(
+                id="recent-1",
+                name="新入库电影",
+                type="Movie",
+                year="2026",
+                genres=("科幻",),
+            )
+        ]
+
+    def recently_played(self, user_id, limit=8):
+        assert user_id == "viewer-1"
+        assert limit == 6
+        return [
+            MediaItem(
+                id="played-1",
+                name="第 3 集",
+                type="Episode",
+                series_name="示例动画",
+                season_number=1,
+                episode_number=3,
+                last_played="2026-09-03T10:00:00+08:00",
+                progress=100,
+                genres=("动画", "奇幻"),
+            ),
+            MediaItem(
+                id="played-2",
+                name="示例电影",
+                type="Movie",
+                last_played="2026-09-02T20:00:00+08:00",
+                genres=("科幻",),
+            ),
+        ]
+
+    def enrich_media_genres(self, user_id, items):
+        assert user_id == "viewer-1"
+        return items
+
+    def continue_watching(self, user_id, limit=8):
+        assert user_id == "viewer-1"
+        assert limit == 3
+        return [
+            MediaItem(
+                id="resume-1",
+                name="第 4 集",
+                type="Episode",
+                series_name="示例动画",
+                season_number=1,
+                episode_number=4,
+                progress=42.5,
+            )
+        ]
 
     def search_series_candidates(self, query, limit=6):
         return SeriesSearchResult(
@@ -115,6 +173,7 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
         url="http://hidden",
         credential="hidden",
         enabled=True,
+        user_id="viewer-1",
     )
     monkeypatch.setattr(
         "app.agent.providers.media_server.list_configured_profiles",
@@ -144,6 +203,27 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
     )
     assert search.data["items"][0]["name"] == "暗芝居"
 
+    recent = transport.execute_read(
+        "configured:jellyfin", "media.items.recent_added", {"limit": 4}
+    )
+    assert recent.data["items"][0]["genres"] == ["科幻"]
+
+    played = transport.execute_read(
+        "configured:jellyfin", "media.items.recent_played", {"limit": 6}
+    )
+    assert played.data["history_kind"] == "最近播放"
+    assert played.data["preference_signals"] == {
+        "recent_titles": ["示例动画", "示例电影"],
+        "top_genres": ["动画", "奇幻", "科幻"],
+        "media_types": ["episode", "movie"],
+    }
+
+    resume = transport.execute_read(
+        "configured:jellyfin", "media.items.continue_watching", {"limit": 3}
+    )
+    assert resume.data["history_kind"] == "继续观看"
+    assert resume.data["items"][0]["progress_percent"] == 42.5
+
     series = transport.execute_read(
         "configured:jellyfin", "media.series.search", {"query": "暗芝居", "limit": 6}
     )
@@ -158,6 +238,34 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
         {"season": 1, "episode": 1},
         {"season": 17, "episode": 6},
     ]
+
+
+def test_media_transport_uses_server_default_user_when_not_configured(monkeypatch):
+    transport = MediaServerProviderTransport()
+    profile = MediaServerProfile(
+        source="configured:emby",
+        server_type="emby",
+        label="Emby",
+        url="http://hidden",
+        credential="hidden",
+        enabled=True,
+        user_id="",
+    )
+    monkeypatch.setattr(
+        "app.agent.providers.media_server.list_configured_profiles",
+        lambda: [profile],
+    )
+    monkeypatch.setattr(transport, "_client", lambda _profile: _FakeMediaClient())
+
+    played = transport.execute_read(
+        "configured:emby", "media.items.recent_played", {"limit": 6}
+    )
+    assert played.data["user_selection"] == "服务器默认用户"
+
+    resume = transport.execute_read(
+        "configured:emby", "media.items.continue_watching", {"limit": 3}
+    )
+    assert resume.data["user_selection"] == "服务器默认用户"
 
 
 def test_qb_transport_reuses_client_and_never_returns_paths(monkeypatch):

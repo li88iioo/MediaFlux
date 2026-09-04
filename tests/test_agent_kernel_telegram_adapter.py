@@ -233,10 +233,16 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
 
         self.assertTrue(handled)
         self.assertTrue(any(action == "typing" for _, action, _ in bot.actions))
-        streamed = [text for _chat, _draft, text, _kwargs in bot.drafts if "正在输出" in text]
+        self.assertEqual(bot.drafts, [])
+        self.assertEqual(bot.sent[0][2]["reply_to_message_id"], 11)
+        streamed = [
+            text
+            for text, _chat, _message, _kwargs in bot.edits
+            if "正在输出" in text
+        ]
         self.assertTrue(streamed)
         self.assertIn("<b>2026 新番推荐</b>", streamed[0])
-        _chat_id, final_text, final_kwargs = bot.sent[-1]
+        final_text, _chat_id, _message_id, final_kwargs = bot.edits[-1]
         self.assertEqual(final_kwargs["parse_mode"], "HTML")
         self.assertIn("<b>2026 新番推荐</b>", final_text)
         self.assertIn("<b>《葬送的芙莉莲》第二季</b>", final_text)
@@ -246,14 +252,103 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertNotIn("**", final_text)
         self.assertNotIn("正在输出", final_text)
 
+    def test_long_stream_keeps_a_bounded_latest_preview(self):
+        factory = EventFactory(
+            session_id="tg_session",
+            turn_id="turn-long-stream",
+            request_id="request-long-stream",
+        )
+        answer = "\n".join(
+            f"{index}. **推荐 {index}**：" + ("详细说明" * 20)
+            for index in range(1, 81)
+        )
+        transport = FakeTelegramTransport(
+            TurnView(
+                session_id="tg_session",
+                turn_id="turn-long-stream",
+                request_id="request-long-stream",
+                status="success",
+                answer=answer,
+            ),
+            events=(
+                factory.create(AgentEventType.MODEL_STARTED, {"round": 1}),
+                factory.create(
+                    AgentEventType.MODEL_DELTA,
+                    {"round": 1, "delta": answer},
+                ),
+            ),
+        )
+        runtime = types.SimpleNamespace(telegram=transport, store=FakeStore())
+        bot = FakeDraftBot()
+        patches = self._patch_access()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime),
+        ):
+            handled = adapter.handle_agent_message(
+                bot, TELEBOT, Message("最近有什么推荐的美剧")
+            )
+
+        self.assertTrue(handled)
+        streamed = [
+            text
+            for text, _chat, _message, _kwargs in bot.edits
+            if "正在输出" in text
+        ]
+        self.assertTrue(streamed)
+        preview = streamed[-1]
+        self.assertIn("回答较长，下面显示最新生成内容", preview)
+        self.assertIn("<b>推荐 80</b>", preview)
+        self.assertNotIn("<b>推荐 1</b>", preview)
+        self.assertLess(len(preview), 1_600)
+
+        final_chunks = [bot.edits[-1][0], *(text for _chat, text, _kwargs in bot.sent[1:])]
+        self.assertGreater(len(final_chunks), 1)
+        self.assertTrue(
+            all(
+                adapter.telegram_html_text_length(chunk) <= adapter._MAX_MESSAGE
+                for chunk in final_chunks
+            )
+        )
+        complete = "\n".join(final_chunks)
+        self.assertIn("<b>推荐 1</b>", complete)
+        self.assertIn("<b>推荐 80</b>", complete)
+        self.assertNotIn("正在输出", complete)
+
+    def test_stream_overflow_preview_never_exceeds_telegram_hard_limit(self):
+        preview = adapter._truncate_stream_overflow_preview(
+            "<b>超长回答</b>\n" + ("😀" * 3_000)
+        )
+
+        self.assertLessEqual(
+            adapter.telegram_html_text_length(preview),
+            adapter._TELEGRAM_MESSAGE_LIMIT,
+        )
+        self.assertIn("前文已生成", preview)
+        self.assertIn("正在输出", preview)
+
     def test_query_renders_kernel_approval_with_direct_effect_buttons(self):
         approval = ApprovalView(
             plan_id="plan_1234567890abcdef",
             tool_name="rss.create_subscription",
             effect="WRITE",
-            preview={"summary": "将创建 RSS 订阅"},
+            preview={
+                "summary": "将创建 RSS 订阅",
+                "data": {
+                    "target": "qb",
+                    "count": 1,
+                    "effects": ["创建一条每 6 小时刷新的 RSS 规则"],
+                },
+            },
             result={},
             expires_at="2026-09-03T12:00:00Z",
+            confirmation={
+                "action": "创建 RSS 订阅",
+                "impact": "确认后会保存订阅规则。",
+                "reversibility": "可在 RSS 页面删除。",
+            },
         )
         transport = FakeTelegramTransport(
             TurnView(
@@ -284,6 +379,9 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
             ["agk:c:plan_1234567890abcdef", "agk:x:plan_1234567890abcdef"],
         )
         self.assertIn("等待确认", bot.edits[-1][0])
+        self.assertIn("创建 RSS 订阅", bot.edits[-1][0])
+        self.assertIn("qBittorrent", bot.edits[-1][0])
+        self.assertIn("确认后会保存订阅规则", bot.edits[-1][0])
 
     def test_confirm_callback_executes_plan_without_model_protocol(self):
         transport = FakeTelegramTransport(None)

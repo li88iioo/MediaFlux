@@ -5,6 +5,7 @@
 {% block page_styles %}
 <script>
 (() => {
+    document.documentElement.dataset.settingsConfig='pending';
     const target=location.hash.slice(1);
     if(target&&target!=='console'&&['telegram','agent','metadata','discovery','downloads','network'].includes(target))document.documentElement.dataset.settingsBoot='pending';
 })();
@@ -188,15 +189,15 @@
 
                         <section class="agent-settings-card agent-settings-card-search" aria-labelledby="agent-search-heading">
                             <header class="agent-settings-card-head">
-                                <div><h3 id="agent-search-heading">网页搜索</h3><p>通过 Tavily 补充公开网页信息，缓存、超时、结果数和每日额度均由本机约束。</p></div>
-                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="WEB_SEARCH_ENABLED" data-bool="1" aria-label="启用 Tavily 网络搜索"><span class="toggle-slider"></span></label>
+                                <div><h3 id="agent-search-heading">网页搜索与读取</h3><p>通过 Tavily 搜索公开信息并提取指定网页正文；缓存、超时、结果数和每日额度均由本机约束。</p></div>
+                                <label class="toggle agent-settings-master-toggle"><input type="checkbox" data-key="WEB_SEARCH_ENABLED" data-bool="1" aria-label="启用 Tavily 网页搜索与读取"><span class="toggle-slider"></span></label>
                             </header>
                             <p class="settings-managed-note agent-managed-badge" data-managed-note data-managed-keys="WEB_SEARCH_ENABLED,TAVILY_API_KEY,TAVILY_SEARCH_DEPTH,TAVILY_MAX_RESULTS,TAVILY_CACHE_TTL_SECONDS,TAVILY_DAILY_CREDIT_LIMIT,TAVILY_TIMEOUT_SECONDS" hidden></p>
                             <div class="agent-settings-fields">
                                 <label class="agent-field agent-field-wide"><span>Tavily API Key</span><span class="field-control-password"><input type="password" autocomplete="new-password" class="form-input" data-key="TAVILY_API_KEY" aria-label="Tavily API Key" placeholder="********"></span></label>
                                 <label class="agent-field"><span>搜索深度（Advanced 消耗 2 额度）</span><select class="form-select" data-key="TAVILY_SEARCH_DEPTH" aria-label="Tavily 搜索深度"><option value="basic">Basic</option><option value="advanced">Advanced</option></select></label>
                                 <label class="agent-field"><span>结果上限（每次返回 1–10 条）</span><span class="agent-input-unit"><input type="number" min="1" max="10" step="1" value="5" class="form-input" data-key="TAVILY_MAX_RESULTS" aria-label="Tavily 单次结果上限"><b>条</b></span></label>
-                                <label class="agent-field"><span>缓存时间（复用结果）</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" value="900" class="form-input" data-key="TAVILY_CACHE_TTL_SECONDS" aria-label="Tavily 搜索缓存时间（秒）"><b>秒</b></span></label>
+                                <label class="agent-field"><span>搜索/读取缓存时间</span><span class="agent-input-unit"><input type="number" min="30" max="86400" step="1" value="900" class="form-input" data-key="TAVILY_CACHE_TTL_SECONDS" aria-label="Tavily 搜索与读取缓存时间（秒）"><b>秒</b></span></label>
                                 <label class="agent-field"><span>请求超时（2–30 秒）</span><span class="agent-input-unit"><input type="number" min="2" max="30" step="1" value="10" class="form-input" data-key="TAVILY_TIMEOUT_SECONDS" aria-label="Tavily 请求超时（秒）"><b>秒</b></span></label>
                                 <label class="agent-field"><span>每日额度（防止失效调用）</span><span class="agent-input-unit"><input type="number" min="1" max="100000" step="1" value="100" class="form-input" data-key="TAVILY_DAILY_CREDIT_LIMIT" aria-label="Tavily 每日额度"><b>额度</b></span></label>
                             </div>

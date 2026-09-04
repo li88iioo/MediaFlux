@@ -165,6 +165,9 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertNotIn("payload.arguments", source)
         self.assertIn(".agent-stream-steps", styles)
         self.assertIn(".agent-stream-step", styles)
+        self.assertIn(".agent-tool-trace", styles)
+        self.assertIn("function buildToolTrace(turn)", source)
+        self.assertNotIn("payload.answer || '查询已完成。'", source)
 
     def test_agent_frontend_renders_effect_plan_as_safe_confirmation_card(self):
         source = SCRIPT.read_text(encoding="utf-8")
@@ -181,6 +184,10 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("effect.failed", source)
         self.assertIn(".agent-confirmation-card", styles)
         self.assertIn(".agent-confirmation-actions", styles)
+        self.assertIn(".agent-confirmation-scope", styles)
+        self.assertIn("payload.plan.confirmation", source)
+        self.assertIn("confirmation.action", source)
+        self.assertNotIn("for (const [key, value] of Object.entries(data))", source)
         self.assertIn("textContent", source)
         self.assertNotIn("innerHTML", source)
         self.assertNotIn("insertAdjacentHTML", source)
@@ -334,9 +341,14 @@ class AgentPageTests(InitializedWebTestCase):
             ),
         )
         self.assertIn(".agent-confirmation-executing", source)
-        self.assertIn(
-            ".agent-confirmation-executing-mark svg { animation: none !important; }",
+        self.assertRegex(
             source,
+            re.compile(
+                r"\.agent-confirmation-executing-mark svg,\s*"
+                r"\.agent-stream-step\.is-pending svg\s*\{[^}]*"
+                r"animation:\s*none\s*!important",
+                re.DOTALL,
+            ),
         )
         self.assertIn("@media (max-width: 980px)", source)
         self.assertIn("@media (max-width: 680px)", source)
@@ -447,6 +459,8 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertNotIn(".agent-evidence", source)
         self.assertIn(".agent-guidance-actions", source)
         self.assertIn(".agent-confirmation-facts", source)
+        self.assertIn(".agent-confirmation-details", source)
+        self.assertIn(".agent-confirmation-scope", source)
         self.assertRegex(
             source,
             re.compile(

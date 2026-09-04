@@ -52,6 +52,15 @@ class _TextDraftBot(_RichBot):
     send_rich_message = None
 
 
+class _RichEditBot(_RichBot):
+    def __init__(self):
+        super().__init__()
+        self.edits = []
+
+    def edit_message_text(self, text, chat_id, message_id, **kwargs):
+        self.edits.append((chat_id, message_id, text, kwargs))
+
+
 class _EditBot:
     def __init__(self):
         self.messages = []
@@ -181,6 +190,62 @@ class TelegramProgressTests(IsolatedDatabaseTestCase):
         reply = bot.rich_messages[-1][2]["reply_parameters"]
         self.assertEqual(reply.message_id, 8)
         self.assertTrue(reply.allow_sending_without_reply)
+
+    def test_persistent_progress_skips_draft_and_edits_real_reply(self):
+        bot = _RichEditBot()
+        source = SimpleNamespace(
+            chat=SimpleNamespace(id="100"),
+            message_id=18,
+        )
+        progress = TelegramProgress(
+            bot,
+            _TELEBOT,
+            "100",
+            "Agent 输出",
+            source_message=source,
+            timeout_seconds=60,
+            prefer_persistent_message=True,
+        )
+
+        progress.begin("<b>正在理解任务</b>")
+
+        self.assertEqual(progress.mode, "edit")
+        self.assertEqual(bot.rich_drafts, [])
+        self.assertEqual(bot.text_drafts, [])
+        self.assertEqual(bot.messages[-1][2]["reply_to_message_id"], 18)
+        self.assertTrue(progress.update("<b>正在输出</b>"))
+        self.assertTrue(progress.finish("<b>回答完成</b>"))
+        self.assertEqual(bot.edits[-1][2], "<b>回答完成</b>")
+
+    def test_persistent_progress_sends_all_terminal_chunks_in_order(self):
+        bot = _RichEditBot()
+        source = SimpleNamespace(
+            chat=SimpleNamespace(id="100"),
+            message_id=28,
+        )
+        progress = TelegramProgress(
+            bot,
+            _TELEBOT,
+            "100",
+            "Agent 输出",
+            source_message=source,
+            timeout_seconds=60,
+            prefer_persistent_message=True,
+        )
+        progress.begin("<b>正在理解任务</b>")
+
+        self.assertTrue(
+            progress.finish_many(
+                ("<b>第一段</b>", "<b>第二段</b>", "<b>第三段</b>")
+            )
+        )
+
+        self.assertEqual(bot.edits[-1][2], "<b>第一段</b>")
+        self.assertEqual(
+            [message[1] for message in bot.messages[1:]],
+            ["<b>第二段</b>", "<b>第三段</b>"],
+        )
+        self.assertNotIn("reply_to_message_id", bot.messages[1][2])
 
     def test_rich_terminal_preserves_report_spacing_and_quote_block(self):
         bot = _RichBot()

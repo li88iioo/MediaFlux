@@ -1,12 +1,11 @@
 """Agent API 与 LLM 回退共用的轻量进程内限流。"""
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
-import hashlib
 from collections import deque
 from collections.abc import Callable
-
 
 _TOOL_RATE_LIMIT_SCOPES = {
     "agent.action_history": "agent-action-history",
@@ -57,6 +56,8 @@ _TOOL_RATE_LIMIT_SCOPES = {
     "media.delete_subscription": "media-subscription-control",
     "media.set_subscription_enabled": "media-subscription-control",
     "media.continue_watching": "media-consumption-resume",
+    "media.recently_added": "media-consumption-recent",
+    "media.recently_played": "media-consumption-recent",
     "media.preferences": "media-preferences",
     "media.set_preferences": "media-preferences",
     "media.clear_preferences": "media-preferences",
@@ -112,7 +113,8 @@ _TOOL_RATE_LIMIT_SCOPES = {
     "discovery.add_watchlist": "discovery-watchlist-write",
     "discovery.remove_watchlist": "discovery-watchlist-write",
     "bangumi.calendar": "bangumi-calendar",
-    "web.search": "web-search",
+    "web.search": "web-access",
+    "web.read": "web-access",
 }
 
 _TOOL_RATE_LIMITS = {
@@ -141,6 +143,7 @@ _TOOL_RATE_LIMITS = {
     "discovery.remove_watchlist": 4,
     "bangumi.calendar": 6,
     "web.search": 6,
+    "web.read": 6,
     "provider.capabilities": 12,
     "provider.query": 8,
     "provider.change.preview": 4,
@@ -177,6 +180,8 @@ _TOOL_RATE_LIMITS = {
     "media.delete_subscription": 3,
     "media.set_subscription_enabled": 4,
     "media.continue_watching": 6,
+    "media.recently_added": 6,
+    "media.recently_played": 6,
     "media.preferences": 12,
     "media.set_preferences": 4,
     "media.clear_preferences": 4,

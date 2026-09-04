@@ -69,7 +69,7 @@ _POLICIES: dict[str, SafePolicyDefinition] = {
     ),
     "web_search_timeout_seconds": SafePolicyDefinition(
         key="TAVILY_TIMEOUT_SECONDS",
-        label="网页搜索请求超时",
+        label="网页搜索与读取请求超时",
         kind="integer",
         default=10,
         minimum=2,
@@ -77,7 +77,7 @@ _POLICIES: dict[str, SafePolicyDefinition] = {
     ),
     "web_search_cache_ttl_seconds": SafePolicyDefinition(
         key="TAVILY_CACHE_TTL_SECONDS",
-        label="网页搜索缓存时间",
+        label="网页搜索与读取缓存时间",
         kind="integer",
         default=900,
         minimum=30,
@@ -85,7 +85,7 @@ _POLICIES: dict[str, SafePolicyDefinition] = {
     ),
     "web_search_daily_credit_limit": SafePolicyDefinition(
         key="TAVILY_DAILY_CREDIT_LIMIT",
-        label="网页搜索每日额度",
+        label="网页搜索与读取每日额度",
         kind="integer",
         default=100,
         minimum=1,
@@ -342,11 +342,11 @@ def _effects(state: dict[str, Any]) -> tuple[list[str], list[str]]:
         "web_search_timeout_seconds",
         "web_search_cache_ttl_seconds",
     }:
-        effects.append("清空当前进程的网页搜索结果缓存；不会发起联网搜索或消耗额度")
+        effects.append("清空共享的网页搜索与读取缓存；不会发起联网请求或消耗额度")
         if policy == "web_search_depth" and requested == "advanced":
             suggestions.append("高级搜索每次请求会消耗 2 个 Tavily 额度。")
     elif policy == "web_search_daily_credit_limit":
-        effects.append("新额度会在下一次网页搜索请求时生效；不会立即联网或消耗额度")
+        effects.append("新额度会在下一次网页搜索或读取请求时生效；不会立即联网或消耗额度")
     elif policy in {
         "discovery_cache_ttl_seconds",
         "discovery_stale_ttl_seconds",

@@ -5,6 +5,7 @@ import unittest
 from datetime import datetime
 from unittest.mock import Mock, patch
 
+from app.clients.base import MediaItem
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
 
@@ -121,7 +122,7 @@ class LegacyMediaClientTests(unittest.TestCase):
         self.assertEqual(client._user_id(), "public-user")
         self.assertEqual(calls, ["/Users", "/Users/Public"])
 
-    def test_resume_endpoint_drives_recent_and_total_playback(self):
+    def test_date_played_history_and_resume_total_use_distinct_endpoints(self):
         client = EmbyClient("http://legacy.local", "token")
         client._cached_user_id = "user-id"
         calls: list[tuple[str, dict]] = []
@@ -143,7 +144,9 @@ class LegacyMediaClientTests(unittest.TestCase):
         self.assertEqual(recent[0].display_name, "测试剧")
         self.assertEqual(recent[0].progress, 42)
         self.assertEqual(total, 9)
-        self.assertEqual(calls[0][0], "/Users/user-id/Items/Resume")
+        self.assertEqual(calls[0][0], "/Users/user-id/Items")
+        self.assertEqual(calls[0][1]["SortBy"], "DatePlayed")
+        self.assertEqual(calls[0][1]["EnableUserData"], "true")
         self.assertEqual(calls[1][0], "/Users/user-id/Items/Resume")
 
     def test_legacy_auth_sends_both_compatible_headers(self):
@@ -419,3 +422,147 @@ class ExplicitContinueWatchingTests(unittest.TestCase):
             for invalid in ("../admin", "user?admin=true", "user#fragment", "user%2fadmin"):
                 with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                     client.continue_watching(invalid)
+
+
+class ExplicitPlaybackHistoryTests(unittest.TestCase):
+    def _assert_explicit_history_contract(self, client) -> None:
+        calls = []
+
+        def request(path, params=None):
+            calls.append((path, dict(params or {})))
+            if path == "/System/ActivityLog/Entries":
+                return {
+                    "Items": [{
+                        "Type": "VideoPlaybackStopped",
+                        "UserId": "explicit-user",
+                        "ItemId": "item-1",
+                        "Date": "2026-09-03T10:00:00Z",
+                    }]
+                }
+            return {
+                "Items": [{
+                    "Id": "item-1",
+                    "Name": "第 7 集",
+                    "SeriesName": "示例动画",
+                    "Type": "Episode",
+                    "ParentIndexNumber": 2,
+                    "IndexNumber": 7,
+                    "Genres": ["动画", "奇幻"],
+                    "UserData": {
+                        "LastPlayedDate": "2026-09-03T10:00:00Z",
+                        "PlayedPercentage": 37.5,
+                    },
+                }]
+            }
+
+        client._request = request
+        client._user_id = Mock(side_effect=AssertionError("不得回退枚举管理员用户"))
+        items = client.recently_played("explicit-user", limit=5)
+        self.assertEqual(items[0].display_name, "示例动画")
+        self.assertEqual(items[0].genres, ("动画", "奇幻"))
+        client._user_id.assert_not_called()
+        return calls
+
+    def test_jellyfin_uses_explicit_user_for_activity_history(self):
+        calls = self._assert_explicit_history_contract(
+            JellyfinClient("http://jellyfin.local", "key")
+        )
+        self.assertEqual(calls[0][0], "/System/ActivityLog/Entries")
+        self.assertEqual(calls[1][1]["UserId"], "explicit-user")
+
+    def test_emby_uses_explicit_user_for_date_played_history(self):
+        calls = self._assert_explicit_history_contract(
+            EmbyClient("http://emby.local", "token")
+        )
+        self.assertEqual(calls[0][0], "/Users/explicit-user/Items")
+        self.assertEqual(calls[0][1]["SortBy"], "DatePlayed")
+        self.assertNotIn("Resume", calls[0][0])
+
+    def test_explicit_history_rejects_path_like_identifiers(self):
+        for client in (
+            JellyfinClient("http://jellyfin.local", "key"),
+            EmbyClient("http://emby.local", "token"),
+        ):
+            for invalid in ("../admin", "user?admin=true", "user#fragment", "user%2fadmin"):
+                with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                    client.recently_played(invalid)
+
+
+class PlaybackHistoryGenreEnrichmentTests(unittest.TestCase):
+    def _assert_series_genres_are_enriched(self, client, expected_path: str) -> None:
+        calls: list[tuple[str, dict]] = []
+
+        def request(path, params=None):
+            calls.append((path, dict(params or {})))
+            return {
+                "Items": [
+                    {
+                        "Id": "series-1",
+                        "Type": "Series",
+                        "Name": "示例动画",
+                        "Genres": ["动画", "奇幻", "动画"],
+                    }
+                ]
+            }
+
+        client._request = request
+        items = [
+            MediaItem(
+                id="episode-1",
+                name="第 1 集",
+                type="Episode",
+                series_id="series-1",
+                series_name="示例动画",
+            ),
+            MediaItem(
+                id="episode-2",
+                name="第 2 集",
+                type="Episode",
+                series_id="series-1",
+                series_name="示例动画",
+            ),
+            MediaItem(
+                id="movie-1",
+                name="示例电影",
+                type="Movie",
+                genres=("科幻",),
+            ),
+        ]
+
+        enriched = client.enrich_media_genres("explicit-user", items)
+
+        self.assertIs(enriched, items)
+        self.assertEqual(items[0].genres, ("动画", "奇幻"))
+        self.assertEqual(items[1].genres, ("动画", "奇幻"))
+        self.assertEqual(items[2].genres, ("科幻",))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], expected_path)
+        self.assertEqual(calls[0][1]["Ids"], "series-1")
+        self.assertEqual(calls[0][1]["Fields"], "Genres")
+
+    def test_jellyfin_enriches_episode_genres_from_series(self):
+        self._assert_series_genres_are_enriched(
+            JellyfinClient("http://jellyfin.local", "key"),
+            "/Items",
+        )
+
+    def test_emby_enriches_episode_genres_from_series(self):
+        self._assert_series_genres_are_enriched(
+            EmbyClient("http://emby.local", "token"),
+            "/Users/explicit-user/Items",
+        )
+
+    def test_enrichment_failure_preserves_history(self):
+        client = JellyfinClient("http://jellyfin.local", "key")
+        client._request = Mock(side_effect=RuntimeError("temporary upstream failure"))
+        items = [
+            MediaItem(
+                id="episode-1",
+                name="第 1 集",
+                type="Episode",
+                series_id="series-1",
+            )
+        ]
+
+        self.assertIs(client.enrich_media_genres("explicit-user", items), items)
+        self.assertEqual(items[0].genres, ())

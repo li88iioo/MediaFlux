@@ -9,8 +9,8 @@ token 持久化于运行数据目录的 guangya_token.json。
 from __future__ import annotations
 
 import hashlib
-import logging
 import json
+import logging
 import math
 import os
 import re
@@ -18,15 +18,15 @@ import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from secrets import token_hex
-
-import httpx
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from secrets import token_hex
 from time import monotonic, sleep, time
 from typing import Optional
 from urllib.parse import parse_qs, unquote, urlparse
+
+import httpx
 
 from app.config import PATHS
 from app.logger import get_logger, log_throttled
@@ -1367,6 +1367,16 @@ class GuangYaClient:
             if not getattr(raw, "_mediaflux_last_refresh_persisted", False):
                 self._save_token()
             return self.token_status(valid=True)
+
+    def probe_connection(self) -> bool:
+        """按普通只读链路验证可用性，允许既有 SDK 续签登录态。"""
+        if not self.logged_in:
+            return False
+        self._call_read(
+            "connection_probe",
+            lambda: self.raw.fs_files(parent_id=None, page=0, page_size=1),
+        )
+        return True
 
     def validate(self) -> bool:
         """执行只读校验；不主动刷新，也阻止 SDK 在到期或 401 时刷新。"""

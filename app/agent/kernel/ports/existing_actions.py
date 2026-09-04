@@ -45,7 +45,7 @@ _PREFIX_RETRIEVAL_TERMS: dict[str, tuple[str, ...]] = {
     "media": ("媒体订阅", "追更", "订阅"),
     "indexer": ("资源", "资源搜索", "索引站", "种子", "磁力"),
     "discovery": ("推荐", "新剧", "电影", "剧集", "动漫", "国漫"),
-    "web": ("联网", "最新", "定档", "公开信息"),
+    "web": ("联网", "网页", "链接", "公告", "文档", "最新", "定档", "公开信息"),
 }
 
 _TOOL_RETRIEVAL_TERMS: dict[str, tuple[str, ...]] = {
@@ -85,13 +85,58 @@ _TOOL_RETRIEVAL_TERMS: dict[str, tuple[str, ...]] = {
         "下载进度",
         "当前任务",
     ),
+    "media.recently_played": (
+        "最近播放",
+        "播放历史",
+        "观看历史",
+        "最近看过",
+        "我最近看了什么",
+        "根据观看记录推荐",
+        "根据最近播放推荐",
+    ),
+    "media.recently_added": (
+        "最近入库",
+        "最新入库",
+        "最近添加",
+        "媒体库最近新增",
+    ),
+    "media.continue_watching": (
+        "继续观看",
+        "没看完",
+        "接着看",
+        "Resume",
+    ),
     "library.count_series_episodes": ("一共有多少集", "本地多少集", "季度分布"),
     "indexer.search_resources": ("有没有资源", "搜索资源", "查找资源"),
-    "rss.subscription_summaries": ("配置了哪些RSS", "RSS订阅列表", "RSS订阅源"),
+    "rss.subscription_summaries": (
+        "配置了哪些RSS",
+        "RSS订阅列表",
+        "RSS订阅源",
+        "我订阅了哪些RSS",
+        "我订阅了那些RSS",
+        "有哪些RSS",
+        "RSS规则",
+    ),
     "media.subscription_summaries": ("配置了哪些媒体订阅", "媒体追更列表"),
     "rss.create_subscription": ("添加RSS", "创建RSS订阅", "新增RSS订阅"),
-    "discovery.recommend": ("最近推荐", "新剧推荐", "国漫推荐"),
+    "discovery.recommend": (
+        "最近推荐",
+        "新剧推荐",
+        "国漫推荐",
+        "片单推荐",
+        "根据观看记录推荐",
+        "根据最近播放推荐",
+    ),
     "web.search": ("2026新剧", "最新定档", "近期公开资讯"),
+    "web.read": (
+        "打开网页",
+        "读取链接",
+        "网页正文",
+        "总结网页",
+        "官方公告",
+        "查看文档",
+        "fetch url",
+    ),
 }
 
 

@@ -106,7 +106,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="guangya.connection_status",
-            description="验证光鸭账号是否已配置且可通过最小只读请求连接，不刷新或返回凭据。",
+            description="验证光鸭账号是否已配置且可通过普通最小只读请求连接；允许 SDK 续签登录态，但不返回凭据。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",

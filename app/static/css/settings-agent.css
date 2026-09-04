@@ -9,6 +9,9 @@ body.settings-page::after { display: none; }
 html[data-settings-boot="pending"] .settings-page .settings-workspace {
     visibility: hidden;
 }
+html[data-settings-config="pending"] .settings-page #settingsForm {
+    visibility: hidden;
+}
 .settings-page .nav-item:hover {
     color: var(--text-primary);
     background: var(--control-tint);

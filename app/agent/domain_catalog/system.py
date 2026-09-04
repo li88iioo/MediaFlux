@@ -633,11 +633,72 @@ def register_specs(
 
     def capabilities(_arguments: dict[str, Any]) -> ToolResult:
         tools = registry.capabilities()
+        groups = (
+            (
+                "媒体与媒体库",
+                {"library", "provider", "playback"},
+                "查询 Jellyfin/Emby、媒体总量、单部收录、缺集与播放状态",
+            ),
+            (
+                "资源发现",
+                {"discovery", "indexer", "resource", "web"},
+                "查询 TMDB/Bangumi、推荐公开内容、搜索资源站并读取公开网页",
+            ),
+            (
+                "下载管理",
+                {"download", "downloads", "ingest", "qb"},
+                "查询 qBittorrent 与项目下载任务，并在确认后提交、暂停或清理",
+            ),
+            (
+                "光鸭云盘",
+                {"cloud", "guangya"},
+                "浏览和检索云盘；预览后创建目录、改名、移动、整理或离线转存",
+            ),
+            (
+                "订阅与自动化",
+                {"rss", "media", "automation"},
+                "管理 RSS 规则和媒体追更订阅，检查自动化执行状态",
+            ),
+            (
+                "STRM 与本地整理",
+                {"strm", "local_media", "organize"},
+                "检查或触发 STRM、本地媒体识别、整理和入库复核",
+            ),
+            (
+                "项目运维",
+                {"agent", "workspace", "config", "feature", "telegram"},
+                "查看系统健康、配置、任务与审计；配置变更均需人工确认",
+            ),
+        )
+        prefixes = [str(item.get("name") or "").partition(".")[0] for item in tools]
+        capability_groups: list[dict[str, Any]] = []
+        assigned: set[str] = set()
+        for title, members, description in groups:
+            count = sum(1 for prefix in prefixes if prefix in members)
+            if not count:
+                continue
+            assigned.update(members)
+            capability_groups.append(
+                {"title": title, "description": description, "tool_count": count}
+            )
+        remaining = sum(1 for prefix in prefixes if prefix and prefix not in assigned)
+        if remaining:
+            capability_groups.append(
+                {
+                    "title": "其他项目能力",
+                    "description": "当前注册表中的其他受控读取与确认后执行能力",
+                    "tool_count": remaining,
+                }
+            )
         return ToolResult(
             ok=True,
             status="success",
-            summary=f"当前提供 {len(tools)} 个受控工具",
-            data={"tools": tools},
+            summary=f"当前提供 {len(tools)} 个受控项目能力，写操作统一经过人工确认",
+            data={
+                "total_tools": len(tools),
+                "groups": capability_groups,
+                "write_policy": "只读能力可直接执行；写入和危险操作只生成冻结计划，确认后由确定性代码执行。",
+            },
             evidence=[
                 Evidence("agent_registry", "能力来自服务端显式工具注册表。", _now())
             ],

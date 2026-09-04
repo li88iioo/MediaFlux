@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from typing import Any
 
 from app.agent.confirmation import confirmation_context_fingerprint
@@ -102,7 +103,49 @@ class MediaServerProviderTransport:
             "overview": str(item.overview or ""),
             "last_played": str(item.last_played or ""),
             "progress_percent": float(item.progress or 0),
+            "genres": [str(value) for value in item.genres[:12] if str(value).strip()],
         }
+
+    @staticmethod
+    def _preference_signals(items: list[MediaItem]) -> dict[str, Any]:
+        """从播放历史提取有界偏好信号，供同一模型回合继续推荐。"""
+        title_counts: Counter[str] = Counter()
+        genre_counts: Counter[str] = Counter()
+        media_type_counts: Counter[str] = Counter()
+        for item in items:
+            title = str(item.display_name or "").strip()
+            if title:
+                title_counts[title] += 1
+            media_type = str(item.type or "").strip().casefold()
+            if media_type:
+                media_type_counts[media_type] += 1
+            for genre in item.genres:
+                normalized = str(genre or "").strip()
+                if normalized:
+                    genre_counts[normalized] += 1
+        return {
+            "recent_titles": [name for name, _count in title_counts.most_common(12)],
+            "top_genres": [name for name, _count in genre_counts.most_common(8)],
+            "media_types": [name for name, _count in media_type_counts.most_common(4)],
+        }
+
+    @staticmethod
+    def _playback_user(
+        profile: MediaServerProfile, client: Any
+    ) -> tuple[str, str]:
+        value = str(profile.user_id or "").strip()
+        try:
+            if value:
+                return normalize_explicit_media_user_id(value), "配置用户"
+            return (
+                normalize_explicit_media_user_id(client._user_id()),
+                "服务器默认用户",
+            )
+        except (ValueError, RuntimeError) as exc:
+            raise ProviderGatewayError(
+                "媒体服务器没有可用于观看数据的用户",
+                code="provider_user_required",
+            ) from exc
 
     def execute_read(
         self, profile_ref: str, operation: str, arguments: dict[str, Any]
@@ -144,6 +187,50 @@ class MediaServerProviderTransport:
                             f"{profile.label} 当前共有 {counts['total_items']} 个可播放媒体项"
                         ),
                         data={"server_label": profile.label, **counts},
+                        source=f"{profile.server_type}_api",
+                    )
+                if operation == "media.items.recent_added":
+                    limit = int(arguments.get("limit", 8))
+                    items = client.recent_media(limit=limit)
+                    return ProviderPayload(
+                        summary=f"{profile.label} 返回 {len(items)} 项最近入库内容",
+                        data={
+                            "server_label": profile.label,
+                            "count": len(items),
+                            "items": [self._media_item(item) for item in items],
+                        },
+                        source=f"{profile.server_type}_api",
+                    )
+                if operation == "media.items.recent_played":
+                    limit = int(arguments.get("limit", 8))
+                    user_id, user_selection = self._playback_user(profile, client)
+                    items = client.recently_played(user_id, limit=limit)
+                    items = client.enrich_media_genres(user_id, items)
+                    return ProviderPayload(
+                        summary=f"{profile.label} 返回 {len(items)} 项最近播放记录",
+                        data={
+                            "server_label": profile.label,
+                            "user_selection": user_selection,
+                            "history_kind": "最近播放",
+                            "count": len(items),
+                            "items": [self._media_item(item) for item in items],
+                            "preference_signals": self._preference_signals(items),
+                        },
+                        source=f"{profile.server_type}_api",
+                    )
+                if operation == "media.items.continue_watching":
+                    limit = int(arguments.get("limit", 8))
+                    user_id, user_selection = self._playback_user(profile, client)
+                    items = client.continue_watching(user_id, limit=limit)
+                    return ProviderPayload(
+                        summary=f"{profile.label} 返回 {len(items)} 项继续观看内容",
+                        data={
+                            "server_label": profile.label,
+                            "user_selection": user_selection,
+                            "history_kind": "继续观看",
+                            "count": len(items),
+                            "items": [self._media_item(item) for item in items],
+                        },
                         source=f"{profile.server_type}_api",
                     )
                 if operation == "media.libraries.list":

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from app.agent.domain_catalog import build_tool_specs
 from app.agent.provider_operations import build_provider_catalog
+from app.agent.public_safety import public_tool_label
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FORBIDDEN_TOOL_NAMES = {
@@ -61,6 +63,7 @@ _REQUIRED_PROJECT_TOOLS = {
     "ingest.inspect",
     "ingest.submit",
     "ingest.status",
+    "web.read",
     "web.search",
     "bangumi.calendar",
     "discovery.search",
@@ -84,6 +87,9 @@ _REQUIRED_PROJECT_TOOLS = {
     "media.subscription_notification_rule",
     "media.set_subscription_notification_rule",
     "media.reset_subscription_notification_rule",
+    "media.continue_watching",
+    "media.recently_added",
+    "media.recently_played",
     "guangya.capabilities",
     "guangya.connection_status",
     "guangya.fs.query",
@@ -138,6 +144,9 @@ _REQUIRED_PROVIDER_OPERATIONS = {
     "media.system.info",
     "media.libraries.list",
     "media.items.search",
+    "media.items.recent_added",
+    "media.items.recent_played",
+    "media.items.continue_watching",
     "media.series.search",
     "media.series.episodes",
     "media.library.refresh",
@@ -165,3 +174,30 @@ def test_provider_catalog_is_the_only_external_media_and_qb_write_surface() -> N
         "qb.torrents.delete_task",
     ):
         assert operations[operation].risk.value != "read"
+
+
+def test_all_registered_tools_have_one_complete_kernel_lifecycle() -> None:
+    """防止新增能力只有声明、只有预览或引用到不存在的下一环。"""
+    specs = build_tool_specs()
+    by_name = {spec.name: spec for spec in specs}
+    assert len(by_name) == len(specs)
+
+    for spec in specs:
+        assert public_tool_label(spec.name) != "项目操作", spec.name
+        for related in spec.related_tools:
+            assert related in by_name, f"{spec.name} -> {related}"
+        if spec.risk.value == "read":
+            assert spec.handler is not None or spec.context_handler is not None, spec.name
+            assert not spec.requires_confirmation, spec.name
+            continue
+        assert spec.requires_confirmation, spec.name
+        assert spec.context_confirmation_preparer is not None, spec.name
+        assert spec.context_confirmed_handler is not None, spec.name
+
+
+def test_provider_operations_are_bounded_and_writes_are_reference_scoped() -> None:
+    for spec in build_provider_catalog().operations():
+        assert spec.max_items > 0, spec.operation_id
+        assert spec.timeout_seconds > 0, spec.operation_id
+        if spec.risk.value != "read":
+            assert spec.reference_arguments, spec.operation_id

@@ -32,6 +32,75 @@ def build_provider_catalog() -> ProviderCatalog:
             examples=("我的媒体库有多少媒体", "查看 Jellyfin 媒体总数"),
         ),
         ProviderOperationSpec(
+            operation_id="media.items.recent_added",
+            provider="media",
+            description="读取媒体服务器最近入库的电影、剧集或单集，并按作品去除重复单集展示。",
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 8,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            result_kind="media_items",
+            max_items=20,
+            domains=("media_library", "discovery"),
+            examples=("最近入库了什么", "查看 Jellyfin 最新添加内容"),
+        ),
+        ProviderOperationSpec(
+            operation_id="media.items.recent_played",
+            provider="media",
+            description=(
+                "读取媒体服务器用户的真实最近播放历史；优先使用明确配置用户，未配置时沿用"
+                "服务器默认用户选择。这是 DatePlayed/播放事件，不是继续观看 Resume 列表。"
+            ),
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 8,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            result_kind="media_playback_history",
+            max_items=20,
+            domains=("media_library", "discovery", "playback"),
+            examples=("我最近看了什么", "查看 Emby 最近播放历史"),
+        ),
+        ProviderOperationSpec(
+            operation_id="media.items.continue_watching",
+            provider="media",
+            description="读取媒体服务器用户尚未看完的继续观看 Resume 列表。",
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 8,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            result_kind="media_continue_watching",
+            max_items=20,
+            domains=("media_library", "playback"),
+            examples=("继续观看", "Jellyfin 还有哪些没看完"),
+        ),
+        ProviderOperationSpec(
             operation_id="media.libraries.list",
             provider="media",
             description="列出指定媒体服务器中的媒体库，不返回真实目录路径。",

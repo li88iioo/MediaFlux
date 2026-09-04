@@ -50,7 +50,7 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
         secret = "guangya-secret-must-not-leak"
         client = Mock()
         client.logged_in = True
-        client.validate.return_value = True
+        client.probe_connection.return_value = True
         client.token = secret
         client.phone = "13800000000"
         with patch(
@@ -61,9 +61,22 @@ class GuangyaSchedulePolicyUnitTests(unittest.TestCase):
         rendered = repr(result.to_dict())
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "ready")
+        client.probe_connection.assert_called_once_with()
+        client.validate.assert_not_called()
         self.assertNotIn(secret, rendered)
         self.assertNotIn("13800000000", rendered)
         self.assertNotIn("token", rendered.casefold())
+
+        client.probe_connection.reset_mock()
+        client.probe_connection.return_value = False
+        with patch(
+            "app.agent.guangya_schedule_config_actions.GuangYaClient",
+            return_value=client,
+        ):
+            unavailable = get_guangya_connection_status({})
+        self.assertFalse(unavailable.ok)
+        self.assertEqual(unavailable.status, "attention")
+
         with patch(
             "app.agent.guangya_schedule_config_actions.GuangYaClient",
             side_effect=RuntimeError(f"private {secret}"),

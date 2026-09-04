@@ -26,6 +26,7 @@ class ApprovalView:
     preview: Mapping[str, Any]
     result: Mapping[str, Any]
     expires_at: str
+    confirmation: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -34,6 +35,7 @@ class ApprovalView:
             "effect": self.effect,
             "preview": deepcopy(dict(self.preview)),
             "result": deepcopy(dict(self.result)),
+            "confirmation": deepcopy(dict(self.confirmation)),
             "expires_at": self.expires_at,
         }
 
@@ -121,6 +123,7 @@ class TurnViewBuilder:
             result = payload.get("result")
             if isinstance(plan, Mapping):
                 preview = plan.get("preview")
+                confirmation = plan.get("confirmation")
                 self._approval = ApprovalView(
                     plan_id=str(plan.get("plan_id") or ""),
                     tool_name=str(plan.get("tool_name") or payload.get("tool") or ""),
@@ -130,6 +133,9 @@ class TurnViewBuilder:
                     else {},
                     result=deepcopy(dict(result))
                     if isinstance(result, Mapping)
+                    else {},
+                    confirmation=deepcopy(dict(confirmation))
+                    if isinstance(confirmation, Mapping)
                     else {},
                     expires_at=str(plan.get("expires_at") or ""),
                 )

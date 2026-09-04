@@ -26,10 +26,16 @@ from app.agent.feature_gate import (
 from app.agent.kernel.adapters import ApprovalView, TurnView
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime
 from app.agent.kernel.events import AgentEvent, AgentEventType
+from app.agent.kernel.public_view import format_public_result
 from app.agent.kernel.transports import EffectEnvelope, QueryEnvelope
+from app.agent.public_safety import public_tool_label
 from app.agent.rate_limit import agent_rate_limiter
 from app.bot.progress import TelegramProgress, send_typing
-from app.bot.telegram_markdown import render_telegram_markdown
+from app.bot.telegram_markdown import (
+    render_telegram_markdown,
+    split_telegram_html,
+    telegram_html_text_length,
+)
 from app.modules.telegram_write_confirmations import (
     TelegramWriteConfirmationError,
     get_telegram_write_confirmation_store,
@@ -39,7 +45,10 @@ logger = logging.getLogger(__name__)
 
 _ALLOWED_ID_RE = re.compile(r"^-?[1-9][0-9]*$")
 _ALLOWED_USER_RE = re.compile(r"^[1-9][0-9]*$")
+_TELEGRAM_MESSAGE_LIMIT = 4096
 _MAX_MESSAGE = 3900
+_STREAM_PREVIEW_MAX_CHARS = 720
+_STREAM_PREVIEW_MAX_LINES = 16
 _QUERY_LIMIT_PER_MINUTE = 12
 _CALLBACK_LIMIT_PER_MINUTE = 16
 _CALLBACK_RE = re.compile(r"^agk:(?P<action>[cx]):(?P<plan>[A-Za-z0-9_-]{16,96})$")
@@ -190,38 +199,163 @@ def _public_summary(value: Any) -> str:
     return ""
 
 
-def _preview_lines(approval: ApprovalView) -> list[str]:
+def _tool_chain_line(tool_calls: tuple[str, ...] | list[str]) -> str:
+    labels: list[str] = []
+    for tool_name in tool_calls:
+        label = public_tool_label(tool_name)
+        if label not in labels:
+            labels.append(label)
+        if len(labels) >= 6:
+            break
+    return " → ".join(labels)
+
+
+def _stream_preview_source(value: object) -> tuple[str, bool]:
+    """截取流式回答的最新窗口，避免 Telegram 消息持续扩高推挤视口。"""
+
+    source = str(value or "").replace("\x00", "")
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    if not source:
+        return "", False
+
+    line_starts = [match.end() for match in re.finditer("\n", source)]
+    line_start = (
+        line_starts[-_STREAM_PREVIEW_MAX_LINES]
+        if len(line_starts) >= _STREAM_PREVIEW_MAX_LINES
+        else 0
+    )
+    char_start = max(0, len(source) - _STREAM_PREVIEW_MAX_CHARS)
+    start = max(line_start, char_start)
+    if start <= 0:
+        return source, False
+
+    # 不从正文行中间开始，优先把窗口推进到下一条完整 Markdown 行。
+    if source[start - 1 : start] != "\n":
+        next_line = source.find("\n", start)
+        if next_line >= 0:
+            start = next_line + 1
+    preview = source[start:].lstrip("\n")
+    if not preview:
+        preview = source[-_STREAM_PREVIEW_MAX_CHARS:]
+
+    # 若窗口落在代码围栏内部，补回开围栏，让局部 Markdown 仍可安全渲染。
+    prefix = source[:start]
+    fences = list(re.finditer(r"(?m)^\s*(`{3,}|~{3,})[^\n]*$", prefix))
+    if len(fences) % 2 == 1:
+        preview = f"{fences[-1].group(1)}\n{preview}"
+    return preview, True
+
+
+def _truncate_stream_overflow_preview(rendered: object) -> str:
+    """保证每个 Telegram 流式预览都低于单条消息的硬上限。"""
+
+    body = str(rendered or "").strip()
+    suffix = "\n\n<i>正在输出…</i>"
+    candidate = body + suffix
+    if telegram_html_text_length(candidate) <= _TELEGRAM_MESSAGE_LIMIT:
+        return candidate
+
+    marker = "<i>前文已生成，完成后将分段发送；下面显示最新内容</i>\n\n"
+    budget = max(
+        256,
+        _TELEGRAM_MESSAGE_LIMIT
+        - telegram_html_text_length(marker)
+        - telegram_html_text_length(suffix),
+    )
+    latest = split_telegram_html(body, limit=budget)[-1]
+    candidate = marker + latest + suffix
+    if telegram_html_text_length(candidate) <= _TELEGRAM_MESSAGE_LIMIT:
+        return candidate
+    return split_telegram_html(candidate, limit=_TELEGRAM_MESSAGE_LIMIT)[-1]
+
+
+def _render_turn(view: TurnView) -> str:
+    return render_telegram_markdown(_turn_text(view))
+
+
+def _turn_chunks(view: TurnView) -> tuple[str, ...]:
+    """将完整 Agent 终态转换为 Telegram-safe HTML 分段，不截断正文。"""
+
+    rendered = _render_turn(view)
+    chunks = split_telegram_html(rendered, limit=_MAX_MESSAGE)
+    return chunks or ("Agent 未返回可显示的回答，请重试。",)
+
+
+def _preview_lines(
+    approval: ApprovalView,
+    *,
+    tool_calls: tuple[str, ...] | list[str] = (),
+) -> list[str]:
     preview = dict(approval.preview)
     result = dict(approval.result)
+    confirmation = dict(approval.confirmation)
+    action = _safe_text(confirmation.get("action"), limit=120) or "执行受控操作"
     summary = (
-        _public_summary(preview) or _public_summary(result) or "系统已完成写入前检查。"
+        _safe_text(confirmation.get("preflight_summary"), limit=360)
+        or _public_summary(preview)
+        or _public_summary(result)
+        or "系统已完成写入前检查。"
     )
-    lines = ["⚠️ <b>等待确认</b>", html.escape(summary)]
+    lines = ["⚠️ <b>等待确认</b>", f"<b>{html.escape(action)}</b>", html.escape(summary)]
     data = preview.get("data")
     if isinstance(data, dict):
-        shown = 0
-        for raw_key, raw_value in data.items():
-            if shown >= 6 or isinstance(raw_value, (dict, list, tuple)):
-                continue
-            value = _safe_text(raw_value, limit=240)
-            if not value:
-                continue
-            lines.append(
-                f"<b>{html.escape(str(raw_key)[:40])}</b>：{html.escape(value)}"
-            )
-            shown += 1
-    lines.append("\n确认后才会执行；取消或发送新任务都不会写入。")
+        target = str(data.get("target") or "").strip().lower()
+        target_label = {
+            "guangya": "光鸭云盘",
+            "qb": "qBittorrent",
+            "qbittorrent": "qBittorrent",
+        }.get(target, _safe_text(target, limit=40))
+        if target_label:
+            lines.append(f"<b>目标</b>：{html.escape(target_label)}")
+        count = data.get("count")
+        if type(count) is int:
+            lines.append(f"<b>对象</b>：{count} 项")
+        resources = data.get("resources")
+        if isinstance(resources, list) and resources:
+            lines.append("\n<b>将处理</b>")
+            for item in resources[:5]:
+                if not isinstance(item, dict):
+                    continue
+                title = _safe_text(item.get("title"), limit=180) or "未命名资源"
+                site = _safe_text(item.get("site_name"), limit=60)
+                suffix = f" · {site}" if site else ""
+                lines.append(f"• {html.escape(title + suffix)}")
+            if len(resources) > 5:
+                lines.append(f"• 另有 {len(resources) - 5} 项")
+        effects = data.get("effects")
+        if isinstance(effects, list) and effects:
+            lines.append("\n<b>执行内容</b>")
+            for item in effects[:4]:
+                value = _safe_text(item, limit=180)
+                if value:
+                    lines.append(f"• {html.escape(value)}")
+    impact = _safe_text(confirmation.get("impact"), limit=300)
+    reversibility = _safe_text(confirmation.get("reversibility"), limit=300)
+    if impact:
+        lines.append(f"\n<b>影响</b>：{html.escape(impact)}")
+    if reversibility:
+        lines.append(f"<b>撤销</b>：{html.escape(reversibility)}")
+    chain = _tool_chain_line(tool_calls)
+    if chain:
+        lines.append(f"\n<b>执行链</b>：{html.escape(chain)}")
+    lines.append("\n确认后才会执行；取消不会写入任何变更。")
     return lines
 
 
 def _effect_result_text(view: TurnView) -> str:
-    summary = _public_summary(view.effect_result)
-    return f"✅ {summary or '操作已完成并通过写后校验。'}"
+    return format_public_result(
+        view.effect_result,
+        fallback="操作已完成并通过写后校验。",
+    )
 
 
 def _turn_text(view: TurnView) -> str:
     if view.status == "success":
-        return _safe_text(view.answer or "查询已完成。")
+        chain = _tool_chain_line(view.tool_calls)
+        answer = str(
+            view.answer or "Agent 未返回可显示的回答，请重试。"
+        ).replace("\x00", "").strip()
+        return f"{answer}\n\n🔎 执行：{chain}" if chain else answer
     if view.status == "effect_completed":
         return _effect_result_text(view)
     if view.status == "cancelled":
@@ -334,10 +468,12 @@ class _TelegramEventObserver:
         await asyncio.to_thread(self.progress.update, rendered)
 
     async def _publish_stream(self, *, force: bool = False) -> None:
-        source = _safe_text(self.model_text, limit=3600)
+        source, clipped = _stream_preview_source(self.model_text)
         if not source:
             return
         rendered = render_telegram_markdown(source)
+        if clipped:
+            rendered = "<i>回答较长，下面显示最新生成内容</i>\n\n" + rendered
         if not rendered or rendered == self.last_stream:
             return
         now = time.monotonic()
@@ -347,10 +483,8 @@ class _TelegramEventObserver:
             return
         self.last_stream_at = now
         self.last_stream = rendered
-        await asyncio.to_thread(
-            self.progress.update,
-            rendered + "\n\n<i>正在输出…</i>",
-        )
+        preview = _truncate_stream_overflow_preview(rendered)
+        await asyncio.to_thread(self.progress.update, preview)
 
 
 def _positive_int(value: object) -> int | None:
@@ -370,14 +504,15 @@ def _edit_final(
     rendered_html: bool = False,
 ) -> None:
     body = str(text) if rendered_html else html.escape(_safe_text(text))
+    chunks = split_telegram_html(body, limit=_MAX_MESSAGE) or ("任务已结束。",)
     kwargs: dict[str, Any] = {
-        "reply_markup": reply_markup,
+        "reply_markup": reply_markup if len(chunks) == 1 else None,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     try:
         bot.edit_message_text(
-            body,
+            chunks[0],
             target.chat.id,
             target.message_id,
             **kwargs,
@@ -388,9 +523,27 @@ def _edit_final(
             parse_mode="HTML",
             disable_web_page_preview=True,
         )
-        if reply_markup is not None:
+        if reply_markup is not None and len(chunks) == 1:
             send_kwargs["reply_markup"] = reply_markup
-        bot.send_message(target.chat.id, body, **send_kwargs)
+        bot.send_message(target.chat.id, chunks[0], **send_kwargs)
+    for index, chunk in enumerate(chunks[1:], start=1):
+        send_kwargs = _thread_kwargs(target)
+        send_kwargs.update(
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+        if reply_markup is not None and index == len(chunks) - 1:
+            send_kwargs["reply_markup"] = reply_markup
+        try:
+            bot.send_message(target.chat.id, chunk, **send_kwargs)
+        except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
+            logger.warning(
+                "Telegram Agent 长终态后续分段发送失败 part=%s/%s type=%s",
+                index,
+                len(chunks),
+                type(exc).__name__,
+            )
+            break
 
 
 def _approval_markup(telebot_module: Any, approval: ApprovalView) -> Any:
@@ -450,6 +603,7 @@ def _execute_query(
         "Media Agent",
         source_message=source,
         timeout_seconds=300,
+        prefer_persistent_message=True,
     ).begin("<b>Media Agent</b>\n正在理解任务…")
     observer = _TelegramEventObserver(progress)
     try:
@@ -467,13 +621,15 @@ def _execute_query(
             )
         )
         if view.approval is not None:
-            body = "\n".join(_preview_lines(view.approval))
+            body = "\n".join(
+                _preview_lines(view.approval, tool_calls=view.tool_calls)
+            )
             progress.finish(
                 body,
                 reply_markup=_approval_markup(telebot_module, view.approval),
             )
         else:
-            progress.finish(render_telegram_markdown(_turn_text(view)))
+            progress.finish_many(_turn_chunks(view))
         return view
     except Exception:
         with suppress(Exception):
@@ -579,7 +735,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         _edit_final(
             bot,
             call.message,
-            render_telegram_markdown(_turn_text(view)),
+            _render_turn(view),
             rendered_html=True,
         )
     except Exception as exc:  # noqa: BLE001 - Telegram transport boundary

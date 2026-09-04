@@ -4,12 +4,12 @@ import errno
 import importlib.util
 import json
 import os
-import sys
-import uuid
 import re
+import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from pathlib import Path
 from time import monotonic, time
 from types import SimpleNamespace
@@ -18,13 +18,11 @@ from unittest.mock import Mock, patch
 import httpx
 from fastapi.testclient import TestClient
 
-from tests.support import InitializedWebTestCase
-
 import app.clients.guangya as guangya_module
 from app.clients.guangya import GuangYaClient, _to_file
 from app.config import web_credentials
 from app.main import create_app
-
+from tests.support import InitializedWebTestCase
 
 SAFE_TOKEN_KEYS = {
     "has_access_token",
@@ -743,6 +741,18 @@ class GuangYaTokenClientTests(unittest.TestCase):
             self.assertRegex(str(errors[0]), "已撤销|重新登录")
             self.assertFalse(token_file.exists())
             self.assertIsNone(refresher._raw)
+
+    def test_connection_probe_uses_normal_read_chain_and_can_refresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory, expires_at=time() - 60)
+            with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
+                client = GuangYaClient(token_file=token_file)
+                reachable = client.probe_connection()
+
+            self.assertTrue(reachable)
+            self.assertEqual(client._raw.token, "rotated-access-9999")
+            persisted = json.loads(token_file.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["access_token"], "rotated-access-9999")
 
     def test_validate_rejects_expired_token_without_refresh_or_persist(self):
         with tempfile.TemporaryDirectory() as directory:

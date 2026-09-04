@@ -7,6 +7,8 @@ from app.agent.media_consumption_actions import (
     continue_watching_arguments,
     get_continue_watching,
     get_preferences,
+    get_recently_added,
+    get_recently_played,
     get_subscription_notification_rule,
     get_today_summary,
     notification_rule_arguments,
@@ -16,6 +18,8 @@ from app.agent.media_consumption_actions import (
     prepare_reset_subscription_notification_rule,
     prepare_set_preferences,
     prepare_set_subscription_notification_rule,
+    recently_added_arguments,
+    recently_played_arguments,
     reset_subscription_notification_rule_confirmed,
     set_preferences_confirmed,
     set_subscription_notification_rule_confirmed,
@@ -123,7 +127,10 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="rss.subscription_summaries",
-            description="只读列出有界 RSS 订阅安全摘要，仅含编号、名称、启用/调度状态和条目计数，不返回 URL、过滤词、正文或路径。",
+            description=(
+                "只读列出 RSS 规则订阅（不是媒体追更订阅）的安全摘要，仅含编号、名称、"
+                "启用/调度状态和条目计数，不返回 URL、过滤词、正文或路径。"
+            ),
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -134,8 +141,10 @@ def register_specs(
             validator=rss_subscription_summaries_arguments,
             examples=(
                 "我有哪些 RSS 订阅",
+                "我订阅了哪些 RSS",
+                "我订阅了那些 RSS",
                 "列出 RSS 订阅和启用状态",
-                "查看我的订阅",
+                "查看 RSS 规则",
             ),
         )
     )
@@ -290,7 +299,10 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="media.subscription_summaries",
-            description="只读列出有界媒体追更订阅摘要，仅含编号、标题、媒体类型、启用状态和缺失数量。",
+            description=(
+                "只读列出影视/动画媒体追更订阅（不是 RSS 规则订阅）摘要，仅含编号、"
+                "标题、媒体类型、启用状态和缺失数量。"
+            ),
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -302,7 +314,6 @@ def register_specs(
             examples=(
                 "我订阅了哪些媒体",
                 "列出当前的追更订阅",
-                "查看我的订阅",
                 "看看我的媒体订阅",
             ),
         )
@@ -509,14 +520,59 @@ def register_specs(
     )
     registry.register(
         ToolSpec(
-            name="media.continue_watching",
-            description="读取显式配置媒体用户的继续观看列表；不会回退管理员或其他用户，也不返回用户 ID、媒体内部 ID、URL、路径或凭据。",
+            name="media.recently_played",
+            description=(
+                "读取媒体服务器用户的真实最近播放历史（播放事件/DatePlayed）；优先使用"
+                "明确配置的用户，未配置时沿用服务器默认用户选择。不是继续观看 Resume 列表，"
+                "可作为个性化片单推荐的事实依据。"
+            ),
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
                 "properties": {
                     "server": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 12},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "additionalProperties": False,
+            },
+            context_handler=get_recently_played,
+            validator=recently_played_arguments,
+            related_tools=("discovery.recommend",),
+            examples=(
+                "我最近看了什么",
+                "查看 Jellyfin 最近播放历史",
+                "根据我最近播放的内容推荐片单",
+            ),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="media.recently_added",
+            description="读取 Jellyfin 或 Emby 最近入库的内容；连续单集会按作品去重，避免刷屏。",
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                },
+                "additionalProperties": False,
+            },
+            context_handler=get_recently_added,
+            validator=recently_added_arguments,
+            examples=("最近入库了什么", "查看 Jellyfin 最新添加内容"),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="media.continue_watching",
+            description="读取媒体服务器用户的继续观看列表；优先使用明确配置用户，未配置时沿用服务器默认用户选择，不返回用户 ID、媒体内部 ID、URL、路径或凭据。",
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
                 },
                 "additionalProperties": False,
             },

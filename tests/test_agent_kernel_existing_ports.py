@@ -42,7 +42,7 @@ async def context_for(state, *, owner="owner", session="session"):
 class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_existing_atomic_tools_can_be_declared_to_kernel(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
-        self.assertEqual(len(catalog), 139)
+        self.assertEqual(len(catalog), 142)
         self.assertFalse(catalog.has("agent.cancel_pending_action"))
         selection = CapabilityRetriever().retrieve(
             "规整光鸭云盘动漫目录并按 TMDB 集数重命名",
@@ -57,6 +57,22 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
                 for tool in selection.tools
             )
         )
+
+    async def test_web_search_and_read_are_neighboring_read_capabilities(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        search = catalog.get("web.search")
+        read = catalog.get("web.read")
+
+        self.assertEqual(search.effect, ToolEffect.READ)
+        self.assertEqual(read.effect, ToolEffect.READ)
+        self.assertIn("web.read", search.metadata["related_tools"])
+        self.assertIn("web.search", read.metadata["related_tools"])
+        selection = CapabilityRetriever().retrieve(
+            "搜索 2026 年新番并打开官方公告核对发布日期",
+            catalog,
+        )
+        self.assertIn("web.search", selection.names)
+        self.assertIn("web.read", selection.names)
 
     async def test_short_followup_reuses_recent_media_library_context(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
@@ -144,6 +160,22 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.tool.effect, ToolEffect.READ)
         self.assertTrue(result.outcome.public_content["ok"])
         self.assertIn("agent_enabled", result.outcome.public_content["data"])
+
+    async def test_agent_capabilities_returns_compact_domain_summary(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        state = InMemorySessionStateStore()
+        result = await ToolPipeline(catalog=catalog, state_store=state).execute(
+            "agent.capabilities",
+            {},
+            context=await context_for(state),
+        )
+
+        public = result.outcome.public_content
+        self.assertEqual(public["data"]["total_tools"], 142)
+        self.assertGreaterEqual(len(public["data"]["groups"]), 6)
+        self.assertNotIn("tools", public["data"])
+        self.assertNotIn("parameters", str(public))
+        self.assertLess(len(result.outcome.model_content), 8_000)
 
     async def test_domain_owned_opaque_refs_are_not_misresolved_as_kernel_refs(
         self,

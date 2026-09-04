@@ -5,7 +5,6 @@ Emby 和 Jellyfin 10.x 的页面路由。
 """
 from __future__ import annotations
 
-
 from app.clients.base import (
     Library,
     MediaItem,
@@ -192,6 +191,14 @@ class EmbyClient(MediaServerClient):
         image_id = series_id if is_episode and series_id else item_id
         raw_user_data = item.get("UserData")
         user_data = raw_user_data if isinstance(raw_user_data, dict) else {}
+        raw_genres = item.get("Genres")
+        genres = tuple(
+            dict.fromkeys(
+                str(value or "").strip()
+                for value in (raw_genres if isinstance(raw_genres, list) else [])
+                if str(value or "").strip()
+            )
+        )[:12]
         return MediaItem(
             id=item_id,
             name=item.get("Name", ""),
@@ -209,6 +216,7 @@ class EmbyClient(MediaServerClient):
             episode_number=item.get("IndexNumber"),
             last_played=user_data.get("LastPlayedDate", ""),
             progress=normalize_playback_progress(user_data.get("PlayedPercentage")),
+            genres=genres,
         )
 
     def _recent_added(self, limit: int = 8) -> list[MediaItem]:
@@ -222,7 +230,7 @@ class EmbyClient(MediaServerClient):
                 "IncludeItemTypes": "Movie,Series,Episode",
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,ProductionYear,UserData"
+                    "ParentIndexNumber,ImageTags,ProductionYear,Genres,UserData"
                 ),
                 "SortBy": "DateCreated",
                 "SortOrder": "Descending",
@@ -264,7 +272,7 @@ class EmbyClient(MediaServerClient):
                 "IncludeItemTypes": "Movie,Series,Episode",
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,ProductionYear,RunTimeTicks,UserData"
+                    "ParentIndexNumber,ImageTags,ProductionYear,RunTimeTicks,Genres,UserData"
                 ),
                 "SortBy": "SortName",
                 "SortOrder": "Ascending",
@@ -311,20 +319,106 @@ class EmbyClient(MediaServerClient):
             "episode_count": max(0, int(counts.get("EpisodeCount", 0) or 0)),
         }
 
-    def _recent_played(self) -> list[MediaItem]:
-        uid = self._user_id()
+    def recently_played(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
+        """按显式用户读取 DatePlayed 历史，不能用 Resume 继续观看列表代替。"""
+        selected = normalize_explicit_media_user_id(user_id)
+        normalized_limit = max(1, min(int(limit or 12), 50))
         data = self._request(
-            f"/Users/{uid}/Items/Resume",
+            f"/Users/{selected}/Items",
             params={
-                "Limit": 12,
+                "Recursive": "true",
+                "Limit": max(36, normalized_limit * 3),
+                "IncludeItemTypes": "Movie,Episode",
                 "MediaTypes": "Video",
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,ProductionYear,UserData"
+                    "ParentIndexNumber,ImageTags,ProductionYear,Genres,UserData"
                 ),
+                "SortBy": "DatePlayed",
+                "SortOrder": "Descending",
+                "EnableUserData": "true",
+                "EnableTotalRecordCount": "false",
             },
         )
-        return [self._media_item(item) for item in data.get("Items", [])]
+        raw_items = data if isinstance(data, list) else (
+            data.get("Items") or [] if isinstance(data, dict) else []
+        )
+        if not isinstance(raw_items, list):
+            raise ValueError("媒体服务器播放历史响应无效")
+        raw_items = sorted(
+            (
+                item
+                for item in raw_items
+                if isinstance(item, dict)
+                and isinstance(item.get("UserData"), dict)
+                and str(item["UserData"].get("LastPlayedDate") or "").strip()
+            ),
+            key=lambda item: str(item["UserData"].get("LastPlayedDate") or ""),
+            reverse=True,
+        )
+        items: list[MediaItem] = []
+        seen: set[str] = set()
+        for raw in raw_items:
+            item_id = str(raw.get("Id") or "")
+            if not item_id or item_id in seen:
+                continue
+            seen.add(item_id)
+            items.append(self._media_item(raw))
+            if len(items) >= normalized_limit:
+                break
+        return items
+
+    def enrich_media_genres(
+        self, user_id: str, items: list[MediaItem]
+    ) -> list[MediaItem]:
+        selected = normalize_explicit_media_user_id(user_id)
+        series_ids = tuple(
+            dict.fromkeys(
+                item.series_id
+                for item in items
+                if not item.genres and item.series_id
+            )
+        )
+        if not series_ids:
+            return items
+        try:
+            data = self._request(
+                f"/Users/{selected}/Items",
+                params={
+                    "Ids": ",".join(series_ids),
+                    "Fields": "Genres",
+                    "EnableImages": "false",
+                    "EnableUserData": "false",
+                    "EnableTotalRecordCount": "false",
+                },
+            )
+            raw_items = data if isinstance(data, list) else (
+                data.get("Items") or [] if isinstance(data, dict) else []
+            )
+            genres_by_id = {
+                str(raw.get("Id") or ""): tuple(
+                    dict.fromkeys(
+                        str(value or "").strip()
+                        for value in (
+                            raw.get("Genres")
+                            if isinstance(raw.get("Genres"), list)
+                            else []
+                        )
+                        if str(value or "").strip()
+                    )
+                )[:12]
+                for raw in raw_items
+                if isinstance(raw, dict) and str(raw.get("Id") or "")
+            }
+            for item in items:
+                if not item.genres and item.series_id in genres_by_id:
+                    item.genres = genres_by_id[item.series_id]
+        except Exception as exc:
+            logger.debug("[Emby] 补齐播放历史题材失败 type=%s", type(exc).__name__)
+        return items
+
+    def _recent_played(self, limit: int = 12) -> list[MediaItem]:
+        return self.recently_played(self._user_id(), limit=limit)
 
     def continue_watching(self, user_id: str, *, limit: int = 12) -> list[MediaItem]:
         selected = normalize_explicit_media_user_id(user_id)
@@ -336,7 +430,7 @@ class EmbyClient(MediaServerClient):
                 "MediaTypes": "Video",
                 "Fields": (
                     "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,ProductionYear,RunTimeTicks,UserData"
+                    "ParentIndexNumber,ImageTags,ProductionYear,RunTimeTicks,Genres,UserData"
                 ),
             },
         )

@@ -11,6 +11,11 @@ from app.sensitive_data import is_sensitive_key, redact_sensitive_text
 SENSITIVE_KEY_RE = re.compile(
     r"(?i)(password|passport|secret|token|api[_-]?key|authorization|cookie|phone)"
 )
+# 配置名中的 “TOKENS” 代表模型容量单位，不是认证令牌。只放行满足
+# 后端取值范围的精确数字，异常部署值仍按敏感内容隐藏。
+_PUBLIC_NUMERIC_CONFIG_LIMITS = {
+    "AGENT_LLM_CONTEXT_WINDOW_TOKENS": (16_384, 2_000_000),
+}
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 _LOGIN_WINDOW_SECONDS = 15 * 60
 _LOGIN_MAX_FAILURES = 5
@@ -68,10 +73,25 @@ def _record_failure(
     attempts.append(now)
 
 
+def _is_public_numeric_config_value(key: object, value: object) -> bool:
+    limits = _PUBLIC_NUMERIC_CONFIG_LIMITS.get(str(key or "").strip().upper())
+    if limits is None:
+        return False
+    try:
+        numeric = int(str(value or "").strip())
+    except (TypeError, ValueError):
+        return False
+    return limits[0] <= numeric <= limits[1]
+
+
 def redact_config(items: dict[str, str]) -> dict[str, str]:
     redacted: dict[str, str] = {}
     for key, value in items.items():
-        if value and (SENSITIVE_KEY_RE.search(key) or is_sensitive_key(key)):
+        if (
+            value
+            and not _is_public_numeric_config_value(key, value)
+            and (SENSITIVE_KEY_RE.search(key) or is_sensitive_key(key))
+        ):
             redacted[key] = "********"
         else:
             # URL/userinfo 等凭据可能藏在普通 URL 配置值中，不能只依赖键名。

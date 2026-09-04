@@ -10,9 +10,11 @@ from app.agent.media_consumption_actions import (
     continue_watching_arguments,
     notification_rule_update_arguments,
     preferences_update_arguments,
+    recently_played_arguments,
 )
+from app.agent.models import ToolResult
+from app.agent.provider_models import ProviderGatewayError
 from app.agent.rate_limit import agent_rate_limiter
-from app.clients.base import MediaItem
 from app.modules.media_server_profiles import MediaServerProfile
 from tests.agent_kernel_test_harness import (
     get_kernel_test_service as get_agent_service,
@@ -58,6 +60,8 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         capabilities = {item["name"]: item for item in service.capabilities()["tools"]}
         for name in (
             "media.continue_watching",
+            "media.recently_added",
+            "media.recently_played",
             "media.preferences",
             "media.today_summary",
             "media.subscription_notification_rule",
@@ -79,6 +83,10 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             continue_watching_arguments({}), {"server": "auto", "limit": 8}
         )
         self.assertEqual(
+            recently_played_arguments({"server": "emby", "limit": 20}),
+            {"server": "emby", "limit": 20},
+        )
+        self.assertEqual(
             preferences_update_arguments({"preferred_download_target": "both"}),
             {"preferred_download_target": "both"},
         )
@@ -95,7 +103,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             notification_rule_update_arguments({"subscription_number": 1})
 
-    def test_continue_watching_requires_explicit_user_and_redacts_internal_ids(
+    def test_continue_watching_uses_config_or_default_user_and_redacts_ids(
         self,
     ) -> None:
         service = get_agent_service()
@@ -108,26 +116,35 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             enabled=True,
             user_id="PRIVATE-USER-ID",
         )
-        client = Mock()
-        client.continue_watching.return_value = [
-            MediaItem(
-                id="PRIVATE-ITEM-ID",
-                name="第 3 集",
-                type="Episode",
-                web_url="http://private.local/web/index.html#!/details?id=secret",
-                series_name="示例动画",
-                season_number=1,
-                episode_number=3,
-                last_played="2026-08-23T09:30:00+08:00",
-                progress=42.5,
-            )
-        ]
+        gateway = Mock()
+        gateway.query.return_value = ToolResult(
+            True,
+            "success",
+            "Jellyfin 返回 1 项继续观看内容",
+            data={
+                "server_label": "Jellyfin",
+                "user_selection": "配置用户",
+                "history_kind": "继续观看",
+                "count": 1,
+                "items": [{
+                    "name": "第 3 集",
+                    "series_name": "示例动画",
+                    "type": "Episode",
+                    "season_number": 1,
+                    "episode_number": 3,
+                    "progress_percent": 42.5,
+                }],
+            },
+        )
         with (
             patch(
                 "app.agent.media_consumption_actions.list_configured_profiles",
                 return_value=[profile],
             ),
-            patch("app.agent.media_consumption_actions._client", return_value=client),
+            patch(
+                "app.agent.media_consumption_actions.get_provider_gateway",
+                return_value=gateway,
+            ),
         ):
             response = service.invoke(
                 "media.continue_watching",
@@ -135,9 +152,9 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
                 owner="owner-a",
             )
         item = response["result"]["data"]["items"][0]
-        self.assertEqual(item["title"], "示例动画")
-        self.assertEqual(item["episode"], 3)
-        self.assertEqual(item["progress"], 42.5)
+        self.assertEqual(item["series_name"], "示例动画")
+        self.assertEqual(item["episode_number"], 3)
+        self.assertEqual(item["progress_percent"], 42.5)
         serialized = repr(response)
         for secret in (
             "PRIVATE-ITEM-ID",
@@ -146,11 +163,15 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             "private.local",
         ):
             self.assertNotIn(secret, serialized)
-        client.continue_watching.assert_called_once_with("PRIVATE-USER-ID", limit=8)
-        client.close.assert_called_once_with()
-        failed_client = Mock()
-        failed_client.continue_watching.side_effect = RuntimeError(
-            "provider unavailable"
+        gateway.query.assert_called_once()
+        self.assertEqual(
+            gateway.query.call_args.kwargs["operation"],
+            "media.items.continue_watching",
+        )
+        self.assertEqual(gateway.query.call_args.kwargs["arguments"], {"limit": 8})
+        failed_gateway = Mock()
+        failed_gateway.query.side_effect = ProviderGatewayError(
+            "媒体服务器当前不可用", code="provider_unavailable"
         )
         with (
             patch(
@@ -158,8 +179,8 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
                 return_value=[profile],
             ),
             patch(
-                "app.agent.media_consumption_actions._client",
-                return_value=failed_client,
+                "app.agent.media_consumption_actions.get_provider_gateway",
+                return_value=failed_gateway,
             ),
         ):
             unavailable = service.invoke(
@@ -167,8 +188,7 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
                 {"server": "jellyfin", "limit": 8},
                 owner="owner-a",
             )
-        self.assertEqual(unavailable["result"]["status"], "unavailable")
-        failed_client.close.assert_called_once_with()
+        self.assertEqual(unavailable["result"]["status"], "provider_unavailable")
         profile_without_user = MediaServerProfile(
             source="configured:jellyfin",
             server_type="jellyfin",
@@ -178,13 +198,91 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             enabled=True,
             user_id="",
         )
-        with patch(
-            "app.agent.media_consumption_actions.list_configured_profiles",
-            return_value=[profile_without_user],
+        default_gateway = Mock()
+        default_gateway.query.return_value = ToolResult(
+            True,
+            "success",
+            "Jellyfin 返回 0 项继续观看内容",
+            data={
+                "server_label": "Jellyfin",
+                "user_selection": "服务器默认用户",
+                "history_kind": "继续观看",
+                "count": 0,
+                "items": [],
+            },
+        )
+        with (
+            patch(
+                "app.agent.media_consumption_actions.list_configured_profiles",
+                return_value=[profile_without_user],
+            ),
+            patch(
+                "app.agent.media_consumption_actions.get_provider_gateway",
+                return_value=default_gateway,
+            ),
         ):
-            blocked = service.invoke("media.continue_watching", {}, owner="owner-a")
-        self.assertEqual(blocked["result"]["status"], "precondition_failed")
-        self.assertIn("不会回退", blocked["result"]["error"])
+            fallback = service.invoke("media.continue_watching", {}, owner="owner-a")
+        self.assertEqual(fallback["result"]["status"], "success")
+        self.assertEqual(
+            fallback["result"]["data"]["user_selection"], "服务器默认用户"
+        )
+
+    def test_recent_played_uses_provider_gateway_and_selects_recommendation(self) -> None:
+        service = get_agent_service()
+        profile = MediaServerProfile(
+            source="configured:jellyfin",
+            server_type="jellyfin",
+            label="Jellyfin",
+            url="http://private.local",
+            credential="PRIVATE-TOKEN",
+            enabled=True,
+            user_id="PRIVATE-USER-ID",
+        )
+        gateway = Mock()
+        gateway.query.return_value = ToolResult(
+            True,
+            "success",
+            "Jellyfin 返回 1 项最近播放记录",
+            data={
+                "server_label": "Jellyfin",
+                "history_kind": "最近播放",
+                "count": 1,
+                "items": [{"name": "示例电影", "genres": ["科幻"]}],
+                "preference_signals": {
+                    "recent_titles": ["示例电影"],
+                    "top_genres": ["科幻"],
+                    "media_types": ["movie"],
+                },
+            },
+        )
+        with (
+            patch(
+                "app.agent.media_consumption_actions.list_configured_profiles",
+                return_value=[profile],
+            ),
+            patch(
+                "app.agent.media_consumption_actions.get_provider_gateway",
+                return_value=gateway,
+            ),
+        ):
+            response = service.invoke(
+                "media.recently_played",
+                {"server": "auto", "limit": 8},
+                owner="owner-a",
+            )
+        self.assertEqual(response["result"]["data"]["history_kind"], "最近播放")
+        self.assertEqual(
+            gateway.query.call_args.kwargs["operation"], "media.items.recent_played"
+        )
+
+        from app.agent.kernel.capabilities import CapabilityRetriever
+
+        selection = CapabilityRetriever().retrieve(
+            "根据我最近播放的内容推荐一个片单",
+            service.catalog,
+        )
+        self.assertIn("media.recently_played", selection.names)
+        self.assertIn("discovery.recommend", selection.names)
 
     def test_preferences_are_owner_isolated_confirmation_gated_and_clearable(
         self,

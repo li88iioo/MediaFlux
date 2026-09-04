@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from app.agent.public_safety import public_tool_label
 from app.sensitive_data import contains_sensitive_credential
 
 from .capabilities import CapabilityRetriever, ToolCatalog, ToolEffect
@@ -22,6 +23,8 @@ from .model import (
     ModelToolCall,
 )
 from .pipeline import ToolCallContext, ToolPipeline, ToolPipelineError
+from .provider_model import ModelProviderError
+from .public_view import format_public_result
 from .state import (
     AgentInput,
     CancellationToken,
@@ -35,6 +38,19 @@ from .state import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _provider_failure_message(exc: ModelProviderError) -> str:
+    """把 Provider 内部故障归一为不泄露配置的用户提示。"""
+
+    reason = str(exc or "")
+    if "超时" in reason:
+        return "模型服务响应超时，请稍后重试。"
+    if "HTTP 429" in reason:
+        return "模型服务请求过于频繁，请稍后重试。"
+    if "HTTP 401" in reason or "HTTP 403" in reason:
+        return "模型服务鉴权失败，请检查模型路由配置。"
+    return "模型服务暂时不可用，请稍后重试。"
 
 DEFAULT_SYSTEM_PROMPT = """你是 MediaFlux Media Agent，一名可操作当前 MediaFlux 项目的家庭媒体助手。
 
@@ -58,6 +74,7 @@ DEFAULT_SYSTEM_PROMPT = """你是 MediaFlux Media Agent，一名可操作当前 
 - 同一 observation_ref 的全部分页合计已覆盖用户指定的对象数量且未截断时，视为观察完成；直接使用这份快照生成变更预览，不要再创建新的搜索快照或重复核对，否则先前 object_ref 会失效。
 - 大批量剧集需要统一移动并按集号改名时，使用一项 batch_relocate，把每个 object_ref 与真实集号完整列入 items；不要只提交一个示例文件。用户要求全局 1-N/TMDB 顺序时使用 naming="absolute"，按季编号时使用 naming="season_episode"。若目标目录尚不存在，可在同一 operations 中加入 create_directory（可直接传完整 path），并让 batch_relocate.target_path 指向该新目录。
 - 媒体服务器实时统计、媒体总数、qBittorrent 实时任务/速度/进度应先读取 Provider 能力，再执行 Provider 实时查询；媒体总数使用能力清单中的 media.items.counts，不用本地历史记录或巡检快照冒充实时状态。
+- 用户询问“最近看了什么、播放历史”时必须读取媒体服务器用户的真实播放历史，不能用继续观看列表代替。优先使用配置的用户，未配置时采用媒体客户端与看板相同的默认用户选择。用户要求“根据最近播放推荐”时，先读取播放历史与偏好信号，再读取推荐候选，排除最近已观看作品，并明确推荐依据；历史不可用时不得编造观看偏好。
 - 资源搜索结果会给出 `reference_arguments.resource_candidates_ref`。同轮继续提交或用户用“这个/4K版/第几个/推送”等短句续接时，必须把该引用原样传给资源检查/提交工具，再生成确认计划；不能遗漏引用、重复搜索，或因为当前短句没重复“云盘”就声称提交能力未挂载。
 - 直链或光鸭分享检查会给出 `reference_arguments.ingest_snapshot_ref`。后续提交必须原样传入该引用；不得把原始链接重新塞进写工具，也不得依赖另一个标签页的“最近一次”内存状态。
 - “最近/今年/定档/新剧”若本地探索数据不能证明时，结合联网公开信息并标明来源时效。
@@ -393,6 +410,7 @@ class AgentSession:
                                 {
                                     "call_id": call.call_id,
                                     "tool": public_tool_name,
+                                    "label": public_tool_label(public_tool_name),
                                     "argument_keys": sorted(
                                         str(key)[:80] for key in call.arguments
                                     )[:50],
@@ -439,6 +457,7 @@ class AgentSession:
                                 {
                                     "call_id": call.call_id,
                                     "tool": call.name,
+                                    "label": public_tool_label(call.name),
                                     "code": error.code,
                                     "message": str(error),
                                 },
@@ -454,13 +473,18 @@ class AgentSession:
                         if tool.effect is not ToolEffect.READ:
                             await publish(
                                 AgentEventType.EFFECT_PREVIEW_STARTED,
-                                {"call_id": call.call_id, "tool": tool.name},
+                                {
+                                    "call_id": call.call_id,
+                                    "tool": tool.name,
+                                    "label": public_tool_label(tool.name),
+                                },
                             )
                         await publish(
                             AgentEventType.TOOL_STARTED,
                             {
                                 "call_id": call.call_id,
                                 "tool": tool.name,
+                                "label": public_tool_label(tool.name),
                                 "effect": tool.effect.value,
                             },
                         )
@@ -476,6 +500,7 @@ class AgentSession:
                                 {
                                     "call_id": call.call_id,
                                     "tool": tool.name,
+                                    "label": public_tool_label(tool.name),
                                     "code": exc.code,
                                     "message": str(exc),
                                 },
@@ -489,6 +514,7 @@ class AgentSession:
                                 {
                                     "call_id": call.call_id,
                                     "tool": tool.name,
+                                    "label": public_tool_label(tool.name),
                                     "plan": plan.public_dict(),
                                     "result": dict(result.outcome.public_content),
                                 },
@@ -525,6 +551,7 @@ class AgentSession:
                             {
                                 "call_id": call.call_id,
                                 "tool": tool.name,
+                                "label": public_tool_label(tool.name),
                                 "elapsed_ms": result.elapsed_ms,
                                 "result": dict(result.outcome.public_content),
                             },
@@ -597,24 +624,49 @@ class AgentSession:
                 await self.journal.append(event, owner=agent_input.owner)
             await queue.put(event)
         except ToolPipelineError as exc:
-            if factory is not None:
-                event = factory.create(
-                    AgentEventType.TURN_FAILED,
-                    {"code": exc.code, "message": str(exc)},
-                )
-                if self.journal is not None:
-                    await self.journal.append(event, owner=agent_input.owner)
-                await queue.put(event)
+            failure_factory = factory or EventFactory(
+                session_id=agent_input.session_id,
+                turn_id=secrets.token_urlsafe(12),
+                request_id=agent_input.request_id,
+            )
+            event = failure_factory.create(
+                AgentEventType.TURN_FAILED,
+                {"code": exc.code, "message": str(exc)},
+            )
+            if self.journal is not None:
+                await self.journal.append(event, owner=agent_input.owner)
+            await queue.put(event)
+        except ModelProviderError as exc:
+            logger.warning("Agent model provider failed type=%s", type(exc).__name__)
+            failure_factory = factory or EventFactory(
+                session_id=agent_input.session_id,
+                turn_id=secrets.token_urlsafe(12),
+                request_id=agent_input.request_id,
+            )
+            event = failure_factory.create(
+                AgentEventType.TURN_FAILED,
+                {
+                    "code": "model_provider_error",
+                    "message": _provider_failure_message(exc),
+                },
+            )
+            if self.journal is not None:
+                await self.journal.append(event, owner=agent_input.owner)
+            await queue.put(event)
         except Exception as exc:  # noqa: BLE001 - final turn fault boundary
             logger.error("Agent turn failed type=%s", type(exc).__name__)
-            if factory is not None:
-                event = factory.create(
-                    AgentEventType.TURN_FAILED,
-                    {"code": "internal_error", "message": "Agent 运行失败"},
-                )
-                if self.journal is not None:
-                    await self.journal.append(event, owner=agent_input.owner)
-                await queue.put(event)
+            failure_factory = factory or EventFactory(
+                session_id=agent_input.session_id,
+                turn_id=secrets.token_urlsafe(12),
+                request_id=agent_input.request_id,
+            )
+            event = failure_factory.create(
+                AgentEventType.TURN_FAILED,
+                {"code": "internal_error", "message": "Agent 运行失败"},
+            )
+            if self.journal is not None:
+                await self.journal.append(event, owner=agent_input.owner)
+            await queue.put(event)
         finally:
             if lease is not None and token is not None:
                 await self.coordinator.finish(lease, token)
@@ -692,22 +744,25 @@ class AgentSession:
             *,
             tool_name: str,
             content: str,
+            public_content: str,
         ) -> None:
             """把确定性确认终态写回会话，供下一轮续问直接引用。"""
             safe_content = str(content or "").strip()
             if not safe_content:
                 return
             conversation = [dict(item) for item in state.conversation]
-            conversation.append(
-                ModelMessage(
-                    role="assistant",
-                    content=(
-                        "已确认操作的可信系统结果（不是待执行计划）：\n"
-                        + safe_content
-                    ),
-                    tool_name=tool_name,
-                ).to_dict()
-            )
+            item = ModelMessage(
+                role="assistant",
+                content=(
+                    "已确认操作的可信系统结果（不是待执行计划）：\n"
+                    + safe_content
+                ),
+                tool_name=tool_name,
+            ).to_dict()
+            safe_public_content = str(public_content or "").strip()
+            if safe_public_content:
+                item["public_content"] = safe_public_content
+            conversation.append(item)
             try:
                 await self.state_store.commit(
                     lease,
@@ -738,6 +793,7 @@ class AgentSession:
             await remember_result(
                 tool_name=result.tool.name,
                 content=result.outcome.model_message(),
+                public_content=format_public_result(public_result),
             )
             if public_result.get("ok") is False:
                 code = str(public_result.get("status") or "effect_failed")[:80]
@@ -786,6 +842,14 @@ class AgentSession:
             await remember_result(
                 tool_name="confirmed_effect",
                 content=f"执行失败：{str(exc)[:500]}（错误码：{exc.code[:80]}）",
+                public_content=format_public_result(
+                    {
+                        "ok": False,
+                        "status": exc.code,
+                        "summary": str(exc),
+                    },
+                    fallback="确认执行未能完成。",
+                ),
             )
             await publish(
                 AgentEventType.EFFECT_FAILED,
@@ -802,6 +866,9 @@ class AgentSession:
                 content=(
                     "执行状态未知：确认执行发生内部错误"
                     "（错误码：internal_error），请先查询真实业务状态再决定是否重试。"
+                ),
+                public_content=(
+                    "❌ 确认执行发生内部错误，请先查询真实业务状态再决定是否重试。"
                 ),
             )
             await publish(
@@ -844,7 +911,7 @@ class AgentSession:
     ) -> tuple[ModelMessage, ...]:
         """裁剪旧回合并压缩当前工具结果，绝不把超预算请求交给 Provider。"""
         split_at = max(0, min(int(history_end), len(messages)))
-        history = list(messages[:split_at])
+        history = self._compact_legacy_history(messages[:split_at])
         current = list(messages[split_at:])
         fixed_tokens = (
             self._estimated_tokens(self.system_prompt)
@@ -888,6 +955,32 @@ class AgentSession:
             remaining -= cost
         bounded_history = [message for group in reversed(kept) for message in group]
         return tuple(bounded_history + current)
+
+    @classmethod
+    def _compact_legacy_history(
+        cls, messages: Sequence[ModelMessage]
+    ) -> list[ModelMessage]:
+        """压缩旧版本曾持久化的巨型能力清单，避免长期污染会话窗口。"""
+
+        result: list[ModelMessage] = []
+        for message in messages:
+            if (
+                message.role == "tool"
+                and message.tool_name == "agent.capabilities"
+                and len(message.content) > 4_000
+            ):
+                result.append(
+                    replace(
+                        message,
+                        content=cls._compact_tool_content(
+                            message.content,
+                            maximum=800,
+                        ),
+                    )
+                )
+            else:
+                result.append(message)
+        return result
 
     @classmethod
     def _compact_current_chain(

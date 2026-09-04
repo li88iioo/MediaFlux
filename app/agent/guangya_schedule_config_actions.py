@@ -48,12 +48,12 @@ def guangya_connection_status_arguments(arguments: dict[str, Any]) -> dict[str, 
 
 
 def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
-    """只验证凭据是否存在以及最小只读请求是否可达，不刷新或返回凭据。"""
+    """验证凭据是否存在，并沿普通只读链路检查当前是否可用。"""
     client = None
     try:
         client = GuangYaClient()
         configured = bool(client.logged_in)
-        reachable = bool(client.validate()) if configured else False
+        reachable = bool(client.probe_connection()) if configured else False
     except Exception as exc:
         logger.warning("Agent 光鸭连接状态读取失败 type=%s", type(exc).__name__)
         return ToolResult(
@@ -111,7 +111,7 @@ def get_guangya_connection_status(_arguments: dict[str, Any]) -> ToolResult:
             evidence=[
                 Evidence(
                     "guangya_connection",
-                    "使用最小只读目录请求验证连接；未刷新或返回任何凭据。",
+                    "使用普通最小只读请求验证连接；允许 SDK 续签登录态，但不返回任何凭据。",
                     _now(),
                 )
             ],

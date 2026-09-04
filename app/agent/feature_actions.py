@@ -57,9 +57,11 @@ _FEATURES: dict[str, FeatureDefinition] = {
     ),
     "web_search": FeatureDefinition(
         key="WEB_SEARCH_ENABLED",
-        label="联网搜索",
+        label="联网搜索与网页读取",
         default=False,
-        effect_note="仅影响后续显式联网搜索；本次配置写入不会访问 Tavily 或消耗搜索额度",
+        effect_note=(
+            "仅影响后续显式联网搜索或公开网页读取；本次配置写入不会访问 Tavily 或消耗额度"
+        ),
         requires_tavily_key=True,
     ),
     "offline_magnet": FeatureDefinition(

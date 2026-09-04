@@ -285,6 +285,7 @@ class TelegramProgress:
     label: str
     source_message: Any | None = None
     timeout_seconds: float = 180.0
+    prefer_persistent_message: bool = False
     operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     mode: str = ""
     draft_id: int | None = None
@@ -316,40 +317,49 @@ class TelegramProgress:
         )
         self.draft_id = secrets.randbelow(2_147_483_647) + 1
 
-        rich = _rich_message(self.telebot, rendered)
-        send_rich_draft = getattr(self.bot, "send_rich_message_draft", None)
-        send_rich = getattr(self.bot, "send_rich_message", None)
-        if callable(send_rich_draft) and callable(send_rich) and rich is not None:
-            try:
-                if send_rich_draft(
-                    self.chat_id,
-                    self.draft_id,
-                    rich,
-                    message_thread_id=self.message_thread_id,
-                ):
-                    self.mode = "rich_draft"
-            except Exception as exc:
-                logger.info("Telegram 富草稿启动失败 type=%s", type(exc).__name__)
-
-        if not self.mode:
-            send_draft = getattr(self.bot, "send_message_draft", None)
-            if callable(send_draft):
+        # Agent 等需要稳定引用关系的交互应直接创建真实回复，再通过 edit
+        # 增量更新。Telegram 的 draft API 不支持 reply_parameters，且长草稿
+        # 持续扩高会造成客户端视口跳动；其他后台任务仍默认使用原生草稿。
+        if not self.prefer_persistent_message:
+            rich = _rich_message(self.telebot, rendered)
+            send_rich_draft = getattr(self.bot, "send_rich_message_draft", None)
+            send_rich = getattr(self.bot, "send_rich_message", None)
+            if callable(send_rich_draft) and callable(send_rich) and rich is not None:
                 try:
-                    if send_draft(
+                    if send_rich_draft(
                         self.chat_id,
                         self.draft_id,
-                        rendered,
+                        rich,
                         message_thread_id=self.message_thread_id,
-                        parse_mode="HTML",
                     ):
-                        self.mode = "draft"
+                        self.mode = "rich_draft"
                 except Exception as exc:
-                    logger.info("Telegram 文本草稿启动失败 type=%s", type(exc).__name__)
+                    logger.info("Telegram 富草稿启动失败 type=%s", type(exc).__name__)
+
+            if not self.mode:
+                send_draft = getattr(self.bot, "send_message_draft", None)
+                if callable(send_draft):
+                    try:
+                        if send_draft(
+                            self.chat_id,
+                            self.draft_id,
+                            rendered,
+                            message_thread_id=self.message_thread_id,
+                            parse_mode="HTML",
+                        ):
+                            self.mode = "draft"
+                    except Exception as exc:
+                        logger.info(
+                            "Telegram 文本草稿启动失败 type=%s",
+                            type(exc).__name__,
+                        )
 
         if not self.mode:
             result = self._send_real(rendered)
             self.message_id = getattr(result, "message_id", None)
-            if self.message_id is not None and callable(getattr(self.bot, "edit_message_text", None)):
+            if self.message_id is not None and callable(
+                getattr(self.bot, "edit_message_text", None)
+            ):
                 self.mode = "edit"
             else:
                 self.mode = "reply"
@@ -462,6 +472,40 @@ class TelegramProgress:
         if result.ok and value is None:
             return TelegramSendResult(
                 ok=False, error="TelegramSendReturnedNoMessage", status_code=503,
+            )
+        return result
+
+    def _send_followup_result(
+        self,
+        rendered: str,
+        *,
+        reply_markup: Any = None,
+    ) -> TelegramSendResult:
+        """发送终态的后续分段，不重复引用原始用户消息。"""
+
+        sender = getattr(self.bot, "send_message", None)
+        if not callable(sender):
+            return TelegramSendResult(
+                ok=False,
+                error="TelegramSenderUnavailable",
+                status_code=503,
+            )
+        kwargs: dict[str, Any] = {
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            kwargs["reply_markup"] = reply_markup
+        if self.message_thread_id is not None:
+            kwargs["message_thread_id"] = self.message_thread_id
+        result, value = call_telegram_delivery(
+            lambda: sender(self.chat_id, rendered, **kwargs)
+        )
+        if result.ok and value is None:
+            return TelegramSendResult(
+                ok=False,
+                error="TelegramSendReturnedNoMessage",
+                status_code=503,
             )
         return result
 
@@ -622,6 +666,26 @@ class TelegramProgress:
         reply_markup: Any = None,
         clear_reply_markup: bool = False,
     ) -> bool:
+        return self.finish_many(
+            (rendered,),
+            reply_markup=reply_markup,
+            clear_reply_markup=clear_reply_markup,
+        )
+
+    def finish_many(
+        self,
+        rendered_chunks: Iterable[str],
+        *,
+        reply_markup: Any = None,
+        clear_reply_markup: bool = False,
+    ) -> bool:
+        """可靠结束进度，并把超长终态按顺序发送为多条完整消息。"""
+
+        chunks = tuple(str(chunk) for chunk in rendered_chunks if str(chunk))
+        if not chunks:
+            chunks = ("任务已结束。",)
+        rendered = chunks[0]
+        first_markup = reply_markup if len(chunks) == 1 else None
         with self._io_lock:
             if not self._claim_finished():
                 return False
@@ -634,7 +698,7 @@ class TelegramProgress:
                     "disable_web_page_preview": True,
                 }
                 if reply_markup is not None or clear_reply_markup:
-                    kwargs["reply_markup"] = reply_markup
+                    kwargs["reply_markup"] = first_markup
                 self._mark_terminal_attempt("edit", rendered)
                 result, _value = call_telegram_delivery(
                     lambda: self.bot.edit_message_text(
@@ -650,7 +714,7 @@ class TelegramProgress:
                     )
                     self._mark_terminal_attempt("send", rendered)
                     result = self._send_real_result(
-                        rendered, reply_markup=reply_markup,
+                        rendered, reply_markup=first_markup,
                     )
                     if result.ok:
                         self._delete_placeholder()
@@ -660,8 +724,8 @@ class TelegramProgress:
                 self._mark_terminal_attempt("send", rendered)
                 if callable(sender) and rich is not None:
                     kwargs = {}
-                    if reply_markup is not None:
-                        kwargs["reply_markup"] = reply_markup
+                    if first_markup is not None:
+                        kwargs["reply_markup"] = first_markup
                     if self.message_thread_id is not None:
                         kwargs["message_thread_id"] = self.message_thread_id
                     reply_parameters = self._rich_reply_parameters()
@@ -672,18 +736,49 @@ class TelegramProgress:
                     )
                 else:
                     result = self._send_real_result(
-                        rendered, reply_markup=reply_markup,
+                        rendered, reply_markup=first_markup,
                     )
                 self._clear_draft()
             else:
                 self._mark_terminal_attempt("send", rendered)
                 result = self._send_real_result(
-                    rendered, reply_markup=reply_markup,
+                    rendered, reply_markup=first_markup,
                 )
                 self._clear_draft()
                 if self.mode == "reply" and result.ok:
                     self._delete_placeholder()
-            self._settle_terminal_result(result, rendered)
+
+            settled_text = rendered
+            if result.ok and len(chunks) > 1:
+                for index, continuation in enumerate(chunks[1:], start=1):
+                    continuation_markup = (
+                        reply_markup if index == len(chunks) - 1 else None
+                    )
+                    settled_text = continuation
+                    self._mark_terminal_attempt("send", continuation)
+                    continuation_result = self._send_followup_result(
+                        continuation,
+                        reply_markup=continuation_markup,
+                    )
+                    if continuation_result.ok:
+                        result = continuation_result
+                        continue
+                    result = TelegramSendResult(
+                        ok=False,
+                        retry_after_seconds=continuation_result.retry_after_seconds,
+                        error=continuation_result.error,
+                        status_code=continuation_result.status_code,
+                        partially_delivered=True,
+                        message_id=continuation_result.message_id,
+                    )
+                    logger.warning(
+                        "Telegram 多段终态仅部分送达 part=%s/%s status=%s",
+                        index,
+                        len(chunks),
+                        result.status_code or "-",
+                    )
+                    break
+            self._settle_terminal_result(result, settled_text)
             return result.ok
 
     def dismiss(self, fallback_text: str = "任务已完成。") -> bool:

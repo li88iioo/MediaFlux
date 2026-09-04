@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import html
 import re
+from bisect import bisect_right
 from urllib.parse import urlsplit
 
 _MAX_INLINE_DEPTH = 4
@@ -22,6 +23,13 @@ _TABLE_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
 _THEMATIC_RE = re.compile(
     r"^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$"
 )
+_HTML_TOKEN_RE = re.compile(
+    r"<[^>]+>|&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);|.",
+    re.DOTALL,
+)
+_HTML_TAG_RE = re.compile(r"<\s*(/?)\s*([a-zA-Z0-9]+)(?:\s[^>]*)?>")
+_HTML_VOID_TAGS = frozenset({"br"})
+_SOFT_BREAK_CHARACTERS = frozenset(" \t。！？.!?；;，,")
 
 
 def _escape(value: object, *, quote: bool = False) -> str:
@@ -42,6 +50,140 @@ def _safe_link(raw_url: str) -> str | None:
     if scheme == "mailto" and parsed.path:
         return value
     return None
+
+
+def _utf16_length(value: object) -> int:
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in str(value or ""))
+
+
+def _html_token_length(token: str) -> int:
+    if token.startswith("<"):
+        return 0
+    return _utf16_length(html.unescape(token))
+
+
+def telegram_html_text_length(value: object) -> int:
+    """返回 Telegram 解析 HTML 后的 UTF-16 可见文本长度。"""
+
+    return sum(
+        _html_token_length(token)
+        for token in _HTML_TOKEN_RE.findall(str(value or ""))
+    )
+
+
+def _html_tag_transition(
+    stack: tuple[tuple[str, str], ...], token: str
+) -> tuple[tuple[str, str], ...]:
+    match = _HTML_TAG_RE.fullmatch(token)
+    if match is None:
+        return stack
+    closing, raw_name = match.groups()
+    name = raw_name.casefold()
+    if closing:
+        items = list(stack)
+        for index in range(len(items) - 1, -1, -1):
+            if items[index][0] == name:
+                del items[index:]
+                return tuple(items)
+        return stack
+    if name in _HTML_VOID_TAGS or token.rstrip().endswith("/>"):
+        return stack
+    return (*stack, (name, token))
+
+
+def _open_html_tags(stack: tuple[tuple[str, str], ...]) -> str:
+    return "".join(opening for _name, opening in stack)
+
+
+def _close_html_tags(stack: tuple[tuple[str, str], ...]) -> str:
+    return "".join(f"</{name}>" for name, _opening in reversed(stack))
+
+
+def split_telegram_html(value: object, *, limit: int = 3900) -> tuple[str, ...]:
+    """按 Telegram 可见文本长度拆分 HTML，并在每段闭合、续接样式标签。"""
+
+    maximum = int(limit or 0)
+    if maximum <= 0:
+        raise ValueError("limit 必须大于 0")
+    source = str(value or "")
+    if not source:
+        return ("",)
+
+    tokens = _HTML_TOKEN_RE.findall(source)
+    if any(token.startswith("<") and len(token) > maximum for token in tokens):
+        return split_telegram_html(html.escape(source), limit=maximum)
+
+    stacks: list[tuple[tuple[str, str], ...]] = [()]
+    visible_prefix = [0]
+    blank_breaks: list[int] = []
+    line_breaks: list[int] = []
+    soft_breaks: list[int] = []
+    previous_visible = ""
+    stack: tuple[tuple[str, str], ...] = ()
+    for index, token in enumerate(tokens, start=1):
+        if token.startswith("<"):
+            stack = _html_tag_transition(stack, token)
+        width = _html_token_length(token)
+        stacks.append(stack)
+        visible_prefix.append(visible_prefix[-1] + width)
+        if not width:
+            continue
+        decoded = html.unescape(token)
+        if decoded == "\n":
+            line_breaks.append(index)
+            if previous_visible == "\n":
+                blank_breaks.append(index)
+        elif decoded in _SOFT_BREAK_CHARACTERS:
+            soft_breaks.append(index)
+        previous_visible = decoded
+
+    if visible_prefix[-1] <= maximum:
+        return (source,)
+
+    def preferred_end(start: int, maximum_end: int) -> int:
+        minimum_visible = visible_prefix[start] + max(1, maximum // 2)
+        for candidates in (blank_breaks, line_breaks, soft_breaks):
+            position = bisect_right(candidates, maximum_end) - 1
+            if position < 0:
+                continue
+            candidate = candidates[position]
+            if candidate > start and visible_prefix[candidate] >= minimum_visible:
+                return candidate
+        return maximum_end
+
+    chunks: list[str] = []
+    start = 0
+    token_count = len(tokens)
+    while start < token_count:
+        target = visible_prefix[start] + maximum
+        maximum_end = bisect_right(visible_prefix, target) - 1
+        maximum_end = min(token_count, max(start + 1, maximum_end))
+        end = (
+            token_count
+            if maximum_end >= token_count
+            else preferred_end(start, maximum_end)
+        )
+
+        content_end = end
+        next_start = end
+        if end < token_count:
+            while content_end > start and tokens[content_end - 1] == "\n":
+                content_end -= 1
+            while next_start < token_count and tokens[next_start] == "\n":
+                next_start += 1
+        if content_end <= start:
+            content_end = end
+            next_start = end
+
+        chunk = (
+            _open_html_tags(stacks[start])
+            + "".join(tokens[start:content_end])
+            + _close_html_tags(stacks[content_end])
+        )
+        chunks.append(chunk)
+        start = next_start
+
+    return tuple(chunks)
 
 
 def _markdown_link_at(source: str, start: int) -> tuple[bool, str, str, int] | None:

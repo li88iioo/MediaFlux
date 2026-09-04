@@ -4985,7 +4985,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn('data-test-media="emby"', dashboard.text)
         self.assertIn('data-key="JELLYFIN_USER_ID"', dashboard.text)
         self.assertIn('data-key="EMBY_USER_ID"', dashboard.text)
-        self.assertIn("不回退管理员历史", dashboard.text)
+        self.assertIn("留空使用服务器默认用户", dashboard.text)
         self.assertEqual(settings.status_code, 200)
         self.assertEqual(organize.status_code, 200)
         self.assertEqual(organize_rules.status_code, 200)

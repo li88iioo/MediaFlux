@@ -18,6 +18,7 @@ from app.agent.feature_gate import is_agent_enabled
 from app.main import create_app
 from app.routes import strm_api
 from app.routes.api import _validate_agent_llm_updates, get_config, save_config
+from app.security import redact_config
 from app.web import relative_url_for
 
 
@@ -65,6 +66,11 @@ class AgentSettingsUiTests(unittest.TestCase):
         html = (Path("app/templates/settings.html").read_text(encoding="utf-8") + Path("app/static/js/settings.js").read_text(encoding="utf-8"))
         self.assertIn('<div class="card card-pad" id="settingsForm">', html)
         self.assertNotIn('<form class="card card-pad" id="settingsForm"', html)
+        self.assertIn("dataset.settingsConfig='pending'", html)
+        self.assertIn("delete document.documentElement.dataset.settingsConfig", html)
+        settings_css = Path("app/static/css/settings-agent.css").read_text(encoding="utf-8")
+        self.assertIn('html[data-settings-config="pending"] .settings-page #settingsForm', settings_css)
+        self.assertIn("visibility: hidden;", settings_css)
         self.assertEqual(html.count('<form class="settings-panel'), 7)
         self.assertEqual(html.count('onsubmit="return false;" novalidate'), 7)
         self.assertIn('data-lucide="bot"', html)
@@ -232,9 +238,9 @@ class AgentSettingsUiTests(unittest.TestCase):
             "发送下载后入库复核通知",
             "巡检间隔（小时）",
             "单次巡检剧集上限",
-            "启用 Tavily 网络搜索",
+            "启用 Tavily 网页搜索与读取",
             "Tavily API Key",
-            "Tavily 搜索缓存时间（秒）",
+            "Tavily 搜索与读取缓存时间（秒）",
             "Tavily 请求超时（秒）",
         ):
             self.assertIn(f'aria-label="{label}"', html)
@@ -259,6 +265,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         effective = {
             "TAVILY_API_KEY": "deployment-secret",
             "AGENT_LLM_API_KEY": "llm-deployment-secret",
+            "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "262144",
             "AGENT_LLM_MODEL": "deployment-model",
             "AGENT_LIBRARY_PATROL_ENABLED": "1",
             "DOWNLOAD_TORRENT_RETENTION_DAYS": "30",
@@ -278,6 +285,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         self.assertEqual(payload["TAVILY_API_KEY"], "********")
         self.assertEqual(payload["AGENT_LLM_API_KEY"], "********")
+        self.assertEqual(payload["AGENT_LLM_CONTEXT_WINDOW_TOKENS"], "262144")
         self.assertEqual(payload["AGENT_LLM_MODEL"], "deployment-model")
         self.assertEqual(payload["AGENT_LIBRARY_PATROL_ENABLED"], "1")
         self.assertEqual(payload["GY_STRM_BASE_URL"], "http://mediaflux.internal:1258")
@@ -287,6 +295,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             [
                 "AGENT_LIBRARY_PATROL_ENABLED",
                 "AGENT_LLM_API_KEY",
+                "AGENT_LLM_CONTEXT_WINDOW_TOKENS",
                 "AGENT_LLM_MODEL",
                 "DOWNLOAD_TORRENT_RETENTION_DAYS",
                 "GY_STRM_BASE_URL",
@@ -296,6 +305,22 @@ class AgentSettingsUiTests(unittest.TestCase):
         serialized = json.dumps(payload, ensure_ascii=False)
         self.assertNotIn("deployment-secret", serialized)
         self.assertNotIn("llm-deployment-secret", serialized)
+
+    def test_context_window_is_visible_but_token_credentials_remain_masked(self):
+        payload = redact_config(
+            {
+                "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "262144",
+                "AGENT_LLM_API_KEY": "provider-secret",
+            }
+        )
+        self.assertEqual(payload["AGENT_LLM_CONTEXT_WINDOW_TOKENS"], "262144")
+        self.assertEqual(payload["AGENT_LLM_API_KEY"], "********")
+        self.assertEqual(
+            redact_config({"AGENT_LLM_CONTEXT_WINDOW_TOKENS": "not-a-number"})[
+                "AGENT_LLM_CONTEXT_WINDOW_TOKENS"
+            ],
+            "********",
+        )
 
     def test_only_real_config_changes_persist_and_advance_agent_runtime(self):
         values = {

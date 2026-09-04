@@ -11,8 +11,9 @@ from typing import Any
 from app.agent.action_history import action_history_owner_digest
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolContext, ToolResult
+from app.agent.provider_actions import get_provider_gateway
+from app.agent.provider_models import ProviderGatewayError
 from app.agent.public_safety import sanitize_public_text
-from app.clients.base import close_media_server_client
 from app.modules.media_server_profiles import list_configured_profiles
 from app.repositories.media_experience import (
     clear_media_preferences,
@@ -84,18 +85,36 @@ def empty_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
-def continue_watching_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+def _media_list_arguments(
+    arguments: dict[str, Any], *, label: str, maximum: int = 20
+) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) - {"server", "limit"}:
-        raise AgentToolError("继续观看只接受 server 和 limit")
+        raise AgentToolError(f"{label}只接受 server 和 limit")
     server = str(arguments.get("server") or "auto").strip().lower()
     if server not in {"auto", "jellyfin", "emby"}:
         raise AgentToolError("server 仅支持 auto、jellyfin 或 emby")
     limit = arguments.get("limit", 8)
-    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 12:
-        raise AgentToolError("limit 必须是 1 到 12 的整数")
+    if (
+        isinstance(limit, bool)
+        or not isinstance(limit, int)
+        or not 1 <= limit <= maximum
+    ):
+        raise AgentToolError(f"limit 必须是 1 到 {maximum} 的整数")
     return {"server": server, "limit": limit}
+
+
+def continue_watching_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    return _media_list_arguments(arguments, label="继续观看")
+
+
+def recently_played_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    return _media_list_arguments(arguments, label="最近播放")
+
+
+def recently_added_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    return _media_list_arguments(arguments, label="最近入库")
 
 
 def preferences_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -141,18 +160,6 @@ def notification_rule_update_arguments(arguments: dict[str, Any]) -> dict[str, A
     return result
 
 
-def _client(profile: Any) -> Any:
-    if profile.server_type == "jellyfin":
-        from app.clients.jellyfin import JellyfinClient
-
-        return JellyfinClient(profile.url, profile.credential)
-    if profile.server_type == "emby":
-        from app.clients.emby import EmbyClient
-
-        return EmbyClient(profile.url, profile.credential)
-    raise AgentToolError("媒体服务器类型不受支持", code="precondition_failed")
-
-
 def explicit_preferred_download_target(owner: str) -> str:
     """只返回 owner 显式保存的下载目标；没有显式记录时保持原有澄清行为。"""
     normalized_owner = str(owner or "").strip()
@@ -165,9 +172,12 @@ def explicit_preferred_download_target(owner: str) -> str:
     return target if target in {"qb", "guangya", "both"} else ""
 
 
-def get_continue_watching(
-    arguments: dict[str, Any], context: ToolContext
-) -> ToolResult:
+def _select_media_profile(
+    arguments: dict[str, Any],
+    context: ToolContext,
+    *,
+    purpose: str,
+) -> tuple[Any | None, ToolResult | None]:
     preferences = get_media_preferences(_owner_digest(context))
     requested = str(arguments["server"])
     if requested == "auto" and preferences["preferred_server"] != "any":
@@ -177,83 +187,92 @@ def get_continue_watching(
         for item in list_configured_profiles()
         if item.enabled
         and item.configured
-        and str(item.user_id or "").strip()
         and (requested == "auto" or item.server_type == requested)
     ]
     if not profiles:
-        return ToolResult(
+        return None, ToolResult(
             False,
             "precondition_failed",
-            "尚未配置可用于继续观看的显式媒体用户",
+            f"尚未配置可用于{purpose}的媒体服务器",
             data={"server": requested, "items": [], "user_selection": "required"},
-            error="请先配置 JELLYFIN_USER_ID 或 EMBY_USER_ID；不会回退读取管理员观看历史。",
+            error="请先启用并完整配置 Jellyfin 或 Emby。",
         )
     if len(profiles) != 1:
-        return ToolResult(
+        return None, ToolResult(
             False,
             "attention",
             "检测到多个可用媒体服务器，请明确指定 Jellyfin 或 Emby",
             data={"servers": [item.server_type for item in profiles], "items": []},
             suggestions=[
-                "可说：查看 Jellyfin 继续观看。",
-                "可说：查看 Emby 继续观看。",
+                f"可说：查看 Jellyfin {purpose}。",
+                f"可说：查看 Emby {purpose}。",
             ],
         )
-    profile = profiles[0]
-    client = None
+    return profiles[0], None
+
+
+def _query_media_profile(
+    arguments: dict[str, Any],
+    context: ToolContext,
+    *,
+    purpose: str,
+    operation: str,
+) -> ToolResult:
+    profile, failure = _select_media_profile(
+        arguments,
+        context,
+        purpose=purpose,
+    )
+    if failure is not None:
+        return failure
+    assert profile is not None
     try:
-        client = _client(profile)
-        items = client.continue_watching(profile.user_id, limit=int(arguments["limit"]))
-    except Exception:
+        return get_provider_gateway().query(
+            profile_ref=profile.source,
+            operation=operation,
+            arguments={"limit": int(arguments["limit"])},
+            context=context,
+        )
+    except ProviderGatewayError as exc:
         return ToolResult(
             False,
-            "unavailable",
-            f"暂时无法读取 {profile.label} 继续观看",
+            exc.code,
+            f"暂时无法读取 {profile.label} {purpose}",
             data={"server": profile.server_type, "items": []},
-            error="媒体服务器未返回可用的继续观看列表。",
+            error=exc.safe_message,
         )
-    finally:
-        close_media_server_client(client)
-    public_items = []
-    for item in items[: int(arguments["limit"])]:
-        public_items.append(
-            {
-                "title": sanitize_public_text(item.display_name, limit=120),
-                "episode_title": sanitize_public_text(item.name, limit=120),
-                "media_type": (
-                    str(item.type or "").strip().casefold()
-                    if str(item.type or "").strip().casefold()
-                    in {"movie", "series", "episode", "video"}
-                    else "unknown"
-                ),
-                "season": item.season_number
-                if isinstance(item.season_number, int)
-                else None,
-                "episode": item.episode_number
-                if isinstance(item.episode_number, int)
-                else None,
-                "progress": max(0.0, min(float(item.progress or 0.0), 100.0)),
-                "last_played": sanitize_public_text(item.last_played, limit=40),
-            }
-        )
-    return ToolResult(
-        True,
-        "completed",
-        f"已读取 {profile.label} 的继续观看列表",
-        data={
-            "server": profile.server_type,
-            "server_label": profile.label,
-            "user_selection": "explicit_config",
-            "count": len(public_items),
-            "items": public_items,
-        },
-        evidence=[
-            Evidence(
-                "media_server_resume",
-                "只使用部署级明确配置的共享媒体用户读取 Resume 列表；未回退选择管理员或其他用户，也未返回用户 ID、媒体内部 ID、URL 或凭据。",
-                _now(),
-            )
-        ],
+
+
+def get_continue_watching(
+    arguments: dict[str, Any], context: ToolContext
+) -> ToolResult:
+    return _query_media_profile(
+        arguments,
+        context,
+        purpose="继续观看",
+        operation="media.items.continue_watching",
+    )
+
+
+def get_recently_played(
+    arguments: dict[str, Any], context: ToolContext
+) -> ToolResult:
+    return _query_media_profile(
+        arguments,
+        context,
+        purpose="最近播放",
+        operation="media.items.recent_played",
+    )
+
+
+def get_recently_added(
+    arguments: dict[str, Any], context: ToolContext
+) -> ToolResult:
+    return _query_media_profile(
+        arguments,
+        context,
+        purpose="最近入库",
+        operation="media.items.recent_added",
     )
 
 
