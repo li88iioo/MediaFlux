@@ -626,6 +626,18 @@ class PipelineResilienceIncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(query["v"], ["1"])
         self.assertEqual(query["sig"], [sign_playgy("文件-id", "etag%?#", 123)])
 
+    def test_playgy_get_and_head_have_unique_openapi_operation_ids(self):
+        from app.routes.proxy import router as playgy_router
+
+        app = FastAPI()
+        app.include_router(playgy_router)
+        operations = app.openapi()["paths"][
+            "/playgy/{file_id}/{etag}/{size}/{filename}"
+        ]
+
+        self.assertEqual(operations["get"]["operationId"], "proxy_play_gy_get")
+        self.assertEqual(operations["head"]["operationId"], "proxy_play_gy_head")
+
     def test_strm_url_with_slash_identifier_reaches_proxy_with_original_identity(self):
         from app.routes.proxy import router as playgy_router
 

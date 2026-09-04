@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -86,6 +87,78 @@ class RecognitionWebHintsTests(unittest.TestCase):
         self.assertTrue(second.cached)
         self.assertEqual(queries, ['"Wrong Movie" 2024 TV series'])
         reserve.assert_called_once_with(20)
+
+    def test_concurrent_identical_hint_waits_for_cached_owner_result(self):
+        both_reserved = threading.Event()
+        reserve_lock = threading.Lock()
+        reserve_count = 0
+        request_calls = 0
+        reserve_daily = Mock(return_value=True)
+        original_reserve = hints._singleflight.reserve
+
+        def reserve(key):
+            nonlocal reserve_count
+            lease = original_reserve(key)
+            with reserve_lock:
+                reserve_count += 1
+                if reserve_count == 2:
+                    both_reserved.set()
+            return lease
+
+        async def request(*_args, **_kwargs):
+            nonlocal request_calls
+            request_calls += 1
+            if not await asyncio.to_thread(both_reserved.wait, 2):
+                raise RuntimeError("concurrent waiter did not reserve")
+            return hints.RecognitionWebHintResult(
+                titles=("Corrected Movie",), attempted=True, status="ok"
+            )
+
+        start = threading.Barrier(2)
+        results = [None, None]
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                start.wait(timeout=2)
+                results[index] = hints.search_recognition_titles(
+                    "Wrong Movie",
+                    media_type="movie",
+                    year="2024",
+                    reserve_daily=reserve_daily,
+                    runner=asyncio.run,
+                )
+            except BaseException as exc:  # pragma: no cover - 线程错误回传
+                errors.append(exc)
+
+        with (
+            patch.object(hints, "get_bool", return_value=True),
+            patch.object(hints, "get", side_effect=self._get),
+            patch.object(hints, "_request_titles", side_effect=request),
+            patch.object(hints._singleflight, "reserve", side_effect=reserve),
+        ):
+            threads = [
+                threading.Thread(target=worker, args=(index,)) for index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(request_calls, 1)
+        reserve_daily.assert_called_once_with(20)
+        self.assertEqual(
+            sorted(result.cached for result in results if result is not None),
+            [False, True],
+        )
+        self.assertTrue(
+            all(
+                result is not None and result.titles == ("Corrected Movie",)
+                for result in results
+            )
+        )
 
     def test_known_result_site_suffix_adds_clean_title_variant(self):
         response = SimpleNamespace(

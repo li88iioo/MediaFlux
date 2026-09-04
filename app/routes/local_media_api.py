@@ -435,18 +435,22 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
             candidates, error, current = discover_local_media_directory_candidates(
                 source, selected_path,
             )
-            if error or current is None:
+            if current is None:
                 return api_error(error or "目录读取失败", 400)
             targets = db.list_local_library_targets(source.id, owner=_OWNER)
             organize_ready = bool(targets) and source.mode != "preview_only"
             serialized: list[dict] = []
+            serialization_incomplete = False
             for candidate in candidates:
                 try:
                     serialized.append(candidate_payload(
                         source, candidate, organize_ready=organize_ready, allow_nested=True,
                     ))
                 except (FileNotFoundError, OSError, PathMappingError):
+                    serialization_incomplete = True
                     continue
+            if serialization_incomplete and not error:
+                error = "目录扫描不完整：部分条目在读取期间发生变化"
             root_candidate = Path(source.local_root).expanduser().absolute()
             root = assert_within(root_candidate, root_candidate)
             relative = current.relative_to(root)
@@ -458,7 +462,10 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
             return {
                 "items": serialized,
                 "sources": [{
-                    "id": source.id, "name": source.name, "count": len(serialized), "error": "",
+                    "id": source.id,
+                    "name": source.name,
+                    "count": len(serialized),
+                    "error": error,
                 }],
                 "browse": {
                     "source_id": source.id,
@@ -476,12 +483,13 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
             targets = db.list_local_library_targets(source.id, owner=_OWNER)
             organize_ready = bool(targets) and source.mode != "preview_only"
             candidates, error, _ = discover_local_media_directory_candidates(source)
-            if error:
+            if error and not candidates:
                 source_results.append({
                     "id": source.id, "name": source.name, "count": 0, "error": error,
                 })
                 continue
             serialized: list[dict] = []
+            serialization_incomplete = False
             for candidate in candidates:
                 try:
                     serialized.append(
@@ -489,10 +497,16 @@ def list_media_items(request: Request, source_id: int = 0, path: str = ""):
                     )
                 except (FileNotFoundError, OSError, PathMappingError):
                     # 列表读取期间条目可能被下载器改名或移动；跳过瞬时失效项即可。
+                    serialization_incomplete = True
                     continue
+            if serialization_incomplete and not error:
+                error = "目录扫描不完整：部分条目在读取期间发生变化"
             items.extend(serialized)
             source_results.append({
-                "id": source.id, "name": source.name, "count": len(serialized), "error": "",
+                "id": source.id,
+                "name": source.name,
+                "count": len(serialized),
+                "error": error,
             })
         items.sort(key=lambda item: (item["source_name"].casefold(), item["name"].casefold()))
         return {"items": items, "sources": source_results, "browse": None}

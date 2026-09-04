@@ -363,7 +363,7 @@ class LocalMediaScheduler:
                     candidate for candidate in candidates
                     if _candidate_matches_query(candidate, candidate_query)
                 ]
-            if error:
+            if error and not candidates:
                 source_results.append({
                     "id": source.id, "name": source.name, "candidates": 0,
                     "queued": 0, "skipped": True, "reason": "", "error": error,
@@ -395,7 +395,7 @@ class LocalMediaScheduler:
                 "queued": len(set(source_task_ids)),
                 "skipped": False,
                 "reason": "",
-                "error": "",
+                "error": error,
             })
         unique_task_ids = list(dict.fromkeys(task_ids))
         if capture_results and unique_task_ids:

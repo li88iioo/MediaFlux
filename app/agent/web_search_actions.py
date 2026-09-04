@@ -9,7 +9,6 @@ import re
 import time
 import unicodedata
 from collections.abc import Callable
-from datetime import date
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -23,6 +22,10 @@ from app.agent.async_bridge import (
 )
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.agent.web_request_singleflight import (
+    WEB_REQUEST_SINGLE_FLIGHT_WAIT_SECONDS,
+    web_request_singleflight,
+)
 from app.config import get
 from app.indexers.errors import (
     IndexerError,
@@ -182,8 +185,9 @@ def _store_cache(key: str, result: ToolResult) -> None:
 
 
 def clear_web_search_cache() -> None:
-    """清空跨 Worker 共享的网页搜索结果缓存。"""
+    """清空跨 Worker 共享缓存，并释放本进程内等待中的同键请求。"""
     db.clear_agent_web_search_cache()
+    web_request_singleflight.clear()
 
 
 def reset_web_search_cache_for_tests() -> None:
@@ -230,7 +234,11 @@ def _map_response(
             item["published_date"] = published
         results.append(item)
         evidence.append(
-            Evidence("web_search", f"{title}（{host}）", date.today().isoformat())
+            Evidence(
+                "web_search",
+                f"{title}（{host}）",
+                db.current_agent_web_search_usage_date(),
+            )
         )
     if not results:
         return ToolResult(
@@ -358,23 +366,40 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
             error="请从同步 Agent 查询入口调用网页搜索。",
         )
 
-    daily_limit = _int_config(
-        "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
-    )
+    lease = web_request_singleflight.reserve(("search", key))
+    if not lease.owner:
+        if not web_request_singleflight.wait(
+            lease, timeout=WEB_REQUEST_SINGLE_FLIGHT_WAIT_SECONDS
+        ):
+            return ToolResult(False, "unavailable", "网页搜索服务暂时不可用")
+        cached = _cached(key)
+        if cached is None:
+            return ToolResult(False, "unavailable", "网页搜索服务暂时不可用")
+        cached.data = dict(cached.data)
+        cached.data["cached"] = True
+        return cached
+
     cost = 2 if depth == "advanced" else 1
-    usage_date = date.today().isoformat()
-    if not db.reserve_agent_web_search_credits(
-        provider="tavily", usage_date=usage_date, cost=cost, daily_limit=daily_limit
-    ):
-        return ToolResult(
-            False,
-            "budget_exhausted",
-            "今日网页搜索额度已用完",
-            data={"daily_limit": daily_limit, "usage_date": usage_date},
-            suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
-        )
-    charged = True
+    usage_date = db.current_agent_web_search_usage_date()
+    charged = False
     try:
+        daily_limit = _int_config(
+            "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
+        )
+        if not db.reserve_agent_web_search_credits(
+            provider="tavily",
+            usage_date=usage_date,
+            cost=cost,
+            daily_limit=daily_limit,
+        ):
+            return ToolResult(
+                False,
+                "budget_exhausted",
+                "今日网页搜索额度已用完",
+                data={"daily_limit": daily_limit, "usage_date": usage_date},
+                suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
+            )
+        charged = True
         result = run_awaitable_sync(
             _search_tavily(normalized, api_key=api_key, depth=depth)
         )
@@ -388,11 +413,15 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
                     "cached": False,
                 }
             )
-            _store_cache(key, result)
             charged = False
+            try:
+                _store_cache(key, result)
+            except Exception as exc:  # noqa: BLE001 - 缓存失败不得覆盖有效搜索结果
+                logger.warning("Tavily 网页搜索缓存失败 type=%s", type(exc).__name__)
         return result
     finally:
         if charged:
             db.refund_agent_web_search_credits(
                 provider="tavily", usage_date=usage_date, cost=cost
             )
+        web_request_singleflight.finish(lease)

@@ -15,6 +15,7 @@ from app.agent.providers.media_server import MediaServerProviderTransport
 from app.agent.providers.qbittorrent import QBittorrentProviderTransport
 from app.repositories.agent_provider_plans import (
     invalidate_provider_plans_for_owner,
+    invalidate_provider_plans_for_session,
 )
 
 _GATEWAY: ProviderGateway | None = None
@@ -43,18 +44,37 @@ def reset_provider_gateway_for_tests() -> None:
         _GATEWAY = None
 
 
-def clear_provider_session_state(*, owner: str) -> dict[str, int]:
-    """统一撤销 owner 的 Provider artifacts 与短期写计划。"""
+def clear_provider_session_state(
+    *,
+    owner: str,
+    session_id: str = "",
+) -> dict[str, int]:
+    """统一撤销 owner 或其指定会话的 Provider artifacts 与短期写计划。"""
     owner_key = str(owner or "").strip()
+    session_key = str(session_id or "").strip()
     if not owner_key:
         return {"artifacts": 0, "plans": 0}
     with _LOCK:
         artifacts = (
-            _GATEWAY.artifacts.clear_owner(owner=owner_key)
+            (
+                _GATEWAY.artifacts.clear_session(
+                    owner=owner_key,
+                    session_id=session_key,
+                )
+                if session_key
+                else _GATEWAY.artifacts.clear_owner(owner=owner_key)
+            )
             if _GATEWAY is not None
             else 0
         )
-    plans = invalidate_provider_plans_for_owner(owner=owner_key)
+    plans = (
+        invalidate_provider_plans_for_session(
+            owner=owner_key,
+            session_id=session_key,
+        )
+        if session_key
+        else invalidate_provider_plans_for_owner(owner=owner_key)
+    )
     return {
         "artifacts": artifacts,
         "plans": int(plans["scrubbed_running"]) + int(plans["deleted"]),

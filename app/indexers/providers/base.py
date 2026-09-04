@@ -8,7 +8,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from urllib.parse import parse_qs, urljoin, urlsplit
 
-from ..concurrency import CrossLoopAsyncLock
+from app.concurrency import CrossLoopAsyncLock
 from ..errors import IndexerInvalidResponse, IndexerSecurityError
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
 

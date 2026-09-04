@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from app import config
 from app.logger import get_logger, log_throttled
+from app.modules.image_payload import ImagePayloadError, read_bounded_image
 
 logger = get_logger(__name__)
 router = APIRouter()
@@ -86,18 +87,34 @@ def media_image(request: Request, server: str, item_id: str):
     cache_key = _missing_image_cache_key(request, server, base_url, item_id)
     if _is_missing_image_cached(cache_key):
         return _missing_image_response()
+    upstream = None
     try:
         upstream = requests.get(
             f"{base_url}/Items/{item_id}/Images/Primary",
             headers=headers,
             params=params,
             timeout=15,
+            stream=True,
         )
         if upstream.status_code == 404:
             _remember_missing_image(cache_key)
             logger.debug(f"[{server}] 海报尚未就绪或不存在 item_id={item_id}")
             return _missing_image_response()
         upstream.raise_for_status()
+        try:
+            content, content_type = read_bounded_image(upstream)
+        except ImagePayloadError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        return Response(
+            content=content,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "private, max-age=3600",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
+    except HTTPException:
+        raise
     except requests.RequestException as exc:
         log_throttled(
             logger,
@@ -108,11 +125,6 @@ def media_image(request: Request, server: str, item_id: str):
             type(exc).__name__,
         )
         raise HTTPException(status_code=502, detail="upstream image failed") from exc
-    content_type = upstream.headers.get("Content-Type", "")
-    if not content_type.startswith("image/"):
-        raise HTTPException(status_code=502, detail="invalid upstream content type")
-    return Response(
-        content=upstream.content,
-        media_type=content_type,
-        headers={"Cache-Control": "private, max-age=3600"},
-    )
+    finally:
+        if upstream is not None:
+            upstream.close()

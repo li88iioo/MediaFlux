@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -837,6 +838,82 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             confirmation_module._confirmation_dispatch_loop()
 
         get_next.assert_not_called()
+
+    def test_dispatcher_restart_does_not_revive_timed_out_worker_generation(self):
+        processing = threading.Event()
+        release = threading.Event()
+        claims: list[int] = []
+        first_worker: list[int] = []
+
+        def get_next():
+            worker = threading.get_ident()
+            claims.append(worker)
+            if not first_worker:
+                first_worker.append(worker)
+                return {"token": "queued-token"}
+            return None
+
+        def dispatch(_token):
+            processing.set()
+            release.wait(timeout=2)
+            return {"ok": False}
+
+        try:
+            with (
+                patch.object(
+                    confirmation_module,
+                    "_run_confirmation_maintenance",
+                    return_value=False,
+                ),
+                patch.object(
+                    confirmation_module,
+                    "_dispatch_due_confirmation_delivery",
+                    return_value=False,
+                ),
+                patch.object(
+                    confirmation_module.db,
+                    "get_next_queued_organize_confirmation",
+                    side_effect=get_next,
+                ),
+                patch.object(
+                    confirmation_module,
+                    "_dispatch_confirmation_token",
+                    side_effect=dispatch,
+                ),
+                patch.object(confirmation_module, "_DISPATCH_POLL_SECONDS", 0.01),
+                patch.object(
+                    confirmation_module,
+                    "start_recognition_review_dispatcher",
+                ),
+                patch.object(
+                    confirmation_module,
+                    "stop_recognition_review_dispatcher",
+                    return_value=True,
+                ),
+            ):
+                confirmation_module.start_confirmation_dispatcher()
+                self.assertTrue(processing.wait(timeout=1))
+                old_worker = first_worker[0]
+                self.assertFalse(
+                    confirmation_module.stop_confirmation_dispatcher(timeout=0)
+                )
+
+                confirmation_module.start_confirmation_dispatcher()
+                deadline = time.monotonic() + 1
+                while (
+                    not any(worker != old_worker for worker in claims)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                self.assertTrue(any(worker != old_worker for worker in claims))
+
+                release.set()
+                time.sleep(0.05)
+                confirmation_module.stop_confirmation_dispatcher(timeout=1)
+
+            self.assertEqual(claims.count(old_worker), 1)
+        finally:
+            release.set()
 
     def test_cancel_marks_record_and_rejects_later_candidate_click(self):
         actions = create_confirmation_actions(

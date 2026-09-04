@@ -865,6 +865,45 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             task = db.get_local_media_task(result["task_ids"][0], owner="admin")
             self.assertEqual(Path(task.content_path), media_dir / "Movie.2026.mkv")
 
+    def test_manual_scan_queues_good_candidates_and_reports_partial_error(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            source_root = root / "downloads"
+            target_root = root / "library"
+            source_root.mkdir()
+            target_root.mkdir()
+            candidate = source_root / "Movie.2026.mkv"
+            candidate.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="本地下载",
+                qb_profile="",
+                qb_path_prefix="",
+                local_root=str(source_root),
+                owner="admin",
+            )
+            db.upsert_local_library_target(
+                source_id,
+                "default",
+                str(target_root),
+                owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with patch.object(
+                scheduler,
+                "_source_candidates",
+                return_value=(
+                    [candidate],
+                    "目录扫描不完整：目录文件数量超过安全上限",
+                ),
+            ):
+                result = scheduler.enqueue_manual_scan_candidates()
+
+            self.assertEqual(result["candidate_count"], 1)
+            self.assertEqual(result["queued_count"], 1)
+            self.assertFalse(result["sources"][0]["skipped"])
+            self.assertIn("扫描不完整", result["sources"][0]["error"])
+
     def test_manual_scan_splits_mixed_collection_into_independent_media_units(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

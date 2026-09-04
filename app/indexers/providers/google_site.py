@@ -8,7 +8,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from bs4 import BeautifulSoup
 
-from ..concurrency import CrossLoopAsyncLock
+from app.concurrency import CrossLoopAsyncLock
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerSecurityError, IndexerUnavailable
 from .base import fixed_host_join, require_html_response
 

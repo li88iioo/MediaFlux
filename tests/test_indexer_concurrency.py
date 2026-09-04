@@ -5,8 +5,59 @@ import threading
 import time
 import unittest
 
-from app.indexers.concurrency import CrossLoopAsyncLock
+from app.concurrency import CrossLoopAsyncLock, KeyedSingleFlight
 from app.indexers.providers.base import SearchRequestPacer
+
+
+class KeyedSingleFlightTests(unittest.TestCase):
+    def test_same_key_has_one_owner_and_finish_releases_waiter(self):
+        flight = KeyedSingleFlight(max_entries=2)
+        owner = flight.reserve("same")
+        waiter = flight.reserve("same")
+
+        self.assertTrue(owner.owner)
+        self.assertFalse(waiter.owner)
+        self.assertEqual(flight.active_count, 1)
+        self.assertFalse(flight.wait(waiter, timeout=0.01))
+
+        flight.finish(owner)
+
+        self.assertTrue(flight.wait(waiter, timeout=0.1))
+        self.assertEqual(flight.active_count, 0)
+
+    def test_clear_releases_waiters_and_isolates_stale_owner(self):
+        flight = KeyedSingleFlight(max_entries=2)
+        stale_owner = flight.reserve("same")
+        stale_waiter = flight.reserve("same")
+        generation = flight.generation
+
+        flight.clear()
+
+        self.assertEqual(flight.generation, generation + 1)
+        self.assertTrue(flight.wait(stale_waiter, timeout=0.1))
+        current_owner = flight.reserve("same")
+        current_waiter = flight.reserve("same")
+        flight.finish(stale_owner)
+        self.assertFalse(flight.wait(current_waiter, timeout=0.01))
+
+        flight.finish(current_owner)
+        self.assertTrue(flight.wait(current_waiter, timeout=0.1))
+
+    def test_capacity_is_bounded_without_serializing_distinct_keys(self):
+        flight = KeyedSingleFlight(max_entries=1)
+        first = flight.reserve("first")
+        overflow = flight.reserve("second")
+
+        self.assertTrue(first.owner)
+        self.assertTrue(first.tracked)
+        self.assertTrue(overflow.owner)
+        self.assertFalse(overflow.tracked)
+        self.assertEqual(flight.active_count, 1)
+
+        flight.finish(overflow)
+        self.assertEqual(flight.active_count, 1)
+        flight.finish(first)
+        self.assertEqual(flight.active_count, 0)
 
 
 class CrossLoopAsyncLockTests(unittest.TestCase):

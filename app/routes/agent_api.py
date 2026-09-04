@@ -14,6 +14,7 @@ from app import config
 from app.agent.feature_gate import is_agent_enabled
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime
 from app.agent.kernel.public_view import public_conversation_messages
+from app.agent.kernel.state import SessionBusyError
 from app.agent.kernel.transports import (
     EffectEnvelope,
     QueryEnvelope,
@@ -83,6 +84,14 @@ def _error(exc: Exception):
         return api_error(str(exc), 429)
     if isinstance(exc, TransportInputError):
         return api_error(str(exc), 400)
+    if isinstance(exc, SessionBusyError):
+        return api_response(
+            {
+                "error": "已确认写操作正在执行，当前会话暂不能重置或删除",
+                "code": "effect_in_progress",
+            },
+            409,
+        )
     logger.warning("Agent Kernel API 失败 type=%s", type(exc).__name__)
     return api_error("Media Agent 暂时不可用", 500)
 
@@ -254,8 +263,7 @@ async def reset_session(request: Request, data: Annotated[Any, Body()] = None):
         owner = _owner(request)
         session_id = _session_id(data.get("session_id"))
         runtime = get_agent_kernel_runtime()
-        await runtime.session.cancel(owner=owner, session_id=session_id)
-        state = await runtime.store.reset_session(owner=owner, session_id=session_id)
+        state = await runtime.lifecycle.reset(owner=owner, session_id=session_id)
         return api_response({"session_id": session_id, "generation": state.generation})
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
         return _error(exc)
@@ -339,8 +347,7 @@ async def delete_session(request: Request, session_id: str):
         owner = _owner(request)
         normalized = _session_id(session_id)
         runtime = get_agent_kernel_runtime()
-        await runtime.session.cancel(owner=owner, session_id=normalized)
-        deleted = await runtime.store.delete_session(owner=owner, session_id=normalized)
+        deleted = await runtime.lifecycle.delete(owner=owner, session_id=normalized)
         return api_response({"deleted": deleted, "session_id": normalized})
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
         return _error(exc)

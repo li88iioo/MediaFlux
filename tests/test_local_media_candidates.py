@@ -12,6 +12,7 @@ from app.modules.local_media_candidates import (
     discover_local_media_candidates,
     move_candidate_to_trash,
 )
+from app.modules.local_storage import LocalFilesystemAdapter, LocalScanLimitExceeded
 
 
 class LocalMediaCandidateTests(unittest.TestCase):
@@ -44,6 +45,53 @@ class LocalMediaCandidateTests(unittest.TestCase):
 
             self.assertEqual(error, "")
             self.assertEqual(candidates, [proof])
+
+    def test_discovery_preserves_good_candidates_and_reports_partial_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            good = root / "Good.mkv"
+            good.write_bytes(b"movie")
+            blocked = root / "Blocked"
+            blocked.mkdir()
+
+            original = LocalFilesystemAdapter.contains_video
+
+            def contains_video(adapter, path):
+                if Path(path).name == "Blocked":
+                    raise LocalScanLimitExceeded("目录文件数量超过安全上限")
+                return original(adapter, path)
+
+            with patch.object(
+                LocalFilesystemAdapter,
+                "contains_video",
+                autospec=True,
+                side_effect=contains_video,
+            ):
+                candidates, error = discover_local_media_candidates(
+                    SimpleNamespace(local_root=str(root))
+                )
+
+            self.assertEqual(candidates, [good])
+            self.assertIn("目录扫描不完整", error)
+            self.assertIn("目录文件数量超过安全上限", error)
+
+    def test_discovery_never_reports_empty_success_when_all_probes_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            blocked = root / "Blocked"
+            blocked.mkdir()
+
+            with patch.object(
+                LocalFilesystemAdapter,
+                "contains_video",
+                side_effect=LocalScanLimitExceeded("目录扫描深度超过安全上限"),
+            ):
+                candidates, error = discover_local_media_candidates(
+                    SimpleNamespace(local_root=str(root))
+                )
+
+            self.assertEqual(candidates, [])
+            self.assertIn("目录扫描深度超过安全上限", error)
 
     def test_rollback_never_overwrites_recreated_root_file(self) -> None:
         with tempfile.TemporaryDirectory() as root_raw:

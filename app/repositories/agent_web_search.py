@@ -1,7 +1,7 @@
 """Agent 网页搜索每日额度的数据访问。"""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 import json
 import re
 import time
@@ -17,6 +17,11 @@ def _database() -> "ModuleType":
     from app import database
 
     return database
+
+
+def current_agent_web_search_usage_date() -> str:
+    """返回共享每日额度使用的本地日历日。"""
+    return date.today().isoformat()
 
 
 def _validate_agent_web_search_usage_date(value: str) -> str:

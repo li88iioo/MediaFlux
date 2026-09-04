@@ -27,6 +27,54 @@ class SupportBundleTests(unittest.TestCase):
             trash_dir=root / "trash",
         )
 
+    def test_bundle_rejects_authoritative_runtime_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self._paths(Path(temporary))
+            paths.ensure_writable_dirs()
+            paths.database_path.write_bytes(b"database")
+            paths.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
+            paths.token_file.write_text('{"token":"keep"}', encoding="utf-8")
+
+            with patch("app.modules.support_bundle.run_diagnostics") as diagnostics:
+                for target in (
+                    paths.database_path,
+                    paths.env_file,
+                    paths.token_file,
+                ):
+                    with self.subTest(target=target.name):
+                        original = target.read_bytes()
+                        with self.assertRaisesRegex(
+                            Exception,
+                            "支持包输出不能覆盖 MediaFlux 运行文件",
+                        ):
+                            create_support_bundle(paths, output=target)
+                        self.assertEqual(target.read_bytes(), original)
+            diagnostics.assert_not_called()
+
+    @unittest.skipUnless(os.name == "posix", "文件别名验证仅在 POSIX 环境执行")
+    def test_bundle_rejects_runtime_file_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self._paths(root)
+            paths.ensure_writable_dirs()
+            paths.token_file.write_text('{"token":"keep"}', encoding="utf-8")
+            symlink = root / "token-alias.zip"
+            symlink.symlink_to(paths.token_file)
+            hardlink = root / "token-hardlink.zip"
+            os.link(paths.token_file, hardlink)
+
+            for target in (symlink, hardlink):
+                with self.subTest(target=target.name):
+                    with self.assertRaisesRegex(
+                        Exception,
+                        "支持包输出不能覆盖 MediaFlux 运行文件",
+                    ):
+                        create_support_bundle(paths, output=target)
+            self.assertEqual(
+                paths.token_file.read_text(encoding="utf-8"),
+                '{"token":"keep"}',
+            )
+
     def test_bundle_is_redacted_and_excludes_sensitive_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

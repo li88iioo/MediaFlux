@@ -65,6 +65,22 @@ class ProviderArtifactStore:
                 self._items.pop(ref, None)
         return len(refs)
 
+    def clear_session(self, *, owner: str, session_id: str) -> int:
+        """仅清除指定 owner/session 的短期对象引用。"""
+        owner_key = str(owner or "").strip()
+        session_key = str(session_id or "").strip()
+        if not owner_key or not session_key:
+            return 0
+        with self._lock:
+            refs = [
+                ref
+                for ref, item in self._items.items()
+                if item.owner == owner_key and item.session_id == session_key
+            ]
+            for ref in refs:
+                self._items.pop(ref, None)
+        return len(refs)
+
     def _prune_locked(self, now: float) -> None:
         expired = [key for key, item in self._items.items() if item.expires_at <= now]
         for key in expired:

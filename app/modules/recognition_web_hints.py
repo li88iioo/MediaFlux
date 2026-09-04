@@ -12,7 +12,6 @@ import threading
 import time
 import unicodedata
 from dataclasses import dataclass
-from datetime import date
 from typing import Any, Callable
 
 import httpx
@@ -22,6 +21,7 @@ from app.agent.async_bridge import (
     ensure_sync_bridge_available,
     run_awaitable_sync,
 )
+from app.concurrency import KeyedSingleFlight
 from app.config import get, get_bool
 from app.logger import get_logger
 from app.sensitive_data import contains_sensitive_credential
@@ -41,8 +41,8 @@ _CACHE_LIMIT = 128
 _NEGATIVE_CACHE_TTL_SECONDS = 30.0
 _SINGLE_FLIGHT_WAIT_SECONDS = 35.0
 _cache: dict[str, tuple[float, "RecognitionWebHintResult"]] = {}
-_inflight: dict[str, threading.Event] = {}
 _cache_lock = threading.RLock()
+_singleflight = KeyedSingleFlight(max_entries=_CACHE_LIMIT)
 _generation = 0
 
 
@@ -138,11 +138,14 @@ def _store(
 
 
 def _reserve_daily(limit: int) -> bool:
-    from app.database import reserve_agent_web_search_credits
+    from app.database import (
+        current_agent_web_search_usage_date,
+        reserve_agent_web_search_credits,
+    )
 
     return reserve_agent_web_search_credits(
         provider="tavily_recognition",
-        usage_date=date.today().isoformat(),
+        usage_date=current_agent_web_search_usage_date(),
         cost=1,
         daily_limit=limit,
     )
@@ -279,79 +282,67 @@ def search_recognition_titles(
 
     with _cache_lock:
         generation = _generation
-        in_flight = _inflight.get(key)
-        if in_flight is None:
-            in_flight = threading.Event()
-            _inflight[key] = in_flight
-            owner = True
-        else:
-            owner = False
-    if not owner:
-        if not in_flight.wait(timeout=_SINGLE_FLIGHT_WAIT_SECONDS):
+    lease = _singleflight.reserve(key)
+    if not lease.owner:
+        if not _singleflight.wait(lease, timeout=_SINGLE_FLIGHT_WAIT_SECONDS):
             return RecognitionWebHintResult(status="unavailable")
         cached = _cached(key)
         return cached or RecognitionWebHintResult(status="unavailable")
 
-    owner_event = in_flight
     result = RecognitionWebHintResult(status="unavailable")
     awaitable: object | None = None
     try:
-        daily_limit = _bounded_int(
-            "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT",
-            20,
-            minimum=1,
-            maximum=100_000,
-        )
-        if not reserve_daily(daily_limit):
-            result = RecognitionWebHintResult(status="budget_exhausted")
-        else:
-            query_parts = [f'"{normalized_title}"']
-            if normalized_year:
-                query_parts.append(normalized_year)
-            if normalized_type == "tv":
-                query_parts.append("TV series")
-            elif normalized_type == "movie":
-                query_parts.append("movie")
-            awaitable = _request_titles(
-                " ".join(query_parts),
-                api_key=api_key,
-                client_factory=client_factory,
+        try:
+            daily_limit = _bounded_int(
+                "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT",
+                20,
+                minimum=1,
+                maximum=100_000,
             )
-            result = runner(awaitable)
-            awaitable = None
+            if not reserve_daily(daily_limit):
+                result = RecognitionWebHintResult(status="budget_exhausted")
+            else:
+                query_parts = [f'"{normalized_title}"']
+                if normalized_year:
+                    query_parts.append(normalized_year)
+                if normalized_type == "tv":
+                    query_parts.append("TV series")
+                elif normalized_type == "movie":
+                    query_parts.append("movie")
+                awaitable = _request_titles(
+                    " ".join(query_parts),
+                    api_key=api_key,
+                    client_factory=client_factory,
+                )
+                result = runner(awaitable)
+                awaitable = None
+        except AsyncBridgeUnavailable:
+            _close_awaitable(awaitable)
+            result = RecognitionWebHintResult(status="unavailable")
+        except Exception as exc:
+            _close_awaitable(awaitable)
+            logger.info("整理标题线索执行失败 type=%s", type(exc).__name__)
+            result = RecognitionWebHintResult(
+                attempted=True, status="unavailable", error="Tavily 暂时不可用"
+            )
 
-    except AsyncBridgeUnavailable:
-        _close_awaitable(awaitable)
-        result = RecognitionWebHintResult(status="unavailable")
-    except Exception as exc:
-        _close_awaitable(awaitable)
-        logger.info("整理标题线索执行失败 type=%s", type(exc).__name__)
-        result = RecognitionWebHintResult(
-            attempted=True, status="unavailable", error="Tavily 暂时不可用"
-        )
+        if result.status in {"ok", "no_result"}:
+            _store(key, result, generation=generation)
+        elif result.status in {
+            "provider_error",
+            "invalid_response",
+            "unavailable",
+            "budget_exhausted",
+        }:
+            _store(
+                key,
+                result,
+                ttl_seconds=_NEGATIVE_CACHE_TTL_SECONDS,
+                generation=generation,
+            )
+        return result
     finally:
-        # 只有当前 owner 能释放自己登记的 single-flight 事件。配置热更新
-        # 后新一代同 key 请求不得被旧请求误删或提前唤醒。
-        with _cache_lock:
-            if _inflight.get(key) is owner_event:
-                _inflight.pop(key, None)
-                owner_event.set()
-
-    if result.status in {"ok", "no_result"}:
-        _store(key, result, generation=generation)
-    elif result.status in {
-        "provider_error",
-        "invalid_response",
-        "unavailable",
-        "budget_exhausted",
-    }:
-        _store(
-            key,
-            result,
-            ttl_seconds=_NEGATIVE_CACHE_TTL_SECONDS,
-            generation=generation,
-        )
-    return result
+        _singleflight.finish(lease)
 
 
 def clear_recognition_web_hint_cache() -> None:
@@ -360,10 +351,7 @@ def clear_recognition_web_hint_cache() -> None:
     with _cache_lock:
         _generation += 1
         _cache.clear()
-        pending = tuple(_inflight.values())
-        _inflight.clear()
-    for event in pending:
-        event.set()
+        _singleflight.clear()
 
 
 def reset_recognition_web_hints_for_tests() -> None:

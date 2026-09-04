@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import asyncio
 import secrets
 import time
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Protocol
+
+from app.concurrency import CrossLoopAsyncLock
 
 
 class ReferenceError(ValueError):
@@ -55,7 +56,7 @@ class InMemoryReferenceStore:
     def __init__(self, *, clock=time.monotonic, max_entries: int = 2048) -> None:
         self._clock = clock
         self._max_entries = max(32, int(max_entries))
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
         self._records: dict[str, _ReferenceRecord] = {}
 
     async def put(

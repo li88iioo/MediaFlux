@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -150,6 +152,35 @@ def _approval_model() -> _ScriptedModel:
 
 
 class RecognitionReviewKernelTests(IsolatedDatabaseTestCase):
+    def test_case_over_file_limit_abstains_before_external_services(self) -> None:
+        payload = _review_payload()
+        payload["files"] = [
+            {
+                "file_id": f"file-{index}",
+                "parent_id": "parent-1",
+                "name": f"测试动画.S01E{index:02d}.mkv",
+                "size": 1024,
+                "season": 1,
+                "episode": index,
+            }
+            for index in range(1, 82)
+        ]
+
+        with patch(
+            "app.modules.agent_recognition_review.ProviderSettings.from_config"
+        ) as settings, patch(
+            "app.modules.agent_recognition_review.OpenAICompatibleModelAdapter"
+        ) as model, patch(
+            "app.modules.agent_recognition_review.TMDBScraper"
+        ) as scraper:
+            decision = asyncio.run(_review_async(payload))
+
+        self.assertEqual(decision.status, "abstained")
+        self.assertEqual(decision.reason_code, "case_file_limit_exceeded")
+        settings.assert_not_called()
+        model.assert_not_called()
+        scraper.assert_not_called()
+
     def test_internal_kernel_approves_only_after_read_evidence(self) -> None:
         model = _approval_model()
         scraper = _FakeScraper()
@@ -667,3 +698,73 @@ class RecognitionReviewQueueTests(IsolatedDatabaseTestCase):
         self.assertEqual(current["status"], "pending")
         self.assertEqual(current["review_status"], "failed")
         self.assertIsNone(db.claim_next_organize_confirmation_review())
+
+
+class RecognitionReviewDispatcherTests(IsolatedDatabaseTestCase):
+    def tearDown(self) -> None:
+        organize_confirmations.stop_recognition_review_dispatcher(timeout=1)
+
+    def test_restart_does_not_revive_timed_out_worker_generation(self) -> None:
+        organize_confirmations.stop_recognition_review_dispatcher(timeout=1)
+        processing = threading.Event()
+        release = threading.Event()
+        claims: list[int] = []
+        first_worker: list[int] = []
+
+        def claim_next():
+            worker = threading.get_ident()
+            claims.append(worker)
+            if not first_worker:
+                first_worker.append(worker)
+                return {"token": "review-token"}
+            return None
+
+        def process(_row):
+            processing.set()
+            release.wait(timeout=2)
+            return "abstained"
+
+        try:
+            with (
+                patch.object(
+                    organize_confirmations.db,
+                    "recover_interrupted_organize_confirmation_reviews",
+                    return_value=0,
+                ),
+                patch.object(
+                    organize_confirmations.db,
+                    "claim_next_organize_confirmation_review",
+                    side_effect=claim_next,
+                ),
+                patch.object(
+                    organize_confirmations,
+                    "_process_recognition_review_row",
+                    side_effect=process,
+                ),
+                patch.object(organize_confirmations, "_DISPATCH_POLL_SECONDS", 0.01),
+            ):
+                organize_confirmations.start_recognition_review_dispatcher()
+                self.assertTrue(processing.wait(timeout=1))
+                old_worker = first_worker[0]
+                self.assertFalse(
+                    organize_confirmations.stop_recognition_review_dispatcher(
+                        timeout=0
+                    )
+                )
+
+                organize_confirmations.start_recognition_review_dispatcher()
+                deadline = time.monotonic() + 1
+                while (
+                    not any(worker != old_worker for worker in claims)
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.005)
+                self.assertTrue(any(worker != old_worker for worker in claims))
+
+                release.set()
+                time.sleep(0.05)
+                organize_confirmations.stop_recognition_review_dispatcher(timeout=1)
+
+            self.assertEqual(claims.count(old_worker), 1)
+        finally:
+            release.set()

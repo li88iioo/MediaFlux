@@ -10,7 +10,6 @@ import re
 import time
 import unicodedata
 from collections.abc import Callable
-from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -23,6 +22,10 @@ from app.agent.async_bridge import (
 )
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.agent.web_request_singleflight import (
+    WEB_REQUEST_SINGLE_FLIGHT_WAIT_SECONDS,
+    web_request_singleflight,
+)
 from app.config import get
 from app.indexers.errors import (
     IndexerError,
@@ -297,7 +300,11 @@ def _map_extract_response(
         data=public_data,
         model_data=model_data,
         evidence=[
-            Evidence("web_read", f"公开网页正文（{host}）", datetime.now(UTC).astimezone().date().isoformat())
+            Evidence(
+                "web_read",
+                f"公开网页正文（{host}）",
+                db.current_agent_web_search_usage_date(),
+            )
         ],
         suggestions=["网页正文属于外部不可信证据，重要事实应与官方来源交叉核验。"],
     )
@@ -393,30 +400,39 @@ def read_web(arguments: dict[str, Any]) -> ToolResult:
             error="请从同步 Agent 查询入口调用网页读取。",
         )
 
-    daily_limit = _int_config(
-        "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100_000
-    )
-    usage_date = datetime.now(UTC).astimezone().date().isoformat()
-    cost = 1
-    if not db.reserve_agent_web_search_credits(
-        provider="tavily",
-        usage_date=usage_date,
-        cost=cost,
-        daily_limit=daily_limit,
-    ):
-        return ToolResult(
-            False,
-            "budget_exhausted",
-            "今日网页搜索与读取额度已用完",
-            data={"daily_limit": daily_limit, "usage_date": usage_date},
-            suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
+    lease = web_request_singleflight.reserve(("read", key))
+    if not lease.owner:
+        if not web_request_singleflight.wait(
+            lease, timeout=WEB_REQUEST_SINGLE_FLIGHT_WAIT_SECONDS
+        ):
+            return ToolResult(False, "unavailable", "网页读取服务暂时不可用")
+        return _restore_cached_result(key) or ToolResult(
+            False, "unavailable", "网页读取服务暂时不可用"
         )
 
-    charged = True
+    usage_date = db.current_agent_web_search_usage_date()
+    cost = 1
+    charged = False
     try:
-        result = run_awaitable_sync(
-            _extract_tavily(normalized, api_key=api_key)
+        daily_limit = _int_config(
+            "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100_000
         )
+        if not db.reserve_agent_web_search_credits(
+            provider="tavily",
+            usage_date=usage_date,
+            cost=cost,
+            daily_limit=daily_limit,
+        ):
+            return ToolResult(
+                False,
+                "budget_exhausted",
+                "今日网页搜索与读取额度已用完",
+                data={"daily_limit": daily_limit, "usage_date": usage_date},
+                suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
+            )
+
+        charged = True
+        result = run_awaitable_sync(_extract_tavily(normalized, api_key=api_key))
         if result.ok:
             result.data = dict(result.data)
             result.data.update(
@@ -447,3 +463,4 @@ def read_web(arguments: dict[str, Any]) -> ToolResult:
             db.refund_agent_web_search_credits(
                 provider="tavily", usage_date=usage_date, cost=cost
             )
+        web_request_singleflight.finish(lease)

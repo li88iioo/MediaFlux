@@ -151,6 +151,11 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.store.list_sessions(owner="owner"), [])
 
+        recreated, _ = await self.store.begin_turn(
+            owner="owner", session_id="session-a", request_id="recreated"
+        )
+        self.assertGreater(recreated.generation, reset.generation)
+
     async def test_event_journal_records_real_public_events(self) -> None:
         event = AgentEvent(
             type=AgentEventType.TOOL_STARTED,

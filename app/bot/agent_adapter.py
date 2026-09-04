@@ -27,6 +27,7 @@ from app.agent.kernel.adapters import ApprovalView, TurnView
 from app.agent.kernel.bootstrap import get_agent_kernel_runtime
 from app.agent.kernel.events import AgentEvent, AgentEventType
 from app.agent.kernel.public_view import format_public_result
+from app.agent.kernel.state import SessionBusyError
 from app.agent.kernel.transports import EffectEnvelope, QueryEnvelope
 from app.agent.public_safety import public_tool_label
 from app.agent.rate_limit import agent_rate_limiter
@@ -852,9 +853,10 @@ def handle_agent_reset(bot: Any, message: Any) -> None:
     session_id = telegram_agent_session_id(chat_id, user_id)
     try:
         runtime = get_agent_kernel_runtime()
-        _run_async(runtime.telegram.cancel(owner=owner, session_id=session_id))
-        _run_async(runtime.store.reset_session(owner=owner, session_id=session_id))
+        _run_async(runtime.lifecycle.reset(owner=owner, session_id=session_id))
         bot.reply_to(message, "Media Agent 会话已重置。")
+    except SessionBusyError:
+        bot.reply_to(message, "已确认写操作正在执行，当前会话暂不能重置。")
     except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
         logger.warning("Telegram Agent 会话重置失败 type=%s", type(exc).__name__)
         bot.reply_to(message, "Agent 会话暂时无法重置，请稍后重试。")

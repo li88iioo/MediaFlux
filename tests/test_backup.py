@@ -38,6 +38,53 @@ def make_paths(root: Path) -> RuntimePaths:
 
 
 class BackupTests(unittest.TestCase):
+    def test_create_backup_rejects_authoritative_runtime_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_paths(Path(directory))
+            paths.ensure_writable_dirs()
+            sqlite3.connect(paths.database_path).close()
+            paths.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
+            paths.token_file.write_text('{"token":"keep"}', encoding="utf-8")
+
+            for target in (
+                paths.database_path,
+                paths.env_file,
+                paths.token_file,
+            ):
+                with self.subTest(target=target.name):
+                    original = target.read_bytes()
+                    with self.assertRaisesRegex(
+                        BackupError,
+                        "备份输出不能覆盖 MediaFlux 运行文件",
+                    ):
+                        create_backup(paths, output=target)
+                    self.assertEqual(target.read_bytes(), original)
+
+    @unittest.skipUnless(os.name == "posix", "文件别名验证仅在 POSIX 环境执行")
+    def test_create_backup_rejects_runtime_file_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = make_paths(root)
+            paths.ensure_writable_dirs()
+            paths.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
+
+            symlink = root / "config-alias.zip"
+            symlink.symlink_to(paths.env_file)
+            hardlink = root / "config-hardlink.zip"
+            os.link(paths.env_file, hardlink)
+
+            for target in (symlink, hardlink):
+                with self.subTest(target=target.name):
+                    with self.assertRaisesRegex(
+                        BackupError,
+                        "备份输出不能覆盖 MediaFlux 运行文件",
+                    ):
+                        create_backup(paths, output=target)
+            self.assertEqual(
+                paths.env_file.read_text(encoding="utf-8"),
+                "WEB_PORT=1258\n",
+            )
+
     def test_create_app_recovers_pending_restore_before_reading_session_secret(self) -> None:
         from app import main
 

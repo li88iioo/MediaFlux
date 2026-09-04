@@ -19,7 +19,7 @@ from app.modules.runtime_diagnostics import (
     run_diagnostics,
 )
 from app.private_files import protect_private_file, protect_private_stream
-from app.runtime_paths import RuntimePaths
+from app.runtime_paths import RuntimePaths, protected_runtime_output_target
 from app.security import redact_config
 from app.sensitive_data import is_sensitive_key, redact_sensitive_text
 from app.version import BuildInfo
@@ -438,6 +438,11 @@ def create_support_bundle(
     """创建支持包；不包含数据库、token 或原始 user.env。"""
     destination_input = Path(output) if output is not None else _default_output()
     destination = _absolute_path_without_links(destination_input.expanduser())
+    protected = protected_runtime_output_target(paths, destination)
+    if protected is not None:
+        raise SupportBundleError(
+            f"支持包输出不能覆盖 MediaFlux 运行文件：{protected.name}"
+        )
     _ensure_directory_chain(destination.parent)
     _validate_directory_chain(destination.parent)
     _validate_destination(destination)

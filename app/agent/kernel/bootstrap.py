@@ -20,6 +20,7 @@ from app.agent.ingest_actions import AgentIngestSessionStore
 from app.agent.local_media_task_actions import configure_local_media_agent_context
 from app.agent.missing_media_workflow_runtime import MissingMediaWorkflowRuntime
 from app.agent.missing_media_workflows import SQLiteMissingMediaWorkflowRepository
+from app.agent.provider_actions import clear_provider_session_state
 from app.agent.recent_download_submissions import RecentDownloadSubmissionStore
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 from app.agent.session_context import SQLiteAgentSessionContextRepository
@@ -27,6 +28,7 @@ from app.agent.session_context import SQLiteAgentSessionContextRepository
 from .capabilities import CapabilityRetriever
 from .effects import ConfirmationEffectPlanStore
 from .metrics import KernelMetrics
+from .lifecycle import AgentSessionLifecycle
 from .model import ModelAdapter
 from .persistence import SQLiteKernelStore
 from .pipeline import ToolPipeline
@@ -46,6 +48,7 @@ from .transports import TelegramKernelTransport, WebKernelTransport
 class AgentKernelRuntime:
     session: AgentSession
     store: SQLiteKernelStore
+    lifecycle: AgentSessionLifecycle
     metrics: KernelMetrics
     web: WebKernelTransport
     telegram: TelegramKernelTransport
@@ -134,9 +137,16 @@ def build_agent_kernel_runtime(
         turn_admission=MediaFluxTurnAdmission(),
     )
     metrics = KernelMetrics()
+    lifecycle = AgentSessionLifecycle(
+        session=session,
+        store=kernel_store,
+        effect_store=effect_store,
+        clear_provider_state=clear_provider_session_state,
+    )
     return AgentKernelRuntime(
         session=session,
         store=kernel_store,
+        lifecycle=lifecycle,
         metrics=metrics,
         web=WebKernelTransport(session, metrics=metrics),
         telegram=TelegramKernelTransport(session, metrics=metrics),

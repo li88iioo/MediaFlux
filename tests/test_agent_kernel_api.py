@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.agent.kernel.adapters import TurnView
+from app.agent.kernel.state import SessionBusyError
 from app.routes import agent_api as agent_kernel_api
 
 
@@ -105,16 +106,36 @@ class FakeStore:
         return True
 
 
+class FakeLifecycle:
+    def __init__(self):
+        self.calls = []
+        self.error = None
+
+    async def reset(self, *, owner, session_id):
+        self.calls.append(("reset", owner, session_id))
+        if self.error is not None:
+            raise self.error
+        return types.SimpleNamespace(generation=1)
+
+    async def delete(self, *, owner, session_id):
+        self.calls.append(("delete", owner, session_id))
+        if self.error is not None:
+            raise self.error
+        return True
+
+
 class AgentKernelApiTests(unittest.TestCase):
     def setUp(self):
         app = FastAPI()
         app.include_router(agent_kernel_api.router)
         self.client = TestClient(app, raise_server_exceptions=False)
         self.web = FakeWeb()
+        self.lifecycle = FakeLifecycle()
         self.runtime = types.SimpleNamespace(
             web=self.web,
             session=types.SimpleNamespace(catalog=FakeCatalog()),
             store=FakeStore(),
+            lifecycle=self.lifecycle,
             metrics=types.SimpleNamespace(snapshot=lambda: {"turns": 0}),
         )
         self.patches = [
@@ -281,6 +302,33 @@ class AgentKernelApiTests(unittest.TestCase):
                 json={"message": "检查媒体库", "session_id": "session_1234567890"},
             )
         self.assertEqual(response.status_code, 429)
+
+    def test_reset_and_delete_use_unified_lifecycle(self):
+        reset = self.client.post(
+            "/api/agent/session/reset",
+            json={"session_id": "session_1234567890"},
+        )
+        deleted = self.client.delete(
+            "/api/agent/sessions/session_1234567890"
+        )
+
+        self.assertEqual(reset.status_code, 200, reset.text)
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(
+            [call[0] for call in self.lifecycle.calls],
+            ["reset", "delete"],
+        )
+
+    def test_session_lifecycle_rejects_protected_effect_with_409(self):
+        self.lifecycle.error = SessionBusyError("confirmed effect is executing")
+
+        response = self.client.post(
+            "/api/agent/session/reset",
+            json={"session_id": "session_1234567890"},
+        )
+
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(response.json()["code"], "effect_in_progress")
 
 
 if __name__ == "__main__":

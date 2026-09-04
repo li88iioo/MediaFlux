@@ -232,6 +232,13 @@ def _model_visible_payload_is_safe(
 
 async def _review_async(payload: dict[str, Any]) -> RecognitionReviewDecision:
     started = time.monotonic()
+    files = list(payload.get("files") or [])
+    if len(files) > _MAX_FILES:
+        return RecognitionReviewDecision(
+            status="abstained",
+            reason_code="case_file_limit_exceeded",
+            summary=f"冻结案例包含 {len(files)} 个文件，超过自动复核上限 {_MAX_FILES}",
+        )
     candidates = [
         dict(item) for item in list(payload.get("candidates") or [])[:_MAX_CANDIDATES]
         if isinstance(item, dict)

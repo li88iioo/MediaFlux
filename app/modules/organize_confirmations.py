@@ -1238,13 +1238,18 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
     return True
 
 
-def _confirmation_dispatch_loop() -> None:
+def _confirmation_dispatch_loop(
+    stop_event: threading.Event | None = None,
+    wakeup_event: threading.Event | None = None,
+) -> None:
+    stop_event = stop_event or _dispatch_stop
+    wakeup_event = wakeup_event or _dispatch_wakeup
     next_maintenance_at = 0.0
-    while not _dispatch_stop.is_set():
+    while not stop_event.is_set():
         try:
             # stop() 可能在 while 条件检查后立刻触发；查询前再次确认，
             # 避免测试库/应用资源已经开始释放时仍访问 SQLite。
-            if _dispatch_stop.is_set():
+            if stop_event.is_set():
                 break
             now_monotonic = time.monotonic()
             if now_monotonic >= next_maintenance_at:
@@ -1258,22 +1263,22 @@ def _confirmation_dispatch_loop() -> None:
                 continue
             row = db.get_next_queued_organize_confirmation()
             if row is None:
-                _dispatch_wakeup.wait(2.0)
-                _dispatch_wakeup.clear()
+                wakeup_event.wait(2.0)
+                wakeup_event.clear()
                 continue
 
-            if _dispatch_stop.is_set():
+            if stop_event.is_set():
                 break
             token = str(row["token"] or "")
             result = _dispatch_confirmation_token(token)
             if result.get("ok"):
-                while not _dispatch_stop.is_set():
+                while not stop_event.is_set():
                     current = db.get_organize_confirmation(token)
                     if current is None or str(current["status"] or "") != "running":
                         break
                     _dispatch_due_confirmation_delivery()
-                    _dispatch_wakeup.wait(_DISPATCH_POLL_SECONDS)
-                    _dispatch_wakeup.clear()
+                    wakeup_event.wait(_DISPATCH_POLL_SECONDS)
+                    wakeup_event.clear()
                 continue
         except Exception as exc:
             logger.error(
@@ -1282,8 +1287,8 @@ def _confirmation_dispatch_loop() -> None:
                 exc_info=True,
             )
 
-        _dispatch_wakeup.wait(_DISPATCH_POLL_SECONDS)
-        _dispatch_wakeup.clear()
+        wakeup_event.wait(_DISPATCH_POLL_SECONDS)
+        wakeup_event.clear()
 
 
 def _process_recognition_review_row(row) -> str:
@@ -1368,7 +1373,12 @@ def _process_recognition_review_row(row) -> str:
     return "approved"
 
 
-def _recognition_review_loop() -> None:
+def _recognition_review_loop(
+    stop_event: threading.Event | None = None,
+    wakeup_event: threading.Event | None = None,
+) -> None:
+    stop_event = stop_event or _review_stop
+    wakeup_event = wakeup_event or _review_wakeup
     try:
         recovered = db.recover_interrupted_organize_confirmation_reviews()
         if recovered:
@@ -1378,13 +1388,13 @@ def _recognition_review_loop() -> None:
             "恢复 Agent 主动识别复核失败 type=%s", type(exc).__name__
         )
 
-    while not _review_stop.is_set():
+    while not stop_event.is_set():
         token = ""
         try:
             row = db.claim_next_organize_confirmation_review()
             if row is None:
-                _review_wakeup.wait(_DISPATCH_POLL_SECONDS)
-                _review_wakeup.clear()
+                wakeup_event.wait(_DISPATCH_POLL_SECONDS)
+                wakeup_event.clear()
                 continue
             token = str(row["token"] or "")
             _process_recognition_review_row(row)
@@ -1411,18 +1421,25 @@ def _recognition_review_loop() -> None:
                         token[:6],
                         exc_info=True,
                     )
-        _review_wakeup.wait(_DISPATCH_POLL_SECONDS)
-        _review_wakeup.clear()
+        wakeup_event.wait(_DISPATCH_POLL_SECONDS)
+        wakeup_event.clear()
 
 def start_recognition_review_dispatcher() -> None:
     """启动独立只读复核消费者；不占用文件整理执行线程。"""
-    global _review_thread, _review_accepting
+    global _review_thread, _review_accepting, _review_stop, _review_wakeup
     with _review_guard:
         _review_accepting = True
-        _review_stop.clear()
-        if _review_thread is None or not _review_thread.is_alive():
+        active = (
+            _review_thread is not None
+            and _review_thread.is_alive()
+            and not _review_stop.is_set()
+        )
+        if not active:
+            _review_stop = threading.Event()
+            _review_wakeup = threading.Event()
             _review_thread = threading.Thread(
                 target=_recognition_review_loop,
+                args=(_review_stop, _review_wakeup),
                 name="agent-recognition-review",
                 daemon=True,
             )
@@ -1447,8 +1464,10 @@ def stop_recognition_review_dispatcher(timeout: float = 2.0) -> bool:
     global _review_thread, _review_accepting
     with _review_guard:
         _review_accepting = False
-        _review_stop.set()
-        _review_wakeup.set()
+        stop_event = _review_stop
+        wakeup_event = _review_wakeup
+        stop_event.set()
+        wakeup_event.set()
         thread = _review_thread
     if thread and thread.is_alive() and thread is not threading.current_thread():
         thread.join(max(0.0, float(timeout)))
@@ -1461,13 +1480,20 @@ def stop_recognition_review_dispatcher(timeout: float = 2.0) -> bool:
 
 def start_confirmation_dispatcher() -> None:
     """在应用启动阶段启用持久化确认队列消费者；重复调用安全。"""
-    global _dispatch_thread, _dispatch_accepting
+    global _dispatch_thread, _dispatch_accepting, _dispatch_stop, _dispatch_wakeup
     with _dispatch_guard:
         _dispatch_accepting = True
-        _dispatch_stop.clear()
-        if _dispatch_thread is None or not _dispatch_thread.is_alive():
+        active = (
+            _dispatch_thread is not None
+            and _dispatch_thread.is_alive()
+            and not _dispatch_stop.is_set()
+        )
+        if not active:
+            _dispatch_stop = threading.Event()
+            _dispatch_wakeup = threading.Event()
             _dispatch_thread = threading.Thread(
                 target=_confirmation_dispatch_loop,
+                args=(_dispatch_stop, _dispatch_wakeup),
                 name="telegram-organize-confirmations",
                 daemon=True,
             )
@@ -1493,8 +1519,10 @@ def stop_confirmation_dispatcher(timeout: float = 2.0) -> bool:
     global _dispatch_thread, _dispatch_accepting
     with _dispatch_guard:
         _dispatch_accepting = False
-        _dispatch_stop.set()
-        _dispatch_wakeup.set()
+        stop_event = _dispatch_stop
+        wakeup_event = _dispatch_wakeup
+        stop_event.set()
+        wakeup_event.set()
         thread = _dispatch_thread
     if thread and thread.is_alive() and thread is not threading.current_thread():
         thread.join(max(0.0, float(timeout)))

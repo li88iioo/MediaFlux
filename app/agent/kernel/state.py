@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from app.concurrency import CrossLoopAsyncLock
 
 
 class KernelStateError(RuntimeError):
@@ -147,7 +150,7 @@ class InMemorySessionStateStore:
     """测试与单进程运行使用的权威状态实现。"""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
         self._states: dict[tuple[str, str], SessionState] = {}
 
     async def begin_turn(
@@ -211,7 +214,7 @@ class CancellationToken:
     __slots__ = ("_event", "_reason")
 
     def __init__(self) -> None:
-        self._event = asyncio.Event()
+        self._event = threading.Event()
         self._reason = ""
 
     @property
@@ -227,7 +230,8 @@ class CancellationToken:
         self._event.set()
 
     async def wait(self) -> None:
-        await self._event.wait()
+        while not self._event.is_set():
+            await asyncio.sleep(0.01)
 
     def raise_if_cancelled(self) -> None:
         if self.cancelled:
@@ -238,7 +242,7 @@ class TurnCoordinator:
     """同一 owner/session 的最新回合拥有唯一发布权。"""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
         self._active: dict[tuple[str, str], tuple[str, CancellationToken, bool]] = {}
 
     async def begin(

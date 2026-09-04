@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app.agent.kernel.adapters import ApprovalView, TurnView
 from app.agent.kernel.events import AgentEventType, EventFactory
+from app.agent.kernel.state import SessionBusyError
 from app.bot import agent_adapter as adapter
 
 
@@ -148,6 +149,18 @@ class FakeStore:
         return None
 
 
+class FakeLifecycle:
+    def __init__(self, *, error=None):
+        self.error = error
+        self.calls = []
+
+    async def reset(self, *, owner, session_id):
+        self.calls.append((owner, session_id))
+        if self.error is not None:
+            raise self.error
+        return None
+
+
 class AgentKernelTelegramAdapterTests(unittest.TestCase):
     def setUp(self):
         self.config_values = {
@@ -178,6 +191,25 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
             adapter.telegram_agent_session_id(-100, 7),
             adapter.telegram_agent_session_id(-100, 8),
         )
+
+    def test_reset_uses_unified_lifecycle_and_reports_protected_effect(self):
+        bot = FakeBot()
+        lifecycle = FakeLifecycle(
+            error=SessionBusyError("confirmed effect is executing")
+        )
+        runtime = types.SimpleNamespace(lifecycle=lifecycle)
+        access_patches = self._patch_access()
+
+        with (
+            access_patches[0],
+            access_patches[1],
+            access_patches[2],
+            patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime),
+        ):
+            adapter.handle_agent_reset(bot, Message(text="/agent_reset"))
+
+        self.assertEqual(len(lifecycle.calls), 1)
+        self.assertIn("已确认写操作正在执行", bot.replies[-1][0])
 
     def test_disabled_agent_does_not_capture_normal_telegram_text(self):
         bot = FakeBot()

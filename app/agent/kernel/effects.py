@@ -284,3 +284,9 @@ class ConfirmationEffectPlanStore:
             confirmation_id=plan_id,
         )
         return plan if discarded else None
+
+    def revoke_session(self, *, owner: str, session_id: str) -> int:
+        """撤销指定 Kernel 会话仍有效的全部确认计划。"""
+        return self.store.revoke_owner(
+            owner=self._scoped_owner(owner, session_id),
+        )

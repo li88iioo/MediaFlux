@@ -10,7 +10,7 @@ from urllib.parse import quote, unquote, urlsplit
 
 from bs4 import BeautifulSoup
 
-from ..concurrency import CrossLoopAsyncLock
+from app.concurrency import CrossLoopAsyncLock
 from ..errors import (
     IndexerInvalidResponse,
     IndexerRateLimited,

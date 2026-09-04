@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from app.runtime_paths import RuntimePaths
+from app.runtime_paths import RuntimePaths, protected_runtime_output_target
 from app.version import BuildInfo
 
 BACKUP_FORMAT_VERSION = 1
@@ -126,6 +126,9 @@ def _create_backup_unlocked(
 ) -> Path:
     """创建原子 ZIP；使用 SQLite backup API，避免 WAL 不一致。"""
     destination = (Path(output) if output is not None else _default_backup_path(paths, reason)).expanduser().resolve()
+    protected = protected_runtime_output_target(paths, destination)
+    if protected is not None:
+        raise BackupError(f"备份输出不能覆盖 MediaFlux 运行文件：{protected.name}")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     payloads: dict[str, bytes] = {}

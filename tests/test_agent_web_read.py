@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
-from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -13,6 +13,7 @@ from app.agent.errors import AgentToolError
 from app.agent.kernel.projection import DefaultProjector
 from app.agent.models import ToolResult
 from app.agent.rate_limit import tool_rate_limit_policy
+from app.agent.web_request_singleflight import web_request_singleflight
 from app.agent.web_read_actions import (
     _extract_tavily,
     _map_extract_response,
@@ -205,7 +206,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         provider.assert_not_called()
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=datetime.now(UTC).date().isoformat()
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -249,7 +250,81 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=datetime.now(UTC).date().isoformat()
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            ),
+            1,
+        )
+
+    def test_concurrent_identical_read_is_single_flight_and_charged_once(self):
+        both_reserved = threading.Event()
+        reserve_lock = threading.Lock()
+        reserve_count = 0
+        provider_calls = 0
+        original_reserve = web_request_singleflight.reserve
+        result = _map_extract_response(
+            {
+                "results": [
+                    {
+                        "url": "https://example.com/concurrent",
+                        "raw_content": "# Demo\nConcurrent body",
+                    }
+                ]
+            },
+            {"url": "https://example.com/concurrent", "max_chars": 4_000},
+            12,
+        )
+
+        def reserve(key):
+            nonlocal reserve_count
+            lease = original_reserve(key)
+            with reserve_lock:
+                reserve_count += 1
+                if reserve_count == 2:
+                    both_reserved.set()
+            return lease
+
+        async def provider(*_args, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            if not await asyncio.to_thread(both_reserved.wait, 2):
+                raise RuntimeError("concurrent waiter did not reserve")
+            return result
+
+        start = threading.Barrier(2)
+        results = [None, None]
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                start.wait(timeout=2)
+                results[index] = read_web(
+                    {"url": "https://example.com/concurrent", "max_chars": 4_000}
+                )
+            except BaseException as exc:  # pragma: no cover - 线程错误回传
+                errors.append(exc)
+
+        with (
+            patch("app.agent.web_read_actions.get", side_effect=_config(self.values)),
+            patch("app.agent.web_read_actions._extract_tavily", side_effect=provider),
+            patch.object(web_request_singleflight, "reserve", side_effect=reserve),
+        ):
+            threads = [
+                threading.Thread(target=worker, args=(index,)) for index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=3)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(provider_calls, 1)
+        self.assertTrue(all(item is not None and item.ok for item in results))
+        self.assertEqual(sorted(item.data["cached"] for item in results), [False, True])
+        self.assertTrue(next(item for item in results if item.data["cached"]).model_data["cached"])
+        self.assertEqual(
+            db.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
             ),
             1,
         )
@@ -266,7 +341,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.status, "timeout")
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=datetime.now(UTC).date().isoformat()
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -276,7 +351,7 @@ class WebReadExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(
             db.reserve_agent_web_search_credits(
                 provider="tavily",
-                usage_date=datetime.now(UTC).date().isoformat(),
+                usage_date=db.current_agent_web_search_usage_date(),
                 cost=1,
                 daily_limit=1,
             )

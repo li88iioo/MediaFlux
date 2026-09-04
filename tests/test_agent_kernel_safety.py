@@ -234,6 +234,46 @@ class EffectPlanStoreSafetyTests(unittest.TestCase):
         # 内存存储使用 monotonic 时钟，不能伪装成 Unix 时间戳。
         self.assertEqual(claimed.public_dict()["expires_at"], "")
 
+    def test_revoke_session_invalidates_only_that_session(self) -> None:
+        store = ConfirmationEffectPlanStore(ConfirmationStore())
+        first = store.freeze(
+            owner="owner",
+            session_id="session-a",
+            generation=1,
+            tool_name="write.test",
+            effect=ToolEffect.WRITE,
+            arguments={"value": "first"},
+            prepared=self._prepared("first"),
+        )
+        second = store.freeze(
+            owner="owner",
+            session_id="session-b",
+            generation=1,
+            tool_name="write.test",
+            effect=ToolEffect.WRITE,
+            arguments={"value": "second"},
+            prepared=self._prepared("second"),
+        )
+
+        self.assertEqual(
+            store.revoke_session(owner="owner", session_id="session-a"),
+            1,
+        )
+        with self.assertRaisesRegex(EffectPlanError, "unavailable"):
+            store.claim(
+                owner="owner",
+                session_id="session-a",
+                generation=1,
+                plan_id=first.plan_id,
+            )
+        claimed = store.claim(
+            owner="owner",
+            session_id="session-b",
+            generation=1,
+            plan_id=second.plan_id,
+        )
+        self.assertEqual(claimed.arguments, {"value": "second"})
+
 
 class EffectLifecycleIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:

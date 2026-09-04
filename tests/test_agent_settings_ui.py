@@ -274,10 +274,20 @@ class AgentSettingsUiTests(unittest.TestCase):
             "AGENT_LIBRARY_PATROL_ENABLED": "1",
             "DOWNLOAD_TORRENT_RETENTION_DAYS": "30",
             "GY_STRM_BASE_URL": "http://mediaflux.internal:1258",
+            "QB_URL": "http://qb.environment:8080",
+            "TMDB_API_KEY": "tmdb-environment-secret",
+            "TG_BOT_TOKEN": "123456:telegram-environment-secret",
+            "PROXY_URL": "http://proxy.environment:7890",
         }
         with patch(
             "app.routes.api.config.all_items",
-            return_value={"TAVILY_API_KEY": "stale-file-value"},
+            return_value={
+                "TAVILY_API_KEY": "stale-file-value",
+                "QB_URL": "http://stale-qb:8080",
+                "TMDB_API_KEY": "stale-tmdb-secret",
+                "TG_BOT_TOKEN": "stale-telegram-secret",
+                "PROXY_URL": "http://stale-proxy:7890",
+            },
         ), patch(
             "app.routes.api.config.has_external_override",
             side_effect=lambda key: key in effective,
@@ -294,6 +304,10 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertEqual(payload["AGENT_LIBRARY_PATROL_ENABLED"], "1")
         self.assertEqual(payload["GY_STRM_BASE_URL"], "http://mediaflux.internal:1258")
         self.assertEqual(payload["DOWNLOAD_TORRENT_RETENTION_DAYS"], "30")
+        self.assertEqual(payload["QB_URL"], "http://qb.environment:8080")
+        self.assertEqual(payload["TMDB_API_KEY"], "********")
+        self.assertEqual(payload["TG_BOT_TOKEN"], "********")
+        self.assertEqual(payload["PROXY_URL"], "http://proxy.environment:7890")
         self.assertEqual(
             payload["__managed_fields"],
             [
@@ -303,7 +317,11 @@ class AgentSettingsUiTests(unittest.TestCase):
                 "AGENT_LLM_MODEL",
                 "DOWNLOAD_TORRENT_RETENTION_DAYS",
                 "GY_STRM_BASE_URL",
+                "PROXY_URL",
+                "QB_URL",
                 "TAVILY_API_KEY",
+                "TG_BOT_TOKEN",
+                "TMDB_API_KEY",
             ],
         )
         serialized = json.dumps(payload, ensure_ascii=False)
@@ -888,6 +906,33 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIn("部署环境管理", self._payload(response)["error"])
+        persist.assert_not_called()
+
+    def test_config_save_rejects_all_environment_managed_ui_fields_early(self):
+        for key, value in (
+            ("QB_URL", "http://qb.changed:8080"),
+            ("TMDB_API_KEY", "changed-tmdb-key"),
+            ("TG_BOT_TOKEN", "123456:changed-token"),
+            ("PROXY_URL", "http://proxy.changed:7890"),
+        ):
+            with self.subTest(key=key), patch(
+                "app.routes.api.config.has_external_override",
+                side_effect=lambda candidate, managed=key: candidate == managed,
+            ), patch("app.routes.api.config.set_and_save") as persist:
+                response = save_config(self._request(), {key: value})
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIn(key, self._payload(response)["error"])
+            persist.assert_not_called()
+
+    def test_environment_managed_mask_placeholder_remains_a_noop(self):
+        with patch(
+            "app.routes.api.config.has_external_override",
+            side_effect=lambda key: key == "TMDB_API_KEY",
+        ), patch("app.routes.api.config.set_and_save") as persist:
+            response = save_config(self._request(), {"TMDB_API_KEY": "********"})
+
+        self.assertEqual(response, {"success": True})
         persist.assert_not_called()
 
     def test_config_save_rejects_entire_mixed_payload_with_removed_network_key(self):

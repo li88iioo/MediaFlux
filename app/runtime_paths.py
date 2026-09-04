@@ -128,6 +128,35 @@ class RuntimePaths:
                 directory.mkdir(parents=True, exist_ok=True)
 
 
+def protected_runtime_output_target(
+    paths: RuntimePaths,
+    destination: Path,
+) -> Path | None:
+    """返回与输出路径重合的权威运行文件，包含符号链接与硬链接别名。"""
+    candidate = Path(destination).expanduser()
+    protected_files = (
+        paths.database_path,
+        paths.env_file,
+        paths.token_file,
+    )
+
+    def normalized(path: Path) -> str:
+        return os.path.normcase(
+            os.path.realpath(os.path.abspath(os.fspath(path.expanduser())))
+        )
+
+    candidate_normalized = normalized(candidate)
+    for protected in protected_files:
+        if candidate_normalized == normalized(protected):
+            return protected
+        try:
+            if candidate.exists() and protected.exists() and candidate.samefile(protected):
+                return protected
+        except OSError:
+            continue
+    return None
+
+
 def _environment_path(
     name: str,
     value: str | None,

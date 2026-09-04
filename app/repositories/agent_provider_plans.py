@@ -180,10 +180,17 @@ def _trim_history(conn: Any, *, owner_digest: str, session_digest: str) -> None:
         )
 
 
-def invalidate_provider_plans_for_owner(*, owner: str) -> dict[str, int]:
-    """撤销 owner 的短期 Provider 状态；运行中计划仅脱敏后等待执行者收尾。"""
-    owner_digest = _digest(owner, domain=b"mediaflux-agent-provider-plan-owner:v1")
+def _invalidate_provider_plans(
+    *,
+    owner_digest: str,
+    session_digest: str | None = None,
+) -> dict[str, int]:
     stamp = now()
+    scope = "owner_digest=?"
+    scope_values: tuple[str, ...] = (owner_digest,)
+    if session_digest is not None:
+        scope += " AND session_digest=?"
+        scope_values += (session_digest,)
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         table_exists = conn.execute(
@@ -201,16 +208,35 @@ def invalidate_provider_plans_for_owner(*, owner: str) -> dict[str, int]:
             "operation='',risk='write',arguments_json='{}',target_snapshot_json='{}',"
             "result_json='{}',context_fingerprint='',summary='',"
             "error_code='session_reset_pending',updated_at=? "
-            "WHERE owner_digest=? AND status='running'",
-            (stamp, owner_digest),
+            f"WHERE {scope} AND status='running'",
+            (stamp, *scope_values),
         )
         removed = conn.execute(
-            "DELETE FROM agent_provider_plans WHERE owner_digest=? AND status<>'running'",
-            (owner_digest,),
+            f"DELETE FROM agent_provider_plans WHERE {scope} AND status<>'running'",
+            scope_values,
         )
     scrubbed = max(0, int(running.rowcount or 0))
     deleted = max(0, int(removed.rowcount or 0))
     return {"scrubbed_running": scrubbed, "deleted": deleted}
+
+
+def invalidate_provider_plans_for_owner(*, owner: str) -> dict[str, int]:
+    """撤销 owner 的短期 Provider 状态；运行中计划仅脱敏后等待执行者收尾。"""
+    owner_digest = _digest(owner, domain=b"mediaflux-agent-provider-plan-owner:v1")
+    return _invalidate_provider_plans(owner_digest=owner_digest)
+
+
+def invalidate_provider_plans_for_session(
+    *,
+    owner: str,
+    session_id: str,
+) -> dict[str, int]:
+    """仅撤销指定 owner/session 的 Provider 短期写计划。"""
+    owner_digest, session_digest = _principal(owner, session_id)
+    return _invalidate_provider_plans(
+        owner_digest=owner_digest,
+        session_digest=session_digest,
+    )
 
 
 def create_provider_plan(

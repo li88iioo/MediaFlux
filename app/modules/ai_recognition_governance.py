@@ -6,7 +6,6 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date
 from email.utils import parsedate_to_datetime
 from typing import Callable
 
@@ -114,11 +113,14 @@ def _state_for(fingerprint: str, config: AIRecognitionGovernanceConfig) -> _Prov
 
 
 def _reserve_daily_request(limit: int) -> bool:
-    from app.database import reserve_agent_web_search_credits
+    from app.database import (
+        current_agent_web_search_usage_date,
+        reserve_agent_web_search_credits,
+    )
 
     return reserve_agent_web_search_credits(
         provider="ai_recognition",
-        usage_date=date.today().isoformat(),
+        usage_date=current_agent_web_search_usage_date(),
         cost=1,
         daily_limit=limit,
     )

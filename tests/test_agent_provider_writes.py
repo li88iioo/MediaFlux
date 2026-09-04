@@ -24,6 +24,7 @@ from app.repositories.agent_provider_plans import (
     finish_provider_plan,
     get_latest_prepared_provider_plan,
     invalidate_provider_plans_for_owner,
+    invalidate_provider_plans_for_session,
 )
 
 
@@ -922,6 +923,33 @@ def test_provider_owner_reset_removes_prepared_and_scrubs_running_plan(
     assert row["error_code"] == "session_reset_pending"
     assert gateway.prepare_change_execution(
         plan_ref=other.data["plan_ref"], context=other_context
+    )[0].ok
+
+
+def test_provider_session_reset_keeps_same_owner_other_session(
+    isolated_provider_db,
+):
+    gateway = ProviderGateway(catalog=_catalog(), transports=[_WriteTransport()])
+    first_context = ToolContext(owner="owner-a", session_id="session-a")
+    second_context = ToolContext(owner="owner-a", session_id="session-b")
+    first = _preview(gateway, first_context)
+    second = _preview(gateway, second_context)
+
+    result = invalidate_provider_plans_for_session(
+        owner=first_context.owner,
+        session_id=first_context.session_id,
+    )
+
+    assert result == {"scrubbed_running": 0, "deleted": 1}
+    with pytest.raises(AgentToolError) as missing:
+        gateway.prepare_change_execution(
+            plan_ref=first.data["plan_ref"],
+            context=first_context,
+        )
+    assert missing.value.code == "plan_not_found"
+    assert gateway.prepare_change_execution(
+        plan_ref=second.data["plan_ref"],
+        context=second_context,
     )[0].ok
 
 

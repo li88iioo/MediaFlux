@@ -12,7 +12,7 @@ import httpx
 
 from app.logger import get_logger
 
-from .concurrency import CrossLoopAsyncLock
+from app.concurrency import CrossLoopAsyncLock
 from .errors import IndexerInvalidResponse, IndexerResponseTooLarge, IndexerSecurityError
 
 Resolver = Callable[[str, int], list[tuple]]

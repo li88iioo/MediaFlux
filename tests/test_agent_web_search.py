@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import threading
 import unittest
 from datetime import date
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from app import database as db
 from app.agent.errors import AgentToolError
 from app.agent.models import ToolResult
 from app.agent.rate_limit import AgentRateLimiter
+from app.agent.web_request_singleflight import web_request_singleflight
 from app.agent.web_search_actions import (
     _map_response,
     _provider_error,
@@ -92,6 +94,14 @@ class WebSearchArgumentTests(unittest.TestCase):
 
 
 class WebSearchDatabaseFacadeCompatibilityTests(unittest.TestCase):
+    def test_shared_usage_date_uses_the_local_calendar_day(self):
+        with patch("app.repositories.agent_web_search.date") as local_date:
+            local_date.today.return_value = date(2026, 9, 5)
+            self.assertEqual(
+                db.current_agent_web_search_usage_date(),
+                "2026-09-05",
+            )
+
     def test_private_usage_date_validator_remains_available(self):
         self.assertEqual(
             db._validate_agent_web_search_usage_date("2026-08-08"), "2026-08-08"
@@ -155,7 +165,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         provider.assert_not_called()
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=date.today().isoformat()
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -182,9 +192,114 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(call.call_count, 1)
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=date.today().isoformat()
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
             ),
             1,
+        )
+
+    def _run_two_threads(self, action):
+        start = threading.Barrier(2)
+        results = [None, None]
+        errors: list[BaseException] = []
+
+        def worker(index: int) -> None:
+            try:
+                start.wait(timeout=2)
+                results[index] = action()
+            except BaseException as exc:  # pragma: no cover - 线程错误回传
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(index,)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        return results
+
+    def test_concurrent_identical_search_is_single_flight_and_charged_once(self):
+        both_reserved = threading.Event()
+        reserve_lock = threading.Lock()
+        reserve_count = 0
+        provider_calls = 0
+        original_reserve = web_request_singleflight.reserve
+
+        def reserve(key):
+            nonlocal reserve_count
+            lease = original_reserve(key)
+            with reserve_lock:
+                reserve_count += 1
+                if reserve_count == 2:
+                    both_reserved.set()
+            return lease
+
+        async def provider(*_args, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            if not await asyncio.to_thread(both_reserved.wait, 2):
+                raise RuntimeError("concurrent waiter did not reserve")
+            return ToolResult(
+                True,
+                "ok",
+                "找到 1 条网页结果",
+                data={"results": [{"title": "Demo"}]},
+            )
+
+        with (
+            patch("app.agent.web_search_actions.get", side_effect=_config(self.values)),
+            patch("app.agent.web_search_actions._search_tavily", side_effect=provider),
+            patch.object(web_request_singleflight, "reserve", side_effect=reserve),
+        ):
+            results = self._run_two_threads(lambda: search_web({"query": "same"}))
+
+        self.assertEqual(provider_calls, 1)
+        self.assertTrue(all(result is not None and result.ok for result in results))
+        self.assertEqual(sorted(result.data["cached"] for result in results), [False, True])
+        self.assertEqual(
+            db.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            ),
+            1,
+        )
+
+    def test_concurrent_owner_failure_releases_waiter_and_refunds_credit(self):
+        both_reserved = threading.Event()
+        reserve_lock = threading.Lock()
+        reserve_count = 0
+        provider_calls = 0
+        original_reserve = web_request_singleflight.reserve
+
+        def reserve(key):
+            nonlocal reserve_count
+            lease = original_reserve(key)
+            with reserve_lock:
+                reserve_count += 1
+                if reserve_count == 2:
+                    both_reserved.set()
+            return lease
+
+        async def provider(*_args, **_kwargs):
+            nonlocal provider_calls
+            provider_calls += 1
+            if not await asyncio.to_thread(both_reserved.wait, 2):
+                raise RuntimeError("concurrent waiter did not reserve")
+            return ToolResult(False, "timeout", "网页搜索服务响应超时")
+
+        with (
+            patch("app.agent.web_search_actions.get", side_effect=_config(self.values)),
+            patch("app.agent.web_search_actions._search_tavily", side_effect=provider),
+            patch.object(web_request_singleflight, "reserve", side_effect=reserve),
+        ):
+            results = self._run_two_threads(lambda: search_web({"query": "failure"}))
+
+        self.assertEqual(provider_calls, 1)
+        self.assertEqual(sorted(result.status for result in results), ["timeout", "unavailable"])
+        self.assertEqual(
+            db.get_agent_web_search_daily_usage(
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
+            ),
+            0,
         )
 
     def test_provider_failure_refunds_reserved_credits(self):
@@ -200,7 +315,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(result.status, "timeout")
         self.assertEqual(
             db.get_agent_web_search_daily_usage(
-                provider="tavily", usage_date=date.today().isoformat()
+                provider="tavily", usage_date=db.current_agent_web_search_usage_date()
             ),
             0,
         )
@@ -261,7 +376,7 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(
             db.reserve_agent_web_search_credits(
                 provider="tavily",
-                usage_date=date.today().isoformat(),
+                usage_date=db.current_agent_web_search_usage_date(),
                 cost=1,
                 daily_limit=1,
             )

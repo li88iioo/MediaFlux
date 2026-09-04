@@ -33,6 +33,13 @@ CREATE TABLE IF NOT EXISTS agent_kernel_sessions (
     updated_at REAL NOT NULL,
     PRIMARY KEY(owner_digest, session_digest)
 );
+CREATE TABLE IF NOT EXISTS agent_kernel_session_epochs (
+    owner_digest TEXT NOT NULL,
+    session_digest TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 0),
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(owner_digest, session_digest)
+);
 CREATE TABLE IF NOT EXISTS agent_kernel_refs (
     ref_id TEXT PRIMARY KEY,
     owner_digest TEXT NOT NULL,
@@ -406,6 +413,43 @@ class SQLiteKernelStore:
                 self._clock(),
             ),
         )
+        self._write_epoch(
+            conn,
+            owner_digest=owner_digest,
+            session_digest=session_digest,
+            generation=state.generation,
+        )
+
+    def _write_epoch(
+        self,
+        conn: Any,
+        *,
+        owner_digest: str,
+        session_digest: str,
+        generation: int,
+    ) -> None:
+        conn.execute(
+            "INSERT INTO agent_kernel_session_epochs("
+            "owner_digest,session_digest,generation,updated_at) VALUES(?,?,?,?) "
+            "ON CONFLICT(owner_digest,session_digest) DO UPDATE SET "
+            "generation=MAX(agent_kernel_session_epochs.generation,excluded.generation),"
+            "updated_at=excluded.updated_at",
+            (owner_digest, session_digest, max(0, int(generation)), self._clock()),
+        )
+
+    @staticmethod
+    def _generation_floor(
+        conn: Any,
+        *,
+        owner_digest: str,
+        session_digest: str,
+    ) -> int:
+        row = conn.execute(
+            "SELECT generation FROM agent_kernel_session_epochs "
+            "WHERE owner_digest=? AND session_digest=?",
+            (owner_digest, session_digest),
+        ).fetchone()
+        return max(0, int(row["generation"])) if row is not None else 0
 
     def _begin_turn_sync(
         self, owner: str, session_id: str, request_id: str
@@ -414,7 +458,15 @@ class SQLiteKernelStore:
             self._ensure_schema(conn)
             conn.execute("BEGIN IMMEDIATE")
             state = self._load_row(conn, owner, session_id)
-            state.generation += 1
+            owner_digest, session_digest = self._scope(owner, session_id)
+            state.generation = max(
+                state.generation,
+                self._generation_floor(
+                    conn,
+                    owner_digest=owner_digest,
+                    session_digest=session_digest,
+                ),
+            ) + 1
             self._write_state(conn, state)
         lease = PublicationLease(
             owner=owner,
@@ -520,7 +572,14 @@ class SQLiteKernelStore:
             reset = SessionState(
                 owner=owner,
                 session_id=session_id,
-                generation=current.generation + 1,
+                generation=max(
+                    current.generation,
+                    self._generation_floor(
+                        conn,
+                        owner_digest=owner_digest,
+                        session_digest=session_digest,
+                    ),
+                ) + 1,
             )
             self._write_state(conn, reset)
             conn.execute(
@@ -538,6 +597,18 @@ class SQLiteKernelStore:
         with db.get_conn() as conn:
             self._ensure_schema(conn)
             conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT generation FROM agent_kernel_sessions "
+                "WHERE owner_digest=? AND session_digest=?",
+                (owner_digest, session_digest),
+            ).fetchone()
+            if current is not None:
+                self._write_epoch(
+                    conn,
+                    owner_digest=owner_digest,
+                    session_digest=session_digest,
+                    generation=int(current["generation"]),
+                )
             cursor = conn.execute(
                 "DELETE FROM agent_kernel_sessions WHERE owner_digest=? AND session_digest=?",
                 (owner_digest, session_digest),

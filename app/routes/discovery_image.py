@@ -13,8 +13,9 @@ from itsdangerous import BadSignature, URLSafeSerializer
 from requests.adapters import HTTPAdapter
 
 from app import config
-from app.modules.web_secret import WebSecretUnavailable, get_web_secret
 from app.logger import get_logger, log_throttled
+from app.modules.image_payload import ImagePayloadError, read_bounded_image
+from app.modules.web_secret import WebSecretUnavailable, get_web_secret
 
 logger = get_logger(__name__)
 
@@ -75,34 +76,12 @@ def _require_discovery_enabled() -> None:
 
 
 router = APIRouter(dependencies=[Depends(_require_discovery_enabled)])
-_MAX_IMAGE_BYTES = 5 * 1024 * 1024
 _MAX_TOKEN_LENGTH = 2048
-_SAFE_IMAGE_MIME_TYPES = {
-    "image/jpeg", "image/png", "image/webp", "image/avif", "image/gif",
-}
 _SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9._~!$&'()+,;=:@/-]+$")
 _DOUBAN_IMAGE_HOSTS = {
     "img1.doubanio.com", "img2.doubanio.com", "img3.doubanio.com",
     "img9.doubanio.com", "qnmob3.doubanio.com",
 }
-
-
-def _matches_image_magic(content_type: str, content: bytes) -> bool:
-    if content_type == "image/jpeg":
-        return content.startswith(b"\xff\xd8\xff")
-    if content_type == "image/png":
-        return content.startswith(b"\x89PNG\r\n\x1a\n")
-    if content_type == "image/gif":
-        return content.startswith((b"GIF87a", b"GIF89a"))
-    if content_type == "image/webp":
-        return len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP"
-    if content_type == "image/avif":
-        if len(content) < 12 or content[4:8] != b"ftyp":
-            return False
-        brands = {content[8:12]}
-        brands.update(content[offset:offset + 4] for offset in range(16, min(len(content), 64), 4))
-        return bool(brands & {b"avif", b"avis"})
-    return False
 
 
 def _serializer() -> URLSafeSerializer:
@@ -278,27 +257,10 @@ def poster(request: Request, provider: str, token: str):
                 status_code,
             )
             raise HTTPException(status_code=502, detail="upstream image failed")
-        content_type = str(upstream.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-        if content_type not in _SAFE_IMAGE_MIME_TYPES:
-            raise HTTPException(status_code=502, detail="invalid upstream content type")
         try:
-            content_length = int(upstream.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            content_length = 0
-        if content_length > _MAX_IMAGE_BYTES:
-            raise HTTPException(status_code=502, detail="upstream image too large")
-        chunks: list[bytes] = []
-        total = 0
-        for chunk in upstream.iter_content(chunk_size=64 * 1024):
-            if not chunk:
-                continue
-            total += len(chunk)
-            if total > _MAX_IMAGE_BYTES:
-                raise HTTPException(status_code=502, detail="upstream image too large")
-            chunks.append(chunk)
-        content = b"".join(chunks)
-        if not _matches_image_magic(content_type, content):
-            raise HTTPException(status_code=502, detail="upstream image content mismatch")
+            content, content_type = read_bounded_image(upstream)
+        except ImagePayloadError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
         return Response(
             content=content, media_type=content_type,
             headers={"Cache-Control": "private, max-age=86400", "X-Content-Type-Options": "nosniff"},

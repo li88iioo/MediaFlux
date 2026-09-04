@@ -25,6 +25,24 @@ from app.modules.local_storage import (
 LOCAL_MEDIA_TRASH_DIR = ".mediaflux-trash"
 
 _CANDIDATE_DISCOVERY_DEPTH_LIMIT = 16
+_DISCOVERY_INCOMPLETE_PREFIX = "目录扫描不完整："
+
+
+def _append_discovery_error(errors: list[str], value: object) -> None:
+    if isinstance(value, OSError):
+        message = f"条目暂时不可读取（{type(value).__name__}）"
+    else:
+        message = str(value or "").strip() or "部分条目暂时不可读取"
+    if message.startswith(_DISCOVERY_INCOMPLETE_PREFIX):
+        message = message[len(_DISCOVERY_INCOMPLETE_PREFIX):].strip()
+    if message and message not in errors:
+        errors.append(message[:240])
+
+
+def _discovery_error(errors: list[str]) -> str:
+    if not errors:
+        return ""
+    return _DISCOVERY_INCOMPLETE_PREFIX + "；".join(errors[:3])
 
 
 def _source_root(source) -> Path:
@@ -35,15 +53,24 @@ def _source_root(source) -> Path:
 def discover_local_media_candidates(source) -> tuple[list[Path], str]:
     """发现来源内可独立整理的视频单元，避免单集异常阻塞同目录其他媒体。"""
     candidates, error, root = discover_local_media_directory_candidates(source)
-    if error or root is None:
+    if root is None:
         return [], error
 
     adapter = LocalFilesystemAdapter(root)
     expanded: list[Path] = []
     visited: set[tuple[int, int]] = set()
+    errors: list[str] = []
+    if error:
+        _append_discovery_error(errors, error)
     for candidate in candidates:
         expanded.extend(
-            _expand_media_candidate(candidate, adapter=adapter, depth=0, visited=visited)
+            _expand_media_candidate(
+                candidate,
+                adapter=adapter,
+                depth=0,
+                visited=visited,
+                errors=errors,
+            )
         )
 
     unique = {str(candidate): candidate for candidate in expanded}
@@ -67,11 +94,14 @@ def discover_local_media_candidates(source) -> tuple[list[Path], str]:
     return sorted(
         filtered,
         key=lambda item: item.relative_to(root).as_posix().casefold(),
-    ), ""
+    ), _discovery_error(errors)
 
 
 def _direct_media_entries(
-    directory: Path, *, adapter: LocalFilesystemAdapter,
+    directory: Path,
+    *,
+    adapter: LocalFilesystemAdapter,
+    errors: list[str],
 ) -> tuple[list[Path], list[Path]]:
     """返回目录中的直接视频与包含视频的直接子目录。"""
     try:
@@ -93,7 +123,8 @@ def _direct_media_entries(
                     directories.append(candidate)
             elif stat_module.S_ISREG(info.st_mode) and adapter.contains_video(candidate):
                 videos.append(candidate)
-        except (LocalStorageError, OSError):
+        except (LocalStorageError, OSError) as exc:
+            _append_discovery_error(errors, exc)
             continue
     return videos, directories
 
@@ -104,18 +135,21 @@ def _expand_media_candidate(
     adapter: LocalFilesystemAdapter,
     depth: int,
     visited: set[tuple[int, int]],
+    errors: list[str],
 ) -> list[Path]:
     """把纯容器目录展开为互不阻塞的最小稳定媒体单元。"""
     try:
         info = candidate.lstat()
-    except OSError:
+    except OSError as exc:
+        _append_discovery_error(errors, exc)
         return []
     if stat_module.S_ISLNK(info.st_mode):
         return []
     if stat_module.S_ISREG(info.st_mode):
         try:
             return [candidate] if adapter.contains_video(candidate) else []
-        except (LocalStorageError, OSError):
+        except (LocalStorageError, OSError) as exc:
+            _append_discovery_error(errors, exc)
             return []
     if not stat_module.S_ISDIR(info.st_mode):
         return []
@@ -127,12 +161,18 @@ def _expand_media_candidate(
     if depth >= _CANDIDATE_DISCOVERY_DEPTH_LIMIT:
         try:
             return [item.path for item in adapter.scan(candidate) if item.role == "video"]
-        except (LocalStorageError, OSError):
+        except (LocalStorageError, OSError) as exc:
+            _append_discovery_error(errors, exc)
             return [candidate]
 
     try:
-        direct_videos, media_directories = _direct_media_entries(candidate, adapter=adapter)
-    except LocalStorageError:
+        direct_videos, media_directories = _direct_media_entries(
+            candidate,
+            adapter=adapter,
+            errors=errors,
+        )
+    except LocalStorageError as exc:
+        _append_discovery_error(errors, exc)
         # 上层发现已确认该目录包含视频；瞬时读取失败时保留原有整体候选语义，
         # 不应因为进一步拆分失败而把媒体静默漏掉。
         return [candidate]
@@ -144,7 +184,11 @@ def _expand_media_candidate(
     for child in media_directories:
         expanded.extend(
             _expand_media_candidate(
-                child, adapter=adapter, depth=depth + 1, visited=visited,
+                child,
+                adapter=adapter,
+                depth=depth + 1,
+                visited=visited,
+                errors=errors,
             )
         )
     return expanded
@@ -177,6 +221,7 @@ def discover_local_media_directory_candidates(
         return [], "目录读取失败", None
     adapter = LocalFilesystemAdapter(root)
     candidates: list[Path] = []
+    errors: list[str] = []
     for candidate in entries:
         if is_ignored_local_media_directory(candidate.name):
             continue
@@ -192,9 +237,10 @@ def discover_local_media_directory_candidates(
                 and adapter.contains_video(candidate)
             ):
                 candidates.append(candidate)
-        except (LocalStorageError, OSError):
+        except (LocalStorageError, OSError) as exc:
+            _append_discovery_error(errors, exc)
             continue
-    return candidates, "", selected
+    return candidates, _discovery_error(errors), selected
 
 
 def candidate_payload(

@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit
 from bs4 import BeautifulSoup
 import httpx
 
-from ..concurrency import CrossLoopAsyncLock
+from app.concurrency import CrossLoopAsyncLock
 from ..errors import (
     IndexerError,
     IndexerInvalidResponse,

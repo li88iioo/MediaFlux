@@ -11,6 +11,8 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from app.concurrency import CrossLoopAsyncLock
+
 from app.agent.public_safety import sanitize_public_text
 
 from .capabilities import KernelToolSpec, ToolCatalog, ToolEffect
@@ -175,7 +177,7 @@ class InMemoryRateLimiter:
     def __init__(self, *, limit: int = 30, window_seconds: float = 60.0) -> None:
         self.limit = max(1, int(limit))
         self.window_seconds = max(1.0, float(window_seconds))
-        self._lock = asyncio.Lock()
+        self._lock = CrossLoopAsyncLock()
         self._events: dict[tuple[str, str], list[tuple[float, float]]] = {}
 
     async def acquire(self, *, owner: str, tool_name: str, cost: float) -> None:

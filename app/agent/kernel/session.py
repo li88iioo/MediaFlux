@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from app.agent.public_safety import public_tool_label
+from app.concurrency import CrossLoopAsyncLock
 from app.sensitive_data import contains_sensitive_credential
 
 from .capabilities import CapabilityRetriever, ToolCatalog, ToolEffect
@@ -167,7 +168,7 @@ class AgentSession:
         self.turn_admission = turn_admission or AllowAllTurnAdmission()
         # 只串行化极短的“取得 generation + 注册 active turn”窗口；
         # 已确认写操作一旦开始就不会被后续聊天抢占。
-        self._start_lock = asyncio.Lock()
+        self._start_lock = CrossLoopAsyncLock()
         # 已确认写操作脱离客户端流后仍必须持有强引用直到可信终态。
         # 普通聊天仍遵循“消费者断开即取消”，两者不能共享取消语义。
         self._detached_tasks: set[asyncio.Task[None]] = set()

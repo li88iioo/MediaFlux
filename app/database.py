@@ -41,7 +41,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -1473,6 +1473,13 @@ CREATE TABLE IF NOT EXISTS agent_kernel_sessions (
     generation INTEGER NOT NULL CHECK(generation >= 0),
     state_json TEXT NOT NULL,
     state_hmac TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(owner_digest, session_digest)
+);
+CREATE TABLE IF NOT EXISTS agent_kernel_session_epochs (
+    owner_digest TEXT NOT NULL,
+    session_digest TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK(generation >= 0),
     updated_at REAL NOT NULL,
     PRIMARY KEY(owner_digest, session_digest)
 );
@@ -3168,6 +3175,25 @@ def _migrate_agent_recognition_review_v22(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_agent_kernel_session_epochs_v23(conn: sqlite3.Connection) -> None:
+    """保留已删除 Agent 会话的 generation，防止旧确认计划 ABA 复活。"""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_kernel_session_epochs ("
+        "owner_digest TEXT NOT NULL,session_digest TEXT NOT NULL,"
+        "generation INTEGER NOT NULL CHECK(generation >= 0),updated_at REAL NOT NULL,"
+        "PRIMARY KEY(owner_digest,session_digest))"
+    )
+    conn.execute(
+        "INSERT INTO agent_kernel_session_epochs("
+        "owner_digest,session_digest,generation,updated_at) "
+        "SELECT owner_digest,session_digest,generation,updated_at "
+        "FROM agent_kernel_sessions WHERE 1 "
+        "ON CONFLICT(owner_digest,session_digest) DO UPDATE SET "
+        "generation=MAX(agent_kernel_session_epochs.generation,excluded.generation),"
+        "updated_at=excluded.updated_at"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -3191,6 +3217,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     19: _migrate_unify_rss_download_requests_v20,
     20: _migrate_agent_kernel_v21,
     21: _migrate_agent_recognition_review_v22,
+    22: _migrate_agent_kernel_session_epochs_v23,
 }
 
 
@@ -3937,6 +3964,7 @@ def now() -> str:
 from app.repositories.agent_web_search import (  # noqa: E402,F401
     _validate_agent_web_search_usage_date,
     clear_agent_web_search_cache,
+    current_agent_web_search_usage_date,
     get_agent_web_search_cache,
     get_agent_web_search_daily_usage,
     refund_agent_web_search_credits,

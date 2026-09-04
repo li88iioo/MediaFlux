@@ -522,6 +522,42 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         )
         self.assertEqual(outside.status_code, 400, outside.text)
 
+    def test_media_items_return_partial_results_with_scan_error(self):
+        self.login()
+        media_file = self.local_root / "Movie.2026.mkv"
+        media_file.write_bytes(b"movie")
+        source_id = db.create_local_media_source(
+            name="本地下载",
+            qb_profile="",
+            qb_path_prefix="",
+            local_root=str(self.local_root),
+            owner="admin",
+        )
+        db.upsert_local_library_target(
+            source_id,
+            "default",
+            str(self.default_target),
+            owner="admin",
+        )
+
+        with patch(
+            "app.routes.local_media_api.discover_local_media_directory_candidates",
+            return_value=(
+                [media_file],
+                "目录扫描不完整：目录文件数量超过安全上限",
+                self.local_root,
+            ),
+        ):
+            response = self.client.get(
+                "/api/local-media/items",
+                params={"source_id": source_id},
+            )
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual([item["name"] for item in payload["items"]], [media_file.name])
+        self.assertIn("扫描不完整", payload["sources"][0]["error"])
+
     def test_media_item_delete_delegates_to_local_media_service_writer(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}
         media_file = self.local_root / "Movie.2026.mkv"

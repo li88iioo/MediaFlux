@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 import unittest
 from collections.abc import AsyncIterator
 
@@ -28,6 +29,8 @@ from app.agent.kernel.state import (
     AgentInput,
     CancellationToken,
     InMemorySessionStateStore,
+    PublicationLease,
+    TurnCoordinator,
 )
 from app.agent.models import ToolReference, ToolResult
 
@@ -77,6 +80,13 @@ async def collect(stream) -> list:
     return [event async for event in stream]
 
 
+def _run_thread(coroutine_factory, errors: list[BaseException]) -> None:
+    try:
+        asyncio.run(coroutine_factory(), debug=True)
+    except BaseException as exc:  # pragma: no cover - 仅用于线程错误回传
+        errors.append(exc)
+
+
 class CapabilityRetrieverTests(unittest.TestCase):
     def test_retrieves_six_to_twelve_atomic_tools_without_deciding_intent(self) -> None:
         tools = [
@@ -104,6 +114,133 @@ class CapabilityRetrieverTests(unittest.TestCase):
         self.assertLessEqual(len(selection.tools), 12)
         self.assertEqual(selection.tools[0].name, "cloud.list_directory")
         self.assertIn("cloud.inspect_directory", selection.names)
+
+
+class AgentKernelCrossLoopTests(unittest.TestCase):
+    def test_turn_coordinator_survives_repeated_cross_loop_contention(self) -> None:
+        coordinator = TurnCoordinator()
+        errors: list[BaseException] = []
+
+        for round_number in range(2):
+            entered = threading.Event()
+            release = threading.Event()
+            waiter_finished = threading.Event()
+
+            async def hold_lock() -> None:
+                async with coordinator._lock:
+                    entered.set()
+                    while not release.is_set():
+                        await asyncio.sleep(0.001)
+
+            async def wait_through_public_api() -> None:
+                lease = PublicationLease(
+                    owner="owner-1",
+                    session_id="session-1",
+                    generation=round_number + 1,
+                    turn_id=f"turn-{round_number}",
+                    request_id=f"request-{round_number}",
+                )
+                token = await coordinator.begin(lease)
+                await coordinator.finish(lease, token)
+                waiter_finished.set()
+
+            holder = threading.Thread(
+                target=_run_thread,
+                args=(hold_lock, errors),
+            )
+            waiter = threading.Thread(
+                target=_run_thread,
+                args=(wait_through_public_api, errors),
+            )
+            holder.start()
+            self.assertTrue(entered.wait(timeout=1))
+            waiter.start()
+            time.sleep(0.03)
+            self.assertFalse(waiter_finished.is_set())
+            release.set()
+            holder.join(timeout=1)
+            waiter.join(timeout=1)
+
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(waiter.is_alive())
+            self.assertTrue(waiter_finished.is_set())
+
+        self.assertEqual(errors, [])
+
+    def test_agent_session_start_window_survives_repeated_cross_loop_contention(
+        self,
+    ) -> None:
+        catalog = ToolCatalog([read_tool("agent.status", domain="agent")])
+        state = InMemorySessionStateStore()
+        model = ScriptedModel(
+            [
+                [
+                    ModelEvent(ModelEventType.TEXT_DELTA, text="运行正常。"),
+                    ModelEvent(ModelEventType.FINISH, finish_reason="stop"),
+                ],
+                [
+                    ModelEvent(ModelEventType.TEXT_DELTA, text="运行正常。"),
+                    ModelEvent(ModelEventType.FINISH, finish_reason="stop"),
+                ],
+            ]
+        )
+        session = AgentSession(
+            model=model,
+            catalog=catalog,
+            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state),
+            state_store=state,
+        )
+        errors: list[BaseException] = []
+        completed: list[list] = []
+
+        for round_number in range(2):
+            entered = threading.Event()
+            release = threading.Event()
+
+            async def hold_start_window() -> None:
+                async with session._start_lock:
+                    entered.set()
+                    while not release.is_set():
+                        await asyncio.sleep(0.001)
+
+            async def run_session() -> None:
+                completed.append(
+                    await collect(
+                        session.run(
+                            AgentInput(
+                                message="检查运行状态",
+                                owner="owner-1",
+                                session_id="session-1",
+                                request_id=f"request-{round_number}",
+                            )
+                        )
+                    )
+                )
+
+            holder = threading.Thread(
+                target=_run_thread,
+                args=(hold_start_window, errors),
+            )
+            waiter = threading.Thread(
+                target=_run_thread,
+                args=(run_session, errors),
+            )
+            holder.start()
+            self.assertTrue(entered.wait(timeout=1))
+            waiter.start()
+            time.sleep(0.03)
+            self.assertEqual(len(completed), round_number)
+            release.set()
+            holder.join(timeout=2)
+            waiter.join(timeout=2)
+
+            self.assertFalse(holder.is_alive())
+            self.assertFalse(waiter.is_alive())
+            self.assertEqual(len(completed), round_number + 1)
+            self.assertEqual(completed[-1][-1].type, AgentEventType.TURN_COMPLETED)
+
+        self.assertEqual(errors, [])
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
