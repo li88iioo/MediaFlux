@@ -12,6 +12,7 @@ from app.agent.provider_models import (
     ProviderPayload,
     ProviderProfileView,
 )
+from app.agent.providers.media_recommendation import rank_local_recommendations
 from app.clients.base import MediaItem, normalize_explicit_media_user_id
 from app.modules.media_server_profiles import (
     MediaServerProfile,
@@ -218,6 +219,65 @@ class MediaServerProviderTransport:
                         },
                         source=f"{profile.server_type}_api",
                     )
+                if operation == "media.items.recommend_from_library":
+                    user_id, user_selection = self._playback_user(profile, client)
+                    history = client.recently_played(user_id, limit=50)
+                    history = client.enrich_media_genres(user_id, history)
+                    inventory = client.list_recommendation_candidates(
+                        user_id,
+                        media_type=str(arguments.get("media_type") or "any"),
+                        max_items=5_000,
+                        page_size=200,
+                    )
+                    ranked = rank_local_recommendations(
+                        inventory.candidates,
+                        history,
+                        must_match=list(arguments.get("must_match") or []),
+                        prefer=list(arguments.get("prefer") or []),
+                        exclude=list(arguments.get("exclude") or []),
+                        min_rating=float(arguments.get("min_rating", 0) or 0),
+                        exclude_played=bool(arguments.get("exclude_played", True)),
+                        limit=int(arguments.get("limit", 8)),
+                    )
+                    ranked.update(
+                        {
+                            "server_label": profile.label,
+                            "user_selection": user_selection,
+                            "inventory_total": int(inventory.total or 0),
+                            "inventory_truncated": bool(inventory.truncated),
+                            "criteria": {
+                                "media_type": str(
+                                    arguments.get("media_type") or "any"
+                                ),
+                                "must_match": list(
+                                    arguments.get("must_match") or []
+                                ),
+                                "prefer": list(arguments.get("prefer") or []),
+                                "exclude": list(arguments.get("exclude") or []),
+                                "min_rating": float(
+                                    arguments.get("min_rating", 0) or 0
+                                ),
+                                "exclude_played": bool(
+                                    arguments.get("exclude_played", True)
+                                ),
+                            },
+                        }
+                    )
+                    count = int(ranked.get("count", 0) or 0)
+                    return ProviderPayload(
+                        summary=(
+                            f"{profile.label} 从本地媒体库筛选出 {count} 部"
+                            "符合条件且可直接观看的候选"
+                        ),
+                        data=ranked,
+                        source=f"{profile.server_type}_api",
+                        status="success" if count else "empty",
+                        suggestions=(
+                            []
+                            if count
+                            else ["可减少必须匹配条件或降低最低评分后重试。"]
+                        ),
+                    )
                 if operation == "media.items.continue_watching":
                     limit = int(arguments.get("limit", 8))
                     user_id, user_selection = self._playback_user(profile, client)
@@ -250,6 +310,29 @@ class MediaServerProviderTransport:
                     return ProviderPayload(
                         summary=f"{profile.label} 返回 {len(libraries)} 个媒体库",
                         data={"libraries": libraries, "count": len(libraries)},
+                        source=f"{profile.server_type}_api",
+                    )
+                if operation == "media.library.counts":
+                    raw_counts = client.get_library_media_counts(
+                        str(arguments["library_ref"])
+                    )
+                    counts = {
+                        key: max(0, int(raw_counts.get(key, 0) or 0))
+                        for key in (
+                            "total_items",
+                            "movie_count",
+                            "series_count",
+                            "episode_count",
+                        )
+                    }
+                    return ProviderPayload(
+                        summary=(
+                            f"{profile.label} 所选媒体库共有 "
+                            f"{counts['series_count']} 部剧集、"
+                            f"{counts['movie_count']} 部电影和 "
+                            f"{counts['episode_count']} 集单集"
+                        ),
+                        data={"server_label": profile.label, **counts},
                         source=f"{profile.server_type}_api",
                     )
                 if operation == "media.items.search":

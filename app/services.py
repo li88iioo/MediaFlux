@@ -5,9 +5,10 @@ import logging
 import threading
 import time
 import unicodedata
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any
 
 from app import database as db
 from app.clients.base import (
@@ -409,6 +410,115 @@ def _normalize_series_identity_title(value: object) -> str:
     """用于本地候选消歧的严格标题口径；仅保留 Unicode 字母和数字。"""
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
     return "".join(char for char in normalized if char.isalnum())
+
+
+def _media_identity_batch_source_payload(
+    server_type: str,
+    server_name: str,
+    client: MediaServerClient,
+    identities: list[dict[str, str]],
+) -> dict:
+    """一次枚举一个媒体源并核对一批公开 TMDB 身份。"""
+    try:
+        media_types = tuple(
+            dict.fromkeys(str(item["media_type"]) for item in identities)
+        )
+        inventories = {
+            media_type: client.list_media_identity_inventory(
+                media_type,
+                max_items=5_000,
+                page_size=200,
+            )
+            for media_type in media_types
+        }
+        exact_ids = {
+            media_type: {
+                candidate.tmdb_id
+                for candidate in inventory.candidates
+                if candidate.tmdb_id
+            }
+            for media_type, inventory in inventories.items()
+        }
+        unmapped_titles = {
+            media_type: {
+                (
+                    _normalize_series_identity_title(candidate.name),
+                    str(candidate.year or "").strip(),
+                )
+                for candidate in inventory.candidates
+                if not candidate.tmdb_id
+                and _normalize_series_identity_title(candidate.name)
+            }
+            for media_type, inventory in inventories.items()
+        }
+        results: list[dict[str, Any]] = []
+        for identity in identities:
+            media_type = identity["media_type"]
+            inventory = inventories[media_type]
+            if identity["tmdb_id"] in exact_ids[media_type]:
+                status = "present"
+                match = "provider_id"
+            else:
+                title_key = _normalize_series_identity_title(identity.get("title"))
+                year = str(identity.get("year") or "").strip()
+                possible = bool(
+                    title_key
+                    and (title_key, year) in unmapped_titles[media_type]
+                )
+                if possible:
+                    status = "possible"
+                    match = "title_year"
+                elif inventory.truncated:
+                    status = "indeterminate"
+                    match = "none"
+                else:
+                    status = "missing"
+                    match = "none"
+            results.append(
+                {
+                    "tmdb_id": identity["tmdb_id"],
+                    "media_type": media_type,
+                    "status": status,
+                    "match": match,
+                }
+            )
+        return {
+            "server_type": server_type,
+            "server_name": server_name,
+            "status": "ready",
+            "inventories": {
+                media_type: {
+                    "total": inventory.total,
+                    "truncated": inventory.truncated,
+                    "unmapped": inventory.unmapped,
+                }
+                for media_type, inventory in inventories.items()
+            },
+            "items": results,
+            "error": "",
+        }
+    except Exception as exc:  # noqa: BLE001 - 隔离单个媒体服务器故障，保留其他来源结果
+        logger.warning(
+            "媒体服务器批量身份审计失败 server=%s type=%s",
+            server_type,
+            type(exc).__name__,
+        )
+        return {
+            "server_type": server_type,
+            "server_name": server_name,
+            "status": "unavailable",
+            "inventories": {},
+            "items": [
+                {
+                    "tmdb_id": identity["tmdb_id"],
+                    "media_type": identity["media_type"],
+                    "status": "indeterminate",
+                    "match": "none",
+                }
+                for identity in identities
+            ],
+            "error": "媒体服务器暂时不可用",
+        }
 
 
 def _complete_series_matches(search, query: str) -> list:
@@ -926,6 +1036,26 @@ def inspect_media_identity_sources(tmdb_id: str, media_type: str) -> list[dict]:
                 client,
                 lambda: _media_identity_source_payload(
                     server_type, server_name, client, tmdb_id, media_type
+                ),
+            )
+        )
+    return _run_media_source_jobs(jobs)
+
+
+def inspect_media_identity_batch(
+    identities: list[dict[str, str]],
+) -> list[dict]:
+    """一次并发枚举各媒体服务器，核对一批电影或剧集 TMDB 身份。"""
+    jobs: list[Callable[[], dict]] = []
+    for server_type, server_name, _web_url, client in _configured_media_sources():
+        jobs.append(
+            lambda server_type=server_type, server_name=server_name, client=client: _run_owned_media_source_job(
+                client,
+                lambda: _media_identity_batch_source_payload(
+                    server_type,
+                    server_name,
+                    client,
+                    identities,
                 ),
             )
         )

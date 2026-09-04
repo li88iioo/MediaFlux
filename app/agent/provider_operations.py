@@ -79,6 +79,70 @@ def build_provider_catalog() -> ProviderCatalog:
             examples=("我最近看了什么", "查看 Emby 最近播放历史"),
         ),
         ProviderOperationSpec(
+            operation_id="media.items.recommend_from_library",
+            provider="media",
+            description=(
+                "从 Jellyfin 或 Emby 本地媒体库读取 Genres、Tags、评分和用户播放状态，"
+                "结合最近播放题材信号排序，并可排除已播放或已开始的作品。"
+            ),
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "properties": {
+                    "media_type": {
+                        "type": "string",
+                        "enum": ["any", "movie", "tv"],
+                        "default": "any",
+                    },
+                    "must_match": {
+                        "type": "array",
+                        "description": (
+                            "必须同时满足的独立概念；同义词放在同一项并用 | 连接。"
+                        ),
+                        "maxItems": 6,
+                        "default": [],
+                        "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                    },
+                    "prefer": {
+                        "type": "array",
+                        "description": "用于排序的软偏好，不要求全部命中。",
+                        "maxItems": 12,
+                        "default": [],
+                        "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "maxItems": 8,
+                        "default": [],
+                        "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                    },
+                    "min_rating": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                        "default": 0,
+                    },
+                    "exclude_played": {"type": "boolean", "default": True},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 8,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            result_kind="media_library_recommendations",
+            max_items=20,
+            timeout_seconds=30,
+            domains=("media_library", "discovery", "playback"),
+            examples=(
+                "从我的媒体库推荐没看过的爆笑动画",
+                "结合最近观看记录推荐今晚能直接看的片",
+                "心情低落，推荐本地不用动脑的喜剧",
+            ),
+        ),
+        ProviderOperationSpec(
             operation_id="media.items.continue_watching",
             provider="media",
             description="读取媒体服务器用户尚未看完的继续观看 Resume 列表。",
@@ -108,7 +172,36 @@ def build_provider_catalog() -> ProviderCatalog:
             parameters=_EMPTY,
             result_kind="media_libraries",
             domains=("media_library",),
-            examples=("列出 Jellyfin 媒体库", "有哪些媒体库"),
+            examples=(
+                "列出 Jellyfin 媒体库",
+                "有哪些媒体库",
+                "查找动漫媒体库以便统计",
+            ),
+        ),
+        ProviderOperationSpec(
+            operation_id="media.library.counts",
+            provider="media",
+            description=(
+                "读取先前列出的指定媒体库中的可播放媒体总数，以及电影、剧集和单集数量；"
+                "library_ref 必须来自 media.libraries.list。"
+            ),
+            risk=RiskLevel.READ,
+            parameters={
+                "type": "object",
+                "required": ["library_ref"],
+                "properties": {
+                    "library_ref": {
+                        "type": "string",
+                        "minLength": 8,
+                        "maxLength": 64,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            result_kind="media_library_counts",
+            reference_arguments={"library_ref": "media_library"},
+            domains=("media_library",),
+            examples=("动漫媒体库有多少部剧集", "统计刚才选中的媒体库"),
         ),
         ProviderOperationSpec(
             operation_id="media.items.search",

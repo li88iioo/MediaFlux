@@ -89,6 +89,111 @@ class DashboardMediaCountTests(unittest.TestCase):
             params={"userId": "user-id"},
         )
 
+    def test_library_media_counts_are_scoped_to_selected_library_and_user(self):
+        expected = {
+            "Movie,Episode,Audio,MusicVideo,Book,Video": 126,
+            "Movie": 0,
+            "Series": 9,
+            "Episode": 126,
+        }
+        for client in (
+            JellyfinClient("http://jellyfin.local", "key"),
+            EmbyClient("http://legacy.local", "token"),
+        ):
+            with self.subTest(client=type(client).__name__):
+                client._cached_user_id = "user-id"
+                calls: list[tuple[str, dict]] = []
+
+                def request(path, params=None, *, _calls=calls):
+                    normalized = dict(params or {})
+                    _calls.append((path, normalized))
+                    return {
+                        "TotalRecordCount": expected[normalized["IncludeItemTypes"]]
+                    }
+
+                client._request = request
+
+                self.assertEqual(
+                    client.get_library_media_counts("anime-library"),
+                    {
+                        "total_items": 126,
+                        "movie_count": 0,
+                        "series_count": 9,
+                        "episode_count": 126,
+                    },
+                )
+                self.assertEqual(len(calls), 4)
+                for path, params in calls:
+                    self.assertEqual(path, "/Users/user-id/Items")
+                    self.assertEqual(params["ParentId"], "anime-library")
+                    self.assertEqual(params["Recursive"], "true")
+                    self.assertEqual(params["Limit"], 0)
+                    self.assertEqual(params["EnableImages"], "false")
+
+    def test_library_media_counts_reject_invalid_library_id(self):
+        client = JellyfinClient("http://jellyfin.local", "key")
+        with self.assertRaisesRegex(ValueError, "媒体库标识无效"):
+            client.get_library_media_counts("\n")
+
+    def test_media_identity_inventory_pages_without_loading_media_content(self):
+        for client in (
+            JellyfinClient("http://jellyfin.local", "key"),
+            EmbyClient("http://legacy.local", "token"),
+        ):
+            with self.subTest(client=type(client).__name__):
+                client._cached_user_id = "user-id"
+                calls: list[tuple[str, dict, object]] = []
+
+                def request(path, params=None, *, timeout=None, _calls=calls):
+                    normalized = dict(params or {})
+                    _calls.append((path, normalized, timeout))
+                    if normalized["StartIndex"] == 0:
+                        return {
+                            "TotalRecordCount": 3,
+                            "Items": [
+                                {
+                                    "Name": "记忆碎片",
+                                    "ProductionYear": 2000,
+                                    "ProviderIds": {"Tmdb": "77"},
+                                },
+                                {
+                                    "Name": "星际穿越",
+                                    "ProductionYear": 2014,
+                                    "ProviderIds": {},
+                                },
+                            ],
+                        }
+                    return {
+                        "TotalRecordCount": 3,
+                        "Items": [
+                            {
+                                "Name": "奥本海默",
+                                "ProductionYear": 2023,
+                                "ProviderIds": {"Tmdb": "872585"},
+                            }
+                        ],
+                    }
+
+                client._request = request
+                inventory = client.list_media_identity_inventory(
+                    "movie", max_items=10, page_size=2
+                )
+
+                self.assertEqual(inventory.total, 3)
+                self.assertFalse(inventory.truncated)
+                self.assertEqual(inventory.unmapped, 1)
+                self.assertEqual(
+                    [item.tmdb_id for item in inventory.candidates],
+                    ["77", "", "872585"],
+                )
+                self.assertEqual(len(calls), 2)
+                self.assertTrue(
+                    all(call[1]["IncludeItemTypes"] == "Movie" for call in calls)
+                )
+                self.assertTrue(
+                    all(call[1]["Fields"] == "ProviderIds,ProductionYear" for call in calls)
+                )
+
 
 class LegacyMediaClientTests(unittest.TestCase):
     def test_identifies_jellyfin_10_compatible_node(self):
@@ -170,6 +275,107 @@ class JellyfinAuthenticationTests(unittest.TestCase):
         self.assertEqual(call.kwargs["params"], {"Limit": 1})
         self.assertNotIn("api_key", call.kwargs["params"])
         self.assertIn('MediaBrowser Token="secret-token"', call.kwargs["headers"]["Authorization"])
+
+
+class MediaRecommendationInventoryTests(unittest.TestCase):
+    def test_recommendation_inventory_pages_and_preserves_user_watch_state(self):
+        for client in (
+            JellyfinClient("http://jellyfin.local", "key"),
+            EmbyClient("http://emby.local", "token"),
+        ):
+            with self.subTest(client=type(client).__name__):
+                calls: list[tuple[str, dict, object]] = []
+
+                def request(path, params=None, *, timeout=None, _calls=calls):
+                    normalized = dict(params or {})
+                    _calls.append((path, normalized, timeout))
+                    if normalized["StartIndex"] == 0:
+                        return {
+                            "TotalRecordCount": 3,
+                            "Items": [
+                                {
+                                    "Id": "series-unplayed",
+                                    "Name": "男子高中生的日常",
+                                    "OriginalTitle": "男子高校生の日常",
+                                    "Type": "Series",
+                                    "ProductionYear": 2012,
+                                    "Overview": "轻松搞笑的校园日常。",
+                                    "Genres": ["动画", "喜剧", "动画"],
+                                    "Tags": ["搞笑", "无厘头", "搞笑"],
+                                    "Studios": [{"Name": "Sunrise"}],
+                                    "ProductionLocations": ["日本"],
+                                    "CommunityRating": 8.7,
+                                    "CriticRating": 91,
+                                    "ProviderIds": {"Tmdb": "123"},
+                                    "UserData": {
+                                        "Played": False,
+                                        "PlayCount": 0,
+                                        "PlaybackPositionTicks": 0,
+                                    },
+                                },
+                                {
+                                    "Id": "movie-started",
+                                    "Name": "已开始电影",
+                                    "Type": "Movie",
+                                    "CommunityRating": "not-a-number",
+                                    "CriticRating": 500,
+                                    "UserData": {"PlaybackPositionTicks": 1},
+                                },
+                            ],
+                        }
+                    return {
+                        "TotalRecordCount": 3,
+                        "Items": [
+                            {
+                                "Id": "series-played",
+                                "Name": "碧蓝之海",
+                                "Type": "Series",
+                                "CommunityRating": 8.9,
+                                "UserData": {
+                                    "Played": False,
+                                    "LastPlayedDate": "2026-09-03T10:00:00Z",
+                                },
+                            }
+                        ],
+                    }
+
+                client._request = request
+                inventory = client.list_recommendation_candidates(
+                    "viewer-1",
+                    media_type="any",
+                    max_items=10,
+                    page_size=2,
+                )
+
+                self.assertEqual(inventory.total, 3)
+                self.assertFalse(inventory.truncated)
+                self.assertEqual(len(inventory.candidates), 3)
+                first, second, third = inventory.candidates
+                self.assertEqual(first.name, "男子高中生的日常")
+                self.assertEqual(first.original_title, "男子高校生の日常")
+                self.assertEqual(first.genres, ("动画", "喜剧"))
+                self.assertEqual(first.tags, ("搞笑", "无厘头"))
+                self.assertEqual(first.studios, ("Sunrise",))
+                self.assertEqual(first.production_locations, ("日本",))
+                self.assertEqual(first.tmdb_id, "123")
+                self.assertFalse(first.watched)
+                self.assertTrue(second.watched)
+                self.assertEqual(second.community_rating, 0)
+                self.assertEqual(second.critic_rating, 100)
+                self.assertTrue(third.watched)
+                self.assertEqual(len(calls), 2)
+                for path, params, _timeout in calls:
+                    self.assertEqual(path, "/Users/viewer-1/Items")
+                    self.assertEqual(params["IncludeItemTypes"], "Movie,Series")
+                    self.assertEqual(params["EnableImages"], "false")
+                    self.assertEqual(params["EnableUserData"], "true")
+                    self.assertIn("Tags", params["Fields"])
+                    self.assertIn("UserData", params["Fields"])
+
+    def test_recommendation_inventory_rejects_invalid_user_identifier(self):
+        client = JellyfinClient("http://jellyfin.local", "key")
+        with self.assertRaises(ValueError):
+            client.list_recommendation_candidates("../admin")
 
 
 class JellyfinPlaybackHistoryTests(unittest.TestCase):

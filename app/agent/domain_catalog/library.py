@@ -14,6 +14,10 @@ from app.agent.episode_resource_actions import (
     search_missing_episode_resources,
     search_missing_season_resources,
 )
+from app.agent.library_batch_presence import (
+    batch_library_presence,
+    batch_presence_arguments,
+)
 from app.agent.library_episode_audit import audit_library_episodes
 from app.agent.library_episode_count import (
     count_series_episodes,
@@ -99,7 +103,11 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="library.search",
-            description="在已配置的 Jellyfin / Emby 媒体库中搜索标题。",
+            description=(
+                "在已配置的 Jellyfin / Emby 媒体库中搜索一个具体标题；适合单片核对。"
+                "已有 TMDB 身份清单或多部片单时必须使用 library.batch_presence，"
+                "不要逐部重复调用本工具。"
+            ),
             risk=RiskLevel.READ,
             domains=("library", "media_identity"),
             source_kind="local_library",
@@ -123,6 +131,64 @@ def register_specs(
             examples=(
                 "媒体库里有没有《某片》",
                 "在 Jellyfin 或 Emby 搜索这个标题",
+            ),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="library.batch_presence",
+            description=(
+                "一次按 TMDB ID 批量核对最多 50 部电影或剧集是否存在于已配置的 Jellyfin / "
+                "Emby。人物作品表、系列片单或其他多条媒体清单必须优先使用本工具，不能逐部"
+                "重复调用 library.search。"
+            ),
+            risk=RiskLevel.READ,
+            domains=("library", "media_identity"),
+            source_kind="local_library",
+            freshness="live",
+            parameters={
+                "type": "object",
+                "required": ["items"],
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "items": {
+                            "type": "object",
+                            "required": ["tmdb_id", "media_type", "title"],
+                            "properties": {
+                                "tmdb_id": {
+                                    "type": "string",
+                                    "pattern": "^[1-9][0-9]{0,9}$",
+                                },
+                                "media_type": {
+                                    "type": "string",
+                                    "enum": ["movie", "tv"],
+                                },
+                                "title": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "maxLength": 240,
+                                },
+                                "year": {
+                                    "type": "string",
+                                    "pattern": "^(?:19|20)[0-9]{2}$",
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "additionalProperties": False,
+            },
+            handler=batch_library_presence,
+            validator=batch_presence_arguments,
+            related_tools=("discovery.person_filmography",),
+            examples=(
+                "一次核对这份导演片单哪些已入库、哪些缺失",
+                "批量检查这些 TMDB 电影是否在 Jellyfin",
+                "比较一组剧集的媒体库收录状态",
             ),
         )
     )

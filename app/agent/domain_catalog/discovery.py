@@ -37,6 +37,10 @@ from app.agent.discovery_watchlist_actions import (
     watchlist_summaries_arguments,
     watchlist_summary_arguments,
 )
+from app.agent.library_recommendation_actions import (
+    get_library_recommendations,
+    library_recommendation_arguments,
+)
 from app.agent.media_rating_actions import (
     lookup_media_rating,
     media_rating_arguments,
@@ -44,6 +48,10 @@ from app.agent.media_rating_actions import (
 from app.agent.models import (
     RiskLevel,
     ToolSpec,
+)
+from app.agent.person_filmography_actions import (
+    person_filmography,
+    person_filmography_arguments,
 )
 from app.agent.web_read_actions import read_web, web_read_arguments
 from app.agent.web_search_actions import (
@@ -99,6 +107,8 @@ def register_specs(
                 "查询官方平台目前播到哪里",
                 "最近有什么推荐的国漫",
                 "今年或指定年份有哪些新剧",
+                "联网核对最近的成人作品发行信息",
+                "查询近期步兵或无码资源的公开时效信息",
             ),
         )
     )
@@ -215,6 +225,48 @@ def register_specs(
                 "从 TMDB 或豆瓣搜索影视资料",
                 "查一部电影的外部元数据",
                 "搜索 2026 年欧美科幻剧集",
+            ),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="discovery.person_filmography",
+            description=(
+                "按人物名称读取 TMDB 电影演职员表，可按导演、演员、编剧或制片身份筛选，"
+                "并一次返回按上映日期升序排列的有界作品列表。人物作品全集或导演片单应使用"
+                "本工具，不要逐部猜片名或重复普通影视搜索。"
+            ),
+            risk=RiskLevel.READ,
+            domains=("discovery", "media_identity"),
+            source_kind="metadata_catalog",
+            freshness="live",
+            parameters={
+                "type": "object",
+                "required": ["person"],
+                "properties": {
+                    "person": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "role": {
+                        "type": "string",
+                        "enum": ["directing", "acting", "writing", "production"],
+                        "default": "directing",
+                    },
+                    "include_upcoming": {"type": "boolean", "default": False},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                        "default": 50,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            handler=person_filmography,
+            validator=person_filmography_arguments,
+            related_tools=("library.batch_presence",),
+            examples=(
+                "列出诺兰导演的全部电影并按上映年份排序",
+                "查看某位演员参演过的电影",
+                "列出某位编剧的电影作品表",
             ),
         )
     )
@@ -386,6 +438,93 @@ def register_specs(
             ),
             context_confirmation_preparer=ToolSpec.context_free_confirmation_preparer(
                 prepare_remove_watchlist
+            ),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="media.recommend_from_library",
+            description=(
+                "从已配置的 Jellyfin / Emby 本地媒体库中推荐可以立即观看的作品。"
+                "一次读取候选的 Genres、Tags、评分与观看状态，结合最近播放题材信号排序，"
+                "默认排除已播放或已开始的作品。适合‘今晚看什么’、情绪/题材偏好和"
+                "‘从我的库里推荐’；不是互联网新片榜单。must_match 中每一项都必须命中，"
+                "同一概念的同义词必须放在同一项并用 | 连接；prefer 只用于排序。"
+            ),
+            risk=RiskLevel.READ,
+            domains=("discovery", "media_library", "playback"),
+            source_kind="local_library",
+            freshness="live",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "server": {
+                        "type": "string",
+                        "enum": ["auto", "jellyfin", "emby"],
+                        "default": "auto",
+                    },
+                    "media_type": {
+                        "type": "string",
+                        "enum": ["any", "movie", "tv"],
+                        "default": "any",
+                    },
+                    "must_match": {
+                        "type": "array",
+                        "description": (
+                            "必须同时满足的独立概念；同一概念的近义词用 | 合并，"
+                            "例如 动画|Animation、喜剧|搞笑|无厘头。"
+                        ),
+                        "maxItems": 6,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 80,
+                        },
+                    },
+                    "prefer": {
+                        "type": "array",
+                        "description": "用于加权排序的软偏好，不要求每项都命中。",
+                        "maxItems": 12,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 80,
+                        },
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "description": "命中任一项即排除；同义词可用 | 合并。",
+                        "maxItems": 8,
+                        "items": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 80,
+                        },
+                    },
+                    "min_rating": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 10,
+                        "default": 0,
+                    },
+                    "exclude_played": {"type": "boolean", "default": True},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 8,
+                    },
+                },
+                "additionalProperties": False,
+            },
+            context_handler=get_library_recommendations,
+            validator=library_recommendation_arguments,
+            related_tools=("media.recently_played", "discovery.recommend"),
+            examples=(
+                "今天心情很丧，想看点不用脑子、爆笑的无厘头日番",
+                "从我的媒体库推荐几部没看过的轻松喜剧",
+                "结合最近观看记录推荐今晚能直接看的作品",
+                "我的 Jellyfin 里有什么高分科幻片值得看",
             ),
         )
     )

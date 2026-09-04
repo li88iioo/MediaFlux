@@ -138,6 +138,51 @@ class SeriesEpisodeInventory:
     ignored_unknown: int = 0
 
 
+@dataclass(frozen=True)
+class MediaIdentityCandidate:
+    """媒体服务器中的电影或剧集身份，用于有界批量存在性核对。"""
+
+    name: str
+    year: str = ""
+    tmdb_id: str = ""
+    media_type: str = "movie"
+
+
+@dataclass
+class MediaIdentityInventory:
+    candidates: list[MediaIdentityCandidate] = field(default_factory=list)
+    total: int = 0
+    truncated: bool = False
+    unmapped: int = 0
+
+
+@dataclass(frozen=True)
+class MediaRecommendationCandidate:
+    """用于本地片单推荐的有界媒体元数据；内部 ID 不直接公开。"""
+
+    id: str
+    name: str
+    media_type: str
+    year: str = ""
+    original_title: str = ""
+    overview: str = ""
+    genres: tuple[str, ...] = ()
+    tags: tuple[str, ...] = ()
+    studios: tuple[str, ...] = ()
+    production_locations: tuple[str, ...] = ()
+    community_rating: float = 0.0
+    critic_rating: float = 0.0
+    watched: bool = False
+    tmdb_id: str = ""
+
+
+@dataclass
+class MediaRecommendationInventory:
+    candidates: list[MediaRecommendationCandidate] = field(default_factory=list)
+    total: int = 0
+    truncated: bool = False
+
+
 @dataclass
 class DashboardData:
     server_name: str
@@ -201,6 +246,7 @@ class MediaServerClient:
     """媒体服务器客户端基类。"""
 
     display_name = "MediaServer"
+    _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
 
     def __init__(
         self,
@@ -294,6 +340,40 @@ class MediaServerClient:
             "movie_count": 0,
             "series_count": 0,
             "episode_count": 0,
+        }
+
+    def get_library_media_counts(self, library_id: str) -> dict[str, int]:
+        """按媒体库读取用户可见的电影、剧集、单集与可播放项数量。"""
+        normalized_library_id = str(library_id or "").strip()
+        if (
+            not normalized_library_id
+            or len(normalized_library_id) > 256
+            or any(ord(char) < 32 for char in normalized_library_id)
+        ):
+            raise ValueError("媒体库标识无效")
+
+        user_id = self._user_id()
+
+        def count(include_item_types: str) -> int:
+            data = self._request(
+                f"/Users/{user_id}/Items",
+                params={
+                    "ParentId": normalized_library_id,
+                    "Recursive": "true",
+                    "Limit": 0,
+                    "EnableImages": "false",
+                    "IncludeItemTypes": include_item_types,
+                },
+            )
+            if not isinstance(data, dict):
+                raise TypeError("媒体服务器媒体库统计响应无效")
+            return max(0, int(data.get("TotalRecordCount", 0) or 0))
+
+        return {
+            "total_items": count(self._PLAYABLE_ITEM_TYPES),
+            "movie_count": count("Movie"),
+            "series_count": count("Series"),
+            "episode_count": count("Episode"),
         }
 
     def get_dashboard(self) -> DashboardData:
@@ -593,6 +673,203 @@ class MediaServerClient:
             candidates=candidates[:cap],
             total=reported_total or offset,
             truncated=not exhausted and (reported_total > offset or len(candidates) >= cap),
+        )
+
+    def list_media_identity_inventory(
+        self,
+        media_type: str,
+        *,
+        max_items: int = 5_000,
+        page_size: int = 200,
+        deadline_at: float | None = None,
+    ) -> MediaIdentityInventory:
+        """分页枚举电影或剧集的标题、年份与 TMDB 身份，不加载媒体内容。"""
+        normalized_type = str(media_type or "").strip().casefold()
+        if normalized_type not in {"movie", "tv"}:
+            raise ValueError("媒体类型仅支持 movie 或 tv")
+        include_item_type = "Movie" if normalized_type == "movie" else "Series"
+        cap = max(1, min(int(max_items or 5_000), 10_000))
+        page = max(1, min(int(page_size or 200), 500))
+        offset = 0
+        candidates: list[MediaIdentityCandidate] = []
+        reported_total = 0
+        exhausted = False
+        unmapped = 0
+        user_id = self._user_id(deadline_at=deadline_at)
+
+        while offset < cap:
+            limit = min(page, cap - offset)
+            data = self._request(
+                f"/Users/{user_id}/Items",
+                params={
+                    "Recursive": "true",
+                    "StartIndex": offset,
+                    "Limit": limit,
+                    "IncludeItemTypes": include_item_type,
+                    "Fields": "ProviderIds,ProductionYear",
+                    "SortBy": "SortName",
+                    "SortOrder": "Ascending",
+                },
+                timeout=self._remaining_timeout(deadline_at),
+            )
+            items, total = self._items_payload(data)
+            reported_total = max(reported_total, total)
+            for item in items:
+                name = str(item.get("Name") or "").strip()
+                if not name:
+                    continue
+                tmdb_id = self._provider_tmdb_id(item.get("ProviderIds"))
+                if not tmdb_id:
+                    unmapped += 1
+                candidates.append(
+                    MediaIdentityCandidate(
+                        name=name,
+                        year=str(item.get("ProductionYear") or "").strip(),
+                        tmdb_id=tmdb_id,
+                        media_type=normalized_type,
+                    )
+                )
+            offset += len(items)
+            if not items or len(items) < limit or offset >= total:
+                exhausted = True
+                break
+
+        return MediaIdentityInventory(
+            candidates=candidates[:cap],
+            total=reported_total or offset,
+            truncated=not exhausted and (reported_total > offset or offset >= cap),
+            unmapped=unmapped,
+        )
+
+    def list_recommendation_candidates(
+        self,
+        user_id: str,
+        *,
+        media_type: str = "any",
+        max_items: int = 5_000,
+        page_size: int = 200,
+        deadline_at: float | None = None,
+    ) -> MediaRecommendationInventory:
+        """分页读取可推荐的电影/剧集元数据与用户观看状态。"""
+        selected_user = normalize_explicit_media_user_id(user_id)
+        normalized_type = str(media_type or "any").strip().casefold()
+        if normalized_type not in {"any", "movie", "tv"}:
+            raise ValueError("媒体类型仅支持 any、movie 或 tv")
+        include_types = {
+            "any": "Movie,Series",
+            "movie": "Movie",
+            "tv": "Series",
+        }[normalized_type]
+        cap = max(1, min(int(max_items or 5_000), 10_000))
+        page = max(1, min(int(page_size or 200), 500))
+        offset = 0
+        candidates: list[MediaRecommendationCandidate] = []
+        reported_total = 0
+        exhausted = False
+
+        def score(value: object, *, maximum: float) -> float:
+            if isinstance(value, bool):
+                return 0.0
+            try:
+                result = float(value or 0)
+            except (TypeError, ValueError, OverflowError):
+                return 0.0
+            if not math.isfinite(result):
+                return 0.0
+            return round(max(0.0, min(result, maximum)), 2)
+
+        def studio_names(value: object) -> tuple[str, ...]:
+            if not isinstance(value, list):
+                return ()
+            names = []
+            for item in value:
+                raw = item.get("Name") if isinstance(item, dict) else item
+                name = str(raw or "").strip()
+                if name:
+                    names.append(name)
+            return tuple(dict.fromkeys(names))[:12]
+
+        while offset < cap:
+            limit = min(page, cap - offset)
+            data = self._request(
+                f"/Users/{selected_user}/Items",
+                params={
+                    "Recursive": "true",
+                    "StartIndex": offset,
+                    "Limit": limit,
+                    "IncludeItemTypes": include_types,
+                    "Fields": (
+                        "Overview,ProductionYear,OriginalTitle,Genres,Tags,Studios,"
+                        "ProductionLocations,CommunityRating,CriticRating,ProviderIds,"
+                        "UserData"
+                    ),
+                    "EnableImages": "false",
+                    "EnableUserData": "true",
+                    "SortBy": "SortName",
+                    "SortOrder": "Ascending",
+                },
+                timeout=self._remaining_timeout(deadline_at),
+            )
+            items, total = self._items_payload(data)
+            reported_total = max(reported_total, total)
+            for item in items:
+                item_id = str(item.get("Id") or "").strip()
+                name = str(item.get("Name") or "").strip()
+                raw_type = str(item.get("Type") or "").strip().casefold()
+                candidate_type = "movie" if raw_type == "movie" else (
+                    "tv" if raw_type == "series" else ""
+                )
+                if not item_id or not name or not candidate_type:
+                    continue
+                raw_user_data = item.get("UserData")
+                user_data = raw_user_data if isinstance(raw_user_data, dict) else {}
+                try:
+                    play_count = max(0, int(user_data.get("PlayCount", 0) or 0))
+                except (TypeError, ValueError, OverflowError):
+                    play_count = 0
+                try:
+                    playback_position = max(
+                        0, int(user_data.get("PlaybackPositionTicks", 0) or 0)
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    playback_position = 0
+                watched = bool(
+                    user_data.get("Played")
+                    or play_count
+                    or playback_position
+                    or str(user_data.get("LastPlayedDate") or "").strip()
+                )
+                candidates.append(
+                    MediaRecommendationCandidate(
+                        id=item_id,
+                        name=name,
+                        media_type=candidate_type,
+                        year=str(item.get("ProductionYear") or "").strip(),
+                        original_title=str(item.get("OriginalTitle") or "").strip(),
+                        overview=str(item.get("Overview") or "").strip()[:1_000],
+                        genres=tuple(_dedupe_texts(item.get("Genres")))[:12],
+                        tags=tuple(_dedupe_texts(item.get("Tags")))[:24],
+                        studios=studio_names(item.get("Studios")),
+                        production_locations=tuple(
+                            _dedupe_texts(item.get("ProductionLocations"))
+                        )[:12],
+                        community_rating=score(
+                            item.get("CommunityRating"), maximum=10.0
+                        ),
+                        critic_rating=score(item.get("CriticRating"), maximum=100.0),
+                        watched=watched,
+                        tmdb_id=self._provider_tmdb_id(item.get("ProviderIds")),
+                    )
+                )
+            offset += len(items)
+            if not items or len(items) < limit or offset >= total:
+                exhausted = True
+                break
+
+        return MediaRecommendationInventory(
+            candidates=candidates[:cap],
+            total=reported_total or offset,
+            truncated=not exhausted and (reported_total > offset or offset >= cap),
         )
 
     def list_series_episode_inventory(

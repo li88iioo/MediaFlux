@@ -169,6 +169,7 @@ def register_specs(
             examples=(
                 "查看 Jellyfin 可以读取哪些信息",
                 "统计媒体库中电影、剧集和单集总数",
+                "查看动漫媒体库有多少部剧集",
                 "查看 qBittorrent 可用能力",
                 "我能让你检查哪些媒体服务器内容",
             ),
@@ -179,6 +180,7 @@ def register_specs(
             name="provider.query",
             description=(
                 "调用静态目录中已登记的 Jellyfin、Emby 或 qBittorrent 只读操作。"
+                "可读取全库统计，也可先列出媒体库后按指定媒体库统计。"
                 "profile 和 operation 必须先从 Provider 能力清单获取；禁止任意 URL、HTTP 方法、header 或凭据。"
             ),
             risk=RiskLevel.READ,
@@ -207,6 +209,7 @@ def register_specs(
             examples=(
                 "读取 Jellyfin 媒体库",
                 "统计媒体库中有多少电影、剧集和单集",
+                "统计动漫媒体库中有多少部剧集",
                 "在媒体服务器中搜索一部剧",
                 "读取 qBittorrent 下载任务",
                 "查看刚才下载任务的文件",

@@ -10,6 +10,8 @@ from app.agent.providers.media_server import MediaServerProviderTransport
 from app.agent.providers.qbittorrent import QBittorrentProviderTransport
 from app.clients.base import (
     MediaItem,
+    MediaRecommendationCandidate,
+    MediaRecommendationInventory,
     SeriesCandidate,
     SeriesEpisodeInventory,
     SeriesSearchResult,
@@ -43,6 +45,15 @@ class _FakeMediaClient:
             "episode_count": 114,
         }
 
+    def get_library_media_counts(self, library_id):
+        assert library_id == "lib-1"
+        return {
+            "total_items": 126,
+            "movie_count": 0,
+            "series_count": 9,
+            "episode_count": 126,
+        }
+
     def list_virtual_folders(self):
         return [
             {
@@ -72,7 +83,7 @@ class _FakeMediaClient:
 
     def recently_played(self, user_id, limit=8):
         assert user_id == "viewer-1"
-        assert limit == 6
+        assert limit in {6, 50}
         return [
             MediaItem(
                 id="played-1",
@@ -97,6 +108,29 @@ class _FakeMediaClient:
     def enrich_media_genres(self, user_id, items):
         assert user_id == "viewer-1"
         return items
+
+    def list_recommendation_candidates(
+        self, user_id, *, media_type, max_items, page_size
+    ):
+        assert user_id == "viewer-1"
+        assert media_type == "tv"
+        assert max_items == 5000
+        assert page_size == 200
+        return MediaRecommendationInventory(
+            candidates=[
+                MediaRecommendationCandidate(
+                    id="recommend-1",
+                    name="男子高中生的日常",
+                    media_type="tv",
+                    year="2012",
+                    original_title="男子高校生の日常",
+                    genres=("动画", "喜剧"),
+                    tags=("搞笑", "日常"),
+                    community_rating=8.8,
+                )
+            ],
+            total=1,
+        )
 
     def continue_watching(self, user_id, limit=8):
         assert user_id == "viewer-1"
@@ -198,6 +232,20 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
     assert libraries.data["libraries"][0]["__object_id"] == "lib-1"
     assert "paths" not in libraries.data["libraries"][0]
 
+    library_counts = transport.execute_read(
+        "configured:jellyfin",
+        "media.library.counts",
+        {"library_ref": "lib-1"},
+    )
+    assert library_counts.data == {
+        "server_label": "Jellyfin",
+        "total_items": 126,
+        "movie_count": 0,
+        "series_count": 9,
+        "episode_count": 126,
+    }
+    assert "9 部剧集" in library_counts.summary
+
     search = transport.execute_read(
         "configured:jellyfin", "media.items.search", {"query": "暗芝居", "limit": 5}
     )
@@ -217,6 +265,23 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
         "top_genres": ["动画", "奇幻", "科幻"],
         "media_types": ["episode", "movie"],
     }
+
+    recommendations = transport.execute_read(
+        "configured:jellyfin",
+        "media.items.recommend_from_library",
+        {
+            "media_type": "tv",
+            "must_match": ["动画|Animation"],
+            "prefer": ["日本|Japan|Japanese", "喜剧|Comedy"],
+            "exclude": [],
+            "min_rating": 7.0,
+            "exclude_played": True,
+            "limit": 5,
+        },
+    )
+    assert recommendations.data["items"][0]["name"] == "男子高中生的日常"
+    assert recommendations.data["history"]["records_used"] == 2
+    assert recommendations.data["items"][0]["__object_kind"] == "media_item"
 
     resume = transport.execute_read(
         "configured:jellyfin", "media.items.continue_watching", {"limit": 3}

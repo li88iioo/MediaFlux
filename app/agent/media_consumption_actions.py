@@ -172,7 +172,7 @@ def explicit_preferred_download_target(owner: str) -> str:
     return target if target in {"qb", "guangya", "both"} else ""
 
 
-def _select_media_profile(
+def select_media_profile(
     arguments: dict[str, Any],
     context: ToolContext,
     *,
@@ -218,7 +218,7 @@ def _query_media_profile(
     purpose: str,
     operation: str,
 ) -> ToolResult:
-    profile, failure = _select_media_profile(
+    profile, failure = select_media_profile(
         arguments,
         context,
         purpose=purpose,

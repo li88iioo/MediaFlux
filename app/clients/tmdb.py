@@ -220,6 +220,53 @@ class TMDBClient:
             raise ProviderInvalidResponse("TMDB 搜索响应结构无效")
         return [item for item in results if isinstance(item, dict)][:10]
 
+    def search_people(
+        self,
+        query: str,
+        *,
+        limit: int = 10,
+        deadline_at: float | None = None,
+        retries: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """按人物名称搜索 TMDB，返回有界候选。"""
+        normalized_query = str(query or "").strip()
+        if not normalized_query or len(normalized_query) > 120:
+            raise ValueError("人物名称必须为 1 到 120 个字符")
+        normalized_limit = max(1, min(int(limit or 10), 20))
+        payload = self.get(
+            "/search/person",
+            {"query": normalized_query, "page": 1},
+            deadline_at=deadline_at,
+            retries=retries,
+        )
+        results = payload.get("results", [])
+        if not isinstance(results, list):
+            raise ProviderInvalidResponse("TMDB 人物搜索响应结构无效")
+        return [item for item in results if isinstance(item, dict)][
+            :normalized_limit
+        ]
+
+    def person_movie_credits(
+        self,
+        person_id: str,
+        *,
+        deadline_at: float | None = None,
+        retries: int | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """读取人物电影演职员表，不返回原始图片或外部 URL。"""
+        payload = self.get(
+            f"/person/{self._numeric_id(person_id)}/movie_credits",
+            deadline_at=deadline_at,
+            retries=retries,
+        )
+        result: dict[str, list[dict[str, Any]]] = {}
+        for key in ("cast", "crew"):
+            items = payload.get(key, [])
+            if not isinstance(items, list):
+                raise ProviderInvalidResponse("TMDB 人物作品响应结构无效")
+            result[key] = [item for item in items if isinstance(item, dict)]
+        return result
+
     @staticmethod
     def _numeric_id(value: object) -> str:
         normalized = str(value or "").strip()

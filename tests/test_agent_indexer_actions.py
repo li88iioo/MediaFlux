@@ -44,12 +44,22 @@ class FakeResultStore:
 
 class FakeIndexerService:
     def __init__(
-        self, *, item: IndexerItem | None = None, items: list[IndexerItem] | None = None
+        self,
+        *,
+        item: IndexerItem | None = None,
+        items: list[IndexerItem] | None = None,
+        enabled_site_ids: tuple[str, ...] = ("nyaa",),
+        sites_attempted: tuple[str, ...] = ("nyaa", "broken"),
+        sites_succeeded: tuple[str, ...] = ("nyaa",),
+        partial: bool = True,
     ):
         self.item = item or _resource_item()
         self.items = list(items) if items is not None else [self.item]
         self.result_store = FakeResultStore(self.item)
-        self.enabled_site_ids = frozenset({"nyaa"})
+        self.enabled_site_ids = frozenset(enabled_site_ids)
+        self.sites_attempted = sites_attempted
+        self.sites_succeeded = sites_succeeded
+        self.partial = partial
         self.search_calls: list[tuple[object, object]] = []
 
     async def search_media(self, request, sites=None):
@@ -58,10 +68,14 @@ class FakeIndexerService:
             query=request.title,
             page=request.page,
             items=self.items,
-            sites_attempted=("nyaa", "broken"),
-            sites_succeeded=("nyaa",),
-            errors=[IndexerProviderError("broken", "unavailable", "站点暂不可用")],
-            partial=True,
+            sites_attempted=self.sites_attempted,
+            sites_succeeded=self.sites_succeeded,
+            errors=(
+                [IndexerProviderError("broken", "unavailable", "站点暂不可用")]
+                if self.partial
+                else []
+            ),
+            partial=self.partial,
             cached=False,
             has_more=True,
         )
@@ -118,12 +132,14 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
                     "year": 2026,
                     "media_type": "ANIME",
                     "sites": ["NYAA", "nyaa"],
+                    "sort_mode": "PUBLISHED_DESC",
                     "limit": 12,
                 }
             )
         self.assertEqual(normalized["title"], "Demo")
         self.assertEqual(normalized["media_type"], "anime")
         self.assertEqual(normalized["sites"], ["nyaa"])
+        self.assertEqual(normalized["sort_mode"], "published_desc")
         self.assertEqual(normalized["limit"], 12)
         invalid_payloads = (
             {"title": "Demo", "magnet": _SECRET_MAGNET},
@@ -134,6 +150,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             {"title": "Demo", "page": 0},
             {"title": "Demo", "limit": 51},
             {"title": "Demo", "sites": ["../nyaa"]},
+            {"title": "Demo", "sort_mode": "newest"},
         )
         for payload in invalid_payloads:
             with self.subTest(payload=payload), self.assertRaises(AgentToolError):
@@ -150,6 +167,66 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         ):
             search_arguments({"title": "Demo", "sites": ["mikan"]})
         self.assertIn("未启用", rejected.exception.safe_message)
+
+    def test_disabled_sukebei_does_not_suggest_enabling_all_sites(self):
+        service = FakeIndexerService()
+        with (
+            patch("app.agent.indexer_actions.config.get_bool", return_value=True),
+            patch(
+                "app.agent.indexer_actions.get_indexer_service", return_value=service
+            ),
+            self.assertRaises(AgentToolError) as rejected,
+        ):
+            search_arguments(
+                {
+                    "title": "uncensored",
+                    "sites": ["sukebei"],
+                    "sort_mode": "published_desc",
+                }
+            )
+
+        self.assertEqual(rejected.exception.code, "precondition_failed")
+        self.assertIn("单独启用 Sukebei", rejected.exception.safe_message)
+        self.assertIn("无需启用其他索引站", rejected.exception.safe_message)
+
+    def test_recent_adult_search_is_restricted_to_sukebei_and_sorted_by_date(self):
+        item = _resource_item(
+            site_id="sukebei",
+            site_name="Sukebei",
+            category="Real Life",
+        )
+        service = FakeIndexerService(
+            item=item,
+            enabled_site_ids=("sukebei",),
+            sites_attempted=("sukebei",),
+            sites_succeeded=("sukebei",),
+            partial=False,
+        )
+        with (
+            patch("app.agent.indexer_actions.config.get_bool", return_value=True),
+            patch(
+                "app.agent.indexer_actions.get_indexer_service", return_value=service
+            ),
+        ):
+            arguments = search_arguments(
+                {
+                    "title": "uncensored",
+                    "sites": ["sukebei"],
+                    "sort_mode": "published_desc",
+                    "limit": 10,
+                }
+            )
+            result = search_resources(arguments)
+
+        request, sites = service.search_calls[0]
+        self.assertEqual(sites, ["sukebei"])
+        self.assertEqual(request.title, "uncensored")
+        self.assertEqual(request.sort_mode, "published_desc")
+        self.assertEqual(result.status, "success")
+        self.assertEqual(result.data["sort_mode"], "published_desc")
+        self.assertEqual(result.data["sites_attempted"], ["sukebei"])
+        self.assertEqual(result.data["sites_succeeded"], ["sukebei"])
+        self.assertEqual(result.data["items"][0]["site_id"], "sukebei")
 
     def test_search_resources_returns_only_public_projection(self):
         service = FakeIndexerService()

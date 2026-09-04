@@ -80,15 +80,28 @@ def _catalog() -> ProviderCatalog:
 
 
 def test_default_catalog_contains_media_and_qb_read_operations():
-    operations = {item.operation_id for item in build_provider_catalog().operations()}
+    catalog = build_provider_catalog()
+    operations = {item.operation_id for item in catalog.operations()}
     assert "media.items.counts" in operations
     assert "media.items.recent_added" in operations
     assert "media.items.recent_played" in operations
+    assert "media.items.recommend_from_library" in operations
     assert "media.items.continue_watching" in operations
     assert "media.libraries.list" in operations
+    assert "media.library.counts" in operations
     assert "media.series.episodes" in operations
     assert "qb.torrents.info" in operations
     assert "qb.torrents.files" in operations
+
+    library_counts = catalog.get("media.library.counts")
+    assert library_counts.reference_arguments == {"library_ref": "media_library"}
+    named_library_operations = {
+        item.operation_id
+        for item in catalog.list(
+            provider="media", intent="动漫媒体库里有多少部剧集", limit=8
+        )
+    }
+    assert {"media.libraries.list", "media.library.counts"} <= named_library_operations
 
 
 def test_catalog_rejects_duplicate_and_invalid_operations():

@@ -35,6 +35,16 @@ from app.indexers.runtime import get_indexer_service, run_indexer_awaitable_sync
 _SITE_ID_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
 _RESULT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 _TARGETS = frozenset({"qb", "guangya", "both"})
+_SORT_MODES = frozenset(
+    {
+        "published_desc",
+        "relevance_desc",
+        "episode_desc",
+        "seeders_desc",
+        "size_desc",
+        "size_asc",
+    }
+)
 
 
 def _now() -> str:
@@ -95,6 +105,11 @@ def validate_enabled_search_sites(sites: list[str]) -> None:
     enabled = set(getattr(service, "enabled_site_ids", ()))
     invalid = [site_id for site_id in sites if site_id not in enabled]
     if invalid:
+        if invalid == ["sukebei"]:
+            raise AgentToolError(
+                "Sukebei 尚未启用；只需单独启用 Sukebei，无需启用其他索引站",
+                code="precondition_failed",
+            )
         raise AgentToolError(f"站点未启用或不存在：{', '.join(invalid)}")
 
 
@@ -109,6 +124,7 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
             "year",
             "media_type",
             "page",
+            "sort_mode",
             "sites",
             "limit",
         },
@@ -146,6 +162,16 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     page = arguments.get("page", 1)
     if isinstance(page, bool) or not isinstance(page, int) or not 1 <= page <= 100:
         raise AgentToolError("page 必须是 1 到 100 的整数")
+    sort_mode = arguments.get("sort_mode", "relevance_desc")
+    if (
+        not isinstance(sort_mode, str)
+        or sort_mode.strip().lower() not in _SORT_MODES
+    ):
+        raise AgentToolError(
+            "sort_mode 仅支持 published_desc、relevance_desc、episode_desc、"
+            "seeders_desc、size_desc 或 size_asc"
+        )
+    sort_mode = sort_mode.strip().lower()
     limit = arguments.get("limit", 20)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 50:
         raise AgentToolError("limit 必须是 1 到 50 的整数")
@@ -161,6 +187,7 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
             year=year,
             media_type=media_type,
             page=page,
+            sort_mode=sort_mode,
         )
     except IndexerValidationError as exc:
         raise AgentToolError(exc.public_message) from exc
@@ -174,6 +201,7 @@ def search_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         "year": request.year,
         "media_type": request.media_type,
         "page": request.page,
+        "sort_mode": request.sort_mode,
         "sites": sites,
         "limit": limit,
     }
@@ -259,6 +287,7 @@ def search_resources(
         year=arguments["year"],
         media_type=arguments["media_type"],
         page=arguments["page"],
+        sort_mode=arguments.get("sort_mode", "relevance_desc"),
     )
     service = get_indexer_service()
     search_awaitable = service.search_media(request, arguments["sites"] or None)
@@ -317,6 +346,7 @@ def search_resources(
         data={
             "query": _safe_text(result.query, 120),
             "page": int(result.page),
+            "sort_mode": request.sort_mode,
             "items": items,
             "sites_attempted": [
                 _safe_text(value, 32) for value in result.sites_attempted[:16]

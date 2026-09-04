@@ -43,7 +43,7 @@ async def context_for(state, *, owner="owner", session="session"):
 class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_existing_atomic_tools_can_be_declared_to_kernel(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
-        self.assertEqual(len(catalog), 150)
+        self.assertEqual(len(catalog), 153)
         self.assertFalse(catalog.has("agent.cancel_pending_action"))
         selection = CapabilityRetriever().retrieve(
             "规整光鸭云盘动漫目录并按 TMDB 集数重命名",
@@ -74,6 +74,23 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("web.search", selection.names)
         self.assertIn("web.read", selection.names)
+
+    async def test_recent_nsfw_request_selects_web_and_sukebei_search_capabilities(
+        self,
+    ) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        search = catalog.get("indexer.search_resources")
+        selection = CapabilityRetriever().retrieve(
+            "最近有什么新出的步兵资源？",
+            catalog,
+        )
+
+        self.assertIn("web.search", selection.names)
+        self.assertIn("indexer.search_resources", selection.names)
+        properties = search.input_schema["properties"]
+        self.assertIn("sort_mode", properties)
+        self.assertIn("published_desc", properties["sort_mode"]["enum"])
+        self.assertIn('sites=["sukebei"]', search.description)
 
     async def test_short_followup_reuses_recent_media_library_context(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
@@ -146,6 +163,35 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("provider.capabilities", selection.names)
         self.assertIn("provider.query", selection.names)
+
+    async def test_named_library_count_selects_provider_reference_path(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        for message in ("有多少部动漫", "动漫媒体库里有多少部剧集"):
+            with self.subTest(message=message):
+                selection = CapabilityRetriever().retrieve(message, catalog)
+                self.assertIn("provider.capabilities", selection.names)
+                self.assertIn("provider.query", selection.names)
+
+    async def test_mood_recommendation_prioritizes_local_library_capability(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        selection = CapabilityRetriever().retrieve(
+            "今天心情很丧，想看点不用脑子、爆笑的无厘头日番",
+            catalog,
+        )
+
+        self.assertEqual(selection.names[0], "media.recommend_from_library")
+        self.assertIn("discovery.recommend", selection.names)
+        self.assertIn("media.recently_played", selection.names)
+
+    async def test_person_filmography_uses_one_batch_library_comparison(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        selection = CapabilityRetriever().retrieve(
+            "把诺兰导演的所有电影按上映年份排出来，标出我库里缺哪几部",
+            catalog,
+        )
+
+        self.assertIn("discovery.person_filmography", selection.names)
+        self.assertIn("library.batch_presence", selection.names)
 
     async def test_guangya_sdk_p1_p3_capabilities_are_retrievable(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
@@ -354,7 +400,7 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         )
 
         public = result.outcome.public_content
-        self.assertEqual(public["data"]["total_tools"], 150)
+        self.assertEqual(public["data"]["total_tools"], 153)
         self.assertGreaterEqual(len(public["data"]["groups"]), 6)
         self.assertNotIn("tools", public["data"])
         self.assertNotIn("parameters", str(public))

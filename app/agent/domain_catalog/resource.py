@@ -50,6 +50,9 @@ def register_specs(
             name="indexer.search_resources",
             description=(
                 "在已启用的多站索引中搜索短期资源结果，只返回 opaque result_id 与公开元数据。"
+                "sites 可把本次读取严格限制到指定站点且不会修改站点配置；例如 "
+                'sites=["sukebei"] 只查询 Sukebei。需要近期结果时使用 '
+                "sort_mode=published_desc。"
                 "可提交的候选会同时返回 owner/session 绑定的 resource_candidates_ref，后续资源检查或"
                 "提交必须原样使用该引用。"
                 "可用于交叉核对连载资源跟进到哪一集，但资源标题只能作为旁证，不能证明官方播出进度。"
@@ -81,6 +84,18 @@ def register_specs(
                         "maximum": 100,
                         "default": 1,
                     },
+                    "sort_mode": {
+                        "type": "string",
+                        "enum": [
+                            "published_desc",
+                            "relevance_desc",
+                            "episode_desc",
+                            "seeders_desc",
+                            "size_desc",
+                            "size_asc",
+                        ],
+                        "default": "relevance_desc",
+                    },
                     "sites": {
                         "type": "array",
                         "maxItems": 16,
@@ -105,6 +120,8 @@ def register_specs(
                 "下载某部电视剧",
                 "核对某部连载动画的资源索引跟进到第几集",
                 "检查订阅更新并在需要时搜索资源",
+                '最近有什么新出的步兵资源，仅用 sites=["sukebei"] 并按发布时间倒序搜索 uncensored',
+                '查看 Sukebei 最近发布的无码资源，不查询其他索引站',
             ),
         )
     )
