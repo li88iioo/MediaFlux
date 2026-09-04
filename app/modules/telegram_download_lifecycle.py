@@ -131,9 +131,14 @@ def _overall_state(row, *, verification_status: str = "") -> str:
         return "error"
     if states.intersection(_PROCESSING_STATES):
         return "processing"
-    downstream = {
+    archive_states = {
         _status(_value(row, "local_import_status")),
         _status(_value(row, "organize_status")),
+    } - {""}
+    archive_completed = archive_states.intersection({"completed", "success"})
+    if "skipped" in archive_states and not archive_completed:
+        return "downloaded"
+    downstream = archive_states | {
         _status(_value(row, "strm_status")),
     } - {""}
     if downstream and downstream.issubset({"completed", "success", "skipped"}):
@@ -172,6 +177,7 @@ def build_download_lifecycle_event(
         "attention": "⚠️ 下载入库需要处理",
         "error": "⚠️ 下载入库部分完成",
         "completed": "✅ 下载与入库完成",
+        "downloaded": "✅ 下载完成（自动入库已跳过）",
         "processing": "⏳ 下载与入库处理中",
     }[state]
     archive_name, archive_value = _archive_label(row)
@@ -234,6 +240,8 @@ def build_download_lifecycle_event(
             footer = "请前往 Web 下载任务核对当前状态；为避免重复提交，请勿直接重试。"
     elif state == "error":
         footer = errors[0] if errors else "本次链路存在未完成阶段，请查看 Web 运行记录。"
+    elif state == "downloaded":
+        footer = errors[0] if errors else "下载已完成，但本次没有执行自动入库。"
     elif state == "processing":
         footer = "后续阶段会更新本条消息，无需重复提交。"
     event = NotificationEvent(

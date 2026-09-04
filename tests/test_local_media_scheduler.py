@@ -15,6 +15,7 @@ from app.modules.local_media_scheduler import (
     LocalMediaProbeRetryable,
     LocalMediaScheduler,
     LocalMediaSourceAmbiguous,
+    LocalMediaSourceMappingRequired,
     LocalMediaSourceMigrationRequired,
 )
 from app.modules.local_storage import LocalFilesystemAdapter, LocalScanLimitExceeded
@@ -36,8 +37,10 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM local_media_sources")
 
     @staticmethod
-    def torrent(path: str, hash_value: str = "hash-1") -> TorrentTask:
-        return TorrentTask(hash_value, "Movie", 1.0, "uploading", "/downloads", path,
+    def torrent(
+        path: str, hash_value: str = "hash-1", save_path: str = "/downloads",
+    ) -> TorrentTask:
+        return TorrentTask(hash_value, "Movie", 1.0, "uploading", save_path, path,
                            1, 1, 0, 0, 0, 0, "", 0)
 
     def test_completed_torrent_longest_mapping_is_deduplicated_and_processed(self):
@@ -327,6 +330,66 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
                 )
 
             self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+
+    def test_blank_prefix_uses_qb_task_save_path_as_implicit_mapping(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            source = Path(root_raw) / "downloads"
+            source.mkdir()
+            media_name = "[ANi] Test Show - 10.mp4"
+            media = source / media_name
+            media.write_bytes(b"movie")
+            source_id = db.create_local_media_source(
+                name="local", qb_profile="configured:qb", qb_path_prefix="",
+                local_root=str(source), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            task_id = scheduler.enqueue_completed_torrent(
+                self.torrent(
+                    f"/vol3/1000/下载/{media_name}",
+                    hash_value="implicit-qb-save-path",
+                    save_path="/vol3/1000/下载",
+                )
+            )
+
+            task = db.get_local_media_task(task_id, owner="admin")
+            self.assertEqual(task.source_id, source_id)
+            self.assertEqual(Path(task.content_path), media)
+
+    def test_completed_torrent_unmatched_qb_path_requires_visible_mapping_fix(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            source = Path(root_raw) / "downloads"
+            source.mkdir()
+            media_name = "[ANi] Test Show - 10.mp4"
+            (source / media_name).write_bytes(b"movie")
+            db.create_local_media_source(
+                name="local", qb_profile="configured:qb", qb_path_prefix="",
+                local_root=str(source), stable_seconds=0, owner="admin",
+            )
+            scheduler = LocalMediaScheduler(service=FakeService())
+
+            with self.assertRaisesRegex(
+                LocalMediaSourceMappingRequired, "qB 路径前缀"
+            ):
+                scheduler.enqueue_completed_torrent(
+                    self.torrent(
+                        f"/vol3/1000/下载/{media_name}",
+                        hash_value="missing-qb-mapping",
+                        save_path="",
+                    )
+                )
+
+            self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
+
+    def test_completed_torrent_without_enabled_local_source_remains_unclaimed(self):
+        scheduler = LocalMediaScheduler(service=FakeService())
+
+        task_id = scheduler.enqueue_completed_torrent(
+            self.torrent("/downloads/Movie.mkv", hash_value="no-local-source")
+        )
+
+        self.assertIsNone(task_id)
+        self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
     def test_completed_torrent_filters_non_media_content(self):
         with tempfile.TemporaryDirectory() as root_raw:

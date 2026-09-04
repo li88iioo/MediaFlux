@@ -904,6 +904,50 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertIn(("媒体库刷新", "Jellyfin 完成 🎯"), final_event.fields)
         self.assertEqual(final_event.actions, ())
 
+    def test_qb_path_mapping_failure_reports_partial_ingest(self) -> None:
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        request_id, _ = db.create_download_request(
+            "tg-qb-path-mapping-failure", "magnet", title="测试剧", chat_id="100",
+        )
+        reason = "qB 完成路径未匹配任何已启用的本地媒体来源"
+        db.update_download_request(
+            request_id,
+            status="completed",
+            qb_status="completed",
+            local_import_status="failed",
+            local_import_error=reason,
+        )
+
+        event = build_download_lifecycle_event(db.get_download_request(request_id))
+
+        self.assertEqual(event.title, "⚠️ 下载入库部分完成")
+        self.assertIn(("下载", "qB 完成"), event.fields)
+        self.assertIn(("本地整理", "失败"), event.fields)
+        self.assertEqual(event.footer, reason)
+
+    def test_skipped_local_import_does_not_claim_ingest_completed(self) -> None:
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        request_id, _ = db.create_download_request(
+            "tg-skipped-local-import", "magnet", title="测试剧", chat_id="100",
+        )
+        reason = "未命中可整理的本地媒体内容"
+        db.update_download_request(
+            request_id,
+            status="completed",
+            qb_status="completed",
+            local_import_status="skipped",
+            local_import_error=reason,
+        )
+
+        event = build_download_lifecycle_event(db.get_download_request(request_id))
+
+        self.assertEqual(event.title, "✅ 下载完成（自动入库已跳过）")
+        self.assertIn(("下载", "qB 完成"), event.fields)
+        self.assertIn(("本地整理", "已跳过"), event.fields)
+        self.assertEqual(event.footer, reason)
+
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")
     def test_download_pipeline_collapses_into_one_message(self, sender, editor) -> None:

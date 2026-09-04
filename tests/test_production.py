@@ -42,6 +42,7 @@ from app.modules.gcid_manifest import (
 )
 from app.modules.local_media_scheduler import (
     LocalMediaProbeRetryable,
+    LocalMediaScheduler,
     LocalMediaSourceMigrationRequired,
 )
 from app.modules.media_proxy import (
@@ -1000,6 +1001,91 @@ class DownloadRequestLocalMediaTests(unittest.TestCase):
                         self.assertEqual(
                             current["local_import_completed_at"], "2026-08-22 00:00:00"
                         )
+
+    def test_blank_qb_prefix_uses_task_save_path_for_local_import(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            source_root = Path(root) / "media-downloads"
+            source_root.mkdir()
+            media_name = "[ANi] Test Show - 10.mp4"
+            local_media = source_root / media_name
+            local_media.write_bytes(b"movie")
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                source_id = db.create_local_media_source(
+                    name="下载", qb_profile="configured:qb", qb_path_prefix="",
+                    local_root=str(source_root), stable_seconds=0, owner="admin",
+                )
+                request_id, _ = db.create_download_request(
+                    "implicit-qb-save-path", "magnet"
+                )
+                db.update_download_request(
+                    request_id, qb_status="completed", status="completed"
+                )
+                tracker = DownloadTracker()
+                scheduler = LocalMediaScheduler(service=Mock())
+                qb_root = "/vol3/1000/下载"
+                qb_path = f"{qb_root}/{media_name}"
+
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    tracker._start_local_import(
+                        db.get_download_request(request_id),
+                        self._task(qb_path, qb_root),
+                    )
+
+                row = db.get_download_request(request_id)
+                self.assertEqual(row["local_import_status"], "pending")
+                self.assertEqual(row["qb_content_path"], str(local_media))
+                self.assertEqual(row["local_import_error"], "")
+                self.assertTrue(row["local_import_target"].startswith(
+                    "local-media-task:"
+                ))
+                task_id = int(row["local_import_target"].split(":", 1)[1])
+                local_task = db.get_local_media_task(task_id, owner="admin")
+                self.assertEqual(local_task.source_id, source_id)
+                self.assertEqual(local_task.qb_hash, "hash")
+                self.assertEqual(Path(local_task.content_path), local_media)
+
+    def test_unmatched_qb_path_without_save_path_is_visible_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            test_db = Path(root) / "downloads.db"
+            source_root = Path(root) / "media-downloads"
+            source_root.mkdir()
+            media_name = "[ANi] Test Show - 10.mp4"
+            (source_root / media_name).write_bytes(b"movie")
+            with patch("app.database.DB_PATH", test_db):
+                db.init_db()
+                db.create_local_media_source(
+                    name="下载", qb_profile="configured:qb", qb_path_prefix="",
+                    local_root=str(source_root), stable_seconds=0, owner="admin",
+                )
+                request_id, _ = db.create_download_request(
+                    "unmatched-qb-path", "magnet"
+                )
+                db.update_download_request(
+                    request_id, qb_status="completed", status="completed"
+                )
+                tracker = DownloadTracker()
+                scheduler = LocalMediaScheduler(service=Mock())
+                qb_path = f"/vol3/1000/下载/{media_name}"
+
+                with patch(
+                    "app.modules.local_media_scheduler.get_local_media_scheduler",
+                    return_value=scheduler,
+                ):
+                    tracker._start_local_import(
+                        db.get_download_request(request_id),
+                        self._task(qb_path, ""),
+                    )
+
+                row = db.get_download_request(request_id)
+                self.assertEqual(row["local_import_status"], "failed")
+                self.assertEqual(row["qb_content_path"], qb_path)
+                self.assertIn("qB 路径前缀", row["local_import_error"])
+                self.assertEqual(db.list_local_media_tasks(owner="admin"), [])
 
     def test_unmatched_completed_request_is_marked_skipped(self):
         with tempfile.TemporaryDirectory() as root:

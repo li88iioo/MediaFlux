@@ -476,6 +476,7 @@ class DownloadTracker:
         # 新来源配置优先走持久化调度器；此处只上报完成事件，不执行文件写入。
         from app.modules.local_media_scheduler import (
             LocalMediaProbeRetryable,
+            LocalMediaSourceMappingRequired,
             LocalMediaSourceMigrationRequired,
             get_local_media_scheduler,
         )
@@ -498,7 +499,10 @@ class DownloadTracker:
             local_task_id = scheduler.enqueue_completed_torrent(
                 task, wake=False, request_id=int(row["id"]),
             )
-        except LocalMediaSourceMigrationRequired as exc:
+        except (
+            LocalMediaSourceMappingRequired,
+            LocalMediaSourceMigrationRequired,
+        ) as exc:
             self._record_local_import_configuration_failure(row, task, exc)
             return
         except LocalMediaProbeRetryable as exc:
@@ -538,7 +542,10 @@ class DownloadTracker:
         )
         if updated:
             logger.warning(
-                "qB 本地媒体来源需要迁移 request=%s error=%s", request_id, message,
+                "qB 本地媒体来源配置异常 request=%s path=%s error=%s",
+                request_id,
+                str(getattr(task, "content_path", "") or ""),
+                message,
             )
 
     def _record_local_import_probe_retry(self, row, task, error: Exception) -> None:

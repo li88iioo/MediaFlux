@@ -74,6 +74,10 @@ class LocalMediaSourceMigrationRequired(RuntimeError):
     """qB 已命中遗留来源，但该来源必须迁移为 Docker 容器路径。"""
 
 
+class LocalMediaSourceMappingRequired(ValueError):
+    """存在可接管来源，但 qB 完成路径没有命中任何路径映射。"""
+
+
 class LocalMediaSourceAmbiguous(ValueError):
     """同一 qB 路径实际命中多个同优先级来源，必须先修正配置。"""
 
@@ -209,23 +213,49 @@ class LocalMediaScheduler:
         raw_path = str(task.content_path or "").strip()
         if not raw_path:
             return None
+        task_save_path = str(task.save_path or "").strip()
         matches = []
+        eligible_sources = []
         for source in db.list_local_media_sources(owner=self.owner, enabled_only=True):
             if source.qb_profile and source.qb_profile not in {"qb", "configured:qb", "default"}:
                 continue
+            eligible_sources.append(source)
             source_error = _source_path_error(source)
-            try:
-                mapping = PathMapping(
-                    source.qb_path_prefix or source.local_root,
-                    Path("/") if source_error else Path(source.local_root),
-                )
-                if mapping.matches(raw_path):
-                    matches.append((
-                        len(mapping.comparison_prefix), source, mapping, source_error,
-                    ))
-            except PathMappingError:
-                continue
+            explicit_prefix = str(source.qb_path_prefix or "").strip()
+            # 空前缀既支持两端绝对路径相同，也支持 qB 默认保存路径与
+            # MediaFlux 容器挂载路径不同。任务级 save_path 只提供映射前缀，
+            # 最终候选仍必须在来源根目录内真实存在并包含视频。
+            mapping_prefixes = (
+                (explicit_prefix,)
+                if explicit_prefix
+                else (str(source.local_root or "").strip(), task_save_path)
+            )
+            seen_prefixes: set[str] = set()
+            for qb_prefix in mapping_prefixes:
+                if not qb_prefix:
+                    continue
+                try:
+                    mapping = PathMapping(
+                        qb_prefix,
+                        Path("/") if source_error else Path(source.local_root),
+                    )
+                    prefix_key = mapping.comparison_prefix
+                    if prefix_key in seen_prefixes:
+                        continue
+                    seen_prefixes.add(prefix_key)
+                    if mapping.matches(raw_path):
+                        matches.append((
+                            len(prefix_key), source, mapping, source_error,
+                        ))
+                except PathMappingError:
+                    continue
         if not matches:
+            if eligible_sources:
+                raise LocalMediaSourceMappingRequired(
+                    "qB 完成路径未匹配任何已启用的本地媒体来源；"
+                    "请在“本地整理”把 qB 路径前缀设置为 qB 所见下载根目录，"
+                    "并确认来源目录指向同一宿主机目录"
+                )
             return None
         longest_prefix = max(item[0] for item in matches)
         strongest_matches = [item for item in matches if item[0] == longest_prefix]
