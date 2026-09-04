@@ -16,7 +16,9 @@ from app.agent.indexer_actions import (
 )
 from app.agent.indexer_actions import search_arguments as indexer_search_arguments
 from app.agent.models import Evidence, ToolResult
+from app.agent.recent_resource_candidates import attach_resource_candidate_reference
 from app.agent.resource_recommendation import rank_episode_search
+from app.indexers.runtime import get_indexer_service
 
 
 def _now() -> str:
@@ -91,14 +93,15 @@ def missing_episode_resource_arguments(arguments: dict[str, Any]) -> dict[str, A
     season = _positive_int(arguments.get("season"), name="season", maximum=100)
     episode = _positive_int(arguments.get("episode"), name="episode", maximum=1000)
 
-    as_of = arguments.get("as_of", date.today().isoformat())
+    today = datetime.now().astimezone().date()
+    as_of = arguments.get("as_of", today.isoformat())
     if not isinstance(as_of, str):
         raise AgentToolError("as_of 必须是 YYYY-MM-DD 日期")
     try:
         parsed_as_of = date.fromisoformat(as_of.strip())
     except ValueError as exc:
         raise AgentToolError("as_of 必须是 YYYY-MM-DD 日期") from exc
-    if parsed_as_of > date.today():
+    if parsed_as_of > today:
         raise AgentToolError("as_of 不能晚于今天")
 
     sites = normalize_search_sites(arguments.get("sites", []))
@@ -153,14 +156,15 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
         raise AgentToolError("tmdb_id 必须是 1 到 10 位数字")
 
     season = _positive_int(arguments.get("season"), name="season", maximum=100)
-    as_of = arguments.get("as_of", date.today().isoformat())
+    today = datetime.now().astimezone().date()
+    as_of = arguments.get("as_of", today.isoformat())
     if not isinstance(as_of, str):
         raise AgentToolError("as_of 必须是 YYYY-MM-DD 日期")
     try:
         parsed_as_of = date.fromisoformat(as_of.strip())
     except ValueError as exc:
         raise AgentToolError("as_of 必须是 YYYY-MM-DD 日期") from exc
-    if parsed_as_of > date.today():
+    if parsed_as_of > today:
         raise AgentToolError("as_of 不能晚于今天")
 
     sites = normalize_search_sites(arguments.get("sites", []))
@@ -349,29 +353,32 @@ def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
         )
     else:
         summary = f"已确认指定集缺失，但{searched.summary}"
-    return ToolResult(
-        searched.ok,
-        searched.status,
-        summary,
-        data=data,
-        evidence=list(audit.evidence)
-        + list(searched.evidence)
-        + [
-            Evidence(
-                "agent_verification",
-                "资源站搜索仅在媒体库与 TMDB 审计确认目标为已播缺集后执行；未自动提交下载。",
-                _now(),
-            )
-        ],
-        suggestions=list(searched.suggestions)
-        + (
-            [
-                "已按季集匹配、可提交性、发布规格和站点活跃度生成只读推荐；确认后才会提交下载。"
-            ]
-            if ranked_search.get("recommendation", {}).get("selected")
-            else []
+    return attach_resource_candidate_reference(
+        ToolResult(
+            searched.ok,
+            searched.status,
+            summary,
+            data=data,
+            evidence=list(audit.evidence)
+            + list(searched.evidence)
+            + [
+                Evidence(
+                    "agent_verification",
+                    "资源站搜索仅在媒体库与 TMDB 审计确认目标为已播缺集后执行；未自动提交下载。",
+                    _now(),
+                )
+            ],
+            suggestions=list(searched.suggestions)
+            + (
+                [
+                    "已按季集匹配、可提交性、发布规格和站点活跃度生成只读推荐；确认后才会提交下载。"
+                ]
+                if ranked_search.get("recommendation", {}).get("selected")
+                else []
+            ),
+            error=searched.error,
         ),
-        error=searched.error,
+        result_store=get_indexer_service().result_store,
     )
 
 
@@ -528,27 +535,30 @@ def search_missing_season_resources(arguments: dict[str, Any]) -> ToolResult:
         suggestions.append(f"本次最多处理 3 集；剩余 {remaining} 集可再次按季度检索。")
     if failed:
         suggestions.append("部分集的资源站搜索未完成；这不代表资源站中没有相关资源。")
-    return ToolResult(
-        ok,
-        status,
-        summary,
-        data={
-            "verification": verification,
-            "missing_total": len(missing),
-            "processed": len(episodes),
-            "remaining": remaining,
-            "failed": failed,
-            "truncated": bool(remaining),
-            "episodes": episodes,
-        },
-        evidence=evidence[:16]
-        + [
-            Evidence(
-                "agent_verification",
-                "批量资源站搜索仅处理本次媒体库与 TMDB 审计确认的已播缺集；未自动提交下载。",
-                _now(),
-            )
-        ],
-        suggestions=suggestions,
-        error="" if ok else "该批次资源站搜索未完成。",
+    return attach_resource_candidate_reference(
+        ToolResult(
+            ok,
+            status,
+            summary,
+            data={
+                "verification": verification,
+                "missing_total": len(missing),
+                "processed": len(episodes),
+                "remaining": remaining,
+                "failed": failed,
+                "truncated": bool(remaining),
+                "episodes": episodes,
+            },
+            evidence=evidence[:16]
+            + [
+                Evidence(
+                    "agent_verification",
+                    "批量资源站搜索仅处理本次媒体库与 TMDB 审计确认的已播缺集；未自动提交下载。",
+                    _now(),
+                )
+            ],
+            suggestions=suggestions,
+            error="" if ok else "该批次资源站搜索未完成。",
+        ),
+        result_store=get_indexer_service().result_store,
     )

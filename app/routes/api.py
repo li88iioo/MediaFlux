@@ -80,7 +80,7 @@ _AGENT_LLM_KEYS = {
     "AGENT_LLM_PROTOCOL",
     "AGENT_LLM_MODEL",
     "AGENT_LLM_TIMEOUT_SECONDS",
-    "AGENT_LLM_REQUESTS_PER_MINUTE",
+    "AGENT_LLM_CONTEXT_WINDOW_TOKENS",
 }
 
 _AGENT_LIBRARY_PATROL_KEYS = {
@@ -115,7 +115,7 @@ _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_LLM_ENABLED": "1" if DEFAULT_AGENT_LLM_ENABLED else "0",
     "AGENT_LLM_PROTOCOL": "auto",
     "AGENT_LLM_TIMEOUT_SECONDS": "12",
-    "AGENT_LLM_REQUESTS_PER_MINUTE": "6",
+    "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "128000",
     "WEB_SEARCH_ENABLED": "0",
     "TAVILY_SEARCH_DEPTH": "basic",
     "TAVILY_MAX_RESULTS": "5",
@@ -483,7 +483,7 @@ def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
 
     limits = {
         "AGENT_LLM_TIMEOUT_SECONDS": (2, 30),
-        "AGENT_LLM_REQUESTS_PER_MINUTE": (1, 30),
+        "AGENT_LLM_CONTEXT_WINDOW_TOKENS": (16_384, 2_000_000),
     }
     for key, (minimum, maximum) in limits.items():
         if key not in data:
@@ -1414,6 +1414,12 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 # 任意真实配置变更均与代次推进共用同一发布窗口，避免新增
                 # 配置项后遗漏白名单，导致旧请求在新配置下迟到发布。
                 invalidate_agent_runtime_generation()
+                if _AGENT_LLM_KEYS & changed_keys:
+                    from app.agent.kernel.bootstrap import (
+                        invalidate_agent_kernel_runtime,
+                    )
+
+                    invalidate_agent_kernel_runtime()
     except (config.AtomicPublishError, OSError) as exc:
         return config_write_api_error(
             exc,

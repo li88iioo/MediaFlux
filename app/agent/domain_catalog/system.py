@@ -4,44 +4,62 @@ from __future__ import annotations
 
 from typing import Any
 
-from .support import (
-    INDEXER_SITE_ORDER,
-    SAFE_POLICY_IDS,
+from app import config
+from app.agent.action_history import (
+    action_history_arguments,
+    list_action_history,
+)
+from app.agent.automation_actions import (
+    automation_pipeline_arguments,
+    diagnose_automation_pipeline,
+)
+from app.agent.config_actions import (
+    media_server_arguments,
+    test_media_server,
+)
+from app.agent.config_diagnosis_actions import diagnose_config
+from app.agent.config_explain_actions import (
+    config_component_arguments,
+    explain_config_component,
+)
+from app.agent.durable_job_actions import (
+    agent_job_status_arguments,
+    cancel_agent_job_arguments,
+    cancel_agent_job_confirmed,
+    get_agent_job_status,
+    prepare_cancel_agent_job,
+)
+from app.agent.feature_actions import (
+    feature_state_arguments,
+    feature_summary_arguments,
+    prepare_feature_state_confirmation,
+    set_feature_state_confirmed,
+    summarize_feature_states,
+    verify_feature_state_write,
+)
+from app.agent.feature_gate import is_agent_enabled
+from app.agent.indexer_config_actions import (
+    indexer_sites_arguments,
+    indexer_sites_summary_arguments,
+    prepare_indexer_sites_confirmation,
+    set_indexer_sites_confirmed,
+    summarize_indexer_sites,
+    verify_indexer_sites_write,
+)
+from app.agent.media_server_actions import (
+    diagnose_media_servers,
+    media_server_diagnosis_arguments,
+)
+from app.agent.models import (
     Evidence,
     RiskLevel,
     ToolResult,
     ToolSpec,
-    _no_arguments,
-    _now,
-    action_history_arguments,
-    agent_job_status_arguments,
-    automation_pipeline_arguments,
-    cancel_agent_job_arguments,
-    cancel_agent_job_confirmed,
-    config,
-    config_component_arguments,
-    diagnose_automation_pipeline,
-    diagnose_config,
-    diagnose_media_servers,
+)
+from app.agent.provider_actions import (
     execute_provider_change_confirmed,
-    explain_config_component,
-    feature_state_arguments,
-    feature_summary_arguments,
-    get_agent_job_status,
-    indexer_sites_arguments,
-    indexer_sites_summary_arguments,
-    is_agent_enabled,
-    list_action_history,
     list_provider_capabilities,
-    media_server_arguments,
-    media_server_diagnosis_arguments,
-    prepare_cancel_agent_job,
-    prepare_feature_state_confirmation,
-    prepare_indexer_sites_confirmation,
     prepare_provider_change_execution,
-    prepare_safe_policy_confirmation,
-    prepare_set_recognition_rule_enabled,
-    prepare_telegram_test_notification,
     preview_provider_change,
     provider_capabilities_arguments,
     provider_change_status,
@@ -49,21 +67,30 @@ from .support import (
     provider_plan_ref_arguments,
     provider_query_arguments,
     query_provider,
+)
+from app.agent.recognition_toggle_actions import (
+    prepare_set_recognition_rule_enabled,
     recognition_rule_enabled_arguments,
+    set_recognition_rule_enabled_confirmed,
+)
+from app.agent.safe_policy_actions import (
+    SAFE_POLICY_IDS,
+    prepare_safe_policy_confirmation,
     safe_policy_arguments,
     safe_policy_summary_arguments,
-    send_telegram_test_notification_confirmed,
-    set_feature_state_confirmed,
-    set_indexer_sites_confirmed,
-    set_recognition_rule_enabled_confirmed,
     set_safe_policy_confirmed,
-    summarize_feature_states,
-    summarize_indexer_sites,
     summarize_safe_policies,
+)
+from app.agent.telegram_test_actions import (
+    prepare_telegram_test_notification,
+    send_telegram_test_notification_confirmed,
     telegram_test_arguments,
-    test_media_server,
-    verify_feature_state_write,
-    verify_indexer_sites_write,
+)
+from app.indexers.config import INDEXER_SITE_ORDER
+
+from .shared import (
+    _no_arguments,
+    _now,
 )
 
 
@@ -141,6 +168,7 @@ def register_specs(
             workflow_stage=10,
             examples=(
                 "查看 Jellyfin 可以读取哪些信息",
+                "统计媒体库中电影、剧集和单集总数",
                 "查看 qBittorrent 可用能力",
                 "我能让你检查哪些媒体服务器内容",
             ),
@@ -178,6 +206,7 @@ def register_specs(
             workflow_stage=20,
             examples=(
                 "读取 Jellyfin 媒体库",
+                "统计媒体库中有多少电影、剧集和单集",
                 "在媒体服务器中搜索一部剧",
                 "读取 qBittorrent 下载任务",
                 "查看刚才下载任务的文件",

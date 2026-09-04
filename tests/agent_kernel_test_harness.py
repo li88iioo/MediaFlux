@@ -91,10 +91,19 @@ class KernelDomainTestHarness:
 
     def __init__(self) -> None:
         self.state = InMemorySessionStateStore()
-        _repository, resource_store, ingest_store = _configure_domain_contexts()
+        (
+            _repository,
+            resource_store,
+            ingest_store,
+            missing_media_runtime,
+        ) = _configure_domain_contexts()
         self.recent_resource_store = resource_store
         self.catalog = catalog_from_tool_specs(
-            build_tool_specs(resource_store, ingest_store)
+            build_tool_specs(
+                resource_store,
+                ingest_store,
+                missing_media_runtime=missing_media_runtime,
+            )
         )
         self.pipeline = ToolPipeline(
             catalog=self.catalog,
@@ -104,7 +113,9 @@ class KernelDomainTestHarness:
                 record_actions=True,
             ),
             rate_limiter=InMemoryRateLimiter(limit=10_000),
-            effect_lifecycle=MediaFluxEffectLifecycle(),
+            effect_lifecycle=MediaFluxEffectLifecycle(
+                missing_media_runtime=missing_media_runtime
+            ),
         )
         self.registry = KernelTestRegistry(self)
         self._prepared: dict[str, _PreparedTurn] = {}

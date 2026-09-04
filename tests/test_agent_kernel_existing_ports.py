@@ -11,7 +11,12 @@ from app.agent.kernel.ports.existing_actions import (
     adapt_tool_spec,
     catalog_from_tool_specs,
 )
-from app.agent.kernel.state import CancellationToken, InMemorySessionStateStore
+from app.agent.kernel.session import AgentSession
+from app.agent.kernel.state import (
+    CancellationToken,
+    InMemorySessionStateStore,
+    SessionState,
+)
 from app.agent.models import RiskLevel, ToolResult, ToolSpec
 
 
@@ -52,6 +57,78 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
                 for tool in selection.tools
             )
         )
+
+    async def test_short_followup_reuses_recent_media_library_context(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        state = SessionState(
+            owner="owner",
+            session_id="session",
+            conversation=[
+                {
+                    "role": "user",
+                    "content": "黄泉使者 我的 Jellyfin 媒体库中有吗",
+                },
+                {"role": "assistant", "content": "已查询。"},
+            ],
+        )
+        selection = CapabilityRetriever().retrieve(
+            "绿灯军团呢",
+            catalog,
+            context=AgentSession._capability_retrieval_context(state),
+        )
+
+        self.assertIn("library.search", selection.names)
+        self.assertIn("provider.capabilities", selection.names)
+        self.assertIn("provider.query", selection.names)
+
+    async def test_resource_version_followup_keeps_inspect_and_submit_tools(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        state = SessionState(
+            owner="owner",
+            session_id="session",
+            conversation=[
+                {
+                    "role": "user",
+                    "content": "搜索绿灯军团资源，有的话推送到云盘",
+                },
+                {
+                    "role": "assistant",
+                    "content": "找到候选。",
+                    "tool_calls": [
+                        {
+                            "call_id": "search-1",
+                            "name": "indexer.search_resources",
+                            "arguments": {},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "content": "候选已保存",
+                    "tool_call_id": "search-1",
+                    "tool_name": "indexer.search_resources",
+                },
+                {"role": "assistant", "content": "请选择版本。"},
+            ],
+        )
+        selection = CapabilityRetriever().retrieve(
+            "推送4K版",
+            catalog,
+            context=AgentSession._capability_retrieval_context(state),
+        )
+
+        self.assertIn("indexer.search_resources", selection.names)
+        self.assertIn("ingest.inspect", selection.names)
+        self.assertIn("ingest.submit", selection.names)
+
+    async def test_global_library_count_selects_provider_count_path(self) -> None:
+        catalog = catalog_from_tool_specs(build_tool_specs())
+        selection = CapabilityRetriever().retrieve(
+            "我媒体库中有多少资源", catalog
+        )
+
+        self.assertIn("provider.capabilities", selection.names)
+        self.assertIn("provider.query", selection.names)
 
     async def test_existing_read_action_executes_through_new_pipeline_only(
         self,

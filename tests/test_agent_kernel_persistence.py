@@ -53,6 +53,13 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
             value={"id": 1938, "path": "/private/path"},
         )
         self.assertTrue(reference.ref.startswith("ref_"))
+        with db.get_conn() as conn:
+            row = conn.execute(
+                "SELECT value_json FROM agent_kernel_refs WHERE ref_id=?",
+                (reference.ref,),
+            ).fetchone()
+        self.assertTrue(str(row["value_json"]).startswith("enc:v1:"))
+        self.assertNotIn("/private/path", str(row["value_json"]))
         resolved = await SQLiteKernelStore(
             secret_provider=lambda: "test-kernel-secret"
         ).resolve(
@@ -69,6 +76,49 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
                 session_id="session",
                 expected_kind="cloud_directory",
             )
+
+    async def test_event_retention_caps_session_and_removes_expired_rows(self) -> None:
+        now = [10_000.0]
+        store = SQLiteKernelStore(
+            secret_provider=lambda: "test-kernel-secret",
+            clock=lambda: now[0],
+            max_events_per_session=10,
+            event_retention_seconds=3_600,
+        )
+        for sequence in range(1, 13):
+            await store.append(
+                AgentEvent(
+                    type=AgentEventType.MODEL_DELTA,
+                    session_id="retained-session",
+                    turn_id="turn-a",
+                    request_id="request-a",
+                    sequence=sequence,
+                    payload={"delta": str(sequence)},
+                ),
+                owner="owner",
+            )
+        capped = await store.list_events(
+            owner="owner", session_id="retained-session"
+        )
+        self.assertEqual([item["sequence"] for item in capped], list(range(3, 13)))
+
+        now[0] += 3_601
+        await store.append(
+            AgentEvent(
+                type=AgentEventType.TURN_COMPLETED,
+                session_id="retained-session",
+                turn_id="turn-b",
+                request_id="request-b",
+                sequence=1,
+                payload={"status": "success"},
+            ),
+            owner="owner",
+        )
+        remaining = await store.list_events(
+            owner="owner", session_id="retained-session"
+        )
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["turn_id"], "turn-b")
 
     async def test_session_listing_reset_and_delete_are_owner_scoped(self) -> None:
         lease, _ = await self.store.begin_turn(

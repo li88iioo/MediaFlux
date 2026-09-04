@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import copy
+import re
 import secrets
 import threading
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Callable
 
 from .errors import IndexerResultExpired, IndexerResultNotFound
 from .models import IndexerItem
+
+_RESULT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
 
 
 @dataclass(slots=True)
@@ -52,6 +55,27 @@ class IndexerResultStore:
                 expires_at=now + timedelta(seconds=self.ttl_seconds),
             )
         return result_id
+
+    def restore(self, result_id: str, item: IndexerItem) -> str:
+        """用原 opaque ID 恢复已认证的短期结果，供跨进程确认继续执行。"""
+        token = str(result_id or "").strip()
+        if not _RESULT_ID_PATTERN.fullmatch(token):
+            raise ValueError("invalid result id")
+        if not isinstance(item, IndexerItem):
+            raise TypeError("item must be IndexerItem")
+        now = self._clock()
+        with self._lock:
+            self._prune_expired(now)
+            while token not in self._entries and len(self._entries) >= self.max_entries:
+                evicted_id, _ = self._entries.popitem(last=False)
+                self._expired_ids.discard(evicted_id)
+            self._entries[token] = _StoredEntry(
+                item=copy.deepcopy(item),
+                expires_at=now + timedelta(seconds=self.ttl_seconds),
+            )
+            self._entries.move_to_end(token)
+            self._expired_ids.discard(token)
+        return token
 
     def get(self, result_id: str) -> IndexerItem:
         token = str(result_id or "").strip()

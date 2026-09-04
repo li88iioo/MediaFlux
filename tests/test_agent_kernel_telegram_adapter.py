@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from unittest.mock import patch
 
 from app.agent.kernel.adapters import ApprovalView, TurnView
+from app.agent.kernel.events import AgentEventType, EventFactory
 from app.bot import agent_adapter as adapter
 
 
@@ -66,6 +67,8 @@ class FakeBot:
         self.edits = []
         self.answers = []
         self.sent = []
+        self.actions = []
+        self.deleted = []
         self._next = 100
 
     def reply_to(self, source, text, **kwargs):
@@ -82,14 +85,35 @@ class FakeBot:
 
     def send_message(self, chat_id, text, **kwargs):
         self.sent.append((chat_id, text, kwargs))
+        target = Message(text, chat_id=chat_id, user_id=0, message_id=self._next)
+        self._next += 1
+        return target
+
+    def send_chat_action(self, chat_id, action, **kwargs):
+        self.actions.append((chat_id, action, kwargs))
+
+    def delete_message(self, chat_id, message_id):
+        self.deleted.append((chat_id, message_id))
+        return True
 
     def edit_message_reply_markup(self, chat_id, message_id, **kwargs):
         self.edits.append(("", chat_id, message_id, kwargs))
 
 
+class FakeDraftBot(FakeBot):
+    def __init__(self):
+        super().__init__()
+        self.drafts = []
+
+    def send_message_draft(self, chat_id, draft_id, text, **kwargs):
+        self.drafts.append((chat_id, draft_id, text, kwargs))
+        return True
+
+
 class FakeTelegramTransport:
-    def __init__(self, view):
+    def __init__(self, view, *, events=()):
         self.view = view
+        self.events = tuple(events)
         self.queries = []
         self.confirmations = []
         self.cancelled = []
@@ -97,8 +121,8 @@ class FakeTelegramTransport:
     async def query(self, envelope, *, observe=None):
         self.queries.append(envelope)
         if observe is not None:
-            # No need to fake a second event state machine; the presenter only observes.
-            pass
+            for event in self.events:
+                await observe(event)
         return self.view
 
     async def confirm(self, envelope, *, observe=None):
@@ -160,6 +184,67 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         with patch.object(adapter, "is_agent_enabled", return_value=False):
             self.assertFalse(adapter.handle_agent_message(bot, TELEBOT, Message()))
         self.assertEqual(bot.replies, [])
+
+    def test_query_streams_typing_and_renders_markdown_as_telegram_html(self):
+        factory = EventFactory(
+            session_id="tg_session",
+            turn_id="turn-stream",
+            request_id="request-stream",
+        )
+        answer = (
+            "### 2026 新番推荐\n"
+            "1. **《葬送的芙莉莲》第二季**\n"
+            "   - **题材**：奇幻 / 冒险\n\n"
+            "---\n"
+            "> 定档信息可能变化。"
+        )
+        transport = FakeTelegramTransport(
+            TurnView(
+                session_id="tg_session",
+                turn_id="turn-stream",
+                request_id="request-stream",
+                status="success",
+                answer=answer,
+            ),
+            events=(
+                factory.create(AgentEventType.MODEL_STARTED, {"round": 1}),
+                factory.create(
+                    AgentEventType.MODEL_DELTA,
+                    {"round": 1, "delta": answer[:35]},
+                ),
+                factory.create(
+                    AgentEventType.MODEL_DELTA,
+                    {"round": 1, "delta": answer[35:]},
+                ),
+            ),
+        )
+        runtime = types.SimpleNamespace(telegram=transport, store=FakeStore())
+        bot = FakeDraftBot()
+        patches = self._patch_access()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime),
+        ):
+            handled = adapter.handle_agent_message(
+                bot, TELEBOT, Message("2026 新番推荐")
+            )
+
+        self.assertTrue(handled)
+        self.assertTrue(any(action == "typing" for _, action, _ in bot.actions))
+        streamed = [text for _chat, _draft, text, _kwargs in bot.drafts if "正在输出" in text]
+        self.assertTrue(streamed)
+        self.assertIn("<b>2026 新番推荐</b>", streamed[0])
+        _chat_id, final_text, final_kwargs = bot.sent[-1]
+        self.assertEqual(final_kwargs["parse_mode"], "HTML")
+        self.assertIn("<b>2026 新番推荐</b>", final_text)
+        self.assertIn("<b>《葬送的芙莉莲》第二季</b>", final_text)
+        self.assertIn("────────", final_text)
+        self.assertIn("<blockquote>定档信息可能变化。</blockquote>", final_text)
+        self.assertNotIn("###", final_text)
+        self.assertNotIn("**", final_text)
+        self.assertNotIn("正在输出", final_text)
 
     def test_query_renders_kernel_approval_with_direct_effect_buttons(self):
         approval = ApprovalView(

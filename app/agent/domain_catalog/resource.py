@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
-from .support import (
-    RiskLevel,
-    ToolSpec,
+from app.agent.indexer_actions import (
+    search_arguments as indexer_search_arguments,
+)
+from app.agent.indexer_actions import (
+    search_resources,
+)
+from app.agent.indexer_readiness_actions import (
     diagnose_indexer_readiness,
     indexer_readiness_arguments,
-    indexer_search_arguments,
+)
+from app.agent.ingest_actions import (
     ingest_inspect_arguments,
     ingest_status_arguments,
     ingest_submit_arguments,
-    search_resources,
+)
+from app.agent.models import (
+    RiskLevel,
+    ToolSpec,
 )
 
 
@@ -42,6 +50,8 @@ def register_specs(
             name="indexer.search_resources",
             description=(
                 "在已启用的多站索引中搜索短期资源结果，只返回 opaque result_id 与公开元数据。"
+                "可提交的候选会同时返回 owner/session 绑定的 resource_candidates_ref，后续资源检查或"
+                "提交必须原样使用该引用。"
                 "可用于交叉核对连载资源跟进到哪一集，但资源标题只能作为旁证，不能证明官方播出进度。"
             ),
             risk=RiskLevel.READ,
@@ -87,6 +97,7 @@ def register_specs(
             },
             handler=search_resources,
             validator=indexer_search_arguments,
+            related_tools=("ingest.inspect", "ingest.submit"),
             examples=(
                 "搜索《某片》的下载资源",
                 "找种子或磁力资源",
@@ -120,6 +131,10 @@ def register_specs(
                         "default": "auto",
                     },
                     "input": {"type": "string", "maxLength": 8192},
+                    "resource_candidates_ref": {
+                        "type": "string",
+                        "pattern": "^ref_[A-Za-z0-9_-]{16,160}$",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -130,6 +145,7 @@ def register_specs(
             freshness="live",
             workflow="ingest_submit",
             workflow_stage=10,
+            related_tools=("ingest.submit",),
             examples=(
                 "解析这个光鸭分享链接",
                 "检查这个磁力链接能否下载",
@@ -141,7 +157,9 @@ def register_specs(
         ToolSpec(
             name="ingest.submit",
             description=(
-                "在用户确认后统一提交最近检查的直链或光鸭分享，或按最近资源搜索候选序号提交。"
+                "在用户确认后统一提交最近检查的直链或光鸭分享，或按资源搜索候选序号提交。"
+                "资源搜索完成后应把返回的 resource_candidates_ref 原样传入，确保同轮与后续对话均绑定"
+                "同一份候选快照；直链或分享检查完成后应把 ingest_snapshot_ref 原样传入。"
                 "直链和资源候选可选 qB、光鸭或两边；光鸭分享仅转存到光鸭。确认参数不包含链接、"
                 "访问令牌、云端 file_id、内部 result_id 或后端任务标识。"
             ),
@@ -162,6 +180,14 @@ def register_specs(
                         "uniqueItems": True,
                         "items": {"type": "integer", "minimum": 1, "maximum": 200},
                     },
+                    "resource_candidates_ref": {
+                        "type": "string",
+                        "pattern": "^ref_[A-Za-z0-9_-]{16,160}$",
+                    },
+                    "ingest_snapshot_ref": {
+                        "type": "string",
+                        "pattern": "^ref_[A-Za-z0-9_-]{16,160}$",
+                    },
                 },
                 "additionalProperties": False,
             },
@@ -178,7 +204,7 @@ def register_specs(
             examples=(
                 "把刚才的磁力提交到 qB",
                 "把这个光鸭分享全部转存",
-                "把刚才第 1、3 个资源提交到两边",
+                "把刚才第 1、3 个资源提交到两边，并使用搜索结果返回的 resource_candidates_ref",
             ),
         )
     )

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 
 from app import database as db
+from app.agent.missing_media_workflow_runtime import MissingMediaWorkflowRuntime
 from app.agent.missing_media_workflows import (
     SQLiteMissingMediaWorkflowRepository,
     list_missing_workflows,
@@ -12,11 +13,11 @@ from app.agent.missing_media_workflows import (
 )
 from app.agent.models import ToolContext, ToolResult
 from app.agent.recent_download_submissions import (
+    RecentDownloadSubmissionStore,
     enqueue_recent_download_library_verification,
     parse_recent_download_verification_context,
 )
 from tests.support import IsolatedDatabaseTestCase
-
 
 _VERIFICATION = {
     "title": "The Show",
@@ -83,6 +84,103 @@ class MissingMediaWorkflowTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM download_requests")
         self.repository = SQLiteMissingMediaWorkflowRepository(
             secret_provider=lambda: "workflow-test-secret"
+        )
+
+    def test_kernel_runtime_closes_search_selection_submission_verification_chain(self):
+        recent = RecentDownloadSubmissionStore()
+
+        def enqueue(result, context, _owner):
+            workflow_ref = workflow_ref_from_context(context)
+            request_id = int(result.data["request_id"])
+            return bool(
+                workflow_ref
+                and self.repository.attach_submission(
+                    workflow_ref=workflow_ref,
+                    request_id=request_id,
+                    verification_enqueued=True,
+                )
+            )
+
+        runtime = MissingMediaWorkflowRuntime(
+            repository=self.repository,
+            recent_download_store=recent,
+            verification_enqueuer=enqueue,
+        )
+        self.assertTrue(
+            runtime.capture_search(
+                owner="session-a",
+                tool_name="library.search_missing_episode_resources",
+                result=_search_result(),
+            )
+        )
+        followups = runtime.stage_candidates(
+            owner="session-a",
+            candidates=[
+                {
+                    "verification": _VERIFICATION,
+                    "candidate_title": "The.Show.S02E03.1080p",
+                    "target": "qb",
+                }
+            ],
+        )
+        self.assertEqual(len(followups), 1)
+        self.assertEqual(
+            self.repository.list_for_owner(owner="session-a")[0]["item_state"],
+            "confirmation_required",
+        )
+
+        request_id, created = db.create_download_request(
+            "kernel-runtime-closed-loop",
+            "magnet",
+            title="The Show S02E03",
+            origin="agent:session-a",
+        )
+        self.assertTrue(created)
+        submission = _submission_result(request_id)
+        submission.data["source_type"] = "resource_candidates"
+        runtime.complete_submission(
+            owner="session-a",
+            tool_name="ingest.submit",
+            result=submission,
+            followups=followups,
+        )
+
+        row = self.repository.list_for_owner(owner="session-a")[0]
+        self.assertEqual(row["item_state"], "verification_pending")
+        self.assertEqual(row["download_request_id"], request_id)
+        captured = recent.get(owner="session-a")
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0].request_id, request_id)
+        self.assertEqual(captured[0].verification.episode, 3)
+
+    def test_kernel_runtime_releases_cancelled_confirmation_for_reselection(self):
+        runtime = MissingMediaWorkflowRuntime(repository=self.repository)
+        runtime.capture_search(
+            owner="session-a",
+            tool_name="library.search_missing_episode_resources",
+            result=_search_result(),
+        )
+        followups = runtime.stage_candidates(
+            owner="session-a",
+            candidates=[
+                {
+                    "verification": _VERIFICATION,
+                    "candidate_title": "The.Show.S02E03.1080p",
+                    "target": "qb",
+                }
+            ],
+        )
+        runtime.release_followups(owner="session-a", followups=followups)
+
+        row = self.repository.list_for_owner(owner="session-a")[0]
+        self.assertEqual(row["item_state"], "selection_required")
+        self.assertIsNotNone(
+            self.repository.select_candidate(
+                owner="session-a",
+                verification=_VERIFICATION,
+                candidate_title="The.Show.S02E03.2160p",
+                target="guangya",
+            )
         )
 
     def test_search_projection_is_owner_scoped_and_persists_no_resource_secret(self):

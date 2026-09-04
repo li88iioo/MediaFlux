@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.agent.models import ToolResult
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
+    attach_resource_candidate_reference,
     public_candidate_projection,
+    restore_resource_candidate_reference,
     validate_safe_resource_snapshot,
 )
+from app.indexers.models import IndexerItem
+from app.indexers.result_store import IndexerResultStore
 
 
 def _candidate(
@@ -105,6 +111,38 @@ def _season_result(*candidates: dict) -> ToolResult:
 
 
 class RecentResourceCandidateStoreTests(unittest.TestCase):
+    def test_private_reference_restores_verified_candidate_after_process_restart(self):
+        original_store = IndexerResultStore()
+        result_id = original_store.put(
+            IndexerItem(
+                site_id="mikan",
+                site_name="Mikan",
+                title="The.Show.S02E03.1080p.WEB-DL",
+                detail_url="https://private.invalid/detail",
+                download_state="ready",
+                download_kinds=("magnet",),
+                magnet="magnet:?xt=urn:btih:" + "b" * 40,
+            )
+        )
+        result = _single_result(_candidate(result_id))
+
+        attach_resource_candidate_reference(result, result_store=original_store)
+        private_value = result.references[0].value
+        restarted_store = IndexerResultStore()
+        with patch(
+            "app.indexers.runtime.get_indexer_service",
+            return_value=SimpleNamespace(result_store=restarted_store),
+        ):
+            snapshot = restore_resource_candidate_reference(private_value)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(
+            snapshot["candidates"][0]["_verification_context"]["episode"], 3
+        )
+        restored = restarted_store.get(result_id)
+        self.assertEqual(restored.title, "The.Show.S02E03.1080p.WEB-DL")
+        self.assertTrue(str(restored.magnet).startswith("magnet:?xt=urn:btih:"))
+
     def test_snapshot_is_owner_bound_short_lived_and_safely_projected(self):
         now = [100.0]
         store = RecentResourceCandidateStore(ttl_seconds=10, clock=lambda: now[0])

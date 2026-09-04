@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -17,6 +18,24 @@ SCRIPT = ROOT / "app" / "static" / "js" / "agent.js"
 MAIN_STYLES = ROOT / "app" / "static" / "css" / "main.css"
 AGENT_STYLES = ROOT / "app" / "static" / "css" / "agent.css"
 SESSION_ID = "session_kernel_browser_0001"
+
+
+def _chromium_executable(playwright) -> str | None:
+    """优先使用与 Playwright 配套的浏览器，避免系统 Chrome 超前导致崩溃。"""
+    candidates: list[Path] = []
+    configured = str(os.getenv("PLAYWRIGHT_CHROMIUM_EXECUTABLE") or "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    candidates.append(Path(playwright.chromium.executable_path))
+    cache_root = Path.home() / ".cache" / "ms-playwright"
+    candidates.extend(
+        sorted(
+            cache_root.glob("chromium-*/chrome-linux*/chrome"),
+            reverse=True,
+        )
+    )
+    candidates.extend((Path("/usr/bin/google-chrome"), Path("/usr/bin/chromium")))
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def _event(sequence: int, event_type: str, payload: dict | None = None) -> dict:
@@ -160,11 +179,14 @@ class AgentKernelBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.playwright = sync_playwright().start()
-        cls.browser = cls.playwright.chromium.launch(
-            headless=True,
-            executable_path="/usr/bin/google-chrome",
-            args=["--no-sandbox"],
-        )
+        executable_path = _chromium_executable(cls.playwright)
+        launch_options = {
+            "headless": True,
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+        }
+        if executable_path is not None:
+            launch_options["executable_path"] = executable_path
+        cls.browser = cls.playwright.chromium.launch(**launch_options)
         cls.source = SCRIPT.read_text(encoding="utf-8")
         cls.styles = "\n".join(
             (
@@ -253,6 +275,92 @@ class AgentKernelBrowserTests(unittest.TestCase):
         self.assertIn("/api/agent/query", paths)
         self.assertFalse(any("/tools/" in path or "/prepare" in path for path in paths))
 
+    def test_assistant_markdown_is_rendered_as_safe_semantic_dom(self) -> None:
+        answer = """# 国漫推荐
+
+以下是结合近期热度整理的作品：
+
+---
+
+## 传统玄幻
+
+- **《剑来》**：动作与水墨表现突出
+- `《仙逆》`：节奏紧凑
+
+> 提示：可以继续让我检查媒体库收录状态。
+
+| 作品 | 年份 |
+| --- | ---: |
+| 剑来 | 2026 |
+
+[打开媒体库](/media-libraries) [危险链接](javascript:alert(1))
+
+公开页面：https://example.com/donghua。
+
+本地路径：C:\\Media\\Anime
+
+```text
+Season 1 / S01E01
+```
+
+<script>window.__markdownXss = true</script>
+"""
+        events = [
+            _event(1, "turn.started", {"kind": "query"}),
+            _event(2, "model.started", {"round": 1}),
+            _event(3, "model.delta", {"round": 1, "delta": answer[:80]}),
+            _event(4, "model.delta", {"round": 1, "delta": answer[80:]}),
+            _event(5, "turn.completed", {"status": "success", "answer": answer}),
+        ]
+        page = self.make_page(
+            {"sessions": {"sessions": []}, "queryEvents": events, "queryDelayMs": 12}
+        )
+        page.locator("#agentPrompt").fill("最近有什么推荐的国漫")
+        page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        narrative = page.locator(".agent-narrative")
+        narrative.wait_for()
+
+        self.assertEqual(
+            narrative.locator("h2.agent-md-heading-1").inner_text(), "国漫推荐"
+        )
+        self.assertEqual(
+            narrative.locator("h3.agent-md-heading-2").inner_text(), "传统玄幻"
+        )
+        self.assertEqual(narrative.locator("ul > li").count(), 2)
+        self.assertEqual(narrative.locator("strong").inner_text(), "《剑来》")
+        self.assertEqual(
+            narrative.locator("code.agent-md-inline-code").inner_text(), "《仙逆》"
+        )
+        self.assertEqual(narrative.locator("blockquote").count(), 1)
+        self.assertEqual(narrative.locator("hr").count(), 1)
+        self.assertEqual(narrative.locator("table tbody tr").count(), 1)
+        self.assertEqual(
+            narrative.locator("pre code").inner_text(), "Season 1 / S01E01"
+        )
+        self.assertEqual(narrative.locator('a[href="/media-libraries"]').count(), 1)
+        self.assertEqual(
+            narrative.locator('a[href^="https://example.com/donghua"]').count(), 1
+        )
+        self.assertEqual(narrative.locator("a a").count(), 0)
+        self.assertEqual(narrative.locator('a[href^="javascript:"]').count(), 0)
+        self.assertEqual(narrative.locator("script").count(), 0)
+        self.assertFalse(page.evaluate("Boolean(window.__markdownXss)"))
+        self.assertIn(r"C:\Media\Anime", narrative.inner_text())
+        self.assertIn("<script>window.__markdownXss", narrative.inner_text())
+
+        page.set_viewport_size({"width": 390, "height": 844})
+        layout = page.evaluate("""() => {
+          const table = document.querySelector('.agent-md-table-scroll');
+          return {
+            documentWidth: document.documentElement.scrollWidth,
+            viewportWidth: window.innerWidth,
+            tableClientWidth: table?.clientWidth || 0,
+            tableScrollWidth: table?.scrollWidth || 0,
+          };
+        }""")
+        self.assertLessEqual(layout["documentWidth"], layout["viewportWidth"])
+        self.assertGreaterEqual(layout["tableScrollWidth"], layout["tableClientWidth"])
+
     def test_effect_preview_can_be_cancelled_without_executing_confirm(self) -> None:
         events = [
             _event(1, "turn.started", {"kind": "query"}),
@@ -283,7 +391,15 @@ class AgentKernelBrowserTests(unittest.TestCase):
         card = page.locator(".agent-confirmation-card")
         card.wait_for()
         self.assertIn("创建 RSS 订阅", card.inner_text())
-        card.locator("[data-effect-cancel]").click()
+        self.assertTrue(
+            card.locator("xpath=ancestor::article[1]").evaluate(
+                "node => node.classList.contains('is-confirmation') && node.getAnimations().length === 0"
+            )
+        )
+        # 这里验证的是事件委托与取消 API；先独立断言卡片无位移动画，再直接
+        # 分发点击事件，避免系统 Chrome 与 Playwright 版本差异引发 actionability
+        # 层的偶发 Target crashed。
+        card.locator("[data-effect-cancel]").dispatch_event("click")
         page.locator(".agent-cancelled").wait_for()
         calls = page.evaluate("window.__kernelCalls")
         paths = [call["url"] for call in calls]

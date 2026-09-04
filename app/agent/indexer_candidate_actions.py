@@ -15,6 +15,7 @@ from app.agent.models import ToolContext, ToolResult
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     normalize_resource_search_id,
+    restore_resource_candidate_reference,
 )
 from app.agent.state_commit import active_agent_resource_candidates
 
@@ -37,6 +38,27 @@ class IndexerCandidateActions:
             raise AgentToolError("请先登录后搜索资源", code="precondition_failed")
 
         search_id = normalize_resource_search_id(arguments.get("search_id"))
+        provided_value = arguments.get("resource_candidates")
+        if provided_value is not None:
+            snapshot = restore_resource_candidate_reference(provided_value)
+            if snapshot is None:
+                raise AgentToolError(
+                    "资源候选引用无效或已过期",
+                    code="confirmation_stale"
+                    if require_search_id
+                    else "precondition_failed",
+                )
+            snapshot_search_id = normalize_resource_search_id(snapshot.get("search_id"))
+            if search_id and search_id != snapshot_search_id:
+                raise AgentToolError(
+                    "资源候选引用与搜索快照不匹配",
+                    code="confirmation_stale"
+                    if require_search_id
+                    else "precondition_failed",
+                )
+            arguments["search_id"] = snapshot_search_id
+            return snapshot
+
         if require_search_id and not search_id:
             raise AgentToolError(
                 "资源确认缺少已冻结的搜索快照，请重新选择",
@@ -44,6 +66,15 @@ class IndexerCandidateActions:
             )
 
         staged = active_agent_resource_candidates(owner=owner)
+        if (
+            context.session_id
+            and not search_id
+            and not isinstance(staged, dict)
+        ):
+            raise AgentToolError(
+                "当前会话缺少资源候选引用，请使用搜索结果返回的引用",
+                code="precondition_failed",
+            )
         if search_id:
             staged_search_id = (
                 normalize_resource_search_id(staged.get("search_id"))
@@ -82,12 +113,18 @@ class IndexerCandidateActions:
         return snapshot
 
     def current_snapshot(
-        self, context: ToolContext, *, search_id: str = ""
+        self,
+        context: ToolContext,
+        *,
+        search_id: str = "",
+        resource_candidates: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """返回 staged 优先或精确 search_id 绑定的安全快照。"""
         arguments: dict[str, Any] = {}
         if search_id:
             arguments["search_id"] = search_id
+        if resource_candidates is not None:
+            arguments["resource_candidates"] = resource_candidates
         return self._snapshot(arguments, context)
 
     def _candidates(
@@ -172,13 +209,22 @@ class IndexerCandidateActions:
     def prepare_one(
         self, arguments: dict[str, Any], context: ToolContext
     ) -> tuple[ToolResult, str]:
-        internal, _candidate = self._resolve_one(arguments, context)
+        internal, candidate = self._resolve_one(arguments, context)
         result, confirmation_context = prepare_submit_resource(internal)
         if isinstance(result.data, dict):
             resource = result.data.get("resource")
             if isinstance(resource, dict):
                 resource.pop("result_id", None)
                 resource["position"] = int(arguments["position"])
+        verification = candidate.get("_verification_context")
+        if isinstance(verification, dict):
+            result.effect_metadata["missing_media_candidates"] = [
+                {
+                    "verification": verification,
+                    "candidate_title": str(candidate.get("title") or "")[:300],
+                    "target": str(arguments["target"]),
+                }
+            ]
         return result, confirmation_context
 
     def confirm_one(
@@ -192,17 +238,13 @@ class IndexerCandidateActions:
             context,
             require_search_id=True,
         )
-        result = submit_resource_confirmed(internal, expected_context)
-        if isinstance(result.data, dict):
-            verification = candidate.get("_verification_context")
-            if isinstance(verification, dict):
-                result.data["_verification_context"] = verification
-        return result
+        del candidate
+        return submit_resource_confirmed(internal, expected_context)
 
     def prepare_batch(
         self, arguments: dict[str, Any], context: ToolContext
     ) -> tuple[ToolResult, str]:
-        internal, _candidates = self._resolve_batch(arguments, context)
+        internal, candidates = self._resolve_batch(arguments, context)
         result, confirmation_context = prepare_submit_resource_batch(internal)
         if isinstance(result.data, dict):
             resources = result.data.get("resources")
@@ -210,6 +252,23 @@ class IndexerCandidateActions:
                 for public_position, resource in zip(arguments["positions"], resources):
                     if isinstance(resource, dict):
                         resource["position"] = int(public_position)
+        effect_candidates = []
+        for candidate in candidates:
+            verification = candidate.get("_verification_context")
+            effect_candidates.append(
+                {
+                    "verification": (
+                        verification if isinstance(verification, dict) else None
+                    ),
+                    "candidate_title": str(candidate.get("title") or "")[:300],
+                    "target": str(arguments["target"]),
+                }
+            )
+        if any(
+            isinstance(item.get("verification"), dict)
+            for item in effect_candidates
+        ):
+            result.effect_metadata["missing_media_candidates"] = effect_candidates
         return result, confirmation_context
 
     def confirm_batch(
@@ -223,12 +282,5 @@ class IndexerCandidateActions:
             context,
             require_search_id=True,
         )
-        result = submit_resource_batch_confirmed(internal, expected_context)
-        if isinstance(result.data, dict):
-            result.data["_verification_contexts"] = [
-                candidate.get("_verification_context")
-                if isinstance(candidate.get("_verification_context"), dict)
-                else None
-                for candidate in candidates
-            ]
-        return result
+        del candidates
+        return submit_resource_batch_confirmed(internal, expected_context)

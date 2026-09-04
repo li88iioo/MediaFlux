@@ -54,7 +54,9 @@ class FakeAdapter:
         self.calls += 1
         if self.tracker is not None:
             self.tracker["active"] += 1
-            self.tracker["maximum"] = max(self.tracker["maximum"], self.tracker["active"])
+            self.tracker["maximum"] = max(
+                self.tracker["maximum"], self.tracker["active"]
+            )
         try:
             if self.delay:
                 await asyncio.sleep(self.delay)
@@ -156,7 +158,9 @@ class ShutdownAwareRegistry(IndexerRegistry):
 class QueryAwareAdapter(FakeAdapter):
     def __init__(self, site_id, items_by_query):
         super().__init__(site_id)
-        self.items_by_query = {query: list(items) for query, items in items_by_query.items()}
+        self.items_by_query = {
+            query: list(items) for query, items in items_by_query.items()
+        }
         self.queries = []
         self.media_types = []
         self.sort_modes = []
@@ -238,7 +242,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     def service(self, adapters, **kwargs):
         return IndexerService(
-            registry=IndexerRegistry({adapter.site_id: adapter for adapter in adapters}),
+            registry=IndexerRegistry(
+                {adapter.site_id: adapter for adapter in adapters}
+            ),
             result_store=self.store,
             clock=lambda: self.now,
             cache_ttl_seconds=kwargs.pop("cache_ttl_seconds", 30),
@@ -250,8 +256,12 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_partial_success_caps_each_site_and_returns_safe_error(self):
-        good = FakeAdapter("nyaa", [item("nyaa", "one"), item("nyaa", "two"), item("nyaa", "three")])
-        bad = FakeAdapter("mikan", error=IndexerUnavailable("internal upstream detail must not leak"))
+        good = FakeAdapter(
+            "nyaa", [item("nyaa", "one"), item("nyaa", "two"), item("nyaa", "three")]
+        )
+        bad = FakeAdapter(
+            "mikan", error=IndexerUnavailable("internal upstream detail must not leak")
+        )
         service = self.service([good, bad])
 
         result = await service.search("Frieren", page=1, site_ids=("nyaa", "mikan"))
@@ -277,19 +287,27 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         nyaa = QueryAwareAdapter(
             "nyaa",
-            {"手札が多めのビクトリア": [item(
-                "nyaa",
-                "手札が多めのビクトリア 2026 1080p",
-                magnet=f"magnet:?xt=urn:btih:{HASH}",
-            )]},
+            {
+                "手札が多めのビクトリア": [
+                    item(
+                        "nyaa",
+                        "手札が多めのビクトリア 2026 1080p",
+                        magnet=f"magnet:?xt=urn:btih:{HASH}",
+                    )
+                ]
+            },
         )
         mikan = QueryAwareAdapter(
             "mikan",
-            {"奇招百出的维多利亚": [item(
-                "mikan",
-                "奇招百出的维多利亚 2026 1080p",
-                magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
-            )]},
+            {
+                "奇招百出的维多利亚": [
+                    item(
+                        "mikan",
+                        "奇招百出的维多利亚 2026 1080p",
+                        magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+                    )
+                ]
+            },
         )
         service = self.service([nyaa, mikan])
 
@@ -299,7 +317,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             nyaa.queries,
             ["Tefuda ga Oome no Victoria", "手札が多めのビクトリア"],
         )
-        self.assertEqual(mikan.queries, ["奇招百出的维多利亚"] )
+        self.assertEqual(mikan.queries, ["奇招百出的维多利亚"])
         self.assertEqual(nyaa.media_types, ["tv", "tv"])
         self.assertEqual(mikan.media_types, ["tv"])
         self.assertEqual(
@@ -313,7 +331,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.site_attempt_counts, {"nyaa": 2, "mikan": 1})
         self.assertEqual(result.query, "奇招百出的维多利亚")
 
-    async def test_low_quality_nonempty_alias_does_not_suppress_better_later_alias(self):
+    async def test_low_quality_nonempty_alias_does_not_suppress_better_later_alias(
+        self,
+    ):
         media = IndexerMediaSearchRequest.create(
             title="本地标题",
             original_title="原題",
@@ -325,11 +345,13 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             "nyaa",
             {
                 "Romanized Alias": [item("nyaa", "Old unrelated upload")],
-                "原題": [item(
-                    "nyaa",
-                    "原題 2026 1080p",
-                    magnet=f"magnet:?xt=urn:btih:{HASH}",
-                )],
+                "原題": [
+                    item(
+                        "nyaa",
+                        "原題 2026 1080p",
+                        magnet=f"magnet:?xt=urn:btih:{HASH}",
+                    )
+                ],
             },
         )
         service = self.service([adapter])
@@ -383,11 +405,13 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         adapter = QueryAwareAdapter(
             "1lou",
             {
-                "九门 S02E30": [item(
-                    "1lou",
-                    "九门[第30集].Mystic.Nine.S02.2026.1080p",
-                    magnet=f"magnet:?xt=urn:btih:{HASH}",
-                )],
+                "九门 S02E30": [
+                    item(
+                        "1lou",
+                        "九门[第30集].Mystic.Nine.S02.2026.1080p",
+                        magnet=f"magnet:?xt=urn:btih:{HASH}",
+                    )
+                ],
             },
         )
         service = self.service([adapter])
@@ -434,7 +458,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("episode_exact", result.items[0].match_reasons)
         self.assertIn("episode_range", result.items[1].match_reasons)
 
-    async def test_aliases_share_one_site_budget_instead_of_each_getting_full_timeout(self):
+    async def test_aliases_share_one_site_budget_instead_of_each_getting_full_timeout(
+        self,
+    ):
         media = IndexerMediaSearchRequest.create(
             title="本地标题",
             original_title="原題",
@@ -478,7 +504,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.search_media(media, ("nyaa",))
 
-        self.assertEqual([entry.title for entry in result.items], ["Demo newer", "Demo older"])
+        self.assertEqual(
+            [entry.title for entry in result.items], ["Demo newer", "Demo older"]
+        )
 
     async def test_alias_merge_applies_requested_sort_before_per_site_limit(self):
         older_relevant = IndexerItem(
@@ -513,7 +541,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.search_media(media, ("nyaa",))
 
         self.assertEqual(adapter.queries, ["Alias", "Target"])
-        self.assertEqual([entry.title for entry in result.items], [newer_downloadable.title])
+        self.assertEqual(
+            [entry.title for entry in result.items], [newer_downloadable.title]
+        )
 
     async def test_episode_conflicts_stay_below_matching_ranges_even_when_newer(self):
         conflict = item(
@@ -540,9 +570,13 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         result = await service.search_media(media, ("1lou",))
 
-        self.assertEqual([entry.title for entry in result.items], [matching.title, conflict.title])
+        self.assertEqual(
+            [entry.title for entry in result.items], [matching.title, conflict.title]
+        )
 
-    async def test_btbtla_failure_is_marked_as_onelou_fallback_only_when_both_are_selected(self):
+    async def test_btbtla_failure_is_marked_as_onelou_fallback_only_when_both_are_selected(
+        self,
+    ):
         btbtla = FakeAdapter("btbtla", error=IndexerUnavailable("tls failed"))
         onelou = FakeAdapter("1lou", [item("1lou", "fallback resource")])
         service = self.service([btbtla, onelou])
@@ -550,21 +584,41 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.search("Demo", 1, ("btbtla", "1lou"))
 
         self.assertEqual(result.site_fallbacks, {"btbtla": "1lou"})
-        self.assertEqual([entry.title for entry in result.items], ["fallback resource"] )
+        self.assertEqual([entry.title for entry in result.items], ["fallback resource"])
 
-        isolated = self.service([FakeAdapter("btbtla", error=IndexerUnavailable("tls failed"))])
+        isolated = self.service(
+            [FakeAdapter("btbtla", error=IndexerUnavailable("tls failed"))]
+        )
         isolated_result = await isolated.search("Demo", 1, ("btbtla",))
         self.assertEqual(isolated_result.site_fallbacks, {})
 
     async def test_magnet_infohash_dedupe_keeps_the_richer_cross_site_result(self):
-        first = item("nyaa", "first", magnet=f"magnet:?dn=one&xt=urn:btih:{HASH.upper()}", seeders=1)
-        duplicate = item("mikan", "duplicate", magnet=f"magnet:?xt=urn:btih:{HASH}&dn=two", seeders=999)
-        unique = item("mikan", "unique", magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef")
-        service = self.service([FakeAdapter("nyaa", [first]), FakeAdapter("mikan", [duplicate, unique])])
+        first = item(
+            "nyaa",
+            "first",
+            magnet=f"magnet:?dn=one&xt=urn:btih:{HASH.upper()}",
+            seeders=1,
+        )
+        duplicate = item(
+            "mikan",
+            "duplicate",
+            magnet=f"magnet:?xt=urn:btih:{HASH}&dn=two",
+            seeders=999,
+        )
+        unique = item(
+            "mikan",
+            "unique",
+            magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
+        )
+        service = self.service(
+            [FakeAdapter("nyaa", [first]), FakeAdapter("mikan", [duplicate, unique])]
+        )
 
         result = await service.search("Frieren", 1, ("nyaa", "mikan"))
 
-        self.assertEqual([entry.title for entry in result.items], ["duplicate", "unique"])
+        self.assertEqual(
+            [entry.title for entry in result.items], ["duplicate", "unique"]
+        )
         self.assertEqual(result.site_item_counts, {"nyaa": 1, "mikan": 2})
         self.assertEqual(result.site_visible_counts, {"nyaa": 0, "mikan": 2})
 
@@ -595,7 +649,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(merged[0].title, richer.title)
         self.assertEqual(merged[0].download_state, "ready")
 
-    def test_alias_merge_prefers_more_relevant_actionable_duplicate_over_ready_state(self):
+    def test_alias_merge_prefers_more_relevant_actionable_duplicate_over_ready_state(
+        self,
+    ):
         detail_url = "https://www.1lou.me/thread-456.htm"
         relevant = IndexerItem(
             site_id="1lou",
@@ -680,7 +736,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_site_timeout_and_total_timeout_preserve_completed_results(self):
         fast = FakeAdapter("nyaa", [item("nyaa", "fast")], delay=0.01)
         slow = FakeAdapter("mikan", [item("mikan", "slow")], delay=0.3)
-        service = self.service([fast, slow], site_timeout_seconds=0.5, total_timeout_seconds=0.05)
+        service = self.service(
+            [fast, slow], site_timeout_seconds=0.5, total_timeout_seconds=0.05
+        )
 
         result = await service.search("Frieren", 1, ("nyaa", "mikan"))
 
@@ -691,10 +749,17 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_max_concurrency_is_enforced(self):
         tracker = {"active": 0, "maximum": 0}
-        adapters = [FakeAdapter(f"site{i}", [item(f"site{i}", str(i))], delay=0.02, tracker=tracker) for i in range(4)]
+        adapters = [
+            FakeAdapter(
+                f"site{i}", [item(f"site{i}", str(i))], delay=0.02, tracker=tracker
+            )
+            for i in range(4)
+        ]
         service = self.service(adapters, max_concurrency=2, max_results_per_site=1)
 
-        result = await service.search("query", 1, tuple(adapter.site_id for adapter in adapters))
+        result = await service.search(
+            "query", 1, tuple(adapter.site_id for adapter in adapters)
+        )
 
         self.assertEqual(len(result.items), 4)
         self.assertEqual(tracker["maximum"], 2)
@@ -734,7 +799,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.now = datetime(2026, 7, 26, 14, 0, tzinfo=timezone.utc)
         partial_good = FakeAdapter("nyaa", [item("nyaa", "partial hit")])
         partial_bad = FakeAdapter("mikan", error=IndexerUnavailable("temporary"))
-        partial_service = self.service([partial_good, partial_bad], cache_ttl_seconds=60)
+        partial_service = self.service(
+            [partial_good, partial_bad], cache_ttl_seconds=60
+        )
         await partial_service.search("partial", 1, ("nyaa", "mikan"))
         self.now += timedelta(seconds=16)
         partial_expired = await partial_service.search("partial", 1, ("nyaa", "mikan"))
@@ -797,10 +864,14 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(resolved.kind, "magnet")
         self.assertEqual(len(adapter.resolve_calls), 1)
-        self.assertEqual(adapter.resolve_calls[0].detail_url, "https://www.btbtlb.com/detail/frieren")
+        self.assertEqual(
+            adapter.resolve_calls[0].detail_url, "https://www.btbtlb.com/detail/frieren"
+        )
         self.assertIsNone(adapter.resolve_calls[0].result_id)
 
-    async def test_resolve_rejects_disabled_stored_provider_without_calling_adapter(self):
+    async def test_resolve_rejects_disabled_stored_provider_without_calling_adapter(
+        self,
+    ):
         adapter = FakeAdapter("1lou", default_enabled=False)
         stored_id = self.store.put(
             IndexerItem(
@@ -841,7 +912,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(caught.exception), "索引站点暂不可用")
 
     async def test_resolve_masks_unexpected_provider_exception(self):
-        adapter = FakeAdapter("btbtla", resolve_error=RuntimeError("secret upstream URL must not leak"))
+        adapter = FakeAdapter(
+            "btbtla", resolve_error=RuntimeError("secret upstream URL must not leak")
+        )
         stored_id = self.store.put(
             IndexerItem(
                 site_id="btbtla",
@@ -898,7 +971,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         # 普通不可用属于可能瞬时的故障，未达阈值前仍应继续尝试。
         self.assertEqual(adapter.calls, 2)
 
-    async def test_provider_circuit_opens_after_three_failures_and_recovers_after_cooldown(self):
+    async def test_provider_circuit_opens_after_three_failures_and_recovers_after_cooldown(
+        self,
+    ):
         adapter = FakeAdapter("nyaa", error=IndexerUnavailable("temporary"))
         service = self.service([adapter], breaker_cooldown_seconds=300)
 
@@ -914,7 +989,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         adapter.items = [item("nyaa", "recovered")]
         recovered = await service.search("recovered", 1, ("nyaa",))
         self.assertEqual(adapter.calls, 4)
-        self.assertEqual([entry.title for entry in recovered.items], ["recovered"] )
+        self.assertEqual([entry.title for entry in recovered.items], ["recovered"])
 
     async def test_unknown_or_disabled_site_is_rejected_before_search(self):
         disabled = FakeAdapter("sukebei", default_enabled=False)
@@ -927,13 +1002,30 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disabled.calls, 0)
 
     async def test_ranking_clusters_and_page_state_are_exposed(self):
-        first = item("nyaa", "[A] Frieren S01E01 1080p", magnet="magnet:?xt=urn:btih:" + "1" * 40, seeders=2)
-        second = item("mikan", "[B] Frieren S01E01 WEB-DL", magnet="magnet:?xt=urn:btih:" + "2" * 40, seeders=20)
-        unrelated = item("nyaa", "Unrelated Release", magnet="magnet:?xt=urn:btih:" + "3" * 40, seeders=999)
+        first = item(
+            "nyaa",
+            "[A] Frieren S01E01 1080p",
+            magnet="magnet:?xt=urn:btih:" + "1" * 40,
+            seeders=2,
+        )
+        second = item(
+            "mikan",
+            "[B] Frieren S01E01 WEB-DL",
+            magnet="magnet:?xt=urn:btih:" + "2" * 40,
+            seeders=20,
+        )
+        unrelated = item(
+            "nyaa",
+            "Unrelated Release",
+            magnet="magnet:?xt=urn:btih:" + "3" * 40,
+            seeders=999,
+        )
         nyaa = FakeAdapter("nyaa", [unrelated, first], has_more=True)
         mikan = FakeAdapter("mikan", [second])
         service = self.service([nyaa, mikan])
-        media = IndexerMediaSearchRequest.create(title="Frieren", year=2026, media_type="tv")
+        media = IndexerMediaSearchRequest.create(
+            title="Frieren", year=2026, media_type="tv"
+        )
 
         result = await service.search_media(media, ("nyaa", "mikan"))
 
@@ -949,9 +1041,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_service_can_search_from_independent_event_loops(self):
         barrier = threading.Barrier(2)
-        adapter = CrossLoopAdapter(
-            "nyaa", [item("nyaa", "Frieren")], barrier
-        )
+        adapter = CrossLoopAdapter("nyaa", [item("nyaa", "Frieren")], barrier)
         service = self.service([adapter])
 
         def run_search():
@@ -979,9 +1069,11 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.calls, 1)
         self.assertNotEqual(first.items[0].result_id, second.items[0].result_id)
 
-
     async def test_close_failure_is_shared_with_waiters_and_can_be_retried(self):
         service = self.service([FakeAdapter("nyaa")])
+        service._inflight[(asyncio.get_running_loop(), ("test-close",))] = (
+            asyncio.current_task()
+        )
         first_wait_started = threading.Event()
         release_first_wait = threading.Event()
         wait_calls = 0
@@ -997,11 +1089,11 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
                 release_first_wait.wait(1.0)
             return False
 
-        with patch.object(
-            service, "_wait_for_inflight", side_effect=fail_to_drain
-        ), patch.object(service, "_cancel_inflight") as cancel_inflight, patch.object(
-            service.registry, "aclose", new=AsyncMock()
-        ) as close_registry:
+        with (
+            patch.object(service, "_wait_for_inflight", side_effect=fail_to_drain),
+            patch.object(service, "_cancel_inflight") as cancel_inflight,
+            patch.object(service.registry, "aclose", new=AsyncMock()) as close_registry,
+        ):
             owner = asyncio.create_task(service.aclose())
             self.assertTrue(await asyncio.to_thread(first_wait_started.wait, 1.0))
             waiter = asyncio.create_task(service.aclose())
@@ -1012,7 +1104,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(results), 2)
         self.assertTrue(all(isinstance(result, RuntimeError) for result in results))
-        self.assertTrue(all("索引器仍有任务未退出" in str(result) for result in results))
+        self.assertTrue(
+            all("索引器仍有任务未退出" in str(result) for result in results)
+        )
         cancel_inflight.assert_called_once_with()
         close_registry.assert_not_awaited()
         self.assertTrue(service._closing)
@@ -1020,17 +1114,29 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(IndexerUnavailable):
             await service.search("another", 1, ("nyaa",))
 
-        with patch.object(
-            service, "_wait_for_inflight", return_value=True
-        ), patch.object(
-            service.registry, "aclose", new=AsyncMock()
-        ) as close_registry:
+        with (
+            patch.object(service, "_wait_for_inflight", return_value=True),
+            patch.object(service.registry, "aclose", new=AsyncMock()) as close_registry,
+        ):
             await service.aclose()
 
         close_registry.assert_awaited_once_with()
         self.assertFalse(service._closing)
         self.assertTrue(service._closed)
 
+    async def test_idle_close_does_not_require_thread_pool(self):
+        service = self.service([FakeAdapter("nyaa")])
+        with (
+            patch(
+                "app.indexers.service.asyncio.to_thread",
+                side_effect=RuntimeError("thread pool unavailable"),
+            ),
+            patch.object(service.registry, "aclose", new=AsyncMock()) as close_registry,
+        ):
+            await service.aclose()
+
+        close_registry.assert_awaited_once_with()
+        self.assertTrue(service._closed)
 
     async def test_close_cancels_inflight_search_before_registry_close(self):
         adapter = ShutdownAwareAdapter("nyaa", [item("nyaa", "Frieren")])

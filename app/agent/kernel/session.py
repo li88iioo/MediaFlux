@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 from app.sensitive_data import contains_sensitive_credential
@@ -30,6 +30,7 @@ from .state import (
     SessionState,
     SessionStateStore,
     StalePublicationError,
+    StateUpdate,
     TurnCoordinator,
 )
 
@@ -42,6 +43,7 @@ DEFAULT_SYSTEM_PROMPT = """你是 MediaFlux Media Agent，一名可操作当前 
 - 云盘、媒体库、下载、订阅、资源、TMDB 与项目状态等事实必须来自本轮工具结果；不得凭记忆编造当前状态。
 - 在本轮候选原子工具中自主执行 MODEL -> TOOL -> MODEL 循环。工具失败时先阅读安全错误，能修正参数或改用候选能力就自行重试。
 - 一次请求可以连续组合多个 READ 工具；最终直接回答，不调用第二个模型做 presentation。
+- 短追问必须继承最近会话中的媒体对象、工具事实与用户约束；只要本轮候选中存在相关能力，就先调用验证，不能未经尝试便声称“未挂载”或“接口未开放”。
 
 副作用规则：
 - READ 工具可直接调用。
@@ -55,7 +57,9 @@ DEFAULT_SYSTEM_PROMPT = """你是 MediaFlux Media Agent，一名可操作当前 
 - 用户要求先整理混乱发布组文件、按 TMDB 集序重命名、再方便后续识别入库时，这是云盘文件规整，不等同于刮削、媒体名称垃圾清理或立即执行媒体整理。先列出共同父目录确认真实发布组名称，再用 paths 一次合并这些目录并以 kinds=["video"]、max_depth=0 聚合正片；只有不便枚举目录时才从共同父目录 search，并用 max_depth 限制花絮子目录。有更多页时沿同一 observation_ref 分页，再一次生成批量文件变更预览。
 - 同一 observation_ref 的全部分页合计已覆盖用户指定的对象数量且未截断时，视为观察完成；直接使用这份快照生成变更预览，不要再创建新的搜索快照或重复核对，否则先前 object_ref 会失效。
 - 大批量剧集需要统一移动并按集号改名时，使用一项 batch_relocate，把每个 object_ref 与真实集号完整列入 items；不要只提交一个示例文件。用户要求全局 1-N/TMDB 顺序时使用 naming="absolute"，按季编号时使用 naming="season_episode"。若目标目录尚不存在，可在同一 operations 中加入 create_directory（可直接传完整 path），并让 batch_relocate.target_path 指向该新目录。
-- 媒体服务器实时统计、媒体总数、qBittorrent 实时任务/速度/进度应读取 Provider 能力与 Provider 实时查询，不用本地历史记录冒充实时状态。
+- 媒体服务器实时统计、媒体总数、qBittorrent 实时任务/速度/进度应先读取 Provider 能力，再执行 Provider 实时查询；媒体总数使用能力清单中的 media.items.counts，不用本地历史记录或巡检快照冒充实时状态。
+- 资源搜索结果会给出 `reference_arguments.resource_candidates_ref`。同轮继续提交或用户用“这个/4K版/第几个/推送”等短句续接时，必须把该引用原样传给资源检查/提交工具，再生成确认计划；不能遗漏引用、重复搜索，或因为当前短句没重复“云盘”就声称提交能力未挂载。
+- 直链或光鸭分享检查会给出 `reference_arguments.ingest_snapshot_ref`。后续提交必须原样传入该引用；不得把原始链接重新塞进写工具，也不得依赖另一个标签页的“最近一次”内存状态。
 - “最近/今年/定档/新剧”若本地探索数据不能证明时，结合联网公开信息并标明来源时效。
 - RSS 规则、媒体追更订阅和下载请求是不同对象；创建、修改、删除必须展示准确预览并等待确认，不能仅凭模型回答宣称创建成功。
 
@@ -91,6 +95,7 @@ class SessionLimits:
     max_model_rounds: int = 12
     max_tool_calls: int = 16
     max_output_tokens: int = 6_000
+    context_window_tokens: int = 128_000
 
     def __post_init__(self) -> None:
         if not 1 <= self.max_model_rounds <= 12:
@@ -99,6 +104,15 @@ class SessionLimits:
             raise ValueError("max_tool_calls out of range")
         if not 128 <= self.max_output_tokens <= 16_000:
             raise ValueError("max_output_tokens out of range")
+        if not 16_384 <= self.context_window_tokens <= 2_000_000:
+            raise ValueError("context_window_tokens out of range")
+
+    @property
+    def effective_output_tokens(self) -> int:
+        return min(
+            self.max_output_tokens,
+            max(1_024, self.context_window_tokens // 4),
+        )
 
 
 class AgentSession:
@@ -298,6 +312,7 @@ class AgentSession:
                     "session_id": agent_input.session_id,
                     "channel": agent_input.channel,
                     "reference_kinds": tuple(state.ref_kinds),
+                    **self._capability_retrieval_context(state),
                 },
             )
             await publish(
@@ -312,6 +327,9 @@ class AgentSession:
             messages.append(ModelMessage(role="user", content=contextual_message))
             selected_names = set(selection.names)
             selected_model_names = set(selection.model_names)
+            tool_definitions = tuple(
+                tool.model_definition() for tool in selection.tools
+            )
             total_tool_calls = 0
             total_usage: dict[str, int] = {}
 
@@ -344,9 +362,13 @@ class AgentSession:
                 finish_reason = ""
                 request = ModelRequest(
                     system_prompt=self.system_prompt,
-                    messages=tuple(messages),
-                    tools=tuple(tool.model_definition() for tool in selection.tools),
-                    max_output_tokens=self.limits.max_output_tokens,
+                    messages=self._bounded_model_messages(
+                        messages,
+                        history_end=current_user_index,
+                        tool_definitions=tool_definitions,
+                    ),
+                    tools=tool_definitions,
+                    max_output_tokens=self.limits.effective_output_tokens,
                     round_index=round_index,
                 )
                 async for model_event in self.model.stream(request, cancellation=token):
@@ -665,6 +687,39 @@ class AgentSession:
             cancellation=token,
             report_progress=progress,
         )
+
+        async def remember_result(
+            *,
+            tool_name: str,
+            content: str,
+        ) -> None:
+            """把确定性确认终态写回会话，供下一轮续问直接引用。"""
+            safe_content = str(content or "").strip()
+            if not safe_content:
+                return
+            conversation = [dict(item) for item in state.conversation]
+            conversation.append(
+                ModelMessage(
+                    role="assistant",
+                    content=(
+                        "已确认操作的可信系统结果（不是待执行计划）：\n"
+                        + safe_content
+                    ),
+                    tool_name=tool_name,
+                ).to_dict()
+            )
+            try:
+                await self.state_store.commit(
+                    lease,
+                    conversation=conversation,
+                    updates=(StateUpdate("pending_effect_plan_id", ""),),
+                )
+            except StalePublicationError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 已执行副作用不得被状态写回遮蔽
+                logger.warning(
+                    "Agent 确认结果写回会话失败 type=%s", type(exc).__name__
+                )
         try:
             await publish(
                 AgentEventType.TURN_STARTED,
@@ -680,6 +735,10 @@ class AgentSession:
             )
             result = await self.pipeline.execute_confirmed(plan_id, context=context)
             public_result = dict(result.outcome.public_content)
+            await remember_result(
+                tool_name=result.tool.name,
+                content=result.outcome.model_message(),
+            )
             if public_result.get("ok") is False:
                 code = str(public_result.get("status") or "effect_failed")[:80]
                 await publish(
@@ -724,6 +783,10 @@ class AgentSession:
                 await self.journal.append(event, owner=owner)
             await queue.put(event)
         except ToolPipelineError as exc:
+            await remember_result(
+                tool_name="confirmed_effect",
+                content=f"执行失败：{str(exc)[:500]}（错误码：{exc.code[:80]}）",
+            )
             await publish(
                 AgentEventType.EFFECT_FAILED,
                 {"plan_id": plan_id, "code": exc.code, "message": str(exc)},
@@ -734,6 +797,13 @@ class AgentSession:
             )
         except Exception as exc:  # noqa: BLE001 - confirmed-effect fault boundary
             logger.error("Agent confirmed effect failed type=%s", type(exc).__name__)
+            await remember_result(
+                tool_name="confirmed_effect",
+                content=(
+                    "执行状态未知：确认执行发生内部错误"
+                    "（错误码：internal_error），请先查询真实业务状态再决定是否重试。"
+                ),
+            )
             await publish(
                 AgentEventType.EFFECT_FAILED,
                 {
@@ -749,6 +819,160 @@ class AgentSession:
         finally:
             await self.coordinator.finish(lease, token)
             await queue.put(None)
+
+    @staticmethod
+    def _estimated_tokens(value: object) -> int:
+        if isinstance(value, str):
+            text = value
+        else:
+            try:
+                text = json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), default=str
+                )
+            except (TypeError, ValueError):
+                text = str(value)
+        ascii_chars = sum(1 for char in text if ord(char) < 128)
+        wide_chars = len(text) - ascii_chars
+        return max(1, (ascii_chars + 3) // 4 + wide_chars)
+
+    def _bounded_model_messages(
+        self,
+        messages: Sequence[ModelMessage],
+        *,
+        history_end: int,
+        tool_definitions: Sequence[Mapping[str, Any]],
+    ) -> tuple[ModelMessage, ...]:
+        """裁剪旧回合并压缩当前工具结果，绝不把超预算请求交给 Provider。"""
+        split_at = max(0, min(int(history_end), len(messages)))
+        history = list(messages[:split_at])
+        current = list(messages[split_at:])
+        fixed_tokens = (
+            self._estimated_tokens(self.system_prompt)
+            + self._estimated_tokens(tool_definitions)
+            + self.limits.effective_output_tokens
+            + 512
+        )
+        message_budget = max(0, self.limits.context_window_tokens - fixed_tokens)
+
+        def message_cost(items: Sequence[ModelMessage]) -> int:
+            return sum(8 + self._estimated_tokens(item.to_dict()) for item in items)
+
+        current_cost = message_cost(current)
+        if current_cost > message_budget:
+            current = self._compact_current_chain(current, max_tool_chars=1_200)
+            current_cost = message_cost(current)
+        if current_cost > message_budget:
+            current = self._compact_current_chain(current, max_tool_chars=400)
+            current_cost = message_cost(current)
+        if current_cost > message_budget:
+            raise ToolPipelineError(
+                "当前工具链超过模型上下文上限，请缩小查询范围后重试",
+                code="context_budget_exceeded",
+            )
+        remaining = max(0, message_budget - current_cost)
+        if message_cost(history) <= remaining:
+            return tuple(history + current)
+
+        groups: list[list[ModelMessage]] = []
+        for message in history:
+            if message.role == "user" or not groups:
+                groups.append([])
+            groups[-1].append(message)
+
+        kept: list[list[ModelMessage]] = []
+        for group in reversed(groups):
+            cost = message_cost(group)
+            if cost > remaining:
+                break
+            kept.append(group)
+            remaining -= cost
+        bounded_history = [message for group in reversed(kept) for message in group]
+        return tuple(bounded_history + current)
+
+    @classmethod
+    def _compact_current_chain(
+        cls,
+        messages: Sequence[ModelMessage],
+        *,
+        max_tool_chars: int,
+    ) -> list[ModelMessage]:
+        result: list[ModelMessage] = []
+        for message in messages:
+            if message.role == "tool":
+                result.append(
+                    replace(
+                        message,
+                        content=cls._compact_tool_content(
+                            message.content,
+                            maximum=max_tool_chars,
+                        ),
+                    )
+                )
+            elif message.role == "assistant" and message.tool_calls and message.content:
+                result.append(replace(message, content=""))
+            else:
+                result.append(message)
+        return result
+
+    @staticmethod
+    def _compact_tool_content(content: str, *, maximum: int) -> str:
+        text = str(content or "")
+        json_text, _separator, suffix = text.partition("\nopaque_refs=")
+        try:
+            payload = json.loads(json_text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        compact = {
+            "ok": bool(payload.get("ok", True)) if isinstance(payload, dict) else True,
+            "status": str(payload.get("status") or "success")[:80]
+            if isinstance(payload, dict)
+            else "success",
+            "summary": str(payload.get("summary") or "工具执行完成")
+            if isinstance(payload, dict)
+            else "工具执行完成",
+            "truncated": True,
+        }
+        reference_suffix = f"\nopaque_refs={suffix}" if suffix else ""
+        budget = max(80, int(maximum) - len(reference_suffix) - 80)
+        compact["summary"] = compact["summary"][:budget]
+        encoded = json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
+        return encoded + reference_suffix
+
+    @staticmethod
+    def _capability_retrieval_context(
+        state: SessionState,
+    ) -> dict[str, tuple[str, ...]]:
+        """提取有界跨轮线索供本地召回使用，不替模型裁决用户意图。"""
+        recent_users: list[str] = []
+        recent_tools: list[str] = []
+        seen_tools: set[str] = set()
+        for item in reversed(state.conversation[-24:]):
+            if not isinstance(item, Mapping):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role == "user" and len(recent_users) < 3:
+                text = str(item.get("content") or "").strip()
+                if text:
+                    recent_users.append(text[:600])
+            tool_name = str(item.get("tool_name") or "").strip()
+            if tool_name and tool_name not in seen_tools and len(recent_tools) < 6:
+                recent_tools.append(tool_name)
+                seen_tools.add(tool_name)
+            calls = item.get("tool_calls")
+            if isinstance(calls, Sequence) and not isinstance(
+                calls, (str, bytes, bytearray)
+            ):
+                for call in reversed(calls):
+                    if not isinstance(call, Mapping):
+                        continue
+                    name = str(call.get("name") or "").strip()
+                    if name and name not in seen_tools and len(recent_tools) < 6:
+                        recent_tools.append(name)
+                        seen_tools.add(name)
+        return {
+            "recent_user_messages": tuple(recent_users),
+            "recent_tool_names": tuple(recent_tools),
+        }
 
     @staticmethod
     def _contextual_message(agent_input: AgentInput) -> str:

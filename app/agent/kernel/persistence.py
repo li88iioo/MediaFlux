@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import secrets
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from typing import Any
+
+from cryptography.fernet import Fernet, InvalidToken
 
 from app import database as db
 from app.modules.web_secret import get_web_secret
@@ -71,12 +75,18 @@ class SQLiteKernelStore:
         max_state_bytes: int = 256 * 1024,
         max_ref_bytes: int = 128 * 1024,
         max_event_bytes: int = 128 * 1024,
+        max_events_per_session: int = 2_000,
+        event_retention_seconds: int = 30 * 24 * 60 * 60,
     ) -> None:
         self._secret_provider = secret_provider
         self._clock = clock
         self.max_state_bytes = max(16 * 1024, int(max_state_bytes))
         self.max_ref_bytes = max(4 * 1024, int(max_ref_bytes))
         self.max_event_bytes = max(4 * 1024, int(max_event_bytes))
+        self.max_events_per_session = max(10, int(max_events_per_session))
+        self.event_retention_seconds = max(3_600, int(event_retention_seconds))
+        self._event_maintenance_lock = threading.Lock()
+        self._events_since_global_prune = 0
 
     async def begin_turn(
         self, *, owner: str, session_id: str, request_id: str
@@ -243,6 +253,69 @@ class SQLiteKernelStore:
             raise TypeError("Agent Kernel 持久化数据类型无效")
         return value
 
+    def _reference_cipher(self) -> Fernet:
+        key = hashlib.sha256(
+            b"mediaflux-agent-kernel-reference:v1\0" + self._secret()
+        ).digest()
+        return Fernet(base64.urlsafe_b64encode(key))
+
+    def _encode_reference(
+        self, value: Any, *, domain: bytes
+    ) -> tuple[str, str]:
+        try:
+            plaintext = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+            RecursionError,
+            UnicodeError,
+        ) as exc:
+            raise ValueError("Agent Kernel 引用无法序列化") from exc
+        if len(plaintext) > self.max_ref_bytes:
+            raise ValueError("Agent Kernel 引用超过持久化上限")
+        encoded = "enc:v1:" + self._reference_cipher().encrypt(plaintext).decode(
+            "ascii"
+        )
+        payload = encoded.encode("utf-8")
+        signature = hmac.new(
+            self._secret(), domain + b"\0" + payload, hashlib.sha256
+        ).hexdigest()
+        return encoded, signature
+
+    def _decode_reference(
+        self,
+        encoded: Any,
+        signature: Any,
+        *,
+        domain: bytes,
+    ) -> Any:
+        text = str(encoded or "")
+        payload = text.encode("utf-8")
+        expected = hmac.new(
+            self._secret(), domain + b"\0" + payload, hashlib.sha256
+        ).hexdigest()
+        if not secrets.compare_digest(expected, str(signature or "")):
+            raise ValueError("Agent Kernel 引用校验失败")
+        if text.startswith("enc:v1:"):
+            try:
+                plaintext = self._reference_cipher().decrypt(
+                    text.removeprefix("enc:v1:").encode("ascii")
+                )
+            except (InvalidToken, UnicodeError, ValueError) as exc:
+                raise ValueError("Agent Kernel 引用解密失败") from exc
+            if len(plaintext) > self.max_ref_bytes:
+                raise ValueError("Agent Kernel 引用超过持久化上限")
+            return json.loads(plaintext.decode("utf-8"))
+        # 兼容切换前已签名但未加密的短期引用；新写入一律使用 enc:v1。
+        return json.loads(text)
+
     @staticmethod
     def _state_payload(state: SessionState) -> dict[str, Any]:
         return {
@@ -281,6 +354,14 @@ class SQLiteKernelStore:
 
     def _empty_state(self, owner: str, session_id: str) -> SessionState:
         return SessionState(owner=owner, session_id=session_id)
+
+    def _should_prune_all_events(self) -> bool:
+        with self._event_maintenance_lock:
+            self._events_since_global_prune += 1
+            if self._events_since_global_prune < 128:
+                return False
+            self._events_since_global_prune = 0
+            return True
 
     def _load_row(self, conn: Any, owner: str, session_id: str) -> SessionState:
         owner_digest, session_digest = self._scope(owner, session_id)
@@ -486,10 +567,9 @@ class SQLiteKernelStore:
         now = self._clock()
         expires_at = now + max(1, min(int(ttl_seconds), 86_400))
         ref_id = "ref_" + secrets.token_urlsafe(18)
-        encoded, signature = self._encode(
+        encoded, signature = self._encode_reference(
             value,
             domain=f"ref:v1:{ref_id}:{owner_digest}:{session_digest}:{normalized_kind}:{expires_at}".encode(),
-            maximum=self.max_ref_bytes,
         )
         with db.get_conn() as conn:
             self._ensure_schema(conn)
@@ -541,18 +621,14 @@ class SQLiteKernelStore:
         if expected and expected != kind:
             raise ReferenceError("reference type mismatch")
         expires_at = float(row["expires_at"])
-        return self._decode(
-            row["value_json"],
-            row["value_hmac"],
-            domain=f"ref:v1:{ref_id}:{owner_digest}:{session_digest}:{kind}:{expires_at}".encode(),
-            expected_type=(
-                dict
-                if str(row["value_json"]).lstrip().startswith("{")
-                else list
-                if str(row["value_json"]).lstrip().startswith("[")
-                else object
-            ),
-        )
+        try:
+            return self._decode_reference(
+                row["value_json"],
+                row["value_hmac"],
+                domain=f"ref:v1:{ref_id}:{owner_digest}:{session_digest}:{kind}:{expires_at}".encode(),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ReferenceError("reference payload is invalid") from exc
 
     def _append_event_sync(self, event: AgentEvent, owner: str) -> None:
         owner_digest, session_digest = self._scope(owner, event.session_id)
@@ -563,6 +639,8 @@ class SQLiteKernelStore:
         )
         with db.get_conn() as conn:
             self._ensure_schema(conn)
+            now = self._clock()
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "INSERT OR IGNORE INTO agent_kernel_events(event_id,owner_digest,session_digest,turn_id,request_id,sequence,event_type,event_json,event_hmac,occurred_at,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -577,9 +655,34 @@ class SQLiteKernelStore:
                     encoded,
                     signature,
                     event.occurred_at,
-                    self._clock(),
+                    now,
                 ),
             )
+            conn.execute(
+                "DELETE FROM agent_kernel_events WHERE rowid IN ("
+                "SELECT rowid FROM agent_kernel_events "
+                "WHERE owner_digest=? AND session_digest=? "
+                "ORDER BY created_at DESC,rowid DESC LIMIT -1 OFFSET ?)",
+                (
+                    owner_digest,
+                    session_digest,
+                    self.max_events_per_session,
+                ),
+            )
+            conn.execute(
+                "DELETE FROM agent_kernel_events WHERE owner_digest=? "
+                "AND session_digest=? AND created_at<?",
+                (
+                    owner_digest,
+                    session_digest,
+                    now - self.event_retention_seconds,
+                ),
+            )
+            if self._should_prune_all_events():
+                conn.execute(
+                    "DELETE FROM agent_kernel_events WHERE created_at<?",
+                    (now - self.event_retention_seconds,),
+                )
 
     def _list_events_sync(
         self, owner: str, session_id: str, limit: int
@@ -590,7 +693,7 @@ class SQLiteKernelStore:
             self._ensure_schema(conn)
             rows = conn.execute(
                 "SELECT event_id,event_json,event_hmac FROM agent_kernel_events WHERE owner_digest=? AND session_digest=? "
-                "ORDER BY created_at DESC,sequence DESC LIMIT ?",
+                "ORDER BY created_at DESC,rowid DESC LIMIT ?",
                 (owner_digest, session_digest, bounded),
             ).fetchall()
         result: list[dict[str, Any]] = []

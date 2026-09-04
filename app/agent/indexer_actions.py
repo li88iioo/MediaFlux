@@ -18,6 +18,9 @@ from app.agent.async_bridge import (
 )
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.agent.recent_resource_candidates import (
+    attach_resource_candidate_reference,
+)
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.indexers.downloads import (
     DownloadRequestCreationError,
@@ -307,7 +310,7 @@ def search_resources(
         summary += "，部分站点暂不可用"
     elif not items:
         summary = "已完成多站搜索，暂未找到匹配资源"
-    return ToolResult(
+    tool_result = ToolResult(
         ok=ok,
         status=status,
         summary=summary,
@@ -340,6 +343,10 @@ def search_resources(
             ["回复“第 2 个到 qB / 光鸭 / 两边”，即可进入提交确认。"] if items else []
         ),
     )
+    return attach_resource_candidate_reference(
+        tool_result,
+        result_store=service.result_store,
+    )
 
 
 def download_target_readiness(target: str) -> dict[str, bool]:
@@ -351,7 +358,7 @@ def download_target_readiness(target: str) -> dict[str, bool]:
         try:
             client = GuangYaClient()
             readiness["guangya"] = bool(client.logged_in)
-        except Exception:
+        except Exception:  # noqa: BLE001 - 后端就绪探测必须安全降级
             readiness["guangya"] = False
         finally:
             close_guangya_client(client)
@@ -535,7 +542,7 @@ def _submit_resource(
         return ToolResult(
             False, "unavailable", "下载请求创建失败", error="下载请求创建失败。"
         )
-    except Exception:
+    except Exception:  # noqa: BLE001 - Provider 错误统一投影为安全失败
         return ToolResult(
             False, "unavailable", "下载处理失败", error="下载处理失败，请稍后重试。"
         )
@@ -769,7 +776,7 @@ def _submit_resource_batch(
 
     try:
         items = run_indexer_awaitable_sync(submit_all())
-    except Exception:
+    except Exception:  # noqa: BLE001 - 批量 Provider 错误统一安全投影
         return ToolResult(
             False,
             "unavailable",

@@ -23,6 +23,8 @@
     const SESSION_KEY = 'mediaflux.agent.kernel.session.v1';
     const SESSION_RE = /^[A-Za-z0-9_-]{16,64}$/;
     const MAX_TRANSCRIPT_ITEMS = 120;
+    const STREAM_MARKDOWN_INTERVAL_MS = 72;
+    const MAX_MARKDOWN_DEPTH = 4;
     const TOOL_LABELS = {
         cloud: '读取光鸭云盘',
         guangya: '读取光鸭云盘',
@@ -147,39 +149,442 @@
         return view;
     }
 
-    function parseTextBlocks(text) {
-        const root = element('div', 'agent-rich-text');
-        const lines = String(text || '').replace(/\r\n?/g, '\n').split('\n');
-        let list = null;
-        let firstParagraph = true;
-        const flushList = () => {
-            if (list) root.append(list);
-            list = null;
+    function appendText(parent, value) {
+        const text = String(value || '');
+        if (!text) return;
+        const previous = parent.lastChild;
+        if (previous?.nodeType === 3) previous.nodeValue += text;
+        else parent.append(document.createTextNode(text));
+    }
+
+    function safeMarkdownLink(rawHref) {
+        const value = String(rawHref || '').trim();
+        if (!value) return null;
+        if (value.startsWith('#') || (value.startsWith('/') && !value.startsWith('//')) || value.startsWith('?')) {
+            return {href: value, external: false};
+        }
+        try {
+            const parsed = new URL(value, window.location.href);
+            const protocol = parsed.protocol.toLowerCase();
+            if (!['http:', 'https:', 'mailto:'].includes(protocol)) return null;
+            return {
+                href: parsed.href,
+                external: protocol === 'mailto:' || parsed.origin !== window.location.origin,
+            };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function trimBareUrl(value) {
+        let url = String(value || '');
+        while (/[.,;:!?，。；：！？》】）}]$/.test(url)) url = url.slice(0, -1);
+        return url;
+    }
+
+    function appendMarkdownLink(parent, label, rawHref, depth) {
+        const target = safeMarkdownLink(rawHref);
+        if (!target) {
+            appendInlineMarkdown(parent, label, depth + 1);
+            return;
+        }
+        const anchor = element('a', 'agent-md-link');
+        anchor.href = target.href;
+        if (target.external) {
+            anchor.target = '_blank';
+            anchor.rel = 'noopener noreferrer';
+        }
+        if (/^(?:https?:\/\/|mailto:)/i.test(label)) appendText(anchor, label);
+        else appendInlineMarkdown(anchor, label, depth + 1);
+        parent.append(anchor);
+    }
+
+    function markdownLinkAt(source, start) {
+        const image = source.startsWith('![', start);
+        const labelStart = start + (image ? 2 : 1);
+        const labelEnd = source.indexOf('](', labelStart);
+        if (labelEnd < 0) return null;
+        let cursor = labelEnd + 2;
+        let nesting = 0;
+        let escaped = false;
+        for (; cursor < source.length; cursor += 1) {
+            const character = source[cursor];
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (character === '\\') {
+                escaped = true;
+                continue;
+            }
+            if (character === '(') nesting += 1;
+            if (character === ')' && nesting > 0) nesting -= 1;
+            else if (character === ')' && nesting === 0) break;
+        }
+        if (cursor >= source.length) return null;
+        const destination = source.slice(labelEnd + 2, cursor).trim();
+        const match = destination.match(/^(?:<([^>]+)>|([^\s]+))(?:\s+["'].*["'])?$/);
+        if (!match) return null;
+        return {
+            image,
+            label: source.slice(labelStart, labelEnd),
+            href: match[1] || match[2] || '',
+            end: cursor + 1,
         };
-        for (const raw of lines) {
+    }
+
+    function appendInlineMarkdown(parent, input, depth = 0) {
+        const source = String(input || '');
+        if (!source || depth > MAX_MARKDOWN_DEPTH) {
+            appendText(parent, source);
+            return;
+        }
+        let index = 0;
+        while (index < source.length) {
+            const escapedCharacter = source[index + 1] || '';
+            if (source[index] === '\\' && '\\`*{}[]()#+-.!_|>~'.includes(escapedCharacter)) {
+                appendText(parent, source[index + 1]);
+                index += 2;
+                continue;
+            }
+
+            if (source[index] === '`') {
+                const marker = source.slice(index).match(/^`+/)?.[0] || '`';
+                const end = source.indexOf(marker, index + marker.length);
+                if (end >= 0) {
+                    const code = element('code', 'agent-md-inline-code', source.slice(index + marker.length, end).replace(/^ | $/g, ''));
+                    parent.append(code);
+                    index = end + marker.length;
+                    continue;
+                }
+            }
+
+            if (source.startsWith('![', index) || source[index] === '[') {
+                const link = markdownLinkAt(source, index);
+                if (link) {
+                    if (link.image) {
+                        const alt = element('span', 'agent-md-image-alt');
+                        alt.setAttribute('role', 'img');
+                        alt.setAttribute('aria-label', link.label || '图片');
+                        alt.append(icon('image'), element('span', '', link.label || '图片'));
+                        parent.append(alt);
+                    } else {
+                        appendMarkdownLink(parent, link.label, link.href, depth);
+                    }
+                    index = link.end;
+                    continue;
+                }
+            }
+
+            const strongMarker = source.startsWith('**', index) ? '**' : source.startsWith('__', index) ? '__' : '';
+            if (strongMarker) {
+                const end = source.indexOf(strongMarker, index + 2);
+                if (end > index + 2) {
+                    const strong = document.createElement('strong');
+                    appendInlineMarkdown(strong, source.slice(index + 2, end), depth + 1);
+                    parent.append(strong);
+                    index = end + 2;
+                    continue;
+                }
+            }
+
+            if (source.startsWith('~~', index)) {
+                const end = source.indexOf('~~', index + 2);
+                if (end > index + 2) {
+                    const deleted = document.createElement('del');
+                    appendInlineMarkdown(deleted, source.slice(index + 2, end), depth + 1);
+                    parent.append(deleted);
+                    index = end + 2;
+                    continue;
+                }
+            }
+
+            const emphasisMarker = source[index] === '*' ? '*' : source[index] === '_' ? '_' : '';
+            if (emphasisMarker) {
+                const previous = source[index - 1] || '';
+                const next = source[index + 1] || '';
+                const canOpen = next && !/\s/.test(next) && !(emphasisMarker === '_' && /[\p{L}\p{N}]/u.test(previous));
+                const end = canOpen ? source.indexOf(emphasisMarker, index + 1) : -1;
+                if (end > index + 1) {
+                    const emphasis = document.createElement('em');
+                    appendInlineMarkdown(emphasis, source.slice(index + 1, end), depth + 1);
+                    parent.append(emphasis);
+                    index = end + 1;
+                    continue;
+                }
+            }
+
+            if (source[index] === '<') {
+                const autoLink = source.slice(index).match(/^<(https?:\/\/[^>]+|mailto:[^>]+)>/i);
+                if (autoLink) {
+                    appendMarkdownLink(parent, autoLink[1], autoLink[1], depth);
+                    index += autoLink[0].length;
+                    continue;
+                }
+            }
+
+            const beginsBareLink = source.startsWith('http://', index) || source.startsWith('https://', index);
+            const bareLink = beginsBareLink ? source.slice(index).match(/^https?:\/\/[^\s<]+/i) : null;
+            if (bareLink) {
+                const href = trimBareUrl(bareLink[0]);
+                appendMarkdownLink(parent, href, href, depth);
+                index += href.length;
+                continue;
+            }
+
+            let next = index + 1;
+            while (next < source.length) {
+                const character = source[next];
+                if ('\\`*_[~<'.includes(character)
+                    || character === '['
+                    || (character === '!' && source[next + 1] === '[')
+                    || source.startsWith('http://', next)
+                    || source.startsWith('https://', next)) break;
+                next += 1;
+            }
+            appendText(parent, source.slice(index, next));
+            index = next;
+        }
+    }
+
+    function splitMarkdownTableRow(value) {
+        let line = String(value || '').trim();
+        if (line.startsWith('|')) line = line.slice(1);
+        if (line.endsWith('|')) line = line.slice(0, -1);
+        const cells = [];
+        let current = '';
+        let codeMarker = false;
+        for (let index = 0; index < line.length; index += 1) {
+            const character = line[index];
+            const next = line[index + 1] || '';
+            if (character === '\\' && ['|', '\\', '`'].includes(next)) {
+                current += next;
+                index += 1;
+                continue;
+            }
+            if (character === '`') codeMarker = !codeMarker;
+            if (character === '|' && !codeMarker) {
+                cells.push(current.trim());
+                current = '';
+            } else {
+                current += character;
+            }
+        }
+        cells.push(current.trim());
+        return cells;
+    }
+
+    function markdownTableDefinition(lines, index) {
+        if (index + 1 >= lines.length || !lines[index].includes('|')) return null;
+        const header = splitMarkdownTableRow(lines[index]);
+        const separators = splitMarkdownTableRow(lines[index + 1]);
+        if (header.length < 2 || header.length !== separators.length) return null;
+        if (!separators.every((cell) => /^:?-{3,}:?$/.test(cell.replace(/\s/g, '')))) return null;
+        return {header, separators};
+    }
+
+    function markdownListItem(value) {
+        const unordered = String(value || '').match(/^\s{0,3}[-+*•]\s+(.+)$/);
+        if (unordered) return {ordered: false, value: unordered[1], start: 1};
+        const ordered = String(value || '').match(/^\s{0,3}(\d{1,4})[.)、]\s+(.+)$/);
+        return ordered ? {ordered: true, value: ordered[2], start: Number(ordered[1]) || 1} : null;
+    }
+
+    function isMarkdownBlockStart(lines, index) {
+        const line = String(lines[index] || '');
+        return /^\s{0,3}(?:`{3,}|~{3,})/.test(line)
+            || /^\s{0,3}#{1,6}\s+/.test(line)
+            || /^\s{0,3}>/.test(line)
+            || /^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(line)
+            || Boolean(markdownListItem(line))
+            || Boolean(markdownTableDefinition(lines, index));
+    }
+
+    function appendMarkdownBlocks(root, input, depth = 0) {
+        const lines = String(input || '').replace(/\r\n?/g, '\n').split('\n');
+        let index = 0;
+        while (index < lines.length) {
+            const raw = lines[index];
             const line = raw.trim();
             if (!line) {
-                flushList();
+                index += 1;
                 continue;
             }
-            const bullet = line.match(/^(?:[-*+•]|\d{1,3}[.)、])\s+(.+)$/);
-            if (bullet) {
-                if (!list) list = element('ul');
-                list.append(element('li', '', bullet[1]));
+
+            const fence = raw.match(/^\s{0,3}(`{3,}|~{3,})\s*([^\s`]*)\s*$/);
+            if (fence) {
+                const marker = fence[1];
+                const language = String(fence[2] || '').replace(/[^A-Za-z0-9_+.-]/g, '').slice(0, 24);
+                const values = [];
+                index += 1;
+                while (index < lines.length && !new RegExp(`^\\s{0,3}${marker[0]}{${marker.length},}\\s*$`).test(lines[index])) {
+                    values.push(lines[index]);
+                    index += 1;
+                }
+                if (index < lines.length) index += 1;
+                const frame = element('div', 'agent-md-code-frame');
+                if (language) frame.append(element('span', 'agent-md-code-language', language));
+                const pre = document.createElement('pre');
+                pre.append(element('code', '', values.join('\n')));
+                frame.append(pre);
+                root.append(frame);
                 continue;
             }
-            flushList();
-            const paragraph = element('p', firstParagraph && line.length <= 140 ? 'agent-answer-lead' : '', line);
+
+            const heading = raw.match(/^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/);
+            if (heading) {
+                const level = heading[1].length;
+                const title = element(`h${Math.min(6, level + 1)}`, `agent-md-heading agent-md-heading-${level}`);
+                appendInlineMarkdown(title, heading[2]);
+                root.append(title);
+                index += 1;
+                continue;
+            }
+
+            if (/^\s{0,3}(?:(?:\*\s*){3,}|(?:-\s*){3,}|(?:_\s*){3,})$/.test(raw)) {
+                root.append(document.createElement('hr'));
+                index += 1;
+                continue;
+            }
+
+            if (/^\s{0,3}>/.test(raw)) {
+                const quoteLines = [];
+                while (index < lines.length && /^\s{0,3}>/.test(lines[index])) {
+                    quoteLines.push(lines[index].replace(/^\s{0,3}>\s?/, ''));
+                    index += 1;
+                }
+                const quote = document.createElement('blockquote');
+                if (depth < MAX_MARKDOWN_DEPTH) appendMarkdownBlocks(quote, quoteLines.join('\n'), depth + 1);
+                else appendText(quote, quoteLines.join('\n'));
+                root.append(quote);
+                continue;
+            }
+
+            const table = markdownTableDefinition(lines, index);
+            if (table) {
+                const scroll = element('div', 'agent-md-table-scroll');
+                scroll.tabIndex = 0;
+                scroll.setAttribute('role', 'region');
+                scroll.setAttribute('aria-label', 'Markdown 表格');
+                const tableNode = document.createElement('table');
+                const head = document.createElement('thead');
+                const headRow = document.createElement('tr');
+                table.header.forEach((value, cellIndex) => {
+                    const cell = document.createElement('th');
+                    const separator = table.separators[cellIndex].replace(/\s/g, '');
+                    if (separator.startsWith(':') && separator.endsWith(':')) cell.className = 'is-center';
+                    else if (separator.endsWith(':')) cell.className = 'is-right';
+                    appendInlineMarkdown(cell, value);
+                    headRow.append(cell);
+                });
+                head.append(headRow);
+                tableNode.append(head);
+                const body = document.createElement('tbody');
+                index += 2;
+                while (index < lines.length && lines[index].trim() && lines[index].includes('|')) {
+                    const values = splitMarkdownTableRow(lines[index]);
+                    const row = document.createElement('tr');
+                    table.header.forEach((_, cellIndex) => {
+                        const cell = document.createElement('td');
+                        const separator = table.separators[cellIndex].replace(/\s/g, '');
+                        if (separator.startsWith(':') && separator.endsWith(':')) cell.className = 'is-center';
+                        else if (separator.endsWith(':')) cell.className = 'is-right';
+                        appendInlineMarkdown(cell, values[cellIndex] || '');
+                        row.append(cell);
+                    });
+                    body.append(row);
+                    index += 1;
+                }
+                tableNode.append(body);
+                scroll.append(tableNode);
+                root.append(scroll);
+                continue;
+            }
+
+            const listItem = markdownListItem(raw);
+            if (listItem) {
+                const list = document.createElement(listItem.ordered ? 'ol' : 'ul');
+                if (listItem.ordered && listItem.start !== 1) list.start = listItem.start;
+                while (index < lines.length) {
+                    const item = markdownListItem(lines[index]);
+                    if (!item || item.ordered !== listItem.ordered) break;
+                    const row = document.createElement('li');
+                    const task = item.value.match(/^\[([ xX])\]\s+(.+)$/);
+                    if (task) {
+                        row.className = 'agent-md-task';
+                        const marker = element('span', 'agent-md-task-marker', task[1].toLowerCase() === 'x' ? '✓' : '');
+                        marker.setAttribute('aria-hidden', 'true');
+                        row.append(marker);
+                        appendInlineMarkdown(row, task[2]);
+                    } else {
+                        appendInlineMarkdown(row, item.value);
+                    }
+                    list.append(row);
+                    index += 1;
+                }
+                root.append(list);
+                continue;
+            }
+
+            const paragraphLines = [];
+            while (index < lines.length && lines[index].trim() && (paragraphLines.length === 0 || !isMarkdownBlockStart(lines, index))) {
+                paragraphLines.push(lines[index]);
+                index += 1;
+            }
+            const paragraphText = paragraphLines.map((value) => value.trim()).join(' ');
+            const paragraph = element('p', root.childElementCount === 0 && paragraphText.length <= 140 ? 'agent-answer-lead' : '');
+            paragraphLines.forEach((value, lineIndex) => {
+                const hardBreak = /\s{2}$/.test(value) || /\\$/.test(value);
+                appendInlineMarkdown(paragraph, value.replace(/(?:\s{2}|\\)$/, '').trim());
+                if (lineIndex < paragraphLines.length - 1) paragraph.append(hardBreak ? document.createElement('br') : document.createTextNode(' '));
+            });
             root.append(paragraph);
-            firstParagraph = false;
         }
-        flushList();
+    }
+
+    function parseTextBlocks(text) {
+        const root = element('div', 'agent-rich-text');
+        appendMarkdownBlocks(root, text);
         return root;
     }
 
     function replaceRichText(target, text) {
         const rendered = parseTextBlocks(text);
+        target.classList.add('agent-rich-text');
         target.replaceChildren(...rendered.childNodes);
+        if (target.querySelector('[data-lucide]')) renderIcons(target);
+    }
+
+    function cancelTurnMarkdownRender(turn) {
+        if (!turn) return;
+        if (turn.markdownTimer !== null) window.clearTimeout(turn.markdownTimer);
+        if (turn.markdownFrame !== null) window.cancelAnimationFrame(turn.markdownFrame);
+        turn.markdownTimer = null;
+        turn.markdownFrame = null;
+    }
+
+    function renderTurnMarkdown(turn, text, {immediate = false} = {}) {
+        if (!turn?.text) return;
+        turn.pendingMarkdown = String(text || '');
+        const commit = () => {
+            const shouldFollow = transcriptNearBottom();
+            turn.markdownTimer = null;
+            turn.markdownFrame = null;
+            replaceRichText(turn.text, turn.pendingMarkdown);
+            turn.lastMarkdownRender = performance.now();
+            if (shouldFollow) scrollToBottom(true);
+        };
+        if (immediate) {
+            cancelTurnMarkdownRender(turn);
+            commit();
+            return;
+        }
+        if (turn.markdownTimer !== null || turn.markdownFrame !== null) return;
+        const delay = Math.max(0, STREAM_MARKDOWN_INTERVAL_MS - (performance.now() - turn.lastMarkdownRender));
+        turn.markdownTimer = window.setTimeout(() => {
+            turn.markdownTimer = null;
+            turn.markdownFrame = window.requestAnimationFrame(commit);
+        }, delay);
     }
 
     function createAssistantTurn({recovered = false} = {}) {
@@ -187,7 +592,7 @@
         const card = element('section', 'agent-result-card agent-streaming');
         const head = element('div', 'agent-stream-head');
         head.append(icon('loader-circle'), element('span', '', '正在理解任务'));
-        const text = element('div', 'agent-stream-text');
+        const text = element('div', 'agent-stream-text agent-rich-text');
         const steps = element('div', 'agent-stream-steps');
         card.append(head, text, steps);
         view.body.append(card);
@@ -203,6 +608,10 @@
             currentRound: 0,
             completedTools: new Set(),
             approvalNode: null,
+            pendingMarkdown: '',
+            markdownTimer: null,
+            markdownFrame: null,
+            lastMarkdownRender: 0,
         };
     }
 
@@ -238,16 +647,18 @@
     }
 
     function finalizeAnswer(turn, text) {
+        cancelTurnMarkdownRender(turn);
         turn.card.classList.remove('agent-streaming', 'is-interrupted');
         turn.card.classList.add('has-narrative', 'is-conversation');
         turn.head.remove();
         turn.steps.remove();
-        turn.text.className = 'agent-narrative';
+        turn.text.className = 'agent-narrative agent-rich-text';
         replaceRichText(turn.text, text || '查询已完成。');
         scrollToBottom(true);
     }
 
     function finalizeError(turn, message, {cancelled = false} = {}) {
+        cancelTurnMarkdownRender(turn);
         turn.card.classList.remove('agent-streaming');
         turn.card.classList.add(cancelled ? 'agent-cancelled' : 'is-interrupted');
         setTurnStatus(turn, cancelled ? '已停止' : '未能完成', cancelled ? 'circle-stop' : 'triangle-alert');
@@ -318,6 +729,9 @@
 
     function showApproval(turn, approval) {
         const card = buildApproval(approval);
+        // 确认卡包含真实写操作按钮，不应继承消息入场位移动画；否则在快速
+        // 预检完成时按钮会短暂移动，既影响触控，也会造成自动化点击不稳定。
+        turn.item?.classList.add('is-confirmation');
         turn.card.replaceWith(card);
         turn.approvalNode = card;
         scrollToBottom(true);
@@ -327,7 +741,8 @@
         const result = element('section', `agent-result-card${error ? ' is-interrupted' : ''}${cancelled ? ' agent-cancelled' : ''}`);
         const head = element('div', 'agent-stream-head');
         head.append(icon(error ? 'triangle-alert' : cancelled ? 'circle-stop' : 'circle-check-big'), element('span', '', error ? '执行失败' : cancelled ? '已取消' : '执行完成'));
-        const body = element('div', 'agent-stream-text', text);
+        const body = element('div', 'agent-stream-text agent-rich-text');
+        replaceRichText(body, text);
         result.append(head, body);
         card.replaceWith(result);
         renderIcons(result);
@@ -361,14 +776,15 @@
             const round = Number(payload.round || turn.currentRound || 1);
             const value = `${turn.rounds.get(round) || ''}${String(payload.delta || '')}`;
             turn.rounds.set(round, value);
-            turn.text.textContent = value;
-            scrollToBottom();
+            renderTurnMarkdown(turn, value);
             break;
         }
         case 'model.tool_call': {
             const key = `call:${payload.call_id || event.sequence}`;
             addStep(turn, key, `${toolLabel(payload.tool)}…`, {pending: true});
-            turn.text.textContent = '';
+            cancelTurnMarkdownRender(turn);
+            turn.pendingMarkdown = '';
+            turn.text.replaceChildren();
             setTurnStatus(turn, toolLabel(payload.tool));
             break;
         }

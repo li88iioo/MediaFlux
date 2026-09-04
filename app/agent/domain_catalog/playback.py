@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-from .support import (
-    RiskLevel,
-    ToolSpec,
+from app.agent.media_proxy_actions import (
     media_proxy_enabled_arguments,
     media_proxy_failure_summary_arguments,
     media_proxy_restart_arguments,
@@ -17,6 +15,10 @@ from .support import (
     summarize_media_proxy_playback_failures,
     summarize_media_proxy_status,
     test_media_proxy_instance,
+)
+from app.agent.models import (
+    RiskLevel,
+    ToolSpec,
 )
 
 

@@ -2,44 +2,100 @@
 
 from __future__ import annotations
 
-from .support import (
+from app.agent.durable_job_actions import (
+    prepare_start_episode_audit,
+    start_episode_audit_arguments,
+    start_episode_audit_confirmed,
+)
+from app.agent.episode_audit import audit_series_episodes
+from app.agent.episode_resource_actions import (
+    missing_episode_resource_arguments,
+    missing_season_resource_arguments,
+    search_missing_episode_resources,
+    search_missing_season_resources,
+)
+from app.agent.library_episode_audit import audit_library_episodes
+from app.agent.library_episode_count import (
+    count_series_episodes,
+    count_series_episodes_arguments,
+)
+from app.agent.library_patrol_config_actions import (
+    patrol_policy_arguments,
+    patrol_policy_summary_arguments,
+    prepare_patrol_policy_confirmation,
+    set_patrol_policy_confirmed,
+    summarize_patrol_policy,
+)
+from app.agent.library_patrol_status import (
+    get_library_patrol_status,
+    patrol_status_arguments,
+)
+from app.agent.library_patrol_trigger_actions import (
+    patrol_trigger_arguments,
+    prepare_trigger_patrol_now,
+    trigger_patrol_now_confirmed,
+)
+from app.agent.missing_media_workflow_runtime import MissingMediaWorkflowRuntime
+from app.agent.missing_media_workflows import (
+    list_missing_workflows,
+    missing_workflow_arguments,
+)
+from app.agent.models import (
     RiskLevel,
     ToolSpec,
+)
+from app.agent.update_actions import check_library_updates
+
+from .library_search import search_library
+from .shared import (
     _episode_audit_arguments,
     _library_episode_audit_arguments,
     _library_update_arguments,
     _search_arguments,
-    audit_library_episodes,
-    audit_series_episodes,
-    check_library_updates,
-    count_series_episodes,
-    count_series_episodes_arguments,
-    get_library_patrol_status,
-    list_missing_workflows,
-    missing_episode_resource_arguments,
-    missing_season_resource_arguments,
-    missing_workflow_arguments,
-    patrol_policy_arguments,
-    patrol_policy_summary_arguments,
-    patrol_status_arguments,
-    patrol_trigger_arguments,
-    prepare_patrol_policy_confirmation,
-    prepare_start_episode_audit,
-    prepare_trigger_patrol_now,
-    search_library,
-    search_missing_episode_resources,
-    search_missing_season_resources,
-    set_patrol_policy_confirmed,
-    start_episode_audit_arguments,
-    start_episode_audit_confirmed,
-    summarize_patrol_policy,
-    trigger_patrol_now_confirmed,
 )
 
 
 def register_specs(
-    registry, *, resource_store, active_ingest_store, ingest_actions
+    registry,
+    *,
+    resource_store,
+    active_ingest_store,
+    ingest_actions,
+    missing_media_runtime: MissingMediaWorkflowRuntime | None = None,
 ) -> None:
+    del resource_store, active_ingest_store, ingest_actions
+
+    def missing_episode_search(arguments, context):
+        result = search_missing_episode_resources(arguments)
+        if missing_media_runtime is not None:
+            missing_media_runtime.capture_search(
+                owner=context.owner,
+                tool_name="library.search_missing_episode_resources",
+                result=result,
+            )
+        return result
+
+    def missing_season_search(arguments, context):
+        result = search_missing_season_resources(arguments)
+        if missing_media_runtime is not None:
+            missing_media_runtime.capture_search(
+                owner=context.owner,
+                tool_name="library.search_missing_season_resources",
+                result=result,
+            )
+        return result
+
+    def missing_workflows(arguments, context):
+        return list_missing_workflows(
+            arguments,
+            context,
+            repository=(
+                missing_media_runtime.repository
+                if missing_media_runtime is not None
+                else None
+            ),
+        )
+
     registry.register(
         ToolSpec(
             name="library.search",
@@ -97,7 +153,7 @@ def register_specs(
                 },
                 "additionalProperties": False,
             },
-            handler=search_missing_episode_resources,
+            context_handler=missing_episode_search,
             validator=missing_episode_resource_arguments,
             examples=(
                 "搜索某剧第 2 季第 3 集的缺集资源",
@@ -136,7 +192,7 @@ def register_specs(
                 },
                 "additionalProperties": False,
             },
-            handler=search_missing_season_resources,
+            context_handler=missing_season_search,
             validator=missing_season_resource_arguments,
         )
     )
@@ -161,7 +217,7 @@ def register_specs(
                 "additionalProperties": False,
             },
             validator=missing_workflow_arguments,
-            context_handler=list_missing_workflows,
+            context_handler=missing_workflows,
         )
     )
     registry.register(

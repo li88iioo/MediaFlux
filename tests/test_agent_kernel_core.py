@@ -15,13 +15,19 @@ from app.agent.kernel.events import AgentEventType
 from app.agent.kernel.model import (
     ModelEvent,
     ModelEventType,
+    ModelMessage,
     ModelRequest,
     ModelToolCall,
 )
-from app.agent.kernel.pipeline import ToolPipeline
+from app.agent.kernel.pipeline import ToolCallContext, ToolPipeline, ToolPipelineError
 from app.agent.kernel.projection import ReferenceValue, ToolOutcome
-from app.agent.kernel.session import AgentSession
-from app.agent.kernel.state import AgentInput, InMemorySessionStateStore
+from app.agent.kernel.session import AgentSession, SessionLimits
+from app.agent.kernel.state import (
+    AgentInput,
+    CancellationToken,
+    InMemorySessionStateStore,
+)
+from app.agent.models import ToolReference, ToolResult
 
 
 class ScriptedModel:
@@ -169,6 +175,40 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("37", model.requests[1].messages[-1].content)
 
+    async def test_context_window_drops_oldest_complete_turns_only(self) -> None:
+        catalog = ToolCatalog([read_tool("library.status")])
+        state = InMemorySessionStateStore()
+        model = ScriptedModel([])
+        session = AgentSession(
+            model=model,
+            catalog=catalog,
+            retriever=CapabilityRetriever(),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state),
+            state_store=state,
+            limits=SessionLimits(
+                max_output_tokens=1_024,
+                context_window_tokens=16_384,
+            ),
+        )
+        messages = [
+            ModelMessage(role="user", content="old:" + "a" * 100_000),
+            ModelMessage(role="assistant", content="old answer"),
+            ModelMessage(role="user", content="recent:" + "b" * 4_000),
+            ModelMessage(role="assistant", content="recent answer"),
+            ModelMessage(role="user", content="current question"),
+        ]
+
+        bounded = session._bounded_model_messages(
+            messages,
+            history_end=4,
+            tool_definitions=(catalog.get("library.status").model_definition(),),
+        )
+
+        self.assertEqual(bounded[-1].content, "current question")
+        self.assertTrue(any(item.content.startswith("recent:") for item in bounded))
+        self.assertNotIn("old answer", [item.content for item in bounded])
+        self.assertEqual(bounded[0].role, "user")
+
     async def test_reply_context_is_available_to_model_but_not_persisted_as_chat_text(
         self,
     ) -> None:
@@ -304,7 +344,14 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                         ),
                     ),
                     ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
-                ]
+                ],
+                [
+                    ModelEvent(
+                        ModelEventType.TEXT_DELTA,
+                        text="job-7 已暂停。",
+                    ),
+                    ModelEvent(ModelEventType.FINISH, finish_reason="stop"),
+                ],
             ]
         )
         pipeline = ToolPipeline(catalog=catalog, state_store=state)
@@ -349,6 +396,21 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(confirmed_events[-1].payload["status"], "effect_completed")
 
+        await collect(
+            session.run(
+                AgentInput(
+                    message="它现在怎么样？",
+                    owner="owner-1",
+                    session_id="session-1",
+                )
+            )
+        )
+        next_turn_history = "\n".join(
+            item.content for item in model.requests[-1].messages
+        )
+        self.assertIn("可信系统结果", next_turn_history)
+        self.assertIn("已暂停任务 job-7", next_turn_history)
+
         replay = await collect(
             session.confirm(
                 owner="owner-1",
@@ -358,6 +420,114 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(calls["execute"], 1)
         self.assertIn(AgentEventType.EFFECT_FAILED, [event.type for event in replay])
+
+    async def test_context_hard_limit_fails_before_provider_call(self) -> None:
+        catalog = ToolCatalog([read_tool("library.status")])
+        state = InMemorySessionStateStore()
+        model = ScriptedModel([])
+        session = AgentSession(
+            model=model,
+            catalog=catalog,
+            retriever=CapabilityRetriever(),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state),
+            state_store=state,
+            limits=SessionLimits(
+                max_output_tokens=1_024,
+                context_window_tokens=16_384,
+            ),
+            system_prompt="系统" * 3_000,
+        )
+
+        events = await collect(
+            session.run(
+                AgentInput(
+                    message="界" * 12_000,
+                    owner="owner-1",
+                    session_id="session-1",
+                )
+            )
+        )
+
+        self.assertEqual(model.requests, [])
+        self.assertEqual(events[-1].type, AgentEventType.TURN_FAILED)
+        self.assertEqual(events[-1].payload["code"], "context_budget_exceeded")
+
+    async def test_preview_publication_failure_discards_frozen_effect(self) -> None:
+        class FailingCommitStateStore(InMemorySessionStateStore):
+            async def commit(self, lease, *, conversation=None, updates=()):
+                del lease, conversation, updates
+                raise RuntimeError("commit failed")
+
+        class RecordingLifecycle:
+            def __init__(self):
+                self.cancelled_plans = []
+
+            def prepared(self, *, tool, arguments, prepared, context):
+                del tool, arguments, context
+                return prepared
+
+            def prepare_failed(self, *, prepared, context):
+                del prepared, context
+
+            def completed(self, *, plan, value, elapsed_ms):
+                del plan, value, elapsed_ms
+
+            def failed(self, *, plan, code, elapsed_ms):
+                del plan, code, elapsed_ms
+
+            def interrupted(self, *, plan):
+                del plan
+
+            def cancelled(self, *, plan):
+                self.cancelled_plans.append(plan)
+
+        tool = KernelToolSpec(
+            name="download.pause",
+            domain="download",
+            description="暂停下载任务",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.WRITE,
+            prepare=lambda _arguments, _context: PreparedEffect(
+                preview={"summary": "将暂停"},
+                snapshot_fingerprint="snapshot:v1",
+            ),
+            execute_confirmed=lambda _arguments, _snapshot, _context: {
+                "summary": "已暂停"
+            },
+        )
+        catalog = ToolCatalog([tool])
+        state = FailingCommitStateStore()
+        lifecycle = RecordingLifecycle()
+        pipeline = ToolPipeline(
+            catalog=catalog,
+            state_store=state,
+            effect_lifecycle=lifecycle,
+        )
+        lease, _ = await state.begin_turn(
+            owner="owner-1", session_id="session-1", request_id="request-1"
+        )
+
+        async def progress(_payload):
+            return None
+
+        context = ToolCallContext(
+            owner="owner-1",
+            session_id="session-1",
+            request_id="request-1",
+            turn_id=lease.turn_id,
+            lease=lease,
+            cancellation=CancellationToken(),
+            report_progress=progress,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "commit failed"):
+            await pipeline.execute("download.pause", {}, context=context)
+        self.assertEqual(len(lifecycle.cancelled_plans), 1)
+        self.assertEqual(lifecycle.cancelled_plans[0].tool_name, "download.pause")
 
     async def test_new_turn_discards_unconfirmed_effect_without_leaving_stale_state(
         self,
@@ -666,6 +836,138 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(reference, tool_message)
         self.assertNotIn("/secret/path", tool_message)
         self.assertNotIn("database_id", tool_message)
+
+    async def test_confirmed_effect_reresolves_the_frozen_resource_reference(
+        self,
+    ) -> None:
+        first_snapshot = {
+            "search_id": "rs_1234567890abcdef",
+            "search_status": "success",
+            "candidates": [{"position": 1, "result_id": "first-resource-0001"}],
+        }
+        second_snapshot = {
+            "search_id": "rs_fedcba0987654321",
+            "search_status": "success",
+            "candidates": [{"position": 1, "result_id": "second-resource-001"}],
+        }
+        snapshots = iter((first_snapshot, second_snapshot))
+        executed: list[str] = []
+
+        def search(_arguments, _context):
+            snapshot = next(snapshots)
+            return ToolResult(
+                True,
+                "success",
+                "候选已找到",
+                references=[ToolReference("resource_candidates", snapshot)],
+            )
+
+        def prepare(arguments, _context):
+            snapshot = arguments["resource_candidates"]
+            return PreparedEffect(
+                preview={"summary": "将提交资源"},
+                snapshot_fingerprint=snapshot["search_id"],
+            )
+
+        def execute(arguments, expected_snapshot, _context):
+            snapshot = arguments["resource_candidates"]
+            self.assertEqual(expected_snapshot, snapshot["search_id"])
+            executed.append(snapshot["candidates"][0]["result_id"])
+            return {"summary": "资源已提交"}
+
+        search_tool = KernelToolSpec(
+            name="resource.search",
+            domain="resource",
+            description="搜索资源并返回候选引用",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.READ,
+            read=search,
+        )
+        submit_tool = KernelToolSpec(
+            name="resource.submit",
+            domain="resource",
+            description="提交资源候选",
+            input_schema={
+                "type": "object",
+                "required": ["resource_candidates_ref"],
+                "properties": {
+                    "resource_candidates_ref": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.WRITE,
+            validator=lambda value: dict(value),
+            prepare=prepare,
+            execute_confirmed=execute,
+        )
+        catalog = ToolCatalog((search_tool, submit_tool))
+        state = InMemorySessionStateStore()
+        pipeline = ToolPipeline(catalog=catalog, state_store=state)
+        lease, _state = await state.begin_turn(
+            owner="owner-1", session_id="session-1", request_id="request-1"
+        )
+        token = CancellationToken()
+
+        async def progress(_payload):
+            return None
+
+        context = ToolCallContext(
+            owner="owner-1",
+            session_id="session-1",
+            request_id="request-1",
+            turn_id=lease.turn_id,
+            lease=lease,
+            cancellation=token,
+            report_progress=progress,
+        )
+        first = await pipeline.execute("resource.search", {}, context=context)
+        first_ref = first.outcome.public_content["reference_arguments"][
+            "resource_candidates_ref"
+        ]
+        preview = await pipeline.execute(
+            "resource.submit",
+            {"resource_candidates_ref": first_ref},
+            context=context,
+        )
+        self.assertEqual(
+            preview.effect_plan.arguments,
+            {"resource_candidates_ref": first_ref},
+        )
+
+        newer = await pipeline.execute("resource.search", {}, context=context)
+        self.assertNotEqual(
+            newer.outcome.public_content["reference_arguments"][
+                "resource_candidates_ref"
+            ],
+            first_ref,
+        )
+        await pipeline.execute_confirmed(preview.effect_plan.plan_id, context=context)
+        self.assertEqual(executed, ["first-resource-0001"])
+
+        foreign_lease, _foreign_state = await state.begin_turn(
+            owner="owner-1", session_id="session-2", request_id="request-2"
+        )
+        foreign_token = CancellationToken()
+        foreign_context = ToolCallContext(
+            owner="owner-1",
+            session_id="session-2",
+            request_id="request-2",
+            turn_id=foreign_lease.turn_id,
+            lease=foreign_lease,
+            cancellation=foreign_token,
+            report_progress=progress,
+        )
+        with self.assertRaises(ToolPipelineError) as raised:
+            await pipeline.execute(
+                "resource.submit",
+                {"resource_candidates_ref": first_ref},
+                context=foreign_context,
+            )
+        self.assertEqual(raised.exception.code, "reference_invalid")
 
     async def test_default_projection_redacts_credentials_and_model_internal_paths(
         self,

@@ -1,7 +1,9 @@
-"""MediaFlux 已确认副作用的审计与运行代次收束。"""
+"""MediaFlux 副作用的领域后置动作、审计与运行代次收束。"""
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from app.agent.action_history import (
@@ -10,14 +12,25 @@ from app.agent.action_history import (
     record_confirmed_result,
 )
 from app.agent.feature_gate import invalidate_agent_runtime_generation
+from app.agent.missing_media_workflow_runtime import (
+    MISSING_MEDIA_CANDIDATES_KEY,
+    MISSING_MEDIA_FOLLOWUPS_KEY,
+    MissingMediaWorkflowRuntime,
+)
 from app.agent.models import RiskLevel, ToolResult
 
-from ..capabilities import ToolEffect
-from ..effects import EffectPlan
+from ..capabilities import KernelToolSpec, ToolEffect
+from ..effects import EffectPlan, PreparedEffect
+from ..pipeline import ToolCallContext
 
 
 class MediaFluxEffectLifecycle:
-    """复用既有脱敏审计；任何审计故障都不得改变领域执行结果。"""
+    """复用领域后置动作和既有脱敏审计；辅助故障不改变真实写入结果。"""
+
+    def __init__(
+        self, *, missing_media_runtime: MissingMediaWorkflowRuntime | None = None
+    ) -> None:
+        self.missing_media_runtime = missing_media_runtime
 
     @staticmethod
     def _risk(plan: EffectPlan) -> RiskLevel:
@@ -36,7 +49,56 @@ class MediaFluxEffectLifecycle:
         contract = plan.confirmation_contract.get("audit_contract")
         return dict(contract) if isinstance(contract, dict) else {}
 
+    @staticmethod
+    def _followups(metadata: Any) -> Any:
+        return (
+            metadata.get(MISSING_MEDIA_FOLLOWUPS_KEY)
+            if isinstance(metadata, dict)
+            else None
+        )
+
+    def prepared(
+        self,
+        *,
+        tool: KernelToolSpec,
+        arguments: Mapping[str, Any],
+        prepared: PreparedEffect,
+        context: ToolCallContext,
+    ) -> PreparedEffect:
+        del tool, arguments
+        runtime = self.missing_media_runtime
+        metadata = dict(prepared.metadata)
+        candidates = metadata.pop(MISSING_MEDIA_CANDIDATES_KEY, None)
+        if runtime is None or candidates is None:
+            return replace(prepared, metadata=metadata)
+        followups = runtime.stage_candidates(
+            owner=context.owner,
+            candidates=candidates,
+        )
+        if followups:
+            metadata[MISSING_MEDIA_FOLLOWUPS_KEY] = list(followups)
+        return replace(prepared, metadata=metadata)
+
+    def prepare_failed(
+        self, *, prepared: PreparedEffect, context: ToolCallContext
+    ) -> None:
+        runtime = self.missing_media_runtime
+        if runtime is None:
+            return
+        runtime.release_followups(
+            owner=context.owner,
+            followups=self._followups(dict(prepared.metadata)),
+        )
+
     def completed(self, *, plan: EffectPlan, value: Any, elapsed_ms: int) -> None:
+        runtime = self.missing_media_runtime
+        if runtime is not None:
+            runtime.complete_submission(
+                owner=plan.owner,
+                tool_name=plan.tool_name,
+                result=value,
+                followups=self._followups(dict(plan.metadata)),
+            )
         if not isinstance(value, ToolResult):
             return
         record_confirmed_result(
@@ -53,6 +115,12 @@ class MediaFluxEffectLifecycle:
             invalidate_agent_runtime_generation()
 
     def failed(self, *, plan: EffectPlan, code: str, elapsed_ms: int) -> None:
+        runtime = self.missing_media_runtime
+        if runtime is not None:
+            runtime.release_followups(
+                owner=plan.owner,
+                followups=self._followups(dict(plan.metadata)),
+            )
         record_confirmation_error(
             owner=plan.owner,
             tool_name=plan.tool_name,
@@ -65,6 +133,12 @@ class MediaFluxEffectLifecycle:
         )
 
     def interrupted(self, *, plan: EffectPlan) -> None:
+        runtime = self.missing_media_runtime
+        if runtime is not None:
+            runtime.release_followups(
+                owner=plan.owner,
+                followups=self._followups(dict(plan.metadata)),
+            )
         record_confirmation_interrupted(
             owner=plan.owner,
             confirmation_id=plan.plan_id,
@@ -72,4 +146,13 @@ class MediaFluxEffectLifecycle:
             tool_name=plan.tool_name,
             risk=self._risk(plan),
             confirmation_contract=self._contract(plan),
+        )
+
+    def cancelled(self, *, plan: EffectPlan) -> None:
+        runtime = self.missing_media_runtime
+        if runtime is None:
+            return
+        runtime.release_followups(
+            owner=plan.owner,
+            followups=self._followups(dict(plan.metadata)),
         )

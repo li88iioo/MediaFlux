@@ -1241,7 +1241,8 @@ html[data-settings-boot="pending"] .settings-page .settings-workspace {
     place-items: center;
 }
 .agent-model-actions .jump-btn svg { width: 16px; height: 16px; }
-.agent-timeout-field > .agent-input-unit { width: min(100%, 190px); }
+.agent-timeout-field > .agent-input-unit,
+.agent-context-field > .agent-input-unit { width: 100%; }
 .agent-model-test-btn {
     color: var(--accent);
     background: var(--accent-soft);

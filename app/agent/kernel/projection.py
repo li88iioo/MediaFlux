@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.agent.models import ToolReference
 from app.sensitive_data import is_sensitive_key, redact_sensitive_text
 
 from .state import StateUpdate
@@ -140,4 +141,23 @@ class DefaultProjector:
             model_content = json.dumps(
                 compact, ensure_ascii=False, separators=(",", ":")
             )
-        return ToolOutcome(model_content=model_content, public_content=public)
+        raw_references = getattr(value, "references", ())
+        references: list[ReferenceValue] = []
+        if isinstance(raw_references, Sequence) and not isinstance(
+            raw_references, (str, bytes, bytearray)
+        ):
+            for item in raw_references:
+                if not isinstance(item, ToolReference):
+                    raise TypeError("tool result contains an invalid reference")
+                references.append(
+                    ReferenceValue(
+                        kind=item.kind,
+                        value=item.value,
+                        ttl_seconds=item.ttl_seconds,
+                    )
+                )
+        return ToolOutcome(
+            model_content=model_content,
+            public_content=public,
+            refs=tuple(references),
+        )

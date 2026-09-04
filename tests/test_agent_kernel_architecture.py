@@ -61,6 +61,28 @@ class AgentKernelArchitectureTests(unittest.TestCase):
                     violations.append(f"{path}:{node.lineno}:{sorted(overlap)}")
         self.assertEqual(violations, [])
 
+    def test_domain_catalog_has_no_central_support_god_module(self) -> None:
+        domain_root = ROOT / "app" / "agent" / "domain_catalog"
+        self.assertFalse((domain_root / "support.py").exists())
+        for name in (
+            "shared.py",
+            "strm_runtime.py",
+            "cloud_runtime.py",
+            "library_search.py",
+        ):
+            self.assertTrue((domain_root / name).is_file(), name)
+
+        violations: list[str] = []
+        for path in domain_root.glob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom):
+                    continue
+                module = str(node.module or "")
+                if module == "support" or module.endswith("domain_catalog.support"):
+                    violations.append(f"{path}:{node.lineno}")
+        self.assertEqual(violations, [])
+
     def test_kernel_has_one_compact_control_plane_without_business_regex_router(
         self,
     ) -> None:

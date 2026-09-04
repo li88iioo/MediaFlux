@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import secrets
 import threading
 import time
@@ -25,7 +26,7 @@ from app.agent.download_actions import download_request_public_summary
 from app.agent.errors import AgentToolError
 from app.agent.indexer_actions import download_target_readiness
 from app.agent.indexer_candidate_actions import IndexerCandidateActions
-from app.agent.models import Evidence, ToolContext, ToolResult
+from app.agent.models import Evidence, ToolContext, ToolReference, ToolResult
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
     normalize_resource_search_id,
@@ -53,6 +54,8 @@ _SUBMIT_SOURCE_TYPES = frozenset({"direct_url", "guangya_share", "resource_candi
 _TARGETS = frozenset({"qb", "guangya", "both"})
 _MAX_RESOURCE_POSITIONS = 12
 _MAX_SHARE_POSITIONS = 200
+_OPAQUE_REFERENCE_RE = re.compile(r"^ref_[A-Za-z0-9_-]{16,160}$")
+_INGEST_REFERENCE_VERSION = 1
 
 
 def _now() -> str:
@@ -96,7 +99,7 @@ class IngestSessionSnapshot:
 
 
 class AgentIngestSessionStore:
-    """按 owner 保存最新资源接入快照；与传统 Telegram 预览完全隔离。"""
+    """按 owner 与会话保存资源接入快照；与传统 Telegram 预览完全隔离。"""
 
     def __init__(
         self,
@@ -116,18 +119,27 @@ class AgentIngestSessionStore:
             max_entries=self.max_entries,
         )
         self._lock = threading.RLock()
-        self._entries: OrderedDict[str, IngestSessionSnapshot] = OrderedDict()
+        self._entries: OrderedDict[tuple[str, str], IngestSessionSnapshot] = (
+            OrderedDict()
+        )
+
+    @staticmethod
+    def _scope(owner: str, conversation_session_id: str = "") -> tuple[str, str]:
+        return (
+            str(owner or "").strip(),
+            str(conversation_session_id or "").strip(),
+        )
 
     def _prune_locked(self, now: float) -> None:
-        for owner in [
-            owner
-            for owner, snapshot in self._entries.items()
+        for scope in [
+            scope
+            for scope, snapshot in self._entries.items()
             if snapshot.expires_at <= now
         ]:
-            self._discard_locked(owner)
+            self._discard_locked(scope)
 
-    def _discard_locked(self, owner: str) -> None:
-        snapshot = self._entries.pop(owner, None)
+    def _discard_locked(self, scope: tuple[str, str]) -> None:
+        snapshot = self._entries.pop(scope, None)
         if snapshot is None or snapshot.source_type != "guangya_share":
             return
         preview_id = str(snapshot.private.get("preview_id") or "")
@@ -146,23 +158,25 @@ class AgentIngestSessionStore:
         public: dict[str, Any],
         private: dict[str, Any],
         identity: str,
+        conversation_session_id: str = "",
     ) -> IngestSessionSnapshot:
         owner_key = str(owner or "").strip()
         if not owner_key:
             raise AgentToolError("请先登录后检查资源", code="precondition_failed")
-        session_id = str(self._token_factory() or "").strip()
-        if not session_id:
+        snapshot_id = str(self._token_factory() or "").strip()
+        if not snapshot_id:
             raise AgentToolError("暂时无法保存资源检查结果", code="unavailable")
+        scope = self._scope(owner_key, conversation_session_id)
         now = self._clock()
         snapshot = IngestSessionSnapshot(
-            session_id=session_id,
+            session_id=snapshot_id,
             owner=owner_key,
             source_type=source_type,
             public=deepcopy(public),
             private=deepcopy(private),
             fingerprint=_fingerprint(
                 {
-                    "session_id": session_id,
+                    "session_id": snapshot_id,
                     "owner": owner_key,
                     "source_type": source_type,
                     "identity": identity,
@@ -172,26 +186,44 @@ class AgentIngestSessionStore:
         )
         with self._lock:
             self._prune_locked(now)
-            self._discard_locked(owner_key)
-            self._entries[owner_key] = snapshot
-            self._entries.move_to_end(owner_key)
+            self._discard_locked(scope)
+            self._entries[scope] = snapshot
+            self._entries.move_to_end(scope)
             while len(self._entries) > self.max_entries:
                 oldest = next(iter(self._entries))
                 self._discard_locked(oldest)
         return deepcopy(snapshot)
 
-    def get(self, *, owner: str, source_type: str = "") -> IngestSessionSnapshot | None:
+    def get(
+        self,
+        *,
+        owner: str,
+        source_type: str = "",
+        conversation_session_id: str = "",
+    ) -> IngestSessionSnapshot | None:
         owner_key = str(owner or "").strip()
         if not owner_key:
             return None
         with self._lock:
             self._prune_locked(self._clock())
-            snapshot = self._entries.get(owner_key)
+            if conversation_session_id:
+                scope = self._scope(owner_key, conversation_session_id)
+                snapshot = self._entries.get(scope)
+            else:
+                match = next(
+                    (
+                        (scope, item)
+                        for scope, item in reversed(self._entries.items())
+                        if scope[0] == owner_key
+                    ),
+                    None,
+                )
+                scope, snapshot = match if match is not None else (("", ""), None)
             if snapshot is None or (
                 source_type and snapshot.source_type != source_type
             ):
                 return None
-            self._entries.move_to_end(owner_key)
+            self._entries.move_to_end(scope)
             return deepcopy(snapshot)
 
     def clear_owner(self, *, owner: str) -> bool:
@@ -199,19 +231,21 @@ class AgentIngestSessionStore:
         if not owner_key:
             return False
         with self._lock:
-            existed = owner_key in self._entries
-            self._discard_locked(owner_key)
+            scopes = [scope for scope in self._entries if scope[0] == owner_key]
+            existed = bool(scopes)
+            for scope in scopes:
+                self._discard_locked(scope)
             return existed
 
     def reset(self) -> None:
         with self._lock:
-            for owner in list(self._entries):
-                self._discard_locked(owner)
+            for scope in list(self._entries):
+                self._discard_locked(scope)
 
 
 def ingest_inspect_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"source_type", "input"}
+        {"source_type", "input", "resource_candidates_ref"}
     ):
         raise AgentToolError("资源检查参数无效")
     source_type = str(arguments.get("source_type") or "auto").strip().lower()
@@ -225,7 +259,17 @@ def ingest_inspect_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         raise AgentToolError("请提供需要检查的资源链接")
     if len(value) > 8192:
         raise AgentToolError("资源链接过长")
-    return {"source_type": source_type, "input": value}
+    normalized = {"source_type": source_type, "input": value}
+    raw_reference = arguments.get("resource_candidates_ref")
+    if source_type == "resource_candidates":
+        if raw_reference not in (None, ""):
+            reference = str(raw_reference or "").strip()
+            if not _OPAQUE_REFERENCE_RE.fullmatch(reference):
+                raise AgentToolError("resource_candidates_ref 不是有效的资源候选引用")
+            normalized["resource_candidates_ref"] = reference
+    elif raw_reference not in (None, ""):
+        raise AgentToolError("只有资源候选检查接受 resource_candidates_ref")
+    return normalized
 
 
 def _positions(value: Any, *, maximum: int, required: bool) -> list[int]:
@@ -246,7 +290,14 @@ def _positions(value: Any, *, maximum: int, required: bool) -> list[int]:
 
 def ingest_submit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict) or not set(arguments).issubset(
-        {"source_type", "target", "positions", "search_id"}
+        {
+            "source_type",
+            "target",
+            "positions",
+            "search_id",
+            "resource_candidates_ref",
+            "ingest_snapshot_ref",
+        }
     ):
         raise AgentToolError("资源提交参数无效")
     source_type = str(arguments.get("source_type") or "").strip().lower()
@@ -278,14 +329,30 @@ def ingest_submit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         "positions": positions,
     }
     raw_search_id = arguments.get("search_id")
+    raw_reference = arguments.get("resource_candidates_ref")
+    raw_ingest_reference = arguments.get("ingest_snapshot_ref")
     if source_type == "resource_candidates":
         search_id = normalize_resource_search_id(raw_search_id)
         if raw_search_id not in (None, "") and not search_id:
             raise AgentToolError("search_id 不是有效的资源搜索快照标识")
         if search_id:
             normalized["search_id"] = search_id
+        if raw_reference not in (None, ""):
+            reference = str(raw_reference or "").strip()
+            if not _OPAQUE_REFERENCE_RE.fullmatch(reference):
+                raise AgentToolError("resource_candidates_ref 不是有效的资源候选引用")
+            normalized["resource_candidates_ref"] = reference
+        if raw_ingest_reference not in (None, ""):
+            raise AgentToolError("资源候选提交不接受 ingest_snapshot_ref")
     elif raw_search_id not in (None, ""):
         raise AgentToolError("只有资源候选提交接受 search_id")
+    elif raw_reference not in (None, ""):
+        raise AgentToolError("只有资源候选提交接受 resource_candidates_ref")
+    elif raw_ingest_reference not in (None, ""):
+        reference = str(raw_ingest_reference or "").strip()
+        if not _OPAQUE_REFERENCE_RE.fullmatch(reference):
+            raise AgentToolError("ingest_snapshot_ref 不是有效的资源检查引用")
+        normalized["ingest_snapshot_ref"] = reference
     return normalized
 
 
@@ -321,7 +388,10 @@ class IngestActions:
         source_type = arguments["source_type"]
         value = arguments["input"]
         if source_type == "resource_candidates":
-            snapshot = self.candidate_actions.current_snapshot(context)
+            snapshot = self.candidate_actions.current_snapshot(
+                context,
+                resource_candidates=arguments.get("resource_candidates"),
+            )
             candidates = snapshot.get("candidates")
             if not isinstance(candidates, list) or not candidates:
                 raise AgentToolError(
@@ -439,6 +509,7 @@ class IngestActions:
                         "files": [item.get("id") for item in share_files],
                     }
                 ),
+                conversation_session_id=context.session_id,
             )
             public["expires_in"] = max(0, int(session.expires_at - time.monotonic()))
             return ToolResult(
@@ -454,6 +525,30 @@ class IngestActions:
                     )
                 ],
                 suggestions=["可选择序号后转存；不提供序号时默认转存全部项目。"],
+                references=[
+                    ToolReference(
+                        kind="ingest_snapshot",
+                        value={
+                            "version": _INGEST_REFERENCE_VERSION,
+                            "source_type": "guangya_share",
+                            "input": value,
+                            "target_id": str(inspected.get("target_id") or "0"),
+                            "target_name": str(
+                                inspected.get("target_name") or "根目录"
+                            ),
+                            "files": [
+                                {
+                                    "id": str(item.get("id") or ""),
+                                    "name": str(item.get("name") or ""),
+                                    "is_dir": bool(item.get("is_dir")),
+                                    "size": _nonnegative_int(item.get("size")),
+                                }
+                                for item in share_files
+                            ],
+                        },
+                        ttl_seconds=self.store.ttl_seconds,
+                    )
+                ],
             )
 
         if routed in {"guangya_share", "web"}:
@@ -481,6 +576,7 @@ class IngestActions:
             public=public,
             private={"download_input": item},
             identity=request_key(item),
+            conversation_session_id=context.session_id,
         )
         public["expires_in"] = max(0, int(session.expires_at - time.monotonic()))
         return ToolResult(
@@ -496,6 +592,18 @@ class IngestActions:
                 )
             ],
             suggestions=["选择 qB、光鸭或两边后可进入提交确认。"],
+            references=[
+                ToolReference(
+                    kind="ingest_snapshot",
+                    value={
+                        "version": _INGEST_REFERENCE_VERSION,
+                        "source_type": "direct_url",
+                        "input": value,
+                        "identity": request_key(item),
+                    },
+                    ttl_seconds=self.store.ttl_seconds,
+                )
+            ],
         )
 
     @staticmethod
@@ -507,6 +615,10 @@ class IngestActions:
         search_id = normalize_resource_search_id(arguments.get("search_id"))
         if search_id:
             resource_arguments["search_id"] = search_id
+        if "resource_candidates" in arguments:
+            resource_arguments["resource_candidates"] = arguments.get(
+                "resource_candidates"
+            )
         if len(positions) == 1:
             resource_arguments["position"] = positions[0]
         else:
@@ -517,7 +629,18 @@ class IngestActions:
         self, arguments: dict[str, Any], context: ToolContext
     ) -> IngestSessionSnapshot:
         owner = self._owner(context)
-        snapshot = self.store.get(owner=owner, source_type=arguments["source_type"])
+        reference = arguments.get("ingest_snapshot")
+        if reference is not None:
+            return self._snapshot_from_reference(
+                reference,
+                owner=owner,
+                source_type=str(arguments["source_type"]),
+            )
+        snapshot = self.store.get(
+            owner=owner,
+            source_type=arguments["source_type"],
+            conversation_session_id=context.session_id,
+        )
         if snapshot is None:
             label = (
                 "光鸭分享"
@@ -529,6 +652,150 @@ class IngestActions:
                 code="precondition_failed",
             )
         return snapshot
+
+    def _snapshot_from_reference(
+        self,
+        value: Any,
+        *,
+        owner: str,
+        source_type: str,
+    ) -> IngestSessionSnapshot:
+        if not isinstance(value, dict) or value.get("version") != _INGEST_REFERENCE_VERSION:
+            raise AgentToolError(
+                "资源检查引用无效或已过期", code="confirmation_stale"
+            )
+        reference_source = str(value.get("source_type") or "").strip().lower()
+        if reference_source != source_type or reference_source not in {
+            "direct_url",
+            "guangya_share",
+        }:
+            raise AgentToolError(
+                "资源检查引用与提交类型不匹配", code="confirmation_stale"
+            )
+        raw_input = value.get("input")
+        if not isinstance(raw_input, str) or not raw_input or len(raw_input) > 8192:
+            raise AgentToolError("资源检查引用无效", code="confirmation_stale")
+        now = time.monotonic()
+
+        if reference_source == "direct_url":
+            if set(value) != {"version", "source_type", "input", "identity"}:
+                raise AgentToolError("资源检查引用无效", code="confirmation_stale")
+            try:
+                item = normalize_download_url(raw_input)
+            except ValueError as exc:
+                raise AgentToolError(
+                    "下载资源引用已经失效", code="confirmation_stale"
+                ) from exc
+            identity = request_key(item)
+            if not secrets.compare_digest(
+                identity, str(value.get("identity") or "")
+            ):
+                raise AgentToolError(
+                    "下载资源引用已变化", code="confirmation_stale"
+                )
+            public = {
+                "source_type": "direct_url",
+                "kind": item.kind,
+                "title": _safe_text(item.title or "下载资源", 180),
+                "expires_in": self.store.ttl_seconds,
+            }
+            return IngestSessionSnapshot(
+                session_id=_fingerprint(value)[:32],
+                owner=owner,
+                source_type="direct_url",
+                public=public,
+                private={"download_input": item},
+                fingerprint=_fingerprint(
+                    {"source_type": "direct_url", "identity": identity}
+                ),
+                expires_at=now + self.store.ttl_seconds,
+            )
+
+        if set(value) != {
+            "version",
+            "source_type",
+            "input",
+            "target_id",
+            "target_name",
+            "files",
+        }:
+            raise AgentToolError("分享检查引用无效", code="confirmation_stale")
+        expected_files = value.get("files")
+        if not isinstance(expected_files, list) or not expected_files:
+            raise AgentToolError("分享检查引用无效", code="confirmation_stale")
+        try:
+            inspected = inspect_share_for_transfer(
+                raw_input,
+                owner,
+                "agent",
+                store=self.store.share_store,
+            )
+        except Exception as exc:
+            raise AgentToolError(
+                "光鸭分享引用已失效，请重新解析", code="confirmation_stale"
+            ) from exc
+        share_files = [
+            item
+            for item in (inspected.get("files") or [])
+            if isinstance(item, dict) and str(item.get("id") or "").strip()
+        ]
+        current_files = [
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or ""),
+                "is_dir": bool(item.get("is_dir")),
+                "size": _nonnegative_int(item.get("size")),
+            }
+            for item in share_files
+        ]
+        target_id = str(inspected.get("target_id") or "0")
+        target_name = str(inspected.get("target_name") or "根目录")
+        if (
+            current_files != expected_files
+            or target_id != str(value.get("target_id") or "0")
+            or target_name != str(value.get("target_name") or "根目录")
+        ):
+            raise AgentToolError(
+                "光鸭分享内容或目标目录已变化，请重新解析",
+                code="confirmation_stale",
+            )
+        public_items = [
+            {
+                "position": index,
+                "name": _safe_text(item.get("name"), 300),
+                "is_dir": bool(item.get("is_dir")),
+                "size_bytes": _nonnegative_int(item.get("size")),
+            }
+            for index, item in enumerate(share_files, start=1)
+        ]
+        return IngestSessionSnapshot(
+            session_id=_fingerprint(value)[:32],
+            owner=owner,
+            source_type="guangya_share",
+            public={
+                "source_type": "guangya_share",
+                "count": len(public_items),
+                "items": public_items,
+                "target_name": _safe_text(target_name, 120),
+                "expires_in": self.store.ttl_seconds,
+            },
+            private={
+                "preview_id": str(inspected.get("preview_id") or ""),
+                "file_ids": [str(item.get("id") or "") for item in share_files],
+                "target_id": target_id,
+                "target_name": target_name,
+            },
+            fingerprint=_fingerprint(
+                {
+                    "source_type": "guangya_share",
+                    "input": raw_input,
+                    "target_id": target_id,
+                    "target_name": target_name,
+                    "files": current_files,
+                }
+            ),
+            expires_at=now + self.store.ttl_seconds,
+        )
 
     @staticmethod
     def _submission_context(
@@ -558,15 +825,22 @@ class IngestActions:
                     internal, context
                 )
             # 候选解析器把本轮实际使用的 search_id 写回 internal；这里再冻结进
-            # ToolRegistry 的 normalized 参数，使确认只能回到同一份快照。
-            arguments["search_id"] = internal["search_id"]
+            # 确认指纹，使执行只能回到同一份 owner/session 引用快照。
+            search_id = internal["search_id"]
+            arguments["search_id"] = search_id
             if isinstance(result.data, dict):
                 result.data["source_type"] = "resource_candidates"
-                result.data["search_id"] = internal["search_id"]
+                result.data["search_id"] = search_id
+            frozen_arguments = {
+                "source_type": "resource_candidates",
+                "target": arguments["target"],
+                "positions": list(arguments["positions"]),
+                "search_id": search_id,
+            }
             return result, _fingerprint(
                 {
                     "source_type": "resource_candidates",
-                    "arguments": arguments,
+                    "arguments": frozen_arguments,
                     "inner_context": inner_context,
                 }
             )
@@ -661,13 +935,9 @@ class IngestActions:
         context: ToolContext,
     ) -> ToolResult:
         if arguments["source_type"] == "resource_candidates":
-            if not normalize_resource_search_id(arguments.get("search_id")):
-                raise AgentToolError(
-                    "资源确认缺少已冻结的搜索快照，请重新选择",
-                    code="confirmation_stale",
-                )
             internal = self._resource_arguments(arguments)
-            # 只按 ticket 已冻结的 search_id 重新生成底层上下文；不得回落到 latest。
+            # 重新解析 EffectPlan 中冻结的 owner/session opaque ref，并按其
+            # search_id 生成底层上下文；不得回落到另一次 latest 搜索。
             if len(arguments["positions"]) == 1:
                 _preview, inner_context = self.candidate_actions.prepare_one(
                     internal, context
@@ -676,10 +946,22 @@ class IngestActions:
                 _preview, inner_context = self.candidate_actions.prepare_batch(
                     internal, context
                 )
+            search_id = normalize_resource_search_id(internal.get("search_id"))
+            if not search_id:
+                raise AgentToolError(
+                    "资源确认缺少已冻结的搜索快照，请重新选择",
+                    code="confirmation_stale",
+                )
+            frozen_arguments = {
+                "source_type": "resource_candidates",
+                "target": arguments["target"],
+                "positions": list(arguments["positions"]),
+                "search_id": search_id,
+            }
             current = _fingerprint(
                 {
                     "source_type": "resource_candidates",
-                    "arguments": arguments,
+                    "arguments": frozen_arguments,
                     "inner_context": inner_context,
                 }
             )

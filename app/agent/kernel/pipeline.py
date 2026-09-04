@@ -21,7 +21,7 @@ from .effects import (
     PreparedEffect,
 )
 from .projection import DefaultProjector, ReferenceValue, ToolOutcome
-from .references import InMemoryReferenceStore, ReferenceStore
+from .references import InMemoryReferenceStore, ReferenceError, ReferenceStore
 from .state import (
     CancellationToken,
     PublicationLease,
@@ -83,7 +83,20 @@ class RateLimiter(Protocol):
 
 
 class EffectLifecycle(Protocol):
-    """已领取 EffectPlan 的确定性审计与运行代次生命周期。"""
+    """EffectPlan 的确定性领域后置动作、审计与运行代次生命周期。"""
+
+    def prepared(
+        self,
+        *,
+        tool: KernelToolSpec,
+        arguments: Mapping[str, Any],
+        prepared: PreparedEffect,
+        context: ToolCallContext,
+    ) -> PreparedEffect: ...
+
+    def prepare_failed(
+        self, *, prepared: PreparedEffect, context: ToolCallContext
+    ) -> None: ...
 
     def completed(self, *, plan: EffectPlan, value: Any, elapsed_ms: int) -> None: ...
 
@@ -91,8 +104,26 @@ class EffectLifecycle(Protocol):
 
     def interrupted(self, *, plan: EffectPlan) -> None: ...
 
+    def cancelled(self, *, plan: EffectPlan) -> None: ...
+
 
 class NoopEffectLifecycle:
+    def prepared(
+        self,
+        *,
+        tool: KernelToolSpec,
+        arguments: Mapping[str, Any],
+        prepared: PreparedEffect,
+        context: ToolCallContext,
+    ) -> PreparedEffect:
+        del tool, arguments, context
+        return prepared
+
+    def prepare_failed(
+        self, *, prepared: PreparedEffect, context: ToolCallContext
+    ) -> None:
+        del prepared, context
+
     def completed(self, *, plan: EffectPlan, value: Any, elapsed_ms: int) -> None:
         del plan, value, elapsed_ms
 
@@ -100,6 +131,9 @@ class NoopEffectLifecycle:
         del plan, code, elapsed_ms
 
     def interrupted(self, *, plan: EffectPlan) -> None:
+        del plan
+
+    def cancelled(self, *, plan: EffectPlan) -> None:
         del plan
 
 
@@ -264,6 +298,36 @@ class ToolPipeline:
         self.rate_limiter = rate_limiter or InMemoryRateLimiter()
         self.effect_lifecycle = effect_lifecycle or NoopEffectLifecycle()
 
+    def _effect_prepared(
+        self,
+        *,
+        tool: KernelToolSpec,
+        arguments: Mapping[str, Any],
+        prepared: PreparedEffect,
+        context: ToolCallContext,
+    ) -> PreparedEffect:
+        try:
+            value = self.effect_lifecycle.prepared(
+                tool=tool,
+                arguments=arguments,
+                prepared=prepared,
+                context=context,
+            )
+        except Exception:  # noqa: BLE001 - 辅助领域状态不得遮蔽有效预检
+            return prepared
+        return value if isinstance(value, PreparedEffect) else prepared
+
+    def _effect_prepare_failed(
+        self, *, prepared: PreparedEffect, context: ToolCallContext
+    ) -> None:
+        try:
+            self.effect_lifecycle.prepare_failed(
+                prepared=prepared,
+                context=context,
+            )
+        except Exception:  # noqa: BLE001 - 清理失败不得覆盖原始错误
+            return
+
     def _effect_completed(self, plan: EffectPlan, value: Any, elapsed_ms: int) -> None:
         try:
             self.effect_lifecycle.completed(
@@ -289,6 +353,36 @@ class ToolPipeline:
             self.effect_lifecycle.interrupted(plan=plan)
         except Exception:  # noqa: BLE001 - audit hooks may not mask interruption
             return
+
+    def _effect_cancelled(self, plan: EffectPlan) -> None:
+        try:
+            self.effect_lifecycle.cancelled(plan=plan)
+        except Exception:  # noqa: BLE001 - 清理失败不得改变取消结果
+            return
+
+    async def _discard_frozen_effect(
+        self,
+        *,
+        plan: EffectPlan,
+        prepared: PreparedEffect,
+        context: ToolCallContext,
+    ) -> None:
+        """预览发布失败时撤销已冻结票据并释放领域预占状态。"""
+        cancelled: EffectPlan | None = None
+        try:
+            cancelled = await asyncio.to_thread(
+                self.effect_store.cancel,
+                owner=context.owner,
+                session_id=context.session_id,
+                generation=context.lease.generation,
+                plan_id=plan.plan_id,
+            )
+        except Exception:  # noqa: BLE001 - 原始发布失败仍是主错误
+            cancelled = None
+        if cancelled is not None:
+            self._effect_cancelled(cancelled)
+        else:
+            self._effect_prepare_failed(prepared=prepared, context=context)
 
     async def execute(
         self,
@@ -322,7 +416,13 @@ class ToolPipeline:
             raise ToolPipelineError(
                 "工具参数校验器返回无效结果", code="invalid_arguments"
             )
-        resolved = await self._resolve_references(normalized, context=context)
+        try:
+            resolved = await self._resolve_references(normalized, context=context)
+        except ReferenceError as exc:
+            raise ToolPipelineError(
+                "工具引用无效、已过期或不属于当前会话",
+                code="reference_invalid",
+            ) from exc
         await self.authorization.authorize(tool, resolved, context)
         await self.rate_limiter.acquire(
             owner=context.owner,
@@ -357,26 +457,45 @@ class ToolPipeline:
             raise ToolPipelineError(
                 "工具预检缺少快照指纹", code="invalid_effect_preview"
             )
-        if not await self.state_store.is_current(context.lease):
-            raise StalePublicationError("turn lost publication authority")
-        plan = await asyncio.to_thread(
-            self.effect_store.freeze,
-            owner=context.owner,
-            session_id=context.session_id,
-            generation=context.lease.generation,
-            tool_name=tool.name,
-            effect=tool.effect,
+        prepared_value = self._effect_prepared(
+            tool=tool,
             arguments=normalized,
             prepared=prepared_value,
+            context=context,
         )
-        preview_outcome = await self._materialize_refs(
-            self.projector.project(prepared_value.preview), context=context
-        )
-        updates = tuple(preview_outcome.state_updates) + (
-            StateUpdate("pending_effect_plan_id", plan.plan_id),
-        )
-        outcome = replace(preview_outcome, state_updates=updates, effect_plan=plan)
-        await self._commit_updates(context.lease, updates)
+        if not await self.state_store.is_current(context.lease):
+            self._effect_prepare_failed(prepared=prepared_value, context=context)
+            raise StalePublicationError("turn lost publication authority")
+        try:
+            plan = await asyncio.to_thread(
+                self.effect_store.freeze,
+                owner=context.owner,
+                session_id=context.session_id,
+                generation=context.lease.generation,
+                tool_name=tool.name,
+                effect=tool.effect,
+                arguments=normalized,
+                prepared=prepared_value,
+            )
+        except BaseException:
+            self._effect_prepare_failed(prepared=prepared_value, context=context)
+            raise
+        try:
+            preview_outcome = await self._materialize_refs(
+                self.projector.project(prepared_value.preview), context=context
+            )
+            updates = tuple(preview_outcome.state_updates) + (
+                StateUpdate("pending_effect_plan_id", plan.plan_id),
+            )
+            outcome = replace(preview_outcome, state_updates=updates, effect_plan=plan)
+            await self._commit_updates(context.lease, updates)
+        except BaseException:
+            await self._discard_frozen_effect(
+                plan=plan,
+                prepared=prepared_value,
+                context=context,
+            )
+            raise
         return PipelineResult(
             tool=tool,
             arguments=normalized,
@@ -422,7 +541,16 @@ class ToolPipeline:
                 raise ToolPipelineError(
                     "确认计划风险类型不匹配", code="confirmation_invalid"
                 )
-            await self.authorization.authorize(tool, plan.arguments, context)
+            try:
+                resolved_arguments = await self._resolve_references(
+                    dict(plan.arguments), context=context
+                )
+            except ReferenceError as exc:
+                raise ToolPipelineError(
+                    "确认计划引用无效、已过期或不属于当前会话",
+                    code="confirmation_stale",
+                ) from exc
+            await self.authorization.authorize(tool, resolved_arguments, context)
             await self.rate_limiter.acquire(
                 owner=context.owner,
                 tool_name=f"confirm:{tool.name}",
@@ -435,14 +563,14 @@ class ToolPipeline:
                 )
             value = await _invoke(
                 tool.execute_confirmed,
-                dict(plan.arguments),
+                resolved_arguments,
                 plan.snapshot_fingerprint,
                 context,
             )
             if tool.verify is not None:
                 verified = await _invoke(
                     tool.verify,
-                    dict(plan.arguments),
+                    resolved_arguments,
                     value,
                     context,
                 )
@@ -489,19 +617,22 @@ class ToolPipeline:
         *,
         context: ToolCallContext,
     ) -> bool:
-        cancelled = await asyncio.to_thread(
+        cancelled_plan = await asyncio.to_thread(
             self.effect_store.cancel,
             owner=context.owner,
             session_id=context.session_id,
+            generation=context.lease.generation,
             plan_id=plan_id,
         )
+        if cancelled_plan is not None:
+            self._effect_cancelled(cancelled_plan)
         # 即使票据已过期或被抢先消费，当前会话也不能继续保留一个
         # 永远无法执行的 pending_effect_plan_id。
         await self._commit_updates(
             context.lease,
             (StateUpdate("pending_effect_plan_id", ""),),
         )
-        return bool(cancelled)
+        return cancelled_plan is not None
 
     async def _resolve_references(
         self,
@@ -548,6 +679,7 @@ class ToolPipeline:
         if not outcome.refs:
             return outcome
         exposed: list[dict[str, str]] = []
+        reference_arguments: dict[str, str] = {}
         kinds: list[str] = []
         ids: list[str] = []
         for item in outcome.refs:
@@ -563,14 +695,28 @@ class ToolPipeline:
                 ttl_seconds=item.ttl_seconds,
             )
             exposed.append({"ref": reference.ref, "kind": reference.kind})
+            argument_name = (
+                re.sub(r"[^a-z0-9_]+", "_", reference.kind.casefold()).strip("_")
+                + "_ref"
+            )
+            if argument_name != "_ref":
+                reference_arguments[argument_name] = reference.ref
             ids.append(reference.ref)
             kinds.append(reference.kind)
         public = dict(outcome.public_content)
         public["refs"] = exposed
+        if reference_arguments:
+            public["reference_arguments"] = reference_arguments
         model_content = (
             outcome.model_content.rstrip()
             + "\nopaque_refs="
             + json.dumps(exposed, ensure_ascii=False, separators=(",", ":"))
+            + "\nreference_arguments="
+            + json.dumps(
+                reference_arguments,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
         )
         updates = tuple(outcome.state_updates) + (
             StateUpdate("recent_refs", ids, mode="append"),

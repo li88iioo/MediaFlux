@@ -28,6 +28,20 @@ class Evidence:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class ToolReference:
+    """领域结果交给 Kernel 持久化的私有引用值。
+
+    引用内容不会进入公开 DTO 或模型上下文；ToolPipeline 会把它转换为
+    owner/session 绑定的 opaque ref。领域层只声明引用类型和值，不接触
+    Kernel 的引用存储实现。
+    """
+
+    kind: str
+    value: Any
+    ttl_seconds: int = 900
+
+
 @dataclass
 class ToolResult:
     ok: bool
@@ -38,6 +52,8 @@ class ToolResult:
     suggestions: list[str] = field(default_factory=list)
     error: str = ""
     model_data: dict[str, Any] | None = None
+    references: list[ToolReference] = field(default_factory=list, repr=False)
+    effect_metadata: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {

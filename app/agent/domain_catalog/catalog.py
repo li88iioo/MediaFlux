@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.agent.ingest_actions import AgentIngestSessionStore, IngestActions
+from app.agent.missing_media_workflow_runtime import MissingMediaWorkflowRuntime
 from app.agent.models import ToolSpec
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 
@@ -52,6 +53,7 @@ _REGISTRARS = (
 def build_tool_specs(
     recent_resource_store: RecentResourceCandidateStore | None = None,
     ingest_store: AgentIngestSessionStore | None = None,
+    missing_media_runtime: MissingMediaWorkflowRuntime | None = None,
 ) -> tuple[ToolSpec, ...]:
     collector = ToolSpecCollector()
     resource_store = recent_resource_store or RecentResourceCandidateStore()
@@ -61,10 +63,19 @@ def build_tool_specs(
         recent_resource_store=resource_store,
     )
     for registrar in _REGISTRARS:
-        registrar(
-            collector,
-            resource_store=resource_store,
-            active_ingest_store=active_ingest_store,
-            ingest_actions=ingest_actions,
-        )
+        if registrar is register_library_specs:
+            registrar(
+                collector,
+                resource_store=resource_store,
+                active_ingest_store=active_ingest_store,
+                ingest_actions=ingest_actions,
+                missing_media_runtime=missing_media_runtime,
+            )
+        else:
+            registrar(
+                collector,
+                resource_store=resource_store,
+                active_ingest_store=active_ingest_store,
+                ingest_actions=ingest_actions,
+            )
     return tuple(collector.items)

@@ -189,7 +189,8 @@ class AgentPageTests(InitializedWebTestCase):
         source = SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("case 'model.delta'", source)
-        self.assertIn("turn.text.textContent = value", source)
+        self.assertIn("renderTurnMarkdown(turn, value)", source)
+        self.assertIn("function parseTextBlocks(text)", source)
         self.assertIn("payload.answer", source)
         self.assertIn("function finalizeAnswer(turn, text)", source)
         self.assertEqual(source.count("fetch('/api/agent/query'"), 1)

@@ -219,6 +219,36 @@ def _negated_tokens(value: object) -> Counter[str]:
     return result
 
 
+def _bm25_overlap(
+    terms: Counter[str],
+    document_counts: Counter[str],
+    *,
+    document_length: int,
+    document_frequency: Counter[str],
+    total_documents: int,
+    average_length: float,
+    weight: float,
+) -> float:
+    score = 0.0
+    for token, query_frequency in terms.items():
+        frequency = document_counts.get(token, 0)
+        if not frequency:
+            continue
+        df = document_frequency[token]
+        idf = math.log(
+            1.0 + (total_documents - df + 0.5) / (df + 0.5)
+        )
+        denominator = frequency + 1.5 * (
+            1.0 - 0.75 + 0.75 * document_length / max(1.0, average_length)
+        )
+        score += (
+            idf
+            * ((frequency * 2.5) / denominator)
+            * min(2, query_frequency)
+        )
+    return score * weight
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilitySelection:
     tools: tuple[KernelToolSpec, ...]
@@ -236,7 +266,7 @@ class CapabilitySelection:
 class CapabilityRetriever:
     """BM25 风格候选召回；只缩小能力集合，不裁决最终意图。"""
 
-    def __init__(self, *, minimum: int = 6, maximum: int = 8) -> None:
+    def __init__(self, *, minimum: int = 6, maximum: int = 10) -> None:
         if minimum < 1 or maximum < minimum or maximum > 24:
             raise ValueError("invalid capability retrieval bounds")
         self.minimum = minimum
@@ -249,11 +279,32 @@ class CapabilityRetriever:
         *,
         context: Mapping[str, Any] | None = None,
     ) -> CapabilitySelection:
-        visible = list(catalog.visible(context))
+        runtime = context or {}
+        visible = list(catalog.visible(runtime))
         if not visible:
             return CapabilitySelection((), {})
         query_tokens = _tokens(message)
         query_counts = Counter(query_tokens)
+        raw_hints = runtime.get("recent_user_messages", ())
+        if isinstance(raw_hints, str):
+            raw_hints = (raw_hints,)
+        hint_counts = Counter(
+            _tokens(
+                " ".join(
+                    str(item)[:600]
+                    for item in raw_hints
+                    if str(item).strip()
+                )
+            )
+        )
+        raw_recent_tools = runtime.get("recent_tool_names", ())
+        if isinstance(raw_recent_tools, str):
+            raw_recent_tools = (raw_recent_tools,)
+        recent_tool_names = {
+            str(item).strip()
+            for item in raw_recent_tools
+            if str(item).strip()
+        }
         negated_counts = _negated_tokens(message)
         for token, count in negated_counts.items():
             remaining = query_counts.get(token, 0) - count
@@ -300,23 +351,29 @@ class CapabilityRetriever:
         )
         total_docs = len(documents)
         normalized_message = _normalize(message)
+        normalized_hints = _normalize(" ".join(str(item) for item in raw_hints))
         scores: dict[str, float] = {}
         for tool in visible:
             tokens = documents[tool.name]
             counts = Counter(tokens)
-            score = 0.0
-            for token, query_frequency in query_counts.items():
-                frequency = counts.get(token, 0)
-                if not frequency:
-                    continue
-                df = document_frequency[token]
-                idf = math.log(1.0 + (total_docs - df + 0.5) / (df + 0.5))
-                denominator = frequency + 1.5 * (
-                    1.0 - 0.75 + 0.75 * len(tokens) / max(1.0, average_length)
-                )
-                score += (
-                    idf * ((frequency * 2.5) / denominator) * min(2, query_frequency)
-                )
+            overlap_options = {
+                "document_length": len(tokens),
+                "document_frequency": document_frequency,
+                "total_documents": total_docs,
+                "average_length": average_length,
+            }
+            score = _bm25_overlap(
+                query_counts,
+                counts,
+                weight=1.0,
+                **overlap_options,
+            )
+            score += _bm25_overlap(
+                hint_counts,
+                counts,
+                weight=0.55,
+                **overlap_options,
+            )
             normalized_name = _normalize(tool.name)
             normalized_domain = _normalize(tool.domain)
             if normalized_name in normalized_message:
@@ -330,6 +387,13 @@ class CapabilityRetriever:
                     or normalized_message in normalized_example
                 ):
                     score += 5.0
+                elif normalized_example and normalized_hints and (
+                    normalized_example in normalized_hints
+                    or normalized_hints in normalized_example
+                ):
+                    score += 1.5
+            if tool.name in recent_tool_names or tool.model_name in recent_tool_names:
+                score += 8.0
             negative_overlap = 0.0
             negative_document = negative_documents[tool.name]
             for token, negative_frequency in negated_counts.items():

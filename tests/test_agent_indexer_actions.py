@@ -176,7 +176,14 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertEqual(result.data["items"][0]["result_id"], _RESULT_ID)
         self.assertEqual(result.data["items"][0]["position"], 1)
         self.assertEqual(service.search_calls[0][1], ["nyaa"])
+        self.assertEqual(len(result.references), 1)
+        self.assertEqual(result.references[0].kind, "resource_candidates")
+        self.assertEqual(
+            result.references[0].value["candidates"][0]["result_id"],
+            _RESULT_ID,
+        )
         serialized = str(result.to_dict())
+        self.assertNotIn("references", serialized)
         self.assertNotIn(_SECRET_MAGNET, serialized)
         self.assertNotIn(_SECRET_TORRENT_URL, serialized)
         self.assertNotIn(_SECRET_DETAIL_URL, serialized)

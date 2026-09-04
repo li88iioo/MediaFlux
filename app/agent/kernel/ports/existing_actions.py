@@ -76,6 +76,10 @@ _TOOL_RETRIEVAL_TERMS: dict[str, tuple[str, ...]] = {
     "provider.query": (
         "媒体总数",
         "媒体库统计",
+        "媒体资源总量",
+        "媒体库有多少资源",
+        "媒体库有多少媒体",
+        "电影剧集总数",
         "实时下载任务",
         "下载速度",
         "下载进度",
@@ -262,12 +266,18 @@ def adapt_tool_spec(spec: ToolSpec) -> KernelToolSpec:
         except Exception as exc:
             raise _safe_error(exc, fallback_code="precondition_failed") from exc
         checked = _assert_success(result, code="precondition_failed")
+        effect_metadata = (
+            dict(checked.effect_metadata)
+            if isinstance(checked.effect_metadata, dict)
+            else {}
+        )
         return PreparedEffect(
             preview=checked.to_dict(),
             snapshot_fingerprint=_bind_runtime_snapshot(
                 str(fingerprint or ""), context
             ),
             metadata={
+                **effect_metadata,
                 "source_kind": spec.source_kind,
                 "risk": spec.risk.value,
                 "confirmation": build_confirmation_contract(

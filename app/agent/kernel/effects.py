@@ -85,7 +85,14 @@ class EffectPlanStore(Protocol):
         plan_id: str,
     ) -> EffectPlan: ...
 
-    def cancel(self, *, owner: str, session_id: str, plan_id: str) -> bool: ...
+    def cancel(
+        self,
+        *,
+        owner: str,
+        session_id: str,
+        generation: int,
+        plan_id: str,
+    ) -> EffectPlan | None: ...
 
 
 class ConfirmationEffectPlanStore:
@@ -244,8 +251,36 @@ class ConfirmationEffectPlanStore:
             generation=generation,
         )
 
-    def cancel(self, *, owner: str, session_id: str, plan_id: str) -> bool:
-        return self.store.discard(
-            owner=self._scoped_owner(owner, session_id),
+    def cancel(
+        self,
+        *,
+        owner: str,
+        session_id: str,
+        generation: int,
+        plan_id: str,
+    ) -> EffectPlan | None:
+        scoped_owner = self._scoped_owner(owner, session_id)
+        ticket = next(
+            (
+                item
+                for item in self.store.list_active_tickets(owner=scoped_owner)
+                if secrets.compare_digest(item.confirmation_id, plan_id)
+            ),
+            None,
+        )
+        if ticket is None:
+            return None
+        try:
+            plan = self._restore_plan(
+                ticket,
+                owner=owner,
+                session_id=session_id,
+                generation=generation,
+            )
+        except EffectPlanError:
+            plan = None
+        discarded = self.store.discard(
+            owner=scoped_owner,
             confirmation_id=plan_id,
         )
+        return plan if discarded else None

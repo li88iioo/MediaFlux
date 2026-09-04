@@ -98,6 +98,72 @@ class AgentIngestArgumentTests(unittest.TestCase):
                 {"source_type": "direct_url", "target": "qb", "search_id": search_id}
             )
 
+    def test_resource_candidate_reference_is_private_coordinate_only(self):
+        reference = "ref_1234567890abcdefghijkl"
+        self.assertEqual(
+            ingest_submit_arguments(
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [1],
+                    "target": "guangya",
+                    "resource_candidates_ref": reference,
+                }
+            )["resource_candidates_ref"],
+            reference,
+        )
+        self.assertEqual(
+            ingest_inspect_arguments(
+                {
+                    "source_type": "resource_candidates",
+                    "resource_candidates_ref": reference,
+                }
+            )["resource_candidates_ref"],
+            reference,
+        )
+        with self.assertRaises(AgentToolError):
+            ingest_submit_arguments(
+                {
+                    "source_type": "resource_candidates",
+                    "positions": [1],
+                    "target": "guangya",
+                    "resource_candidates_ref": "latest",
+                }
+            )
+
+    def test_direct_and_share_submit_accept_only_typed_ingest_snapshot_reference(self):
+        reference = "ref_1234567890abcdefghijkl"
+        direct = ingest_submit_arguments(
+            {
+                "source_type": "direct_url",
+                "target": "qb",
+                "ingest_snapshot_ref": reference,
+            }
+        )
+        share = ingest_submit_arguments(
+            {
+                "source_type": "guangya_share",
+                "ingest_snapshot_ref": reference,
+            }
+        )
+        self.assertEqual(direct["ingest_snapshot_ref"], reference)
+        self.assertEqual(share["ingest_snapshot_ref"], reference)
+        with self.assertRaises(AgentToolError):
+            ingest_submit_arguments(
+                {
+                    "source_type": "direct_url",
+                    "target": "qb",
+                    "ingest_snapshot_ref": "latest",
+                }
+            )
+        with self.assertRaises(AgentToolError):
+            ingest_submit_arguments(
+                {
+                    "source_type": "direct_url",
+                    "target": "qb",
+                    "resource_candidates_ref": reference,
+                }
+            )
+
     def test_share_defaults_to_guangya_and_all_items(self):
         self.assertEqual(
             ingest_submit_arguments({"source_type": "guangya_share"}),
@@ -141,6 +207,66 @@ class AgentIngestActionTests(unittest.TestCase):
         self.assertNotIn("a" * 40, rendered)
         self.assertEqual(result.data["source_type"], "direct_url")
         self.assertIsNone(self.store.get(owner="owner-b"))
+
+    def test_ingest_memory_snapshots_are_isolated_by_conversation_session(self):
+        first_context = ToolContext(owner="owner-a", session_id="session-a")
+        second_context = ToolContext(owner="owner-a", session_id="session-b")
+        self.actions.inspect(
+            {"source_type": "direct_url", "input": _MAGNET}, first_context
+        )
+        self.actions.inspect(
+            {"source_type": "direct_url", "input": _MAGNET}, second_context
+        )
+
+        first = self.store.get(
+            owner="owner-a",
+            source_type="direct_url",
+            conversation_session_id="session-a",
+        )
+        second = self.store.get(
+            owner="owner-a",
+            source_type="direct_url",
+            conversation_session_id="session-b",
+        )
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first.session_id, second.session_id)
+
+    @patch(
+        "app.agent.ingest_actions.download_target_readiness",
+        return_value={"qb": True},
+    )
+    def test_direct_reference_rebuilds_preview_after_memory_store_restart(
+        self, _readiness
+    ):
+        context = ToolContext(owner="owner-a", session_id="session-a")
+        inspected = self.actions.inspect(
+            {"source_type": "direct_url", "input": _MAGNET}, context
+        )
+        reference_value = inspected.references[0].value
+        restarted = IngestActions(
+            store=AgentIngestSessionStore(),
+            recent_resource_store=RecentResourceCandidateStore(),
+        )
+        resolved_arguments = {
+            "source_type": "direct_url",
+            "target": "qb",
+            "positions": [],
+            "ingest_snapshot": reference_value,
+        }
+
+        preview, fingerprint = restarted.prepare_submit(resolved_arguments, context)
+
+        self.assertTrue(preview.ok)
+        self.assertTrue(fingerprint)
+        self.assertEqual(preview.data["source_type"], "direct_url")
+        self.assertIsNone(
+            restarted.store.get(
+                owner="owner-a",
+                source_type="direct_url",
+                conversation_session_id="session-a",
+            )
+        )
 
     def test_ordinary_web_page_is_not_ingested(self):
         with self.assertRaises(AgentToolError) as raised:
@@ -224,6 +350,63 @@ class AgentIngestActionTests(unittest.TestCase):
         self.assertEqual([item["position"] for item in result.data["items"]], [1, 2])
 
     @patch(
+        "app.agent.ingest_actions.download_target_readiness",
+        return_value={"guangya": True},
+    )
+    @patch(
+        "app.agent.ingest_actions.inspect_share_for_transfer",
+        return_value={
+            "preview_id": "preview-secret",
+            "share_id": "share-secret",
+            "files": [
+                {
+                    "id": "file-secret-1",
+                    "name": "Episode 1.mkv",
+                    "is_dir": False,
+                    "size": 10,
+                },
+                {
+                    "id": "file-secret-2",
+                    "name": "Episode 2.mkv",
+                    "is_dir": False,
+                    "size": 20,
+                },
+            ],
+            "selected_ids": ["file-secret-1", "file-secret-2"],
+            "target_id": "target-secret",
+            "target_name": "默认目录",
+            "expires_in": 900,
+        },
+    )
+    def test_share_reference_revalidates_after_memory_store_restart(
+        self, inspect_share, _readiness
+    ):
+        context = ToolContext(owner="owner-a", session_id="session-a")
+        inspected = self.actions.inspect(
+            {"source_type": "guangya_share", "input": _SHARE}, context
+        )
+        reference_value = inspected.references[0].value
+        restarted = IngestActions(
+            store=AgentIngestSessionStore(),
+            recent_resource_store=RecentResourceCandidateStore(),
+        )
+
+        preview, fingerprint = restarted.prepare_submit(
+            {
+                "source_type": "guangya_share",
+                "target": "guangya",
+                "positions": [1, 2],
+                "ingest_snapshot": reference_value,
+            },
+            context,
+        )
+
+        self.assertTrue(preview.ok)
+        self.assertTrue(fingerprint)
+        self.assertEqual(preview.data["count"], 2)
+        self.assertEqual(inspect_share.call_count, 2)
+
+    @patch(
         "app.agent.ingest_actions.inspect_share_for_transfer",
         return_value={
             "preview_id": "preview-secret",
@@ -277,6 +460,26 @@ class AgentIngestActionTests(unittest.TestCase):
         )
         buffer.discard()
 
+    def test_kernel_session_does_not_fall_back_to_another_sessions_latest_candidates(
+        self,
+    ):
+        self.resources.capture(
+            owner="owner-a", result=_resource_result("resource-other-001", "Other")
+        )
+        with self.assertRaises(AgentToolError) as raised:
+            self.actions.prepare_submit(
+                ingest_submit_arguments(
+                    {
+                        "source_type": "resource_candidates",
+                        "positions": [1],
+                        "target": "qb",
+                    }
+                ),
+                ToolContext(owner="owner-a", session_id="session-a"),
+            )
+        self.assertEqual(raised.exception.code, "precondition_failed")
+        self.assertIn("资源候选引用", raised.exception.safe_message)
+
     @patch("app.agent.indexer_candidate_actions.submit_resource_confirmed")
     @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
     def test_confirm_uses_frozen_snapshot_after_a_newer_search(
@@ -311,6 +514,42 @@ class AgentIngestActionTests(unittest.TestCase):
         )
         submit_resource.assert_called_once_with(
             {"result_id": "resource-first-001", "target": "qb"}, "resource-first-001:qb"
+        )
+
+    @patch("app.agent.indexer_candidate_actions.submit_resource_confirmed")
+    @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
+    def test_kernel_reference_snapshot_survives_preview_and_confirmation(
+        self, prepare_resource, submit_resource
+    ):
+        prepare_resource.side_effect = lambda arguments: (
+            ToolResult(True, "confirmation_required", "preview", data={"resource": {}}),
+            f"{arguments['result_id']}:{arguments['target']}",
+        )
+        submit_resource.side_effect = lambda arguments, _expected: ToolResult(
+            True, "accepted", "submitted", data={"result_id": arguments["result_id"]}
+        )
+        search_id = new_resource_search_id()
+        snapshot = safe_resource_snapshot(
+            _resource_result("resource-kernel-0001", "Kernel"),
+            search_id=search_id,
+        )
+        arguments = {
+            "source_type": "resource_candidates",
+            "positions": [1],
+            "target": "guangya",
+            "resource_candidates": snapshot,
+        }
+
+        preview, expected_context = self.actions.prepare_submit(arguments, self.context)
+        self.assertTrue(preview.ok)
+        self.assertEqual(arguments["search_id"], search_id)
+        self.assertIsNone(self.resources.get(owner="owner-a"))
+
+        result = self.actions.execute_submit(arguments, expected_context, self.context)
+        self.assertTrue(result.ok)
+        submit_resource.assert_called_once_with(
+            {"result_id": "resource-kernel-0001", "target": "guangya"},
+            "resource-kernel-0001:guangya",
         )
 
     @patch("app.agent.indexer_candidate_actions.submit_resource_confirmed")

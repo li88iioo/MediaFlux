@@ -171,26 +171,61 @@ def _rich_html(rendered: str) -> str:
 
     paragraphs: list[str] = []
     lines: list[str] = []
+    block_lines: list[str] = []
+    block_close = ""
+
+    def is_standalone_block(value: str) -> bool:
+        stripped = value.strip()
+        return (
+            stripped.startswith("<blockquote")
+            and stripped.endswith("</blockquote>")
+        ) or (stripped.startswith("<pre") and stripped.endswith("</pre>"))
 
     def flush_lines() -> None:
         if not lines:
             return
         paragraph = "<br>".join(lines)
         paragraphs.append(
-            paragraph
-            if len(lines) == 1
-            and paragraph.startswith("<blockquote")
-            and paragraph.endswith("</blockquote>")
+            paragraph if len(lines) == 1 and is_standalone_block(paragraph)
             else f"<p>{paragraph}</p>"
         )
         lines.clear()
 
+    def flush_block() -> None:
+        nonlocal block_close
+        if not block_lines:
+            return
+        block = "\n".join(block_lines)
+        if block_close == "</blockquote>":
+            # Rich Message 按 HTML 规则折叠普通换行；引用块内部显式保留分行。
+            block = block.replace("\n", "<br>")
+        paragraphs.append(block)
+        block_lines.clear()
+        block_close = ""
+
     normalized = str(rendered).replace("\r\n", "\n").replace("\r", "\n")
     for line in normalized.split("\n"):
-        if line.strip():
+        stripped = line.strip()
+        if block_close:
+            block_lines.append(line)
+            if block_close in stripped:
+                flush_block()
+            continue
+        if stripped.startswith(("<blockquote", "<pre")):
+            close = "</blockquote>" if stripped.startswith("<blockquote") else "</pre>"
+            if close in stripped:
+                flush_lines()
+                paragraphs.append(line)
+            else:
+                flush_lines()
+                block_close = close
+                block_lines.append(line)
+            continue
+        if stripped:
             lines.append(line)
             continue
         flush_lines()
+    flush_block()
     flush_lines()
     # Rich Message 的相邻块只会换行，不会保留源文本中的空白行。
     # 在段落之间补一个显式 <br>，使标题、正文和引用块保持一行呼吸空间。
@@ -373,6 +408,22 @@ class TelegramProgress:
             send_typing(
                 self.bot, self.chat_id, message_thread_id=self.message_thread_id
             )
+
+    def _rich_reply_parameters(self) -> Any | None:
+        source_id = getattr(self.source_message, "message_id", None)
+        if source_id is None:
+            return None
+        types = getattr(self.telebot, "types", None)
+        reply_parameters = getattr(types, "ReplyParameters", None)
+        if not callable(reply_parameters):
+            return None
+        try:
+            return reply_parameters(
+                message_id=int(source_id),
+                allow_sending_without_reply=True,
+            )
+        except (TypeError, ValueError):
+            return None
 
     def _send_real(self, rendered: str, *, reply_markup: Any = None) -> Any:
         kwargs: dict[str, Any] = {
@@ -613,6 +664,9 @@ class TelegramProgress:
                         kwargs["reply_markup"] = reply_markup
                     if self.message_thread_id is not None:
                         kwargs["message_thread_id"] = self.message_thread_id
+                    reply_parameters = self._rich_reply_parameters()
+                    if reply_parameters is not None:
+                        kwargs["reply_parameters"] = reply_parameters
                     result, _value = call_telegram_delivery(
                         lambda: sender(self.chat_id, rich, **kwargs)
                     )

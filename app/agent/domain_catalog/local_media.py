@@ -2,38 +2,46 @@
 
 from __future__ import annotations
 
-from .support import (
-    LOCAL_TASK_STATUSES,
-    RiskLevel,
-    ToolSpec,
+from app.agent.local_media_actions import (
     diagnose_local_media,
-    get_local_media_source_summary,
-    inspect_local_media_task,
-    list_local_media_source_summaries,
-    list_local_media_task_summaries,
     local_media_diagnosis_arguments,
     local_media_history_arguments,
-    local_media_inspection_arguments,
     local_media_review_queue_arguments,
+    summarize_local_media_history,
+    summarize_local_media_review_queue,
+)
+from app.agent.local_media_scan_actions import (
     local_media_scan_arguments,
+    prepare_scan_local_media_sources,
+    scan_local_media_sources_confirmed,
+)
+from app.agent.local_media_source_actions import (
+    get_local_media_source_summary,
+    list_local_media_source_summaries,
     local_media_source_summaries_arguments,
     local_media_source_summary_arguments,
     local_media_source_trigger_arguments,
+    prepare_set_local_media_source_trigger_enabled,
+    set_local_media_source_trigger_enabled_confirmed,
+)
+from app.agent.local_media_task_actions import (
+    inspect_local_media_task,
+    list_local_media_task_summaries,
+    local_media_inspection_arguments,
     local_media_task_number_arguments,
     local_media_task_summaries_arguments,
     prepare_refresh_local_media_task_library,
     prepare_retry_local_media_task,
-    prepare_scan_local_media_sources,
-    prepare_set_local_media_source_trigger_enabled,
     preview_local_media_task,
     refresh_local_media_task_library_confirmed,
     retry_local_media_task_confirmed,
-    scan_local_media_sources_confirmed,
-    set_local_media_source_trigger_enabled_confirmed,
-    summarize_local_media_history,
-    summarize_local_media_review_queue,
     verify_local_media_task_library_visibility,
 )
+from app.agent.models import (
+    RiskLevel,
+    ToolSpec,
+)
+from app.modules.local_media_models import LOCAL_TASK_STATUSES
 
 
 def register_specs(

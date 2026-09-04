@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from contextlib import contextmanager
 import errno
 import json
 import re
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -17,7 +17,7 @@ from app import config
 from app.agent.feature_gate import is_agent_enabled
 from app.main import create_app
 from app.routes import strm_api
-from app.routes.api import get_config, save_config
+from app.routes.api import _validate_agent_llm_updates, get_config, save_config
 from app.web import relative_url_for
 
 
@@ -140,7 +140,14 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn("AI 线索可信门槛", metadata_panel)
         self.assertNotIn('data-key="TMDB_PREVIEW_CONFIRM"', metadata_panel)
         self.assertNotIn("TMDB_PREVIEW_CONFIRM:'1'", html)
-        for key in ("AGENT_LLM_API_URL", "AGENT_LLM_API_KEY", "AGENT_LLM_MODEL", "WEB_SEARCH_ENABLED", "TAVILY_API_KEY"):
+        for key in (
+            "AGENT_LLM_API_URL",
+            "AGENT_LLM_API_KEY",
+            "AGENT_LLM_MODEL",
+            "AGENT_LLM_CONTEXT_WINDOW_TOKENS",
+            "WEB_SEARCH_ENABLED",
+            "TAVILY_API_KEY",
+        ):
             self.assertIn(f'data-key="{key}"', agent_panel)
             self.assertNotIn(f'data-key="{key}"', telegram_panel)
             self.assertNotIn(f'data-key="{key}"', discovery_panel)
@@ -159,6 +166,11 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn('id="testTelegramBtn"', telegram_card)
         self.assertNotIn('id="testTelegramBtn"', telegram_savebar)
         self.assertIn('id="testAgentModelBtn"', agent_panel)
+        self.assertIn("模型运行", agent_panel)
+        self.assertIn("统一 Agent Kernel", agent_panel)
+        self.assertIn('min="16384" max="2000000"', agent_panel)
+        self.assertNotIn("AGENT_LLM_REQUESTS_PER_MINUTE", agent_panel)
+        self.assertNotIn("每用户速率", agent_panel)
         self.assertIn('aria-describedby="agentModelState"', agent_panel)
         self.assertIn('id="agentModelCapabilities"', agent_panel)
         self.assertIn('data-capability="tool_calling"', agent_panel)
@@ -301,7 +313,9 @@ class AgentSettingsUiTests(unittest.TestCase):
             "app.bot.handlers.request_command_menu_refresh"
         ) as refresh_menu, patch(
             "app.agent.feature_gate.invalidate_agent_runtime_generation"
-        ) as invalidate:
+        ) as invalidate, patch(
+            "app.agent.kernel.bootstrap.invalidate_agent_kernel_runtime"
+        ) as invalidate_kernel:
             unchanged = save_config(self._request(), {"AGENT_ENABLED": "1"})
             changed = save_config(
                 self._request(),
@@ -315,6 +329,20 @@ class AgentSettingsUiTests(unittest.TestCase):
         reconcile.assert_not_called()
         refresh_menu.assert_not_called()
         invalidate.assert_called_once_with()
+        invalidate_kernel.assert_called_once_with()
+
+    def test_agent_llm_context_window_validation(self):
+        self.assertEqual(
+            _validate_agent_llm_updates(
+                {"AGENT_LLM_CONTEXT_WINDOW_TOKENS": "262144"}
+            ),
+            {"AGENT_LLM_CONTEXT_WINDOW_TOKENS": "262144"},
+        )
+        for value in ("16383", "2000001", "not-a-number"):
+            with self.assertRaises(ValueError):
+                _validate_agent_llm_updates(
+                    {"AGENT_LLM_CONTEXT_WINDOW_TOKENS": value}
+                )
 
     def test_agent_feature_gate_hot_toggle_queues_runtime_without_bot_restart(self):
         request = self._request()
@@ -936,7 +964,10 @@ class AgentSettingsUiTests(unittest.TestCase):
         )
         self.assertIn("width: 42px", agent_css)
         self.assertIn("height: 42px", agent_css)
-        self.assertIn(".agent-timeout-field > .agent-input-unit { width: min(100%, 190px); }", agent_css)
+        self.assertIn(
+            ".agent-context-field > .agent-input-unit { width: 100%; }",
+            agent_css,
+        )
         self.assertIn("justify-content: end", agent_css)
 
     def test_settings_save_waits_for_config_before_enabling_actions(self):

@@ -28,6 +28,8 @@ from app.agent.kernel.bootstrap import get_agent_kernel_runtime
 from app.agent.kernel.events import AgentEvent, AgentEventType
 from app.agent.kernel.transports import EffectEnvelope, QueryEnvelope
 from app.agent.rate_limit import agent_rate_limiter
+from app.bot.progress import TelegramProgress, send_typing
+from app.bot.telegram_markdown import render_telegram_markdown
 from app.modules.telegram_write_confirmations import (
     TelegramWriteConfirmationError,
     get_telegram_write_confirmation_store,
@@ -231,69 +233,164 @@ def _turn_text(view: TurnView) -> str:
     return _safe_text(view.answer or "任务已结束。")
 
 
-class _TelegramEventObserver:
+class _ExistingMessageProgress:
+    """让确认回调复用事件观察器，同时只更新原确认消息。"""
+
+    mode = "edit"
+
     def __init__(self, bot: Any, target: Any) -> None:
         self.bot = bot
         self.target = target
-        self.last_update = 0.0
-        self.last_text = ""
 
-    async def __call__(self, event: AgentEvent) -> None:
-        text = ""
-        if event.type is AgentEventType.CAPABILITIES_SELECTED:
-            text = "正在理解任务…"
-        elif event.type is AgentEventType.MODEL_STARTED:
-            text = "正在规划下一步…"
-        elif event.type is AgentEventType.TOOL_STARTED:
-            text = _tool_progress(event.payload.get("tool")) + "…"
-        elif event.type is AgentEventType.TOOL_FAILED:
-            text = "当前方法不可用，正在调整方案…"
-        elif event.type is AgentEventType.EFFECT_PREVIEW_STARTED:
-            text = "正在生成安全变更预览…"
-        if not text or text == self.last_text:
-            return
-        now = time.monotonic()
-        if now - self.last_update < 0.65:
-            return
-        self.last_update = now
-        self.last_text = text
-        await asyncio.to_thread(self._edit, text)
-
-    def _edit(self, text: str) -> None:
-        with suppress(Exception):
+    def update(self, rendered: str) -> bool:
+        try:
             self.bot.edit_message_text(
-                text,
+                rendered,
                 self.target.chat.id,
                 self.target.message_id,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=None,
             )
+            return True
+        except Exception:  # noqa: BLE001 - 进度展示失败不应中断真实执行
+            return False
 
 
-def _reply_progress(bot: Any, source: Any) -> Any:
-    kwargs = _thread_kwargs(source)
+class _TelegramEventObserver:
+    """把 Kernel 真实事件流投影到一个 TelegramProgress，不另建状态机。"""
+
+    def __init__(self, progress: Any) -> None:
+        self.progress = progress
+        self.last_status_at = 0.0
+        self.last_status = ""
+        self.last_stream_at = 0.0
+        self.last_stream = ""
+        self.model_text = ""
+        self.model_round: int | None = None
+        self.active_tool = ""
+
+    async def __call__(self, event: AgentEvent) -> None:
+        if event.type is AgentEventType.MODEL_STARTED:
+            self.model_round = _positive_int(event.payload.get("round"))
+            self.model_text = ""
+            self.last_stream = ""
+            await self._publish_status("正在规划下一步…")
+            return
+
+        if event.type is AgentEventType.MODEL_DELTA:
+            event_round = _positive_int(event.payload.get("round"))
+            if event_round is not None and event_round != self.model_round:
+                self.model_round = event_round
+                self.model_text = ""
+                self.last_stream = ""
+            delta = str(event.payload.get("delta") or "")
+            if not delta:
+                return
+            first_delta = not self.model_text
+            self.model_text += delta
+            await self._publish_stream(force=first_delta)
+            return
+
+        text = ""
+        force = False
+        if event.type is AgentEventType.CAPABILITIES_SELECTED:
+            text = "正在理解任务…"
+        elif event.type is AgentEventType.MODEL_TOOL_CALL:
+            self.model_text = ""
+            self.last_stream = ""
+            self.active_tool = str(event.payload.get("tool") or "")
+            text = _tool_progress(self.active_tool) + "…"
+            force = True
+        elif event.type is AgentEventType.TOOL_STARTED:
+            self.active_tool = str(event.payload.get("tool") or self.active_tool)
+            text = _tool_progress(self.active_tool) + "…"
+        elif event.type is AgentEventType.TOOL_PROGRESS:
+            text = _tool_progress(event.payload.get("tool") or self.active_tool) + "…"
+        elif event.type is AgentEventType.TOOL_COMPLETED:
+            text = "正在整理查询结果…"
+        elif event.type is AgentEventType.TOOL_FAILED:
+            text = "当前方法不可用，正在调整方案…"
+            force = True
+        elif event.type is AgentEventType.EFFECT_PREVIEW_STARTED:
+            text = "正在生成安全变更预览…"
+            force = True
+        elif event.type is AgentEventType.EFFECT_COMPLETED:
+            text = "正在校验执行结果…"
+        elif event.type is AgentEventType.EFFECT_FAILED:
+            text = "执行未完成，正在整理结果…"
+        if text:
+            await self._publish_status(text, force=force)
+
+    async def _publish_status(self, text: str, *, force: bool = False) -> None:
+        if text == self.last_status:
+            return
+        now = time.monotonic()
+        if not force and now - self.last_status_at < 0.65:
+            return
+        self.last_status_at = now
+        self.last_status = text
+        rendered = f"<b>Media Agent</b>\n{html.escape(text)}"
+        await asyncio.to_thread(self.progress.update, rendered)
+
+    async def _publish_stream(self, *, force: bool = False) -> None:
+        source = _safe_text(self.model_text, limit=3600)
+        if not source:
+            return
+        rendered = render_telegram_markdown(source)
+        if not rendered or rendered == self.last_stream:
+            return
+        now = time.monotonic()
+        mode = str(getattr(self.progress, "mode", "") or "")
+        interval = 0.2 if mode in {"draft", "rich_draft"} else 0.85
+        if not force and now - self.last_stream_at < interval:
+            return
+        self.last_stream_at = now
+        self.last_stream = rendered
+        await asyncio.to_thread(
+            self.progress.update,
+            rendered + "\n\n<i>正在输出…</i>",
+        )
+
+
+def _positive_int(value: object) -> int | None:
     try:
-        return bot.reply_to(source, "正在理解任务…", **kwargs)
-    except TypeError:
-        return bot.reply_to(source, "正在理解任务…")
+        normalized = int(value or 0)
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
 
 
-def _edit_final(bot: Any, target: Any, text: str, *, reply_markup: Any = None) -> None:
-    kwargs: dict[str, Any] = {"reply_markup": reply_markup}
-    if "<b>" in text:
-        kwargs["parse_mode"] = "HTML"
+def _edit_final(
+    bot: Any,
+    target: Any,
+    text: str,
+    *,
+    reply_markup: Any = None,
+    rendered_html: bool = False,
+) -> None:
+    body = str(text) if rendered_html else html.escape(_safe_text(text))
+    kwargs: dict[str, Any] = {
+        "reply_markup": reply_markup,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
         bot.edit_message_text(
-            _safe_text(text),
+            body,
             target.chat.id,
             target.message_id,
             **kwargs,
         )
     except Exception:  # noqa: BLE001 - Telegram transport fallback
         send_kwargs = _thread_kwargs(target)
-        if kwargs.get("parse_mode"):
-            send_kwargs["parse_mode"] = kwargs["parse_mode"]
+        send_kwargs.update(
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
         if reply_markup is not None:
             send_kwargs["reply_markup"] = reply_markup
-        bot.send_message(target.chat.id, _safe_text(text), **send_kwargs)
+        bot.send_message(target.chat.id, body, **send_kwargs)
 
 
 def _approval_markup(telebot_module: Any, approval: ApprovalView) -> Any:
@@ -346,8 +443,15 @@ def _execute_query(
     ):
         raise RuntimeError("该消息已经处理，请勿重复发送。")
 
-    progress = _reply_progress(bot, source)
-    observer = _TelegramEventObserver(bot, progress)
+    progress = TelegramProgress(
+        bot,
+        telebot_module,
+        chat_id,
+        "Media Agent",
+        source_message=source,
+        timeout_seconds=300,
+    ).begin("<b>Media Agent</b>\n正在理解任务…")
+    observer = _TelegramEventObserver(progress)
     try:
         view = _run_async(
             get_agent_kernel_runtime().telegram.query(
@@ -364,18 +468,16 @@ def _execute_query(
         )
         if view.approval is not None:
             body = "\n".join(_preview_lines(view.approval))
-            _edit_final(
-                bot,
-                progress,
+            progress.finish(
                 body,
                 reply_markup=_approval_markup(telebot_module, view.approval),
             )
         else:
-            _edit_final(bot, progress, _turn_text(view))
+            progress.finish(render_telegram_markdown(_turn_text(view)))
         return view
     except Exception:
         with suppress(Exception):
-            _edit_final(bot, progress, "Agent 暂时无法完成该请求，请稍后重试。")
+            progress.finish("Agent 暂时无法完成该请求，请稍后重试。")
         raise
 
 
@@ -461,7 +563,12 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         return
 
     bot.answer_callback_query(call.id, "正在执行")
-    observer = _TelegramEventObserver(bot, call.message)
+    send_typing(
+        bot,
+        call.message.chat.id,
+        message_thread_id=getattr(call.message, "message_thread_id", None),
+    )
+    observer = _TelegramEventObserver(_ExistingMessageProgress(bot, call.message))
     try:
         view = _run_async(
             get_agent_kernel_runtime().telegram.confirm(
@@ -469,7 +576,12 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 observe=observer,
             )
         )
-        _edit_final(bot, call.message, _turn_text(view))
+        _edit_final(
+            bot,
+            call.message,
+            render_telegram_markdown(_turn_text(view)),
+            rendered_html=True,
+        )
     except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
         logger.warning("Telegram Agent 确认执行失败 type=%s", type(exc).__name__)
         _edit_final(bot, call.message, "确认执行失败；操作可能未开始，请重新查询状态。")
@@ -667,6 +779,7 @@ def handle_agent_control_action(
             if action_name == "enable_all"
             else "<b>确认关闭 Media Agent</b>\n将停止 Agent 入口与后台任务；传统 Telegram 功能不受影响。",
             reply_markup=markup,
+            rendered_html=True,
         )
         bot.answer_callback_query(call.id, "请再次确认")
         return
