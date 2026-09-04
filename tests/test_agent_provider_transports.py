@@ -37,6 +37,9 @@ class _FakeMediaClient:
     def _user_id(self):
         return "viewer-1"
 
+    def media_web_url(self, item_id):
+        return f"http://hidden/web/index.html#!/details?id={item_id}"
+
     def get_media_counts(self):
         return {
             "total_items": 166,
@@ -67,7 +70,15 @@ class _FakeMediaClient:
     def search_media(self, query, limit=12):
         assert query == "暗芝居"
         assert limit == 5
-        return [MediaItem(id="item-1", name="暗芝居", type="Series", year="2013")]
+        return [
+            MediaItem(
+                id="item-1",
+                name="暗芝居",
+                type="Series",
+                year="2013",
+                web_url=self.media_web_url("item-1"),
+            )
+        ]
 
     def recent_media(self, limit=8):
         assert limit == 4
@@ -78,6 +89,7 @@ class _FakeMediaClient:
                 type="Movie",
                 year="2026",
                 genres=("科幻",),
+                web_url=self.media_web_url("recent-1"),
             )
         ]
 
@@ -95,6 +107,7 @@ class _FakeMediaClient:
                 last_played="2026-09-03T10:00:00+08:00",
                 progress=100,
                 genres=("动画", "奇幻"),
+                web_url=self.media_web_url("played-1"),
             ),
             MediaItem(
                 id="played-2",
@@ -102,6 +115,7 @@ class _FakeMediaClient:
                 type="Movie",
                 last_played="2026-09-02T20:00:00+08:00",
                 genres=("科幻",),
+                web_url=self.media_web_url("played-2"),
             ),
         ]
 
@@ -144,6 +158,7 @@ class _FakeMediaClient:
                 season_number=1,
                 episode_number=4,
                 progress=42.5,
+                web_url=self.media_web_url("resume-1"),
             )
         ]
 
@@ -250,16 +265,19 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
         "configured:jellyfin", "media.items.search", {"query": "暗芝居", "limit": 5}
     )
     assert search.data["items"][0]["name"] == "暗芝居"
+    assert search.data["items"][0]["open_url"].endswith("id=item-1")
 
     recent = transport.execute_read(
         "configured:jellyfin", "media.items.recent_added", {"limit": 4}
     )
     assert recent.data["items"][0]["genres"] == ["科幻"]
+    assert recent.data["items"][0]["open_url"].endswith("id=recent-1")
 
     played = transport.execute_read(
         "configured:jellyfin", "media.items.recent_played", {"limit": 6}
     )
     assert played.data["history_kind"] == "最近播放"
+    assert played.data["items"][0]["open_url"].endswith("id=played-1")
     assert played.data["preference_signals"] == {
         "recent_titles": ["示例动画", "示例电影"],
         "top_genres": ["动画", "奇幻", "科幻"],
@@ -282,17 +300,22 @@ def test_media_transport_reuses_profile_and_projects_native_reads(monkeypatch):
     assert recommendations.data["items"][0]["name"] == "男子高中生的日常"
     assert recommendations.data["history"]["records_used"] == 2
     assert recommendations.data["items"][0]["__object_kind"] == "media_item"
+    assert recommendations.data["items"][0]["open_url"].endswith(
+        "id=recommend-1"
+    )
 
     resume = transport.execute_read(
         "configured:jellyfin", "media.items.continue_watching", {"limit": 3}
     )
     assert resume.data["history_kind"] == "继续观看"
     assert resume.data["items"][0]["progress_percent"] == 42.5
+    assert resume.data["items"][0]["open_url"].endswith("id=resume-1")
 
     series = transport.execute_read(
         "configured:jellyfin", "media.series.search", {"query": "暗芝居", "limit": 6}
     )
     assert series.data["series"][0]["__object_kind"] == "media_series"
+    assert series.data["series"][0]["open_url"].endswith("id=series-1")
 
     episodes = transport.execute_read(
         "configured:jellyfin",
@@ -828,7 +851,9 @@ def test_provider_projection_preserves_dotted_name_without_relaxing_other_fields
             "description": internal_text,
             "path": "/secret/Example.Show.S01E01.1080p.mkv",
             "nested": {"name": "Another.Show.S02E03.mkv", "note": internal_text},
-        }
+            "open_url": "http://media.local/web/index.html#!/details?id=item-1",
+        },
+        allow_open_url=True,
     )
 
     assert projected["name"] == dotted_name
@@ -836,4 +861,12 @@ def test_provider_projection_preserves_dotted_name_without_relaxing_other_fields
     assert "path" not in projected
     assert projected["nested"]["name"] == "Another.Show.S02E03.mkv"
     assert projected["nested"]["note"] != internal_text
+    assert projected["open_url"].endswith("id=item-1")
+    assert "open_url" not in project_provider_value(
+        {"open_url": "http://media.local/web/index.html#!/details?id=item-1"}
+    )
+    assert "open_url" not in project_provider_value(
+        {"open_url": "http://media.local/web?api_key=secret"},
+        allow_open_url=True,
+    )
     assert project_provider_value({"name": "/secret/Hidden.Show.mkv"})["name"] == ""

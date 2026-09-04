@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import re
 from collections import Counter
+from collections.abc import Callable
 from typing import Any
 
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.media_links import media_open_url_resolver
 from app.agent.provider_models import (
     ProviderGatewayError,
     ProviderPayload,
@@ -89,8 +91,11 @@ class MediaServerProviderTransport:
         )
 
     @staticmethod
-    def _media_item(item: MediaItem) -> dict[str, Any]:
-        return {
+    def _media_item(
+        resolve_link: Callable[[object], str],
+        item: MediaItem,
+    ) -> dict[str, Any]:
+        result = {
             "__object_id": str(item.id or ""),
             "__object_kind": "media_item",
             "name": str(item.name or ""),
@@ -106,6 +111,10 @@ class MediaServerProviderTransport:
             "progress_percent": float(item.progress or 0),
             "genres": [str(value) for value in item.genres[:12] if str(value).strip()],
         }
+        open_url = resolve_link(item.web_url or item.series_web_url)
+        if open_url:
+            result["open_url"] = open_url
+        return result
 
     @staticmethod
     def _preference_signals(items: list[MediaItem]) -> dict[str, Any]:
@@ -158,6 +167,17 @@ class MediaServerProviderTransport:
             )
         try:
             with self._client(profile) as client:
+                link_resolver: Callable[[object], str] | None = None
+
+                def resolve_link(item_url: object) -> str:
+                    nonlocal link_resolver
+                    if link_resolver is None:
+                        link_resolver = media_open_url_resolver(
+                            server_type=profile.server_type,
+                            server_url=profile.url,
+                        )
+                    return link_resolver(item_url)
+
                 if operation == "media.system.info":
                     name, product, version = client.server_identity()
                     return ProviderPayload(
@@ -198,7 +218,7 @@ class MediaServerProviderTransport:
                         data={
                             "server_label": profile.label,
                             "count": len(items),
-                            "items": [self._media_item(item) for item in items],
+                            "items": [self._media_item(resolve_link, item) for item in items],
                         },
                         source=f"{profile.server_type}_api",
                     )
@@ -214,7 +234,7 @@ class MediaServerProviderTransport:
                             "user_selection": user_selection,
                             "history_kind": "最近播放",
                             "count": len(items),
-                            "items": [self._media_item(item) for item in items],
+                            "items": [self._media_item(resolve_link, item) for item in items],
                             "preference_signals": self._preference_signals(items),
                         },
                         source=f"{profile.server_type}_api",
@@ -239,6 +259,13 @@ class MediaServerProviderTransport:
                         exclude_played=bool(arguments.get("exclude_played", True)),
                         limit=int(arguments.get("limit", 8)),
                     )
+                    for item in ranked.get("items", []):
+                        if not isinstance(item, dict):
+                            continue
+                        item_id = str(item.get("__object_id") or "").strip()
+                        open_url = resolve_link(client.media_web_url(item_id))
+                        if open_url:
+                            item["open_url"] = open_url
                     ranked.update(
                         {
                             "server_label": profile.label,
@@ -289,7 +316,7 @@ class MediaServerProviderTransport:
                             "user_selection": user_selection,
                             "history_kind": "继续观看",
                             "count": len(items),
-                            "items": [self._media_item(item) for item in items],
+                            "items": [self._media_item(resolve_link, item) for item in items],
                         },
                         source=f"{profile.server_type}_api",
                     )
@@ -341,7 +368,7 @@ class MediaServerProviderTransport:
                     return ProviderPayload(
                         summary=f"{profile.label} 搜索到 {len(items)} 个媒体条目",
                         data={
-                            "items": [self._media_item(item) for item in items],
+                            "items": [self._media_item(resolve_link, item) for item in items],
                             "count": len(items),
                         },
                         source=f"{profile.server_type}_api",
@@ -350,16 +377,19 @@ class MediaServerProviderTransport:
                     result = client.search_series_candidates(
                         str(arguments["query"]), limit=int(arguments.get("limit", 6))
                     )
-                    candidates = [
-                        {
+                    candidates = []
+                    for candidate in result.candidates:
+                        item = {
                             "__object_id": candidate.id,
                             "__object_kind": "media_series",
                             "name": candidate.name,
                             "year": candidate.year,
                             "tmdb_id": candidate.tmdb_id,
                         }
-                        for candidate in result.candidates
-                    ]
+                        open_url = resolve_link(client.media_web_url(candidate.id))
+                        if open_url:
+                            item["open_url"] = open_url
+                        candidates.append(item)
                     return ProviderPayload(
                         summary=f"{profile.label} 搜索到 {len(candidates)} 个剧集候选",
                         data={

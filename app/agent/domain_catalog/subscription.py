@@ -524,7 +524,7 @@ def register_specs(
             description=(
                 "读取媒体服务器用户的真实最近播放历史（播放事件/DatePlayed）；优先使用"
                 "明确配置的用户，未配置时沿用服务器默认用户选择。不是继续观看 Resume 列表，"
-                "可作为个性化片单推荐的事实依据。"
+                "可作为个性化片单推荐的事实依据，并在可用时返回已校验的 open_url。"
             ),
             risk=RiskLevel.READ,
             parameters={
@@ -548,7 +548,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="media.recently_added",
-            description="读取 Jellyfin 或 Emby 最近入库的内容；连续单集会按作品去重，避免刷屏。",
+            description="读取 Jellyfin 或 Emby 最近入库的内容；连续单集会按作品去重，并在可用时返回已校验的 open_url。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -566,7 +566,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="media.continue_watching",
-            description="读取媒体服务器用户的继续观看列表；优先使用明确配置用户，未配置时沿用服务器默认用户选择，不返回用户 ID、媒体内部 ID、URL、路径或凭据。",
+            description="读取媒体服务器用户的继续观看列表；优先使用明确配置用户，未配置时沿用服务器默认用户选择；不返回用户 ID、路径或凭据，但会在可用时返回已校验的 open_url。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",

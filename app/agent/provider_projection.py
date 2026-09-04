@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
+from app.agent.media_links import sanitize_media_open_url
 from app.agent.public_safety import (
     sanitize_public_text,
     sanitize_untrusted_filename,
@@ -51,6 +52,7 @@ def project_provider_value(
     depth: int = 0,
     max_depth: int = 4,
     max_items: int = 32,
+    allow_open_url: bool = False,
 ) -> Any:
     if depth > max_depth:
         return None
@@ -65,7 +67,11 @@ def project_provider_value(
     if isinstance(value, (list, tuple)):
         return [
             project_provider_value(
-                item, depth=depth + 1, max_depth=max_depth, max_items=max_items
+                item,
+                depth=depth + 1,
+                max_depth=max_depth,
+                max_items=max_items,
+                allow_open_url=allow_open_url,
             )
             for item in list(value)[:max_items]
         ]
@@ -73,9 +79,15 @@ def project_provider_value(
         projected: dict[str, Any] = {}
         for raw_key, raw_value in list(value.items())[:max_items]:
             key = _safe_key(raw_key)
-            if not key or key.casefold() in _SENSITIVE_KEYS:
+            normalized_key = key.casefold()
+            if not key or normalized_key in _SENSITIVE_KEYS:
                 continue
-            if key.casefold() == "name" and isinstance(raw_value, str):
+            if normalized_key == "open_url":
+                if allow_open_url:
+                    open_url = sanitize_media_open_url(raw_value)
+                    if open_url:
+                        projected[key] = open_url
+            elif normalized_key == "name" and isinstance(raw_value, str):
                 projected[key] = _project_filename(raw_value)
             else:
                 projected[key] = project_provider_value(
@@ -83,6 +95,7 @@ def project_provider_value(
                     depth=depth + 1,
                     max_depth=max_depth,
                     max_items=max_items,
+                    allow_open_url=allow_open_url,
                 )
         return projected
     return sanitize_public_text(value, limit=160)

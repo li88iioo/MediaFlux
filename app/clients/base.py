@@ -439,6 +439,13 @@ class MediaServerClient:
         """公开只读系统身份；供受控 Provider transport 复用现有适配。"""
         return self._server_identity()
 
+    def media_web_url(self, item_id: str) -> str:
+        """返回媒体服务器自身的条目页面，不附加任何访问凭据。"""
+        return self._web_url(str(item_id or "").strip())
+
+    def _web_url(self, item_id: str) -> str:
+        raise NotImplementedError
+
     def _libraries(self) -> list[Library]:
         raise NotImplementedError
 

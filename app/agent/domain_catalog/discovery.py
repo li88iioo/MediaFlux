@@ -450,6 +450,7 @@ def register_specs(
                 "默认排除已播放或已开始的作品。适合‘今晚看什么’、情绪/题材偏好和"
                 "‘从我的库里推荐’；不是互联网新片榜单。must_match 中每一项都必须命中，"
                 "同一概念的同义词必须放在同一项并用 | 连接；prefer 只用于排序。"
+                "结果在可用时会返回已校验的 open_url，可直接作为媒体库打开链接。"
             ),
             risk=RiskLevel.READ,
             domains=("discovery", "media_library", "playback"),

@@ -125,6 +125,10 @@ class EmbyClient(MediaServerClient):
         except Exception as exc:
             logger.debug(f"[兼容节点] 产品识别失败，使用 Emby 页面路由: {exc}")
 
+    def media_web_url(self, item_id: str) -> str:
+        self._prime_product_identity()
+        return super().media_web_url(item_id)
+
     def recent_media(self, limit: int = 60) -> list[MediaItem]:
         self._prime_product_identity()
         return super().recent_media(limit)

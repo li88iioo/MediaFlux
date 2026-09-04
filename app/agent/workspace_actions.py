@@ -10,6 +10,7 @@ from typing import Any
 
 from app import database as db
 from app.agent.errors import AgentToolError
+from app.agent.media_links import media_open_url_resolver
 from app.agent.models import Evidence, ToolResult
 from app.logger import get_logger
 from app.services import search_media_servers
@@ -190,30 +191,36 @@ def _library_section(query: str) -> tuple[dict[str, Any], bool]:
             continue
         available += 1
         server_type = str(source.get("server_type") or "").casefold()
+        resolve_link = media_open_url_resolver(
+            server_type=server_type,
+            server_url=source.get("web_url"),
+        )
         if server_type not in {"jellyfin", "emby"}:
             server_type = "media_server"
         for item in source.get("items", []):
             if len(items) >= _RESULT_LIMIT:
                 break
-            items.append(
-                {
-                    "title": _safe_title(item.name or item.display_name, "媒体条目"),
-                    "media_type": _safe_status(
-                        item.type, {"movie", "series", "episode", "season", "video"}
-                    ),
-                    "year": _safe_year(item.year),
-                    "series_name": _safe_title(item.series_name, "")
-                    if item.series_name
-                    else "",
-                    "season": item.season_number
-                    if isinstance(item.season_number, int)
-                    else None,
-                    "episode": item.episode_number
-                    if isinstance(item.episode_number, int)
-                    else None,
-                    "server_type": server_type,
-                }
-            )
+            serialized_item = {
+                "title": _safe_title(item.name or item.display_name, "媒体条目"),
+                "media_type": _safe_status(
+                    item.type, {"movie", "series", "episode", "season", "video"}
+                ),
+                "year": _safe_year(item.year),
+                "series_name": _safe_title(item.series_name, "")
+                if item.series_name
+                else "",
+                "season": item.season_number
+                if isinstance(item.season_number, int)
+                else None,
+                "episode": item.episode_number
+                if isinstance(item.episode_number, int)
+                else None,
+                "server_type": server_type,
+            }
+            open_url = resolve_link(item.web_url or item.series_web_url)
+            if open_url:
+                serialized_item["open_url"] = open_url
+            items.append(serialized_item)
     if available == 0:
         status = "unavailable"
     elif unavailable:

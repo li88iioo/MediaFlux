@@ -106,6 +106,7 @@ class ProviderArtifactStore:
         now = time.monotonic()
         artifact_ref = self._ref("PA")
         objects: dict[str, _ProviderObject] = {}
+        allow_open_url = str(provider or "").strip().casefold() == "media"
 
         def visit(value: Any) -> Any:
             if isinstance(value, list):
@@ -122,7 +123,10 @@ class ProviderArtifactStore:
             if raw_id:
                 object_ref = self._ref("PO")
                 projected["object_ref"] = object_ref
-                safe_snapshot = project_provider_value(projected)
+                safe_snapshot = project_provider_value(
+                    projected,
+                    allow_open_url=allow_open_url,
+                )
                 objects[object_ref] = _ProviderObject(
                     object_ref=object_ref,
                     provider=provider,
@@ -134,7 +138,10 @@ class ProviderArtifactStore:
             return projected
 
         visited = visit(deepcopy(data))
-        public_data = project_provider_value(visited)
+        public_data = project_provider_value(
+            visited,
+            allow_open_url=allow_open_url,
+        )
         if not isinstance(public_data, dict):
             raise ProviderGatewayError("Provider 响应结构无效", code="invalid_response")
         item = _ProviderArtifact(

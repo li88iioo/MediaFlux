@@ -8,6 +8,7 @@ import unicodedata
 from typing import Any
 
 from app.agent.episode_audit import reset_episode_audit_cache_for_tests
+from app.agent.media_links import media_open_url_resolver
 from app.agent.models import Evidence, ToolResult
 from app.agent.provider_actions import reset_provider_gateway_for_tests
 from app.agent.workspace_actions import (
@@ -95,6 +96,10 @@ def search_library(arguments: dict[str, Any]) -> ToolResult:
             unavailable += 1
         else:
             server_type = _safe_status(source.get("server_type"), {"jellyfin", "emby"})
+            resolve_link = media_open_url_resolver(
+                server_type=server_type,
+                server_url=source.get("web_url"),
+            )
             if server_type == "unknown":
                 server_type = "media_server"
             for item in source.get("items", []):
@@ -103,29 +108,31 @@ def search_library(arguments: dict[str, Any]) -> ToolResult:
                 series_name = (
                     _safe_title(item.series_name, "") if item.series_name else ""
                 )
-                items.append(
-                    {
-                        "title": title,
-                        "display_name": display_name,
-                        "media_type": _safe_status(
-                            item.type,
-                            {"movie", "series", "episode", "season", "video"},
-                        ),
-                        "year": _safe_year(item.year),
-                        "series_name": series_name,
-                        "season": _safe_optional_index(
-                            item.season_number, allow_zero=True
-                        ),
-                        "episode": _safe_optional_index(
-                            item.episode_number, allow_zero=False
-                        ),
-                        "runtime_minutes": _safe_runtime_minutes(item.runtime),
-                        "playback_progress_percent": normalize_playback_progress(
-                            item.progress
-                        ),
-                        "overview": _safe_overview(item.overview),
-                    }
-                )
+                serialized_item = {
+                    "title": title,
+                    "display_name": display_name,
+                    "media_type": _safe_status(
+                        item.type,
+                        {"movie", "series", "episode", "season", "video"},
+                    ),
+                    "year": _safe_year(item.year),
+                    "series_name": series_name,
+                    "season": _safe_optional_index(
+                        item.season_number, allow_zero=True
+                    ),
+                    "episode": _safe_optional_index(
+                        item.episode_number, allow_zero=False
+                    ),
+                    "runtime_minutes": _safe_runtime_minutes(item.runtime),
+                    "playback_progress_percent": normalize_playback_progress(
+                        item.progress
+                    ),
+                    "overview": _safe_overview(item.overview),
+                }
+                open_url = resolve_link(item.web_url or item.series_web_url)
+                if open_url:
+                    serialized_item["open_url"] = open_url
+                items.append(serialized_item)
         total += len(items)
         server_type = _safe_status(source.get("server_type"), {"jellyfin", "emby"})
         if server_type == "unknown":

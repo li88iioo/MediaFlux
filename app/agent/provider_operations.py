@@ -34,7 +34,7 @@ def build_provider_catalog() -> ProviderCatalog:
         ProviderOperationSpec(
             operation_id="media.items.recent_added",
             provider="media",
-            description="读取媒体服务器最近入库的电影、剧集或单集，并按作品去除重复单集展示。",
+            description="读取媒体服务器最近入库的电影、剧集或单集，按作品去除重复单集展示，并返回可用的已校验 open_url。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -58,7 +58,7 @@ def build_provider_catalog() -> ProviderCatalog:
             provider="media",
             description=(
                 "读取媒体服务器用户的真实最近播放历史；优先使用明确配置用户，未配置时沿用"
-                "服务器默认用户选择。这是 DatePlayed/播放事件，不是继续观看 Resume 列表。"
+                "服务器默认用户选择。这是 DatePlayed/播放事件，不是继续观看 Resume 列表；条目会返回可用的已校验 open_url。"
             ),
             risk=RiskLevel.READ,
             parameters={
@@ -83,7 +83,7 @@ def build_provider_catalog() -> ProviderCatalog:
             provider="media",
             description=(
                 "从 Jellyfin 或 Emby 本地媒体库读取 Genres、Tags、评分和用户播放状态，"
-                "结合最近播放题材信号排序，并可排除已播放或已开始的作品。"
+                "结合最近播放题材信号排序，并可排除已播放或已开始的作品；候选会返回可用的已校验 open_url。"
             ),
             risk=RiskLevel.READ,
             parameters={
@@ -145,7 +145,7 @@ def build_provider_catalog() -> ProviderCatalog:
         ProviderOperationSpec(
             operation_id="media.items.continue_watching",
             provider="media",
-            description="读取媒体服务器用户尚未看完的继续观看 Resume 列表。",
+            description="读取媒体服务器用户尚未看完的继续观看 Resume 列表，并返回可用的已校验 open_url。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -206,7 +206,7 @@ def build_provider_catalog() -> ProviderCatalog:
         ProviderOperationSpec(
             operation_id="media.items.search",
             provider="media",
-            description="使用媒体服务器原生搜索查询电影、剧集或单集。",
+            description="使用媒体服务器原生搜索查询电影、剧集或单集，并返回可用的已校验 open_url。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -225,7 +225,7 @@ def build_provider_catalog() -> ProviderCatalog:
         ProviderOperationSpec(
             operation_id="media.series.search",
             provider="media",
-            description="在媒体服务器中搜索剧集候选，并返回 TMDB 映射和对象引用。",
+            description="在媒体服务器中搜索剧集候选，并返回 TMDB 映射、对象引用和可用的已校验 open_url。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",

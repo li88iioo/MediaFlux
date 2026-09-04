@@ -104,7 +104,8 @@ def register_specs(
         ToolSpec(
             name="library.search",
             description=(
-                "在已配置的 Jellyfin / Emby 媒体库中搜索一个具体标题；适合单片核对。"
+                "在已配置的 Jellyfin / Emby 媒体库中搜索一个具体标题；适合单片核对，"
+                "并在可用时返回已校验的 open_url。"
                 "已有 TMDB 身份清单或多部片单时必须使用 library.batch_presence，"
                 "不要逐部重复调用本工具。"
             ),
