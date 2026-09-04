@@ -166,6 +166,9 @@ class AgentSession:
         # 只串行化极短的“取得 generation + 注册 active turn”窗口；
         # 已确认写操作一旦开始就不会被后续聊天抢占。
         self._start_lock = asyncio.Lock()
+        # 已确认写操作脱离客户端流后仍必须持有强引用直到可信终态。
+        # 普通聊天仍遵循“消费者断开即取消”，两者不能共享取消语义。
+        self._detached_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self, agent_input: AgentInput) -> AsyncIterator[AgentEvent]:
         """运行一轮并实时产生事实事件；消费者断开时取消当前回合。"""
@@ -191,7 +194,8 @@ class AgentSession:
                 request_id=str(request_id or "").strip() or secrets.token_urlsafe(12),
                 channel=str(channel or "api").strip().lower(),
                 queue=queue,
-            )
+            ),
+            cancel_on_consumer_close=False,
         ):
             yield event
 
@@ -239,22 +243,49 @@ class AgentSession:
     async def _run_background(
         self,
         producer: Callable[[asyncio.Queue[AgentEvent | None]], Awaitable[None]],
+        *,
+        cancel_on_consumer_close: bool = True,
     ) -> AsyncIterator[AgentEvent]:
         queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
         task = asyncio.create_task(producer(queue))
+        producer_finished = False
         try:
             while True:
                 item = await queue.get()
                 if item is None:
+                    producer_finished = True
                     break
                 yield item
         finally:
-            if not task.done():
+            if task.done() or producer_finished:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            elif cancel_on_consumer_close:
                 task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            else:
+                # 用户已经确认的副作用不能由刷新、断网或关闭标签页撤销。
+                # 生产者继续完成审计、状态提交和领域后置生命周期；队列会在
+                # 任务结束后与任务一同释放，不再依赖已断开的流消费者。
+                self._detached_tasks.add(task)
+                task.add_done_callback(self._detached_task_finished)
+
+    def _detached_task_finished(self, task: asyncio.Task[None]) -> None:
+        self._detached_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            logger.error(
+                "Agent detached confirmation failed type=%s",
+                type(error).__name__,
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def _drive(
         self,
@@ -430,6 +461,12 @@ class AgentSession:
 
                 assistant_text = "".join(text_parts).strip()
                 if calls:
+                    if total_tool_calls + len(calls) > self.limits.max_tool_calls:
+                        raise ToolPipelineError(
+                            "本轮工具调用次数超过安全上限",
+                            code="tool_budget_exceeded",
+                        )
+                    total_tool_calls += len(calls)
                     messages.append(
                         ModelMessage(
                             role="assistant",
@@ -437,13 +474,7 @@ class AgentSession:
                             tool_calls=tuple(calls),
                         )
                     )
-                    for call in calls:
-                        total_tool_calls += 1
-                        if total_tool_calls > self.limits.max_tool_calls:
-                            raise ToolPipelineError(
-                                "本轮工具调用次数超过安全上限",
-                                code="tool_budget_exceeded",
-                            )
+                    for call_index, call in enumerate(calls):
                         if (
                             call.name not in selected_names
                             and call.name not in selected_model_names
@@ -527,6 +558,32 @@ class AgentSession:
                                     tool_name=call.name,
                                 )
                             )
+                            # Provider 已被要求禁止并行工具，但兼容服务仍可能
+                            # 违规一次返回多个调用。写操作在此暂停等待人工确认，
+                            # 后续调用必须明确闭合为“未执行”，不能留下缺少
+                            # tool result 的无效协议历史。
+                            for deferred_call in calls[call_index + 1 :]:
+                                deferred_error = ToolPipelineError(
+                                    "前序写操作需要人工确认，本调用未执行",
+                                    code="not_executed_after_approval",
+                                )
+                                await publish(
+                                    AgentEventType.TOOL_FAILED,
+                                    {
+                                        "call_id": deferred_call.call_id,
+                                        "tool": deferred_call.name,
+                                        "label": public_tool_label(
+                                            deferred_call.name
+                                        ),
+                                        "code": deferred_error.code,
+                                        "message": str(deferred_error),
+                                    },
+                                )
+                                messages.append(
+                                    self._tool_error_message(
+                                        deferred_call, deferred_error
+                                    )
+                                )
                             await self.state_store.commit(
                                 lease,
                                 conversation=self._persisted_conversation(

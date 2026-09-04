@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import unittest
 from collections.abc import AsyncIterator
 
@@ -788,6 +789,244 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         confirmed = await asyncio.wait_for(confirmation_task, timeout=1)
         self.assertEqual(calls["execute"], 1)
         self.assertEqual(confirmed[-1].payload["status"], "effect_completed")
+
+    async def test_confirmed_sync_effect_survives_stream_consumer_disconnect(
+        self,
+    ) -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        executed = threading.Event()
+
+        class RecordingLifecycle:
+            def __init__(self) -> None:
+                self.completed_plans = []
+                self.interrupted_plans = []
+
+            def prepared(self, *, tool, arguments, prepared, context):
+                del tool, arguments, context
+                return prepared
+
+            def prepare_failed(self, *, prepared, context):
+                del prepared, context
+
+            def completed(self, *, plan, value, elapsed_ms):
+                del value, elapsed_ms
+                self.completed_plans.append(plan)
+
+            def failed(self, *, plan, code, elapsed_ms):
+                del plan, code, elapsed_ms
+
+            def interrupted(self, *, plan):
+                self.interrupted_plans.append(plan)
+
+            def cancelled(self, *, plan):
+                del plan
+
+        def execute(_arguments, expected_snapshot, _context):
+            self.assertEqual(expected_snapshot, "snapshot:disconnect-safe")
+            entered.set()
+            if not release.wait(timeout=2):
+                raise RuntimeError("test release timeout")
+            executed.set()
+            return {"summary": "断流后写操作仍完成"}
+
+        tool = KernelToolSpec(
+            name="download.pause",
+            domain="download",
+            description="暂停下载任务",
+            examples=("暂停下载",),
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.WRITE,
+            prepare=lambda _arguments, _context: PreparedEffect(
+                preview={"summary": "将暂停下载任务"},
+                snapshot_fingerprint="snapshot:disconnect-safe",
+            ),
+            execute_confirmed=execute,
+        )
+        catalog = ToolCatalog([tool])
+        state = InMemorySessionStateStore()
+        lifecycle = RecordingLifecycle()
+        session = AgentSession(
+            model=ScriptedModel(
+                [
+                    [
+                        ModelEvent(
+                            ModelEventType.TOOL_CALL_COMPLETED,
+                            tool_call=ModelToolCall(
+                                "write", "download.pause", {}
+                            ),
+                        ),
+                        ModelEvent(
+                            ModelEventType.FINISH, finish_reason="tool_calls"
+                        ),
+                    ]
+                ]
+            ),
+            catalog=catalog,
+            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(
+                catalog=catalog,
+                state_store=state,
+                effect_lifecycle=lifecycle,
+            ),
+            state_store=state,
+        )
+        preview = await collect(
+            session.run(
+                AgentInput(
+                    message="暂停下载",
+                    owner="owner",
+                    session_id="session",
+                )
+            )
+        )
+        plan_id = next(
+            event.payload["plan"]["plan_id"]
+            for event in preview
+            if event.type is AgentEventType.EFFECT_APPROVAL_REQUIRED
+        )
+
+        stream = session.confirm(
+            owner="owner",
+            session_id="session",
+            plan_id=plan_id,
+        )
+        self.assertEqual((await anext(stream)).type, AgentEventType.TURN_STARTED)
+        self.assertEqual((await anext(stream)).type, AgentEventType.TOOL_STARTED)
+        self.assertTrue(
+            await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.5)
+        )
+        await stream.aclose()
+        release.set()
+        self.assertTrue(
+            await asyncio.wait_for(asyncio.to_thread(executed.wait, 1), timeout=1.5)
+        )
+
+        for _ in range(100):
+            current = await state.load(owner="owner", session_id="session")
+            if not session._detached_tasks and not current.pending_effect_plan_id:
+                break
+            await asyncio.sleep(0.01)
+        current = await state.load(owner="owner", session_id="session")
+        self.assertEqual(current.pending_effect_plan_id, "")
+        self.assertEqual(len(lifecycle.completed_plans), 1)
+        self.assertEqual(lifecycle.interrupted_plans, [])
+        self.assertFalse(session._detached_tasks)
+        self.assertIn("断流后写操作仍完成", current.conversation[-1]["content"])
+
+    async def test_calls_after_write_preview_are_closed_without_execution(
+        self,
+    ) -> None:
+        read_calls = 0
+
+        def read_handler(_arguments, _context):
+            nonlocal read_calls
+            read_calls += 1
+            return {"summary": "读取完成"}
+
+        write_tool = KernelToolSpec(
+            name="download.pause",
+            domain="download",
+            description="暂停下载任务",
+            examples=("暂停并查看状态",),
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            effect=ToolEffect.WRITE,
+            prepare=lambda _arguments, _context: PreparedEffect(
+                preview={"summary": "将暂停下载任务"},
+                snapshot_fingerprint="snapshot:multi-call",
+            ),
+            execute_confirmed=lambda _arguments, _snapshot, _context: {
+                "summary": "已暂停"
+            },
+        )
+        read_status = read_tool(
+            "download.status",
+            domain="download",
+            description="读取下载状态",
+            examples=("暂停并查看状态",),
+            handler=read_handler,
+        )
+        catalog = ToolCatalog([write_tool, read_status])
+        state = InMemorySessionStateStore()
+        session = AgentSession(
+            model=ScriptedModel(
+                [
+                    [
+                        ModelEvent(
+                            ModelEventType.TOOL_CALL_COMPLETED,
+                            tool_call=ModelToolCall(
+                                "write-1", "download.pause", {}
+                            ),
+                        ),
+                        ModelEvent(
+                            ModelEventType.TOOL_CALL_COMPLETED,
+                            tool_call=ModelToolCall(
+                                "read-2", "download.status", {}
+                            ),
+                        ),
+                        ModelEvent(
+                            ModelEventType.FINISH, finish_reason="tool_calls"
+                        ),
+                    ]
+                ]
+            ),
+            catalog=catalog,
+            retriever=CapabilityRetriever(minimum=2, maximum=2),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state),
+            state_store=state,
+        )
+
+        events = await collect(
+            session.run(
+                AgentInput(
+                    message="暂停并查看状态",
+                    owner="owner",
+                    session_id="session",
+                )
+            )
+        )
+        self.assertEqual(read_calls, 0)
+        self.assertEqual(events[-1].payload["status"], "approval_required")
+        self.assertEqual(events[-1].payload["tool_calls"], 2)
+        deferred = [
+            event
+            for event in events
+            if event.type is AgentEventType.TOOL_FAILED
+            and event.payload.get("call_id") == "read-2"
+        ]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(
+            deferred[0].payload["code"], "not_executed_after_approval"
+        )
+
+        current = await state.load(owner="owner", session_id="session")
+        assistant = next(
+            item
+            for item in current.conversation
+            if item.get("role") == "assistant" and item.get("tool_calls")
+        )
+        call_ids = {call["call_id"] for call in assistant["tool_calls"]}
+        result_ids = {
+            item.get("tool_call_id")
+            for item in current.conversation
+            if item.get("role") == "tool"
+        }
+        self.assertEqual(call_ids, {"write-1", "read-2"})
+        self.assertEqual(result_ids, call_ids)
+        deferred_result = next(
+            item
+            for item in current.conversation
+            if item.get("tool_call_id") == "read-2"
+        )
+        self.assertIn("not_executed_after_approval", deferred_result["content"])
 
     async def test_provider_alias_is_projected_as_canonical_tool_name_in_events(
         self,
