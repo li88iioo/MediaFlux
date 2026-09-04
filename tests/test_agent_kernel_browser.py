@@ -68,6 +68,7 @@ HTML = """
             </div>
             <div class="agent-composer-header">
               <div class="agent-composer-actions">
+                <a class="agent-action-btn" id="agentSettings" href="#settings" aria-label="Agent 设置"><svg aria-hidden="true"></svg></a>
                 <button type="button" class="agent-action-btn agent-resume-session" id="agentResumeLatestSession" disabled><span>继续上次</span></button>
               </div>
               <div class="agent-composer-actions-right">
@@ -464,6 +465,27 @@ Season 1 / S01E01
         payload = json.loads(confirm_call["body"])
         self.assertEqual(payload["plan_id"], approval["plan_id"])
         self.assertEqual(payload["session_id"], SESSION_ID)
+
+    def test_empty_composer_centers_prompt_with_leading_action(self) -> None:
+        page = self.make_page({"sessions": {"sessions": []}})
+        layout = page.evaluate("""() => {
+          const centerY = (selector) => {
+            const rect = document.querySelector(selector).getBoundingClientRect();
+            return rect.top + rect.height / 2;
+          };
+          const prompt = document.querySelector('#agentPrompt');
+          return {
+            promptDisplay: getComputedStyle(prompt).display,
+            promptCenter: centerY('#agentPrompt'),
+            settingsCenter: centerY('#agentSettings'),
+            sendCenter: centerY('#agentSend'),
+          };
+        }""")
+        self.assertEqual(layout["promptDisplay"], "block")
+        self.assertAlmostEqual(
+            layout["promptCenter"], layout["settingsCenter"], delta=0.5
+        )
+        self.assertAlmostEqual(layout["promptCenter"], layout["sendCenter"], delta=0.5)
 
     def test_mobile_composer_stays_inside_viewport_and_stop_has_stable_slot(
         self,
