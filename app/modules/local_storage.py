@@ -238,7 +238,13 @@ class LocalFilesystemAdapter:
             candidates = self._single_video_candidates(start)
         elif start.is_dir():
             base_depth = len(start.parts)
-            for current_root, dirs, files in os.walk(start, followlinks=False):
+            def raise_walk_error(exc: OSError) -> None:
+                # 整理/清理计划依赖完整快照，不能把不可读子目录视作空目录。
+                raise LocalStorageError(f"目录暂时不可完整读取: {start.name}") from exc
+
+            for current_root, dirs, files in os.walk(
+                start, followlinks=False, onerror=raise_walk_error,
+            ):
                 current = Path(current_root)
                 depth = len(current.parts) - base_depth
                 if depth > self.depth_limit:

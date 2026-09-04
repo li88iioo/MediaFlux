@@ -57,6 +57,28 @@ class LocalStorageTests(unittest.TestCase):
             )
             self.assertEqual(snapshot_digest(snapshots), snapshot_digest(list(reversed(snapshots))))
 
+    def test_scan_rejects_partial_directory_walk_instead_of_silent_success(self):
+        with tempfile.TemporaryDirectory() as root_raw:
+            root = Path(root_raw)
+            (root / "Movie.mkv").write_bytes(b"video")
+            unreadable = root / "Season 02"
+            unreadable.mkdir()
+            (unreadable / "Episode.mkv").write_bytes(b"episode")
+            original_scandir = os.scandir
+
+            def scandir(path):
+                if Path(path) == unreadable:
+                    raise PermissionError("unreadable directory")
+                return original_scandir(path)
+
+            with patch("app.modules.local_storage.os.scandir", side_effect=scandir):
+                for include_non_media in (False, True):
+                    with self.subTest(include_non_media=include_non_media):
+                        with self.assertRaises(LocalStorageError):
+                            LocalFilesystemAdapter(root).scan(include_non_media=include_non_media)
+            self.assertEqual((root / "Movie.mkv").read_bytes(), b"video")
+            self.assertEqual((unreadable / "Episode.mkv").read_bytes(), b"episode")
+
     def test_scan_can_include_non_media_for_single_pass_cleanup_planning(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw)

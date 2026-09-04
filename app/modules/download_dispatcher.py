@@ -195,10 +195,6 @@ def _validate_download_url(value: str, protocol: str) -> None:
 
 
 def torrent_download_input(filename: str, data: bytes) -> DownloadInput:
-    if not data:
-        raise ValueError("种子文件为空")
-    if len(data) > 10 * 1024 * 1024:
-        raise ValueError("种子文件超过 10MB 限制")
     name, _torrent_id, magnet_xt, _v2_hash = _torrent_metadata(data)
     title = name or (filename or "torrent").rsplit(".", 1)[0]
     magnet = f"magnet:?xt={magnet_xt}"
@@ -1028,8 +1024,10 @@ def dispatch_request(
 
 
 def _torrent_metadata(data: bytes) -> tuple[str, str, str, str]:
-    value, end, info_span = _decode_bencode(data, 0, capture_info=True)
-    if end != len(data) or not isinstance(value, dict) or info_span is None:
+    decoder = _BencodeDecoder(data)
+    value = decoder.decode()
+    info_span = decoder.info_span
+    if not isinstance(value, dict) or info_span is None:
         raise BencodeError("种子文件结构无效")
     info = value.get(b"info")
     if not isinstance(info, dict):
@@ -1057,36 +1055,42 @@ def parse_torrent_metadata(data: bytes) -> tuple[str, str]:
     return name, torrent_id
 
 
-_TORRENT_MANIFEST_MAX_BYTES = 10 * 1024 * 1024
-_TORRENT_MANIFEST_MAX_DEPTH = 64
-_TORRENT_MANIFEST_MAX_VALUES = 250_000
+_TORRENT_MAX_BYTES = 10 * 1024 * 1024
+_BENCODE_MAX_DEPTH = 64
+_BENCODE_MAX_VALUES = 250_000
 _TORRENT_MANIFEST_MAX_FILES = 100_000
 
 
-class _ManifestBencodeDecoder:
-    """面向不可信 .torrent 元数据的有界 Bencode 解码器。
-
-    下载分发仍沿用历史 ``_decode_bencode``，避免改变 TorrentID 兼容语义；
-    文件清单解析使用本解码器，额外拒绝重复键、异常深度和畸形整数。
-    """
+class _BencodeDecoder:
+    """下载身份与文件清单唯一的有界解码器，保留顶层 info 的原始字节范围。"""
 
     def __init__(self, data: bytes):
+        if not isinstance(data, bytes) or not data:
+            raise BencodeError("种子文件为空")
+        if len(data) > _TORRENT_MAX_BYTES:
+            raise BencodeError("种子文件超过 10MB 限制")
         self.data = data
         self.values = 0
+        self.info_span: tuple[int, int] | None = None
 
     def decode(self):
-        value, end = self._decode(0, 0)
+        try:
+            value, end = self._decode(0, 0)
+        except BencodeError:
+            raise
+        except ValueError as exc:
+            raise BencodeError("Bencode 数字格式无效或过大") from exc
         if end != len(self.data):
             raise BencodeError("种子文件包含尾随数据")
         return value
 
     def _touch(self) -> None:
         self.values += 1
-        if self.values > _TORRENT_MANIFEST_MAX_VALUES:
+        if self.values > _BENCODE_MAX_VALUES:
             raise BencodeError("种子文件结构过大")
 
     def _decode(self, index: int, depth: int):
-        if depth > _TORRENT_MANIFEST_MAX_DEPTH:
+        if depth > _BENCODE_MAX_DEPTH:
             raise BencodeError("种子文件嵌套过深")
         if index >= len(self.data):
             raise BencodeError("Bencode 数据不完整")
@@ -1129,7 +1133,10 @@ class _ManifestBencodeDecoder:
                     raise BencodeError("字典键必须是字节串")
                 if key in result:
                     raise BencodeError("种子文件包含重复字典键")
+                value_start = cursor
                 result[key], cursor = self._decode(cursor, depth + 1)
+                if depth == 0 and key == b"info":
+                    self.info_span = (value_start, cursor)
         if b"0" <= token <= b"9":
             colon = self.data.find(b":", index)
             if colon < 0:
@@ -1206,7 +1213,7 @@ def _v2_manifest_files(info: dict, name: str) -> list[TorrentManifestFile]:
     files: list[TorrentManifestFile] = []
 
     def walk(node: dict, prefix: tuple[str, ...], depth: int) -> None:
-        if depth > _TORRENT_MANIFEST_MAX_DEPTH:
+        if depth > _BENCODE_MAX_DEPTH:
             raise BencodeError("file tree 嵌套过深")
         leaf = node.get(b"")
         if leaf is not None:
@@ -1238,11 +1245,7 @@ def parse_torrent_manifest(data: bytes) -> TorrentManifest:
     该接口只返回标题、协议版本、相对文件路径和长度；不会返回 tracker、
     magnet、passkey 等敏感下载信息，可安全用于整理识别基准。
     """
-    if not isinstance(data, bytes) or not data:
-        raise BencodeError("种子文件为空")
-    if len(data) > _TORRENT_MANIFEST_MAX_BYTES:
-        raise BencodeError("种子文件超过 10MB 限制")
-    value = _ManifestBencodeDecoder(data).decode()
+    value = _BencodeDecoder(data).decode()
     if not isinstance(value, dict):
         raise BencodeError("种子文件结构无效")
     info = value.get(b"info")
@@ -1416,50 +1419,3 @@ def _title_from_url(url: str) -> str:
         return unquote(dn) or "磁力任务"
     path = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
     return path or ("ED2K 任务" if url.lower().startswith("ed2k://") else "链接任务")
-
-
-def _decode_bencode(data: bytes, index: int, capture_info: bool = False):
-    if index >= len(data):
-        raise BencodeError("Bencode 数据不完整")
-    token = data[index:index + 1]
-    if token == b"i":
-        end = data.find(b"e", index + 1)
-        if end < 0:
-            raise BencodeError("整数未结束")
-        try:
-            return int(data[index + 1:end]), end + 1, None
-        except ValueError as exc:
-            raise BencodeError("整数格式无效") from exc
-    if token == b"l":
-        result, cursor = [], index + 1
-        while data[cursor:cursor + 1] != b"e":
-            value, cursor, _span = _decode_bencode(data, cursor)
-            result.append(value)
-        return result, cursor + 1, None
-    if token == b"d":
-        result, cursor, info_span = {}, index + 1, None
-        while data[cursor:cursor + 1] != b"e":
-            key, cursor, _ = _decode_bencode(data, cursor)
-            if not isinstance(key, bytes):
-                raise BencodeError("字典键必须是字节串")
-            value_start = cursor
-            value, cursor, nested_span = _decode_bencode(data, cursor)
-            result[key] = value
-            if capture_info and key == b"info":
-                info_span = (value_start, cursor)
-            elif nested_span and info_span is None:
-                info_span = nested_span
-        return result, cursor + 1, info_span
-    if b"0" <= token <= b"9":
-        colon = data.find(b":", index)
-        if colon < 0:
-            raise BencodeError("字节串长度无效")
-        try:
-            length = int(data[index:colon])
-        except ValueError as exc:
-            raise BencodeError("字节串长度无效") from exc
-        start, end = colon + 1, colon + 1 + length
-        if end > len(data):
-            raise BencodeError("字节串越界")
-        return data[start:end], end, None
-    raise BencodeError("未知 Bencode 标记")

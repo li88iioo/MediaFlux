@@ -43,7 +43,6 @@ _SINGLE_FLIGHT_WAIT_SECONDS = 35.0
 _cache: dict[str, tuple[float, "RecognitionWebHintResult"]] = {}
 _cache_lock = threading.RLock()
 _singleflight = KeyedSingleFlight(max_entries=_CACHE_LIMIT)
-_generation = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,7 +119,6 @@ def _store(
     value: RecognitionWebHintResult,
     *,
     ttl_seconds: float | None = None,
-    generation: int | None = None,
 ) -> bool:
     if ttl_seconds is None:
         ttl_seconds = float(
@@ -128,8 +126,6 @@ def _store(
         )
     expires_at = time.monotonic() + max(1.0, float(ttl_seconds))
     with _cache_lock:
-        if generation is not None and generation != _generation:
-            return False
         if key not in _cache and len(_cache) >= _CACHE_LIMIT:
             oldest = min(_cache, key=lambda item: _cache[item][0])
             _cache.pop(oldest, None)
@@ -280,18 +276,9 @@ def search_recognition_titles(
         except AsyncBridgeUnavailable:
             return RecognitionWebHintResult(status="unavailable")
 
-    with _cache_lock:
-        generation = _generation
-    lease = _singleflight.reserve(key)
-    if not lease.owner:
-        if not _singleflight.wait(lease, timeout=_SINGLE_FLIGHT_WAIT_SECONDS):
-            return RecognitionWebHintResult(status="unavailable")
-        cached = _cached(key)
-        return cached or RecognitionWebHintResult(status="unavailable")
-
-    result = RecognitionWebHintResult(status="unavailable")
-    awaitable: object | None = None
-    try:
+    def compute() -> RecognitionWebHintResult:
+        result = RecognitionWebHintResult(status="unavailable")
+        awaitable: object | None = None
         try:
             daily_limit = _bounded_int(
                 "ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT",
@@ -326,32 +313,33 @@ def search_recognition_titles(
                 attempted=True, status="unavailable", error="Tavily 暂时不可用"
             )
 
-        if result.status in {"ok", "no_result"}:
-            _store(key, result, generation=generation)
-        elif result.status in {
-            "provider_error",
-            "invalid_response",
-            "unavailable",
-            "budget_exhausted",
-        }:
-            _store(
-                key,
-                result,
-                ttl_seconds=_NEGATIVE_CACHE_TTL_SECONDS,
-                generation=generation,
-            )
         return result
-    finally:
-        _singleflight.finish(lease)
+
+    def write_cache(result: RecognitionWebHintResult) -> None:
+        if result.status in {"ok", "no_result"}:
+            _store(key, result)
+        elif result.status in {
+            "provider_error", "invalid_response", "unavailable", "budget_exhausted",
+        }:
+            _store(key, result, ttl_seconds=_NEGATIVE_CACHE_TTL_SECONDS)
+
+    return _singleflight.run_cached(
+        key,
+        read_cache=lambda: _cached(key),
+        compute=compute,
+        write_cache=write_cache,
+        unavailable=lambda: RecognitionWebHintResult(status="unavailable"),
+        timeout=_SINGLE_FLIGHT_WAIT_SECONDS,
+    )
 
 
 def clear_recognition_web_hint_cache() -> None:
     """配置热更新后清空标题线索缓存，并释放等待中的相同查询。"""
-    global _generation
-    with _cache_lock:
-        _generation += 1
-        _cache.clear()
-        _singleflight.clear()
+    def clear_cache() -> None:
+        with _cache_lock:
+            _cache.clear()
+
+    _singleflight.clear(clear_cache=clear_cache)
 
 
 def reset_recognition_web_hints_for_tests() -> None:

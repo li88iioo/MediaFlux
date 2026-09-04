@@ -32,6 +32,7 @@ from app.modules.local_media_recognition_summary import (
 )
 from app.modules.local_media_scheduler import get_local_media_scheduler
 from app.modules.local_media_service import LocalMediaServiceError, get_local_media_service
+from app.modules.local_storage import LocalStorageError
 from app.web import api_error, require_api_login
 
 logger = get_logger(__name__)
@@ -202,7 +203,10 @@ def _task_step_payload(row) -> dict:
 
 
 def _safe_error(exc: Exception) -> JSONResponse:
-    if isinstance(exc, (ValueError, LookupError, LocalMediaServiceError, FileNotFoundError, PathMappingError)):
+    if isinstance(exc, (
+        ValueError, LookupError, LocalMediaServiceError, LocalStorageError,
+        FileNotFoundError, PathMappingError,
+    )):
         return api_error(str(exc), 400)
     if isinstance(exc, OSError):
         logger.warning("本地媒体文件系统异常 type=%s", type(exc).__name__)

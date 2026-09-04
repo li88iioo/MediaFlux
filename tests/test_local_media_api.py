@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app import database as db
 from app.main import create_app
 from app.modules.local_media_recognition_summary import infer_recognition_summary
+from app.modules.local_storage import LocalStorageError, LocalScanLimitExceeded
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -818,6 +819,30 @@ class LocalMediaAPITests(IsolatedDatabaseTestCase):
         self.assertIsNone(db.get_local_media_task(completed_id, owner="admin"))
         self.assertIsNotNone(db.get_local_media_task(busy_id, owner="admin"))
         self.assertEqual(self.client.get(f"/api/local-media/tasks/{completed_id}").status_code, 404)
+
+    def test_inspect_reports_scan_failure_without_generic_internal_error(self):
+        csrf = self.login()
+        source_id = db.create_local_media_source(
+            name="source", qb_profile="", qb_path_prefix="",
+            local_root=str(self.local_root), owner="admin",
+        )
+        for error in (
+            LocalStorageError("目录暂时不可完整读取: Season 02"),
+            LocalScanLimitExceeded("目录扫描深度超过安全上限"),
+        ):
+            service = Mock()
+            service.inspect_source.side_effect = error
+            with self.subTest(error=type(error).__name__), patch(
+                "app.routes.local_media_api.get_local_media_service", return_value=service
+            ):
+                response = self.client.post(
+                    "/api/local-media/inspect", json={"source_id": source_id},
+                    headers={"X-CSRF-Token": csrf},
+                )
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertEqual(response.json()["error"], str(error))
+            service.preview.assert_not_called()
+            service.execute_task.assert_not_called()
 
     def test_inspect_preview_execute_delegate_to_service_and_hide_private_plans(self):
         csrf = self.login(); headers = {"X-CSRF-Token": csrf}

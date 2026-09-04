@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Hashable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 
 
@@ -135,11 +135,49 @@ class KeyedSingleFlight:
         if should_release:
             lease._event.set()
 
-    def clear(self) -> None:
-        """切换代际、清空登记并释放当前全部 waiter。"""
+    def run_cached[T](
+        self,
+        key: Hashable,
+        *,
+        read_cache: Callable[[], T | None],
+        compute: Callable[[], T],
+        write_cache: Callable[[T], None],
+        unavailable: Callable[[], T],
+        timeout: float | None,
+    ) -> T:
+        """统一 owner 复查、waiter 等待、缓存发布与异常清理。
+
+        调用方可先走缓存快路；登记租约后必须再读一次，防止快路错过的
+        owner 已完成并退出。网络计算不持锁，只有缓存发布与 clear 互斥，
+        清理前的慢请求不能重新污染缓存。缓存回调不得执行网络请求。
+        """
+        lease = self.reserve(key)
+        try:
+            if not lease.owner and not self.wait(lease, timeout=timeout):
+                return unavailable()
+            cached = read_cache()
+            if cached is not None:
+                return cached
+            if not lease.owner:
+                return unavailable()
+            result = compute()
+            with self._lock:
+                if lease.generation == self._generation:
+                    write_cache(result)
+            return result
+        finally:
+            # 额度退款或缓存写入失败也必须释放 waiter，不能依赖调用方清理。
+            self.finish(lease)
+
+    def clear(self, *, clear_cache: Callable[[], None] | None = None) -> None:
+        """原子失效缓存与租约代际；清理失败时也释放当前 waiter。"""
         with self._lock:
             self._generation += 1
             pending = tuple(event for _, event in self._inflight.values())
             self._inflight.clear()
-        for event in pending:
-            event.set()
+            try:
+                if clear_cache is not None:
+                    clear_cache()
+            finally:
+                for event in pending:
+                    event.set()

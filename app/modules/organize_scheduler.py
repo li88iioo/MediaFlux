@@ -62,15 +62,14 @@ class OrganizeScheduler:
                 name="organize-scheduler",
                 daemon=True,
             )
-            thread = self._thread
-        thread.start()
+            self._thread.start()
         logger.info("网盘整理调度器已启动")
 
     def stop(self) -> bool:
         """停止调度线程并等待退出；返回是否已安全收敛。"""
-        self._stop_event.set()
-        self._wake_event.set()
         with self._state_lock:
+            self._stop_event.set()
+            self._wake_event.set()
             thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=max(2.0, self._check_interval + 1.0))

@@ -4,12 +4,69 @@ import asyncio
 import threading
 import time
 import unittest
+from unittest.mock import Mock
 
 from app.concurrency import CrossLoopAsyncLock, KeyedSingleFlight
 from app.indexers.providers.base import SearchRequestPacer
 
 
 class KeyedSingleFlightTests(unittest.TestCase):
+    def test_cached_call_releases_lease_for_every_failing_phase(self):
+        for phase in ("read_cache", "compute", "write_cache"):
+            with self.subTest(phase=phase):
+                flight = KeyedSingleFlight()
+                callbacks = {
+                    "read_cache": Mock(return_value=None),
+                    "compute": Mock(return_value="result"),
+                    "write_cache": Mock(),
+                    "unavailable": Mock(return_value="unavailable"),
+                }
+                callbacks[phase].side_effect = RuntimeError(phase)
+                with self.assertRaisesRegex(RuntimeError, phase):
+                    flight.run_cached("same", timeout=0.1, **callbacks)
+                self.assertEqual(flight.active_count, 0)
+
+    def test_cache_clear_failure_releases_waiters_and_advances_generation(self):
+        flight = KeyedSingleFlight()
+        owner = flight.reserve("same")
+        waiter = flight.reserve("same")
+        with self.assertRaisesRegex(RuntimeError, "cache unavailable"):
+            flight.clear(clear_cache=Mock(side_effect=RuntimeError("cache unavailable")))
+        self.assertGreater(flight.generation, owner.generation)
+        self.assertTrue(flight.wait(waiter, timeout=0.1))
+        self.assertEqual(flight.active_count, 0)
+
+    def test_cached_waiter_timeout_does_not_compute_or_release_owner(self):
+        flight = KeyedSingleFlight()
+        owner = flight.reserve("same")
+        compute = Mock(return_value="result")
+        store = Mock()
+        result = flight.run_cached(
+            "same", timeout=0, read_cache=lambda: None, compute=compute,
+            write_cache=store, unavailable=lambda: "unavailable",
+        )
+        self.assertEqual(result, "unavailable")
+        compute.assert_not_called()
+        store.assert_not_called()
+        self.assertEqual(flight.active_count, 1)
+        flight.finish(owner)
+
+    def test_cache_clear_rejects_publication_even_for_capacity_overflow_owner(self):
+        flight = KeyedSingleFlight(max_entries=1)
+        flight.reserve("occupied")
+        store = Mock()
+
+        def compute():
+            flight.clear()
+            return "obsolete"
+
+        self.assertEqual(flight.run_cached(
+            "overflow", timeout=0.1, read_cache=lambda: None, compute=compute,
+            write_cache=store, unavailable=lambda: "unavailable",
+        ), "obsolete")
+        store.assert_not_called()
+        self.assertEqual(flight.active_count, 0)
+
     def test_same_key_has_one_owner_and_finish_releases_waiter(self):
         flight = KeyedSingleFlight(max_entries=2)
         owner = flight.reserve("same")

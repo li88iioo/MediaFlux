@@ -186,8 +186,7 @@ def _store_cache(key: str, result: ToolResult) -> None:
 
 def clear_web_search_cache() -> None:
     """清空跨 Worker 共享缓存，并释放本进程内等待中的同键请求。"""
-    db.clear_agent_web_search_cache()
-    web_request_singleflight.clear()
+    web_request_singleflight.clear(clear_cache=db.clear_agent_web_search_cache)
 
 
 def reset_web_search_cache_for_tests() -> None:
@@ -350,10 +349,15 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
     if depth not in {"basic", "advanced"}:
         depth = "basic"
     key = _cache_key(normalized, depth)
-    cached = _cached(key)
+    def read_cache() -> ToolResult | None:
+        cached = _cached(key)
+        if cached is not None:
+            cached.data = dict(cached.data)
+            cached.data["cached"] = True
+        return cached
+
+    cached = read_cache()
     if cached is not None:
-        cached.data = dict(cached.data)
-        cached.data["cached"] = True
         return cached
 
     try:
@@ -366,62 +370,62 @@ def search_web(arguments: dict[str, Any]) -> ToolResult:
             error="请从同步 Agent 查询入口调用网页搜索。",
         )
 
-    lease = web_request_singleflight.reserve(("search", key))
-    if not lease.owner:
-        if not web_request_singleflight.wait(
-            lease, timeout=WEB_REQUEST_SINGLE_FLIGHT_WAIT_SECONDS
-        ):
-            return ToolResult(False, "unavailable", "网页搜索服务暂时不可用")
-        cached = _cached(key)
-        if cached is None:
-            return ToolResult(False, "unavailable", "网页搜索服务暂时不可用")
-        cached.data = dict(cached.data)
-        cached.data["cached"] = True
-        return cached
+    def compute() -> ToolResult:
+        cost = 2 if depth == "advanced" else 1
+        usage_date = db.current_agent_web_search_usage_date()
+        charged = False
+        try:
+            daily_limit = _int_config(
+                "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
+            )
+            if not db.reserve_agent_web_search_credits(
+                provider="tavily",
+                usage_date=usage_date,
+                cost=cost,
+                daily_limit=daily_limit,
+            ):
+                return ToolResult(
+                    False,
+                    "budget_exhausted",
+                    "今日网页搜索额度已用完",
+                    data={"daily_limit": daily_limit, "usage_date": usage_date},
+                    suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
+                )
+            charged = True
+            result = run_awaitable_sync(
+                _search_tavily(normalized, api_key=api_key, depth=depth)
+            )
+            if result.ok:
+                result.data = dict(result.data)
+                result.data.update(
+                    {
+                        "provider": "tavily",
+                        "search_depth": depth,
+                        "credits_used": cost,
+                        "cached": False,
+                    }
+                )
+                charged = False
+            return result
+        finally:
+            if charged:
+                db.refund_agent_web_search_credits(
+                    provider="tavily", usage_date=usage_date, cost=cost
+                )
 
-    cost = 2 if depth == "advanced" else 1
-    usage_date = db.current_agent_web_search_usage_date()
-    charged = False
-    try:
-        daily_limit = _int_config(
-            "TAVILY_DAILY_CREDIT_LIMIT", 100, minimum=1, maximum=100000
-        )
-        if not db.reserve_agent_web_search_credits(
-            provider="tavily",
-            usage_date=usage_date,
-            cost=cost,
-            daily_limit=daily_limit,
-        ):
-            return ToolResult(
-                False,
-                "budget_exhausted",
-                "今日网页搜索额度已用完",
-                data={"daily_limit": daily_limit, "usage_date": usage_date},
-                suggestions=["等待次日额度重置，或提高本地每日预算后重试。"],
-            )
-        charged = True
-        result = run_awaitable_sync(
-            _search_tavily(normalized, api_key=api_key, depth=depth)
-        )
-        if result.ok:
-            result.data = dict(result.data)
-            result.data.update(
-                {
-                    "provider": "tavily",
-                    "search_depth": depth,
-                    "credits_used": cost,
-                    "cached": False,
-                }
-            )
-            charged = False
-            try:
-                _store_cache(key, result)
-            except Exception as exc:  # noqa: BLE001 - 缓存失败不得覆盖有效搜索结果
-                logger.warning("Tavily 网页搜索缓存失败 type=%s", type(exc).__name__)
-        return result
-    finally:
-        if charged:
-            db.refund_agent_web_search_credits(
-                provider="tavily", usage_date=usage_date, cost=cost
-            )
-        web_request_singleflight.finish(lease)
+    def write_cache(result: ToolResult) -> None:
+        if not result.ok:
+            return
+        try:
+            _store_cache(key, result)
+        except Exception as exc:  # noqa: BLE001 - 缓存失败不得覆盖有效结果
+            logger.warning("Tavily 网页搜索缓存失败 type=%s", type(exc).__name__)
+
+    return web_request_singleflight.run_cached(
+        ("search", key),
+        read_cache=read_cache,
+        compute=compute,
+        write_cache=write_cache,
+        unavailable=lambda: ToolResult(False, "unavailable", "网页搜索服务暂时不可用"),
+        timeout=WEB_REQUEST_SINGLE_FLIGHT_WAIT_SECONDS,
+    )

@@ -69,29 +69,33 @@ class AgentLibraryPatrolScheduler:
         # 配置重载、outbox 入队和实际外发共用同一栅栏。关闭通知时，
         # reload() 会等待已开始的发送结束，并保证返回后不会再启动旧发送。
         self._notification_gate = threading.RLock()
+        self._lifecycle_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="agent-library-patrol",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="agent-library-patrol",
+                daemon=True,
+            )
+            self._thread.start()
         logger.info("Agent 全库缺集巡检调度器已启动")
 
     def stop(self, timeout: float = 5.0) -> bool:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            self._wake_event.set()
+            thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
+            thread.join(timeout=max(0.0, float(timeout)))
         stopped = not thread or not thread.is_alive()
-        if stopped:
-            self._thread = None
+        with self._lifecycle_lock:
+            if self._thread is thread and stopped:
+                self._thread = None
         return stopped
 
     def reload(self, *, immediate: bool = True) -> None:

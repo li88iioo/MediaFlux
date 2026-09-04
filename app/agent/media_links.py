@@ -117,7 +117,7 @@ def _normalized_server_base(value: object) -> tuple[str, str, int, str] | None:
     origin = _origin(parsed)
     if origin is None:
         return None
-    return (*origin, path.casefold())
+    return (*origin, path)
 
 
 def _reachable_host(value: object) -> str | None:

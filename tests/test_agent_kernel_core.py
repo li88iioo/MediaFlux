@@ -244,6 +244,30 @@ class AgentKernelCrossLoopTests(unittest.TestCase):
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmation_initialization_failure_terminates_stream(self) -> None:
+        class BrokenStateStore(InMemorySessionStateStore):
+            async def load(self, *, owner, session_id):
+                raise RuntimeError("database unavailable")
+
+        catalog = ToolCatalog([read_tool("agent.status")])
+        state = BrokenStateStore()
+        session = AgentSession(
+            model=ScriptedModel([]), catalog=catalog,
+            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
+        )
+        reader = asyncio.create_task(collect(session.confirm(
+            owner="owner-1", session_id="session-1", plan_id="plan-1"
+        )))
+        try:
+            done, _ = await asyncio.wait([reader], timeout=0.3)
+            self.assertIn(reader, done, "生产者出错后消费者仍在等待队列")
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                await reader
+        finally:
+            reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
     async def test_admission_failure_still_emits_a_terminal_event(self) -> None:
         class RejectingAdmission:
             async def begin(self, agent_input):

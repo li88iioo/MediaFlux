@@ -1,13 +1,16 @@
 """不可信 Torrent 文件清单解析契约。"""
 from __future__ import annotations
 
+import hashlib
 import unittest
+from unittest.mock import patch
 
 from app.modules.download_dispatcher import (
     BencodeError,
     TorrentManifest,
     TorrentManifestFile,
     parse_torrent_manifest,
+    parse_torrent_metadata,
 )
 
 
@@ -146,3 +149,45 @@ class TorrentManifestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UnifiedTorrentDecoderTests(unittest.TestCase):
+    def test_metadata_and_manifest_reject_the_same_malformed_encoding(self):
+        malformed = (
+            b"d4:infod6:lengthi01e4:name8:Demo.mkvee",
+            b"d4:infod6:lengthi" + b"9" * 5000 + b"e4:name8:Demo.mkvee",
+            b"d4:infod6:lengthi-0e4:name8:Demo.mkvee",
+            b"d4:infod6:lengthi1e4:name8:Demo.mkv4:name8:Demo.mkvee",
+            b"d4:infod6:lengthi1e4:name08:Demo.mkvee",
+            b"d4:infod6:lengthi1e4:name8:Demo.mkv4:junk" + b"l" * 70 + b"e" * 70 + b"ee",
+        )
+        for data in malformed:
+            for parser in (parse_torrent_metadata, parse_torrent_manifest):
+                with self.subTest(parser=parser.__name__, data=data[:60]):
+                    with self.assertRaises(BencodeError):
+                        parser(data)
+
+    def test_metadata_hash_uses_original_info_bytes_not_reencoded_dictionary(self):
+        # 字典顺序刻意不同于编码器排序；Tracker 身份必须保留原始 info 字节。
+        raw_info = b"d4:name8:Demo.mkv6:lengthi1ee"
+        data = b"d4:info" + raw_info + b"e"
+        name, torrent_id = parse_torrent_metadata(data)
+        self.assertEqual(name, "Demo.mkv")
+        self.assertEqual(torrent_id, hashlib.sha1(raw_info).hexdigest())
+        self.assertEqual(parse_torrent_manifest(data).name, name)
+
+    def test_both_entrypoints_enforce_the_input_size_bound(self):
+        data = _torrent({b"name": b"Demo.mkv", b"length": 1})
+        with patch("app.modules.download_dispatcher._TORRENT_MAX_BYTES", 8):
+            for parser in (parse_torrent_metadata, parse_torrent_manifest):
+                with self.subTest(parser=parser.__name__):
+                    with self.assertRaisesRegex(BencodeError, "限制"):
+                        parser(data)
+
+    def test_both_entrypoints_enforce_structural_budget(self):
+        data = _torrent({b"name": b"Demo.mkv", b"length": 1})
+        with patch("app.modules.download_dispatcher._BENCODE_MAX_VALUES", 3):
+            for parser in (parse_torrent_metadata, parse_torrent_manifest):
+                with self.subTest(parser=parser.__name__):
+                    with self.assertRaisesRegex(BencodeError, "结构过大"):
+                        parser(data)

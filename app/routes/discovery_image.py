@@ -222,6 +222,8 @@ def poster(request: Request, provider: str, token: str):
                     if is_douban:
                         headers["User-Agent"] = random.choice(_BROWSER_UA_POOL)
                     continue
+                # 非瞬时错误不重试同一 URL，保留响应交由最终边界关闭。
+                break
             except requests.RequestException as req_exc:
                 if attempt == 0:
                     continue

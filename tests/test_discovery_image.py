@@ -4,6 +4,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from fastapi import HTTPException
+
 from app.routes.discovery_image import poster
 
 
@@ -63,6 +65,22 @@ class DiscoveryImageHeaderTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         call_kwargs = session.get.call_args
         self.assertNotIn("Referer", call_kwargs.kwargs["headers"])
+
+    def test_non_retryable_status_does_not_retry_or_leak_response(self):
+        first = FakeImageResponse()
+        first.status_code = 404
+        second = FakeImageResponse()
+        second.status_code = 404
+        request = SimpleNamespace(session={"logged_in": True})
+        session = _mock_session(side_effect=[first, second])
+        with patch(
+            "app.routes.discovery_image.decode_poster_token", return_value="poster.jpg"
+        ), patch("app.routes.discovery_image._get_poster_session", return_value=session):
+            with self.assertRaises(HTTPException) as raised:
+                poster(request, "tmdb", "signed-token")
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertTrue(first.closed)
+        session.get.assert_called_once()
 
     def test_poster_retries_on_transient_error(self):
         fail_resp = FakeImageResponse()

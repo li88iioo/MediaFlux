@@ -322,3 +322,19 @@ def test_only_media_provider_artifacts_may_publish_open_url():
 
     assert media_data["items"][0]["open_url"] == direct
     assert "open_url" not in other_data["items"][0]
+
+
+def test_media_link_does_not_match_a_different_case_sensitive_base_path(monkeypatch):
+    row = {
+        "id": 7, "enabled": 1, "config_source": "custom", "server_type": "jellyfin",
+        "upstream_url": "http://media.local:8096/Media", "listen_port": 18096,
+    }
+    _patch_proxy_state(
+        monkeypatch, rows=[row], runtime={7: {"running": True, "listen_port": 18096}},
+        public_base="http://192.168.0.195:1258",
+    )
+    resolve = media_links.media_open_url_resolver(
+        server_type="jellyfin", server_url="http://media.local:8096/media"
+    )
+    direct = "http://media.local:8096/media/web/index.html#!/details?id=item-1"
+    assert resolve(direct) == direct

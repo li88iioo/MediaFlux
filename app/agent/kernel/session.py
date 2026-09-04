@@ -251,7 +251,15 @@ class AgentSession:
         cancel_on_consumer_close: bool = True,
     ) -> AsyncIterator[AgentEvent]:
         queue: asyncio.Queue[AgentEvent | None] = asyncio.Queue()
-        task = asyncio.create_task(producer(queue))
+        async def drive_to_completion() -> None:
+            try:
+                await producer(queue)
+            finally:
+                # 完成信号归传输边界统一拥有；初始化、审计或收尾失败也不能
+                # 留下永远等待 queue.get() 的消费者。
+                queue.put_nowait(None)
+
+        task = asyncio.create_task(drive_to_completion())
         producer_finished = False
         try:
             while True:
@@ -731,7 +739,6 @@ class AgentSession:
         finally:
             if lease is not None and token is not None:
                 await self.coordinator.finish(lease, token)
-            await queue.put(None)
 
     async def _drive_confirmation(
         self,
@@ -744,7 +751,6 @@ class AgentSession:
         queue: asyncio.Queue[AgentEvent | None],
     ) -> None:
         if not owner or not session_id or not plan_id:
-            await queue.put(None)
             return
         try:
             async with self._start_lock:
@@ -773,7 +779,6 @@ class AgentSession:
             if self.journal is not None:
                 await self.journal.append(event, owner=owner)
             await queue.put(event)
-            await queue.put(None)
             return
         factory = EventFactory(
             session_id=session_id, turn_id=lease.turn_id, request_id=request_id
@@ -946,7 +951,6 @@ class AgentSession:
             )
         finally:
             await self.coordinator.finish(lease, token)
-            await queue.put(None)
 
     @staticmethod
     def _estimated_tokens(value: object) -> int:

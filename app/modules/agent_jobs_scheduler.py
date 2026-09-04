@@ -44,29 +44,33 @@ class AgentJobsScheduler:
         self._clock = clock or datetime.now
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._thread: threading.Thread | None = None
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="agent-durable-jobs",
-            daemon=True,
-        )
-        self._thread.start()
+        with self._lifecycle_lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="agent-durable-jobs",
+                daemon=True,
+            )
+            self._thread.start()
         logger.info("Agent 持久化长任务调度器已启动")
 
     def stop(self, timeout: float = 5.0) -> bool:
-        self._stop_event.set()
-        self._wake_event.set()
-        thread = self._thread
+        with self._lifecycle_lock:
+            self._stop_event.set()
+            self._wake_event.set()
+            thread = self._thread
         if thread and thread.is_alive() and thread is not threading.current_thread():
-            thread.join(timeout=timeout)
+            thread.join(timeout=max(0.0, float(timeout)))
         stopped = not thread or not thread.is_alive()
-        if stopped:
-            self._thread = None
+        with self._lifecycle_lock:
+            if self._thread is thread and stopped:
+                self._thread = None
         return stopped
 
     def wake(self) -> None:
