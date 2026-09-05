@@ -26,6 +26,7 @@ from app.agent.download_actions import download_request_public_summary
 from app.agent.errors import AgentToolError
 from app.agent.indexer_actions import download_target_readiness
 from app.agent.indexer_candidate_actions import IndexerCandidateActions
+from app.agent.media_consumption_actions import explicit_preferred_download_target
 from app.agent.models import Evidence, ToolContext, ToolReference, ToolResult
 from app.agent.recent_resource_candidates import (
     RecentResourceCandidateStore,
@@ -56,6 +57,7 @@ _MAX_RESOURCE_POSITIONS = 12
 _MAX_SHARE_POSITIONS = 200
 _OPAQUE_REFERENCE_RE = re.compile(r"^ref_[A-Za-z0-9_-]{16,160}$")
 _INGEST_REFERENCE_VERSION = 1
+_PREFERRED_TARGET_CONTEXT_PREFIX = "ingest-target-v1:"
 
 
 def _now() -> str:
@@ -305,17 +307,20 @@ def ingest_submit_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
         raise AgentToolError(
             "source_type 仅支持 direct_url、guangya_share 或 resource_candidates"
         )
-    target = str(arguments.get("target") or "").strip().lower()
+    raw_target = arguments.get("target", "preferred")
+    if not isinstance(raw_target, str) or not raw_target.strip():
+        raise AgentToolError("target 必须是有效的下载目标字符串")
+    target = raw_target.strip().lower()
     if source_type == "guangya_share":
-        target = target or "guangya"
+        target = "guangya" if target == "preferred" else target
         if target != "guangya":
             raise AgentToolError("光鸭分享只能转存到光鸭")
         positions = _positions(
             arguments.get("positions"), maximum=_MAX_SHARE_POSITIONS, required=False
         )
     else:
-        if target not in _TARGETS:
-            raise AgentToolError("target 仅支持 qb、guangya 或 both")
+        if target not in _TARGETS | {"preferred"}:
+            raise AgentToolError("target 仅支持 preferred、qb、guangya 或 both")
         positions = _positions(
             arguments.get("positions"),
             maximum=_MAX_RESOURCE_POSITIONS,
@@ -814,6 +819,35 @@ class IngestActions:
     def prepare_submit(
         self, arguments: dict[str, Any], context: ToolContext
     ) -> tuple[ToolResult, str]:
+        """默认目标仅在预检时解析，封装领域指纹以跨重启固定下载去向。"""
+        requested = str(arguments.get("target") or "preferred").strip().lower()
+        if arguments["source_type"] == "guangya_share":
+            resolved = dict(arguments)
+            resolved["target"] = "guangya" if requested == "preferred" else requested
+            if resolved["target"] != "guangya":
+                raise AgentToolError("光鸭分享只能转存到光鸭")
+            return self._prepare_submit_resolved(resolved, context)
+        if requested != "preferred":
+            if requested not in _TARGETS:
+                raise AgentToolError("下载目标无效")
+            return self._prepare_submit_resolved(arguments, context)
+        preferred_target = explicit_preferred_download_target(context.owner)
+        target = preferred_target or "guangya"
+        resolved = {**arguments, "target": target}
+        result, fingerprint = self._prepare_submit_resolved(resolved, context)
+        # 兼容旧的直接领域调用者；Kernel 会从冻结 opaque ref 恢复同一 search_id。
+        if resolved.get("search_id"):
+            arguments["search_id"] = resolved["search_id"]
+        if not result.ok or not fingerprint:
+            return result, fingerprint
+        if isinstance(result.data, dict):
+            result.data["target"] = target
+            result.data["target_selection"] = "saved_preference" if preferred_target else "product_default"
+        return result, f"{_PREFERRED_TARGET_CONTEXT_PREFIX}{target}:{fingerprint}"
+
+    def _prepare_submit_resolved(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> tuple[ToolResult, str]:
         if arguments["source_type"] == "resource_candidates":
             internal = self._resource_arguments(arguments)
             if len(arguments["positions"]) == 1:
@@ -929,6 +963,35 @@ class IngestActions:
         return result, self._submission_context(snapshot, frozen_arguments)
 
     def execute_submit(
+        self,
+        arguments: dict[str, Any],
+        expected_context: str,
+        context: ToolContext,
+    ) -> ToolResult:
+        """确认只恢复预检时冻结的目标；绝不再读取当前用户偏好。"""
+        fingerprint = str(expected_context or "")
+        requested = str(arguments.get("target") or "preferred").strip().lower()
+        if fingerprint.startswith(_PREFERRED_TARGET_CONTEXT_PREFIX):
+            target, separator, inner = fingerprint[len(_PREFERRED_TARGET_CONTEXT_PREFIX):].partition(":")
+            if (not separator or target not in _TARGETS or
+                    not re.fullmatch(r"[a-f0-9]{64}", inner) or
+                    requested != "preferred" or
+                    arguments["source_type"] == "guangya_share"):
+                raise AgentToolError("下载目标冻结上下文无效，请重新预检", code="confirmation_stale")
+            resolved = {**arguments, "target": target}
+            return self._execute_submit_resolved(resolved, inner, context)
+        # 已持久化的旧显式目标计划继续校验原始 hash；没有冻结默认目标时安全失败。
+        if arguments["source_type"] == "guangya_share":
+            resolved = dict(arguments)
+            resolved["target"] = "guangya" if requested == "preferred" else requested
+            if resolved["target"] != "guangya":
+                raise AgentToolError("分享目标已变化，请重新预检", code="confirmation_stale")
+            return self._execute_submit_resolved(resolved, fingerprint, context)
+        if requested not in _TARGETS:
+            raise AgentToolError("确认缺少冻结下载目标，请重新预检", code="confirmation_stale")
+        return self._execute_submit_resolved(arguments, fingerprint, context)
+
+    def _execute_submit_resolved(
         self,
         arguments: dict[str, Any],
         expected_context: str,

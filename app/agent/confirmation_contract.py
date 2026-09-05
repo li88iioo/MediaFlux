@@ -13,6 +13,133 @@ CONTRACT_VERSION = 1
 
 # 文案只描述可观察影响，不包含参数、路径、URL、票据或服务端内部标识。
 _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
+    "activity.follow": {
+        "action": "活动跟踪开启",
+        "object": "本次选定的活动跟踪规则",
+        "impact": "保存或停用周期观察；任务异常、阶段结束或到期时通知一次。不启动、重试或取消原任务。",
+        "reversibility": "可以停用跟踪；已进入统一通知队列的消息不能由本操作撤回。",
+    },
+    "activity.unfollow": {
+        "action": "活动跟踪停用",
+        "object": "本次选定的活动跟踪规则",
+        "impact": "保存或停用周期观察；任务异常、阶段结束或到期时通知一次。不启动、重试或取消原任务。",
+        "reversibility": "可以停用跟踪；已进入统一通知队列的消息不能由本操作撤回。",
+    },
+    "action.undo.execute": {
+        "action": "可逆操作回退",
+        "object": "本次凭证绑定的媒体偏好或光鸭最近可逆文件操作",
+        "impact": "只恢复已记录快照，拒绝覆盖后续更改；文件回退排入原整理执行器，不代表已经完成。",
+        "reversibility": "不保证能再次撤销回退，不恢复永久删除、已提交下载或已发送通知。",
+    },
+    "media.user.mark_played": {
+        "action": "标记媒体已看",
+        "object": "当前媒体用户及预检的单个条目",
+        "impact": "只改变确认卡所示的已看或收藏状态，写前复核状态并写后回读，不隐式展开整个剧集。",
+        "reversibility": "可再次修改标记，但不能保证恢复原观看进度、播放计数或时间记录。",
+    },
+    "media.user.mark_unplayed": {
+        "action": "标记媒体未看",
+        "object": "当前媒体用户及预检的单个条目",
+        "impact": "只改变确认卡所示的已看或收藏状态，写前复核状态并写后回读，不隐式展开整个剧集。",
+        "reversibility": "可再次修改标记，但不能保证恢复原观看进度、播放计数或时间记录。",
+    },
+    "media.user.favorite": {
+        "action": "收藏媒体",
+        "object": "当前媒体用户及预检的单个条目",
+        "impact": "只改变确认卡所示的已看或收藏状态，写前复核状态并写后回读，不隐式展开整个剧集。",
+        "reversibility": "可再次修改标记，但不能保证恢复原观看进度、播放计数或时间记录。",
+    },
+    "media.user.unfavorite": {
+        "action": "取消媒体收藏",
+        "object": "当前媒体用户及预检的单个条目",
+        "impact": "只改变确认卡所示的已看或收藏状态，写前复核状态并写后回读，不隐式展开整个剧集。",
+        "reversibility": "可再次修改标记，但不能保证恢复原观看进度、播放计数或时间记录。",
+    },
+    "media.playlist.create": {
+        "action": "创建播放列表",
+        "object": "已确认的播放列表及成员",
+        "impact": "只创建私有列表或增减列表成员，核对完整快照和写后结果；不删除媒体文件。",
+        "reversibility": "可通过列表成员操作调整，但不保证恢复原成员次序；未知执行结果需先回读。",
+    },
+    "media.playlist.add_items": {
+        "action": "添加播放列表成员",
+        "object": "已确认的播放列表及成员",
+        "impact": "只创建私有列表或增减列表成员，核对完整快照和写后结果；不删除媒体文件。",
+        "reversibility": "可通过列表成员操作调整，但不保证恢复原成员次序；未知执行结果需先回读。",
+    },
+    "media.playlist.remove_items": {
+        "action": "移除播放列表成员",
+        "object": "已确认的播放列表及成员",
+        "impact": "只创建私有列表或增减列表成员，核对完整快照和写后结果；不删除媒体文件。",
+        "reversibility": "可通过列表成员操作调整，但不保证恢复原成员次序；未知执行结果需先回读。",
+    },
+    "automation.create_media_rule": {
+        "action": "创建媒体自动追更规则",
+        "object": "预检识别的媒体追更订阅",
+        "impact": "按确认卡保存检查间隔、站点、下载目标和动作；若选择自动模式，之后匹配资源无需逐次确认即可提交。",
+        "reversibility": "可暂停或删除订阅；已提交的下载无法由此撤回。不支持的画质/字幕硬过滤不会被保存。",
+    },
+    "automation.set_digest": {
+        "action": "主动摘要规则保存",
+        "object": "当前身份绑定的每日摘要规则",
+        "impact": "按本地时区保存启停、时间和异常过滤；复用通知中心，不周期调用模型。",
+        "reversibility": "可以再次修改或停用；已入队通知不撤回。",
+    },
+    "config.create_recognition_knowledge": {
+        "action": "新增识别知识",
+        "object": "发布组或尾部制作组识别知识",
+        "impact": "只改指定用户知识条目或别名，不修改内置条目来源，也不批量重新整理已有媒体。",
+        "reversibility": "可通过原知识配置界面修改；删除前请核对内容，不承诺通用撤销。",
+    },
+    "config.update_recognition_knowledge": {
+        "action": "修改识别知识",
+        "object": "发布组或尾部制作组识别知识",
+        "impact": "只改指定用户知识条目或别名，不修改内置条目来源，也不批量重新整理已有媒体。",
+        "reversibility": "可通过原知识配置界面修改；删除前请核对内容，不承诺通用撤销。",
+    },
+    "config.delete_recognition_knowledge": {
+        "action": "删除识别知识",
+        "object": "发布组或尾部制作组识别知识",
+        "impact": "只改指定用户知识条目或别名，不修改内置条目来源，也不批量重新整理已有媒体。",
+        "reversibility": "可通过原知识配置界面修改；删除前请核对内容，不承诺通用撤销。",
+    },
+    "config.create_local_source": {
+        "action": "新增本地媒体来源",
+        "object": "指定本地媒体来源配置",
+        "impact": "复用本地来源生命周期修改配置，不主动整理或删除媒体文件；新来源默认仅预览且不开启qB自动接管。",
+        "reversibility": "可重新配置，但删除条目的编号或历史关联不保证恢复。",
+    },
+    "config.update_local_source": {
+        "action": "修改本地媒体来源",
+        "object": "指定本地媒体来源配置",
+        "impact": "复用本地来源生命周期修改配置，不主动整理或删除媒体文件；新来源默认仅预览且不开启qB自动接管。",
+        "reversibility": "可重新配置，但删除条目的编号或历史关联不保证恢复。",
+    },
+    "config.delete_local_source": {
+        "action": "删除本地媒体来源",
+        "object": "指定本地媒体来源配置",
+        "impact": "复用本地来源生命周期修改配置，不主动整理或删除媒体文件；新来源默认仅预览且不开启qB自动接管。",
+        "reversibility": "可重新配置，但删除条目的编号或历史关联不保证恢复。",
+    },
+    "config.create_media_path_mapping": {
+        "action": "新增媒体路径映射",
+        "object": "指定媒体服务器的路径前缀映射",
+        "impact": "使用Web相同的配置锁更新映射，保留其他服务器配置及凭据；不移动文件或触发扫描。",
+        "reversibility": "可再次配置原映射；已发出的刷新请求不受本操作撤回。",
+    },
+    "config.update_media_path_mapping": {
+        "action": "修改媒体路径映射",
+        "object": "指定媒体服务器的路径前缀映射",
+        "impact": "使用Web相同的配置锁更新映射，保留其他服务器配置及凭据；不移动文件或触发扫描。",
+        "reversibility": "可再次配置原映射；已发出的刷新请求不受本操作撤回。",
+    },
+    "config.delete_media_path_mapping": {
+        "action": "删除媒体路径映射",
+        "object": "指定媒体服务器的路径前缀映射",
+        "impact": "使用Web相同的配置锁更新映射，保留其他服务器配置及凭据；不移动文件或触发扫描。",
+        "reversibility": "可再次配置原映射；已发出的刷新请求不受本操作撤回。",
+    },
+
     "provider.change.execute": {
         "action": "执行 Provider 写计划",
         "object": "刚才预检并冻结的媒体服务器或 qBittorrent 目标",
@@ -51,14 +178,14 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
     },
     "media.set_preferences": {
         "action": "保存媒体偏好",
-        "object": "当前登录会话的显式媒体偏好",
-        "impact": "会保存媒体服务器或下载目标偏好，供后续媒体请求参考；不会修改系统全局配置或立即创建下载。",
+        "object": "当前登录用户的显式媒体偏好",
+        "impact": "会保存媒体服务器、下载目标及画质/语言/题材/观看过滤偏好，供后续推荐和选源使用；单次明确要求优先。不会修改系统全局配置或立即创建下载。",
         "reversibility": "可再次修改，或确认清除后恢复产品默认值。",
     },
     "media.clear_preferences": {
         "action": "清除媒体偏好",
-        "object": "当前登录会话已保存的显式媒体偏好",
-        "impact": "会删除本会话的偏好记录并恢复产品默认值；不会修改媒体服务器、下载器或已有任务。",
+        "object": "当前登录用户已保存的显式媒体偏好",
+        "impact": "会删除当前用户的偏好记录并恢复产品默认值；不会修改媒体服务器、下载器或已有任务。",
         "reversibility": "清除后可重新保存显式偏好。",
     },
     "media.set_subscription_notification_rule": {

@@ -1,9 +1,11 @@
 """媒体消费偏好、订阅通知规则、通知 outbox 与今日内容摘要。"""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
 import json
+import secrets
 import sqlite3
+from copy import deepcopy
+from datetime import datetime, timedelta
 from typing import Any
 
 from app import database as db
@@ -11,7 +13,23 @@ from app import database as db
 _DEFAULT_PREFERENCES = {
     "preferred_server": "any",
     "preferred_download_target": "guangya",
+    "preferred_resolution": "any",
+    "minimum_resolution": "any",
+    "preferred_hdr": "any",
+    "preferred_codecs": [],
+    "preferred_subtitles": [],
+    "preferred_audio_languages": [],
+    "preferred_release_groups": [],
+    "excluded_keywords": [],
+    "max_episode_size_gb": 0,
+    "preferred_genres": [],
+    "excluded_genres": [],
+    "min_rating": 0,
+    "exclude_played": True,
 }
+_PROFILE_KEYS = tuple(key for key in _DEFAULT_PREFERENCES if key not in {
+    "preferred_server", "preferred_download_target",
+})
 _DEFAULT_RULE = {
     "enabled": False,
     "notify_on_missing": True,
@@ -27,14 +45,14 @@ def _bool(value: Any) -> bool:
 
 def default_media_preferences() -> dict[str, Any]:
     """返回显式偏好的公开默认值，避免使用伪 owner 读取数据库。"""
-    return dict(_DEFAULT_PREFERENCES)
+    return deepcopy(_DEFAULT_PREFERENCES)
 
 
 def get_media_preferences(owner_digest: str) -> dict[str, Any]:
     try:
         with db.get_conn() as conn:
             row = conn.execute(
-                "SELECT preferred_server,preferred_download_target,revision,created_at,updated_at "
+                "SELECT * "
                 "FROM agent_media_preferences WHERE owner_digest=?",
                 (str(owner_digest),),
             ).fetchone()
@@ -43,63 +61,98 @@ def get_media_preferences(owner_digest: str) -> dict[str, Any]:
             raise
         # 兼容启动迁移尚未执行或精简测试库：未建表等同于没有显式偏好。
         row = None
+    return _preferences_from_row(row)
+
+
+def _preferences_from_row(row: sqlite3.Row | None) -> dict[str, Any]:
+    """投影已读取的确切版本；不得在事务结束后另开连接回读。"""
     if row is None:
-        return {**_DEFAULT_PREFERENCES, "revision": 0, "explicit": False}
+        return {**default_media_preferences(), "revision": 0, "revision_token": "", "explicit": False}
+    profile = default_media_preferences()
+    try:
+        saved = json.loads(dict(row).get("profile_json", "{}"))
+    except (TypeError, ValueError):
+        saved = {}
+    if isinstance(saved, dict):
+        profile.update({key: saved[key] for key in _PROFILE_KEYS if key in saved})
     return {
+        **profile,
         "preferred_server": str(row["preferred_server"]),
         "preferred_download_target": str(row["preferred_download_target"]),
         "revision": int(row["revision"]),
+        "revision_token": str(dict(row).get("revision_token") or ""),
         "explicit": True,
     }
 
 
 def set_media_preferences(
-    owner_digest: str, *, expected_revision: int, updates: dict[str, Any]
+    owner_digest: str, *, expected_revision: int, updates: dict[str, Any],
+    expected_revision_token: str | None = None,
 ) -> dict[str, Any] | None:
-    current = get_media_preferences(owner_digest)
     stamp = db.now()
-    merged = {key: updates.get(key, current[key]) for key in _DEFAULT_PREFERENCES}
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT revision FROM agent_media_preferences WHERE owner_digest=?",
+            "SELECT * FROM agent_media_preferences WHERE owner_digest=?",
             (str(owner_digest),),
         ).fetchone()
-        actual_revision = int(row["revision"]) if row is not None else 0
-        if actual_revision != int(expected_revision):
+        current = _preferences_from_row(row)
+        if int(current["revision"]) != int(expected_revision):
             return None
+        if expected_revision_token is not None and not secrets.compare_digest(
+            str(current["revision_token"]), str(expected_revision_token)
+        ):
+            return None
+        merged = {key: updates.get(key, current[key]) for key in _DEFAULT_PREFERENCES}
+        profile_json = json.dumps(
+            {key: merged[key] for key in _PROFILE_KEYS}, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"), allow_nan=False,
+        )
+        # 整数 revision 在删除再创建后会重用；每次写入再分配私有 nonce 阻止旧快照 ABA。
+        revision_token = secrets.token_hex(16)
         if row is None:
             conn.execute(
                 "INSERT INTO agent_media_preferences("
-                "owner_digest,preferred_server,preferred_download_target,"
-                "revision,created_at,updated_at) VALUES(?,?,?,1,?,?)",
+                "owner_digest,preferred_server,preferred_download_target,profile_json,revision_token,"
+                "revision,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)",
                 (
                     str(owner_digest), merged["preferred_server"],
-                    merged["preferred_download_target"], stamp, stamp,
+                    merged["preferred_download_target"], profile_json, revision_token, stamp, stamp,
                 ),
             )
         else:
             conn.execute(
                 "UPDATE agent_media_preferences SET preferred_server=?,"
-                "preferred_download_target=?,revision=revision+1,updated_at=? "
+                "preferred_download_target=?,profile_json=?,revision_token=?,revision=revision+1,updated_at=? "
                 "WHERE owner_digest=? AND revision=?",
                 (
                     merged["preferred_server"], merged["preferred_download_target"],
-                    stamp, str(owner_digest), int(expected_revision),
+                    profile_json, revision_token, stamp, str(owner_digest), int(expected_revision),
                 ),
             )
-    return get_media_preferences(owner_digest)
+        committed = _preferences_from_row(conn.execute(
+            "SELECT * FROM agent_media_preferences WHERE owner_digest=?",
+            (str(owner_digest),),
+        ).fetchone())
+    # 离开 with 后本次事务已成功提交；直接返回锁内读取的自身版本，避免把后来写入 C 当作 B。
+    return committed
 
 
-def clear_media_preferences(owner_digest: str, *, expected_revision: int) -> bool:
+def clear_media_preferences(
+    owner_digest: str, *, expected_revision: int, expected_revision_token: str | None = None,
+) -> bool:
     if int(expected_revision) <= 0:
         return False
+    where_token = " AND revision_token=?" if expected_revision_token is not None else ""
+    parameters: tuple[Any, ...] = (str(owner_digest), int(expected_revision))
+    if expected_revision_token is not None:
+        parameters += (str(expected_revision_token),)
     with db.get_conn() as conn:
         cur = conn.execute(
-            "DELETE FROM agent_media_preferences WHERE owner_digest=? AND revision=?",
-            (str(owner_digest), int(expected_revision)),
+            "DELETE FROM agent_media_preferences WHERE owner_digest=? AND revision=?" + where_token,
+            parameters,
         )
-        return cur.rowcount == 1
+    return bool(cur.rowcount)
 
 
 def get_notification_rule(subscription_id: int) -> dict[str, Any] | None:

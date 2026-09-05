@@ -41,7 +41,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -825,12 +825,42 @@ CREATE TABLE IF NOT EXISTS media_subscription_candidates (
 CREATE INDEX IF NOT EXISTS idx_media_subscription_candidates_lookup
     ON media_subscription_candidates(subscription_id, status, media_key, id DESC);
 
+
+CREATE TABLE IF NOT EXISTS media_automation_rules (
+    id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    settings_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 0,
+    revision INTEGER NOT NULL DEFAULT 1,
+    next_run_at TEXT NOT NULL,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_media_automation_rules_due
+ON media_automation_rules(enabled,next_run_at,lease_until);
+CREATE INDEX IF NOT EXISTS idx_media_automation_rules_owner
+ON media_automation_rules(owner_digest,id);
+
+CREATE TABLE IF NOT EXISTS agent_compensations (
+    receipt_id TEXT PRIMARY KEY,
+    owner_digest TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'available'
+        CHECK(state IN ('available','executing','completed','outcome_unknown')),
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_agent_compensations_owner ON agent_compensations(owner_digest,updated_at);
+
 CREATE TABLE IF NOT EXISTS agent_media_preferences (
     owner_digest TEXT PRIMARY KEY,
     preferred_server TEXT NOT NULL DEFAULT 'any'
         CHECK(preferred_server IN ('any','jellyfin','emby')),
     preferred_download_target TEXT NOT NULL DEFAULT 'guangya'
         CHECK(preferred_download_target IN ('qb','guangya','both')),
+    profile_json TEXT NOT NULL DEFAULT '{}',
+    revision_token TEXT NOT NULL DEFAULT '',
     revision INTEGER NOT NULL DEFAULT 1 CHECK(revision > 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -3194,6 +3224,36 @@ def _migrate_agent_kernel_session_epochs_v23(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_agent_capability_closure_v24(conn: sqlite3.Connection) -> None:
+    """保留旧偏好，增加结构化档案、一次性补偿状态及主动规则。"""
+    from app.repositories.media_automation_rules import SCHEMA as automation_schema
+
+    for statement in automation_schema.split(";"):
+        if statement.strip():
+            conn.execute(statement)
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(agent_media_preferences)")}
+    if columns and "profile_json" not in columns:
+        conn.execute(
+            "ALTER TABLE agent_media_preferences "
+            "ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}'"
+        )
+    if columns and "revision_token" not in columns:
+        conn.execute(
+            "ALTER TABLE agent_media_preferences ADD COLUMN revision_token TEXT NOT NULL DEFAULT ''"
+        )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_compensations ("
+        "receipt_id TEXT PRIMARY KEY,owner_digest TEXT NOT NULL,"
+        "state TEXT NOT NULL DEFAULT 'available' "
+        "CHECK(state IN ('available','executing','completed','outcome_unknown')),"
+        "updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_compensations_owner "
+        "ON agent_compensations(owner_digest,updated_at)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -3218,6 +3278,7 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     20: _migrate_agent_kernel_v21,
     21: _migrate_agent_recognition_review_v22,
     22: _migrate_agent_kernel_session_epochs_v23,
+    23: _migrate_agent_capability_closure_v24,
 }
 
 

@@ -39,6 +39,10 @@ from app.agent.library_patrol_trigger_actions import (
     prepare_trigger_patrol_now,
     trigger_patrol_now_confirmed,
 )
+from app.agent.media_preference_policy import (
+    RESOURCE_PREFERENCE_PROPERTIES,
+    owner_media_preferences,
+)
 from app.agent.missing_media_workflow_runtime import MissingMediaWorkflowRuntime
 from app.agent.missing_media_workflows import (
     list_missing_workflows,
@@ -70,7 +74,9 @@ def register_specs(
     del resource_store, active_ingest_store, ingest_actions
 
     def missing_episode_search(arguments, context):
-        result = search_missing_episode_resources(arguments)
+        result = search_missing_episode_resources(
+            arguments, preferences=owner_media_preferences(context.owner),
+        )
         if missing_media_runtime is not None:
             missing_media_runtime.capture_search(
                 owner=context.owner,
@@ -80,7 +86,9 @@ def register_specs(
         return result
 
     def missing_season_search(arguments, context):
-        result = search_missing_season_resources(arguments)
+        result = search_missing_season_resources(
+            arguments, preferences=owner_media_preferences(context.owner),
+        )
         if missing_media_runtime is not None:
             missing_media_runtime.capture_search(
                 owner=context.owner,
@@ -196,7 +204,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="library.search_missing_episode_resources",
-            description="先确认指定季集属于已播缺集，再定向搜索多站资源；不会自动下载。",
+            description="先确认指定季集属于已播缺集，再按当前身份保存的资源偏好排序；本次 preference_overrides 优先于长期偏好（空数组/0/any 可取消对应约束），不会自动下载。",
             risk=RiskLevel.READ,
             domains=("resource_search", "library"),
             source_kind="resource_index",
@@ -205,6 +213,12 @@ def register_specs(
                 "type": "object",
                 "required": ["query", "season", "episode"],
                 "properties": {
+                    "preference_overrides": {
+                        "type": "object",
+                        "properties": RESOURCE_PREFERENCE_PROPERTIES,
+                        "additionalProperties": False,
+                        "description": "仅本次请求覆盖对应质量偏好；不保存配置。",
+                    },
                     "query": {"type": "string", "minLength": 1, "maxLength": 120},
                     "tmdb_id": {"type": "string", "pattern": "^[0-9]{1,10}$"},
                     "library_name": {"type": "string", "minLength": 1, "maxLength": 80},
@@ -231,7 +245,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="library.search_missing_season_resources",
-            description="先完整核对指定季度，再按顺序搜索最多 3 个已播缺集的多站资源；不会自动下载。",
+            description="先完整核对指定季度，再搜索最多 3 个已播缺集并按当前身份保存的资源偏好排序；本次 preference_overrides 优先，不会自动下载。",
             risk=RiskLevel.READ,
             domains=("resource_search", "library"),
             source_kind="resource_index",
@@ -240,6 +254,12 @@ def register_specs(
                 "type": "object",
                 "required": ["query", "season"],
                 "properties": {
+                    "preference_overrides": {
+                        "type": "object",
+                        "properties": RESOURCE_PREFERENCE_PROPERTIES,
+                        "additionalProperties": False,
+                        "description": "仅本次请求覆盖对应质量偏好；不保存配置。",
+                    },
                     "query": {"type": "string", "minLength": 1, "maxLength": 120},
                     "tmdb_id": {"type": "string", "pattern": "^[0-9]{1,10}$"},
                     "library_name": {"type": "string", "minLength": 1, "maxLength": 80},

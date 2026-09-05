@@ -6,6 +6,10 @@ import re
 import unicodedata
 from typing import Any
 
+from app.agent.media_preference_policy import (
+    effective_preferences,
+    resource_preference_match,
+)
 from app.indexers.release import parse_indexer_release_position
 from app.modules.scraper import TMDBScraper
 
@@ -342,6 +346,8 @@ def rank_episode_search(
     *,
     season: int,
     episode: int,
+    preferences: dict[str, Any] | None = None,
+    preference_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """返回带排序解释和只读下载建议的搜索数据副本。"""
     ranked_data = dict(search_data)
@@ -351,6 +357,21 @@ def rank_episode_search(
         for item in raw_items[:_MAX_ITEMS]
         if isinstance(item, dict)
     ] if isinstance(raw_items, list) else []
+    if preferences or preference_overrides:
+        profile = effective_preferences(preferences or {}, preference_overrides)
+        for item in items:
+            match = resource_preference_match(
+                item, profile, single_episode=item["quality"]["match"] == "exact_episode",
+            )
+            item["preference_match"] = match
+            item["quality"]["score"] += match["score"]
+            item["quality"]["eligible"] = item["quality"]["eligible"] and match["eligible"]
+            item["quality"]["reasons"] = _bounded_messages(
+                match["reasons"] + item["quality"]["reasons"], 6,
+            )
+            item["quality"]["warnings"] = _bounded_messages(
+                match["warnings"] + item["quality"]["warnings"], 4,
+            )
     items.sort(key=_sort_key)
     candidate_position = 0
     for rank, item in enumerate(items, start=1):

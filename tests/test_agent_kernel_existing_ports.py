@@ -43,7 +43,8 @@ async def context_for(state, *, owner="owner", session="session"):
 class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_existing_atomic_tools_can_be_declared_to_kernel(self) -> None:
         catalog = catalog_from_tool_specs(build_tool_specs())
-        self.assertEqual(len(catalog), 153)
+        self.assertEqual(len(catalog), len(build_tool_specs()))
+        self.assertGreaterEqual(len(catalog), 153)
         self.assertFalse(catalog.has("agent.cancel_pending_action"))
         selection = CapabilityRetriever().retrieve(
             "规整光鸭云盘动漫目录并按 TMDB 集数重命名",
@@ -400,7 +401,7 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         )
 
         public = result.outcome.public_content
-        self.assertEqual(public["data"]["total_tools"], 153)
+        self.assertEqual(public["data"]["total_tools"], len(build_tool_specs()))
         self.assertGreaterEqual(len(public["data"]["groups"]), 6)
         self.assertNotIn("tools", public["data"])
         self.assertNotIn("parameters", str(public))

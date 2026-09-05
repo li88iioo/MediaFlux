@@ -27,6 +27,7 @@ from app.agent.media_consumption_actions import (
 from app.agent.media_consumption_actions import (
     empty_arguments as media_consumption_empty_arguments,
 )
+from app.agent.media_preference_policy import PREFERENCE_PROPERTIES
 from app.agent.media_subscription_actions import (
     create_media_subscription_confirmed,
     delete_media_subscription_confirmed,
@@ -584,7 +585,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="media.preferences",
-            description="读取当前会话显式保存的媒体服务器与下载目标偏好；不从聊天摘要或模型记忆推断。",
+            description="读取当前身份显式保存的媒体服务器、下载目标、清晰度/HDR/编码/字幕/音轨/发布组/排除词/单集大小/题材与观看偏好；单次请求条件优先，不从聊天摘要推断。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -599,27 +600,18 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="media.set_preferences",
-            description="预检并在用户确认后保存当前会话的显式媒体偏好；偏好按会话身份隔离，不修改系统全局配置。",
+            description="预检并在用户确认后按字段更新结构化媒体偏好；本地推荐和资源排序使用这些默认偏好，单次显式参数（包括空数组、0、False）优先。按身份隔离，不修改系统全局配置。",
             risk=RiskLevel.LOW_WRITE,
             parameters={
                 "type": "object",
-                "properties": {
-                    "preferred_server": {
-                        "type": "string",
-                        "enum": ["any", "jellyfin", "emby"],
-                    },
-                    "preferred_download_target": {
-                        "type": "string",
-                        "enum": ["qb", "guangya", "both"],
-                    },
-                },
+                "properties": PREFERENCE_PROPERTIES,
                 "additionalProperties": False,
             },
             validator=preferences_update_arguments,
             requires_confirmation=True,
             context_confirmation_preparer=prepare_set_preferences,
             context_confirmed_handler=set_preferences_confirmed,
-            examples=("以后默认下载到光鸭", "优先用 Jellyfin", "默认下载目标改为两边"),
+            examples=("以后默认下载到光鸭", "优先 4K 杜比视界 HEVC 简中", "单集不超过 8 GB，排除枪版", "以后从库里优先推荐没看过的喜剧"),
         )
     )
     registry.register(

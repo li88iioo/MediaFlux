@@ -421,7 +421,17 @@ class CapabilityRetriever:
         selected = list(ranked[:count])
         selected_names = {tool.name for tool in selected}
         related_candidates: list[KernelToolSpec] = []
-        for source in tuple(selected):
+        # 邻接依赖仍按当前相关性排序；最近真实调用的来源仅得到有限加权。
+        # 无条件让历史来源优先会挤掉新任务的必需读取入口；无条件让写工具
+        # 优先则会让无关写能力挤掉搜索→提交。这里不按业务意图或风险分流。
+        def adjacency_score(tool: KernelToolSpec) -> float:
+            score = scores[tool.name]
+            if tool.name in recent_tool_names or tool.model_name in recent_tool_names:
+                score += min(5.0, max(0.0, score) * 0.5)
+            return score
+
+        sources = sorted(selected, key=lambda tool: (-adjacency_score(tool), tool.name))
+        for source in sources:
             related = source.metadata.get("related_tools", ())
             if isinstance(related, str):
                 related = (related,)

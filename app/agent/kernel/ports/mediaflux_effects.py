@@ -11,17 +11,22 @@ from app.agent.action_history import (
     record_confirmation_interrupted,
     record_confirmed_result,
 )
+from app.agent.action_undo import attach_undo_receipt, compensation_candidate
+from app.agent.activity_actions import attach_activity_reference
 from app.agent.feature_gate import invalidate_agent_runtime_generation
 from app.agent.missing_media_workflow_runtime import (
     MISSING_MEDIA_CANDIDATES_KEY,
     MISSING_MEDIA_FOLLOWUPS_KEY,
     MissingMediaWorkflowRuntime,
 )
-from app.agent.models import RiskLevel, ToolResult
+from app.agent.models import RiskLevel, ToolContext, ToolResult
+from app.logger import get_logger
 
 from ..capabilities import KernelToolSpec, ToolEffect
 from ..effects import EffectPlan, PreparedEffect
 from ..pipeline import ToolCallContext
+
+logger = get_logger(__name__)
 
 
 class MediaFluxEffectLifecycle:
@@ -65,9 +70,11 @@ class MediaFluxEffectLifecycle:
         prepared: PreparedEffect,
         context: ToolCallContext,
     ) -> PreparedEffect:
-        del tool, arguments
         runtime = self.missing_media_runtime
         metadata = dict(prepared.metadata)
+        inverse = compensation_candidate(tool.name, dict(arguments), dict(prepared.preview))
+        if inverse:
+            metadata["compensation"] = inverse
         candidates = metadata.pop(MISSING_MEDIA_CANDIDATES_KEY, None)
         if runtime is None or candidates is None:
             return replace(prepared, metadata=metadata)
@@ -101,6 +108,16 @@ class MediaFluxEffectLifecycle:
             )
         if not isinstance(value, ToolResult):
             return
+        attach_activity_reference(value, plan.tool_name)
+        try:
+            attach_undo_receipt(
+                value, plan.metadata.get("compensation"), key=plan.plan_id,
+                context=ToolContext(owner=plan.owner, session_id=plan.session_id),
+            )
+        except Exception as exc:  # noqa: BLE001 -- 可选后置凭证失败不得覆写真实写入结果
+            # 原操作的事实不能被可选回退凭证失败覆写。
+            logger.warning("回退凭证创建失败 type=%s", type(exc).__name__)
+            value.suggestions.append("本次操作未生成回退凭证；需要恢复时请先检查当前状态。")
         record_confirmed_result(
             owner=plan.owner,
             tool_name=plan.tool_name,

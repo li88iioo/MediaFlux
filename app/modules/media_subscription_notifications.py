@@ -82,6 +82,13 @@ def _event(item: dict) -> NotificationEvent:
 
 def drain_media_subscription_notifications(*, limit: int = 20) -> bool:
     """移交订阅事务事件；领域记录只在统一通知中心接纳后确认。"""
+    # 主动摘要复用同一周期唤醒与统一通知 outbox，不建立 Agent 专用线程。
+    from app.modules.media_automation_rules import drain_automation_rules
+
+    try:
+        drain_automation_rules(limit=limit)
+    except Exception as exc:
+        logger.exception("主动媒体摘要调度失败 type=%s", type(exc).__name__)
     recover_notifications()
     claimed = claim_due_notifications(limit=limit)
     if not claimed:
@@ -138,5 +145,5 @@ def recover_media_subscription_notifications() -> int:
     try:
         drain_media_subscription_notifications()
     except Exception as exc:
-        logger.warning("媒体订阅通知恢复投递失败 type=%s", type(exc).__name__)
+        logger.exception("媒体订阅通知恢复投递失败 type=%s", type(exc).__name__)
     return recovered

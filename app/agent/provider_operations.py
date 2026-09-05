@@ -425,6 +425,34 @@ def build_provider_catalog() -> ProviderCatalog:
             examples=("查看刚才下载任务包含哪些文件",),
         ),
     )
-    for spec in specs:
+    for spec in (*specs, *media_management_specs()):
         catalog.register(spec)
     return catalog
+
+
+def media_management_specs() -> tuple[ProviderOperationSpec, ...]:
+    """有界质量检查及用户写操作；原子 Schema 也复用于 Kernel 的领域目录。"""
+    ref = {"type": "string", "minLength": 8, "maxLength": 64}
+    page = {"start_index": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 25, "default": 20}}
+
+    def spec(operation, description, properties, required=(), refs=None, risk=RiskLevel.READ, examples=()):
+        return ProviderOperationSpec(operation_id=operation, provider="media", description=description, risk=risk,
+            parameters={"type": "object", "properties": properties, "required": list(required), "additionalProperties": False},
+            result_kind="media_quality" if operation == "media.library.quality" else "media_user_state",
+            reference_arguments=refs or {}, max_items=25, timeout_seconds=30, domains=("media_library", "playback"), examples=examples)
+
+    items = [
+        spec("media.library.quality", "分页只读检查媒体库视频版本、分辨率、中文字幕和服务器报告缺失状态；未知字段保持 unknown，仅本页查重，不将分页样本当全库结果，不播放或探测 STRM。", {**page, "library_ref": ref, "min_resolution": {"type": "integer", "enum": [720, 1080, 2160], "default": 1080}, "subtitle_language": {"type": "string", "enum": ["any", "chinese"], "default": "chinese"}}, required=("library_ref",), refs={"library_ref": "media_library"}, examples=("媒体库有哪些低清或缺中文字幕", "检查重复版本和失效媒体")),
+        spec("media.user.inspect", "读取搜索结果中单个媒体条目的已看、收藏和观看进度状态，创建绑定用户的短期状态引用；修改前必须读取。", {"item_ref": ref}, ("item_ref",), {"item_ref": "media_item"}, examples=("这部我看过吗", "准备收藏这部电影")),
+        spec("media.playlists.list", "分页列出当前媒体服务器用户可访问的播放列表，并返回短期列表引用。", page, examples=("我的播放列表有哪些",)),
+        spec("media.playlist.inspect", "读取播放列表及完整成员快照，最多250项；条目分页展示；返回修改用的列表快照引用和移除用的成员引用。", {**page, "playlist_ref": ref}, ("playlist_ref",), {"playlist_ref": "media_playlist"}, examples=("查看周末看片列表里的电影",)),
+    ]
+    for operation, action in (("mark_played", "标记已看"), ("mark_unplayed", "标记未看"), ("favorite", "收藏"), ("unfavorite", "取消收藏")):
+        items.append(spec(f"media.user.{operation}", f"人工确认后{action}单个媒体条目；item_ref 必须来自 media.user.inspect，不接受搜索结果旧引用。确认前复查状态，写后回读验证，不隐式批量改变整部剧集的观看状态。", {"item_ref": ref}, ("item_ref",), {"item_ref": "media_user_item"}, RiskLevel.LOW_WRITE, (f"{action}刚才的电影",)))
+    media_refs = {"type": "array", "items": ref, "minItems": 1, "maxItems": 20, "uniqueItems": True}
+    items.extend([
+        spec("media.playlist.create", "人工确认后为配置用户创建私有 Jellyfin 视频播放列表；可放入最多20个明确视频，不展开剧集。Emby API密钥无法验证新列表归属时安全拒绝。", {"name": {"type": "string", "minLength": 1, "maxLength": 120}, "item_refs": media_refs}, ("name", "item_refs"), {"item_refs": "media_item"}, RiskLevel.WRITE, ("把这几部电影放入新建的周末看片播放列表",)),
+        spec("media.playlist.add_items", "人工确认后把明确视频加入已有播放列表，跳过已经存在的条目；playlist_ref 来自 media.playlist.inspect。列表成员变化须重做确认。", {"playlist_ref": ref, "item_refs": media_refs}, ("playlist_ref", "item_refs"), {"playlist_ref": "media_playlist_snapshot", "item_refs": "media_item"}, RiskLevel.LOW_WRITE, ("把刚才的电影加入周末看片",)),
+        spec("media.playlist.remove_items", "人工确认后按成员引用移出播放列表，只改成员关系，绝不删除媒体文件；两个引用均来自 media.playlist.inspect。", {"playlist_ref": ref, "entry_refs": media_refs}, ("playlist_ref", "entry_refs"), {"playlist_ref": "media_playlist_snapshot", "entry_refs": "media_playlist_entry"}, RiskLevel.LOW_WRITE, ("从周末看片列表移除第一部，保留文件",)),
+    ])
+    return tuple(items)

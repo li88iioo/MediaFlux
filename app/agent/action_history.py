@@ -19,6 +19,28 @@ from app.modules.web_secret import get_web_secret
 logger = get_logger(__name__)
 
 _TOOL_LABELS = {
+    "activity.follow": "活动跟踪开启",
+    "activity.unfollow": "活动跟踪停用",
+    "action.undo.execute": "可逆操作回退",
+    "media.user.mark_played": "标记媒体已看",
+    "media.user.mark_unplayed": "标记媒体未看",
+    "media.user.favorite": "收藏媒体",
+    "media.user.unfavorite": "取消媒体收藏",
+    "media.playlist.create": "创建播放列表",
+    "media.playlist.add_items": "添加播放列表成员",
+    "media.playlist.remove_items": "移除播放列表成员",
+    "automation.create_media_rule": "创建媒体自动追更规则",
+    "automation.set_digest": "主动摘要规则保存",
+    "config.create_recognition_knowledge": "新增识别知识",
+    "config.update_recognition_knowledge": "修改识别知识",
+    "config.delete_recognition_knowledge": "删除识别知识",
+    "config.create_local_source": "新增本地媒体来源",
+    "config.update_local_source": "修改本地媒体来源",
+    "config.delete_local_source": "删除本地媒体来源",
+    "config.create_media_path_mapping": "新增媒体路径映射",
+    "config.update_media_path_mapping": "修改媒体路径映射",
+    "config.delete_media_path_mapping": "删除媒体路径映射",
+
     "downloads.retry_submission": "下载请求重新提交",
     "provider.change.execute": "Provider 原生写计划执行",
     "rss.mark_entries": "RSS 条目标记",
@@ -74,6 +96,28 @@ _TOOL_LABELS = {
 }
 
 _SAFE_FIELDS = {
+    "activity.follow": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "activity.unfollow": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "action.undo.execute": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.user.mark_played": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.user.mark_unplayed": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.user.favorite": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.user.unfavorite": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.playlist.create": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.playlist.add_items": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "media.playlist.remove_items": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "automation.create_media_rule": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "automation.set_digest": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.create_recognition_knowledge": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.update_recognition_knowledge": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.delete_recognition_knowledge": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.create_local_source": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.update_local_source": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.delete_local_source": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.create_media_path_mapping": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.update_media_path_mapping": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+    "config.delete_media_path_mapping": {"affected", "accepted", "enabled", "created", "runtime_refreshed"},
+
     "downloads.retry_submission": {
         "target",
         "status",

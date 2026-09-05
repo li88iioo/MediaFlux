@@ -15,6 +15,7 @@ from app.agent.indexer_actions import (
     validate_enabled_search_sites,
 )
 from app.agent.indexer_actions import search_arguments as indexer_search_arguments
+from app.agent.media_preference_policy import validate_resource_preference_overrides
 from app.agent.models import Evidence, ToolResult
 from app.agent.recent_resource_candidates import attach_resource_candidate_reference
 from app.agent.resource_recommendation import rank_episode_search
@@ -72,6 +73,7 @@ def missing_episode_resource_arguments(arguments: dict[str, Any]) -> dict[str, A
             "sites",
             "limit",
             "library_name",
+            "preference_overrides",
         },
     )
     query = _visible_text(arguments.get("query"), name="query")
@@ -120,6 +122,10 @@ def missing_episode_resource_arguments(arguments: dict[str, Any]) -> dict[str, A
     }
     if library_name:
         normalized["library_name"] = library_name
+    if "preference_overrides" in arguments:
+        normalized["preference_overrides"] = validate_resource_preference_overrides(
+            arguments["preference_overrides"],
+        )
     return normalized
 
 
@@ -135,6 +141,7 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
             "max_episodes",
             "limit_per_episode",
             "library_name",
+            "preference_overrides",
         },
     )
     query = _visible_text(arguments.get("query"), name="query")
@@ -184,6 +191,10 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
     }
     if library_name:
         normalized["library_name"] = library_name
+    if "preference_overrides" in arguments:
+        normalized["preference_overrides"] = validate_resource_preference_overrides(
+            arguments["preference_overrides"],
+        )
     return normalized
 
 
@@ -270,7 +281,9 @@ def _episode_search_arguments(arguments: dict[str, Any], title: str) -> dict[str
     )
 
 
-def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
+def search_missing_episode_resources(
+    arguments: dict[str, Any], *, preferences: dict[str, Any] | None = None,
+) -> ToolResult:
     audit_arguments: dict[str, Any] = {
         "query": arguments["query"],
         "tmdb_id": arguments["tmdb_id"],
@@ -342,6 +355,8 @@ def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
         search_data,
         season=arguments["season"],
         episode=arguments["episode"],
+        preferences=preferences,
+        preference_overrides=arguments.get("preference_overrides"),
     )
     data = {
         "verification": verification,
@@ -385,7 +400,9 @@ def search_missing_episode_resources(arguments: dict[str, Any]) -> ToolResult:
 _MISSING_SEASON_SEARCH_DEADLINE_SECONDS = 30.0
 
 
-def search_missing_season_resources(arguments: dict[str, Any]) -> ToolResult:
+def search_missing_season_resources(
+    arguments: dict[str, Any], *, preferences: dict[str, Any] | None = None,
+) -> ToolResult:
     deadline_at = time.monotonic() + _MISSING_SEASON_SEARCH_DEADLINE_SECONDS
     audit_arguments: dict[str, Any] = {
         "query": arguments["query"],
@@ -488,6 +505,8 @@ def search_missing_season_resources(arguments: dict[str, Any]) -> ToolResult:
             raw_search_data,
             season=target["season"],
             episode=target["episode"],
+            preferences=preferences,
+            preference_overrides=arguments.get("preference_overrides"),
         )
         items = search_data.get("items", [])
         item_count = len(items) if isinstance(items, list) else 0

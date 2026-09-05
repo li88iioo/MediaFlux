@@ -8,7 +8,15 @@ from collections.abc import Callable
 from typing import Any
 
 from app.agent.confirmation import confirmation_context_fingerprint
+from app.agent.library_quality_actions import inspect_library_quality
 from app.agent.media_links import media_open_url_resolver
+from app.agent.media_user_actions import (
+    USER_READS,
+    USER_WRITES,
+    execute_media_user,
+    preview_media_user,
+    read_media_user,
+)
 from app.agent.provider_models import (
     ProviderGatewayError,
     ProviderPayload,
@@ -178,6 +186,12 @@ class MediaServerProviderTransport:
                         )
                     return link_resolver(item_url)
 
+                if operation == "media.library.quality":
+                    user_id, _selection = self._playback_user(profile, client)
+                    return inspect_library_quality(client, user_id, arguments, server_label=profile.label, source=f"{profile.server_type}_api")
+                if operation in USER_READS:
+                    user_id, _selection = self._playback_user(profile, client)
+                    return read_media_user(client, user_id, operation, arguments, source=f"{profile.server_type}_api")
                 if operation == "media.system.info":
                     name, product, version = client.server_identity()
                     return ProviderPayload(
@@ -446,6 +460,17 @@ class MediaServerProviderTransport:
             raise ProviderGatewayError(
                 "媒体服务器尚未启用或配置不完整", code="provider_not_configured"
             )
+        if operation in USER_WRITES:
+            if operation == "media.playlist.create" and not profile.user_id:
+                raise ProviderGatewayError("创建播放列表前请明确配置媒体服务器用户，避免默认用户漂移", code="provider_user_required")
+            try:
+                with self._client(profile) as client:
+                    user_id, _selection = self._playback_user(profile, client)
+                    return preview_media_user(client, user_id, operation, arguments, server_type=profile.server_type, source=f"{profile.server_type}_api")
+            except ProviderGatewayError:
+                raise
+            except Exception as exc:
+                raise ProviderGatewayError("媒体用户操作预检未完成，未执行写入", code="provider_unavailable") from exc
         if operation == "media.library.refresh":
             target = dict(target_snapshot.get("library_ref") or {})
             label = str(target.get("name") or "选中媒体库")
@@ -494,6 +519,17 @@ class MediaServerProviderTransport:
             raise ProviderGatewayError(
                 "媒体服务器尚未启用或配置不完整", code="provider_not_configured"
             )
+        if operation in USER_WRITES:
+            if operation == "media.playlist.create" and not profile.user_id:
+                raise ProviderGatewayError("创建播放列表前请明确配置媒体服务器用户，避免默认用户漂移", code="provider_user_required")
+            try:
+                with self._client(profile) as client:
+                    user_id, _selection = self._playback_user(profile, client)
+                    return execute_media_user(client, user_id, operation, arguments, server_type=profile.server_type, source=f"{profile.server_type}_api")
+            except ProviderGatewayError:
+                raise
+            except Exception as exc:
+                raise ProviderGatewayError("媒体用户操作写前检查失败，未执行写入", code="provider_prewrite_failed") from exc
         if operation == "media.library.refresh":
             target_id = str(arguments.get("library_ref") or "").strip()
             scope = "library"

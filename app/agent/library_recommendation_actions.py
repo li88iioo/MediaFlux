@@ -8,6 +8,7 @@ from typing import Any
 
 from app.agent.errors import AgentToolError
 from app.agent.media_consumption_actions import select_media_profile
+from app.agent.media_preference_policy import owner_media_preferences
 from app.agent.models import ToolContext, ToolResult
 from app.agent.provider_actions import get_provider_gateway
 from app.agent.provider_models import ProviderGatewayError
@@ -71,7 +72,7 @@ def library_recommendation_arguments(arguments: dict[str, Any]) -> dict[str, Any
     limit = arguments.get("limit", 8)
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 20:
         raise AgentToolError("limit 必须是 1 到 20 的整数")
-    return {
+    result = {
         "server": server,
         "media_type": media_type,
         "must_match": _term_list(
@@ -84,11 +85,22 @@ def library_recommendation_arguments(arguments: dict[str, Any]) -> dict[str, Any
         "limit": limit,
     }
 
+    for key in ("prefer", "exclude", "min_rating", "exclude_played"):
+        if key not in arguments:
+            result.pop(key)
+    return result
+
 
 def get_library_recommendations(
     arguments: dict[str, Any], context: ToolContext
 ) -> ToolResult:
     normalized = library_recommendation_arguments(arguments)
+    preferences = owner_media_preferences(context.owner)
+    for argument, preference in (
+        ("prefer", "preferred_genres"), ("exclude", "excluded_genres"),
+        ("min_rating", "min_rating"), ("exclude_played", "exclude_played"),
+    ):
+        normalized.setdefault(argument, preferences[preference])
     profile, failure = select_media_profile(
         normalized,
         context,

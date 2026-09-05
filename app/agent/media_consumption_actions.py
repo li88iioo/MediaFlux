@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
+from copy import deepcopy
 from datetime import datetime
 from typing import Any
 
 from app.agent.action_history import action_history_owner_digest
 from app.agent.errors import AgentToolError
+from app.agent.media_preference_policy import (
+    PREFERENCE_FIELDS,
+    validate_preference_updates,
+)
 from app.agent.models import Evidence, ToolContext, ToolResult
 from app.agent.provider_actions import get_provider_gateway
 from app.agent.provider_models import ProviderGatewayError
@@ -26,10 +31,6 @@ from app.repositories.media_experience import (
     today_content_summary,
 )
 
-_PREFERENCE_CHOICES = {
-    "preferred_server": {"any", "jellyfin", "emby"},
-    "preferred_download_target": {"qb", "guangya", "both"},
-}
 _RULE_FIELDS = {
     "enabled",
     "notify_on_missing",
@@ -51,7 +52,7 @@ def _owner_digest(context: ToolContext) -> str:
 
 def _public_preferences(value: dict[str, Any]) -> dict[str, Any]:
     return {
-        key: value[key] for key in (*_PREFERENCE_CHOICES, "explicit") if key in value
+        key: value[key] for key in (*PREFERENCE_FIELDS, "explicit") if key in value
     }
 
 
@@ -118,19 +119,7 @@ def recently_added_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def preferences_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(arguments, dict):
-        raise AgentToolError("工具参数必须是 JSON 对象")
-    if not arguments or set(arguments) - set(_PREFERENCE_CHOICES):
-        raise AgentToolError("媒体偏好字段无效或为空")
-    result: dict[str, Any] = {}
-    for key, allowed in _PREFERENCE_CHOICES.items():
-        if key not in arguments:
-            continue
-        value = str(arguments[key] or "").strip().lower()
-        if value not in allowed:
-            raise AgentToolError(f"{key} 的取值不受支持")
-        result[key] = value
-    return result
+    return validate_preference_updates(arguments)
 
 
 def notification_rule_arguments(arguments: dict[str, Any]) -> dict[str, int]:
@@ -296,8 +285,9 @@ def get_preferences(_arguments: dict[str, Any], context: ToolContext) -> ToolRes
 def prepare_set_preferences(
     arguments: dict[str, Any], context: ToolContext
 ) -> tuple[ToolResult, str]:
+    arguments = preferences_update_arguments(arguments)
     current = get_media_preferences(_owner_digest(context))
-    proposed = {key: arguments.get(key, current[key]) for key in _PREFERENCE_CHOICES}
+    proposed = {key: arguments.get(key, current[key]) for key in PREFERENCE_FIELDS}
     snapshot = {"current": current, "proposed": proposed}
     return ToolResult(
         True,
@@ -310,14 +300,18 @@ def prepare_set_preferences(
 def set_preferences_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext
 ) -> ToolResult:
+    arguments = preferences_update_arguments(arguments)
     digest = _owner_digest(context)
     current = get_media_preferences(digest)
-    proposed = {key: arguments.get(key, current[key]) for key in _PREFERENCE_CHOICES}
+    proposed = {key: arguments.get(key, current[key]) for key in PREFERENCE_FIELDS}
     snapshot = {"current": current, "proposed": proposed}
     if not secrets.compare_digest(_fingerprint(snapshot), str(expected_context or "")):
         raise AgentToolError("媒体偏好已变化，请重新预检", code="confirmation_stale")
     updated = set_media_preferences(
-        digest, expected_revision=int(current["revision"]), updates=arguments
+        digest,
+        expected_revision=int(current["revision"]),
+        expected_revision_token=current["revision_token"],
+        updates=arguments,
     )
     if updated is None:
         raise AgentToolError("媒体偏好已变化，请重新预检", code="confirmation_stale")
@@ -330,6 +324,7 @@ def set_preferences_confirmed(
             "affected": 1,
             **_public_preferences(updated),
         },
+        effect_metadata={"compensation_after": deepcopy(updated)},
     )
 
 
@@ -357,13 +352,21 @@ def clear_preferences_confirmed(
     current = get_media_preferences(digest)
     if not secrets.compare_digest(_fingerprint(current), str(expected_context or "")):
         raise AgentToolError("媒体偏好已变化，请重新预检", code="confirmation_stale")
-    if not clear_media_preferences(digest, expected_revision=int(current["revision"])):
+    if not clear_media_preferences(
+        digest,
+        expected_revision=int(current["revision"]),
+        expected_revision_token=current["revision_token"],
+    ):
         raise AgentToolError("媒体偏好已变化，请重新预检", code="confirmation_stale")
     return ToolResult(
         True,
         "completed",
         "显式媒体偏好已清除",
         data={"operation": "clear_preferences", "affected": 1},
+        # 删除没有独立版本墓碑；这是精确的操作后状态，不是可用于跨 ABA 回退的版本令牌。
+        effect_metadata={"compensation_after": {
+            **default_media_preferences(), "revision": 0, "explicit": False,
+        }},
     )
 
 

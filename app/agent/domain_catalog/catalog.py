@@ -9,11 +9,17 @@ from app.agent.missing_media_workflow_runtime import MissingMediaWorkflowRuntime
 from app.agent.models import ToolSpec
 from app.agent.recent_resource_candidates import RecentResourceCandidateStore
 
+from .activity import register_specs as register_activity_specs
+from .automation_rules import register_specs as register_automation_rules_specs
 from .cloud import register_specs as register_cloud_specs
 from .cloud_sdk import register_specs as register_cloud_sdk_specs
+from .configuration_management import (
+    register_specs as register_configuration_management_specs,
+)
 from .discovery import register_specs as register_discovery_specs
 from .download import register_specs as register_download_specs
 from .library import register_specs as register_library_specs
+from .library_quality import register_specs as register_library_quality_specs
 from .local_media import register_specs as register_local_media_specs
 from .playback import register_specs as register_playback_specs
 from .resource import register_specs as register_resource_specs
@@ -37,6 +43,10 @@ class ToolSpecCollector:
 
 
 _REGISTRARS = (
+    register_activity_specs,
+    register_library_quality_specs,
+    register_automation_rules_specs,
+    register_configuration_management_specs,
     register_system_specs,
     register_local_media_specs,
     register_download_specs,

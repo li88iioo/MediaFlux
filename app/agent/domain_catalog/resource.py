@@ -177,7 +177,7 @@ def register_specs(
                 "在用户确认后统一提交最近检查的直链或光鸭分享，或按资源搜索候选序号提交。"
                 "资源搜索完成后应把返回的 resource_candidates_ref 原样传入，确保同轮与后续对话均绑定"
                 "同一份候选快照；直链或分享检查完成后应把 ingest_snapshot_ref 原样传入。"
-                "直链和资源候选可选 qB、光鸭或两边；光鸭分享仅转存到光鸭。确认参数不包含链接、"
+                "直链和资源候选可选 qB、光鸭或两边；省略 target 或使用 preferred 时，在预检中采用用户保存的默认下载目标，没有偏好则使用光鸭；目标随计划冻结，确认期间不随偏好变化。光鸭分享始终只转存到光鸭。确认参数不包含链接、"
                 "访问令牌、云端 file_id、内部 result_id 或后端任务标识。"
             ),
             risk=RiskLevel.DANGER,
@@ -189,7 +189,10 @@ def register_specs(
                         "type": "string",
                         "enum": ["direct_url", "guangya_share", "resource_candidates"],
                     },
-                    "target": {"type": "string", "enum": ["qb", "guangya", "both"]},
+                    "target": {
+                        "type": "string", "enum": ["preferred", "qb", "guangya", "both"],
+                        "description": "省略或 preferred 使用保存的默认目标；显式 qb/guangya/both 优先。",
+                    },
                     "positions": {
                         "type": "array",
                         "minItems": 1,
@@ -219,6 +222,7 @@ def register_specs(
             workflow="ingest_submit",
             workflow_stage=20,
             examples=(
+                "按我的默认下载目标提交刚才的资源",
                 "把刚才的磁力提交到 qB",
                 "把这个光鸭分享全部转存",
                 "把刚才第 1、3 个资源提交到两边，并使用搜索结果返回的 resource_candidates_ref",
