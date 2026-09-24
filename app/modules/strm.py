@@ -2250,7 +2250,7 @@ def _sync_strm_impl(
             stats.update(end_metrics(read_metrics))
     progress.emit("scan", 1, 1, "扫描云端目录")
     stats["scan_elapsed_seconds"] = round(time.monotonic() - scan_started, 3)
-    if stats["stopped"]:
+    if stop_requested("scan"):
         return stats
     if scan_errors or stats["scan_incomplete"]:
         stats["clean_skipped"] = True

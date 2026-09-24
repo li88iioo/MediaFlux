@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import tempfile
 import threading
@@ -108,6 +109,96 @@ _LAST_LOGGED_TOKEN_FINGERPRINT = ""
 
 _READ_METRICS_MAX_LATENCY_SAMPLES = 1024
 _DEFAULT_DIRECTORY_ITEM_LIMIT = 100_000
+_READ_RATE_LIMIT_CODES = {"127", "429"}
+_READ_RATE_LIMIT_MESSAGE_MARKERS = (
+    "操作过于频繁",
+    "请求过于频繁",
+    "too many requests",
+    "rate limit",
+)
+
+
+class _ReadCancelled(RuntimeError):
+    """调用方停止扫描；不视为云端失败，也不触发网络重试。"""
+
+
+def _wait_read_delay(delay: float, *, deadline=None, should_stop=None) -> None:
+    """退避和调度共用可中断等待，检查实际醒来时间而非仅检查预计时间。"""
+    until = monotonic() + delay
+    while True:
+        if should_stop and should_stop():
+            raise _ReadCancelled()
+        now = monotonic()
+        if deadline is not None and now >= deadline:
+            raise httpx.TimeoutException("光鸭只读请求超过时限")
+        remaining = until - now
+        if remaining <= 0:
+            return
+        if deadline is not None:
+            remaining = min(remaining, deadline - now)
+        sleep(min(remaining, 0.1) if should_stop else remaining)
+
+
+@dataclass
+class _ReadCongestion:
+    """仅在服务端限流后调节请求，不给正常读取施加固定 QPS。
+
+    临时退避从 125ms 起倍增；每 16 次成功减半，最终取消节拍。
+    这些是恢复策略参数，不是对旧站内接口限额的假设。
+    """
+
+    interval: float = 0.0
+    next_at: float = 0.0
+    generation: int = 0
+    successes: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def acquire(self, *, deadline=None, should_stop=None) -> int:
+        while True:
+            _wait_read_delay(0, deadline=deadline, should_stop=should_stop)
+            with self.lock:
+                now = monotonic()
+                delay = self.next_at - now
+                if delay <= 0:
+                    self.next_at = now + self.interval
+                    return self.generation
+                if deadline is not None and self.next_at >= deadline:
+                    raise httpx.TimeoutException("光鸭限流等待超过读取时限")
+            # 不提前预订未来槽位；醒来必须重查其它线程收到的新冷却。
+            _wait_read_delay(delay, deadline=deadline, should_stop=should_stop)
+
+    def rejected(self, generation: int, delay: float) -> None:
+        with self.lock:
+            if generation != self.generation:
+                return  # 同一波在途失败只降速一次，避免 15 个线程叠加退避。
+            self.generation += 1
+            self.successes = 0
+            self.interval = min(2.0, max(0.125, self.interval * 2))
+            self.next_at = max(self.next_at, monotonic() + delay)
+
+    def succeeded(self, generation: int) -> None:
+        with self.lock:
+            if generation != self.generation or not self.interval:
+                return  # 限流前发出的成功响应不能提前解除冷却。
+            self.successes += 1
+            if self.successes >= 16:
+                self.successes = 0
+                self.interval = self.interval / 2 if self.interval > 0.03125 else 0
+                self.next_at = min(self.next_at, monotonic() + self.interval)
+
+
+# 以同一个实际接口为单位共享拥塞状态；不按客户端实例重复计算额度。
+_READ_CONGESTION_LOCK = threading.Lock()
+_READ_CONGESTION: dict[str, _ReadCongestion] = {}
+
+
+def _read_congestion(operation: str) -> _ReadCongestion:
+    # SDK 的 fs_recycle_files 实际调用 fs_files(dir_type=4)，与目录读取同接口。
+    bucket = "list_dir" if operation in {"connection_probe", "list_recycle"} else operation
+    with _READ_CONGESTION_LOCK:
+        if bucket not in _READ_CONGESTION:
+            _READ_CONGESTION[bucket] = _ReadCongestion()
+        return _READ_CONGESTION[bucket]
 
 
 @dataclass
@@ -141,10 +232,10 @@ class GuangYaReadMetrics:
         with self._lock:
             self.pages += 1
 
-    def record_retry(self, status_code: int) -> None:
+    def record_retry(self, status_code: int, *, rate_limited: bool = False) -> None:
         with self._lock:
             self.retries += 1
-            self.rate_limit_retries += int(status_code == 429)
+            self.rate_limit_retries += int(rate_limited or status_code == 429)
 
     @staticmethod
     def _percentile(ordered: list[float], percentile: float) -> float:
@@ -324,26 +415,69 @@ class GuangYaWriteRejected(RuntimeError):
         super().__init__(f"光鸭写操作被拒绝 operation={self.operation}{detail}")
 
 
-def _validate_read_response(response: object) -> None:
-    """HTTP 成功不等于读取成功；错误响应不得用于判断空目录或对象已消失。"""
-    if isinstance(response, list):
+class GuangYaReadRejected(RuntimeError):
+    """Provider 以 HTTP 成功响应拒绝了只读操作。"""
+
+    def __init__(self, operation: str, *, code: str = "", message: str = "") -> None:
+        self.operation = str(operation or "read")
+        self.code = str(code or "").strip()[:40]
+        normalized_message = str(message or "").strip()[:160]
+        lowered = normalized_message.lower()
+        self.rate_limited = self.code in _READ_RATE_LIMIT_CODES or any(
+            token in lowered
+            for token in _READ_RATE_LIMIT_MESSAGE_MARKERS
+        )
+        self.retryable = self.rate_limited or self.code == "101"
+        if self.rate_limited:
+            public_message = "光鸭请求过于频繁，请稍后重试"
+        elif self.code:
+            public_message = f"光鸭接口拒绝读取（错误码 {self.code}）"
+        else:
+            public_message = "光鸭接口拒绝读取"
+        super().__init__(public_message)
+
+
+def _raise_read_rejection(response: object, *, operation: str = "read") -> None:
+    """统一识别 HTTP 200 内的业务失败，确保限流能进入正式重试链路。"""
+    if not isinstance(response, dict):
         return
-    if not isinstance(response, dict) or not response:
-        raise RuntimeError("光鸭读取返回无效响应")
     payloads = [response]
     if isinstance(response.get("data"), dict):
         payloads.append(response["data"])
     for payload in payloads:
-        if payload.get("error") or payload.get("errors"):
-            raise RuntimeError("光鸭接口拒绝读取")
-        if "success" in payload and payload["success"] is not True:
-            raise RuntimeError("光鸭接口拒绝读取")
+        message = str(
+            payload.get("msg")
+            or payload.get("message")
+            or response.get("msg")
+            or response.get("message")
+            or ""
+        ).strip()
         for key in ("code", "error_code"):
-            if key in payload and (
-                isinstance(payload[key], bool)
-                or str(payload[key]).strip() not in {"0", "200"}
-            ):
-                raise RuntimeError("光鸭接口拒绝读取")
+            if key not in payload:
+                continue
+            value = payload[key]
+            raw_code = str(value).strip()
+            if isinstance(value, bool) or raw_code not in {"0", "200"}:
+                raise GuangYaReadRejected(operation, code=raw_code, message=message)
+        if payload.get("error") or payload.get("errors"):
+            raise GuangYaReadRejected(operation, message=message)
+        if "success" in payload and payload["success"] is not True:
+            raise GuangYaReadRejected(operation, message=message)
+        lowered = message.lower()
+        if any(
+            token in lowered
+            for token in _READ_RATE_LIMIT_MESSAGE_MARKERS
+        ):
+            raise GuangYaReadRejected(operation, message=message)
+
+
+def _validate_read_response(response: object, *, operation: str = "read") -> None:
+    """HTTP 成功不等于读取成功；错误响应不得用于判断空目录或对象已消失。"""
+    _raise_read_rejection(response, operation=operation)
+    if isinstance(response, list):
+        return
+    if not isinstance(response, dict) or not response:
+        raise RuntimeError("光鸭读取返回无效响应")
 
 
 def _read_success_acknowledged(response: dict) -> bool:
@@ -1223,8 +1357,8 @@ class GuangYaClient:
         """禁止 SDK 在任意 HTTP 请求内部自动刷新并重放。
 
         光鸭 SDK 的业务接口当前统一使用 POST，不能按 HTTP method 判断
-        是否幂等。明确的业务只读操作由 ``_call_read`` 在外层完成一次
-        有界刷新/重试；移动、删除、创建等写操作始终只发送一次。
+        是否幂等。明确的业务只读操作由 ``_call_read`` 统一执行拥塞控制
+        和有界刷新/重试；移动、删除、创建等写操作始终只发送一次。
         """
         if getattr(raw, "_mediaflux_request_policy", False):
             return
@@ -1322,11 +1456,33 @@ class GuangYaClient:
             return 0
 
     @classmethod
+    def _rate_limit_kind(cls, exc: BaseException) -> str:
+        current: BaseException | None = exc
+        visited: set[int] = set()
+        http_limited = False
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+            if isinstance(current, GuangYaReadRejected) and current.rate_limited:
+                return "business"
+            http_limited |= cls._exception_status_code(current) == 429
+            current = current.__cause__ or current.__context__
+        return "http" if http_limited else ""
+
+    @staticmethod
+    def _read_retry_delay(attempt: int, *, rate_limited: bool) -> float:
+        if not rate_limited:
+            return 0.15
+        base = (0.6, 1.2)[min(max(0, attempt), 1)]
+        return base + random.uniform(0.0, base * 0.25)
+
+    @classmethod
     def _read_retryable(cls, exc: Exception) -> bool:
         current: BaseException | None = exc
         visited: set[int] = set()
         while current is not None and id(current) not in visited:
             visited.add(id(current))
+            if isinstance(current, GuangYaReadRejected) and current.retryable:
+                return True
             status_code = cls._exception_status_code(current)
             if status_code in {401, 408, 425, 429, 500, 502, 503, 504}:
                 return True
@@ -1349,63 +1505,70 @@ class GuangYaClient:
             current = current.__cause__ or current.__context__
         return False
 
-    def _call_read(self, operation: str, callback, *, deadline: float | None = None):
-        """只对明确的只读操作执行一次有界重试。
+    def _call_read(
+        self,
+        operation: str,
+        callback,
+        *,
+        deadline: float | None = None,
+        refresh_unauthorized: bool = True,
+        should_stop: Callable[[], bool] | None = None,
+    ):
+        """对明确的只读操作执行限频、业务响应校验与有界重试。
 
         ``deadline`` 仅用于可降级的媒体探测读取。它禁止 401 路径触发无法
         继承该截止时间的 token 刷新，并把瞬时错误退避限制在剩余预算内。
         """
-        for attempt in range(2):
-            if deadline is not None and monotonic() >= deadline:
-                raise httpx.TimeoutException(f"{operation} exceeded its deadline")
+        congestion = _read_congestion(operation)
+        attempt = 0
+        while True:
+            generation = congestion.acquire(deadline=deadline, should_stop=should_stop)
+            observed_access_token = str(getattr(getattr(self, "_raw", None), "token", "") or "")
+            started = monotonic()
+            metrics = self._active_read_metrics()
             try:
-                observed_access_token = str(
-                    getattr(getattr(self, "_raw", None), "token", "") or ""
-                )
-                started = monotonic()
-                try:
-                    result = callback()
-                except Exception:
-                    metrics = self._active_read_metrics()
-                    if metrics is not None:
-                        metrics.record_request(monotonic() - started, failed=True)
-                    raise
-                metrics = self._active_read_metrics()
-                if metrics is not None:
-                    metrics.record_request(monotonic() - started)
-                return result
+                result = callback()
+                _raise_read_rejection(result, operation=operation)
             except Exception as exc:
-                if attempt or not self._read_retryable(exc):
+                if metrics is not None:
+                    metrics.record_request(monotonic() - started, failed=True)
+                rate_limit_kind = self._rate_limit_kind(exc)
+                rate_limited = bool(rate_limit_kind)
+                delay = self._read_retry_delay(attempt, rate_limited=rate_limited)
+                if rate_limited:
+                    congestion.rejected(generation, delay)
+                retry_limit = 2 if rate_limit_kind == "business" else 1
+                if attempt >= retry_limit or not self._read_retryable(exc):
                     raise
                 status_code = self._exception_status_code(exc)
-                metrics = self._active_read_metrics()
+                if status_code == 401 and (deadline is not None or not refresh_unauthorized):
+                    raise  # 有预算的探测与只读凭据校验不得触发无限时刷新。
                 if metrics is not None:
-                    metrics.record_retry(status_code)
+                    metrics.record_retry(status_code, rate_limited=rate_limited)
+                provider_code = (
+                    exc.code if isinstance(exc, GuangYaReadRejected) else ""
+                )
+                retry_reason = provider_code or status_code or "network"
                 log_throttled(
                     logger,
                     logging.WARNING,
-                    f"guangya-read-retry:{operation}:{status_code or 'network'}:{type(exc).__name__}",
-                    "光鸭只读请求瞬时失败，准备重试 operation=%s status=%s type=%s",
+                    f"guangya-read-retry:{operation}:{retry_reason}:{type(exc).__name__}",
+                    "光鸭只读请求瞬时失败，准备重试 operation=%s reason=%s type=%s",
                     operation,
-                    status_code or "network",
+                    retry_reason,
                     type(exc).__name__,
                 )
                 if status_code == 401:
-                    if deadline is not None:
-                        # 媒体探测属于可降级读取；不要让无截止时间的凭据刷新
-                        # 突破整个整理任务的墙钟预算。
-                        raise
                     self._refresh_after_unauthorized(observed_access_token)
-                else:
-                    delay = 0.15
-                    if deadline is not None:
-                        delay = min(delay, max(0.0, deadline - monotonic()))
-                        if delay <= 0:
-                            raise httpx.TimeoutException(
-                                f"{operation} exceeded its deadline"
-                            ) from exc
-                    sleep(delay)
-        raise RuntimeError("光鸭只读请求重试状态异常")
+                elif not rate_limited:
+                    _wait_read_delay(delay, deadline=deadline, should_stop=should_stop)
+                # 限流由共享调度器统一等待，不再让每个线程各自 sleep 后齐发。
+                attempt += 1
+            else:
+                if metrics is not None:
+                    metrics.record_request(monotonic() - started)
+                congestion.succeeded(generation)
+                return result
 
     def _ensure_fresh_token(self) -> None:
         if self._invalidate_if_stale():
@@ -1616,7 +1779,12 @@ class GuangYaClient:
             previous_blocked = bool(getattr(raw, "_mediaflux_refresh_blocked", False))
             raw._mediaflux_refresh_blocked = True
             try:
-                raw.fs_files(parent_id=None, page=0, page_size=1)
+                response = self._call_read(
+                    "connection_probe",
+                    lambda: raw.fs_files(parent_id=None, page=0, page_size=1),
+                    refresh_unauthorized=False,
+                )
+                _validate_read_response(response, operation="connection_probe")
                 return True
             except _ValidationRefreshBlocked:
                 logger.warning("光鸭只读校验检测到 SDK 刷新请求，已阻止并判定无效")
@@ -1665,14 +1833,18 @@ class GuangYaClient:
         while True:
             if should_stop and should_stop():
                 return
-            res = self._call_read(
-                "list_dir",
-                lambda: self.raw.fs_files(
-                    parent_id=normalized_parent,
-                    page=page,
-                    page_size=page_size,
-                ),
-            )
+            try:
+                res = self._call_read(
+                    "list_dir",
+                    lambda: self.raw.fs_files(
+                        parent_id=normalized_parent,
+                        page=page,
+                        page_size=page_size,
+                    ),
+                    should_stop=should_stop,
+                )
+            except _ReadCancelled:
+                return
             metrics = self._active_read_metrics()
             if metrics is not None:
                 metrics.record_page()

@@ -19,7 +19,7 @@ import httpx
 from fastapi.testclient import TestClient
 
 import app.clients.guangya as guangya_module
-from app.clients.guangya import GuangYaClient, _to_file
+from app.clients.guangya import GuangYaClient, GuangYaReadRejected, _to_file
 from app.config import web_credentials
 from app.main import create_app
 from tests.support import InitializedWebTestCase
@@ -785,6 +785,26 @@ class GuangYaTokenClientTests(unittest.TestCase):
             self.assertEqual(client._raw.refresh_calls, [])
             self.assertEqual(token_file.read_text(encoding="utf-8"), original_payload)
 
+    def test_validate_retries_business_rate_limit_without_refreshing_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            token_file = self._token_file(directory, expires_at=time() + 7200)
+            with patch("app.clients.guangya._load_raw", return_value=_RotatingRawClient):
+                client = GuangYaClient(token_file=token_file)
+            client._raw.fs_files = Mock(side_effect=[
+                {"code": 127, "msg": "操作过于频繁，请稍后重试"},
+                {"code": 127, "msg": "操作过于频繁，请稍后重试"},
+                {"code": 0, "data": {"list": []}},
+            ])
+
+            with patch.object(client, "_read_retry_delay", return_value=0), patch(
+                "app.clients.guangya.sleep"
+            ):
+                valid = client.validate()
+
+            self.assertTrue(valid)
+            self.assertEqual(client._raw.fs_files.call_count, 3)
+            self.assertEqual(client._raw.refresh_calls, [])
+
     def test_token_status_rejects_non_numeric_type_and_out_of_range_expiry(self):
         with tempfile.TemporaryDirectory() as directory:
             token_file = self._token_file(directory)
@@ -1139,6 +1159,11 @@ if __name__ == "__main__":
 
 
 class GuangYaReadRetryPolicyTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.dict(guangya_module._READ_CONGESTION, {}, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     class _TransientError(RuntimeError):
         pass
 
@@ -1152,14 +1177,18 @@ class GuangYaReadRetryPolicyTests(unittest.TestCase):
                 raise self._TransientError("temporary")
             return {"ok": True}
 
-        with patch.object(client, "_read_retryable", return_value=True), patch(
-            "app.clients.guangya.sleep"
-        ) as sleep_mock:
+        clock = [100.0]
+        with (
+            patch.object(client, "_read_retryable", return_value=True),
+            patch("app.clients.guangya.monotonic", side_effect=lambda: clock[0]),
+            patch("app.clients.guangya.sleep", side_effect=lambda t: clock.__setitem__(0, clock[0] + t)) as sleep_mock,
+        ):
             result = client._call_read("unit_read", operation)
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(len(calls), 2)
-        sleep_mock.assert_called_once_with(0.15)
+        sleep_mock.assert_called_once()
+        self.assertAlmostEqual(sleep_mock.call_args.args[0], 0.15, places=3)
 
     def test_httpx_transport_error_is_retryable_through_wrapped_cause(self):
         request = httpx.Request("POST", "https://example.invalid/read")
@@ -1168,6 +1197,74 @@ class GuangYaReadRetryPolicyTests(unittest.TestCase):
         wrapped.__cause__ = transport
 
         self.assertTrue(GuangYaClient._read_retryable(wrapped))
+
+    def test_business_rate_limit_retries_twice_and_records_metrics(self):
+        client = object.__new__(GuangYaClient)
+        client._read_metrics_lock = threading.Lock()
+        client._read_metrics = None
+        collector = client.begin_read_metrics()
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            if calls < 3:
+                return {"code": 127, "msg": "操作过于频繁，请稍后重试"}
+            return {"code": 0, "data": {"list": []}}
+
+        clock = [100.0]
+        with (
+            patch.object(client, "_read_retry_delay", side_effect=(0.6, 1.2)),
+            patch("app.clients.guangya.monotonic", side_effect=lambda: clock[0]),
+            patch("app.clients.guangya.sleep", side_effect=lambda t: clock.__setitem__(0, clock[0] + t)) as sleep_mock,
+        ):
+            result = client._call_read("list_dir", operation)
+        metrics = client.end_read_metrics(collector)
+
+        self.assertEqual(result, {"code": 0, "data": {"list": []}})
+        self.assertEqual(calls, 3)
+        self.assertEqual(len(sleep_mock.call_args_list), 2)
+        self.assertAlmostEqual(sum(c.args[0] for c in sleep_mock.call_args_list), 1.8)
+        self.assertEqual(metrics["directory_requests"], 3)
+        self.assertEqual(metrics["read_failures"], 2)
+        self.assertEqual(metrics["read_retries"], 2)
+        self.assertEqual(metrics["rate_limit_retries"], 2)
+
+    def test_exhausted_business_rate_limit_is_clear_and_does_not_leak_message(self):
+        client = object.__new__(GuangYaClient)
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            return {"code": 127, "msg": "操作过于频繁 secret-provider-detail"}
+
+        clock = [100.0]
+        with (
+            patch.object(client, "_read_retry_delay", return_value=0.6),
+            patch("app.clients.guangya.monotonic", side_effect=lambda: clock[0]),
+            patch("app.clients.guangya.sleep", side_effect=lambda t: clock.__setitem__(0, clock[0] + t)),
+            self.assertRaises(GuangYaReadRejected) as caught,
+        ):
+            client._call_read("list_dir", operation)
+
+        self.assertEqual(calls, 3)
+        self.assertEqual(str(caught.exception), "光鸭请求过于频繁，请稍后重试")
+        self.assertNotIn("secret-provider-detail", str(caught.exception))
+
+    def test_all_client_instances_share_the_same_read_governor(self):
+        self.assertIs(
+            guangya_module._read_congestion("list_dir"),
+            guangya_module._read_congestion("connection_probe"),
+        )
+        self.assertIs(
+            guangya_module._read_congestion("list_dir"),
+            guangya_module._read_congestion("list_recycle"),
+        )
+        self.assertIsNot(
+            guangya_module._read_congestion("list_dir"),
+            guangya_module._read_congestion("get_download_url"),
+        )
 
     def test_read_401_forces_refresh_before_single_retry(self):
         client = object.__new__(GuangYaClient)

@@ -15,7 +15,7 @@ aiohttp>=3.9
 pyTelegramBotAPI>=4.15
 
 # ===== 网盘 SDK =====
-guangyaclient>=0.0.2     # 光鸭云盘官方客户端 (DDSRem-Dev/guangyaclient)
+guangyaclient>=0.0.2     # 光鸭云盘第三方客户端 (DDSRem-Dev/guangyaclient)
 tqdm>=4.66
 
 # ===== 解析与刮削 =====
