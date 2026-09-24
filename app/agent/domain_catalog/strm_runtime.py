@@ -168,6 +168,10 @@ def _capture_strm_run(arguments: dict[str, Any]) -> dict[str, Any]:
     validation_error = str(scheduler.validate_config(auto_only=False) or "")
     raw_status = scheduler.status()
     running = isinstance(raw_status, dict) and raw_status.get("running") is True
+    last_run = raw_status.get("last_run") if isinstance(raw_status, dict) else {}
+    last_run_id = (
+        _bounded_int(last_run.get("id")) if isinstance(last_run, dict) else 0
+    )
     payload = {key: config.get(key, "") for key in _STRM_CONFIRMATION_KEYS}
     payload.update(
         {
@@ -188,6 +192,7 @@ def _capture_strm_run(arguments: dict[str, Any]) -> dict[str, Any]:
         "selection_error": selection_error,
         "validation_error": validation_error,
         "running": running,
+        "last_run_id": last_run_id,
         "fingerprint": hashlib.sha256(encoded).hexdigest(),
     }
 
@@ -346,6 +351,14 @@ def _run_strm_once_state(
             )
         ],
         suggestions=["可询问：查看 STRM 同步进度。"],
+        effect_metadata={
+            "completion": {
+                "kind": "strm_run",
+                "after_run_id": int(state.get("last_run_id") or 0),
+                "trigger_type": "manual",
+                "operation": "run",
+            }
+        },
     )
 
 

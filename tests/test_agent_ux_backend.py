@@ -517,9 +517,13 @@ def test_selection_click_only_previews_and_explicit_confirmation_has_one_effect(
             assert session.model.requests == []
             first = await _events(session.confirm(owner=OWNER, session_id=SESSION, plan_id=pending))
             assert any(event.type is AgentEventType.EFFECT_COMPLETED for event in first)
+            completed = [event for event in first if event.type is AgentEventType.TURN_COMPLETED]
+            assert completed
+            assert "后台任务尚未完成" in completed[-1].payload["answer"]
+            assert "提交步骤已完成" not in completed[-1].payload["answer"]
             await _events(session.confirm(owner=OWNER, session_id=SESSION, plan_id=pending))
             execute.assert_called_once()
-            assert session.model.requests == []  # accepted 回执由 Kernel 确定性收口，不再交给模型改写。
+            assert len(session.model.requests) == 1  # 已受理回执继续交给 Agent 说明状态，但不得再次执行。
     asyncio.run(exercise())
 
 

@@ -41,6 +41,7 @@ def _capture() -> dict[str, Any]:
         else "not_scheduled",
         "next_run_at": str(row["next_run_at"] or "") if row is not None else "",
         "lease_generation": int(row["lease_generation"] or 0) if row is not None else 0,
+        "last_finished_at": str(row["last_finished_at"] or "") if row is not None else "",
     }
     fingerprint = confirmation_context_fingerprint(
         {"policy": policy, "state": state},
@@ -112,6 +113,15 @@ def trigger_patrol_now_confirmed(
             data={"queued": True, "reused": False, "task_status": "pending"},
             evidence=[Evidence("patrol_scheduler", "后台调度器已被唤醒。", _now())],
             suggestions=["稍后可询问：最近一次全库巡检结果。"],
+            effect_metadata={
+                "completion": {
+                    "kind": "library_patrol",
+                    "lease_generation": int(current["state"]["lease_generation"]),
+                    "task_status": str(current["state"]["task_status"]),
+                    "last_finished_at": str(current["state"]["last_finished_at"]),
+                    "operation": "run",
+                }
+            },
         )
     if status == "already_running":
         return ToolResult(
@@ -123,6 +133,15 @@ def trigger_patrol_now_confirmed(
                 Evidence("patrol_scheduler", "已复用当前运行中的巡检单例。", _now())
             ],
             suggestions=["可询问：全库巡检现在到哪了。"],
+            effect_metadata={
+                "completion": {
+                    "kind": "library_patrol",
+                    "lease_generation": int(current["state"]["lease_generation"]),
+                    "task_status": str(current["state"]["task_status"]),
+                    "last_finished_at": str(current["state"]["last_finished_at"]),
+                    "operation": "run",
+                }
+            },
         )
     raise AgentToolError(
         "当前无法安排全库缺集巡检，请稍后重试", code="precondition_failed"

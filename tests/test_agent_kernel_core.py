@@ -383,7 +383,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         internal = (
             "已确认操作的可信系统结果（不是待执行计划）：\n"
             '{"ok":true,"status":"accepted","data":{"private_id":99}}'
-            "\n\n### 处理完成\n后台正在归档。"
+            "\n\n请求已提交，后台仍在归档；可以继续查询进度。"
         )
         model = ScriptedModel([
             [
@@ -421,16 +421,19 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.status, "success")
         self.assertIn("重新排队", final.answer)
         self.assertIn("后台任务尚未完成", final.answer)
-        self.assertTrue(final.answer.startswith("⏳ "))
+        self.assertTrue(final.answer.startswith("📤 "))
+        self.assertIn("可以继续查询进度", final.answer)
         self.assertNotIn("可信系统结果", public_events)
         self.assertNotIn("private_id", public_events)
         self.assertNotIn("处理完成", public_events)
-        self.assertFalse(any(
-            event.type in {AgentEventType.MODEL_STARTED, AgentEventType.MODEL_DELTA}
-            for event in events
+        self.assertTrue(any(
+            event.type is AgentEventType.MODEL_STARTED for event in events
         ))
-        self.assertEqual(len(model.requests), 1, "未完成的后台任务不应再交给模型改写终态")
-        self.assertEqual(len(model.rounds), 1)
+        self.assertFalse(any(
+            event.type is AgentEventType.MODEL_DELTA for event in events
+        ))
+        self.assertEqual(len(model.requests), 2, "已提交结果应继续交给 Agent 汇总")
+        self.assertEqual(len(model.rounds), 0)
         stored = await state.load(owner="owner", session_id="session")
         internal_rows = [
             row for row in stored.conversation
@@ -441,6 +444,68 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "可信系统结果", str(internal_rows[0].get("public_content") or "")
         )
+
+    async def test_confirm_without_restored_user_returns_submitted_receipt_not_fake_completion(self):
+        tool = KernelToolSpec(
+            name="cloud.submit",
+            domain="cloud",
+            description="提交后台任务",
+            input_schema={"type": "object", "properties": {}},
+            effect=ToolEffect.WRITE,
+            prepare=lambda _a, _c: PreparedEffect(
+                preview={"summary": "提交后台任务"},
+                snapshot_fingerprint="snapshot",
+            ),
+            execute_confirmed=lambda _a, _s, _c: ToolResult(
+                True, "accepted", "后台任务已提交"
+            ),
+        )
+        catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
+        pipeline = ToolPipeline(catalog=catalog, state_store=state)
+        lease, _ = await state.begin_turn(
+            owner="owner", session_id="session", request_id="prepare"
+        )
+        preview = await pipeline.execute(
+            tool.name,
+            {},
+            context=ToolCallContext(
+                owner="owner",
+                session_id="session",
+                request_id="prepare",
+                turn_id=lease.turn_id,
+                lease=lease,
+                cancellation=CancellationToken(),
+                report_progress=lambda _payload: asyncio.sleep(0),
+            ),
+        )
+        self.assertEqual(
+            (await state.load(owner="owner", session_id="session")).conversation,
+            [],
+        )
+        model = ScriptedModel([])
+        session = AgentSession(
+            model=model,
+            catalog=catalog,
+            retriever=CapabilityRetriever(),
+            pipeline=pipeline,
+            state_store=state,
+        )
+
+        events = await collect(
+            session.confirm(
+                owner="owner",
+                session_id="session",
+                plan_id=preview.effect_plan.plan_id,
+            )
+        )
+        final = await consume_events(_events_stream(events))
+
+        self.assertEqual(final.status, "success")
+        self.assertTrue(final.answer.startswith("📤 "))
+        self.assertIn("后台任务尚未完成", final.answer)
+        self.assertEqual(events[-1].payload["finish_reason"], "effect_submitted")
+        self.assertNotEqual(events[-1].payload["status"], "effect_completed")
+        self.assertEqual(model.requests, [])
 
     async def test_summary_failure_after_confirm_preserves_successful_write(self):
         writes = []

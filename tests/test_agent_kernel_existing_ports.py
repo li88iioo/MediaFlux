@@ -21,7 +21,9 @@ from app.agent.models import RiskLevel, ToolResult, ToolSpec
 from app.clients.guangya import GuangYaFile
 
 
-async def context_for(state, *, owner="owner", session="session"):
+async def context_for(
+    state, *, owner="owner", session="session", wait_for_completion=False
+):
     lease, _ = await state.begin_turn(
         owner=owner, session_id=session, request_id="request"
     )
@@ -37,6 +39,7 @@ async def context_for(state, *, owner="owner", session="session"):
         lease=lease,
         cancellation=CancellationToken(),
         report_progress=progress,
+        wait_for_completion=wait_for_completion,
     )
 
 
@@ -363,6 +366,9 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 return "private-task-id"
 
+            def task_status(self, _task_id):
+                return {"data": {"status": "completed", "progress": 100}}
+
             def close(self):
                 return True
 
@@ -370,14 +376,11 @@ class ExistingDomainPortTests(unittest.IsolatedAsyncioTestCase):
         catalog = catalog_from_tool_specs(build_tool_specs())
         state = InMemorySessionStateStore()
         pipeline = ToolPipeline(catalog=catalog, state_store=state)
-        context = await context_for(state)
+        context = await context_for(state, wait_for_completion=True)
 
-        with (
-            patch(
-                "app.agent.guangya_recycle_actions.GuangYaClient",
-                return_value=client,
-            ),
-            patch("app.agent.guangya_recycle_actions.time.sleep", return_value=None),
+        with patch(
+            "app.agent.guangya_recycle_actions.GuangYaClient",
+            return_value=client,
         ):
             listed = await pipeline.execute(
                 "guangya.recycle.list",

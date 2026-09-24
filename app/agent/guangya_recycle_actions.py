@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import math
-import time
 from datetime import datetime
 from typing import Any
 
@@ -317,20 +316,6 @@ def execute_restore_guangya_recycle(
             task_id = client.restore_from_recycle(
                 [str(item.get("file_id") or "") for item in selected]
             )
-            remaining = {str(item.get("file_id") or "") for item in selected}
-            for _attempt in range(20):
-                try:
-                    current_ids = {
-                        str(item.file_id)
-                        for item in client.list_recycle(max_items=_MAX_RECYCLE_ITEMS)
-                    }
-                except Exception as exc:  # noqa: BLE001 -- 写已受理，复核失败不可声称未执行
-                    logger.warning("光鸭恢复后复核暂不可用 type=%s", type(exc).__name__)
-                    break
-                remaining &= current_ids
-                if not remaining:
-                    break
-                time.sleep(0.5)
         finally:
             close_guangya_client(client)
     except Exception as exc:
@@ -343,31 +328,23 @@ def execute_restore_guangya_recycle(
             ttl_seconds=24 * 60 * 60,
         )
     ] if task_id else []
-    verified = not remaining
     return ToolResult(
         True,
-        "completed" if verified else "accepted",
-        (
-            f"已从光鸭回收站恢复 {safe['count']} 个对象"
-            if verified
-            else f"光鸭已受理 {safe['count']} 个对象的恢复请求"
-        ),
-        data={**safe, "verified": verified, "verification_pending": not verified},
+        "accepted",
+        f"光鸭已受理 {safe['count']} 个对象的恢复请求",
+        data={**safe, "verified": False, "verification_pending": True},
         model_data={
             "count": safe["count"],
-            "verified": verified,
-            "verification_pending": not verified,
+            "verified": False,
+            "verification_pending": True,
         },
         references=references,
         evidence=[
             Evidence(
                 "guangya_recycle_restore",
-                "恢复请求已经 Provider 接受；同步可见时已再次读取回收站验证。",
+                "Provider 已接受恢复请求；受理不等于完成，后续按任务句柄核验终态。",
                 _now(),
             )
-        ],
-        suggestions=[
-            *(["可使用返回的光鸭任务引用继续查询异步状态。"] if references else []),
         ],
     )
 
@@ -459,16 +436,6 @@ def execute_clear_guangya_recycle(
                     code="confirmation_stale",
                 )
             task_id = client.clear_recycle_bin()
-            remaining = safe["count"]
-            for _attempt in range(20):
-                try:
-                    remaining = len(client.list_recycle(max_items=_MAX_RECYCLE_ITEMS))
-                except Exception as exc:  # noqa: BLE001 -- 写已受理，保留 verification_pending
-                    logger.warning("光鸭清空后复核暂不可用 type=%s", type(exc).__name__)
-                    break
-                if remaining == 0:
-                    break
-                time.sleep(0.5)
         finally:
             close_guangya_client(client)
     except Exception as exc:
@@ -481,37 +448,29 @@ def execute_clear_guangya_recycle(
             ttl_seconds=24 * 60 * 60,
         )
     ] if task_id else []
-    verified = remaining == 0
     return ToolResult(
         True,
-        "completed" if verified else "accepted",
-        (
-            f"光鸭回收站已清空，共永久删除 {safe['count']} 个对象"
-            if verified
-            else f"光鸭已受理清空回收站请求，涉及 {safe['count']} 个对象"
-        ),
+        "accepted",
+        f"光鸭已受理清空回收站请求，涉及 {safe['count']} 个对象",
         data={
             "count": safe["count"],
             "total_size": safe["total_size"],
-            "verified": verified,
-            "verification_pending": not verified,
+            "verified": False,
+            "verification_pending": True,
             "irreversible": True,
         },
         model_data={
             "count": safe["count"],
-            "verified": verified,
-            "verification_pending": not verified,
+            "verified": False,
+            "verification_pending": True,
         },
         references=references,
         evidence=[
             Evidence(
                 "guangya_recycle_clear",
-                "Provider 已接受不可逆清空请求；同步可见时已再次读取回收站验证。",
+                "Provider 已接受不可逆清空请求；受理不等于完成，后续按任务句柄核验终态。",
                 _now(),
             )
-        ],
-        suggestions=[
-            *(["可使用返回的光鸭任务引用继续查询异步状态。"] if references else []),
         ],
     )
 

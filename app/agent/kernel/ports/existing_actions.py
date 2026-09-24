@@ -11,12 +11,12 @@ from collections.abc import Iterable
 from typing import Any
 
 from app.agent.confirmation_contract import build_confirmation_contract
-from app.agent.domain_catalog.cloud_runtime import wait_for_guangya_operation
 from app.agent.domain_tool_metadata import (
     DOMAIN_ALIASES,
     PREFIX_RETRIEVAL_TERMS,
     TOOL_RETRIEVAL_TERMS,
 )
+from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.feature_gate import (
     AgentRuntimeDisabled,
     agent_runtime_admission,
@@ -277,7 +277,9 @@ def adapt_tool_spec(spec: ToolSpec) -> KernelToolSpec:
         # 只有异常或写后验证失败才进入 ToolPipelineError。
         return result
 
-    async def verify(arguments: dict[str, Any], value: Any, context: ToolCallContext) -> Any:
+    async def verify(
+        arguments: dict[str, Any], value: Any, context: ToolCallContext
+    ) -> Any:
         if not isinstance(value, ToolResult):
             raise ToolPipelineError(
                 "写后验证输入无效", code="post_write_verification_failed"
@@ -300,8 +302,12 @@ def adapt_tool_spec(spec: ToolSpec) -> KernelToolSpec:
                     exc, fallback_code="post_write_verification_failed"
                 ) from exc
             if not isinstance(verified, ToolResult):
-                raise ToolPipelineError("领域能力返回无效结果", code="invalid_tool_result")
-        return await wait_for_guangya_operation(
+                raise ToolPipelineError(
+                    "领域能力返回无效结果", code="invalid_tool_result"
+                )
+        if not context.wait_for_completion:
+            return verified
+        return await wait_for_effect_completion(
             verified,
             tool=spec.name,
             context=_kernel_context(context),

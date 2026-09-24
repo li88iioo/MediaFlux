@@ -332,6 +332,7 @@ def execute_undo(
                 "整理队列未接收回退任务，请核对后重试",
                 error="整理任务正在运行",
             )
+        task_id = str(accepted.get("task_id") or "").strip()
         return ToolResult(
             True,
             "accepted",
@@ -344,6 +345,17 @@ def execute_undo(
                     ttl_seconds=86400,
                 )
             ],
+            effect_metadata=(
+                {
+                    "completion": {
+                        "kind": "guangya_organize_task",
+                        "task_id": task_id,
+                        "operation": "undo",
+                    }
+                }
+                if task_id
+                else {}
+            ),
         )
     except BaseException:
         if service:

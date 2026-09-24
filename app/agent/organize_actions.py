@@ -447,6 +447,13 @@ def stop_guangya_organize_confirmed(
             )
         ],
         suggestions=["可询问：查看光鸭整理进度。"],
+        effect_metadata={
+            "completion": {
+                "kind": "guangya_organize_task",
+                "task_id": task_id,
+                "operation": "stop",
+            }
+        },
     )
 
 
@@ -489,6 +496,7 @@ def _run_guangya_organize_once(
                 suggestions=["可询问：查看光鸭整理进度。"],
             )
         transferred = True
+        task_id = str(result.get("task_id") or "").strip()
         return ToolResult(
             ok=True,
             status="accepted",
@@ -502,6 +510,17 @@ def _run_guangya_organize_once(
                 )
             ],
             suggestions=["可询问：查看光鸭整理进度。"],
+            effect_metadata=(
+                {
+                    "completion": {
+                        "kind": "guangya_organize_task",
+                        "task_id": task_id,
+                        "operation": "run",
+                    }
+                }
+                if task_id
+                else {}
+            ),
         )
     finally:
         if not transferred:

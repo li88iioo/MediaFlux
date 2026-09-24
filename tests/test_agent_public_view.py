@@ -141,9 +141,35 @@ class AgentKernelPublicViewTests(unittest.TestCase):
             "改名已经完成，可以继续下一步。",
         )
 
+    def test_submitted_answer_drops_operation_specific_completion_claims(self) -> None:
+        result = {"ok": True, "status": "accepted", "summary": "清空请求已提交"}
+        answer = "光鸭回收站已经清空，删除成功。"
+
+        public = sanitize_confirmed_answer(answer, result)
+
+        self.assertIn("清空请求已提交", public)
+        self.assertIn("后台任务尚未完成", public)
+        self.assertNotIn("已经清空", public)
+        self.assertNotIn("删除成功", public)
+
 
     def test_pending_and_uncertain_results_have_one_canonical_public_state(self) -> None:
-        for status in ("accepted", "queued", "running", "in_progress", "retry_wait"):
+        for status in ("accepted", "submitted"):
+            with self.subTest(status=status):
+                result = {"ok": True, "status": status, "summary": "任务状态已更新"}
+                self.assertEqual(public_result_state(result), "submitted")
+                self.assertTrue(format_public_result(result).startswith("📤 "))
+                self.assertIn("请求已提交", format_public_result(result))
+                self.assertIn("尚未完成", format_public_result(result))
+
+        self.assertEqual(
+            public_result_state(
+                {"ok": False, "status": "accepted", "summary": "提交失败"}
+            ),
+            "failed",
+        )
+
+        for status in ("queued", "running", "in_progress", "retry_wait"):
             with self.subTest(status=status):
                 result = {"ok": True, "status": status, "summary": "任务状态已更新"}
                 self.assertEqual(public_result_state(result), "pending")

@@ -458,9 +458,8 @@ class GuangYaRecycleActionTests(unittest.TestCase):
     def test_list_restore_and_clear_use_frozen_private_snapshots(self) -> None:
         client = _RecycleClient()
         context = ToolContext(owner="owner", session_id="session")
-        with (
-            mock.patch.object(recycle_actions, "GuangYaClient", return_value=client),
-            mock.patch.object(recycle_actions.time, "sleep", return_value=None),
+        with mock.patch.object(
+            recycle_actions, "GuangYaClient", return_value=client
         ):
             listed = recycle_actions.list_guangya_recycle(
                 {"page": 1, "page_size": 50}, context
@@ -475,7 +474,9 @@ class GuangYaRecycleActionTests(unittest.TestCase):
             restored = recycle_actions.execute_restore_guangya_recycle(
                 arguments, fingerprint, context
             )
-            self.assertTrue(restored.data["verified"])
+            self.assertEqual(restored.status, "accepted")
+            self.assertFalse(restored.data["verified"])
+            self.assertTrue(restored.data["verification_pending"])
             self.assertEqual(restored.references[0].kind, "guangya_task")
 
             client.items = [
@@ -488,7 +489,10 @@ class GuangYaRecycleActionTests(unittest.TestCase):
             cleared = recycle_actions.execute_clear_guangya_recycle(
                 {}, clear_fingerprint, context
             )
-            self.assertTrue(cleared.data["verified"])
+            self.assertEqual(cleared.status, "accepted")
+            self.assertFalse(cleared.data["verified"])
+            self.assertTrue(cleared.data["verification_pending"])
+            self.assertEqual(cleared.references[0].kind, "guangya_task")
 
             status = recycle_actions.query_guangya_task_status(
                 {

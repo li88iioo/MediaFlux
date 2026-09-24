@@ -201,7 +201,7 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         callbacks = []
         manager = Mock()
         manager.start_operation.side_effect = lambda _name, _title, callback: (
-            callbacks.append(callback) or {"ok": True}
+            callbacks.append(callback) or {"ok": True, "task_id": "private-undo-task"}
         )
         with (
             patch(
@@ -218,6 +218,14 @@ class ActionUndoTests(IsolatedDatabaseTestCase):
         ):
             result = execute_undo(args, token, self.context)
             self.assertEqual(result.status, "accepted")
+            self.assertEqual(
+                result.effect_metadata["completion"],
+                {
+                    "kind": "guangya_organize_task",
+                    "task_id": "private-undo-task",
+                    "operation": "undo",
+                },
+            )
             client.revert_latest.assert_not_called()
             callbacks[0]()
             client.revert_latest.assert_called_once_with(1, "undo-organize-receipt", 1)

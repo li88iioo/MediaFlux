@@ -364,6 +364,14 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         self.assertEqual(accepted.status, "accepted")
         self.assertEqual(accepted.data["progress_total"], 0)
         self.assertIn("整个媒体库", accepted.summary)
+        self.assertEqual(
+            accepted.effect_metadata["completion"],
+            {
+                "kind": "agent_job",
+                "job_id": accepted.data["job_id"],
+                "operation": "audit",
+            },
+        )
         wake.assert_called_once_with()
         with self.assertRaises(AgentToolError) as stale:
             start_episode_audit_confirmed(arguments, fingerprint, context)

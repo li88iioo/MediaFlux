@@ -484,6 +484,14 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(result.status, "accepted")
         self.assertEqual(result.data, {"trigger_type": "manual", "source_count": 1})
+        self.assertEqual(
+            result.effect_metadata["completion"],
+            {
+                "kind": "guangya_organize_task",
+                "task_id": "secret-task-id",
+                "operation": "run",
+            },
+        )
         manager.start.assert_called_once_with(
             sources,
             rules,
@@ -586,6 +594,14 @@ class GuangYaOrganizeActionTests(unittest.TestCase):
         self.assertEqual(preview.data, {"requested": True, "cooperative": True})
         self.assertEqual(result.status, "accepted")
         self.assertEqual(result.data, {"accepted": True})
+        self.assertEqual(
+            result.effect_metadata["completion"],
+            {
+                "kind": "guangya_organize_task",
+                "task_id": "secret-task-a",
+                "operation": "stop",
+            },
+        )
         manager.stop.assert_called_once_with(
             expected_task_id="secret-task-a", require_running=True
         )

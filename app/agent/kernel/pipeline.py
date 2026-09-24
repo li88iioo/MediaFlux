@@ -64,6 +64,7 @@ class ToolCallContext:
     lease: PublicationLease
     cancellation: CancellationToken
     report_progress: ProgressSink
+    wait_for_completion: bool = False
     capability_search: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     selection_arguments: Mapping[str, Any] | None = None
     resource_candidate_ref: str = ""

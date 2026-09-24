@@ -1001,3 +1001,9 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         self.assertTrue(preview.ok)
         self.assertEqual(confirmed.status, "accepted")
         self.assertTrue(confirmed.data["queued"])
+        self.assertEqual(
+            confirmed.effect_metadata["completion"]["kind"], "library_patrol"
+        )
+        self.assertEqual(
+            confirmed.effect_metadata["completion"]["operation"], "run"
+        )

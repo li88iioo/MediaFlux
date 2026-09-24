@@ -262,6 +262,13 @@ def start_episode_audit_confirmed(
             )
         ],
         suggestions=["可以继续问：全库检查到哪了。", "也可以说：取消全库检查。"],
+        effect_metadata={
+            "completion": {
+                "kind": "agent_job",
+                "job_id": job_id,
+                "operation": "audit",
+            }
+        },
     )
 
 
@@ -639,4 +646,15 @@ def cancel_agent_job_confirmed(
             )
         ],
         suggestions=["可以继续问：全库检查到哪了。"],
+        effect_metadata=(
+            {
+                "completion": {
+                    "kind": "agent_job",
+                    "job_id": str(row["job_id"]),
+                    "operation": "cancel",
+                }
+            }
+            if requested
+            else {}
+        ),
     )

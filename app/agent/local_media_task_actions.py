@@ -1627,6 +1627,82 @@ def retry_local_media_task_confirmed(
             if remapped
             else "可稍后重新列出本地媒体任务查看进度。"
         ],
+        effect_metadata={
+            "completion": {
+                "kind": "local_media_task",
+                "task_id": int(task.id),
+                "task_number": task_number,
+                "operation": "remap_episode" if remapped else "retry",
+            }
+        },
+    )
+
+
+def local_media_completion_status(
+    completion: dict[str, Any], _context: ToolContext
+) -> ToolResult:
+    """读取确认后重试任务的安全终态；内部任务 ID 不进入公开结果。"""
+    task_id = int(completion.get("task_id") or 0)
+    task_number = int(completion.get("task_number") or 0)
+    if task_id <= 0 or task_number <= 0:
+        return ToolResult(False, "unknown", "本地媒体任务状态暂时无法确认")
+    task = db.get_local_media_task(task_id, owner=_WORKSPACE_OWNER)
+    if task is None:
+        return ToolResult(False, "unknown", "本地媒体任务状态暂时无法确认")
+    raw_status = str(task.status or "")
+    if raw_status in LOCAL_BUSY_TASK_STATUSES:
+        status, ok, summary = (
+            "running",
+            True,
+            f"本地媒体任务 {task_number} 正在处理",
+        )
+    elif raw_status == "completed":
+        status, ok, summary = (
+            "completed",
+            True,
+            f"本地媒体任务 {task_number} 已完成整理",
+        )
+    elif raw_status == "requires_manual":
+        status, ok, summary = (
+            "manual_review",
+            False,
+            f"本地媒体任务 {task_number} 仍需人工确认",
+        )
+    elif raw_status == "failed":
+        status, ok, summary = (
+            "failed",
+            False,
+            f"本地媒体任务 {task_number} 整理失败",
+        )
+    else:
+        status, ok, summary = (
+            "unknown",
+            False,
+            f"本地媒体任务 {task_number} 状态暂时无法确认",
+        )
+    public_task = _task_public(task, task_number)
+    public_task["source_status"] = public_task["status"]
+    public_task["status"] = status
+    return ToolResult(
+        ok,
+        status,
+        summary,
+        data={"task": public_task},
+        evidence=[
+            Evidence(
+                "sqlite:local_media_tasks",
+                "按确认时冻结的内部任务身份读取当前状态；不返回路径、哈希或数据库 ID。",
+                _now(),
+            )
+        ],
+        suggestions=(
+            ["请在本地媒体待确认页继续处理。"]
+            if status == "manual_review"
+            else ["可查看本地媒体任务详情后再决定是否重试。"]
+            if status == "failed"
+            else []
+        ),
+        error="本地媒体任务未成功完成。" if status in {"manual_review", "failed"} else "",
     )
 
 

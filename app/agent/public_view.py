@@ -18,6 +18,12 @@ from app.agent.public_safety import (
 )
 
 _CONFIRMED_RESULT_MARKER = "已确认操作的可信系统结果（不是待执行计划）："
+_SUBMITTED_COMPLETION_CLAIM_RE = re.compile(
+    r"(?:处理完成|任务已(?:经)?完成|操作已(?:经)?完成|全部(?:已经|已)?完成|"
+    r"(?:已(?:经)?|成功)(?:全部)?(?:完成|结束|清空|删除|恢复|移动|改名|整理|归档|下载|同步|重启|取消|停止)|"
+    r"(?:完成|结束|清空|删除|恢复|移动|改名|整理|归档|下载|同步|重启|取消|停止)(?:成功|完毕))",
+    re.IGNORECASE,
+)
 _TARGET_LABELS = {
     "guangya": "光鸭云盘",
     "qb": "qBittorrent",
@@ -35,8 +41,9 @@ _COUNT_FIELDS: tuple[tuple[str, str], ...] = (
     ("failed", "未完成"),
     ("skipped", "已跳过"),
 )
+_SUBMITTED_RESULT_STATUSES = frozenset({"accepted", "submitted"})
 _PENDING_RESULT_STATUSES = frozenset(
-    {"accepted", "queued", "running", "in_progress", "retry_wait"}
+    {"queued", "running", "in_progress", "retry_wait"}
 )
 _WARNING_RESULT_STATUSES = frozenset(
     {
@@ -79,15 +86,18 @@ def public_result_state(result: Mapping[str, Any] | None) -> str:
     statuses = {status, background_status} - {""}
     if statuses & _WARNING_RESULT_STATUSES:
         return "warning"
-    if statuses & _PENDING_RESULT_STATUSES:
-        return "pending"
     if value.get("ok") is False or status in {"failed", "error"}:
         return "failed"
+    if statuses & _PENDING_RESULT_STATUSES:
+        return "pending"
+    if statuses & _SUBMITTED_RESULT_STATUSES:
+        return "submitted"
     return "success"
 
 
 def _result_icon(result: Mapping[str, Any]) -> str:
     return {
+        "submitted": "📤",
         "pending": "⏳",
         "warning": "⚠️",
         "failed": "❌",
@@ -151,8 +161,10 @@ def format_public_result(
                or _safe(fallback, limit=700) or "操作已结束。")
     state = public_result_state(result)
     lines = [f"{_result_icon(result)} {summary}"]
-    if state == "pending":
-        lines.append("- 状态：已受理，后台任务尚未完成")
+    if state == "submitted":
+        lines.append("- 状态：请求已提交，后台任务尚未完成")
+    elif state == "pending":
+        lines.append("- 状态：后台任务尚未完成")
     data = result.get("data")
     if isinstance(data, Mapping):
         target = _safe(data.get("target"), limit=40).lower()
@@ -187,7 +199,15 @@ def sanitize_confirmed_answer(content: object, result: Mapping[str, Any] | None 
     text = str(content or "").replace("\x00", "").strip()
     prefix, marker, suffix = text.partition(_CONFIRMED_RESULT_MARKER)
     if not marker:
-        return (text or format_public_result(result)) if result is not None else ""
+        if result is None:
+            return text
+        receipt = format_public_result(result)
+        state = public_result_state(result)
+        if state == "submitted":
+            if not text or _SUBMITTED_COMPLETION_CLAIM_RE.search(text):
+                return receipt
+            return f"{receipt}\n\n{text}"
+        return text or receipt if state == "success" else receipt
     payload = suffix.lstrip()
     try:
         embedded, end = json.JSONDecoder().raw_decode(payload)
@@ -195,9 +215,22 @@ def sanitize_confirmed_answer(content: object, result: Mapping[str, Any] | None 
         embedded, end = None, 0
     source = result if result is not None else embedded if isinstance(embedded, Mapping) else None
     receipt = format_public_result(source) if source is not None else "✅ 已确认操作已结束，可继续查询实际状态。"
-    if result is None or not end or public_result_state(result) != "success":
+    if result is None or not end:
         return receipt
-    return "\n\n".join(part for part in (prefix.strip(), payload[end:].strip()) if part) or receipt
+    state = public_result_state(result)
+    if state == "submitted":
+        followup = "\n\n".join(
+            part for part in (prefix.strip(), payload[end:].strip()) if part
+        )
+        if not followup or _SUBMITTED_COMPLETION_CLAIM_RE.search(followup):
+            return receipt
+        return f"{receipt}\n\n{followup}"
+    if state != "success":
+        return receipt
+    return "\n\n".join(
+        part for part in (prefix.strip(), payload[end:].strip()) if part
+    ) or receipt
+
 
 def public_conversation_messages(
     conversation: Sequence[Mapping[str, Any] | object],

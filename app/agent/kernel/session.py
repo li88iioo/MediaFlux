@@ -577,6 +577,7 @@ class AgentSession:
                 lease=lease,
                 cancellation=token,
                 report_progress=progress,
+                wait_for_completion=True,
                 selection_arguments=validated_selection.arguments if validated_selection else None,
                 resource_candidate_ref=candidate_context.guard.ref if candidate_context else "",
             )
@@ -621,7 +622,7 @@ class AgentSession:
                     await failure("receipt_unavailable", "执行结果已取得，但会话记录保存失败，未继续后续步骤；请先核对任务状态。")
                     return
                 result_state = public_result_state(public_result)
-                if result_state != "success":
+                if result_state not in {"success", "submitted"}:
                     await publish(AgentEventType.TURN_COMPLETED, {
                         "status": "success",
                         "answer": format_public_result(public_result),
@@ -632,7 +633,14 @@ class AgentSession:
                     })
                     return
                 if not last_user:
-                    await publish(AgentEventType.TURN_COMPLETED, {"status": "effect_completed", "plan_id": plan_id})
+                    await publish(AgentEventType.TURN_COMPLETED, {
+                        "status": "success",
+                        "answer": format_public_result(public_result),
+                        "finish_reason": f"effect_{result_state}",
+                        "usage": {},
+                        "model_calls": 0,
+                        "tool_calls": 0,
+                    })
                     return
                 confirmed_result = public_result
                 scope.close()
@@ -773,6 +781,7 @@ class AgentSession:
                         "上一张冻结计划已获授权并已消费；对话末尾的可信系统结果是本次真实执行回执。"
                         "历史中的‘只预览/等待确认/approval_required’描述的是授权前状态，不能覆盖新回执。"
                         "先依据回执的状态、实际动作计数说明已完成或未完成部分；运行中/未知不等于完成。"
+                        "accepted/submitted 只表示请求已提交，绝不等于后台任务完成；应明确说明仍在后台执行或可继续查询。"
                         "不能再次索要这张卡的确认或重复执行；若还有其他写步骤，必须另建确认卡。"
                     )
                 if final_synthesis_round:

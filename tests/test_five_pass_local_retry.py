@@ -109,5 +109,14 @@ class UnifiedLocalRetryTests(IsolatedDatabaseTestCase):
             _, fingerprint = actions.prepare_retry_local_media_task({"task_number": 1}, None)
             result = actions.retry_local_media_task_confirmed({"task_number": 1}, fingerprint, None)
         self.assertTrue(result.ok)
+        self.assertEqual(
+            result.effect_metadata["completion"],
+            {
+                "kind": "local_media_task",
+                "task_id": task.id,
+                "task_number": 1,
+                "operation": "retry",
+            },
+        )
         self.assertEqual(db.get_local_media_task(task.id, owner="admin").confirmation_actor, "")
         scheduler.return_value.reload.assert_called_once()

@@ -12,12 +12,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from app import database
-from app import database_migrations
-from app.agent.domain_catalog.cloud_runtime import (
-    guangya_organize_status,
-    wait_for_guangya_operation,
-)
+from app import database, database_migrations
+from app.agent.domain_catalog.cloud_runtime import guangya_organize_status
+from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.models import ToolContext, ToolResult
 from app.modules import guangya_fs_change
 from app.modules.organize_tasks import OrganizeTaskManager
@@ -268,7 +265,7 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
             ):
                 raw = current.task_result(public_ref, owner=context.owner)
                 public = guangya_organize_status({"operation_ref": public_ref}, context)
-                receipt = asyncio.run(wait_for_guangya_operation(
+                receipt = asyncio.run(wait_for_effect_completion(
                     accepted, tool="guangya.fs.change.execute", context=context,
                 ))
                 self.assertEqual(receipt.data["stats"], stats)

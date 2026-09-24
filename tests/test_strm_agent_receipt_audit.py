@@ -88,6 +88,15 @@ class STRMAgentReceiptAuditTests(unittest.TestCase):
             self.assertEqual(preview.data["source_count"], 2)
             result = strm_runtime.run_strm_once_confirmed(arguments, fingerprint)
             self.assertTrue(result.ok)
+            self.assertEqual(
+                result.effect_metadata["completion"],
+                {
+                    "kind": "strm_run",
+                    "after_run_id": 0,
+                    "trigger_type": "manual",
+                    "operation": "run",
+                },
+            )
             trigger.assert_called_once_with("manual", selected_source_ids=["b", "a"])
             self.config.return_value = "changed"
             with self.assertRaises(AgentToolError) as error:
