@@ -1120,6 +1120,8 @@ class PlaybackRecordDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(summary["average_playback_info_latency_ms"], 30)
         self.assertEqual(summary["redirect_request_count"], 1)
         self.assertEqual(summary["average_redirect_latency_ms"], 10)
+        self.assertEqual(summary["relay_request_count"], 1)
+        self.assertEqual(summary["average_relay_latency_ms"], 90)
         details = db.list_media_proxy_playback_records(session_id=summary["id"])
         self.assertEqual(details["total"], 3)
         self.assertEqual(

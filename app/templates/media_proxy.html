@@ -94,7 +94,7 @@
                         <span class="metric-tile-icon is-safe"><i data-lucide="check-circle-2"></i></span>
                     </div>
                     <strong class="metric-tile-value">—</strong>
-                    <span class="metric-tile-desc">302 直链快速复用</span>
+                    <span class="metric-tile-desc">直链快速复用</span>
                 </div>
                 <div class="metric-tile" data-tone="warning">
                     <div class="metric-tile-head">
@@ -135,7 +135,7 @@
                     </select>
                     <select class="strm-select-input" id="proxyRecordSource">
                         <option value="">全部来源</option>
-                        <option value="guangya">光鸭 302</option>
+                        <option value="guangya">光鸭直链</option>
                         <option value="upstream">上游直放/转码</option>
                         <option value="playback_info">PlaybackInfo</option>
                         <option value="hls">HLS 上游</option>
@@ -497,7 +497,27 @@
     async function saveBinding(){const btn=document.getElementById('saveBindingBtn');const state=document.getElementById('bindingSaveState');const body={media_item_id:document.getElementById('bindingItemId').value.trim(),media_source_id:document.getElementById('bindingSourceId').value.trim(),source_type:'guangya',guangya_file_id:document.getElementById('bindingGuangyaId').value.trim(),enabled:true};btn.disabled=true;state.textContent='保存中...';try{await request(`/api/media-proxy/${selectedId}/bindings`,{method:'POST',body:JSON.stringify(body)});bindingModal.close();await loadBindings();}catch(error){state.textContent=error.message;}finally{btn.disabled=false;}}
     async function removeBinding(id){const confirmed=await appConfirm({title:'删除光鸭播放映射',message:'删除后该播放请求将恢复自动识别或透传上游，不会删除光鸭文件。',confirmText:'删除映射',danger:true});if(!confirmed)return;try{await request(`/api/media-proxy/${selectedId}/bindings/${id}`,{method:'DELETE'});await loadBindings();}catch(error){document.getElementById('bindingPanelHint').textContent=error.message;}}
     function renderProxyRecordInstances(){const select=document.getElementById('proxyRecordInstance');const current=select.value;select.innerHTML='<option value="">全部实例</option>'+instances.map(item=>`<option value="${item.id}">${esc(item.name)}</option>`).join('');if([...select.options].some(option=>option.value===current))select.value=current;}
-    function sourceBadge(source){return {guangya:['cloud','光鸭 302'],upstream:['server','上游'],playback_info:['list-video','PlaybackInfo'],hls:['radio-tower','HLS']}[source]||['route','未知'];}
+    function sourceBadge(record){
+        const source=record?.source;
+        const method=String(record?.method||'GET').toUpperCase();
+        const status=Number(record?.status_code||0);
+        if(method==='HEAD')return ['search','HEAD 探测'];
+        if(record?.route_class==='guangya_direct'&&status===302)return ['cloud','光鸭 302'];
+        if(record?.route_class==='guangya_direct'&&method==='GET'&&[200,206].includes(status))return ['cloud','光鸭直链中转'];
+        if(source==='guangya')return ['cloud-off','光鸭直链（未知）'];
+        return {upstream:['server','上游'],playback_info:['list-video','PlaybackInfo'],hls:['radio-tower','HLS']}[source]||['route','未知'];
+    }
+    function proxySessionSourceBadge(session){
+        const redirect=Number(session.redirect_request_count||0)>0;
+        const relay=Number(session.relay_request_count||0)>0;
+        const probe=Number(session.head_probe_request_count||0)>0;
+        const evidence=[redirect&&'302',relay&&'中转',probe&&'探测'].filter(Boolean);
+        if(evidence.length>1)return ['route',evidence.join(' + ')];
+        if(redirect)return ['cloud','光鸭 302'];
+        if(relay)return ['cloud','直链中转'];
+        if(probe)return ['search','HEAD 探测'];
+        return sourceBadge({source:session.last_source});
+    }
     function statusBadge(code){const value=Number(code||0);if(value>=200&&value<400)return ['running',String(value||'成功')];if(value>=400)return ['failed',String(value)];return ['paused','未完成'];}
     function sessionStatusBadge(session){const errors=Number(session.error_count||0);const successes=Number(session.success_count||0);const last=Number(session.last_status_code||0);if(errors&&last>=200&&last<400)return ['paused','有重试'];if(errors)return ['failed',String(last>=400?last:'失败')];if(successes)return ['running','成功'];return ['paused','未完成'];}
     function routeLabel(route){return {guangya_direct:'原画直链',stream:'视频流',playback_info:'播放信息',upstream_hls:'HLS/分片'}[route]||route||'上游请求';}
@@ -512,7 +532,7 @@
                     <span class="metric-tile-icon is-safe"><i data-lucide="check-circle-2"></i></span>
                 </div>
                 <strong class="metric-tile-value">${value.hits}</strong>
-                <span class="metric-tile-desc">302 直链快速复用</span>
+                <span class="metric-tile-desc">直链快速复用</span>
             </div>
             <div class="metric-tile" data-tone="warning">
                 <div class="metric-tile-head">
@@ -545,14 +565,16 @@
         const total=Math.max(0,Number(record.total_latency_ms||0));
         const upstream=Math.max(0,Number(record.upstream_latency_ms||0));
         const internal=Math.max(0,Number(record.internal_latency_ms??(total-upstream)));
+        const isRelay=record.route_class==='guangya_direct'&&String(record.method||'GET').toUpperCase()==='GET'&&[200,206].includes(Number(record.status_code||0));
         let meta='总耗时';
         if(record.failure_stage)meta=`失败阶段 ${record.failure_stage}`;
+        else if(isRelay)meta='中转响应头';
         else if(upstream>0)meta=`上游 ${upstream} · 内部 ${internal}`;
         else if(record.source==='guangya'&&record.cache_hit)meta='缓存命中 · 无直链拉取';
-        const title=upstream>0?`总耗时 ${total} ms；上游阶段 ${upstream} ms；MediaFlux 内部 ${internal} ms`:`总耗时 ${total} ms`;
+        const title=isRelay?`中转请求至响应头 ${total} ms；不代表整个媒体下载时间`:upstream>0?`总耗时 ${total} ms；上游阶段 ${upstream} ms；MediaFlux 内部 ${internal} ms`:`总耗时 ${total} ms`;
         return {total,meta,title};
     }
-    function proxyRecordMarkup(record){const source=sourceBadge(record.source);const status=statusBadge(record.status_code);const latency=proxyRecordLatency(record);const cache=record.source==='guangya'?`<span class="proxy-record-cache ${record.cache_hit?'hit':'miss'}">${record.cache_hit?'HIT':'MISS'}</span>`:'<span class="proxy-record-cache neutral">—</span>';return `<article class="proxy-record-card" data-record-id="${record.id}"><div class="proxy-record-primary"><time>${esc(record.created_at||'—')}</time><strong>${esc(routeLabel(record.route_class))}</strong><small>${esc(record.method||'GET')} · 实例 #${record.instance_id}</small></div><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span>${cache}<div class="proxy-record-latency" title="${esc(latency.title)}"><strong>${latency.total} ms</strong><small>${esc(latency.meta)}</small></div>${record.error?`<p class="proxy-record-error">${esc(record.error)}</p>`:''}</article>`;}
+    function proxyRecordMarkup(record){const source=sourceBadge(record);const status=statusBadge(record.status_code);const latency=proxyRecordLatency(record);const cache=record.source==='guangya'?`<span class="proxy-record-cache ${record.cache_hit?'hit':'miss'}">${record.cache_hit?'HIT':'MISS'}</span>`:'<span class="proxy-record-cache neutral">—</span>';return `<article class="proxy-record-card" data-record-id="${record.id}"><div class="proxy-record-primary"><time>${esc(record.created_at||'—')}</time><strong>${esc(routeLabel(record.route_class))}</strong><small>${esc(record.method||'GET')} · 实例 #${record.instance_id}</small></div><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span>${cache}<div class="proxy-record-latency" title="${esc(latency.title)}"><strong>${latency.total} ms</strong><small>${esc(latency.meta)}</small></div>${record.error?`<p class="proxy-record-error">${esc(record.error)}</p>`:''}</article>`;}
     function proxySessionDetailsMarkup(data){const rows=Array.isArray(data?.items)?data.items:[];if(!rows.length)return '<div class="proxy-session-detail-empty"><i data-lucide="list-tree"></i><span>该会话暂无可展开的请求明细</span></div>';return `<div class="proxy-session-detail-head"><span>请求链路</span><small>最近 ${rows.length} / ${Number(data.total||rows.length)} 条</small></div><div class="proxy-record-table-head"><span>时间 / 路由</span><span>来源</span><span>状态</span><span>缓存</span><span>耗时</span></div>${rows.map(proxyRecordMarkup).join('')}`;}
     function compactProxyIdentifier(value){const raw=String(value||'');return raw.length>20?`${raw.slice(0,8)}…${raw.slice(-6)}`:raw;}
     function proxySessionIdentity(session){if(session.media_name)return session.media_name;if(session.media_item_id)return `媒体 ${compactProxyIdentifier(session.media_item_id)}`;if(session.guangya_file_id)return `光鸭文件 ${compactProxyIdentifier(session.guangya_file_id)}`;return '未识别媒体';}
@@ -561,13 +583,23 @@
         const peak=Math.max(0,Number(session.max_total_latency_ms||0));
         const directCount=Math.max(0,Number(session.redirect_request_count||0));
         const directAverage=Math.max(0,Number(session.average_redirect_latency_ms||0));
+        const relayCount=Math.max(0,Number(session.relay_request_count||0));
+        const relayAverage=Math.max(0,Number(session.average_relay_latency_ms||0));
+        const probeCount=Math.max(0,Number(session.head_probe_request_count||0));
         const playbackCount=Math.max(0,Number(session.playback_info_request_count||0));
         const playbackAverage=Math.max(0,Number(session.average_playback_info_latency_ms||0));
-        if(directCount)return {value:directAverage,label:`302 平均 · 峰值 ${peak}`,detail:`PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title:`全链平均 ${overall} ms；302 请求 ${directCount} 次，平均 ${directAverage} ms；PlaybackInfo ${playbackCount} 次，平均 ${playbackAverage} ms；峰值 ${peak} ms`};
-        if(playbackCount)return {value:playbackAverage,label:`PlaybackInfo 平均 · 峰值 ${peak}`,detail:`全链平均 ${overall} ms`,title:`全链平均 ${overall} ms；PlaybackInfo ${playbackCount} 次，平均 ${playbackAverage} ms；峰值 ${peak} ms`};
-        return {value:overall,label:`全链平均 · 峰值 ${peak}`,detail:'暂无分项数据',title:`全链平均 ${overall} ms；峰值 ${peak} ms`};
+        const stages=[];
+        if(directCount)stages.push(`302 ${directCount} 次 · 平均 ${directAverage} ms`);
+        if(relayCount)stages.push(`中转响应头 ${relayCount} 次 · 平均 ${relayAverage} ms（非整段下载）`);
+        if(playbackCount)stages.push(`PlaybackInfo ${playbackCount} 次 · 平均 ${playbackAverage} ms`);
+        if(probeCount)stages.push(`HEAD 探测 ${probeCount} 次`);
+        const title=`全链平均 ${overall} ms；${stages.join('；')||'暂无分项数据'}；全链峰值 ${peak} ms`;
+        if(directCount)return {value:directAverage,label:`302 平均 · 全链峰值 ${peak}`,detail:`中转 ${relayCount?`${relayAverage} ms`:'—'} · PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title};
+        if(relayCount)return {value:relayAverage,label:`中转响应头平均 · 全链峰值 ${peak}`,detail:`非整段下载 · PlaybackInfo ${playbackCount?`${playbackAverage} ms`:'—'}`,title};
+        if(playbackCount)return {value:playbackAverage,label:`PlaybackInfo 平均 · 全链峰值 ${peak}`,detail:`全链平均 ${overall} ms`,title};
+        return {value:overall,label:`全链平均 · 全链峰值 ${peak}`,detail:probeCount?`HEAD 探测 ${probeCount} 次`:'暂无分项数据',title};
     }
-    function proxySessionMarkup(session){const id=Number(session.id);const source=sourceBadge(session.last_source);const status=sessionStatusBadge(session);const requests=Number(session.request_count||0);const hits=Number(session.cache_hit_count||0);const misses=Number(session.cache_miss_count||0);const cacheTotal=hits+misses;const latency=proxySessionLatency(session);const rawSourceId=String(session.media_source_id||'');const sourceId=rawSourceId?`MediaSource ${esc(compactProxyIdentifier(rawSourceId))}`:'未提供 MediaSourceId';const isOpen=proxyExpandedSessions.has(id);let cached=proxySessionDetails.get(id);if(cached&&Number(cached.total||0)<requests){proxySessionDetails.delete(id);cached=null;}const detail=cached?proxySessionDetailsMarkup(cached):'<div class="proxy-session-detail-loading"><i data-lucide="list-tree"></i><span>展开后读取请求明细</span></div>';return `<details class="proxy-session-card" data-session-id="${id}" ${isOpen?'open':''}><summary class="proxy-session-summary"><span class="proxy-session-marker"><i data-lucide="play"></i></span><span class="proxy-session-identity"><time>${esc(session.last_request_at||session.started_at||'—')}</time><strong>${esc(proxySessionIdentity(session))}</strong><small>${sourceId} · 实例 #${session.instance_id}</small></span><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span><span class="proxy-session-count"><strong>${requests}</strong><small>链路请求</small></span><span class="proxy-session-cache ${cacheTotal?'active':''}"><strong>${cacheTotal?`${hits}/${cacheTotal}`:'—'}</strong><small>${cacheTotal?'缓存命中':'未使用缓存'}</small></span><span class="proxy-session-latency" title="${esc(latency.title)}"><strong>${latency.value} ms</strong><small>${esc(latency.label)}</small><small class="proxy-session-latency-detail">${esc(latency.detail)}</small></span><span class="proxy-session-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary><div class="proxy-session-detail" id="proxySessionDetail_${id}">${detail}</div>${session.last_error?`<p class="proxy-session-last-error">最近错误：${esc(session.last_error)}</p>`:''}</details>`;}
+    function proxySessionMarkup(session){const id=Number(session.id);const source=proxySessionSourceBadge(session);const status=sessionStatusBadge(session);const requests=Number(session.request_count||0);const hits=Number(session.cache_hit_count||0);const misses=Number(session.cache_miss_count||0);const cacheTotal=hits+misses;const latency=proxySessionLatency(session);const rawSourceId=String(session.media_source_id||'');const sourceId=rawSourceId?`MediaSource ${esc(compactProxyIdentifier(rawSourceId))}`:'未提供 MediaSourceId';const isOpen=proxyExpandedSessions.has(id);let cached=proxySessionDetails.get(id);if(cached&&Number(cached.total||0)<requests){proxySessionDetails.delete(id);cached=null;}const detail=cached?proxySessionDetailsMarkup(cached):'<div class="proxy-session-detail-loading"><i data-lucide="list-tree"></i><span>展开后读取请求明细</span></div>';return `<details class="proxy-session-card" data-session-id="${id}" ${isOpen?'open':''}><summary class="proxy-session-summary"><span class="proxy-session-marker"><i data-lucide="play"></i></span><span class="proxy-session-identity"><time>${esc(session.last_request_at||session.started_at||'—')}</time><strong>${esc(proxySessionIdentity(session))}</strong><small>${sourceId} · 实例 #${session.instance_id}</small></span><span class="proxy-record-source"><i data-lucide="${source[0]}"></i>${source[1]}</span><span class="status-pill ${status[0]}">${status[1]}</span><span class="proxy-session-count"><strong>${requests}</strong><small>链路请求</small></span><span class="proxy-session-cache ${cacheTotal?'active':''}"><strong>${cacheTotal?`${hits}/${cacheTotal}`:'—'}</strong><small>${cacheTotal?'缓存命中':'未使用缓存'}</small></span><span class="proxy-session-latency" title="${esc(latency.title)}"><strong>${latency.value} ms</strong><small>${esc(latency.label)}</small><small class="proxy-session-latency-detail">${esc(latency.detail)}</small></span><span class="proxy-session-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary><div class="proxy-session-detail" id="proxySessionDetail_${id}">${detail}</div>${session.last_error?`<p class="proxy-session-last-error">最近错误：${esc(session.last_error)}</p>`:''}</details>`;}
     function proxyLegacyMarkup(total){return `<details class="proxy-session-card proxy-legacy-session" ${proxyLegacyExpanded?'open':''}><summary class="proxy-session-summary"><span class="proxy-session-marker is-legacy"><i data-lucide="archive"></i></span><span class="proxy-session-identity"><time>兼容记录</time><strong>历史 / 未关联链路</strong><small>升级前或缺少会话标识的请求，无法可靠归并到具体媒体</small></span><span class="proxy-record-source"><i data-lucide="unlink"></i>未关联</span><span class="status-pill paused">历史</span><span class="proxy-session-count"><strong>${Number(total||0)}</strong><small>请求明细</small></span><span class="proxy-session-cache"><strong>—</strong><small>按原记录显示</small></span><span class="proxy-session-latency"><strong>—</strong><small>展开查看</small><small class="proxy-session-latency-detail">暂无分项数据</small></span><span class="proxy-session-chevron" aria-hidden="true"><i data-lucide="chevron-down"></i></span></summary><div class="proxy-session-detail" id="proxyLegacyDetail"><div class="proxy-session-detail-loading"><i data-lucide="list-tree"></i><span>展开后读取历史明细</span></div></div></details>`;}
     async function loadProxyLegacyDetails(){const host=document.getElementById('proxyLegacyDetail');if(!host)return;const serial=++proxyLegacyRequestSerial;const query=new URLSearchParams({unlinked:'true',page:'1',page_size:'100'});const instance=document.getElementById('proxyRecordInstance').value;const status=document.getElementById('proxyRecordStatus').value;const source=document.getElementById('proxyRecordSource').value;if(instance)query.set('instance_id',instance);if(status)query.set('status',status);if(source)query.set('source',source);host.innerHTML='<div class="proxy-session-detail-loading is-loading"><i data-lucide="loader-circle"></i><span>正在读取历史明细...</span></div>';renderLucideIcons(host);try{const data=await request(`/api/media-proxy/records?${query}`);if(serial!==proxyLegacyRequestSerial)return;const current=document.getElementById('proxyLegacyDetail');if(current){current.innerHTML=proxySessionDetailsMarkup(data);renderLucideIcons(current);}}catch(error){if(serial!==proxyLegacyRequestSerial)return;const current=document.getElementById('proxyLegacyDetail');if(current)current.innerHTML=`<div class="proxy-session-detail-empty is-error"><span>${esc(error.message)}</span></div>`;}}
     async function loadProxySessionDetails(sessionId){const id=Number(sessionId);const host=document.getElementById(`proxySessionDetail_${id}`);if(!host)return;if(proxySessionDetails.has(id)){host.innerHTML=proxySessionDetailsMarkup(proxySessionDetails.get(id));renderLucideIcons(host);return;}if(proxySessionDetailPromises.has(id)){await proxySessionDetailPromises.get(id);return;}host.innerHTML='<div class="proxy-session-detail-loading is-loading"><i data-lucide="loader-circle"></i><span>正在读取请求明细...</span></div>';renderLucideIcons(host);const pending=request(`/api/media-proxy/records?session_id=${encodeURIComponent(id)}&page=1&page_size=100`);proxySessionDetailPromises.set(id,pending);try{const data=await pending;proxySessionDetails.set(id,data);const current=document.getElementById(`proxySessionDetail_${id}`);if(current){current.innerHTML=proxySessionDetailsMarkup(data);renderLucideIcons(current);}}catch(error){const current=document.getElementById(`proxySessionDetail_${id}`);if(current)current.innerHTML=`<div class="proxy-session-detail-empty is-error"><span>${esc(error.message)}</span></div>`;}finally{proxySessionDetailPromises.delete(id);}}

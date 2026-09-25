@@ -5822,7 +5822,7 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
     .proxy-cache-metrics > div:nth-child(-n+2) { border-bottom: 1px solid var(--border-soft); }
     .proxy-session-summary { grid-template-columns: 32px minmax(0,1fr) auto; gap: 11px 10px; min-height: 178px; padding: 14px; }
     .proxy-session-marker { grid-column: 1; grid-row: 1; }
-    .proxy-session-identity { grid-column: 2; grid-row: 1; }
+    .proxy-session-identity { grid-column: 2 / -1; grid-row: 1; padding-right: 30px; }
     .proxy-session-chevron { grid-column: 3; grid-row: 1; }
     .proxy-session-summary > .proxy-record-source { grid-column: 1 / 3; grid-row: 2; }
     .proxy-session-summary > .status-pill { grid-column: 3; grid-row: 2; justify-self: end; }

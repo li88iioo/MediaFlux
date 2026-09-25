@@ -5,7 +5,10 @@ import asyncio
 import concurrent.futures
 import importlib
 import importlib.util
+import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -14,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from tests.support import InitializedWebTestCase
+from tests.support import InitializedWebTestCase, IsolatedDatabaseTestCase
 
 
 class MediaServerProfileTests(unittest.TestCase):
@@ -1088,8 +1091,17 @@ class MediaProxyTemplateTests(unittest.TestCase):
         self.assertIn("302 平均", template)
         self.assertIn("上游阶段", template)
         self.assertIn("proxy-session-latency-detail", template)
+        self.assertIn("直链快速复用", template)
+        self.assertNotIn("302 直链快速复用", template)
         self.assertIn(".proxy-session-latency-detail", css)
         self.assertIn("min-height: 54px", css)
+
+    def test_mobile_session_identity_is_not_squeezed_by_latency_labels(self):
+        css = Path("app/static/css/main.css").read_text(encoding="utf-8")
+        self.assertIn(
+            ".proxy-session-identity { grid-column: 2 / -1; grid-row: 1; padding-right: 30px; }",
+            css,
+        )
 
     def test_proxy_async_regions_reserve_stable_space(self):
         css = Path("app/static/css/main.css").read_text(encoding="utf-8")
@@ -1097,3 +1109,131 @@ class MediaProxyTemplateTests(unittest.TestCase):
         self.assertIn("min-height:", css[css.index(".proxy-profile-grid"):])
         self.assertIn(".proxy-instance-list", css)
         self.assertIn(".media-config-modal[hidden]", css)
+
+
+@unittest.skipUnless(shutil.which("node"), "Node.js 不可用")
+class MediaProxyRecordDisplayJavaScriptTests(unittest.TestCase):
+    template_path = Path("app/templates/media_proxy.html")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.template = cls.template_path.read_text(encoding="utf-8")
+
+    @classmethod
+    def _function(cls, name: str, next_name: str) -> str:
+        start = cls.template.index(f"    function {name}(")
+        end = cls.template.index(f"\n    function {next_name}(", start)
+        return cls.template[start:end]
+
+    def _evaluate(self, expression: str):
+        functions = "\n".join((
+            self._function("sourceBadge", "proxySessionSourceBadge"),
+            self._function("proxySessionSourceBadge", "statusBadge"),
+            self._function("proxyRecordLatency", "proxyRecordMarkup"),
+            self._function("proxySessionLatency", "proxySessionMarkup"),
+        ))
+        script = f"{functions}\nconsole.log(JSON.stringify({expression}));"
+        result = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        return json.loads(result.stdout)
+
+    def test_full_page_inline_scripts_parse_including_card_markup(self):
+        import re
+
+        scripts = re.findall(r"<script[^>]*>(.*?)</script>", self.template, re.DOTALL)
+        self.assertTrue(scripts)
+        for script in scripts:
+            result = subprocess.run(
+                ["node", "--check"], input=script, text=True,
+                capture_output=True, timeout=20,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_badges_use_request_evidence_and_keep_mixed_session_evidence(self):
+        actual = self._evaluate(
+            "({records:["
+            "sourceBadge({source:'guangya',route_class:'guangya_direct',method:'GET',status_code:302})[1],"
+            "sourceBadge({source:'guangya',route_class:'guangya_direct',method:'GET',status_code:206})[1],"
+            "sourceBadge({source:'guangya',route_class:'guangya_direct',method:'HEAD',status_code:206})[1],"
+            "sourceBadge({source:'guangya',route_class:'guangya_direct',method:'HEAD',status_code:302})[1],"
+            "sourceBadge({source:'guangya',route_class:'stream',method:'GET',status_code:200})[1]],"
+            "sessions:["
+            "proxySessionSourceBadge({redirect_request_count:1,relay_request_count:1,head_probe_request_count:1,last_source:'upstream'})[1],"
+            "proxySessionSourceBadge({redirect_request_count:0,relay_request_count:1,head_probe_request_count:0,last_source:'upstream'})[1],"
+            "proxySessionSourceBadge({redirect_request_count:0,relay_request_count:0,head_probe_request_count:1,last_source:'guangya'})[1],"
+            "proxySessionSourceBadge({redirect_request_count:0,relay_request_count:0,head_probe_request_count:0,last_source:'guangya'})[1],"
+            "proxySessionSourceBadge({redirect_request_count:0,relay_request_count:0,head_probe_request_count:0,last_source:'upstream'})[1]]})"
+        )
+        self.assertEqual(actual["records"], [
+            "光鸭 302", "光鸭直链中转", "HEAD 探测", "HEAD 探测", "光鸭直链（未知）",
+        ])
+        self.assertEqual(actual["sessions"], [
+            "302 + 中转 + 探测", "直链中转", "HEAD 探测", "光鸭直链（未知）", "上游",
+        ])
+
+    def test_relay_latency_is_separate_from_redirect_and_not_full_download_time(self):
+        actual = self._evaluate(
+            "({record:proxyRecordLatency({route_class:'guangya_direct',method:'GET',status_code:206,"
+            "source:'guangya',total_latency_ms:90}),"
+            "mixed:proxySessionLatency({average_total_latency_ms:30,max_total_latency_ms:100,"
+            "redirect_request_count:1,average_redirect_latency_ms:55,relay_request_count:1,"
+            "average_relay_latency_ms:90,playback_info_request_count:2,"
+            "average_playback_info_latency_ms:12,head_probe_request_count:1}),"
+            "relay:proxySessionLatency({average_total_latency_ms:90,max_total_latency_ms:90,"
+            "redirect_request_count:0,relay_request_count:1,average_relay_latency_ms:90})})"
+        )
+        self.assertEqual(actual["record"]["meta"], "中转响应头")
+        self.assertIn("不代表整个媒体下载时间", actual["record"]["title"])
+        self.assertEqual(actual["mixed"]["value"], 55)
+        self.assertIn("302 平均 · 全链峰值 100", actual["mixed"]["label"])
+        self.assertIn("中转 90 ms", actual["mixed"]["detail"])
+        self.assertIn("非整段下载", actual["mixed"]["title"])
+        self.assertIn("全链峰值 100 ms", actual["mixed"]["title"])
+        self.assertEqual(actual["relay"]["value"], 90)
+        self.assertIn("中转响应头平均 · 全链峰值 90", actual["relay"]["label"])
+
+
+class MediaProxySessionEvidenceAggregationTests(IsolatedDatabaseTestCase):
+    def test_session_aggregates_get_relay_without_counting_head_or_last_source(self):
+        from app.repositories import media_proxy
+
+        instance_id = media_proxy.add_media_proxy_instance(
+            name="聚合测试",
+            server_type="jellyfin",
+            upstream_url="http://127.0.0.1:8096",
+            api_key="",
+            listen_host="127.0.0.1",
+            listen_port=18180,
+        )
+
+        def record(*, method, status, route, source, latency):
+            return media_proxy.record_media_proxy_playback_attempt(
+                instance_id=instance_id,
+                route_class=route,
+                method=method,
+                status_code=status,
+                source=source,
+                total_latency_ms=latency,
+                playback_session_key="mixed-session",
+            )
+
+        record(method="GET", status=206, route="guangya_direct", source="guangya", latency=90)
+        record(method="HEAD", status=206, route="guangya_direct", source="guangya", latency=700)
+        record(method="HEAD", status=302, route="guangya_direct", source="guangya", latency=800)
+        record(method="GET", status=302, route="guangya_direct", source="guangya", latency=50)
+        record(method="GET", status=200, route="stream", source="upstream", latency=80)
+
+        result = media_proxy.list_media_proxy_playback_sessions(page_size=10)
+        self.assertEqual(len(result["items"]), 1)
+        session = result["items"][0]
+        self.assertEqual(session["last_source"], "upstream")
+        self.assertEqual(session["relay_request_count"], 1)
+        self.assertEqual(session["average_relay_latency_ms"], 90)
+        self.assertEqual(session["redirect_request_count"], 1)
+        self.assertEqual(session["average_redirect_latency_ms"], 50)
+        self.assertEqual(session["head_probe_request_count"], 2)
