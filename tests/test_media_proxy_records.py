@@ -114,7 +114,7 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(calls), 2)
         self.assertEqual(cache.metrics()["expired"], 1)
 
-    async def test_guangya_ts_expiry_and_exact_invalidation(self):
+    async def test_guangya_timestamp_cache_supports_exact_invalidation(self):
         mono = [10.0]
         wall = [1000.0]
         cache = media_proxy.SignedUrlCache(
@@ -147,6 +147,82 @@ class SignedUrlCacheIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotEqual(second, third)
         self.assertEqual(len(calls), 2)
+
+    async def test_guangya_issue_timestamp_does_not_disable_sync_or_async_cache(self):
+        for synchronous in (False, True):
+            for timestamp in ("990", "1000", "1010"):
+                with self.subTest(synchronous=synchronous, timestamp=timestamp):
+                    mono, wall = [10.0], [1000.0]
+                    cache = media_proxy.SignedUrlCache(
+                        ttl_seconds=60, clock=lambda: mono[0],
+                        wall_clock=lambda: wall[0],
+                    )
+                    url = f"https://signed.invalid/file?ts={timestamp}&s=fixture"
+                    calls = []
+
+                    def fetch():
+                        calls.append(1)
+                        return url
+
+                    async def read():
+                        if synchronous:
+                            return cache.get_or_fetch_sync_result("file", fetch)
+                        return await cache.get_or_fetch_result("file", lambda: _value(fetch()))
+
+                    first = await read()
+                    second = await read()
+                    mono[0] += 59
+                    wall[0] += 59
+                    third = await read()
+                    self.assertEqual([r.cache_hit for r in (first, second, third)], [False, True, True])
+                    self.assertEqual(len(calls), 1)
+                    mono[0] += 2
+                    wall[0] += 2
+                    refreshed = await read()
+                    self.assertFalse(refreshed.cache_hit)
+                    self.assertEqual(len(calls), 2)
+
+    async def test_issue_timestamp_never_overrides_explicit_expiry(self):
+        for query in (
+            "ts=900&Expires=1015", "ts=2000&Expires=1015",
+            "ts=1000&x-amz-date=19700101T001640Z&x-amz-expires=15",
+            "ts=1000&x-oss-date=19700101T001640Z&x-oss-expires=15",
+        ):
+            with self.subTest(query=query):
+                mono, wall = [10.0], [1000.0]
+                cache = media_proxy.SignedUrlCache(
+                    clock=lambda: mono[0], wall_clock=lambda: wall[0],
+                )
+                fetch = AsyncMock(return_value=f"https://signed.invalid/file?{query}")
+                first = await cache.get_or_fetch_result("file", fetch)
+                mono[0] += 4
+                wall[0] += 4
+                second = await cache.get_or_fetch_result("file", fetch)
+                self.assertFalse(first.cache_hit)
+                self.assertTrue(second.cache_hit)
+                mono[0] += 2
+                wall[0] += 2
+                third = await cache.get_or_fetch_result("file", fetch)
+                fourth = await cache.get_or_fetch_result("file", fetch)
+                self.assertFalse(third.cache_hit)
+                self.assertFalse(fourth.cache_hit)
+                self.assertEqual(cache.entry_count, 0)
+
+    async def test_guangya_issue_timestamp_concurrent_requests_fetch_once(self):
+        cache = media_proxy.SignedUrlCache(wall_clock=lambda: 1000)
+        calls = []
+
+        async def fetch():
+            calls.append(1)
+            await asyncio.sleep(0)
+            return "https://signed.invalid/file?ts=1000&s=fixture"
+
+        results = await asyncio.gather(*[
+            cache.get_or_fetch_result("file", fetch, scope="account") for _ in range(12)
+        ])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sum(result.cache_hit for result in results), 11)
+        self.assertEqual(cache.entry_count, 1)
 
     async def test_clear_scope_does_not_evict_other_instances(self):
         cache = media_proxy.SignedUrlCache()
@@ -1125,7 +1201,7 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
             def get_download_url(self, _file_id, **_kwargs):
                 self.__class__.calls += 1
                 time.sleep(0.02)
-                return "https://signed.invalid/file?Expires=4102444800&token=secret"
+                return f"https://signed.invalid/file?ts={int(time.time())}&token=secret"
 
             def close(self):
                 self.__class__.close_calls += 1
@@ -1164,6 +1240,40 @@ class ProxyRouteRecordIntegrationTests(IsolatedDatabaseTestCase):
         serialized = json.dumps(rows, ensure_ascii=False)
         self.assertNotIn("signed.invalid", serialized)
         self.assertNotIn("provider-account-secret", serialized)
+
+    def test_signed_strm_head_and_get_reuse_guangya_timestamp_url(self):
+        from fastapi import FastAPI
+        from urllib.parse import urlsplit
+        from app.modules.strm import build_play_url
+        from app.routes import proxy
+
+        class Client:
+            logged_in = True
+            calls = 0
+            raw = type("Raw", (), {"token": "fixture-account"})()
+
+            def get_download_url(self, _file_id, **_kwargs):
+                type(self).calls += 1
+                return f"https://signed.invalid/file?ts={int(time.time())}&s=fixture"
+
+            def close(self):
+                return True
+
+        app = FastAPI()
+        app.include_router(proxy.router)
+        url = urlsplit(build_play_url("http://testserver", "file", "etag", 123, "Movie.mkv"))
+        target = url.path + "?" + url.query
+        with (
+            patch.object(proxy, "GuangYaClient", Client),
+            patch.object(proxy, "_playgy_signed_urls", media_proxy.SignedUrlCache()),
+            TestClient(app) as http,
+        ):
+            head = http.head(target)
+            first = http.get(target, follow_redirects=False)
+            second = http.get(target, follow_redirects=False)
+        self.assertEqual((head.status_code, first.status_code, second.status_code), (200, 302, 302))
+        self.assertEqual(first.headers["location"], second.headers["location"])
+        self.assertEqual(Client.calls, 1)
 
 
 @contextmanager

@@ -18,7 +18,7 @@ class SignedUrlExpiryBusinessTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_expired_absolute_url_is_refetched_instead_of_reused(self):
-        for key in ("expires", "x-oss-expires", "oss-expires", "expiry", "exp", "ts"):
+        for key in ("expires", "x-oss-expires", "oss-expires", "expiry", "exp"):
             for expired_at in (1_699_999_999, 1_700_000_000):
                 with self.subTest(key=key, expired_at=expired_at):
                     cache = self._cache()
@@ -72,12 +72,17 @@ class SignedUrlExpiryBusinessTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(result.cache_hit, expected_calls == 1)
 
     async def test_url_without_expiry_keeps_bounded_default_ttl(self):
-        # 未提供到期元数据的历史链接继续使用有界默认TTL。
-        cache = self._cache()
-        fetch = mock.AsyncMock(return_value="https://cdn.invalid/movie.mkv?token=synthetic")
-        await cache.get_or_fetch("movie", fetch)
-        await cache.get_or_fetch("movie", fetch)
-        fetch.assert_awaited_once()
+        # ts 是不确定语义的时间戳，不能把签发时间当成到期时间。
+        # 无明确到期元数据（包括过去/当前/未来的 ts）均沿用有界短 TTL。
+        for query in ("token=synthetic", "ts=1699999999", "ts=1700000000", "ts=1700000060"):
+            with self.subTest(query=query):
+                cache = self._cache()
+                fetch = mock.AsyncMock(return_value=f"https://cdn.invalid/movie.mkv?{query}")
+                first = await cache.get_or_fetch_result("movie", fetch)
+                second = await cache.get_or_fetch_result("movie", fetch)
+                self.assertFalse(first.cache_hit)
+                self.assertTrue(second.cache_hit)
+                fetch.assert_awaited_once()
 
     def test_sync_route_uses_the_same_expiry_policy(self):
         cache = self._cache()

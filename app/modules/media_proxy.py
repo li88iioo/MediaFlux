@@ -613,8 +613,10 @@ class SignedUrlCache:
                     ttl = float(ttl_text)
                     if math.isfinite(ttl):
                         return issued + ttl
+            # ts 可能是签发时间，不能猜成到期时间（光鸭新直链的 ts≈当前时间）。
+            # 没有明确到期证据时沿用本地短 TTL，而不是立即淘汰或按签发时间延长。
             for key in (
-                "expires", "x-oss-expires", "oss-expires", "expiry", "exp", "ts",
+                "expires", "x-oss-expires", "oss-expires", "expiry", "exp",
             ):
                 value = query.get(key)
                 if value:
