@@ -161,6 +161,146 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         self.assertEqual(client.file_info_calls, 3)
         self.assertEqual(len(generated), 1)
 
+    def test_incremental_threshold_retires_indexed_file_and_refreshes_old_path(self):
+        source_id = "incremental-threshold-existing"
+        source_key = f"guangya:{source_id}"
+        metadata_key = f"guangya-meta:{source_id}"
+        large = GuangYaFile(
+            "video-1", "Movie.mkv", False, 20 * 1024 * 1024,
+            "etag-large", "season-dir",
+        )
+        client = _IncrementalClient({large.file_id: large})
+        change = {
+            "source_id": source_id, "kind": "video", "action": "upsert",
+            "file_id": large.file_id, "rel_dir": "剧集/Season 01",
+            "name": large.name, "etag": large.etag, "size": large.size,
+            "parent_id": large.parent_id,
+        }
+        with tempfile.TemporaryDirectory() as root:
+            first = sync_strm_incremental(
+                source_id, [change], "http://media.invalid", root,
+                client=client, skip_threshold_mb=10,
+            )
+            old_path = Path(root) / STRM_SUBDIR / "剧集" / "Season 01" / "Movie.strm"
+            self.assertTrue(old_path.exists())
+            metadata_path = old_path.with_suffix(".nfo")
+            metadata_path.write_text("metadata", encoding="utf-8")
+            db.upsert_strm_index(
+                metadata_key, large.file_id, "metadata-etag",
+                metadata_path.stat().st_size, "Movie.nfo", str(metadata_path),
+                self._fingerprint(metadata_path),
+            )
+            small = GuangYaFile(
+                large.file_id, large.name, False, 1024 * 1024,
+                "etag-small", large.parent_id,
+            )
+            client.files[small.file_id] = small
+            stats = sync_strm_incremental(
+                source_id,
+                [{**change, "etag": small.etag, "size": small.size}],
+                "http://media.invalid", root,
+                client=client, skip_threshold_mb=10,
+            )
+
+            self.assertFalse(old_path.exists())
+            self.assertEqual(db.list_strm_index(source_key), [])
+            metadata_rows = db.list_strm_index(metadata_key)
+            self.assertEqual([row["file_id"] for row in metadata_rows], [large.file_id])
+            self.assertTrue(metadata_path.exists())
+
+        self.assertEqual(first["generated"], 1)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["cleaned"], 1)
+        self.assertFalse(stats["fallback_required"])
+        self.assertEqual(stats["changed_strm_paths"], [str(old_path)])
+        self.assertEqual(client.list_calls, 0)
+
+    def test_incremental_threshold_without_index_is_idempotent_without_scan(self):
+        source_id = "incremental-threshold-new"
+        small = GuangYaFile(
+            "small-video", "Sample.mkv", False, 1024 * 1024,
+            "etag-small", "season-dir",
+        )
+        client = _IncrementalClient({small.file_id: small})
+        change = {
+            "source_id": source_id, "kind": "video", "action": "upsert",
+            "file_id": small.file_id, "rel_dir": "剧集/Season 01",
+            "name": small.name, "etag": small.etag, "size": small.size,
+            "parent_id": small.parent_id,
+        }
+        with tempfile.TemporaryDirectory() as root:
+            first = sync_strm_incremental(
+                source_id, [change], "http://media.invalid", root,
+                client=client, skip_threshold_mb=10,
+            )
+            second = sync_strm_incremental(
+                source_id, [change], "http://media.invalid", root,
+                client=client, skip_threshold_mb=10,
+            )
+            generated = list((Path(root) / STRM_SUBDIR).rglob("*.strm"))
+
+        self.assertEqual(first["skipped"], 1)
+        self.assertEqual(second["skipped"], 1)
+        self.assertEqual(first["cleaned"], 0)
+        self.assertEqual(second["cleaned"], 0)
+        self.assertFalse(first["fallback_required"])
+        self.assertFalse(second["fallback_required"])
+        self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+        self.assertEqual(generated, [])
+        self.assertEqual(client.list_calls, 0)
+
+    def test_incremental_threshold_delete_failure_preserves_old_file_and_index(self):
+        source_id = "incremental-threshold-delete-failure"
+        source_key = f"guangya:{source_id}"
+        large = GuangYaFile(
+            "video-1", "Movie.mkv", False, 20 * 1024 * 1024,
+            "etag-large", "season-dir",
+        )
+        client = _IncrementalClient({large.file_id: large})
+        change = {
+            "source_id": source_id, "kind": "video", "action": "upsert",
+            "file_id": large.file_id, "rel_dir": "剧集/Season 01",
+            "name": large.name, "etag": large.etag, "size": large.size,
+            "parent_id": large.parent_id,
+        }
+        original_unlink = Path.unlink
+        with tempfile.TemporaryDirectory() as root:
+            sync_strm_incremental(
+                source_id, [change], "http://media.invalid", root,
+                client=client, skip_threshold_mb=10,
+            )
+            old_path = Path(root) / STRM_SUBDIR / "剧集" / "Season 01" / "Movie.strm"
+            old_content = old_path.read_text(encoding="utf-8")
+            small = GuangYaFile(
+                large.file_id, large.name, False, 1024 * 1024,
+                "etag-small", large.parent_id,
+            )
+            client.files[small.file_id] = small
+
+            def fail_old_unlink(path_obj, *args, **kwargs):
+                if path_obj == old_path:
+                    raise OSError("threshold cleanup unlink failed")
+                return original_unlink(path_obj, *args, **kwargs)
+
+            with patch.object(Path, "unlink", new=fail_old_unlink):
+                stats = sync_strm_incremental(
+                    source_id,
+                    [{**change, "etag": small.etag, "size": small.size}],
+                    "http://media.invalid", root,
+                    client=client, skip_threshold_mb=10,
+                )
+
+            rows = db.list_strm_index(source_key)
+            self.assertTrue(old_path.exists())
+            self.assertEqual(old_path.read_text(encoding="utf-8"), old_content)
+
+        self.assertTrue(stats["fallback_required"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["file_id"], large.file_id)
+        self.assertEqual(rows[0]["size"], large.size)
+        self.assertEqual(rows[0]["strm_path"], str(old_path))
+        self.assertEqual(stats["changed_strm_paths"], [])
+
     def test_incremental_upserts_batch_verify_shared_parent_snapshot(self):
         source_id = "incremental-parent-batch"
         parent_id = "season-dir"

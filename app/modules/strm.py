@@ -1682,8 +1682,7 @@ def _sync_strm_incremental_impl(
         db.list_strm_index(metadata_key)
     )
     upserts = [item for item in normalized.values() if item["action"] == "upsert"]
-    removals = [item for item in normalized.values() if item["action"] == "remove"]
-    total_work = len(upserts) + len(removals)
+    total_work = len(normalized)
     completed = 0
     generate_started = time.monotonic()
     progress.emit("generate", 0, total_work, "精准更新 STRM")
@@ -1739,8 +1738,7 @@ def _sync_strm_incremental_impl(
                     raise RuntimeError("精准增量对象不属于已配置视频类型")
                 if threshold_bytes and 0 < file.size < threshold_bytes:
                     stats["skipped"] += 1
-                    completed += 1
-                    progress.emit("generate", completed, total_work, "精准更新 STRM")
+                    change["action"] = "remove"
                     continue
                 expected = _strm_target(file, rel_dir, strm_root)
                 current = video_by_id.get(file_id)
@@ -1830,7 +1828,7 @@ def _sync_strm_incremental_impl(
         db.upsert_strm_index_batch(video_key, fingerprint_backfills)
 
     if not stats["fallback_required"] and not stats["stopped"]:
-        for change in removals:
+        for change in (item for item in normalized.values() if item["action"] == "remove"):
             if stop_requested("incremental-cleanup"):
                 stats["generate_elapsed_seconds"] = round(
                     time.monotonic() - generate_started, 3
@@ -1867,9 +1865,9 @@ def _sync_strm_incremental_impl(
 
     if not stats["fallback_required"] and not stats["stopped"] and not stats["failed"]:
         for kind, namespace in (("video", video_key), ("metadata", metadata_key)):
-            scoped = {str(change["file_id"]) for change in normalized.values() if change["kind"] == kind}
+            scoped = {file_id for change_kind, file_id in normalized if change_kind == kind}
             if scoped:
-                active_ids = {str(change["file_id"]) for change in upserts if change["kind"] == kind}
+                active_ids = {file_id for file_id in scoped if normalized[(kind, file_id)]["action"] == "upsert"}
                 recover_pending_paths(
                     namespace, strm_root, stats, valid_ids=active_ids, only_file_ids=scoped,
                     should_stop=should_stop, on_refresh_paths=on_refresh_paths,
