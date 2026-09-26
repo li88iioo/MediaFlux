@@ -1,6 +1,6 @@
 """所有整理入口共用的规则、自动确认判定与持久化快照。
 
-规则只负责配置和纯判定；不扫描目录、不访问网盘、不持有任务运行态。
+规则集中处理配置、持久下载来源归属与判定；不扫描目录、不访问网盘、不持有任务运行态。
 """
 from __future__ import annotations
 
@@ -200,11 +200,18 @@ class OrganizeRules:
     def for_source(self, source_id: str) -> "OrganizeRules":
         """把全局规则收敛为单个光鸭来源的实际识别边界。
 
-        成人识别只有在来源被显式列入专用范围时才启用；选中的来源只走
-        MetaTube 精确番号链，未选来源完全禁用成人识别并保持普通 TMDB 链。
+        成人识别仅用于专用来源及能由持久下载记录证明归属的隔离目录；
+        此范围只走 MetaTube 精确番号链，其余来源保持普通 TMDB 链。
         """
-        selected = str(source_id or "").strip() in self.selected_nsfw_source_ids()
-        active = bool(self.nsfw_enabled and selected)
+        source = str(source_id or "").strip()
+        selected = self.selected_nsfw_source_ids()
+        active = bool(self.nsfw_enabled and source in selected)
+        if self.nsfw_enabled and selected and source not in {"", "0"} and not active:
+            from app.repositories.download_requests import get_guangya_staging_parent
+
+            # 下载只扫描自己的隔离目录；其真实父来源已在提交阶段持久化。
+            # 在统一入口继承，确保 tracker、人工确认和重启后的恢复使用同一规则。
+            active = get_guangya_staging_parent(source) in selected
         return replace(self, nsfw_enabled=active, nsfw_exclusive=active)
 
     def for_local_source(self, media_type: str) -> "OrganizeRules":

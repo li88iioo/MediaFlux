@@ -23,6 +23,9 @@ from app import database as db
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
 from app.logger import get_logger, log_throttled
+from app.modules.organize_sources import (
+    list_nsfw_download_sources as _nsfw_download_sources,
+)
 from app.notifier import (
     NOTIFICATION_SECTION_BREAK,
     NotificationEvent,
@@ -192,6 +195,98 @@ def _configured_organize_sources() -> list[dict[str, str]]:
     if error:
         logger.warning("读取光鸭整理来源失败: %s", error)
     return sources
+
+
+def _nsfw_download_source(source_id: str) -> dict[str, str] | None:
+    source_id = str(source_id or "").strip()
+    if not source_id:
+        return None
+    return next(
+        (
+            source
+            for source in _nsfw_download_sources()
+            if source["id"] == source_id
+        ),
+        None,
+    )
+
+
+def _download_target_picker_markup(
+    telebot,
+    *,
+    request_id: int,
+    chat_id: str,
+    user_id: str,
+    allow_guangya: bool = True,
+):
+    from app.modules.telegram_write_confirmations import (
+        get_telegram_write_confirmation_store,
+    )
+
+    ordinary = [
+        ("光鸭云盘", "confirm", {"request_id": request_id, "target": "guangya"}),
+        ("qBittorrent", "confirm", {"request_id": request_id, "target": "qb"}),
+        ("两者", "confirm", {"request_id": request_id, "target": "both"}),
+        ("取消", "cancel", {"request_id": request_id}),
+    ]
+    if allow_guangya:
+        sources = _nsfw_download_sources()
+        choices = [ordinary[0]]
+        if sources:
+            name_counts: dict[str, int] = {}
+            for source in sources:
+                name = " ".join(str(source.get("name") or "未命名来源").split())
+                name_counts[name] = name_counts.get(name, 0) + 1
+            seen_names: dict[str, int] = {}
+            for source in sources:
+                source_id = str(source["id"]).strip()
+                name = " ".join(str(source.get("name") or "未命名来源").split())
+                suffix = ""
+                if name_counts[name] > 1:
+                    seen_names[name] = seen_names.get(name, 0) + 1
+                    suffix = f" #{seen_names[name]}"
+                label_name = name[: max(1, 40 - len(suffix))].rstrip() + suffix
+                choices.append(
+                    (
+                        f"光鸭·NSFW · {label_name}",
+                        "confirm",
+                        {
+                            "request_id": request_id,
+                            "target": "guangya",
+                            "nsfw_source_id": source_id,
+                        },
+                    )
+                )
+        else:
+            choices.append(
+                (
+                    "光鸭·NSFW",
+                    "confirm",
+                    {
+                        "request_id": request_id,
+                        "target": "guangya",
+                        "nsfw_source_id": "",
+                    },
+                )
+            )
+        choices.extend(ordinary[1:])
+    else:
+        choices = [ordinary[1], ordinary[3]]
+
+    action_ids = get_telegram_write_confirmation_store().create_group(
+        chat_id=chat_id,
+        user_id=user_id,
+        operation="download_request",
+        actions=[(decision, value) for _label, decision, value in choices],
+    )
+    keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        *[
+            telebot.types.InlineKeyboardButton(label, callback_data=f"tgc:{action_id}")
+            for (label, _decision, _value), action_id in zip(choices, action_ids)
+        ]
+    )
+    return keyboard
 
 
 def _configured_local_organize_sources() -> list[object]:
@@ -1632,34 +1727,14 @@ def _register_commands(bot, telebot):
         user_id: str = "",
         reissued: bool = False,
     ):
-        from app.modules.telegram_write_confirmations import (
-            get_telegram_write_confirmation_store,
-        )
-
         if not chat_id or not user_id:
             chat_id, user_id = _telegram_identity(msg)
-        choices = [
-            ("光鸭云盘", "confirm", {"request_id": request_id, "target": "guangya"}),
-            ("qBittorrent", "confirm", {"request_id": request_id, "target": "qb"}),
-            ("两者", "confirm", {"request_id": request_id, "target": "both"}),
-            ("取消", "cancel", {"request_id": request_id}),
-        ]
-        if not allow_guangya:
-            choices = [choices[1], choices[3]]
-        action_ids = get_telegram_write_confirmation_store().create_group(
+        keyboard = _download_target_picker_markup(
+            telebot,
+            request_id=request_id,
             chat_id=chat_id,
             user_id=user_id,
-            operation="download_request",
-            actions=[(decision, value) for _label, decision, value in choices],
-        )
-        keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
-        keyboard.add(
-            *[
-                telebot.types.InlineKeyboardButton(
-                    label, callback_data=f"tgc:{action_id}"
-                )
-                for (label, _decision, _value), action_id in zip(choices, action_ids)
-            ]
+            allow_guangya=allow_guangya,
         )
         bot.reply_to(
             msg,
@@ -2181,6 +2256,49 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             target = str(value.get("target") or "")
             if target not in {"qb", "guangya", "both"}:
                 raise TelegramWriteConfirmationError("下载确认参数无效")
+            nsfw_source_id = ""
+            if "nsfw_source_id" in value:
+                if target != "guangya":
+                    raise TelegramWriteConfirmationError("NSFW 下载目标无效")
+                nsfw_source_id = str(value.get("nsfw_source_id") or "").strip()
+                source = _nsfw_download_source(nsfw_source_id)
+                if source is None:
+                    notice = (
+                        "未配置 NSFW 整理来源，本次未提交；请先配置或选择其他目标。"
+                        if not nsfw_source_id
+                        else "NSFW 来源已变更，本次未提交，请重新选择。"
+                    )
+                    keyboard = _download_target_picker_markup(
+                        telebot,
+                        request_id=request_id,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                    )
+                    picker_text = (
+                        "<b>选择下载目标</b>\n"
+                        f"任务: {html.escape(str(row['title'] or '未命名任务'))}\n"
+                        f"{notice}"
+                    )
+                    try:
+                        bot.edit_message_text(
+                            picker_text,
+                            call.message.chat.id,
+                            call.message.message_id,
+                            parse_mode="HTML",
+                            reply_markup=keyboard,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - fall back from Telegram edits
+                        logger.info(
+                            "Telegram NSFW 重新选择卡更新失败 type=%s",
+                            type(exc).__name__,
+                        )
+                        bot.reply_to(
+                            call.message,
+                            picker_text,
+                            reply_markup=keyboard,
+                        )
+                    bot.answer_callback_query(call.id, notice, show_alert=True)
+                    return
             _edit_write_confirmation_message(
                 bot, call.message, "下载请求已确认", "正在提交到所选下载目标…"
             )
@@ -2196,6 +2314,11 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                 ),
                 name=f"tg-download-{request_id}",
                 daemon=True,
+                **(
+                    {"kwargs": {"nsfw_source_id": nsfw_source_id}}
+                    if nsfw_source_id
+                    else {}
+                ),
             ).start()
             return
         if action["decision"] == "cancel":
@@ -2786,13 +2909,52 @@ def _download_follow_up_text(succeeded: list[str]) -> str:
 
 
 def _dispatch_download_callback(
-    bot, chat_id, message_id, request_id: int, target: str
+    bot,
+    chat_id,
+    message_id,
+    request_id: int,
+    target: str,
+    *,
+    nsfw_source_id: str = "",
 ) -> None:
-    from app.modules.download_dispatcher import dispatch_request, public_dispatch_summary
+    from app.modules.download_dispatcher import (
+        dispatch_request,
+        public_dispatch_summary,
+    )
     from app.modules.download_tracker import get_download_tracker
 
+    nsfw_source = None
+    if nsfw_source_id:
+        nsfw_source = _nsfw_download_source(nsfw_source_id)
+        if target != "guangya" or nsfw_source is None:
+            try:
+                bot.edit_message_text(
+                    "<b>下载未提交</b>\n"
+                    "NSFW 来源配置已变化，本次未提交；请重新发送链接或种子选择目标。",
+                    chat_id,
+                    message_id,
+                    reply_markup=None,
+                )
+            except Exception as exc:  # noqa: BLE001 - Telegram may raise SDK-specific errors
+                logger.warning(
+                    "Telegram NSFW 来源失效回执投递失败 request#%s type=%s",
+                    request_id,
+                    type(exc).__name__,
+                )
+            return
+
     try:
-        summary = public_dispatch_summary(dispatch_request(request_id, target))
+        result = (
+            dispatch_request(
+                request_id,
+                target,
+                gy_target_dir=str(nsfw_source["id"]),
+                gy_target_name=str(nsfw_source["name"]),
+            )
+            if nsfw_source is not None
+            else dispatch_request(request_id, target)
+        )
+        summary = public_dispatch_summary(result)
     except Exception as exc:
         logger.error(
             "Telegram 下载分流失败 request#%s type=%s",
@@ -2822,6 +2984,9 @@ def _dispatch_download_callback(
     text = f"<b>{title}</b>\n请求: #{request_id}"
     labels = {"qb": "qBittorrent", "guangya": "光鸭云盘"}
     succeeded = summary["succeeded"]
+    if nsfw_source is not None:
+        source_name = str(nsfw_source.get("name") or nsfw_source["id"])
+        text += f"\nNSFW 整理来源：{html.escape(source_name)}（按 NSFW 规则整理）"
     if succeeded:
         text += "\n成功: " + "、".join(labels[item] for item in succeeded)
     if summary["failed"]:

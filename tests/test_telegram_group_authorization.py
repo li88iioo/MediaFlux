@@ -368,6 +368,10 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 "app.modules.download_dispatcher.create_request",
                 return_value={"created": True, "id": 77, "status": "pending"},
             ),
+            patch(
+                "app.bot.handlers._nsfw_download_sources",
+                return_value=[{"id": "adult-a", "name": "成人来源 A"}],
+            ),
         ):
             handlers._register_commands(bot, telebot)
             receive_link = next(
@@ -390,7 +394,12 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                     text="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
                 )
             )
-            callback_data = bot.replies[-1][2]["reply_markup"].buttons[0].callback_data
+            button = next(
+                button
+                for button in bot.replies[-1][2]["reply_markup"].buttons
+                if button.text.startswith("光鸭·NSFW")
+            )
+            callback_data = button.callback_data
             self.assertTrue(callback_data.startswith("tgc:"))
             callback = next(
                 registered
@@ -417,6 +426,7 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
             user_id="9",
         )
         self.assertEqual(action["value"]["request_id"], 77)
+        self.assertEqual(action["value"]["nsfw_source_id"], "adult-a")
 
     def test_duplicate_pending_link_reissues_owner_bound_confirmation_picker(self):
         from app.bot import handlers
@@ -542,6 +552,407 @@ class TelegramGroupWriteAuthorizationTests(unittest.TestCase):
                 for button in bot.replies[-1][2]["reply_markup"].buttons
             )
         )
+
+    def test_nsfw_picker_has_explicit_sources_and_ticket_dispatches_selected_source(
+        self,
+    ):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import (
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+        from tests.test_production import TelegramBotTests
+
+        class Bot(TelegramBotTests.FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+                self.edits = []
+
+            def answer_callback_query(self, *args, **kwargs):
+                self.answers.append((args, kwargs))
+
+            def edit_message_text(self, *args, **kwargs):
+                self.edits.append((args, kwargs))
+
+        sources = [
+            {"id": "adult-a", "name": "成人影视 A"},
+            {"id": "adult-b", "name": "成人影视 B"},
+        ]
+        reset_telegram_write_confirmation_store_for_tests()
+        bot = Bot()
+        telebot = TelegramBotTests._telebot_types()
+        with patch(
+            "app.bot.handlers._nsfw_download_sources",
+            return_value=sources,
+        ):
+            markup = handlers._download_target_picker_markup(
+                telebot,
+                request_id=77,
+                chat_id="100",
+                user_id="9",
+            )
+            nsfw_buttons = [
+                button
+                for button in markup.buttons
+                if button.text.startswith("光鸭·NSFW")
+            ]
+            self.assertEqual(len(nsfw_buttons), 2)
+            self.assertIn("成人影视 A", nsfw_buttons[0].text)
+            self.assertIn("成人影视 B", nsfw_buttons[1].text)
+
+            selected = nsfw_buttons[1]
+            call = SimpleNamespace(
+                id="nsfw-source-choice",
+                data=selected.callback_data,
+                from_user=SimpleNamespace(id=9),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    message_id=23,
+                ),
+            )
+            row = {
+                "id": 77,
+                "status": "pending",
+                "kind": "magnet",
+                "source_value": "magnet:?xt=urn:btih:fixture",
+                "title": "待下载任务",
+            }
+            with (
+                patch(
+                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    return_value=row,
+                ) as bind_owner,
+                patch("app.bot.handlers.threading.Thread") as thread,
+            ):
+                handlers._handle_write_confirmation_callback(bot, call, telebot)
+                handlers._handle_write_confirmation_callback(bot, call, telebot)
+
+        thread.assert_called_once()
+        self.assertEqual(
+            thread.call_args.kwargs["kwargs"],
+            {"nsfw_source_id": "adult-b"},
+        )
+        bind_owner.assert_called_once_with(77, chat_id="100", user_id="9")
+        self.assertTrue(bot.edits[0][1]["reply_markup"] is None)
+        self.assertTrue(bot.answers[-1][1]["show_alert"])
+
+    def test_single_nsfw_source_is_named_and_stored_in_ticket(self):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import (
+            get_telegram_write_confirmation_store,
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+        from tests.test_production import TelegramBotTests
+
+        reset_telegram_write_confirmation_store_for_tests()
+        source = {"id": "adult-only", "name": "成人专区"}
+        with patch(
+            "app.bot.handlers._nsfw_download_sources",
+            return_value=[source],
+        ):
+            markup = handlers._download_target_picker_markup(
+                TelegramBotTests._telebot_types(),
+                request_id=77,
+                chat_id="100",
+                user_id="9",
+            )
+
+        button = next(
+            item for item in markup.buttons if item.text.startswith("光鸭·NSFW")
+        )
+        self.assertIn("成人专区", button.text)
+        action = get_telegram_write_confirmation_store().claim(
+            button.callback_data[4:],
+            chat_id="100",
+            user_id="9",
+        )
+        self.assertEqual(action["value"]["nsfw_source_id"], "adult-only")
+
+    def test_ordinary_qb_picker_keeps_existing_dispatch_call_shape(self):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import (
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+        from tests.test_production import TelegramBotTests
+
+        class Bot(TelegramBotTests.FakeBot):
+            def answer_callback_query(self, *_args, **_kwargs):
+                return None
+
+            def edit_message_text(self, *_args, **_kwargs):
+                return None
+
+        reset_telegram_write_confirmation_store_for_tests()
+        telebot = TelegramBotTests._telebot_types()
+        row = {
+            "id": 77,
+            "status": "pending",
+            "kind": "magnet",
+            "source_value": "magnet:?xt=urn:btih:fixture",
+            "title": "普通下载",
+        }
+        with patch(
+            "app.bot.handlers._nsfw_download_sources",
+            return_value=[],
+        ):
+            markup = handlers._download_target_picker_markup(
+                telebot,
+                request_id=77,
+                chat_id="100",
+                user_id="9",
+            )
+            qb_button = next(
+                item for item in markup.buttons if item.text == "qBittorrent"
+            )
+            call = SimpleNamespace(
+                id="ordinary-qb-choice",
+                data=qb_button.callback_data,
+                from_user=SimpleNamespace(id=9),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    message_id=23,
+                ),
+            )
+            with (
+                patch(
+                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    return_value=row,
+                ),
+                patch("app.bot.handlers.threading.Thread") as thread,
+            ):
+                handlers._handle_write_confirmation_callback(
+                    Bot(),
+                    call,
+                    telebot,
+                )
+
+        thread.assert_called_once()
+        self.assertEqual(thread.call_args.kwargs["args"][-1], "qb")
+        self.assertNotIn("kwargs", thread.call_args.kwargs)
+
+    def test_empty_nsfw_choice_does_not_submit_and_keeps_other_targets_available(self):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import (
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+        from tests.test_production import TelegramBotTests
+
+        class Bot(TelegramBotTests.FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+                self.edits = []
+
+            def answer_callback_query(self, *args, **kwargs):
+                self.answers.append((args, kwargs))
+
+            def edit_message_text(self, *args, **kwargs):
+                self.edits.append((args, kwargs))
+
+        reset_telegram_write_confirmation_store_for_tests()
+        bot = Bot()
+        telebot = TelegramBotTests._telebot_types()
+        with patch(
+            "app.bot.handlers._nsfw_download_sources",
+            return_value=[],
+        ):
+            markup = handlers._download_target_picker_markup(
+                telebot,
+                request_id=77,
+                chat_id="100",
+                user_id="9",
+            )
+            button = next(
+                button for button in markup.buttons if button.text == "光鸭·NSFW"
+            )
+            row = {
+                "id": 77,
+                "status": "pending",
+                "kind": "magnet",
+                "source_value": "magnet:?xt=urn:btih:fixture",
+                "title": "待下载任务",
+            }
+            call = SimpleNamespace(
+                id="empty-nsfw-choice",
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=9),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    message_id=23,
+                ),
+            )
+            with (
+                patch(
+                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    return_value=row,
+                ),
+                patch("app.bot.handlers.db.cancel_pending_download_request") as cancel,
+                patch("app.bot.handlers.threading.Thread") as thread,
+            ):
+                handlers._handle_write_confirmation_callback(bot, call, telebot)
+
+        thread.assert_not_called()
+        cancel.assert_not_called()
+        self.assertIn("未配置 NSFW", bot.answers[-1][0][1])
+        replacement = bot.edits[-1][1]["reply_markup"]
+        self.assertTrue(any(item.text == "qBittorrent" for item in replacement.buttons))
+        self.assertTrue(any(item.text == "两者" for item in replacement.buttons))
+        self.assertTrue(any(item.text == "光鸭·NSFW" for item in replacement.buttons))
+
+    def test_stale_nsfw_choice_refreshes_picker_without_submitting(self):
+        from app.bot import handlers
+        from app.modules.telegram_write_confirmations import (
+            reset_telegram_write_confirmation_store_for_tests,
+        )
+        from tests.test_production import TelegramBotTests
+
+        class Bot(TelegramBotTests.FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.answers = []
+                self.edits = []
+
+            def answer_callback_query(self, *args, **kwargs):
+                self.answers.append((args, kwargs))
+
+            def edit_message_text(self, *args, **kwargs):
+                self.edits.append((args, kwargs))
+
+        reset_telegram_write_confirmation_store_for_tests()
+        bot = Bot()
+        telebot = TelegramBotTests._telebot_types()
+        current_sources = [{"id": "adult-old", "name": "旧来源"}]
+        with patch(
+            "app.bot.handlers._nsfw_download_sources",
+            side_effect=lambda: list(current_sources),
+        ):
+            markup = handlers._download_target_picker_markup(
+                telebot,
+                request_id=77,
+                chat_id="100",
+                user_id="9",
+            )
+            button = next(
+                item for item in markup.buttons if item.text.startswith("光鸭·NSFW")
+            )
+            current_sources[:] = [{"id": "adult-new", "name": "新来源"}]
+            row = {
+                "id": 77,
+                "status": "pending",
+                "kind": "magnet",
+                "source_value": "magnet:?xt=urn:btih:fixture",
+                "title": "待下载任务",
+            }
+            call = SimpleNamespace(
+                id="stale-nsfw-choice",
+                data=button.callback_data,
+                from_user=SimpleNamespace(id=9),
+                message=SimpleNamespace(
+                    chat=SimpleNamespace(id=100),
+                    message_id=23,
+                ),
+            )
+            with (
+                patch(
+                    "app.bot.handlers.db.bind_pending_download_request_owner",
+                    return_value=row,
+                ),
+                patch("app.bot.handlers.threading.Thread") as thread,
+            ):
+                handlers._handle_write_confirmation_callback(bot, call, telebot)
+
+        thread.assert_not_called()
+        self.assertIn("来源已变更", bot.answers[-1][0][1])
+        replacement = bot.edits[-1][1]["reply_markup"]
+        labels = [item.text for item in replacement.buttons]
+        self.assertTrue(any("新来源" in label for label in labels))
+        self.assertFalse(any("旧来源" in label for label in labels))
+
+    def test_nsfw_dispatch_revalidates_source_and_uses_existing_directory_target(self):
+        from app.bot import handlers
+
+        class Bot:
+            def __init__(self):
+                self.edits = []
+
+            def edit_message_text(self, *args, **kwargs):
+                self.edits.append((args, kwargs))
+
+        bot = Bot()
+        source = {"id": "adult-a", "name": "成人影视 A"}
+        summary = {
+            "status": "submitted",
+            "succeeded": ["guangya"],
+            "failed": [],
+            "error": "",
+        }
+        tracker = SimpleNamespace(reload=lambda: None)
+        with (
+            patch(
+                "app.bot.handlers._nsfw_download_sources",
+                return_value=[source],
+            ),
+            patch(
+                "app.modules.download_dispatcher.dispatch_request", return_value={}
+            ) as dispatch,
+            patch(
+                "app.modules.download_dispatcher.public_dispatch_summary",
+                return_value=summary,
+            ),
+            patch(
+                "app.modules.download_tracker.get_download_tracker",
+                return_value=tracker,
+            ),
+            patch(
+                "app.bot.handlers._download_follow_up_text",
+                return_value="现有后续提示",
+            ),
+        ):
+            handlers._dispatch_download_callback(
+                bot,
+                100,
+                23,
+                77,
+                "guangya",
+                nsfw_source_id="adult-a",
+            )
+
+        dispatch.assert_called_once_with(
+            77,
+            "guangya",
+            gy_target_dir="adult-a",
+            gy_target_name="成人影视 A",
+        )
+        receipt = bot.edits[-1][0][0]
+        self.assertIn("成人影视 A", receipt)
+        self.assertIn("按 NSFW 规则整理", receipt)
+        self.assertIn("现有后续提示", receipt)
+
+        bot.edits.clear()
+        with (
+            patch(
+                "app.bot.handlers._nsfw_download_sources",
+                return_value=[],
+            ),
+            patch(
+                "app.modules.download_dispatcher.dispatch_request"
+            ) as stale_dispatch,
+            patch(
+                "app.modules.download_tracker.get_download_tracker"
+            ) as tracker_getter,
+        ):
+            handlers._dispatch_download_callback(
+                bot,
+                100,
+                23,
+                78,
+                "guangya",
+                nsfw_source_id="adult-a",
+            )
+
+        stale_dispatch.assert_not_called()
+        tracker_getter.assert_not_called()
+        self.assertIn("本次未提交", bot.edits[-1][0][0])
 
 
 if __name__ == "__main__":

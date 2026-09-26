@@ -957,6 +957,24 @@ def claim_download_request_staging_finalize(
         return cur.rowcount == 1
 
 
+def get_guangya_staging_parent(source_id: str) -> str:
+    """按持久下载身份恢复隔离目录的来源；不把普通目录或名称当作证明。"""
+    with db.get_conn() as conn:
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_requests'"
+        ).fetchone() is None:
+            return ""
+        rows = conn.execute(
+            "SELECT DISTINCT gy_staging_parent_dir FROM download_requests "
+            "WHERE gy_isolated=1 AND gy_target_dir=? "
+            "AND TRIM(COALESCE(gy_staging_parent_dir,'')) NOT IN ('','0') LIMIT 2",
+            (source_id,),
+        ).fetchall()
+    if len(rows) > 1:
+        raise ValueError("下载隔离目录的整理来源不唯一，已停止整理")
+    return str(rows[0]["gy_staging_parent_dir"] or "").strip() if rows else ""
+
+
 def list_protected_guangya_staging_ids() -> set[str]:
     """返回仍可能被下载后端写入或等待人工收口的隔离目录。"""
     with db.get_conn() as conn:

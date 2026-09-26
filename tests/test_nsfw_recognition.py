@@ -1356,5 +1356,144 @@ class OrganizerRecognizerLifecycleTests(unittest.TestCase):
         self.assertTrue(organizer.close())
 
 
+class NsfwDownloadSourceTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM download_request_keys")
+            conn.execute("DELETE FROM download_requests")
+        self.rules = OrganizeRules(
+            target_dir_id="archive", nsfw_enabled=True,
+            nsfw_source_ids='["adult-source","adult-other"]',
+            nsfw_metatube_endpoint="http://127.0.0.1:8080",
+        )
+
+    def _staging(self, source="task-dir", parent="adult-source", *, isolated=True):
+        request_id, _ = db.create_download_request(
+            f"request-{parent}-{source}", "magnet", title="test", source_value="magnet:?xt=urn:btih:" + "a" * 40,
+        )
+        self.assertTrue(db.claim_download_request(request_id, "guangya"))
+        self.assertTrue(db.bind_download_request_guangya_staging(
+            request_id, staging_id=source, parent_id=parent,
+            staging_name="download-task", target_name="来源 / download-task",
+        ))
+        db.update_download_request(request_id, gy_isolated=int(isolated))
+        return request_id
+
+    def test_choices_use_existing_source_ids_and_current_names(self):
+        from app.modules.organize_sources import list_nsfw_download_sources
+
+        values = {
+            "GY_ORGANIZE_SOURCE_DIRS": '[{"id":"ordinary","name":"普通"},{"id":"adult-source","name":"已改名的来源"},{"id":"adult-other","name":"第二来源"}]',
+            "GY_ORGANIZE_NSFW_SOURCE_IDS": '["adult-source","adult-other"]',
+        }
+        with patch("app.config.get_bool", return_value=True), patch(
+            "app.config.get", side_effect=lambda key, default="": values.get(key, default),
+        ):
+            self.assertEqual(list_nsfw_download_sources(), [
+                {"id": "adult-source", "name": "已改名的来源"},
+                {"id": "adult-other", "name": "第二来源"},
+            ])
+            values["GY_ORGANIZE_NSFW_SOURCE_IDS"] = '["removed-source"]'
+            self.assertEqual(list_nsfw_download_sources(), [])
+            values["GY_ORGANIZE_NSFW_SOURCE_IDS"] = "invalid json"
+            self.assertEqual(list_nsfw_download_sources(), [])
+        with patch("app.config.get_bool", return_value=False):
+            self.assertEqual(list_nsfw_download_sources(), [])
+
+    def test_staging_inherits_only_its_persisted_configured_parent(self):
+        self._staging("adult-task")
+        self._staging("ordinary-task", "ordinary")
+        self._staging("not-isolated", isolated=False)
+        self._staging("unscoped", "0")
+        for source in ("adult-source", "adult-task", "ordinary-task", "not-isolated", "unscoped", "unknown", "", "0"):
+            with self.subTest(source=source):
+                rules = self.rules.for_source(source)
+                expected = source in {"adult-source", "adult-task"}
+                self.assertEqual(rules.nsfw_enabled, expected)
+                self.assertEqual(rules.nsfw_exclusive, expected)
+        # 历史普通下载没有隔离身份时，不能因目录名称或父ID猜成人分类。
+        from dataclasses import replace
+        self.assertFalse(replace(self.rules, nsfw_enabled=False).for_source("adult-task").nsfw_enabled)
+        self.assertFalse(replace(self.rules, nsfw_source_ids='["adult-other"]').for_source("adult-task").nsfw_enabled)
+
+    def test_duplicate_parent_evidence_stops_instead_of_guessing(self):
+        self._staging("same-task", "adult-source")
+        self._staging("same-task", "ordinary")
+        with self.assertRaisesRegex(ValueError, "不唯一"):
+            self.rules.for_source("same-task")
+
+    def test_restart_and_confirmation_keep_same_scoped_rules(self):
+        self._staging()
+        snapshot = organize_rules_snapshot(self.rules.for_source("task-dir"))
+        # 新建规则对象、重新读SQLite，不依赖上一次执行的内存意图。
+        restored = OrganizeRules(**self.rules.__dict__).for_source("task-dir")
+        self.assertTrue(restored.nsfw_exclusive)
+        self.assertTrue(organize_rules_snapshot_matches(snapshot, restored))
+        from app.modules.organize_confirmations import _clean_confirmation_retry_is_current
+        with patch.object(OrganizeRules, "from_config", return_value=OrganizeRules(**self.rules.__dict__)):
+            self.assertTrue(_clean_confirmation_retry_is_current({
+                "source_dir_id": "task-dir", "rules": snapshot,
+            }, None))
+
+    def test_staging_without_metatube_match_does_not_fall_back_to_tmdb(self):
+        self._staging()
+        rules = self.rules.for_source("task-dir")
+        scraper = TMDBScraper()
+        scraper.match = MagicMock()
+        organizer = Organizer(client=object(), scraper=scraper)
+        recognizer = MagicMock()
+        recognizer.match.return_value = None
+        with patch.object(organizer, "_nsfw_recognizer_lease", return_value=nullcontext(recognizer)):
+            match = organizer._resolve_plan_match(
+                GuangYaFile("file", "SSIS-001.mp4", False, 1, "e", "task-dir"), rules,
+                match_name="SSIS-001.mp4", parent_path="download-task",
+                recognition_media_type_hint="", match_override=None,
+                recognition_work_cache=None, recognition_work_cache_key=None,
+            )
+        recognizer.match.assert_called_once()
+        scraper.match.assert_not_called()
+        self.assertTrue(match.need_confirm)
+        self.assertEqual(match.provider, "metatube")
+
+    def test_dispatch_download_completion_and_duplicate_use_one_scoped_task(self):
+        from app.modules.download_dispatcher import dispatch_request
+        from app.modules.download_tracker import DownloadTracker
+
+        request_id, _ = db.create_download_request(
+            "nsfw-dispatch", "magnet", title="test", source_value="magnet:?xt=urn:btih:" + "b" * 40,
+        )
+        def offline(_url, **kwargs):
+            self.assertEqual(kwargs["target_dir_id"], "adult-source")
+            self.assertTrue(kwargs["isolate_task"])
+            staging = {"id": "isolated-download", "parent_id": "adult-source", "parent_name": "成人来源",
+                       "name": "download-task", "isolated": True}
+            kwargs["on_staging_created"](staging)
+            return {"ok": True, "task_ids": ["cloud-task"], "selected_count": 1,
+                    "decision": {"target_dir_id": "isolated-download", "target_dir_name": "成人来源 / download-task"},
+                    "staging": staging}
+        with patch("app.modules.download_dispatcher.submit_offline", side_effect=offline) as submit, patch(
+            "app.modules.download_dispatcher._recover_guangya_magnet_torrent", return_value=None,
+        ):
+            self.assertTrue(dispatch_request(request_id, "guangya", gy_target_dir="adult-source", gy_target_name="成人来源")["ok"])
+            self.assertTrue(dispatch_request(request_id, "guangya", gy_target_dir="adult-source")["duplicate"])
+            submit.assert_called_once()
+        db.update_download_request(request_id, gy_status="completed")
+        seen = []
+        def start(sources, rules, **kwargs):
+            self.assertEqual(sources, [{"id": "isolated-download", "name": "成人来源 / download-task"}])
+            self.assertEqual(kwargs["download_request_ids"], [request_id])
+            seen.append(rules.for_source(sources[0]["id"]))
+            return {"ok": True}
+        manager = SimpleNamespace(start=MagicMock(side_effect=start))
+        with patch("app.modules.download_tracker.get_organize_manager", return_value=manager), patch(
+            "app.modules.download_tracker.get", side_effect=lambda key, default="": "archive" if key == "GY_ORGANIZE_TARGET_DIR" else default,
+        ), patch.object(OrganizeRules, "from_config", return_value=self.rules), patch.object(DownloadTracker, "_publish_lifecycle"):
+            DownloadTracker()._start_organize(db.get_download_request(request_id))
+            DownloadTracker()._start_organize(db.get_download_request(request_id))
+        manager.start.assert_called_once()
+        self.assertTrue(seen[0].nsfw_exclusive)
+        self.assertEqual(seen[0].target_dir_id, "archive")
+
+
 if __name__ == "__main__":
     unittest.main()

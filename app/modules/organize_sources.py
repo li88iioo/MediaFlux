@@ -113,3 +113,20 @@ def encode_organize_source_ids(source_ids: list[str]) -> str:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def list_nsfw_download_sources() -> list[dict[str, str]]:
+    """TG 下载复用现有成人专用整理来源，不另存目录或按名称猜测。"""
+    from app import config
+
+    if not config.get_bool("GY_ORGANIZE_NSFW_ENABLED", False):
+        return []
+    sources, error = normalize_organize_sources(config.get("GY_ORGANIZE_SOURCE_DIRS", ""))
+    if error:
+        return []
+    selected, error = normalize_organize_source_ids(
+        config.get("GY_ORGANIZE_NSFW_SOURCE_IDS", ""), configured_sources=sources,
+    )
+    if error:
+        return []
+    return [source for source in sources if source["id"] in selected]
