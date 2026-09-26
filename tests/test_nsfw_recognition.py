@@ -8,7 +8,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 import requests
 
@@ -727,8 +727,8 @@ class NsfwOrganizerTests(unittest.TestCase):
         )
         service = DirectoryScrapeService(client=client, rules_loader=lambda: rules)
 
-        scoped = service._rules_for_scope("child")
-        ordinary = service._rules_for_scope("ordinary")
+        scoped = rules.for_source("child", client=service.client)
+        ordinary = rules.for_source("ordinary", client=service.client)
 
         self.assertTrue(scoped.nsfw_enabled)
         self.assertTrue(scoped.nsfw_exclusive)
@@ -1434,6 +1434,40 @@ class NsfwDownloadSourceTests(IsolatedDatabaseTestCase):
             self.assertTrue(_clean_confirmation_retry_is_current({
                 "source_dir_id": "task-dir", "rules": snapshot,
             }, None))
+
+    def test_manual_scope_uses_same_persisted_identity_without_cloud_dependency(self):
+        self._staging()
+        client = SimpleNamespace(file_info=Mock(side_effect=TimeoutError("cloud unavailable")))
+        self.assertEqual(
+            organize_rules_snapshot(self.rules.for_source("task-dir", client=client)),
+            organize_rules_snapshot(self.rules.for_source("task-dir")),
+        )
+        client.file_info.assert_not_called()
+
+    def test_disabled_scope_never_walks_cloud_parents(self):
+        from dataclasses import replace
+        client = SimpleNamespace(file_info=Mock(side_effect=AssertionError("unexpected lookup")))
+        with patch("app.repositories.download_requests.get_guangya_staging_parent") as lookup:
+            rules = replace(self.rules, nsfw_enabled=False).for_source("child", client=client)
+        self.assertFalse(rules.nsfw_exclusive)
+        client.file_info.assert_not_called()
+        lookup.assert_not_called()
+
+    def test_cloud_scope_walk_is_bounded_and_fails_closed(self):
+        cases = (
+            ({"child": {"parentId": "middle"}, "middle": SimpleNamespace(parent_id="adult-source")}, True, 2),
+            ({"child": {"parent_id": "middle"}, "middle": {"parent_id": "child"}}, False, 2),
+            ({"child": {"parent_id": "0"}}, False, 1),
+            ({"child": None}, False, 1),
+        )
+        for tree, expected, count in cases:
+            with self.subTest(tree=tree):
+                client = SimpleNamespace(file_info=Mock(side_effect=tree.__getitem__))
+                self.assertEqual(self.rules.for_source("child", client=client).nsfw_exclusive, expected)
+                self.assertEqual(client.file_info.call_count, count)
+        client = SimpleNamespace(file_info=Mock(side_effect=lambda value: {"parent_id": str(int(value) + 1)}))
+        self.assertFalse(self.rules.for_source("1", client=client).nsfw_exclusive)
+        self.assertEqual(client.file_info.call_count, 96)
 
     def test_staging_without_metatube_match_does_not_fall_back_to_tmdb(self):
         self._staging()

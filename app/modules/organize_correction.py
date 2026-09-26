@@ -179,7 +179,7 @@ class OrganizeCorrectionService:
                 "检测到云端操作或补偿未完整完成。系统已冻结自动写操作；"
                 "请根据成员快照和操作步骤人工核对云端现状，禁止猜测式续写。"
             )
-        rules = self._rules_for_source_scope(str(data.get("source_dir_id") or ""))
+        rules = OrganizeRules.from_config().for_source(str(data.get("source_dir_id") or ""), client=self.client)
         nsfw_only = bool(rules.nsfw_exclusive)
         data["recognition"] = {
             "provider": "metatube" if nsfw_only else "tmdb",
@@ -190,33 +190,6 @@ class OrganizeCorrectionService:
             ),
         }
         return data
-
-    def _rules_for_source_scope(self, source_dir_id: str) -> OrganizeRules:
-        """按日志来源重新派生规则；无法证明成人来源时失败关闭 MetaTube。"""
-        rules = OrganizeRules.from_config()
-        selected = rules.selected_nsfw_source_ids()
-        if not selected:
-            return rules.for_source("")
-        current = str(source_dir_id or "").strip()
-        visited: set[str] = set()
-        for _ in range(96):
-            if not current or current in visited:
-                break
-            if current in selected:
-                return rules.for_source(current)
-            visited.add(current)
-            try:
-                item = self.client.file_info(current)
-            except Exception:
-                break
-            if isinstance(item, dict):
-                parent_id = str(item.get("parent_id") or item.get("parentId") or "").strip()
-            else:
-                parent_id = str(getattr(item, "parent_id", "") or "").strip()
-            if not parent_id or parent_id == "0" or parent_id == current:
-                break
-            current = parent_id
-        return rules.for_source("")
 
     def validate_batch(self, log_ids: list[int], action: str) -> list[dict]:
         """批量操作写入前统一校验；任何不合格成员都会阻止整个批次。"""
@@ -330,7 +303,7 @@ class OrganizeCorrectionService:
         if not detail["allowed_actions"]["search"]:
             raise ValueError(detail.get("safety_notice") or "该日志不能人工纠偏")
         query = (query or detail.get("title") or detail.get("original_name") or "").strip()
-        rules = self._rules_for_source_scope(str(detail.get("source_dir_id") or ""))
+        rules = OrganizeRules.from_config().for_source(str(detail.get("source_dir_id") or ""), client=self.client)
         if rules.nsfw_exclusive:
             with self.organizer._nsfw_recognizer_lease(rules) as recognizer:
                 if recognizer is None:
@@ -457,7 +430,7 @@ class OrganizeCorrectionService:
             raise ValueError(detail.get("safety_notice") or "当前状态不能重新整理")
         items = self._load_items(log_id)
         video = self._video(items)
-        rules = self._rules_for_source_scope(str(detail.get("source_dir_id") or ""))
+        rules = OrganizeRules.from_config().for_source(str(detail.get("source_dir_id") or ""), client=self.client)
         source_name = video.original_name or video.current_name
         parent_path = str(detail.get("original_path") or "")
         match = self._match(
@@ -1243,8 +1216,8 @@ class OrganizeCorrectionService:
                             preview: dict, items: list[CorrectionItem]) -> dict:
         rules = restore_organize_rules_snapshot(
             preview["rules_snapshot"],
-            trusted_rules=self._rules_for_source_scope(
-                str(self.detail(log_id).get("source_dir_id") or "")
+            trusted_rules=OrganizeRules.from_config().for_source(
+                str(self.detail(log_id).get("source_dir_id") or ""), client=self.client
             ),
         )
         before = db.capture_organize_business_snapshot(log_id)

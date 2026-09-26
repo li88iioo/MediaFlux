@@ -838,34 +838,6 @@ class DirectoryScrapeService:
                         ):
                             self._retired_nsfw_recognizers.pop(identity, None)
 
-    def _rules_for_scope(self, scope_id: str) -> OrganizeRules:
-        """沿光鸭父目录向上寻找正式来源，并应用来源级成人识别边界。"""
-        rules = self.rules_loader()
-        selected = rules.selected_nsfw_source_ids()
-        if not selected:
-            return rules.for_source("")
-        current = str(scope_id or "").strip()
-        visited: set[str] = set()
-        for _ in range(96):
-            if not current or current in visited:
-                break
-            if current in selected:
-                return rules.for_source(current)
-            visited.add(current)
-            try:
-                item = self.client.file_info(current)
-            except Exception:
-                break
-            if isinstance(item, dict):
-                parent_id = str(item.get("parent_id") or item.get("parentId") or "").strip()
-            else:
-                parent_id = str(getattr(item, "parent_id", "") or "").strip()
-            if not parent_id or parent_id == "0" or parent_id == current:
-                break
-            current = parent_id
-        # 无法证明属于专用来源时失败关闭成人识别，普通 TMDB 链保持原状。
-        return rules.for_source("")
-
     @staticmethod
     def _validate_metatube_source_identity(
         inspection: DirectoryInspection,
@@ -902,7 +874,7 @@ class DirectoryScrapeService:
 
     @_directory_scrape_operation
     def inspect(self, owner: str, directory_id: str) -> dict:
-        rules = self._rules_for_scope(directory_id)
+        rules = self.rules_loader().for_source(directory_id, client=self.client)
         inspection = DirectoryMediaInspector(
             client=self.client,
             scraper=self.scraper,
@@ -918,7 +890,7 @@ class DirectoryScrapeService:
 
     @_directory_scrape_operation
     def inspect_file(self, owner: str, file_id: str) -> dict:
-        rules = self._rules_for_scope(file_id)
+        rules = self.rules_loader().for_source(file_id, client=self.client)
         inspection = DirectoryMediaInspector(
             client=self.client,
             scraper=self.scraper,
@@ -1406,7 +1378,7 @@ class DirectoryScrapeService:
             # 预览保存的是“来源级”规则快照。成人专用来源会在全局规则上
             # 额外启用 nsfw_exclusive，因此执行阶段也必须按同一 scope 重新
             # 派生规则；直接拿全局规则比较会把合法成人预览误判成规则变化。
-            current_rules = self._rules_for_scope(record.scope_id)
+            current_rules = self.rules_loader().for_source(record.scope_id, client=self.client)
             if not organize_rules_snapshot_matches(
                 organize_rules_snapshot(record.rules), current_rules,
             ):

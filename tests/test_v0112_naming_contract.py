@@ -36,7 +36,7 @@ class NumericPositionNamingTests(unittest.TestCase):
                     "genres": [], "origin_country": ["US"],
                     "seasons": [{"season_number": 100, "episode_count": 12}],
                 }
-                with patch.object(service, "_rules_for_source_scope", return_value=OrganizeRules(
+                with patch.object(OrganizeRules, "from_config", return_value=OrganizeRules(
                     target_dir_id="library", region_split=False, year_split=False,
                     link_strm=False, emby_refresh=False, keep_multi_versions=True,
                 )):

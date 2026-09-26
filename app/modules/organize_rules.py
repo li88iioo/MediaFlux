@@ -1,6 +1,6 @@
 """所有整理入口共用的规则、自动确认判定与持久化快照。
 
-规则集中处理配置、持久下载来源归属与判定；不扫描目录、不访问网盘、不持有任务运行态。
+规则集中处理配置与来源判定；仅显式传入客户端时查询有界祖先，不扫描目录树或持有任务运行态。
 """
 from __future__ import annotations
 
@@ -197,21 +197,35 @@ class OrganizeRules:
             return frozenset()
         return frozenset(source_ids)
 
-    def for_source(self, source_id: str) -> "OrganizeRules":
-        """把全局规则收敛为单个光鸭来源的实际识别边界。
-
-        成人识别仅用于专用来源及能由持久下载记录证明归属的隔离目录；
-        此范围只走 MetaTube 精确番号链，其余来源保持普通 TMDB 链。
-        """
-        source = str(source_id or "").strip()
+    def for_source(self, source_id: str, *, client=None) -> "OrganizeRules":
+        """统一正式来源、下载隔离目录及手工子目录的 NSFW 识别边界。"""
         selected = self.selected_nsfw_source_ids()
-        active = bool(self.nsfw_enabled and source in selected)
-        if self.nsfw_enabled and selected and source not in {"", "0"} and not active:
+        if not self.nsfw_enabled or not selected:
+            return replace(self, nsfw_enabled=False, nsfw_exclusive=False)
+        source = str(source_id or "").strip()
+        if source not in selected and source not in {"", "0"}:
             from app.repositories.download_requests import get_guangya_staging_parent
 
-            # 下载只扫描自己的隔离目录；其真实父来源已在提交阶段持久化。
-            # 在统一入口继承，确保 tracker、人工确认和重启后的恢复使用同一规则。
-            active = get_guangya_staging_parent(source) in selected
+            parent = get_guangya_staging_parent(source)
+            if parent in selected:
+                source = parent
+        if client is not None:
+            visited: set[str] = set()
+            for _ in range(96):
+                if source in selected or source in {"", "0"} or source in visited:
+                    break
+                visited.add(source)
+                try:
+                    item = client.file_info(source)
+                except Exception:
+                    break
+                source = str(
+                    (item.get("parent_id") or item.get("parentId") or "")
+                    if isinstance(item, dict) else getattr(item, "parent_id", "") or ""
+                ).strip()
+            else:
+                source = ""  # 祖先链未在边界内得到证明，不启用成人识别。
+        active = source in selected
         return replace(self, nsfw_enabled=active, nsfw_exclusive=active)
 
     def for_local_source(self, media_type: str) -> "OrganizeRules":

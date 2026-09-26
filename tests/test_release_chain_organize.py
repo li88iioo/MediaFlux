@@ -399,8 +399,8 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         service = OrganizeCorrectionService(client=cloud, scraper=scraper)
         self.enterContext(
             patch.object(
-                service,
-                "_rules_for_source_scope",
+                OrganizeRules,
+                "from_config",
                 return_value=OrganizeRules(
                     target_dir_id="library",
                     region_split=False,
