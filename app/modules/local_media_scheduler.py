@@ -174,18 +174,14 @@ class LocalMediaScheduler:
             return False
         closed = True
         if self._owns_service:
-            close = getattr(self.service, "close", None)
-            if callable(close):
-                try:
-                    # 兼容旧版 ``None`` 成功语义；新版显式 False 表示仍有
-                    # 在途资源，不能清空全局引用或构造第二个服务实例。
-                    closed = close() is not False
-                except Exception as exc:
-                    closed = False
-                    logger.warning(
-                        "关闭本地媒体调度服务失败 type=%s",
-                        type(exc).__name__,
-                    )
+            try:
+                closed = self.service.close() is True
+            except Exception as exc:
+                closed = False
+                logger.warning(
+                    "关闭本地媒体调度服务失败 type=%s",
+                    type(exc).__name__,
+                )
         if not closed:
             return False
         _release_global_scheduler(self)
@@ -786,11 +782,8 @@ class LocalMediaScheduler:
         finally:
             pool.shutdown(wait=True, cancel_futures=False)
             for planner in planners:
-                close = getattr(planner, "close", None)
-                if not callable(close):
-                    continue
                 try:
-                    if close() is False:
+                    if planner.close() is not True:
                         logger.warning("关闭本地媒体规划 Worker 未完成")
                 except Exception as exc:
                     logger.warning(

@@ -272,6 +272,7 @@ class ClientResourceLifecycleTests(unittest.TestCase):
     def test_organizer_closes_owned_dependencies_and_cached_recognizers(self) -> None:
         owned_client = Mock()
         owned_scraper = Mock()
+        owned_scraper.close.return_value = True
         recognizer = Mock()
         with patch("app.modules.organize.GuangYaClient", return_value=owned_client), patch(
             "app.modules.organize.TMDBScraper", return_value=owned_scraper
@@ -291,9 +292,37 @@ class ClientResourceLifecycleTests(unittest.TestCase):
         injected_client.close.assert_not_called()
         injected_scraper.close.assert_not_called()
 
+    def test_owned_scraper_close_requires_success_and_retries(self) -> None:
+        owners = (
+            (Organizer, "app.modules.organize.TMDBScraper"),
+            (
+                DirectoryScrapeService,
+                "app.modules.directory_scrape.TMDBScraper",
+            ),
+        )
+        failures = (None, False, RuntimeError("close failed"))
+        for owner, scraper_factory in owners:
+            for failure in failures:
+                with self.subTest(owner=owner.__name__, failure=repr(failure)):
+                    scraper = Mock()
+                    scraper.close.side_effect = [failure, True]
+                    with patch(scraper_factory, return_value=scraper):
+                        if owner is Organizer:
+                            service = Organizer(client=object())
+                        else:
+                            service = DirectoryScrapeService(
+                                client=object(), store=Mock(),
+                            )
+
+                    self.assertFalse(service.close())
+                    self.assertFalse(service._closed)
+                    self.assertTrue(service.close())
+                    self.assertEqual(scraper.close.call_count, 2)
+
     def test_organizer_retries_failed_recognizer_before_owned_dependencies(self) -> None:
         owned_client = Mock()
         owned_scraper = Mock()
+        owned_scraper.close.return_value = True
         recognizer = Mock()
         recognizer.close.side_effect = [False, True]
         with patch("app.modules.organize.GuangYaClient", return_value=owned_client), patch(
@@ -617,6 +646,8 @@ class ClientResourceLifecycleTests(unittest.TestCase):
             replacement = None
             refresher = None
             stale = None
+            scraper = Mock()
+            scraper.close.return_value = True
             with patch(
                 "app.clients.guangya._load_raw",
                 return_value=_RotatingCredentialRaw,
@@ -627,7 +658,7 @@ class ClientResourceLifecycleTests(unittest.TestCase):
             ), patch.object(
                 directory_scrape_module,
                 "TMDBScraper",
-                return_value=Mock(),
+                return_value=scraper,
             ):
                 stale = DirectoryScrapeService(
                     store=directory_scrape_module._store,
@@ -791,7 +822,9 @@ class ClientResourceLifecycleTests(unittest.TestCase):
 
     def test_local_media_services_release_only_owned_runtime_dependencies(self) -> None:
         owned_scraper = Mock()
+        owned_scraper.close.return_value = True
         owned_organizer = Mock()
+        owned_organizer.close.return_value = True
         with patch(
             "app.modules.local_media_service.TMDBScraper",
             return_value=owned_scraper,
@@ -807,6 +840,7 @@ class ClientResourceLifecycleTests(unittest.TestCase):
 
         injected_scraper = Mock()
         injected_organizer = Mock()
+        injected_organizer.close.return_value = True
         with patch(
             "app.modules.local_media_service.Organizer",
             return_value=injected_organizer,
@@ -816,8 +850,38 @@ class ClientResourceLifecycleTests(unittest.TestCase):
         injected_organizer.close.assert_called_once_with()
         injected_scraper.close.assert_not_called()
 
+    def test_local_media_close_requires_true_and_retries_none_result(self) -> None:
+        for failed_owner in ("organizer", "scraper"):
+            with self.subTest(failed_owner=failed_owner):
+                scraper = Mock()
+                organizer = Mock()
+                if failed_owner == "organizer":
+                    organizer.close.side_effect = [None, True]
+                    scraper.close.return_value = True
+                else:
+                    organizer.close.return_value = True
+                    scraper.close.side_effect = [None, True]
+                with patch(
+                    "app.modules.local_media_service.TMDBScraper",
+                    return_value=scraper,
+                ), patch(
+                    "app.modules.local_media_service.Organizer",
+                    return_value=organizer,
+                ):
+                    service = LocalMediaService()
+
+                self.assertFalse(service.close())
+                self.assertFalse(service._closed)
+                self.assertTrue(service.close())
+                self.assertTrue(service.close())
+                self.assertEqual(organizer.close.call_count, 2)
+                self.assertEqual(
+                    scraper.close.call_count, 1 if failed_owner == "organizer" else 2,
+                )
+
     def test_local_media_scheduler_shutdown_closes_only_owned_service(self) -> None:
         owned_service = Mock()
+        owned_service.close.return_value = True
         with patch(
             "app.modules.local_media_scheduler.LocalMediaService",
             return_value=owned_service,

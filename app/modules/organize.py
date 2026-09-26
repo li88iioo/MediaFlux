@@ -418,19 +418,13 @@ class Organizer:
                 return False
 
             if self._owns_scraper and not self._owned_scraper_closed:
-                close = getattr(self.scraper, "close", None)
-                if callable(close):
-                    try:
-                        closed = close()
-                    except Exception as exc:
-                        logger.warning(
-                            "关闭 TMDB Scraper 失败 type=%s",
-                            type(exc).__name__,
-                        )
-                        closed = False
-                    self._owned_scraper_closed = closed is not False
-                else:
-                    self._owned_scraper_closed = True
+                try:
+                    self._owned_scraper_closed = self.scraper.close() is True
+                except Exception as exc:
+                    logger.warning(
+                        "关闭 TMDB Scraper 失败 type=%s",
+                        type(exc).__name__,
+                    )
             if self._owns_client and not self._owned_client_closed:
                 self._owned_client_closed = close_guangya_client(self.client)
 

@@ -1580,15 +1580,19 @@ class LocalMediaSchedulerTests(IsolatedDatabaseTestCase):
         self.addCleanup(
             setattr, local_media_scheduler_module, "_scheduler", previous,
         )
-        service = Mock()
-        service.close.return_value = False
-        scheduler = LocalMediaScheduler(service=service)
-        scheduler._owns_service = True
-        local_media_scheduler_module._scheduler = scheduler
+        for result in (None, False, RuntimeError("close failed")):
+            with self.subTest(result=result):
+                service = Mock()
+                service.close.side_effect = [result, True]
+                scheduler = LocalMediaScheduler(service=service)
+                scheduler._owns_service = True
+                local_media_scheduler_module._scheduler = scheduler
 
-        self.assertFalse(scheduler.shutdown())
-        self.assertIs(local_media_scheduler_module._scheduler, scheduler)
-        service.close.assert_called_once_with()
+                self.assertFalse(scheduler.shutdown())
+                self.assertIs(local_media_scheduler_module._scheduler, scheduler)
+                self.assertTrue(scheduler.shutdown())
+                self.assertIsNone(local_media_scheduler_module._scheduler)
+                self.assertEqual(service.close.call_count, 2)
 
     def test_status_reports_running_without_starting_additional_work(self):
         scheduler = LocalMediaScheduler(service=FakeService(), interval=0.2)

@@ -363,23 +363,16 @@ class LocalMediaService:
                         "关闭本地媒体 Organizer 失败 type=%s", type(exc).__name__
                     )
                     organizer_closed = False
-                if organizer_closed is None:
-                    organizer_closed = True
                 if self._owns_scraper and not self._scraper_closed:
-                    close = getattr(self.scraper, "close", None)
-                    if callable(close):
-                        try:
-                            closed = close()
-                        except Exception as exc:
-                            logger.warning(
-                                "关闭本地媒体 TMDB Scraper 失败 type=%s",
-                                type(exc).__name__,
-                            )
-                            closed = False
-                        self._scraper_closed = closed is not False
-                    else:
-                        self._scraper_closed = True
-                resources_closed = bool(organizer_closed and self._scraper_closed)
+                    try:
+                        self._scraper_closed = self.scraper.close() is True
+                    except Exception as exc:
+                        logger.warning(
+                            "关闭本地媒体 TMDB Scraper 失败 type=%s",
+                            type(exc).__name__,
+                        )
+                        self._scraper_closed = False
+                resources_closed = organizer_closed is True and self._scraper_closed
 
             if resources_closed:
                 self._sibling_scan_batch.clear()
