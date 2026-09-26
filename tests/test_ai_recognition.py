@@ -1720,7 +1720,7 @@ class AIPreviewAndSettingsTests(unittest.TestCase):
             def match(self, filename, parent_path=""):
                 return result
 
-            def get_detail(self, tmdb_id, media_type):
+            def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
                 return {}
 
         with patch.object(

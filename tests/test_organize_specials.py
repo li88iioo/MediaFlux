@@ -65,7 +65,7 @@ class _ShowScraper:
     def __init__(self):
         self.calls = []
 
-    def match(self, filename, parent_path=""):
+    def match(self, filename, parent_path="", *, media_type_hint=""):
         self.calls.append((filename, parent_path))
         return MatchResult(
             tmdb_id="86034",
@@ -87,7 +87,7 @@ class _ShowScraper:
             filename=filename, parent_path=parent_path,
         )
 
-    def get_detail(self, _tmdb_id, _media_type):
+    def get_detail(self, _tmdb_id, _media_type, *, force_refresh=False):
         return {
             "genres": [{"id": 16}],
             "origin_country": ["JP"],

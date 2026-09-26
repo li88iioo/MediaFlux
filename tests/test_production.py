@@ -172,7 +172,7 @@ class ScraperAndOrganizerTests(IsolatedDatabaseTestCase):
             "Scraper",
             (),
             {
-                "get_detail": lambda inner, tmdb_id, media_type: details[tmdb_id],
+                "get_detail": lambda inner, tmdb_id, media_type, *, force_refresh=False: details[tmdb_id],
             },
         )()
         organizer = Organizer(client=object(), scraper=scraper)
@@ -1415,11 +1415,11 @@ class OrganizeCorrectionTests(unittest.TestCase):
                             parent_path=parent_path,
                         )
                     )
-                    get_detail = lambda inner, tmdb_id, media_type: {
+                    get_detail = lambda inner, tmdb_id, media_type, *, force_refresh=False: {
                         "genres": [],
                         "origin_country": ["CN"],
                     }
-                    match_from_tmdb = lambda inner, tmdb_id, media_type: MatchResult(
+                    match_from_tmdb = lambda inner, tmdb_id, media_type, *, force_refresh=False: MatchResult(
                         tmdb_id=tmdb_id,
                         title="正确节目",
                         year="2026",
@@ -1501,7 +1501,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
                             parent_path=parent_path,
                         )
 
-                    def get_detail(self, _tmdb_id, _media_type):
+                    def get_detail(self, _tmdb_id, _media_type, *, force_refresh=False):
                         return {"genres": [{"id": 16}], "origin_country": ["JP"]}
 
                     def match_from_tmdb(self, tmdb_id, media_type):
@@ -2570,11 +2570,11 @@ class OrganizeCorrectionTests(unittest.TestCase):
                         parent_path=parent_path,
                     )
                 )
-                get_detail = lambda inner, tmdb_id, media_type: {
+                get_detail = lambda inner, tmdb_id, media_type, *, force_refresh=False: {
                     "genres": [],
                     "origin_country": ["CN"],
                 }
-                match_from_tmdb = lambda inner, tmdb_id, media_type: MatchResult(
+                match_from_tmdb = lambda inner, tmdb_id, media_type, *, force_refresh=False: MatchResult(
                     tmdb_id=tmdb_id,
                     title="新电影",
                     year="2027",
@@ -2671,11 +2671,11 @@ class OrganizeCorrectionTests(unittest.TestCase):
                         parent_path=parent_path,
                     )
                 )
-                get_detail = lambda inner, tmdb_id, media_type: {
+                get_detail = lambda inner, tmdb_id, media_type, *, force_refresh=False: {
                     "genres": [],
                     "origin_country": ["CN"],
                 }
-                match_from_tmdb = lambda inner, tmdb_id, media_type: MatchResult(
+                match_from_tmdb = lambda inner, tmdb_id, media_type, *, force_refresh=False: MatchResult(
                     tmdb_id=tmdb_id,
                     title="新电影",
                     year="2027",

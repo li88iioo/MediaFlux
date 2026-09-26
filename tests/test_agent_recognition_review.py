@@ -51,7 +51,7 @@ class _FakeScraper:
         return 1, 1
 
     @staticmethod
-    def get_detail(tmdb_id: str, media_type: str):
+    def get_detail(tmdb_id: str, media_type: str, *, force_refresh=False):
         assert media_type == "tv"
         return {
             "id": int(tmdb_id),

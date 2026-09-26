@@ -307,7 +307,7 @@ class _VariantScraper:
             filename=filename, parent_path=parent_path,
         )
 
-    def get_detail(self, _tmdb_id, _media_type):
+    def get_detail(self, _tmdb_id, _media_type, *, force_refresh=False):
         return {"genres": [], "origin_country": ["US"]}
 
 
@@ -320,7 +320,7 @@ class _TvVariantScraper(_VariantScraper):
         confidence=1.0,
     )
 
-    def get_detail(self, _tmdb_id, _media_type):
+    def get_detail(self, _tmdb_id, _media_type, *, force_refresh=False):
         return {
             "genres": [{"id": 16, "name": "动画"}],
             "origin_country": ["JP"],

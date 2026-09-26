@@ -1111,6 +1111,31 @@ class DirectoryScrapeEpisodeMappingTests(unittest.TestCase):
             [("100", "tv", True), ("100", "tv", True)],
         )
 
+    def test_force_refresh_type_error_never_retries_without_refresh(self):
+        from types import SimpleNamespace
+        from app.modules.organize import Organizer
+
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                calls = []
+                def detail(_id, _kind, *, force_refresh=False):
+                    calls.append(force_refresh)
+                    if force_refresh:
+                        raise TypeError("metadata decoder failed")
+                    return {"id": 100, "seasons": [{"season_number": 1, "episode_count": 12}]}
+                delegate = SimpleNamespace(get_detail=detail)
+                scraper = FixedMatchScraper(
+                    delegate, MatchResult(tmdb_id="100", media_type="tv"),
+                    {"id": 100, "seasons": [{"season_number": 1, "episode_count": 12}]},
+                ) if wrapped else delegate
+                organizer = Organizer(client=object(), scraper=scraper)
+                organizer._detail("100", "tv")
+                calls.clear()
+                with self.assertRaisesRegex(TypeError, "metadata decoder failed"):
+                    organizer._detail("100", "tv", force_refresh=True)
+                self.assertEqual(calls, [True])
+                self.assertNotIn(("100", "tv"), organizer._detail_cache)
+
     def test_manual_season_override_remains_final_archive_season(self):
         videos = tuple(
             MediaSnapshot(

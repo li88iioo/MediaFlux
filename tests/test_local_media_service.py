@@ -53,7 +53,7 @@ class FakeScraper:
             filename=filename, parent_path=parent_path,
         )
 
-    def get_detail(self, tmdb_id: str, media_type: str):
+    def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False):
         genre = 16 if self.result.title == "攻壳机动队" else 28
         return {"genres": [{"id": genre}], "origin_country": ["JP"],
                 "release_date": "2025-01-01", "first_air_date": "2026-01-01"}
@@ -81,7 +81,7 @@ class SharedPositionFakeScraper(FakeScraper):
             parent_path=parent_path,
         )
 
-    def get_detail(self, tmdb_id: str, media_type: str):
+    def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False):
         return {
             "genres": [{"id": 16}],
             "origin_country": ["JP"],
@@ -1494,7 +1494,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_directory_numbering_mode_reuses_shared_season_continuous_mapping(self):
         class SeasonDetailScraper(FakeScraper):
-            def get_detail(self, tmdb_id: str, media_type: str):
+            def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False):
                 return {
                     "id": int(tmdb_id),
                     "genres": [{"id": 16}],
@@ -1538,7 +1538,7 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
 
     def test_manual_task_execution_reuses_persisted_numbering_mode(self):
         class SeasonDetailScraper(FakeScraper):
-            def get_detail(self, tmdb_id: str, media_type: str):
+            def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False):
                 return {
                     "id": int(tmdb_id),
                     "genres": [{"id": 16}],

@@ -5499,7 +5499,7 @@ class RecognitionPreviewContractTests(RecognitionContractMixin, unittest.TestCas
                 self.received = (filename, parent_path)
                 return result
 
-            def get_detail(self, tmdb_id, media_type):
+            def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
                 return {"id": 40, "name": "Show", "first_air_date": "2024-01-01"}
 
         preview = PreviewScraper()

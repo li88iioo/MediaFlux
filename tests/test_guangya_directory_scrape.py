@@ -1559,7 +1559,7 @@ class _DirectoryScrapeTMDB:
             filename=filename, parent_path=parent_path,
         )
 
-    def get_detail(self, tmdb_id: str, media_type: str) -> dict:
+    def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False) -> dict:
         return self.get_detail_with_credits(tmdb_id, media_type)
 
     def match(self, _filename: str, _parent_path: str = "") -> MatchResult:

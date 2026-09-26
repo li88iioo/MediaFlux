@@ -44,7 +44,7 @@ class _ProbeScraper:
         )
 
     @staticmethod
-    def get_detail(_tmdb_id: str, _media_type: str) -> dict:
+    def get_detail(_tmdb_id: str, _media_type: str, *, force_refresh=False) -> dict:
         return {"genres": [], "origin_country": ["US"]}
 
 

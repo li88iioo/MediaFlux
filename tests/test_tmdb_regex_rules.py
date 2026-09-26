@@ -242,7 +242,7 @@ class TmdbRegexOrganizeIntegrationTests(unittest.TestCase):
             "源目录/电影",
             OrganizeRules(),
         )
-        scraper.match.assert_called_once_with("Example.mkv", "源目录/电影")
+        scraper.match.assert_called_once_with("Example.mkv", "源目录/电影", media_type_hint="")
 
     def test_organizer_prefers_declared_parse_media_and_uses_effective_position(self):
         from app.clients.guangya import GuangYaFile
@@ -272,7 +272,7 @@ class TmdbRegexOrganizeIntegrationTests(unittest.TestCase):
                     effective_season=4, effective_episode=6, context=context,
                 )
 
-            def get_detail(self, tmdb_id, media_type):
+            def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
                 return {
                     "genres": [], "origin_country": ["CN"],
                     "seasons": [{"season_number": 4, "episode_count": 12}],
@@ -348,7 +348,7 @@ class TmdbRegexOrganizeIntegrationTests(unittest.TestCase):
                     source_season=2, source_episode=3,
                 )
 
-            def get_detail(self, tmdb_id, media_type):
+            def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
                 return {"genres": [], "origin_country": ["CN"], "seasons": [{"season_number": 5, "episode_count": 12}]}
 
         organizer = Organizer(client=object(), scraper=Scraper())
@@ -543,7 +543,7 @@ class _RulePreviewScraper:
             threshold=1.0, regex_rule_id=17, season_override=4,
         )
 
-    def get_detail(self, tmdb_id, media_type):
+    def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
         return {"id": 456, "name": "规则剧集", "first_air_date": "2020-01-01"}
 
 

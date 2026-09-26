@@ -298,7 +298,7 @@ class FixedMatchScraper:
             and declared_callable("position_validation_error")
         )
 
-    def match(self, _filename: str, _parent_path: str = "") -> MatchResult:
+    def match(self, _filename: str, _parent_path: str = "", *, media_type_hint: str = "") -> MatchResult:
         return dataclasses.replace(self.fixed_match)
 
     def _position_override(
@@ -413,12 +413,7 @@ class FixedMatchScraper:
         getter = getattr(self.delegate, "get_detail", None)
         if not callable(getter):
             return {}
-        try:
-            refreshed = getter(tmdb_id, media_type, force_refresh=force_refresh)
-        except TypeError:
-            # 兼容不支持受控刷新的第三方实现与测试桩；真实 TMDBScraper
-            # 会走 force_refresh，从而避免最终季集复核继续读取固定旧快照。
-            refreshed = getter(tmdb_id, media_type)
+        refreshed = getter(tmdb_id, media_type, force_refresh=force_refresh)
         if not isinstance(refreshed, dict) or not refreshed:
             return {}
         result = dict(refreshed)

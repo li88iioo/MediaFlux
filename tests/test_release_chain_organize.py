@@ -384,7 +384,7 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         )
         scraper = TMDBScraper()
         self.addCleanup(scraper.close)
-        scraper.get_detail = lambda tmdb_id, media_type: {
+        scraper.get_detail = lambda tmdb_id, media_type, *, force_refresh=False: {
             "id": int(tmdb_id),
             "name": "First" if tmdb_id == "1" else "Second",
             "first_air_date": "2025-01-01" if tmdb_id == "1" else "2026-01-01",

@@ -692,13 +692,9 @@ class Organizer:
         if force_refresh:
             self._detail_cache.pop(key, None)
         if key not in self._detail_cache:
-            try:
-                self._detail_cache[key] = self.scraper.get_detail(
-                    tmdb_id, media_type, force_refresh=force_refresh
-                )
-            except TypeError:
-                # 兼容测试桩与第三方 scraper；生产 TMDBScraper 支持受控刷新。
-                self._detail_cache[key] = self.scraper.get_detail(tmdb_id, media_type)
+            self._detail_cache[key] = self.scraper.get_detail(
+                tmdb_id, media_type, force_refresh=force_refresh
+            )
         return self._detail_cache[key]
 
     def _detail_for_match(
@@ -5262,19 +5258,9 @@ class Organizer:
                         media_type_hint=recognition_media_type_hint,
                     )
                 if bool(getattr(self.scraper, "supports_parent_path", False)):
-                    if recognition_media_type_hint:
-                        try:
-                            return self.scraper.match(
-                                match_name,
-                                parent_path,
-                                media_type_hint=recognition_media_type_hint,
-                            )
-                        except TypeError as exc:
-                            # 兼容只声明 parent_path、尚未接受类型提示的旧扩展识别器。
-                            if "media_type_hint" not in str(exc):
-                                raise
-                            return self.scraper.match(match_name, parent_path)
-                    return self.scraper.match(match_name, parent_path)
+                    return self.scraper.match(
+                        match_name, parent_path, media_type_hint=recognition_media_type_hint,
+                    )
                 return self.scraper.match(match_name)
 
             if task_runtime is not None and task_recognition_key is not None:

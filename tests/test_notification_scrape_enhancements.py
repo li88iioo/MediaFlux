@@ -659,7 +659,7 @@ class _PreviewScraper:
             )],
         )
 
-    def get_detail(self, tmdb_id, media_type):
+    def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
         return {
             "id": 1510055, "title": "狂怒者：荣誉之战",
             "original_title": "The Furious", "release_date": "2026-05-01",

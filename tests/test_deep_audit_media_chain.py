@@ -71,7 +71,7 @@ class Catalog:
             parent_path=parent_path,
         )
 
-    def get_detail(self, tmdb_id, media_type):
+    def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
         return {
             "genres": [{"id": 18}],
             "origin_country": ["US"],

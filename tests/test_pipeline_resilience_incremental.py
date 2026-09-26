@@ -55,7 +55,7 @@ class _LocalScraper:
             filename=filename, parent_path=parent_path,
         )
 
-    def get_detail(self, tmdb_id: str, media_type: str):
+    def get_detail(self, tmdb_id: str, media_type: str, *, force_refresh=False):
         return {"genres": [{"id": 28}], "origin_country": ["US"], "release_date": "2026-01-01"}
 
 

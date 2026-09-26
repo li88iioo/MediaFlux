@@ -31,7 +31,7 @@ class NumericPositionNamingTests(unittest.TestCase):
                 db.update_organize_log(log_id, current_name=cloud.files["video"].name)
                 item = db.list_organize_log_items(log_id)[0]
                 db.update_organize_log_item(item["id"], current_name=cloud.files["video"].name)
-                service.scraper.get_detail = lambda tmdb_id, _media_type: {
+                service.scraper.get_detail = lambda tmdb_id, _media_type, *, force_refresh=False: {
                     "id": int(tmdb_id), "name": "A" * 240, "first_air_date": "",
                     "genres": [], "origin_country": ["US"],
                     "seasons": [{"season_number": 100, "episode_count": 12}],
