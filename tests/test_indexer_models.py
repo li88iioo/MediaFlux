@@ -9,6 +9,13 @@ from app.indexers.result_store import IndexerResultStore
 
 
 class IndexerModelTests(unittest.TestCase):
+    def test_provider_search_request_preserves_validated_media_year(self):
+        self.assertEqual(IndexerSearchRequest.create("征途", year="2026").year, 2026)
+        self.assertIsNone(IndexerSearchRequest.create("1917").year)
+        for value in (True, 1799, 2201, "2026年", 2026.5):
+            with self.subTest(year=value), self.assertRaises(IndexerValidationError):
+                IndexerSearchRequest.create("征途", year=value)
+
     def test_search_request_normalizes_query_and_bounds_page(self):
         request = IndexerSearchRequest.create(
             "  葬送   的芙莉莲  ",

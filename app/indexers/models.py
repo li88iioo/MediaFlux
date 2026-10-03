@@ -30,6 +30,7 @@ class IndexerSearchRequest:
     sort_mode: str = "relevance_desc"
     season: int | None = None
     episode: int | None = None
+    year: int | None = None
 
     @classmethod
     def create(
@@ -41,6 +42,7 @@ class IndexerSearchRequest:
         sort_mode: str = "relevance_desc",
         season: int | str | None = None,
         episode: int | str | None = None,
+        year: int | str | None = None,
     ) -> "IndexerSearchRequest":
         normalized = _normalize_search_text(query, required=True)
         normalized_media_type = _normalize_media_type(media_type)
@@ -55,6 +57,7 @@ class IndexerSearchRequest:
             sort_mode=normalized_sort_mode,
             season=normalized_season,
             episode=normalized_episode,
+            year=_normalize_media_year(year),
         )
 
 

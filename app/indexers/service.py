@@ -850,6 +850,7 @@ class IndexerService:
                     query,
                     page,
                     media_type=media_type,
+                    year=ranking_context.year if ranking_context is not None else None,
                     sort_mode=sort_mode,
                     season=season,
                     episode=episode,

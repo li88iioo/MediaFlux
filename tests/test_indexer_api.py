@@ -239,6 +239,39 @@ class IndexerAPITests(unittest.TestCase):
         self.assertNotIn("torrent_url", payload["items"][0])
         self.assertNotIn("detail_url", payload["items"][0])
 
+    def test_real_btbtla_provider_recall_through_keyword_and_media_api(self):
+        from app.indexers.providers.btbtla import BTBtlaAdapter
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from tests.test_indexer_btbtla_recall import _DETAIL, _EMPTY, _SEARCH
+        from tests.test_indexer_providers import FakeHttpClient
+
+        headers = self.authenticate()
+        http = FakeHttpClient(_EMPTY)
+        http.responses = [_EMPTY, _SEARCH, _DETAIL, _SEARCH, _DETAIL]
+        service = IndexerService(
+            registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http)}),
+            result_store=IndexerResultStore(),
+        )
+        try:
+            with patch.object(indexers_api, 'get_indexer_service', return_value=service):
+                keyword = self.client.get('/api/indexers/search', params={'q': '征途2026', 'sites': 'btbtla'})
+                media = self.client.post('/api/indexers/search', headers=headers,
+                    json={'title': '征途', 'year': 2026, 'media_type': 'tv', 'sites': ['btbtla']})
+            for response in (keyword, media):
+                with self.subTest(endpoint=response.request.method):
+                    self.assertEqual(response.status_code, 200, response.text)
+                    items = response.json()['items']
+                    self.assertEqual(len(items), 21)
+                    self.assertTrue(all('2026' in item['title'] and item['site_id'] == 'btbtla' for item in items))
+                    self.assertTrue(all(item['result_id'] for item in items))
+                    self.assertTrue(all('magnet' not in item and 'detail_url' not in item for item in items))
+            self.assertEqual(len(http.calls), 5)
+            self.assertFalse(any('/detail/10769324.html' in call['url'] for call in http.calls))
+        finally:
+            asyncio.run(service.aclose())
+
     def test_get_search_forwards_requested_sort_mode(self):
         self.authenticate()
         service = FakeIndexerService()

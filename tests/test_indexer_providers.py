@@ -913,7 +913,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             http=FakeHttpClient("<p>暂无</p>".encode()), min_interval_seconds=5,
             monotonic=lambda: current[0], sleeper=sleeper,
         )
-        self.assertEqual(adapter.search_timeout_overhead_seconds(), 20.0)
+        self.assertEqual(adapter.search_timeout_overhead_seconds(), 35.0)
         await adapter.search(IndexerSearchRequest.create("one"))
         await adapter.search(IndexerSearchRequest.create("two"))
         self.assertEqual(sleeps, [5.0])

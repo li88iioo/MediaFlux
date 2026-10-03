@@ -23,6 +23,7 @@ from .base import IndexerAdapter, fixed_host_join, is_likely_challenge_page, mag
 
 _MAGNET_CANDIDATE = re.compile(r"magnet:\?[^\"'\s<>]+", re.IGNORECASE)
 _RESOURCE_SIZE_SUFFIX = re.compile(r"\[\s*([0-9]+(?:\.[0-9]+)?\s*[KMGTPE]?i?B)\s*\]\s*$", re.IGNORECASE)
+_TRAILING_YEAR = re.compile(r"^(.+?)[ ._\-(（]*((?:18|19|20|21)\d{2}|2200)[)）]?(?:年)?$")
 _SEARCH_TOKEN = re.compile(r"[^0-9a-z\u3400-\u9fff]+", re.IGNORECASE)
 _ACCESS_BLOCK_MARKERS = (
     "cloudflare",
@@ -66,17 +67,15 @@ class BTBtlaAdapter(IndexerAdapter):
         self._host_bases = tuple(dict.fromkeys((self.base_url, *self.mirror_base_urls)))
 
     def search_timeout_overhead_seconds(self) -> float:
-        # 最坏可恢复链路：主域搜索 + 全部详情候选，再对每个备用域执行
-        # 一次搜索和一次详情解析。把主动节流从网络请求预算中剥离。
-        paced_gaps = self.max_detail_candidates + (2 * len(self.mirror_base_urls))
+        # 每个入口至多原词+去年份检索两次，再读取有界详情；等待不占网络预算。
+        paced_gaps = (self.max_detail_candidates + 2) * len(self._host_bases) - 1
         return self.min_interval_seconds * paced_gaps
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         last_error: IndexerRateLimited | IndexerUnavailable | None = None
         for base_url in self._host_bases:
             try:
-                detail_limit = self.max_detail_candidates if base_url == self.base_url else 1
-                return await self._search_base(base_url, request, detail_limit=detail_limit)
+                return await self._search_base(base_url, request)
             except (IndexerRateLimited, IndexerUnavailable) as exc:
                 last_error = exc
         assert last_error is not None
@@ -86,55 +85,61 @@ class BTBtlaAdapter(IndexerAdapter):
         self,
         base_url: str,
         request: IndexerSearchRequest,
-        *,
-        detail_limit: int,
     ) -> IndexerPage:
-        search_path = f"/search/{quote(request.query, safe='')}"
-        if request.page > 1:
-            search_path = f"{search_path}/{request.page}"
-        search_url = fixed_host_join(base_url, search_path)
-        response = await self._get(search_url)
-        try:
-            self._validate_response("search", response)
-            require_html_response(response)
-            response_base_url = self._base_for_url(response.url)
-            soup = BeautifulSoup(response.body, "lxml")
-            candidates = self._parse_search_candidates(soup, base_url=response_base_url)
-            has_more = self._has_search_page_link(
-                soup,
-                query=request.query,
-                page=request.page + 1,
-                base_url=response_base_url,
-            )
-            text = soup.get_text(" ", strip=True).lower()
-            if not candidates:
-                # 当前站点以搜索摘要中的 mac_total=0 表示未命中；普通计数器/挑战页不算空结果。
+        # 原词优先：数字可能本就是片名（银翼杀手2049、1917）。仅原生明确空结果
+        # 才拆出末尾年份；年份用于选详情而非继续拼进只索引片名的站点查询。
+        queries = [(request.query, request.year)]
+        if match := _TRAILING_YEAR.fullmatch(request.query):
+            title = match[1].strip(" ._-(（")
+            if title and not title.isdigit():
+                queries.append((title, request.year or int(match[2])))
+        for query, year in queries:
+            search_path = f"/search/{quote(query, safe='')}"
+            if request.page > 1:
+                search_path = f"{search_path}/{request.page}"
+            response = await self._get(fixed_host_join(base_url, search_path))
+            try:
+                self._validate_response("search", response)
+                require_html_response(response)
+                response_base_url = self._base_for_url(response.url)
+                soup = BeautifulSoup(response.body, "lxml")
+                candidates = self._parse_search_candidates(soup, base_url=response_base_url)
+                has_more = self._has_search_page_link(
+                    soup, query=query, page=request.page + 1, base_url=response_base_url,
+                )
+                if candidates:
+                    break
                 zero_summary = any(
                     node.get_text(strip=True) == "0"
                     and re.search(r"^搜索.*找到\s*0\s*部影视作品", node.find_parent("h2").get_text(" ", strip=True))
                     for node in soup.select("h2 strong.mac_total")
                 )
-                known_empty = any(marker in text for marker in ("暂无", "无结果", "no result"))
-                if (known_empty or zero_summary) and not is_likely_challenge_page(response.body):
-                    return IndexerPage(
-                        items=[],
-                        page=request.page,
-                        has_more=False,
-                        pagination_supported=True,
-                    )
-                raise IndexerInvalidResponse("BTBtla search page structure is invalid")
-        except IndexerInvalidResponse as exc:
-            raise IndexerUnavailable("BTBtla search endpoint returned an invalid page") from exc
+                known_empty = any(marker in soup.get_text(" ", strip=True).lower()
+                                  for marker in ("暂无", "无结果", "no result"))
+                if not (known_empty or zero_summary) or is_likely_challenge_page(response.body):
+                    raise IndexerInvalidResponse("BTBtla search page structure is invalid")
+            except IndexerInvalidResponse as exc:
+                raise IndexerUnavailable("BTBtla search endpoint returned an invalid page") from exc
 
+        if year is not None:
+            exact = [candidate for candidate in candidates
+                     if self._search_candidate_score(query, candidate[0])[0] == 3]
+            candidates = exact or candidates  # 有同名作品时，不把其它含关键词的作品冒充指定年份版本。
         ranked_candidates = sorted(
-            candidates,
-            key=lambda candidate: self._search_candidate_score(request.query, candidate[0]),
+            (candidate for candidate in candidates if year is None or candidate[3] in (None, year)),
+            key=lambda candidate: (self._search_candidate_score(query, candidate[0])[0],
+                                   candidate[3] == year if year is not None else False,
+                                   self._search_candidate_score(query, candidate[0])[1]),
             reverse=True,
-        )[:detail_limit]
+        )[:self.max_detail_candidates]
         items: list[IndexerItem] = []
         seen_urls: set[str] = set()
         detail_error: IndexerInvalidResponse | IndexerResultExpired | None = None
-        for _, detail_url, category in ranked_candidates:
+        matched_tier = None
+        for title, detail_url, category, candidate_year in ranked_candidates:
+            tier = (self._search_candidate_score(query, title)[0], year is not None and candidate_year == year)
+            if items and tier < matched_tier:
+                break  # 不为已精确命中的作品额外请求弱匹配；同名作品不能提前截断。
             try:
                 detail = await self._get(detail_url)
                 self._validate_response("detail", detail)
@@ -161,8 +166,8 @@ class BTBtlaAdapter(IndexerAdapter):
                 if item.detail_url:
                     seen_urls.add(item.detail_url)
                 items.append(item)
-            if items:
-                break
+            if detail_items:
+                matched_tier = tier
         if not items and detail_error is not None:
             raise detail_error
         return IndexerPage(
@@ -207,8 +212,8 @@ class BTBtlaAdapter(IndexerAdapter):
         soup: BeautifulSoup,
         *,
         base_url: str,
-    ) -> list[tuple[str, str, str | None]]:
-        candidates: list[tuple[str, str, str | None]] = []
+    ) -> list[tuple[str, str, str | None, int | None]]:
+        candidates: list[tuple[str, str, str | None, int | None]] = []
         for node in soup.select("div.module-item"):
             # 站点改版把标题锚点从 div.video-name a 换成 a.module-item-title；
             # 两种布局都接受，最后兜底任意 /detail/ 链接。
@@ -237,7 +242,11 @@ class BTBtlaAdapter(IndexerAdapter):
             except IndexerSecurityError:
                 continue
             category = self._parse_search_category(node)
-            candidates.append((title, detail_url, category))
+            caption = node.select_one("div.module-item-caption span")
+            caption_text = caption.get_text(strip=True) if caption is not None else ""
+            year = int(caption_text) if re.fullmatch(r"(?:18|19|20|21)\d{2}|2200", caption_text) else None
+            if not any(candidate[1] == detail_url for candidate in candidates):
+                candidates.append((title, detail_url, category, year))
         return candidates
 
     @staticmethod
