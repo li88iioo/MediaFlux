@@ -284,6 +284,133 @@ class ResourceConfirmLayerBrowserTests(unittest.TestCase):
                 self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
                 page.close()
 
+    def test_close_during_pending_download_releases_panel_and_keeps_late_receipt(self):
+        page, writes = self.page()
+        pending_routes = []
+
+        def hold_download(route):
+            writes.append(route.request.post_data_json)
+            pending_routes.append(route)
+
+        page.route('**/api/indexers/download/batch', hold_download)
+        page.locator('[data-resource-batch-target="guangya"]').click()
+        with page.expect_request('**/api/indexers/download/batch'):
+            page.locator('#appConfirmSubmit').click()
+        page.wait_for_function("document.querySelector('#appConfirmModal').hidden")
+        self.assertEqual(len(pending_routes), 1)
+        self.assertEqual(len(writes), 1)
+        self.assertTrue(page.locator('#appMessageModal').is_hidden())
+
+        page.keyboard.press('Escape')
+        page.wait_for_function("""() => {
+            const dialog = document.querySelector('#discovery-detail-dialog');
+            return !dialog.open && document.querySelector('#discovery-detail-body').childElementCount === 0;
+        }""")
+        self.assertEqual(page.locator('#discovery-detail-body [data-resource-result-id]').count(), 0)
+        self.assertTrue(page.locator('#appMessageModal').is_hidden())
+
+        pending_routes[0].fulfill(json={
+            'ok': True,
+            'items': [
+                {'result_id': f'resource-{index}', 'ok': True, 'status': 'success', 'succeeded': ['guangya']}
+                for index in range(5)
+            ],
+        })
+        page.locator('#appMessageModal[open]').wait_for()
+        self.assertEqual(page.locator('#appMessageTitle').inner_text(), '批量提交完成')
+        self.assertIn('成功 5', page.locator('#appMessageText').inner_text())
+        self.assertFalse(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+        self.assertEqual(page.locator('#discovery-detail-body').evaluate('el => el.childElementCount'), 0)
+        page.locator('#appMessageClose').click()
+
+    def test_queued_receipt_opens_global_alert_from_native_close_event(self):
+        page, writes = self.page()
+        pending_routes = []
+
+        def hold_download(route):
+            writes.append(route.request.post_data_json)
+            pending_routes.append(route)
+
+        page.route('**/api/indexers/download/batch', hold_download)
+        page.evaluate("""() => {
+            window.__resourceAlerts = [];
+            const appAlert = window.appAlert;
+            window.appAlert = options => {
+                window.__resourceAlerts.push(options);
+                return appAlert(options);
+            };
+        }""")
+        page.locator('[data-resource-batch-target="guangya"]').click()
+        with page.expect_request('**/api/indexers/download/batch'):
+            page.locator('#appConfirmSubmit').click()
+        self.assertEqual(len(pending_routes), 1)
+
+        page.evaluate("""() => {
+            const link = document.querySelector('#openProfile');
+            document.querySelector('[data-discovery-dialog-close]').click();
+            link.href = '/discovery?detail_provider=tmdb&detail_type=tv&detail_id=456';
+            link.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, button: 0}));
+        }""")
+        page.locator('[data-resource-result-id]').first.wait_for()
+        pending_routes[0].fulfill(json={
+            'ok': True,
+            'items': [
+                {'result_id': f'resource-{index}', 'ok': True, 'status': 'success', 'succeeded': ['guangya']}
+                for index in range(5)
+            ],
+        })
+        page.wait_for_load_state('networkidle')
+        self.assertEqual(page.evaluate('window.__resourceAlerts.length'), 0)
+        self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+        self.assertTrue(page.locator('#appMessageModal').is_hidden())
+
+        page.keyboard.press('Escape')
+        page.locator('#appMessageModal[open]').wait_for()
+        self.assertEqual(page.evaluate('window.__resourceAlerts.length'), 1)
+        self.assertEqual(page.locator('#appMessageTitle').inner_text(), '批量提交完成')
+        self.assertIn('成功 5', page.locator('#appMessageText').inner_text())
+        self.assertEqual(len(writes), 1)
+        page.locator('#appMessageClose').click()
+
+    def test_resubmit_receipt_survives_closing_the_resource_panel(self):
+        for succeeds in (True, False):
+            with self.subTest(succeeds=succeeds):
+                page, writes = self.page()
+                pending = []
+
+                def duplicate(route):
+                    writes.append(route.request.post_data_json)
+                    route.fulfill(status=409, json={
+                        'ok': False, 'duplicate': True, 'request_id': 71,
+                        'existing_status': 'failed', 'can_resubmit': True,
+                        'resubmit_target': 'guangya', 'error': '已有历史任务',
+                    })
+
+                def hold_resubmit(route):
+                    writes.append(route.request.post_data_json)
+                    pending.append(route)
+
+                page.route('**/api/indexers/download', duplicate)
+                page.route('**/api/indexers/download/resubmit', hold_resubmit)
+                page.locator('[data-resource-submit-target="guangya"]').first.click()
+                page.get_by_role('button', name='重新提交', exact=True).click()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(writes[-1], {'request_id': 71, 'target': 'guangya'})
+                page.keyboard.press('Escape')
+                page.wait_for_function("document.querySelector('#discovery-detail-body').childElementCount === 0")
+                if succeeds:
+                    pending[0].fulfill(json={'ok': True, 'request_id': 88, 'succeeded': ['guangya']})
+                else:
+                    pending[0].fulfill(status=400, json={'ok': False, 'error': '测试后端拒绝提交'})
+                page.locator('#appMessageModal[open]').wait_for()
+                self.assertEqual(page.locator('#appMessageTitle').inner_text(), '已重新提交' if succeeds else '重新提交失败')
+                self.assertIn('88' if succeeds else '测试后端拒绝提交', page.locator('#appMessageText').inner_text())
+                self.assertEqual(len(writes), 2)
+                self.assertFalse(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+                self.assertEqual(page.locator('#discovery-detail-body').evaluate('el => el.childElementCount'), 0)
+                page.locator('#appMessageClose').click()
+                page.close()
+
     def test_message_stacks_above_confirmation_without_closing_parent_dialog(self):
         page, writes = self.page()
         page.locator('[data-resource-batch-target="guangya"]').click()

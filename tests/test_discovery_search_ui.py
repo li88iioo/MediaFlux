@@ -161,10 +161,30 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
         self.assertRegex(
             self.script,
             re.compile(
-                r"elements\.dialog\.addEventListener\('close'.*?leaveDetailLocation\(\)",
+                r"function finishDetailDialogClose\([^)]*\).*?"
+                r"elements\.dialogBody\.replaceChildren\(\).*?leaveDetailLocation\(\).*?"
+                r"flushPendingResourceNotifications\(\)",
                 re.S,
             ),
         )
+        self.assertRegex(
+            self.script,
+            re.compile(
+                r"elements\.dialog\.addEventListener\('close'.*?"
+                r"finishDetailDialogClose\(detailRequestId\)",
+                re.S,
+            ),
+        )
+        self.assertRegex(
+            self.script,
+            re.compile(
+                r"elements\.dialog\.addEventListener\('cancel'.*?"
+                r"event\.preventDefault\(\).*?closeDetailDialog\(\)",
+                re.S,
+            ),
+        )
+        self.assertIn("state.dialogCloseRequestIds.push(detailRequestId)", self.script)
+        self.assertIn("detailRequestId !== state.detailRequestId", self.script)
 
     def test_infinite_scroll_has_single_flight_disconnect_and_manual_fallback(self):
         for contract in (
@@ -573,6 +593,12 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
         self.assertIn("!resourceResultTerminal(resultId)", self.script)
         self.assertNotIn("资源提交失败，可保留选择后重试", self.script)
         self.assertNotIn("批量提交失败，请重试", self.script)
+        resubmit_start = self.script.index("async function resubmitResourceRequest")
+        duplicate_start = self.script.index("function resourceDuplicateNotification", resubmit_start)
+        resubmit_source = self.script[resubmit_start:duplicate_start]
+        self.assertIn("beginResourceSubmission(state.detailRequestId, [resultId], target)", resubmit_source)
+        self.assertIn("resourceSubmissionContextActive(submission)", resubmit_source)
+        self.assertIn("notifyResourceCompletion(notification, submission)", resubmit_source)
 
     def test_resource_submissions_use_independent_lifecycle_and_deferred_global_alert(self):
         for contract in (
@@ -583,9 +609,10 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "function renderResourceNotice",
             "function flushPendingResourceNotification",
             "data-resource-notice",
-            "window.setTimeout(flushPendingResourceNotification",
+            "void flushPendingResourceNotifications()",
         ):
             self.assertIn(contract, self.script)
+        self.assertNotIn("setTimeout(flushPendingResourceNotifications", self.script)
         batch_start = self.script.index("async function submitResourceBatch")
         single_start = self.script.index("function resourceActionButton", batch_start)
         row_start = self.script.index("function resourceRow", single_start)
@@ -989,6 +1016,162 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.locator("[data-discovery-resource-list]").wait_for()
         self.assertEqual(page_errors, [])
         return page
+
+    def defer_resource_append_requests(self, page):
+        page.evaluate("""() => {
+            const originalFetch = window.fetch;
+            window.__pendingResourceSearches = [];
+            window.__deferredResourceResponses = 0;
+            window.fetch = (input, options = {}) => {
+                const url = String(input);
+                const body = options.body || null;
+                const payload = body ? JSON.parse(body) : {};
+                if (url === '/api/indexers/search' && payload.page > 1) {
+                    window.__resourceSearchRequests.push({
+                        url, method: options.method || 'GET', body,
+                    });
+                    return new Promise(resolve => window.__pendingResourceSearches.push(() => resolve({
+                        ok: true,
+                        status: 200,
+                        json: async () => {
+                            window.__deferredResourceResponses += 1;
+                            return window.__resourceSearchNextPayload;
+                        },
+                    })));
+                }
+                return originalFetch(input, options);
+            };
+        }""")
+
+    def test_native_escape_releases_all_resource_dom_and_quick_reopen_keeps_new_panel(self):
+        resources = [
+            self.result(f"resource-{index}", "btbtla", "BTBtla", f"https://bt.example/{index}")
+            for index in range(100)
+        ]
+        payload = {
+            "items": resources,
+            "has_more": True,
+            "site_statuses": [
+                {"site_id": "btbtla", "site_name": "BTBtla", "status": "success", "has_more": True},
+            ],
+        }
+        page = self.open_resource_panel(payload)
+        self.assertEqual(page.locator("[data-resource-result-id]").count(), 100)
+
+        page.keyboard.press("Escape")
+        page.wait_for_function("""() => {
+            const dialog = document.querySelector('#discovery-detail-dialog');
+            return !dialog.open && document.querySelector('#discovery-detail-body').childElementCount === 0;
+        }""")
+        self.assertEqual(page.locator("#discovery-detail-body [data-resource-result-id]").count(), 0)
+
+        page.locator("#profileLink").click()
+        page.locator("[data-resource-result-id]").nth(99).wait_for()
+        page.evaluate("""() => {
+            document.querySelector('[data-discovery-dialog-close]').click();
+            document.querySelector('#profileLink').dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, button: 0,
+            }));
+        }""")
+        page.wait_for_function("""() => document.querySelector('#discovery-detail-dialog').open
+            && document.querySelectorAll('#discovery-detail-body [data-resource-result-id]').length === 100""")
+        self.assertEqual(page.locator("[data-resource-result-id]").count(), 100)
+
+    def test_old_close_event_cannot_clear_reopened_then_closed_detail(self):
+        payload = {
+            "items": [self.result("resource-1", "btbtla", "BTBtla", "https://bt.example/1")],
+            "site_statuses": [
+                {"site_id": "btbtla", "site_name": "BTBtla", "status": "success"},
+            ],
+        }
+        page = self.open_resource_panel(payload)
+        page.evaluate("""() => {
+            const dialog = document.querySelector('#discovery-detail-dialog');
+            const body = document.querySelector('#discovery-detail-body');
+            window.__closeSnapshots = [];
+            dialog.addEventListener('close', () => window.__closeSnapshots.push({
+                childCount: body.childElementCount,
+                firstClass: body.firstElementChild?.className || '',
+            }));
+
+            document.querySelector('[data-discovery-dialog-close]').click();
+            const link = document.querySelector('#profileLink');
+            link.href = '/discovery?detail_provider=tmdb&detail_type=movie&detail_id=456';
+            link.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true, button: 0}));
+            document.querySelector('[data-discovery-dialog-close]').click();
+        }""")
+        page.wait_for_function("window.__closeSnapshots.length === 2")
+        snapshots = page.evaluate("window.__closeSnapshots")
+        self.assertGreater(snapshots[0]["childCount"], 0)
+        self.assertEqual(snapshots[1]["childCount"], 0)
+        self.assertFalse(page.locator("#discovery-detail-dialog").evaluate("el => el.open"))
+
+    def test_stale_append_finally_cannot_reset_resorted_or_reopened_search(self):
+        first_page = {
+            "items": [self.result("resource-page-1", "btbtla", "BTBtla", "https://bt.example/1")],
+            "has_more": True,
+            "site_statuses": [
+                {"site_id": "btbtla", "site_name": "BTBtla", "status": "success", "has_more": True},
+            ],
+        }
+        next_page = {
+            "items": [self.result("resource-page-2", "btbtla", "BTBtla", "https://bt.example/2")],
+            "has_more": False,
+            "site_statuses": [
+                {"site_id": "btbtla", "site_name": "BTBtla", "status": "success", "has_more": False},
+            ],
+        }
+        page = self.open_resource_panel(first_page, next_payload=next_page)
+        self.defer_resource_append_requests(page)
+
+        load_more = page.locator(".discovery-resource-load-more")
+        load_more.click()
+        page.wait_for_function("window.__pendingResourceSearches.length === 1")
+
+        request_count = page.evaluate("window.__resourceSearchRequests.length")
+        page.locator("[data-resource-sort]").select_option("seeders_desc")
+        page.wait_for_function(
+            "count => window.__resourceSearchRequests.length === count + 1",
+            arg=request_count,
+        )
+        page.wait_for_function("""() => {
+            const button = document.querySelector('.discovery-resource-load-more');
+            return button && !button.disabled && button.textContent === '加载更多资源';
+        }""")
+        load_more.click()
+        page.wait_for_function("window.__pendingResourceSearches.length === 2")
+        self.assertTrue(load_more.is_disabled())
+
+        page.evaluate("window.__pendingResourceSearches[0]()")
+        page.wait_for_function("window.__deferredResourceResponses === 1")
+        self.assertTrue(load_more.is_disabled())
+        self.assertEqual(load_more.inner_text(), "正在加载更多…")
+
+        page.evaluate("""() => {
+            document.querySelector('[data-discovery-dialog-close]').click();
+            document.querySelector('#profileLink').dispatchEvent(new MouseEvent('click', {
+                bubbles: true, cancelable: true, button: 0,
+            }));
+        }""")
+        page.wait_for_function("""() => document.querySelector('#discovery-detail-dialog').open
+            && document.querySelector('#discovery-detail-body [data-resource-result-id]')?.dataset.resourceResultId === 'resource-page-1'""")
+        load_more = page.locator(".discovery-resource-load-more")
+        load_more.click()
+        page.wait_for_function("window.__pendingResourceSearches.length === 3")
+        self.assertTrue(load_more.is_disabled())
+
+        page.evaluate("window.__pendingResourceSearches[1]()")
+        page.wait_for_function("window.__deferredResourceResponses === 2")
+        self.assertTrue(load_more.is_disabled())
+        self.assertEqual(load_more.inner_text(), "正在加载更多…")
+
+        page.evaluate("window.__pendingResourceSearches[2]()")
+        page.wait_for_function("window.__deferredResourceResponses === 3")
+        page.wait_for_function("""() => {
+            const button = document.querySelector('.discovery-resource-load-more');
+            return button && !button.disabled && button.textContent === '加载更多资源';
+        }""")
+        self.assertTrue(page.locator("[data-resource-result-id='resource-page-2']").is_visible())
 
     def open_filter_controls(self, width=320):
         html = f"""<!doctype html>

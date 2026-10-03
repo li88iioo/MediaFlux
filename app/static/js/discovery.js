@@ -148,6 +148,7 @@
         resourceSubmissionRequests: new Map(),
         pendingResourceNotifications: [],
         resourceNotificationFlushPromise: null,
+        dialogCloseRequestIds: [],
         dialogNoticeTimer: null,
         detailExitInProgress: false,
     };
@@ -1280,7 +1281,7 @@
                 renderIcons(mapState);
                 announce(`已确认《${item.title || '媒体'}》的 TMDB 映射。`);
                 saved = true;
-                elements.dialog.close();
+                closeDetailDialog();
             } catch (error) {
                 if (error.name !== 'AbortError' && mappingRequestId === state.detailRequestId) {
                     window.appAlert?.({type: 'error', title: '映射失败', message: error.message || '无法保存映射。'});
@@ -1507,7 +1508,7 @@
                 state.resourceNotificationFlushPromise = null;
             }
             if (state.pendingResourceNotifications.length && !dialogIsOpen()) {
-                window.setTimeout(flushPendingResourceNotifications, 0);
+                void flushPendingResourceNotifications();
             }
         }
     }
@@ -1527,7 +1528,7 @@
             return;
         }
         state.pendingResourceNotifications.push(notification);
-        if (!dialogIsOpen()) window.setTimeout(flushPendingResourceNotifications, 0);
+        if (!dialogIsOpen()) void flushPendingResourceNotifications();
     }
 
     function beginResourceSubmission(detailRequestId, resultIds, target) {
@@ -1745,6 +1746,7 @@
     async function resubmitResourceRequest(resultId, item, target, label, control) {
         if (!resultId || !item?.request_id || !target) return;
         const previous = state.resourceSubmitState.get(resultId) || item;
+        const submission = beginResourceSubmission(state.detailRequestId, [resultId], target);
         control.disabled = true;
         control.textContent = '提交中';
         control.setAttribute('aria-busy', 'true');
@@ -1759,16 +1761,16 @@
                 true,
                 previous,
             );
-            state.resourceSubmitState.set(resultId, next);
-            syncResourceControls();
             const notification = {
                 type: 'success',
                 title: '已重新提交',
                 message: `请求 #${payload.request_id} · ${label}`,
             };
-            renderResourceNotice(notification);
-            showDialogNotification(notification);
-            announce(notification.message);
+            if (resourceSubmissionContextActive(submission)) {
+                state.resourceSubmitState.set(resultId, next);
+                syncResourceControls();
+            }
+            notifyResourceCompletion(notification, submission);
         } catch (error) {
             const payload = error.payload || {};
             const next = resourceSubmissionState({
@@ -1777,14 +1779,17 @@
                 ok: false,
                 error: payload.error || error.message || '重新提交失败',
             }, true, previous);
-            state.resourceSubmitState.set(resultId, next);
-            syncResourceControls();
             const notification = next.duplicate
                 ? resourceDuplicateNotification(resultId, next, target, label)
                 : {type: 'error', title: '重新提交失败', message: next.error};
-            renderResourceNotice(notification);
-            showDialogNotification(notification);
-            announce(notification.message);
+            if (resourceSubmissionContextActive(submission)) {
+                state.resourceSubmitState.set(resultId, next);
+                syncResourceControls();
+            }
+            notifyResourceCompletion(notification, submission);
+        } finally {
+            state.resourceSubmissionRequests.delete(submission.requestId);
+            if (dialogIsOpen()) syncResourceControls();
         }
     }
 
@@ -2694,14 +2699,12 @@
         state.resourceSearchContext = {item, detail, detailRequestId};
         const pagination = panel.querySelector('[data-resource-pagination]');
         const loadMoreButton = pagination?.querySelector('.discovery-resource-load-more');
-        if (append) {
-            state.resourceLoadingMore = true;
-            if (loadMoreButton) {
-                loadMoreButton.disabled = true;
-                loadMoreButton.textContent = '正在加载更多…';
-            }
-        }
         const {controller, resourceSearchRequestId} = beginResourceSearch();
+        state.resourceLoadingMore = append;
+        if (loadMoreButton) {
+            loadMoreButton.disabled = append;
+            loadMoreButton.textContent = append ? '正在加载更多…' : '加载更多资源';
+        }
         try {
             const payload = await api(
                 INDEXER_SEARCH_PATH,
@@ -2799,16 +2802,14 @@
             renderIcons(panel);
             return false;
         } finally {
-            if (append) {
+            if (resourceSearchRequestId === state.resourceSearchRequestId) {
                 state.resourceLoadingMore = false;
-                const currentPagination = panel.querySelector('[data-resource-pagination]');
+                const currentPagination = elements.dialogBody.querySelector('[data-resource-pagination]');
                 const currentLoadMore = currentPagination?.querySelector('.discovery-resource-load-more');
                 if (currentLoadMore) {
                     currentLoadMore.disabled = false;
                     currentLoadMore.textContent = '加载更多资源';
                 }
-            }
-            if (resourceSearchRequestId === state.resourceSearchRequestId) {
                 state.resourceSearchController = null;
             }
         }
@@ -3116,20 +3117,30 @@
         });
     }
 
-    function closeDetailDialog() {
+    function finishDetailDialogClose(detailRequestId) {
+        if (dialogIsOpen() || detailRequestId !== state.detailRequestId) return;
         document.body.classList.remove('discovery-modal-open');
         state.detailController?.abort();
+        state.detailController = null;
         state.detailRequestId += 1;
         resetResourceState();
+        elements.dialogBody.replaceChildren();
         syncDialogHeader(null, null, false);
-        if (typeof elements.dialog.close === 'function' && elements.dialog.open) {
+        leaveDetailLocation();
+        restoreDetailFocus();
+        void flushPendingResourceNotifications();
+    }
+
+    function closeDetailDialog() {
+        if (!dialogIsOpen()) return;
+        const detailRequestId = state.detailRequestId;
+        if (typeof elements.dialog.close === 'function') {
+            state.dialogCloseRequestIds.push(detailRequestId);
             elements.dialog.close();
         } else {
             elements.dialog.removeAttribute('open');
-            leaveDetailLocation();
-            restoreDetailFocus();
+            finishDetailDialogClose(detailRequestId);
         }
-        window.setTimeout(flushPendingResourceNotifications, 0);
     }
 
     root.querySelectorAll('[data-discovery-dialog-close]').forEach((button) => {
@@ -3139,17 +3150,13 @@
     elements.dialog.addEventListener('click', (event) => {
         if (event.target === elements.dialog) closeDetailDialog();
     });
+    elements.dialog.addEventListener('cancel', (event) => {
+        event.preventDefault();
+        closeDetailDialog();
+    });
     elements.dialog.addEventListener('close', () => {
-        // 原生 close 延迟到达时，新卡片可能已重开；旧事件不能取消新请求或清空其状态。
-        if (elements.dialog.open) return;
-        document.body.classList.remove('discovery-modal-open');
-        state.detailController?.abort();
-        state.detailRequestId += 1;
-        resetResourceState();
-        syncDialogHeader(null, null, false);
-        leaveDetailLocation();
-        restoreDetailFocus();
-        window.setTimeout(flushPendingResourceNotifications, 0);
+        const detailRequestId = state.dialogCloseRequestIds.shift() ?? state.detailRequestId;
+        finishDetailDialogClose(detailRequestId);
     });
 
     if (profileOnly) {
