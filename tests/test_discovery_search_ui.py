@@ -87,6 +87,8 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             re.compile(r"\.discovery-filter-control \.form-select\s*\{[^}]*border:\s*0[^}]*background:\s*transparent", re.S),
         )
         self.assertIn(".discovery-filter-control.is-active", self.styles)
+        self.assertIn(".discovery-page .discovery-filter-control:focus-within", self.styles)
+        self.assertIn(".discovery-page .discovery-filter-control .form-select:focus-visible", self.styles)
         self.assertRegex(
             self.styles,
             re.compile(r"\.discovery-toolbar-meta\s*\{[^}]*grid-column:\s*3", re.S),
@@ -988,6 +990,69 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(page_errors, [])
         return page
 
+    def open_filter_controls(self, width=320):
+        html = f"""<!doctype html>
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>{self.styles}</style></head><body>
+        <div class="discovery-page" data-discovery-root style="width:{width}px">
+            <section class="discovery-control-deck">
+                <div class="discovery-source-tabs" id="discovery-source-tabs" role="tablist">
+                    <button type="button" role="tab" id="sections-tab" aria-selected="true"
+                        data-mode="sections" data-provider="all" data-media-type="all">排期</button>
+                    <button type="button" role="tab" id="items-tab" aria-selected="false" tabindex="-1"
+                        data-mode="items" data-provider="tmdb" data-media-type="movie">电影</button>
+                </div>
+                <div class="discovery-toolbar">
+                    <form id="discovery-search-form" class="discovery-search-form">
+                        <div class="discovery-search-field">
+                            <input class="form-input discovery-search-input" id="discovery-search-query" type="search">
+                            <button id="discovery-search-submit" class="discovery-search-submit" type="submit">搜索</button>
+                        </div>
+                    </form>
+                    <div class="discovery-filter-region" id="discovery-filter-region" aria-label="探索筛选条件" hidden></div>
+                    <div class="discovery-toolbar-meta">
+                        <span class="discovery-provider-status" id="discovery-provider-status" role="status"></span>
+                        <button id="discovery-refresh" class="discovery-refresh" type="button">刷新</button>
+                    </div>
+                </div>
+            </section>
+            <div id="discovery-live" role="status" aria-live="polite"></div>
+            <section id="discovery-stage" role="tabpanel" aria-label="探索内容">
+                <div id="discovery-sections"></div>
+                <div id="discovery-grid" hidden></div>
+                <div id="discovery-page-sentinel"></div>
+                <div id="discovery-load-more-row" hidden><button id="discovery-load-more" type="button"><span>调取下一卷</span></button></div>
+            </section>
+            {self.dialog}
+        </div></body></html>"""
+        context = self.browser.new_context(viewport={"width": width, "height": 480})
+        self.addCleanup(context.close)
+        page = context.new_page()
+        page_errors = []
+        page.on("pageerror", lambda error: page_errors.append(str(error)))
+        page.set_content(html)
+        page.evaluate("""() => {
+            window.renderLucideIcons = () => {};
+            window.fetch = async input => {
+                const path = String(input);
+                const body = path === '/api/discovery/sections'
+                    ? {sections: []}
+                    : path.startsWith('/api/discovery/filters/')
+                        ? {filters: [
+                            {key: 'type', label: '类型', all_label: '全部类型', options: ['电影', '剧集']},
+                            {key: 'language', label: '语言', all_label: '全部语言', options: ['中文', 'English']},
+                            {key: 'sort', label: '排序', all_label: '默认排序', options: ['最新']},
+                        ]}
+                        : path.startsWith('/api/discovery/items?') ? {items: []} : {};
+                return {ok: true, status: 200, json: async () => body};
+            };
+        }""")
+        page.add_script_tag(content=self.script)
+        page.locator("#items-tab").click()
+        page.locator("#discovery-filter-region .discovery-filter-control select").first.wait_for()
+        page.wait_for_function("document.querySelectorAll('#discovery-filter-region .discovery-filter-control select').length === 3")
+        self.assertEqual(page_errors, [])
+        return page
 
     @staticmethod
     def result(result_id, site_id, site_name, source_url):
@@ -1162,6 +1227,55 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(disabled.count(), 1)
         self.assertIn("Nyaa：未启用", disabled.get_attribute("aria-label"))
 
+    def test_filter_select_focus_stays_inside_complete_wrapper_without_geometry_shift(self):
+        page = self.open_filter_controls()
+        wrapper = page.locator(".discovery-filter-control").first
+        select = wrapper.locator("select")
+
+        def focus_metrics():
+            return page.evaluate("""() => {
+                const wrapper = document.querySelector('.discovery-filter-control');
+                const select = wrapper.querySelector('select');
+                const rect = wrapper.getBoundingClientRect();
+                const style = getComputedStyle(wrapper);
+                const selectStyle = getComputedStyle(select);
+                return {
+                    rect: [rect.x, rect.y, rect.width, rect.height],
+                    focusWithin: wrapper.matches(':focus-within'),
+                    focusVisible: select.matches(':focus-visible'),
+                    active: document.activeElement === select,
+                    wrapperShadow: style.boxShadow,
+                    wrapperBorders: [style.borderTopColor, style.borderRightColor, style.borderBottomColor, style.borderLeftColor],
+                    selectOutline: selectStyle.outlineStyle,
+                    selectShadow: selectStyle.boxShadow,
+                };
+            }""")
+
+        initial = focus_metrics()
+        select.click()
+        page.wait_for_function("getComputedStyle(document.querySelector('.discovery-filter-control')).boxShadow.includes('1px inset')")
+        clicked = focus_metrics()
+        self.assertTrue(clicked["focusWithin"])
+        self.assertIn("1px inset", clicked["wrapperShadow"])
+        self.assertEqual(len(set(clicked["wrapperBorders"])), 1)
+        self.assertNotEqual(clicked["wrapperBorders"][0], initial["wrapperBorders"][0])
+        self.assertEqual(clicked["selectOutline"], "none")
+        self.assertEqual(clicked["selectShadow"], "none")
+        self.assertEqual(clicked["rect"], initial["rect"])
+
+        page.evaluate("document.activeElement.blur()")
+        page.locator("#discovery-search-submit").focus()
+        page.keyboard.press("Tab")
+        page.wait_for_function("getComputedStyle(document.querySelector('.discovery-filter-control')).boxShadow.includes('1px inset')")
+        keyboard = focus_metrics()
+        self.assertTrue(keyboard["focusWithin"])
+        self.assertTrue(keyboard["active"])
+        self.assertTrue(keyboard["focusVisible"])
+        self.assertIn("1px inset", keyboard["wrapperShadow"])
+        self.assertEqual(len(set(keyboard["wrapperBorders"])), 1)
+        self.assertEqual(keyboard["selectOutline"], "none")
+        self.assertEqual(keyboard["selectShadow"], "none")
+        self.assertEqual(keyboard["rect"], initial["rect"])
 
 
 
