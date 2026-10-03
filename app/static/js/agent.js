@@ -37,8 +37,11 @@
     const SESSION_RE = /^[A-Za-z0-9_-]{16,64}$/;
     const MAX_TRANSCRIPT_ITEMS = 120;
     const STREAM_MARKDOWN_INTERVAL_MS = 72;
+    const SESSION_POLL_INTERVAL_MS = 1750;
+    const SESSION_POLL_MAX_INTERVAL_MS = 8000;
     const MAX_MARKDOWN_DEPTH = 4;
     const TERMINAL_TURN_STATUSES = ['success', 'partial', 'approval_required', 'effect_completed'];
+    const TERMINAL_LAST_TURN_STATUSES = ['completed', 'failed', 'cancelled', 'interrupted'];
     const STREAM_INTERRUPTED_NOTICE = '连接中断，后续结果尚未确认；可刷新会话核对状态，不要重复提交。';
     const CONFIRMATION_STOP_NOTICE = '已停止等待；已提交操作可能继续执行，请核对任务状态。';
     const TOOL_LABELS = {
@@ -156,15 +159,16 @@
     }
 
     function configureDraftScope(value) {
-        if (typeof value !== 'string' || !/^[a-f0-9]{32,64}$/.test(value) || draftScope === value) return;
+        if (typeof value !== 'string' || !/^[a-f0-9]{32,64}$/.test(value) || draftScope === value) return false;
         // 首次鉴权响应前输入的内容属于当前页面，不被迟到的持久草稿覆盖。
         let typed = String(promptInput?.value || '');
         const accountChanged = Boolean(draftScope);
         if (accountChanged) {
             stopInitialRestore();
-            // 同一页面的登录主体改变时，不把旧主体的内存/输入传给新主体。
+            // 同一页面的登录主体改变时，不把旧主体的请求、内存或输入传给新主体。
             ++sessionLoadGeneration;
-            activeRequest?.controller.abort();
+            invalidateActiveRequest();
+            setBusy(false);
             expireCandidateCards();
             memoryDrafts.clear();
             typed = '';
@@ -180,6 +184,7 @@
         if (!typed && !busy) restoreDraft();
         saveDraft();
         if (accountChanged) setConsoleEmpty(true);
+        return accountChanged;
     }
 
     function fillDraft(text) {
@@ -261,7 +266,7 @@
         }
     }
 
-    function appendMessage(role, {recovered = false} = {}) {
+    function appendMessage(role, {recovered = false, scroll = true} = {}) {
         const item = element('article', `agent-message agent-message-${role}`);
         if (recovered) item.classList.add('is-recovered');
         const mark = element('div', 'agent-message-mark');
@@ -272,7 +277,7 @@
         pruneTranscript();
         setConsoleEmpty(false);
         renderIcons(item);
-        scrollToBottom(true);
+        if (scroll) scrollToBottom(true);
         return {item, body};
     }
 
@@ -736,8 +741,8 @@
         };
     }
 
-    function createAssistantTurn({recovered = false} = {}) {
-        const view = appendMessage('assistant', {recovered});
+    function createAssistantTurn({recovered = false, scroll = true} = {}) {
+        const view = appendMessage('assistant', {recovered, scroll});
         const stream = createStreamingCard();
         view.body.append(stream.card);
         renderIcons(stream.card);
@@ -759,8 +764,18 @@
 
     function setTurnStatus(turn, label, iconName = 'loader-circle') {
         if (!turn?.head) return;
-        turn.head.replaceChildren(icon(iconName), element('span', '', label));
-        renderIcons(turn.head);
+        if (!turn.headText?.isConnected) {
+            turn.head.replaceChildren(icon(iconName), element('span', '', label));
+            turn.headText = turn.head.querySelector('span');
+            renderIcons(turn.head);
+            return;
+        }
+        turn.headText.textContent = label;
+        const currentIcon = turn.head.querySelector('svg');
+        if (currentIcon?.getAttribute('data-lucide') !== iconName) {
+            currentIcon?.replaceWith(icon(iconName));
+            renderIcons(turn.head);
+        }
     }
 
     function toolLabel(tool, label = '') {
@@ -1169,18 +1184,24 @@
         return turn;
     }
 
-    function showExecutingApproval(card) {
+    function showExecutingApproval(card, detail = '执行完成前不会接受另一项写操作。') {
         const preflight = card.querySelector('.agent-confirmation-preflight span');
         if (preflight) preflight.textContent = '已确认，正在等待实际执行结果。';
         const actions = card.querySelector('.agent-confirmation-actions');
-        const executing = element('div', 'agent-confirmation-executing');
-        const mark = element('span', 'agent-confirmation-executing-mark');
-        mark.append(icon('loader-circle'));
-        const copy = element('span', 'agent-confirmation-executing-copy');
-        copy.append(element('strong', '', '正在执行已确认计划'), element('small', '', '执行完成前不会接受另一项写操作。'));
-        executing.append(mark, copy);
-        actions?.replaceChildren(executing);
-        renderIcons(card);
+        let copy = card.querySelector('.agent-confirmation-executing-copy');
+        if (!copy) {
+            const executing = element('div', 'agent-confirmation-executing');
+            const mark = element('span', 'agent-confirmation-executing-mark');
+            mark.append(icon('loader-circle'));
+            copy = element('span', 'agent-confirmation-executing-copy');
+            copy.append(element('strong', '', '正在执行已确认计划'), element('small', '', detail));
+            executing.append(mark, copy);
+            actions?.replaceChildren(executing);
+            renderIcons(card);
+        } else {
+            copy.querySelector('small').textContent = detail;
+        }
+        return copy.querySelector('small');
     }
 
     function promoteTurnCard(turn) {
@@ -1427,6 +1448,180 @@
         return payload;
     }
 
+    function isCurrentActiveRequest(active) {
+        return Boolean(active && activeRequest === active
+            && active.sessionId === sessionId
+            && active.sessionGeneration === sessionLoadGeneration);
+    }
+
+    function clearActiveObservation(active) {
+        if (active?.pollTimer) clearTimeout(active.pollTimer);
+        if (active) active.pollTimer = null;
+        active?.observerController?.abort();
+        if (active) active.observerController = null;
+    }
+
+    function invalidateActiveRequest() {
+        const active = activeRequest;
+        if (!active) return;
+        activeRequest = null;
+        clearActiveObservation(active);
+        active.controller?.abort();
+    }
+
+    function sameActiveTurn(turn, active) {
+        if (!turn || String(turn.request_id || '') !== active.requestId) return false;
+        if (active.turnId && turn.turn_id && String(turn.turn_id) !== active.turnId) return false;
+        if (active.kernelGeneration != null && turn.generation != null
+            && String(turn.generation) !== String(active.kernelGeneration)) return false;
+        return true;
+    }
+
+    function activeProgressText(turn, active) {
+        const detail = String(turn?.detail || '').trim();
+        if (active.cancelAccepted || turn?.status === 'cancelling') {
+            return detail ? `正在停止 · ${detail}` : '正在停止';
+        }
+        return detail || '后台仍在处理';
+    }
+
+    function prepareActiveStatus(active, detail = '') {
+        if (active.kind === 'pending_approval' && active.pendingCard?.isConnected) {
+            active.pendingCard.querySelectorAll('button').forEach(button => { button.disabled = true; });
+            active.statusNode = active.pendingCard.querySelector('.agent-confirmation-preflight span');
+            detail = `尚未执行 · ${detail || '正在完成预览'}`;
+        } else if (active.kind === 'candidate_preview' && active.candidateGroup?.isConnected) {
+            let status = active.candidateGroup.querySelector('[data-agent-active-status]');
+            if (!status) {
+                status = element('p', 'agent-candidates-note agent-candidate-feedback');
+                status.dataset.agentActiveStatus = 'true';
+                active.candidateGroup._candidateState?.output.append(status);
+            }
+            active.statusNode = status;
+        } else if (active.kind === 'confirm' && active.pendingCard?.isConnected) {
+            active.statusNode = showExecutingApproval(active.pendingCard, detail || '正在等待实际执行结果。');
+            active.statusNode.dataset.agentActiveStatus = 'true';
+        } else if (active.turn?.headText?.isConnected) {
+            active.statusNode = active.turn.headText;
+            active.statusNode.dataset.agentActiveStatus = 'true';
+        } else if (active.candidateGroup?.isConnected) {
+            let status = active.candidateGroup.querySelector('[data-agent-active-status]');
+            if (!status) {
+                status = element('p', 'agent-candidates-note agent-candidate-feedback');
+                status.dataset.agentActiveStatus = 'true';
+                active.candidateGroup._candidateState?.output.append(status);
+            }
+            active.statusNode = status;
+        }
+        if (active.statusNode && detail) active.statusNode.textContent = detail;
+        if (active.candidateGroup?.isConnected) {
+            active.candidateGroup.dataset.previewing = 'true';
+            active.candidateGroup.querySelectorAll('[data-effect-confirm]').forEach(button => { button.disabled = true; });
+        }
+    }
+
+    function updateActiveProgress(active, turn) {
+        if (!isCurrentActiveRequest(active)) return;
+        active.turnId = active.turnId || String(turn.turn_id || '');
+        active.kernelGeneration = active.kernelGeneration ?? turn.generation;
+        active.protected = turn.protected === true;
+        const detail = activeProgressText(turn, active);
+        prepareActiveStatus(active, detail);
+        setBusy(true, {stoppable: !active.protected && !active.cancelAccepted});
+    }
+
+    function scheduleActiveObservation(active, delay = SESSION_POLL_INTERVAL_MS) {
+        if (!isCurrentActiveRequest(active) || active.pollTimer) return;
+        active.pollTimer = window.setTimeout(() => {
+            active.pollTimer = null;
+            observeActiveSession(active);
+        }, delay);
+    }
+
+    function finishObservedTurn(active, payload, lastTurn) {
+        if (!isCurrentActiveRequest(active) || !sameActiveTurn(lastTurn, active)
+            || !TERMINAL_LAST_TURN_STATUSES.includes(String(lastTurn?.status || ''))) return;
+        clearActiveObservation(active);
+        activeRequest = null;
+        active.controller?.abort();
+        renderSessionSnapshot(payload, {active, terminalTurn: lastTurn, preserveScroll: true});
+        setBusy(false);
+        resizePrompt();
+        announce(responseStatus, lastTurn.status === 'cancelled' ? '请求已停止'
+            : lastTurn.status === 'failed' || lastTurn.status === 'interrupted' ? '请求未能完成，状态已同步'
+                : 'Media Agent 已完成');
+        refreshSessions({quiet: true});
+    }
+
+    function stopActiveUnconfirmed(active, message) {
+        if (!isCurrentActiveRequest(active)) return;
+        clearActiveObservation(active);
+        activeRequest = null;
+        active.controller?.abort();
+        if (active.turn?.card) {
+            active.turn.card.classList.remove('agent-streaming');
+            active.turn.card.classList.add('is-interrupted');
+        }
+        if (active.statusNode?.isConnected) active.statusNode.textContent = message;
+        if (active.candidateGroup?.isConnected) active.candidateGroup.dataset.previewing = 'false';
+        setBusy(false);
+        resizePrompt();
+        announce(responseStatus, message);
+    }
+
+    async function observeActiveSession(active) {
+        if (!isCurrentActiveRequest(active)) return;
+        const controller = new AbortController();
+        active.observerController = controller;
+        try {
+            const payload = await fetchJSON(`/api/agent/sessions/${encodeURIComponent(active.sessionId)}`, {signal: controller.signal, cache: 'no-store', headers: {'X-Agent-Request-Id': active.requestId}});
+            if (!isCurrentActiveRequest(active)) return;
+            if (configureDraftScope(payload.draft_scope) || !isCurrentActiveRequest(active)) return;
+            if (payload?.session_id !== active.sessionId || !Array.isArray(payload?.messages)) throw new Error('会话状态响应无效');
+            active.pollDelay = SESSION_POLL_INTERVAL_MS;
+            const lastTurn = payload.last_turn;
+            if (sameActiveTurn(lastTurn, active)
+                && TERMINAL_LAST_TURN_STATUSES.includes(String(lastTurn.status || ''))) {
+                finishObservedTurn(active, payload, lastTurn);
+                return;
+            }
+            if (payload.active_turn) {
+                if (!sameActiveTurn(payload.active_turn, active)) {
+                    stopActiveUnconfirmed(active, '会话已有新轮次，原请求状态未确认；请刷新核对。');
+                    return;
+                }
+                active.missingSnapshots = 0;
+                if (payload.active_turn.status === 'cancelling') active.cancellationObserved = true;
+                updateActiveProgress(active, payload.active_turn);
+            } else {
+                active.missingSnapshots = (active.missingSnapshots || 0) + 1;
+                if (active.missingSnapshots >= 3) {
+                    stopActiveUnconfirmed(active, '任务状态未确认：会话中没有匹配的活动轮次或终态；不会自动重试。');
+                    return;
+                }
+            }
+            scheduleActiveObservation(active);
+        } catch (error) {
+            if (!isCurrentActiveRequest(active) || error?.name === 'AbortError') return;
+            active.pollDelay = Math.min(SESSION_POLL_MAX_INTERVAL_MS, Math.max(SESSION_POLL_INTERVAL_MS, (active.pollDelay || SESSION_POLL_INTERVAL_MS) * 2));
+            announce(responseStatus, active.cancelAccepted
+                ? '停止请求已受理，正在核对最终状态'
+                : '连接中断，正在只读核对任务状态');
+            scheduleActiveObservation(active, active.pollDelay);
+        } finally {
+            if (active.observerController === controller) active.observerController = null;
+        }
+    }
+
+    function startActiveObservation(active) {
+        if (!isCurrentActiveRequest(active)) return;
+        active.observing = true;
+        prepareActiveStatus(active, active.statusNode?.textContent || '正在只读核对任务状态');
+        announce(responseStatus, active.cancelNotice || (active.cancelAccepted
+            ? '停止请求已受理，正在核对最终状态' : '连接中断，正在只读核对任务状态'));
+        observeActiveSession(active);
+    }
+
     function streamFailureMessage(turn, error) {
         if (turn?.effectError) return turn.effectError;
         if (Number.isInteger(error?.httpStatus)) {
@@ -1449,7 +1644,6 @@
             stopButton.disabled = !(busy && stoppable);
         }
         syncCandidateButtons();
-        newSessionButton && (newSessionButton.disabled = busy);
         resumeButton && (resumeButton.disabled = busy || !latestSessionId);
     }
 
@@ -1465,10 +1659,10 @@
         syncViewportHeight();
     }
 
-    function queryRequest(message, requestId, signal, selection = null) {
+    function queryRequest(message, requestId, signal, selection = null, targetSessionId = sessionId) {
         return fetch('/api/agent/query', {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({message, session_id: sessionId, request_id: requestId, stream: true, ...(selection ? {selection} : {})}),
+            body: JSON.stringify({message, session_id: targetSessionId, request_id: requestId, stream: true, ...(selection ? {selection} : {})}),
             signal,
         });
     }
@@ -1488,57 +1682,95 @@
         scrollToBottom(true);
         resizePrompt();
         rememberSession(sessionId);
+        const targetSessionId = sessionId;
         const controller = new AbortController();
         const requestId = createId('rq');
-        activeRequest = {controller, requestId, turn, sessionId};
+        const active = {
+            controller, requestId, turn, sessionId: targetSessionId,
+            sessionGeneration: sessionLoadGeneration, kind: 'query', turnId: '',
+            pollTimer: null, observerController: null, observing: false,
+            protected: false, cancelAccepted: false,
+        };
+        activeRequest = active;
         setBusy(true, {stoppable: true});
         announce(responseStatus, 'Media Agent 正在处理请求');
         try {
-            const response = await queryRequest(message, requestId, controller.signal);
+            const response = await queryRequest(message, requestId, controller.signal, null, targetSessionId);
+            if (!isCurrentActiveRequest(active)) return;
             const terminalEvent = await readEventStream(response, (event) => {
-                if (activeRequest?.requestId !== requestId) return;
+                if (!isCurrentActiveRequest(active)) return;
+                if (event.request_id && String(event.request_id) !== active.requestId) return;
+                active.turnId = active.turnId || String(event.turn_id || '');
+                if (active.cancelAccepted && isTerminalEvent(event)) return;
                 applyEvent(turn, event);
             });
-            if (!terminalEvent) {
-                finalizeError(turn, STREAM_INTERRUPTED_NOTICE);
-                announce(responseStatus, '连接中断，后续结果尚未确认');
+            if (!isCurrentActiveRequest(active)) return;
+            if (!terminalEvent || active.cancelAccepted) {
+                startActiveObservation(active);
                 return;
             }
             announce(responseStatus, turn.failed ? (turn.cancelled ? '请求已停止' : '请求失败') : 'Media Agent 已完成');
         } catch (error) {
-            if (error?.name === 'AbortError') finalizeError(turn, '本次任务已停止。', {cancelled: true});
-            else finalizeError(turn, streamFailureMessage(turn, error));
-            announce(
-                responseStatus,
-                error?.name === 'AbortError'
-                    ? '请求已停止'
-                    : turn.effectError ? '请求失败，具体原因已保留'
-                        : Number.isInteger(error?.httpStatus) ? '请求未执行，请核对状态'
-                            : '连接中断，后续结果尚未确认',
-            );
+            if (!isCurrentActiveRequest(active)) return;
+            if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
+                finalizeError(turn, streamFailureMessage(turn, error));
+                announce(responseStatus, '请求未执行，请核对状态');
+            } else startActiveObservation(active);
         } finally {
-            if (activeRequest?.requestId === requestId) activeRequest = null;
-            setBusy(false);
-            resizePrompt();
-            refreshSessions({quiet: true});
+            if (activeRequest === active && !active.observing) {
+                activeRequest = null;
+                clearActiveObservation(active);
+                setBusy(false);
+                resizePrompt();
+                refreshSessions({quiet: true});
+            }
         }
     }
 
     async function stopActiveRequest() {
         const active = activeRequest;
-        if (!active) return;
-        stopButton.disabled = true;
+        if (!isCurrentActiveRequest(active) || active.protected || active.cancelAccepted || active.cancelPending) return;
+        active.cancelPending = true;
+        if (stopButton) stopButton.disabled = true;
+        announce(responseStatus, '正在请求停止当前任务');
         try {
-            await Promise.race([
-                fetchJSON('/api/agent/query/cancel', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({session_id: active.sessionId, request_id: active.requestId}),
-                }),
-                new Promise((resolve) => setTimeout(resolve, 1200)),
-            ]);
-        } catch (_) { /* stream abort remains authoritative for the browser */ }
-        active.controller.abort();
+            const payload = await fetchJSON('/api/agent/query/cancel', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({session_id: active.sessionId, request_id: active.requestId}),
+            });
+            if (!isCurrentActiveRequest(active)) return;
+            if (payload.cancelled === true) {
+                active.cancelAccepted = true;
+                active.cancelNotice = '';
+                prepareActiveStatus(active, '正在停止');
+                if (active.statusNode?.isConnected) active.statusNode.textContent = '正在停止';
+                setBusy(true, {stoppable: false});
+                announce(responseStatus, '停止请求已受理，正在等待任务收尾');
+            } else {
+                active.cancelNotice = '停止请求未被接受，仍在观察任务状态';
+                announce(responseStatus, active.cancelNotice);
+                setBusy(true, {stoppable: !active.protected});
+            }
+        } catch (_) {
+            if (!isCurrentActiveRequest(active)) return;
+            active.cancelNotice = '取消状态尚未确认，仍在观察任务状态';
+            announce(responseStatus, active.cancelNotice);
+            setBusy(true, {stoppable: !active.protected});
+        } finally {
+            active.cancelPending = false;
+            if (isCurrentActiveRequest(active)) {
+                if (active.observing) {
+                    if (active.cancelAccepted) {
+                        if (active.pollTimer) clearTimeout(active.pollTimer);
+                        active.pollTimer = null;
+                        active.observerController?.abort();
+                        observeActiveSession(active);
+                    }
+                } else startActiveObservation(active);
+                if (stopButton && !active.cancelAccepted && !active.protected) stopButton.disabled = false;
+            }
+        }
     }
 
     async function confirmEffect(button) {
@@ -1547,62 +1779,58 @@
         const planId = button.dataset.effectConfirm || '';
         if (!card || !planId) return;
         const turn = approvalTurnForCard(card);
-        if (!turn) return;
-        if (turn.completedPlanIds?.has(String(planId))) return;
-        const buttons = [...card.querySelectorAll('button')];
-        buttons.forEach((item) => { item.disabled = true; });
+        if (!turn || turn.completedPlanIds?.has(String(planId))) return;
+        card.querySelectorAll('button').forEach(item => { item.disabled = true; });
         turn.activePlanId = planId;
         continueTurnFromApproval(turn, card);
-        setBusy(true, {stoppable: true});
+        const targetSessionId = sessionId;
         const controller = new AbortController();
         const requestId = createId('confirm');
-        activeRequest = {controller, requestId, turn, sessionId};
+        const active = {
+            controller, requestId, turn, sessionId: targetSessionId,
+            sessionGeneration: sessionLoadGeneration, kind: 'confirm', pendingCard: card,
+            turnId: '', pollTimer: null, observerController: null, observing: false,
+            protected: false, cancelAccepted: false,
+        };
+        activeRequest = active;
+        setBusy(true, {stoppable: true});
         announce(responseStatus, 'Media Agent 正在执行已确认计划');
         try {
             const response = await fetch('/api/agent/actions/confirm', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    plan_id: planId,
-                    session_id: sessionId,
-                    request_id: requestId,
-                    stream: true,
-                }),
+                body: JSON.stringify({plan_id: planId, session_id: targetSessionId, request_id: requestId, stream: true}),
                 signal: controller.signal,
             });
-            const terminalEvent = await readEventStream(response, (event) => {
-                if (activeRequest?.requestId !== requestId) return;
+            if (!isCurrentActiveRequest(active)) return;
+            const terminalEvent = await readEventStream(response, event => {
+                if (!isCurrentActiveRequest(active)) return;
+                if (event.request_id && String(event.request_id) !== active.requestId) return;
+                active.turnId = active.turnId || String(event.turn_id || '');
+                if (active.cancelAccepted && isTerminalEvent(event)) return;
                 applyEvent(turn, event);
             });
-            if (!terminalEvent) {
-                finalizeError(turn, STREAM_INTERRUPTED_NOTICE);
-                announce(responseStatus, '连接中断，后续结果尚未确认');
+            if (!isCurrentActiveRequest(active)) return;
+            if (!terminalEvent || active.cancelAccepted) {
+                startActiveObservation(active);
                 return;
             }
             const status = String(terminalEvent.payload?.status || '').toLowerCase();
-            announce(
-                responseStatus,
-                status === 'approval_required'
-                    ? '等待下一项确认'
-                    : turn.failed ? (turn.cancelled ? '请求已停止' : '请求失败') : 'Media Agent 已完成',
-            );
+            announce(responseStatus, status === 'approval_required' ? '等待下一项确认'
+                : turn.failed ? (turn.cancelled ? '请求已停止' : '请求失败') : 'Media Agent 已完成');
         } catch (error) {
-            if (error?.name === 'AbortError') {
-                finalizeError(turn, '本次任务已停止。', {cancelled: true});
-                announce(responseStatus, '请求已停止');
-            } else {
+            if (!isCurrentActiveRequest(active)) return;
+            if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
                 finalizeError(turn, streamFailureMessage(turn, error));
-                announce(
-                    responseStatus,
-                    turn.effectError ? '执行失败，具体原因已保留'
-                        : Number.isInteger(error?.httpStatus) ? '执行未完成，请核对状态'
-                            : '连接中断，后续结果尚未确认',
-                );
-            }
+                announce(responseStatus, error.message || '执行未完成，请核对状态');
+            } else startActiveObservation(active);
         } finally {
-            if (activeRequest?.requestId === requestId) activeRequest = null;
-            setBusy(false);
-            refreshSessions({quiet: true});
+            if (activeRequest === active && !active.observing) {
+                activeRequest = null;
+                clearActiveObservation(active);
+                setBusy(false);
+                refreshSessions({quiet: true});
+            }
         }
     }
 
@@ -1833,61 +2061,171 @@
         }
     }
 
-    function renderRecoveredApproval(approval) {
-        if (!approval?.plan_id) return;
-        const view = appendMessage('assistant', {recovered: true});
+    function renderRecoveredApproval(approval, {scroll = true} = {}) {
+        if (!approval?.plan_id) return null;
+        const view = appendMessage('assistant', {recovered: true, scroll});
         const card = buildApproval(approval);
         view.body.append(card);
         const turn = approvalTurnForCard(card);
         turn.item = view.item;
+        return card;
+    }
+
+    function renderSessionSnapshot(payload, {active = null, terminalTurn = null, preserveScroll = false} = {}) {
+        const previousFollow = followOutput;
+        const previousScrollTop = transcript?.scrollTop || 0;
+        expireCandidateCards();
+        transcript?.replaceChildren();
+        const candidateGroups = new Map();
+        for (const message of payload.messages || []) {
+            if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true, scroll: !preserveScroll});
+            else if (message.role === 'assistant') {
+                if (message.candidate_result_ref === payload.candidate_view?.ref && payload.candidate_view?.last_result) continue;
+                const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
+                addRecoveredToolTrace(turn, message.tools, message.tool_labels);
+                finalizeAnswer(turn, String(message.content || ''));
+                if (message.candidate_view) {
+                    const group = renderCandidateView(turn, message.candidate_view);
+                    if (group) candidateGroups.set(String(message.candidate_view.ref || ''), group);
+                }
+            }
+        }
+
+        const candidateRef = String(payload.candidate_view?.ref || '');
+        const candidateGroup = candidateRef ? candidateGroups.get(candidateRef) : null;
+
+        let pendingCard = null;
+        if (payload.pending_approval) {
+            const data = payload.pending_approval.preview?.data;
+            if (candidateGroup && data?.source_type === 'resource_candidates') {
+                pendingCard = buildApproval(payload.pending_approval);
+                candidateGroup._candidateState.output.append(pendingCard);
+            } else pendingCard = renderRecoveredApproval(payload.pending_approval, {scroll: !preserveScroll});
+        }
+
+        if (active && isCurrentActiveRequest(active) && payload.active_turn && sameActiveTurn(payload.active_turn, active)) {
+            active.turnId = active.turnId || String(payload.active_turn.turn_id || '');
+            active.kernelGeneration = active.kernelGeneration ?? payload.active_turn.generation;
+            active.pendingCard = pendingCard;
+            active.candidateGroup = candidateGroup;
+            if (pendingCard) {
+                // 服务端仍返回pending_approval即尚未消费，不能伪装成已经确认。
+                active.kind = 'pending_approval';
+                active.turn = approvalTurnForCard(pendingCard);
+                active.turn.activePlanId = pendingCard.dataset.planId || '';
+                prepareActiveStatus(active, activeProgressText(payload.active_turn, active));
+                active.statusNode.dataset.agentActiveStatus = 'true';
+            } else if (candidateGroup) {
+                active.kind = 'candidate_preview';
+                active.statusNode = null;
+                prepareActiveStatus(active, activeProgressText(payload.active_turn, active));
+            } else {
+                active.kind = active.kind || 'query';
+                const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
+                turn.boundSelection = false;
+                turn.requestMessage = [...(payload.messages || [])].reverse().find(message => message.role === 'user')?.content || '';
+                active.turn = turn;
+                prepareActiveStatus(active, activeProgressText(payload.active_turn, active));
+            }
+            updateActiveProgress(active, payload.active_turn);
+        }
+
+        if (terminalTurn && terminalTurn.status !== 'completed') {
+            const existingAnswer = [...(payload.messages || [])].reverse().find(message => message.role === 'assistant')?.content;
+            const message = String(terminalTurn.message || (terminalTurn.status === 'cancelled'
+                ? '本次任务已停止。' : '任务未能完成，请核对会话状态。'));
+            if (!existingAnswer || String(existingAnswer).trim() !== message.trim()) {
+                const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
+                turn.boundSelection = active?.kind === 'candidate_preview';
+                turn.requestMessage = active?.turn?.requestMessage || '';
+                if (active?.kind === 'confirm') turn.activePlanId = active.turn?.activePlanId || '';
+                finalizeError(turn, message, {cancelled: terminalTurn.status === 'cancelled'});
+            }
+        }
+
+        expireCandidateCards(candidateGroup || null);
+        syncCandidateButtons();
+        followOutput = preserveScroll ? previousFollow : true;
+        if (followOutput) scrollToBottom(true);
+        else if (transcript) {
+            transcript.scrollTop = previousScrollTop;
+            if (newRepliesButton) newRepliesButton.hidden = false;
+        }
+        setConsoleEmpty(!transcript?.childElementCount);
+        return {candidateGroup, pendingCard};
     }
 
     async function loadSession(targetId, {closeHistory = true, startup = false, signal = null} = {}) {
-        if (busy || !SESSION_RE.test(targetId)) return false;
+        if (!SESSION_RE.test(targetId)) return false;
         if (!startup) stopInitialRestore();
-        const generation = ++sessionLoadGeneration;
-        try {
-            const payload = await fetchJSON(`/api/agent/sessions/${encodeURIComponent(targetId)}`, {signal});
-            if (!Array.isArray(payload?.messages)) throw new Error('会话内容响应无效');
-            if (generation !== sessionLoadGeneration) return;
+        const switching = targetId !== sessionId;
+        const restoreResumeFocus = switching && document.activeElement === resumeButton;
+        const previousSessionId = sessionId;
+        if (switching) {
             saveDraft();
+            ++sessionLoadGeneration;
+            invalidateActiveRequest();
             rememberSession(targetId);
             restoreDraft();
-            expireCandidateCards();
-            transcript?.replaceChildren();
-            const candidateGroups = new Map();
-            for (const message of payload.messages || []) {
-                if (message.role === 'user') appendUser(String(message.content || ''), {recovered: true});
-                else if (message.role === 'assistant') {
-                    if (message.candidate_result_ref === payload.candidate_view?.ref && payload.candidate_view?.last_result) continue;
-                    const turn = createAssistantTurn({recovered: true});
-                    addRecoveredToolTrace(turn, message.tools, message.tool_labels);
-                    finalizeAnswer(turn, String(message.content || ''));
-                    if (message.candidate_view) {
-                        const group = renderCandidateView(turn, message.candidate_view);
-                        if (group) {
-                            candidateGroups.set(String(message.candidate_view.ref || ''), group);
-                        }
-                    }
+            setBusy(true, {stoppable: false});
+        }
+        const active = !switching && activeRequest?.sessionId === targetId ? activeRequest : null;
+        const generation = active ? sessionLoadGeneration : ++sessionLoadGeneration;
+        try {
+            const payload = await fetchJSON(`/api/agent/sessions/${encodeURIComponent(targetId)}`, {signal});
+            if (payload?.session_id !== targetId || !Array.isArray(payload?.messages)) throw new Error('会话内容响应无效');
+            if (generation !== sessionLoadGeneration || (active && !isCurrentActiveRequest(active))) return false;
+            if (configureDraftScope(payload.draft_scope) || generation !== sessionLoadGeneration
+                || (active && !isCurrentActiveRequest(active))) return false;
+            if (active) {
+                const lastTurn = payload.last_turn;
+                if (sameActiveTurn(lastTurn, active)
+                    && TERMINAL_LAST_TURN_STATUSES.includes(String(lastTurn.status || ''))) {
+                    finishObservedTurn(active, payload, lastTurn);
+                } else if (payload.active_turn && sameActiveTurn(payload.active_turn, active)) {
+                    if (payload.active_turn.status === 'cancelling') active.cancellationObserved = true;
+                    updateActiveProgress(active, payload.active_turn);
                 }
+            } else {
+                const lastTurn = payload.last_turn;
+                const terminalTurn = lastTurn
+                    && TERMINAL_LAST_TURN_STATUSES.includes(String(lastTurn.status || ''))
+                    && lastTurn.status !== 'completed'
+                    && String(lastTurn.request_id || '').trim()
+                    && String(lastTurn.turn_id || '').trim()
+                    ? lastTurn : null;
+                const recovered = payload.active_turn ? {
+                    controller: new AbortController(),
+                    requestId: String(payload.active_turn.request_id || ''),
+                    turnId: String(payload.active_turn.turn_id || ''),
+                    kernelGeneration: payload.active_turn.generation,
+                    sessionId: targetId,
+                    sessionGeneration: generation,
+                    kind: '',
+                    protected: payload.active_turn.protected === true,
+                    cancelAccepted: payload.active_turn.status === 'cancelling',
+                    pollTimer: null,
+                    observerController: null,
+                    observing: true,
+                } : null;
+                if (recovered) activeRequest = recovered;
+                renderSessionSnapshot(payload, {active: recovered, terminalTurn: recovered ? null : terminalTurn});
+                if (recovered) scheduleActiveObservation(recovered);
+                else setBusy(false);
             }
-            const candidateRef = String(payload.candidate_view?.ref || '');
-            const candidateGroup = candidateRef ? candidateGroups.get(candidateRef) : null;
-            if (payload.pending_approval) {
-                const data = payload.pending_approval.preview?.data;
-                if (candidateGroup && data?.source_type === 'resource_candidates') candidateGroup._candidateState.output.append(buildApproval(payload.pending_approval));
-                else renderRecoveredApproval(payload.pending_approval);
-            }
-            expireCandidateCards(candidateGroup || null);
-            syncCandidateButtons();
-            followOutput = true;
-            scrollToBottom(true);
-            setConsoleEmpty(!transcript?.childElementCount);
+            if (restoreResumeFocus && resumeButton && !resumeButton.disabled) resumeButton.focus({preventScroll: true});
             if (closeHistory) closeHistoryRail();
             if (!startup) refreshSessions({quiet: true});
             return true;
         } catch (error) {
-            if (generation === sessionLoadGeneration) announce(sessionStatus, error?.message || '会话加载失败');
+            if (generation === sessionLoadGeneration) {
+                if (switching && sessionId === targetId) {
+                    rememberSession(previousSessionId);
+                    restoreDraft();
+                    setBusy(false);
+                }
+                announce(sessionStatus, error?.message || '会话加载失败');
+            }
             return false;
         }
     }
@@ -1908,10 +2246,11 @@
     }
 
     function startNewSession() {
-        if (busy) return;
         stopInitialRestore();
-        ++sessionLoadGeneration;
         saveDraft();
+        ++sessionLoadGeneration;
+        invalidateActiveRequest();
+        setBusy(false);
         expireCandidateCards();
         rememberSession(createId('session'));
         restoreDraft();
@@ -2134,20 +2473,29 @@
         if (button.disabled) return;
         const selection = {ref: state.view.selection_ref, positions: [...state.selected].sort((a, b) => a - b), target: state.target};
         const message = `预览候选 ${selection.positions.map(pos => `#${pos}`).join('、')}，下载目标：${approvalTargetLabel(selection.target)}。`;
+        const targetSessionId = sessionId;
         const requestId = createId('rq');
         const controller = new AbortController();
-        const turn = {boundSelection: true, failed: false};
-        activeRequest = {controller, requestId, turn, sessionId};
+        const active = {
+            controller, requestId, sessionId: targetSessionId,
+            sessionGeneration: sessionLoadGeneration, kind: 'candidate_preview',
+            turn: {boundSelection: true, failed: false}, candidateGroup: group,
+            turnId: '', pollTimer: null, observerController: null, observing: false,
+            protected: false, cancelAccepted: false,
+        };
+        activeRequest = active;
         group.dataset.previewing = 'true';
         setBusy(true, {stoppable: false});
         saveCandidateDraft(group);
-        // 保留候选和旧结果，不插入用户/助手气泡，也不卸载列表。
-        let approvalReceived = false;
         announce(responseStatus, '正在生成整批资源预览，尚未下载');
         try {
-            const response = await queryRequest(message, requestId, controller.signal, selection);
-            let terminal = false;
-            await readEventStream(response, event => {
+            const response = await queryRequest(message, requestId, controller.signal, selection, targetSessionId);
+            if (!isCurrentActiveRequest(active)) return;
+            const terminalEvent = await readEventStream(response, event => {
+                if (!isCurrentActiveRequest(active)) return;
+                if (event.request_id && String(event.request_id) !== active.requestId) return;
+                active.turnId = active.turnId || String(event.turn_id || '');
+                if (active.cancelAccepted && isTerminalEvent(event)) return;
                 const payload = event.payload || {};
                 if (event.type === 'turn.started') expireVisibleApprovals();
                 if (event.type === 'effect.approval_required' && payload.plan) {
@@ -2155,25 +2503,38 @@
                     const card = buildApproval({plan_id: plan.plan_id, effect: plan.effect, preview: plan.preview, confirmation: plan.confirmation, expires_at: plan.expires_at, result: payload.result});
                     card._candidateSelection = selection;
                     state.output.replaceChildren(card);
-                    approvalReceived = true;
-                    terminal = true;
+                    active.pendingCard = card;
                 } else if (event.type === 'turn.failed') {
-                    throw new Error(payload.message || '预检未完成，请重试。');
-                } else if (event.type === 'turn.completed') {
-                    terminal = true;
-                    if (payload.status !== 'approval_required') state.output.replaceChildren(element('p', 'agent-candidates-note', payload.answer || '未生成可执行计划，请检查目标与资源状态。'));
+                    const notice = element('p', 'agent-candidates-note agent-candidate-feedback', payload.message || '预检未完成，请重试。');
+                    if (active.pendingCard?.isConnected) {
+                        state.output.querySelector('.agent-candidate-feedback')?.remove();
+                        state.output.append(notice);
+                    } else state.output.replaceChildren(notice);
+                } else if (event.type === 'turn.cancelled') {
+                    state.output.replaceChildren(element('p', 'agent-candidates-note', '本次预检已停止。'));
+                } else if (event.type === 'turn.completed' && payload.status !== 'approval_required') {
+                    state.output.replaceChildren(element('p', 'agent-candidates-note', payload.answer || '未生成可执行计划，请检查目标与资源状态。'));
                 }
             });
-            if (!terminal) throw new Error('预检响应中断，未确认执行任何下载；可重新预检。');
+            if (!isCurrentActiveRequest(active)) return;
+            if (!terminalEvent || active.cancelAccepted) startActiveObservation(active);
+            else announce(responseStatus, terminalEvent.type === 'turn.cancelled' ? '请求已停止' : '预检已完成');
         } catch (error) {
-            const notice = element('p', 'agent-candidates-note agent-candidate-feedback', approvalReceived ? '预览已生成，但连接中断；可刷新核对当前计划后确认。' : error?.message || '预检未完成，请重试。');
-            state.output.querySelector('.agent-candidate-feedback')?.remove();
-            state.output.append(notice);
-            announce(responseStatus, approvalReceived ? '预览已生成，连接已中断' : '预检未完成');
+            if (!isCurrentActiveRequest(active)) return;
+            if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
+                const notice = element('p', 'agent-candidates-note agent-candidate-feedback', error.message || '预检未完成。');
+                state.output.querySelector('.agent-candidate-feedback')?.remove();
+                state.output.append(notice);
+                announce(responseStatus, '预检请求未执行，请核对状态');
+            } else startActiveObservation(active);
         } finally {
-            group.dataset.previewing = 'false';
-            if (activeRequest?.requestId === requestId) activeRequest = null;
-            setBusy(false); refreshSessions({quiet: true});
+            if (activeRequest === active && !active.observing) {
+                group.dataset.previewing = 'false';
+                activeRequest = null;
+                clearActiveObservation(active);
+                setBusy(false);
+                refreshSessions({quiet: true});
+            }
         }
     }
 
@@ -2255,7 +2616,22 @@
         if (followOutput && newRepliesButton) newRepliesButton.hidden = true;
     }, {passive: true});
     newRepliesButton?.addEventListener('click', () => scrollToBottom(true));
-    window.addEventListener('pagehide', saveDraft);
+    function handlePageHide() {
+        saveDraft();
+        ++sessionLoadGeneration;
+        invalidateActiveRequest();
+        startupController?.abort();
+        historyController?.abort();
+        if (candidateExpiryTimer !== null) clearTimeout(candidateExpiryTimer);
+        candidateExpiryTimer = null;
+    }
+
+    function handlePageShow(event) {
+        if (event.persisted) loadSession(sessionId, {closeHistory: false});
+    }
+
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('pageshow', handlePageShow);
     promptInput?.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
             event.preventDefault();

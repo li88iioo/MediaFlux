@@ -257,12 +257,12 @@ class AgentPageTests(InitializedWebTestCase):
         source = SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("const controller = new AbortController()", source)
-        self.assertIn(
-            "activeRequest = {controller, requestId, turn, sessionId}", source
-        )
-        self.assertIn("if (activeRequest?.requestId !== requestId) return", source)
+        self.assertIn("activeRequest = active", source)
+        self.assertIn("sessionId: targetSessionId", source)
+        self.assertIn("if (!isCurrentActiveRequest(active)) return", source)
+        self.assertIn("active.sessionGeneration === sessionLoadGeneration", source)
         self.assertIn("/api/agent/query/cancel", source)
-        self.assertIn("active.controller.abort()", source)
+        self.assertIn("active.controller?.abort()", source)
         self.assertIn("expireVisibleApprovals()", source)
         self.assertIn("body: JSON.stringify({", source)
         self.assertIn("plan_id: planId", source)
@@ -306,7 +306,7 @@ class AgentPageTests(InitializedWebTestCase):
         self.assertIn("historyButton?.setAttribute('aria-expanded', 'true')", source)
         self.assertIn("historyButton?.setAttribute('aria-expanded', 'false')", source)
         self.assertIn("historyController?.abort()", source)
-        self.assertIn("if (generation !== sessionLoadGeneration) return", source)
+        self.assertIn("generation !== sessionLoadGeneration", source)
         self.assertIn("--agent-viewport-height", source)
         self.assertIn(
             "window.visualViewport?.addEventListener('resize', syncViewportHeight",

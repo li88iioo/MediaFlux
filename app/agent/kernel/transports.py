@@ -9,8 +9,8 @@ import asyncio
 import re
 import secrets
 from collections.abc import AsyncIterator, Mapping
-from contextlib import suppress
-from dataclasses import dataclass, field, replace
+from contextlib import aclosing, suppress
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from .adapters import EventObserver, TurnView, consume_events, iter_ndjson
@@ -97,55 +97,41 @@ class WebKernelTransport:
         self.metrics = metrics or KernelMetrics()
 
     async def query(self, request: QueryEnvelope) -> AsyncIterator[bytes]:
-        agent_input = request.to_agent_input()
-        events = self.metrics.track(self.session.run(agent_input), channel="web")
-        async for chunk in iter_ndjson(events):
-            yield chunk
+        async with aclosing(self.session.run(replace(request, channel="web").to_agent_input())) as events:
+            async for chunk in iter_ndjson(self.metrics.track(events, channel="web")):
+                yield chunk
 
     async def query_view(self, request: QueryEnvelope) -> TurnView:
-        agent_input = request.to_agent_input()
-        return await consume_events(
-            self.metrics.track(self.session.run(agent_input), channel="web")
-        )
+        async with aclosing(self.session.run(replace(request, channel="web").to_agent_input())) as events:
+            return await consume_events(self.metrics.track(events, channel="web"))
 
     async def confirm(self, request: EffectEnvelope) -> AsyncIterator[bytes]:
-        normalized = request.normalized()
-        events = self.session.confirm(
-            owner=normalized.owner,
-            session_id=normalized.session_id,
-            plan_id=normalized.plan_id,
-            request_id=normalized.request_id,
-            channel=normalized.channel,
-        )
-        tracked = self.metrics.track(events, channel="web")
-        async for chunk in iter_ndjson(tracked):
-            yield chunk
+        events = self.session.confirm(**asdict(request.normalized()))
+        async with aclosing(events):
+            async for chunk in iter_ndjson(self.metrics.track(events, channel="web")):
+                yield chunk
 
     async def confirm_view(self, request: EffectEnvelope) -> TurnView:
-        normalized = request.normalized()
-        events = self.session.confirm(
-            owner=normalized.owner,
-            session_id=normalized.session_id,
-            plan_id=normalized.plan_id,
-            request_id=normalized.request_id,
-            channel=normalized.channel,
-        )
-        return await consume_events(self.metrics.track(events, channel="web"))
+        events = self.session.confirm(**asdict(request.normalized()))
+        async with aclosing(events):
+            return await consume_events(self.metrics.track(events, channel="web"))
 
-    async def cancel(self, *, owner: str, session_id: str) -> bool:
+    async def activity(self, *, owner: str, session_id: str) -> dict[str, Any] | None:
+        return await self.session.coordinator.describe(
+            owner=_owner(owner), session_id=_scope(session_id, "session_id"),
+        )
+
+    async def cancel(self, *, owner: str, session_id: str, request_id: str) -> bool:
         return await self.session.cancel(
             owner=_owner(owner),
             session_id=_scope(session_id, "session_id"),
+            request_id=_scope(request_id, "request_id"),
         )
 
     async def cancel_effect(self, request: EffectEnvelope) -> bool:
-        normalized = request.normalized()
-        return await self.session.cancel_effect(
-            owner=normalized.owner,
-            session_id=normalized.session_id,
-            plan_id=normalized.plan_id,
-            request_id=normalized.request_id,
-        )
+        arguments = asdict(request.normalized())
+        arguments.pop("channel")
+        return await self.session.cancel_effect(**arguments)
 
 
 class TelegramKernelTransport:
@@ -198,13 +184,7 @@ class TelegramKernelTransport:
         observe: EventObserver | None = None,
     ) -> TurnView:
         normalized = replace(request, channel="telegram").normalized()
-        events = self.session.confirm(
-            owner=normalized.owner,
-            session_id=normalized.session_id,
-            plan_id=normalized.plan_id,
-            request_id=normalized.request_id,
-            channel="telegram",
-        )
+        events = self.session.confirm(**asdict(normalized))
         return await consume_events(
             self.metrics.track(events, channel="telegram"),
             observe=observe,
@@ -217,13 +197,9 @@ class TelegramKernelTransport:
         )
 
     async def cancel_effect(self, request: EffectEnvelope) -> bool:
-        normalized = request.normalized()
-        return await self.session.cancel_effect(
-            owner=normalized.owner,
-            session_id=normalized.session_id,
-            plan_id=normalized.plan_id,
-            request_id=normalized.request_id,
-        )
+        arguments = asdict(request.normalized())
+        arguments.pop("channel")
+        return await self.session.cancel_effect(**arguments)
 
 
 def _owner(value: Any) -> str:

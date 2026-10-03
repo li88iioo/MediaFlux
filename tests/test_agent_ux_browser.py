@@ -1,6 +1,7 @@
 """Agent体验的真实浏览器回归：等待、草稿、稳定位置与安全候选交互。"""
 from __future__ import annotations
 
+import json
 import os
 import time
 import unittest
@@ -45,6 +46,34 @@ def candidate_view_variant(ref: str, selection_ref: str, *, recommended_position
     view['selection_ref'] = selection_ref
     view['recommended_positions'] = [] if recommended_positions is None else recommended_positions
     return view
+
+
+def session_snapshot(session_id: str, *, messages: list[dict] | None = None,
+                     active_turn: dict | None = None, last_turn: dict | None = None,
+                     pending_approval: dict | None = None, candidate: dict | None = None,
+                     generation: int = 1) -> dict:
+    return {
+        'session_id': session_id,
+        'generation': generation,
+        'messages': list(messages or []),
+        'pending_approval': pending_approval,
+        'candidate_view': candidate,
+        'active_turn': active_turn,
+        'last_turn': last_turn,
+        'draft_scope': SCOPE,
+    }
+
+
+def active_turn(request_id: str, turn_id: str, *, status: str = 'running',
+                protected: bool = False, detail: str = '后台仍在处理') -> dict:
+    return {
+        'request_id': request_id,
+        'turn_id': turn_id,
+        'generation': 1,
+        'protected': protected,
+        'status': status,
+        'detail': detail,
+    }
 
 
 @unittest.skipIf(harness.sync_playwright is None, '系统环境未安装 Playwright')
@@ -429,6 +458,89 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), 390)
         self.snapshot(page, 'candidates-mobile')
 
+    def test_running_preview_does_not_claim_pending_approval_was_confirmed(self):
+        payload = session_snapshot(SESSION_A)
+        payload.update(
+            messages=[{'role': 'user', 'content': '准备计划'}],
+            active_turn={'request_id': 'preview-request', 'turn_id': 'preview-turn', 'generation': 1,
+                         'protected': False, 'status': 'running', 'detail': '正在完成预览'},
+            pending_approval={'plan_id': 'plan_preview_not_confirmed_001', 'effect': 'WRITE',
+                              'preview': {'summary': '待确认操作'}, 'confirmation': {}},
+        )
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': []}, 'sessionDetails': {SESSION_A: payload}}, stored_session=SESSION_A)
+        page.locator('.agent-confirmation-card').wait_for()
+        self.assertIn('尚未执行', page.locator('.agent-confirmation-preflight').inner_text())
+        self.assertNotIn('已确认，正在等待', page.locator('.agent-confirmation-card').inner_text())
+        self.assertTrue(page.locator('[data-effect-confirm]').is_disabled())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
+
+    def test_running_restore_polls_without_rebuilding_nodes_or_resubmitting(self):
+        current = {
+            'request_id': 'active-request', 'turn_id': 'active-turn', 'generation': 2,
+            'protected': False, 'status': 'running', 'detail': '正在执行后台测试',
+        }
+        payload = session_snapshot(SESSION_A)
+        payload.update(generation=2, messages=[{'role': 'user', 'content': '原请求'}], active_turn=current)
+        page = self.page({'sessions': {'draft_scope': SCOPE, 'sessions': []}, 'sessionDetails': {SESSION_A: payload}}, stored_session=SESSION_A)
+        page.get_by_text('正在执行后台测试', exact=True).wait_for()
+        page.evaluate("window.__resumeNode = document.querySelector('.agent-message-assistant')")
+        page.locator('#agentPrompt').fill('保留未发送草稿')
+        before = page.locator('#agentComposer').bounding_box()
+        page.wait_for_timeout(3700)
+        self.assertTrue(page.evaluate("window.__resumeNode === document.querySelector('.agent-message-assistant')"))
+        self.assertLessEqual(abs(page.locator('#agentComposer').bounding_box()['y'] - before['y']), 0.5)
+        page.evaluate("""({id, turn}) => { window.__kernelConfig.sessionDetails[id] = {
+            generation: 2, messages: [{role: 'user', content: '原请求'}, {role: 'assistant', content: '恢复后仅一次完成'}],
+            active_turn: null, last_turn: {...turn, status: 'completed', message: '完成'},
+        }; }""", {'id': SESSION_A, 'turn': current})
+        page.get_by_text('恢复后仅一次完成', exact=True).wait_for(timeout=10000)
+        self.assertEqual(page.locator('.agent-message-assistant').count(), 1)
+        self.assertEqual(page.locator('#agentPrompt').input_value(), '保留未发送草稿')
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
+
+    def test_accepted_cancel_waits_for_verified_terminal_instead_of_aborting_ui(self):
+        current = {
+            'request_id': 'stop-request', 'turn_id': 'stop-turn', 'generation': 3,
+            'protected': False, 'status': 'running', 'detail': '正在查询',
+        }
+        payload = session_snapshot(SESSION_A)
+        payload.update(generation=3, messages=[{'role': 'user', 'content': '等待停止'}], active_turn=current)
+        page = self.page({'cancelPending': True, 'sessions': {'draft_scope': SCOPE, 'sessions': []}, 'sessionDetails': {SESSION_A: payload}}, stored_session=SESSION_A)
+        page.locator('#agentStop').wait_for(state='visible')
+        page.locator('#agentStop').click()
+        page.wait_for_timeout(2200)
+        self.assertNotIn('请求已停止', page.locator('#agentResponseStatus').inner_text())
+        self.assertIn('停止', page.locator('#agentResponseStatus').inner_text())
+        page.evaluate("""({id, turn}) => { window.__kernelConfig.sessionDetails[id] = {
+            generation: 3, messages: [{role: 'user', content: '等待停止'}], active_turn: null,
+            last_turn: {...turn, status: 'cancelled', message: '已核实取消'},
+        }; }""", {'id': SESSION_A, 'turn': current})
+        page.get_by_text('已核实取消', exact=True).wait_for(timeout=10000)
+        self.assertTrue(page.locator('#agentStop').is_hidden())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.url === '/api/agent/query/cancel').length"), 1)
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.url === '/api/agent/query').length"), 0)
+
+    def test_failed_terminal_turn_is_restored_after_refresh(self):
+        sessions = {'sessions': [{'session_id': SESSION_A, 'title': '失败任务历史'}], 'draft_scope': SCOPE}
+        initial = {'sessions': sessions, 'sessionDetails': {SESSION_A: session_snapshot(SESSION_A)}}
+        page = self.page(initial, stored_session=SESSION_A)
+        failed = session_snapshot(
+            SESSION_A,
+            messages=[{'role': 'user', 'content': '执行受控失败任务'}],
+            last_turn={
+                'request_id': 'rq-refresh-failed-0001',
+                'turn_id': 'turn-rq-refresh-failed-0001',
+                'status': 'failed',
+                'message': '受控任务失败，状态已同步。',
+            },
+        )
+        self.reload_ui(page, {'sessions': sessions, 'sessionDetails': {SESSION_A: failed}})
+        page.wait_for_function("() => document.querySelector('.agent-result-card.is-interrupted .agent-stream-text')?.textContent.includes('受控任务失败')")
+        self.assertEqual(page.locator('.agent-result-card.is-interrupted .agent-stream-text').count(), 1)
+        self.assertEqual(page.locator('#agentTranscript .agent-message-user').count(), 1)
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query').length"), 0)
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)
+
     def test_resume_nonempty_history_preserves_focused_resume_control(self):
         page = self.page({'sessions': {'sessions': [{'session_id': SESSION_A, 'title': '已保存的历史'}]},
                           'sessionDetails': {SESSION_A: {'messages': [{'role': 'assistant', 'content': '之前已经完成的排障记录。'}]}}})
@@ -533,7 +645,7 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.locator('.agent-narrative').wait_for()
         self.assertIn('后续核验完成', page.locator('.agent-narrative').inner_text())
 
-    def test_confirmation_stays_busy_while_persistent_job_stream_waits(self):
+    def test_confirmation_rejects_stop_while_protected_job_stream_waits(self):
         approval = {
             'plan_id': 'plan_ux_waiting_0001',
             'tool_name': 'download.pause',
@@ -573,14 +685,38 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertTrue(page.locator('#agentSend').is_hidden())
         self.assertEqual(page.locator('.agent-streaming').count(), 1)
 
+        page.evaluate("""() => {
+          const original = window.fetch;
+          window.fetch = async (url, options = {}) => {
+            const path = new URL(String(url), location.href).pathname;
+            if (path === '/api/agent/query/cancel') {
+              const request = JSON.parse(options.body || '{}');
+              window.__kernelCalls.push({url: path, method: 'POST', body: options.body || ''});
+              window.__kernelConfig.sessionDetails ||= {};
+              window.__kernelConfig.sessionDetails[request.session_id] = {
+                session_id: request.session_id, generation: 1, draft_scope: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                messages: [{role: 'user', content: '暂停任务并等待实际状态'}],
+                pending_approval: null, candidate_view: null, last_turn: null,
+                active_turn: {request_id: request.request_id, turn_id: `turn-${request.request_id}`, generation: 1,
+                  protected: true, status: 'running', detail: '安全排队中，等待实际状态回执'},
+              };
+              return new Response(JSON.stringify({cancelled: false}), {status: 200});
+            }
+            return original(url, options);
+          };
+        }""")
         page.locator('#agentStop').click()
-        page.locator('.agent-narrative').wait_for()
-        text = page.locator('.agent-narrative').inner_text()
-        self.assertIn('暂停任务已提交，等待实际状态', text)
-        self.assertIn('后续流程未完成', text)
-        self.assertIn('已停止等待；已提交操作可能继续执行，请核对任务状态', text)
+        page.wait_for_function("() => document.querySelector('#agentResponseStatus').textContent.includes('未被接受')")
+        page.wait_for_function("() => document.querySelector('#agentStop').hidden")
+        self.assertEqual(page.locator('.agent-streaming').count(), 1)
         self.assertEqual(page.locator('.agent-cancelled, .is-interrupted').count(), 0)
-        self.assertIn('/api/agent/query/cancel', [call['url'] for call in page.evaluate('window.__kernelCalls')])
+        calls = page.evaluate('window.__kernelCalls')
+        self.assertEqual(sum(call['url'] == '/api/agent/actions/confirm' for call in calls), 1)
+        self.assertEqual(sum(call['url'] == '/api/agent/query' for call in calls), 1)
+        cancel = next(call for call in calls if call['url'] == '/api/agent/query/cancel')
+        confirm = next(call for call in calls if call['url'] == '/api/agent/actions/confirm')
+        self.assertEqual(json.loads(cancel['body'])['session_id'], json.loads(confirm['body'])['session_id'])
+        self.assertEqual(json.loads(cancel['body'])['request_id'], json.loads(confirm['body'])['request_id'])
 
     def test_candidate_refresh_restores_choices_and_keeps_card_bound_to_search(self):
         view = candidate_view()
@@ -719,5 +855,6 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.wait_for_selector('.agent-candidate-feedback')
         self.assertTrue(page.locator('[data-effect-confirm]').is_enabled())
         self.assertTrue(page.locator('.agent-candidate-select').is_disabled())
-        self.assertIn('预览已生成', page.locator('.agent-candidate-feedback').inner_text())
+        self.assertIn('预检已完成', page.locator('.agent-confirmation-card').inner_text())
+        self.assertIn('连接中断', page.locator('.agent-candidate-feedback').inner_text())
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 0)

@@ -59,6 +59,108 @@ def _request_id(value: Any) -> str:
     return normalized
 
 
+_ACTIVE_PHASE_DETAILS = {
+    "turn.started": "正在启动本轮任务",
+    "capabilities.selected": "正在准备可用能力",
+    "model.started": "正在思考",
+    "model.delta": "正在整理回复",
+    "model.tool_call": "正在规划下一步",
+    "tool.started": "正在执行工具",
+    "tool.progress": "正在处理任务",
+    "tool.completed": "正在整理工具结果",
+    "tool.failed": "正在处理工具异常",
+    "effect.preview_started": "正在准备操作预览",
+    "effect.approval_required": "正在准备确认信息",
+    "effect.completed": "正在整理操作结果",
+    "effect.failed": "正在整理操作结果",
+    "turn.completed": "正在完成本轮任务",
+    "turn.failed": "正在结束本轮任务",
+    "turn.cancelled": "正在停止本轮任务",
+}
+_TERMINAL_TURNS = {
+    "turn.completed": ("completed", "本轮已完成"),
+    "turn.failed": ("failed", "本轮未能完成"),
+    "turn.cancelled": ("cancelled", "本轮已取消"),
+}
+_KNOWN_TURN_EVENTS = frozenset(_ACTIVE_PHASE_DETAILS)
+
+
+def _event_type(event: Any) -> str:
+    return str(event.get("type") or "") if isinstance(event, dict) else ""
+
+
+def _matches_turn(event: Any, turn: dict[str, Any]) -> bool:
+    return bool(
+        isinstance(event, dict)
+        and event.get("turn_id") == turn.get("turn_id")
+        and event.get("request_id") == turn.get("request_id")
+    )
+
+
+def _active_turn_view(
+    activity: Any, events: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    if not isinstance(activity, dict) or activity.get("status") not in {"running", "cancelling"}:
+        return None
+    turn = {
+        "request_id": activity.get("request_id", ""),
+        "turn_id": activity.get("turn_id", ""),
+        "generation": activity.get("generation"),
+        "protected": bool(activity.get("protected")),
+        "status": activity["status"],
+    }
+    latest_type = next(
+        (_event_type(event) for event in reversed(events) if _matches_turn(event, turn)),
+        "",
+    )
+    turn["detail"] = (
+        "正在停止本轮任务"
+        if turn["status"] == "cancelling"
+        else _ACTIVE_PHASE_DETAILS.get(latest_type, "正在处理本轮任务")
+    )
+    return turn
+
+
+def _last_turn_view(
+    events: list[dict[str, Any]], active_turn: dict[str, Any] | None
+) -> dict[str, str] | None:
+    if not events:
+        return None
+    event = events[-1]
+    if not isinstance(event, dict):
+        return None
+    event_type = _event_type(event)
+    request_id = event.get("request_id")
+    turn_id = event.get("turn_id")
+    if not isinstance(request_id, str) or not isinstance(turn_id, str):
+        return None
+    terminal = _TERMINAL_TURNS.get(event_type)
+    if terminal is not None:
+        status, message = terminal
+    elif event_type in _KNOWN_TURN_EVENTS:
+        if active_turn is not None and _matches_turn(event, active_turn):
+            return None
+        # 长回复的started事件可能已超出有界尾部；不能因此把未确认终态当完成。
+        status, message = "interrupted", "本轮执行状态未确认，请核对已保存的结果；不会自动重放。"
+    else:
+        return None
+    return {
+        "request_id": request_id,
+        "turn_id": turn_id,
+        "status": status,
+        "message": message,
+    }
+
+
+def _draft_scope(owner: str) -> str:
+    secret = str(get_web_secret() or "")
+    if not secret:
+        raise RuntimeError("draft scope secret unavailable")
+    return hmac.new(
+        secret.encode(), b"mediaflux-agent-draft:v1\0" + owner.encode(), hashlib.sha256,
+    ).hexdigest()
+
+
 def _owner(request: Request) -> str:
     """把已登录 Web principal 绑定到稳定 owner，而不是临时 CSRF 会话。"""
     del request  # 鉴权由每个入口的 require_api_login 统一完成。
@@ -197,15 +299,19 @@ async def cancel_query(request: Request, data: Annotated[Any, Body()] = None):
     ):
         return api_error("请求字段无效", 400)
     try:
+        request_id = _request_id(data.get("request_id"))
+        if not request_id:
+            raise TransportInputError("停止任务必须提供 request_id，不能通配取消当前会话")
         runtime = get_agent_kernel_runtime()
         cancelled = await runtime.web.cancel(
             owner=_owner(request),
             session_id=_session_id(data.get("session_id")),
+            request_id=request_id,
         )
         return api_response(
             {
                 "cancelled": cancelled,
-                "request_id": _request_id(data.get("request_id")),
+                "request_id": request_id,
             }
         )
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
@@ -295,13 +401,7 @@ async def list_sessions(request: Request):
     try:
         owner = _owner(request)
         sessions = await get_agent_kernel_runtime().store.list_sessions(owner=owner)
-        secret = str(get_web_secret() or "")
-        if not secret:
-            raise RuntimeError("draft scope secret unavailable")
-        draft_scope = hmac.new(
-            secret.encode(), b"mediaflux-agent-draft:v1\0" + owner.encode(),
-            hashlib.sha256,
-        ).hexdigest()
+        draft_scope = _draft_scope(owner)
         response = api_response({
             "sessions": sessions, "draft_scope": draft_scope,
             "scope": "recent_sessions",
@@ -339,16 +439,31 @@ async def get_session(request: Request, session_id: str):
     require_api_login(request)
     try:
         normalized = _session_id(session_id)
+        observed_request = _request_id(request.headers.get("X-Agent-Request-Id"))
         runtime = get_agent_kernel_runtime()
         owner = _owner(request)
+        activity_before = await runtime.web.activity(owner=owner, session_id=normalized)
+        # 终态事件在会话结果提交之后发布：先读事件再读状态，避免
+        # 空→活动→空的快速轮次返回“新完成事件 + 旧对话”。
+        events = await runtime.store.list_events(
+            owner=owner, session_id=normalized, limit=64,
+        )
         state = await runtime.store.load(owner=owner, session_id=normalized)
+        activity_after = await runtime.web.activity(owner=owner, session_id=normalized)
+        if activity_before != activity_after:
+            events = await runtime.store.list_events(
+                owner=owner, session_id=normalized, limit=64,
+            )
+            state = await runtime.store.load(owner=owner, session_id=normalized)
+
+        active_turn = _active_turn_view(activity_after, events)
         candidate_view = await current_candidate_view(
             state=state, store=runtime.store,
         )
         messages = public_conversation_messages(state.conversation, candidate_view=candidate_view)
         pending_approval = None
         pending_plan_id = state.pending_effect_plan_id
-        if pending_plan_id:
+        if pending_plan_id and not (active_turn and active_turn["protected"]):
             plan = await asyncio.to_thread(
                 runtime.lifecycle.effect_store.get_active_plan,
                 owner=owner,
@@ -358,15 +473,23 @@ async def get_session(request: Request, session_id: str):
             )
             if plan is not None:
                 pending_approval = plan.public_approval_dict()
-        return api_response(
+        response = api_response(
             {
                 "session_id": normalized,
+                "draft_scope": _draft_scope(owner),
                 "generation": state.generation,
                 "messages": messages,
                 "pending_approval": pending_approval,
                 "candidate_view": candidate_view,
+                "active_turn": active_turn,
+                "last_turn": _last_turn_view(
+                    [event for event in events if not observed_request or event.get("request_id") == observed_request],
+                    active_turn,
+                ),
             }
         )
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
     except Exception as exc:  # noqa: BLE001 - HTTP fault boundary
         return _error(exc)
 

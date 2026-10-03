@@ -1,7 +1,6 @@
 """真实确认结果在事件聚合、Telegram 和浏览器中的一致性。"""
 from __future__ import annotations
 
-import json
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +8,7 @@ from app.agent.kernel.adapters import TurnView, consume_events
 from app.agent.kernel.events import AgentEventType, EventFactory
 from app.agent.kernel.state import AgentInput
 from app.agent.models import ToolResult
+from app.agent.public_view import format_public_result
 from app.bot.agent_adapter import _render_turn
 from tests.test_agent_kernel_adapters import event_stream
 from tests import test_agent_kernel_browser as browser_tests
@@ -83,13 +83,35 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
                 'title': '确认结果测试', 'message_count': 2}]},
             'sessionDetails': {SESSION_ID: {'session_id': SESSION_ID, 'messages': [],
                 'pending_approval': approval}}, 'confirmEvents': events}, stored_session=SESSION_ID)
-        if malformed_tail:
-            page.evaluate("""text => {
+        interrupted = not http_error and not any(
+            event['type'] in {'turn.failed', 'turn.cancelled'} or (
+                event['type'] == 'turn.completed' and event.get('payload', {}).get('status')
+                in {'success', 'partial', 'approval_required', 'effect_completed'}
+            ) for event in events
+        )
+        if malformed_tail or interrupted:
+            receipts = [format_public_result(event['payload']['result']) for event in events
+                        if event['type'] in {'effect.completed', 'effect.failed'}
+                        and isinstance(event.get('payload', {}).get('result'), dict)
+                        and (event['payload']['result'].get('summary') or event['payload']['result'].get('error'))]
+            page.evaluate("""({events, tail, receipts, interrupted}) => {
                 const previous = window.fetch;
-                window.fetch = async (...args) => String(args[0]) === '/api/agent/actions/confirm'
-                    ? new Response(text, {status: 200, headers: {'Content-Type': 'application/x-ndjson'}})
-                    : previous(...args);
-            }""", ''.join(json.dumps(e, ensure_ascii=False) + '\n' for e in events) + malformed_tail)
+                window.fetch = async (...args) => {
+                    if (String(args[0]) !== '/api/agent/actions/confirm') return previous(...args);
+                    const request = JSON.parse(args[1].body);
+                    window.__kernelCalls.push({url: String(args[0]), method: 'POST', body: args[1].body});
+                    const normalized = events.map(event => ({...event,
+                        request_id: request.request_id, session_id: request.session_id}));
+                    if (interrupted) window.__kernelConfig.sessionDetails[request.session_id] = {
+                        messages: receipts.map(content => ({role: 'assistant', content})),
+                        active_turn: null, pending_approval: null,
+                        last_turn: {request_id: request.request_id, turn_id: normalized[0]?.turn_id,
+                            status: 'interrupted', message: '连接中断，后续结果尚未确认；可刷新会话核对状态，不要重复提交。'},
+                    };
+                    return new Response(normalized.map(event => JSON.stringify(event) + '\\n').join('') + tail,
+                        {status: 200, headers: {'Content-Type': 'application/x-ndjson'}});
+                };
+            }""", {'events': events, 'tail': malformed_tail, 'receipts': receipts, 'interrupted': interrupted})
         elif http_error:
             page.evaluate("""payload => {
                 const previous = window.fetch;
@@ -103,6 +125,10 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
         card = page.locator('.agent-confirmation-card')
         card.wait_for()
         card.locator('[data-effect-confirm]').click()
+        if interrupted:
+            page.get_by_text('连接中断，后续结果尚未确认；可刷新会话核对状态，不要重复提交。', exact=True).wait_for()
+            self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.url === '/api/agent/actions/confirm').length"), 1)
+            return page.locator('#agentTranscript')
         result = page.locator('.agent-result-card:not(.agent-streaming)')
         result.wait_for()
         return result
@@ -120,7 +146,7 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
                 self.assertIn('连接中断，后续结果尚未确认', text)
                 self.assertIn('可刷新会话核对', text)
                 self.assertIn('不要重复提交', text)
-                self.assertIn('is-interrupted', result.get_attribute('class'))
+                self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
 
     def test_failed_dto_survives_generic_turn_failure(self):
         result = self.confirm([_event(1, 'turn.started', {}),
@@ -129,7 +155,7 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
         self.assertIn(WARNING, result.inner_text())
         self.assertIn('光鸭云盘', result.inner_text())
         self.assertIn('提交结果未知', result.inner_text())
-        self.assertIn('is-interrupted', result.get_attribute('class'))
+        self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
 
     def test_isolated_effect_completion_preserves_receipt_but_reports_unknown_eof(self):
         result = self.confirm([_event(1, 'turn.started', {}), _event(2, 'effect.completed',
@@ -139,7 +165,7 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
         self.assertIn('连接中断，后续结果尚未确认', text)
         self.assertIn('不要重复提交', text)
         self.assertNotIn('通过写后校验', text)
-        self.assertNotIn('is-interrupted', result.get_attribute('class'))
+        self.assertNotIn('is-interrupted', result.locator('.agent-result-card').filter(has_text='任务已暂停').get_attribute('class'))
 
     def test_explicit_effect_completed_turn_terminal_renders_without_model_followup(self):
         cases = (
@@ -168,7 +194,7 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
     def test_turn_failure_without_effect_stays_failure(self):
         result = self.confirm([_event(1, 'turn.failed', {'message': '计划已失效，请重新预览'})])
         self.assertIn('计划已失效', result.inner_text())
-        self.assertIn('is-interrupted', result.get_attribute('class'))
+        self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
 
     def test_transport_error_after_trusted_effect_does_not_erase_business_result(self):
         for kind, payload in (('effect.completed', {'result': {'ok': True, 'summary': '任务已暂停'}}),
@@ -180,11 +206,11 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
                 if kind == 'effect.completed':
                     self.assertIn('任务已暂停', text)
                     self.assertIn('连接中断，后续结果尚未确认', text)
-                    self.assertNotIn('is-interrupted', result.get_attribute('class'))
+                    self.assertNotIn('is-interrupted', result.locator('.agent-result-card').filter(has_text='任务已暂停').get_attribute('class'))
                 else:
-                    self.assertIn(WARNING, text)
+                    self.assertIn(WARNING.replace('，', ','), text)
                     self.assertIn('提交结果未知', text)
-                    self.assertIn('is-interrupted', result.get_attribute('class'))
+                    self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
 
     def test_transport_error_before_terminal_reports_unknown_not_success(self):
         result = self.confirm([_event(1, 'turn.started', {})], malformed_tail='{invalid-json')
@@ -193,7 +219,7 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
         self.assertIn('可刷新会话核对状态', text)
         self.assertIn('不要重复提交', text)
         self.assertNotIn('✅', text)
-        self.assertIn('is-interrupted', result.get_attribute('class'))
+        self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
 
     def test_http_error_preserves_backend_reason_and_no_duplicate_submit_warning(self):
         for status, reason in ((400, '请求参数已失效，请重新核对计划'), (409, '计划已过期，请核对当前状态')):
@@ -206,4 +232,4 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
                 self.assertIn(reason, text)
                 self.assertIn('请核对状态，不要重复提交', text)
                 self.assertNotIn('Expected property name', text)
-                self.assertIn('is-interrupted', result.get_attribute('class'))
+                self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))

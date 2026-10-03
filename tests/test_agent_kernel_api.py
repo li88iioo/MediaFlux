@@ -26,6 +26,10 @@ class FakeWeb:
     def __init__(self):
         self.queries = []
         self.confirmations = []
+        self.activity_calls = []
+        self.activity_results = []
+        self.cancel_calls = []
+        self.cancel_result = True
 
     async def query(self, envelope):
         self.queries.append(envelope)
@@ -77,8 +81,16 @@ class FakeWeb:
         self.confirmations.append(envelope)
         yield b'{"type":"effect.completed"}\n'
 
-    async def cancel(self, *, owner, session_id):
-        return True
+    async def activity(self, *, owner, session_id):
+        self.activity_calls.append((owner, session_id))
+        if not self.activity_results:
+            return None
+        result = self.activity_results.pop(0)
+        return dict(result) if result is not None else None
+
+    async def cancel(self, *, owner, session_id, request_id=""):
+        self.cancel_calls.append((owner, session_id, request_id))
+        return self.cancel_result
 
     async def cancel_effect(self, envelope):
         return True
@@ -90,6 +102,10 @@ class FakeStore:
             generation=0, conversation=[], pending_effect_plan_id=""
         )
         self.events = []
+        self.event_calls = []
+
+    def add_event(self, *, owner, session_id, event):
+        self.events.append((owner, session_id, event))
 
     async def list_sessions(self, *, owner):
         return []
@@ -98,7 +114,12 @@ class FakeStore:
         return self.state
 
     async def list_events(self, *, owner, session_id, limit=200):
-        return list(self.events)[-limit:]
+        self.event_calls.append((owner, session_id, limit))
+        scoped = [
+            event for event_owner, event_session, event in self.events
+            if event_owner == owner and event_session == session_id
+        ]
+        return scoped[-limit:]
 
     async def reset_session(self, *, owner, session_id):
         return types.SimpleNamespace(generation=1)
@@ -215,6 +236,7 @@ class AgentKernelApiTests(unittest.TestCase):
             [item["type"] for item in events], ["turn.started", "turn.completed"]
         )
         self.assertEqual(events[-1]["payload"]["answer"], "完成")
+        self.assertEqual(self.web.queries[0].request_id, "request-1")
 
     def test_non_stream_query_and_confirm_return_canonical_turn_view(self):
         query = self.client.post(
@@ -227,6 +249,7 @@ class AgentKernelApiTests(unittest.TestCase):
         )
         self.assertEqual(query.status_code, 200, query.text)
         self.assertEqual(query.json()["answer"], "完成")
+        self.assertEqual(self.web.queries[-1].request_id, "")
         confirmed = self.client.post(
             "/api/agent/actions/confirm",
             json={
@@ -255,6 +278,16 @@ class AgentKernelApiTests(unittest.TestCase):
             json={"message": "x", "session_id": "bad session", "legacy": True},
         )
         self.assertEqual(response.status_code, 400)
+        invalid_request_id = self.client.post(
+            "/api/agent/query",
+            json={
+                "message": "x",
+                "session_id": "session_1234567890",
+                "request_id": "bad/request",
+                "stream": False,
+            },
+        )
+        self.assertEqual(invalid_request_id.status_code, 400)
         self.assertEqual(self.web.queries, [])
 
     def test_session_restore_reconstructs_matching_pending_approval(self):
@@ -302,6 +335,270 @@ class AgentKernelApiTests(unittest.TestCase):
                 "plan_id": "plan-restore-0001",
             }],
         )
+
+    def test_session_restore_includes_active_turn_with_safe_phase_detail(self):
+        from app.agent.kernel.events import AgentEventType
+
+        owner = "webk:v1:" + "a" * 64
+        session_id = "session_1234567890"
+        request_id = "request-active-1"
+        turn_id = "turn-active-1"
+        activity = {
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "generation": 3,
+            "protected": False,
+            "status": "running",
+        }
+        self.web.activity_results = [activity, activity]
+        self.runtime.store.add_event(
+            owner=owner,
+            session_id=session_id,
+            event={"type": AgentEventType.TURN_STARTED.value, "request_id": request_id, "turn_id": turn_id},
+        )
+        self.runtime.store.add_event(
+            owner=owner,
+            session_id=session_id,
+            event={
+                "type": AgentEventType.TOOL_STARTED.value,
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "payload": {"tool": "private.tool", "arguments": {"token": "private-argument"}},
+            },
+        )
+
+        response = self.client.get(f"/api/agent/sessions/{session_id}")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(
+            payload["active_turn"],
+            {**activity, "detail": "正在执行工具"},
+        )
+        self.assertIsNone(payload["last_turn"])
+        self.assertNotIn("private.tool", response.text)
+        self.assertNotIn("private-argument", response.text)
+        self.assertEqual(self.web.activity_calls, [(owner, session_id)] * 2)
+        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 64)])
+
+    def test_session_restore_reloads_persisted_state_when_turn_finishes_during_read(self):
+        owner = "webk:v1:" + "a" * 64
+        session_id = "session_1234567890"
+        request_id = "request-race-1"
+        turn_id = "turn-race-1"
+        activity = {
+            "request_id": request_id,
+            "turn_id": turn_id,
+            "generation": 7,
+            "protected": False,
+            "status": "running",
+        }
+        self.web.activity_results = [activity, None]
+        old_state = types.SimpleNamespace(
+            generation=7,
+            conversation=[{"role": "user", "content": "旧状态"}],
+            pending_effect_plan_id="",
+        )
+        completed_state = types.SimpleNamespace(
+            generation=8,
+            conversation=[
+                {"role": "user", "content": "新问题"},
+                {"role": "assistant", "content": "持久化完成结果"},
+            ],
+            pending_effect_plan_id="",
+        )
+        self.runtime.store.load = AsyncMock(side_effect=[old_state, completed_state])
+        self.runtime.store.add_event(
+            owner=owner,
+            session_id=session_id,
+            event={
+                "type": "turn.completed",
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "payload": {"answer": "private event body must not be copied"},
+            },
+        )
+
+        response = self.client.get(f"/api/agent/sessions/{session_id}")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        self.assertEqual(payload["generation"], 8)
+        self.assertEqual(payload["messages"][-1]["content"], "持久化完成结果")
+        self.assertIsNone(payload["active_turn"])
+        self.assertEqual(
+            payload["last_turn"],
+            {
+                "request_id": request_id,
+                "turn_id": turn_id,
+                "status": "completed",
+                "message": "本轮已完成",
+            },
+        )
+        self.assertNotIn("private event body", response.text)
+        self.assertEqual(self.runtime.store.load.await_count, 2)
+        self.assertEqual(self.runtime.store.event_calls, [(owner, session_id, 64)] * 2)
+
+    def test_session_snapshot_is_uncached_and_draft_scope_matches_list(self):
+        history = self.client.get("/api/agent/sessions")
+        current = self.client.get("/api/agent/sessions/session_1234567890")
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(current.json()["draft_scope"], history.json()["draft_scope"])
+        self.assertEqual(current.headers["cache-control"], "private, no-store")
+
+    def test_evicted_turn_start_does_not_hide_an_unconfirmed_terminal_state(self):
+        self.runtime.store.add_event(owner="webk:v1:" + "a" * 64, session_id="session_1234567890", event={
+            "type": "model.delta", "turn_id": "old-turn", "request_id": "old-request",
+            "payload": {"delta": "incomplete"},
+        })
+        response = self.client.get("/api/agent/sessions/session_1234567890")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["last_turn"]["status"], "interrupted")
+
+    def test_observation_targets_its_request_even_if_old_cancellation_arrives_late(self):
+        session_id = "session_1234567890"
+        for event in (
+            {"type": "turn.completed", "request_id": "current", "turn_id": "current-turn"},
+            {"type": "turn.cancelled", "request_id": "previous", "turn_id": "old-turn"},
+        ):
+            self.runtime.store.add_event(owner="webk:v1:" + "a" * 64, session_id=session_id, event=event)
+        response = self.client.get(f"/api/agent/sessions/{session_id}", headers={"X-Agent-Request-Id": "current"})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["last_turn"]["request_id"], "current")
+        self.assertEqual(response.json()["last_turn"]["status"], "completed")
+
+    def test_fast_completed_turn_between_two_idle_activity_samples_returns_new_result(self):
+        session_id = "session_1234567890"
+        self.runtime.store.state = types.SimpleNamespace(
+            generation=1, conversation=[{"role": "assistant", "content": "旧结果"}], pending_effect_plan_id="",
+        )
+        async def completed_events(**kwargs):
+            self.runtime.store.state = types.SimpleNamespace(
+                generation=2, conversation=[{"role": "assistant", "content": "新结果"}], pending_effect_plan_id="",
+            )
+            return [{"type": "turn.completed", "request_id": "new-request", "turn_id": "new-turn", "payload": {"answer": "新结果"}}]
+        self.runtime.store.list_events = AsyncMock(side_effect=completed_events)
+        response = self.client.get(f"/api/agent/sessions/{session_id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["generation"], 2)
+        self.assertEqual(response.json()["messages"][-1]["content"], "新结果")
+        self.assertEqual(response.json()["last_turn"]["request_id"], "new-request")
+
+    def test_last_turn_projects_failed_cancelled_and_stale_interrupted_events(self):
+        owner = "webk:v1:" + "a" * 64
+        session_id = "session_1234567890"
+        for event_type, status, message in (
+            ("turn.failed", "failed", "本轮未能完成"),
+            ("turn.cancelled", "cancelled", "本轮已取消"),
+            ("tool.progress", "interrupted", "本轮执行状态未确认，请核对已保存的结果；不会自动重放。"),
+        ):
+            with self.subTest(event_type=event_type):
+                self.runtime.store.events.clear()
+                if event_type == "tool.progress":
+                    self.runtime.store.add_event(
+                        owner=owner,
+                        session_id=session_id,
+                        event={
+                            "type": "turn.started",
+                            "request_id": f"request-{event_type}",
+                            "turn_id": f"turn-{event_type}",
+                        },
+                    )
+                self.runtime.store.add_event(
+                    owner=owner,
+                    session_id=session_id,
+                    event={
+                        "type": event_type,
+                        "request_id": f"request-{event_type}",
+                        "turn_id": f"turn-{event_type}",
+                        "payload": {"message": "untrusted internal detail"},
+                    },
+                )
+
+                response = self.client.get(f"/api/agent/sessions/{session_id}")
+
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(
+                    response.json()["last_turn"],
+                    {
+                        "request_id": f"request-{event_type}",
+                        "turn_id": f"turn-{event_type}",
+                        "status": status,
+                        "message": message,
+                    },
+                )
+                self.assertNotIn("untrusted internal detail", response.text)
+
+    def test_last_turn_events_are_scoped_to_authenticated_owner(self):
+        session_id = "session_1234567890"
+        self.runtime.store.add_event(
+            owner="another-owner",
+            session_id=session_id,
+            event={
+                "type": "turn.failed",
+                "request_id": "private-request",
+                "turn_id": "private-turn",
+            },
+        )
+
+        with patch.object(agent_kernel_api, "_owner", return_value="owner-a"):
+            response = self.client.get(f"/api/agent/sessions/{session_id}")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json()["last_turn"])
+        self.assertNotIn("private-request", response.text)
+        self.assertEqual(
+            self.runtime.store.event_calls,
+            [("owner-a", session_id, 64)],
+        )
+
+    def test_protected_active_turn_does_not_restore_old_confirmation_card(self):
+        session_id = "session_1234567890"
+        activity = {
+            "request_id": "request-protected-1",
+            "turn_id": "turn-protected-1",
+            "generation": 4,
+            "protected": True,
+            "status": "running",
+        }
+        self.web.activity_results = [activity, activity]
+        self.runtime.store.state = types.SimpleNamespace(
+            generation=4,
+            conversation=[{"role": "user", "content": "执行已确认操作"}],
+            pending_effect_plan_id="plan-protected-0001",
+        )
+        self.lifecycle.effect_store.plan = FakeApprovalPlan({"plan_id": "plan-protected-0001"})
+
+        response = self.client.get(f"/api/agent/sessions/{session_id}")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["active_turn"]["protected"], True)
+        self.assertIsNone(response.json()["pending_approval"])
+        self.assertEqual(self.lifecycle.effect_store.calls, [])
+        self.assertTrue(self.lifecycle.effect_store.active)
+        self.assertEqual(self.lifecycle.effect_store.plan.payload["plan_id"], "plan-protected-0001")
+
+    def test_cancel_query_requires_exact_request_id_and_never_wildcard_stops(self):
+        owner = "webk:v1:" + "a" * 64
+        session_id = "session_1234567890"
+        cancelled = self.client.post(
+            "/api/agent/query/cancel",
+            json={"session_id": session_id, "request_id": "request-old-tab"},
+        )
+        self.assertEqual(cancelled.status_code, 200, cancelled.text)
+        self.assertEqual(cancelled.json()["request_id"], "request-old-tab")
+        self.assertEqual(self.web.cancel_calls[-1], (owner, session_id, "request-old-tab"))
+
+        legacy = self.client.post("/api/agent/query/cancel", json={"session_id": session_id})
+        self.assertEqual(legacy.status_code, 400, legacy.text)
+        self.assertEqual(len(self.web.cancel_calls), 1)
+
+        invalid = self.client.post(
+            "/api/agent/query/cancel",
+            json={"session_id": session_id, "request_id": "bad/request"},
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(len(self.web.cancel_calls), 1)
 
     def test_pipeline_snapshots_the_exact_projected_public_result(self):
         from app.agent.confirmation import ConfirmationStore

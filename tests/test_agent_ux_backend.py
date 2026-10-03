@@ -78,7 +78,7 @@ def api(store, monkeypatch):
         request.session.update(logged_in=True, csrf_token="ux-csrf")
         return {"ok": True}
 
-    runtime = SimpleNamespace(store=store)
+    runtime = SimpleNamespace(store=store, web=SimpleNamespace(activity=AsyncMock(return_value=None)))
     principal = {"username": "ux-account-a"}
     monkeypatch.setattr(agent_api.config, "web_credentials", lambda: (principal["username"], "unused"))
     monkeypatch.setattr(agent_api, "get_agent_kernel_runtime", lambda: runtime)
@@ -554,6 +554,9 @@ def test_get_session_restores_only_valid_current_candidates_and_query_accepts_se
     response = api.client.get(f"/api/agent/sessions/{SESSION}")
     assert response.status_code == 200 and response.json()["candidate_view"] == view
     class Web:
+        async def activity(self, *, owner, session_id):
+            return None
+
         async def query(self, envelope, *, cancellation=None):
             assert envelope.to_agent_input().metadata["selection"] == _selection(view)
             yield b'{"type":"turn.completed"}\n'

@@ -326,11 +326,13 @@ class InMemorySessionStateStore:
 
 
 class CancellationToken:
-    __slots__ = ("_event", "_reason")
+    __slots__ = ("_event", "_reason", "_task_cancel_requested", "interruptible")
 
     def __init__(self) -> None:
         self._event = threading.Event()
         self._reason = ""
+        self._task_cancel_requested = False
+        self.interruptible = False
 
     @property
     def cancelled(self) -> bool:
@@ -340,9 +342,12 @@ class CancellationToken:
     def reason(self) -> str:
         return self._reason or "cancelled"
 
-    def cancel(self, reason: str = "cancelled") -> None:
+    def cancel(self, reason: str = "cancelled", task: asyncio.Task[Any] | None = None) -> None:
         self._reason = str(reason or "cancelled")[:200]
         self._event.set()
+        if self.interruptible and task is not None and not task.done() and not self._task_cancel_requested:
+            self._task_cancel_requested = True  # 重复取消不能打断状态/回执收尾。
+            task.get_loop().call_soon_threadsafe(task.cancel)
 
     async def wait(self) -> None:
         while not self._event.is_set():
@@ -358,13 +363,14 @@ class TurnCoordinator:
 
     def __init__(self) -> None:
         self._lock = CrossLoopAsyncLock()
-        self._active: dict[tuple[str, str], tuple[str, CancellationToken, bool]] = {}
+        self._active: dict[tuple[str, str], tuple[PublicationLease, CancellationToken, bool, asyncio.Task[Any] | None]] = {}
 
     async def begin(
         self,
         lease: PublicationLease,
         *,
         protected: bool = False,
+        task: asyncio.Task[Any] | None = None,
     ) -> CancellationToken:
         key = (lease.owner, lease.session_id)
         token = CancellationToken()
@@ -373,48 +379,56 @@ class TurnCoordinator:
             if previous is not None:
                 if previous[2]:
                     raise SessionBusyError("confirmed effect is executing")
-                previous[1].cancel("superseded")
-            self._active[key] = (lease.turn_id, token, bool(protected))
+                previous[1].cancel("superseded", previous[3])
+            self._active[key] = (lease, token, bool(protected), task)
         return token
 
     async def cancel(
-        self, *, owner: str, session_id: str, reason: str = "cancelled"
+        self, *, owner: str, session_id: str, reason: str = "cancelled", request_id: str = ""
     ) -> bool:
         async with self._lock:
             current = self._active.get((owner, session_id))
-            if current is None or current[2]:
+            if current is None or current[2] or (
+                request_id and current[0].request_id != request_id
+            ):
                 return False
-            current[1].cancel(reason)
+            current[1].cancel(reason, current[3])
             return True
+
+    def _owned_turn(self, lease: PublicationLease, token: CancellationToken):
+        current = self._active.get((lease.owner, lease.session_id))
+        return current if current and current[0].turn_id == lease.turn_id and current[1] is token else None
 
     async def unprotect(self, lease: PublicationLease, token: CancellationToken) -> None:
         """真实写入与回执持久化后，后续规划恢复为可停止的普通回合。"""
         async with self._lock:
-            key = (lease.owner, lease.session_id)
-            current = self._active.get(key)
-            if current and current[0] == lease.turn_id and current[1] is token:
-                self._active[key] = (lease.turn_id, token, False)
+            if current := self._owned_turn(lease, token):
+                self._active[(lease.owner, lease.session_id)] = (lease, token, False, current[3])
+
+    async def describe(self, *, owner: str, session_id: str) -> dict[str, Any] | None:
+        """只读观察现有轮次；不取得发布权或启动执行。"""
+        async with self._lock:
+            current = self._active.get((owner, session_id))
+            if current is None:
+                return None
+            return {
+                "request_id": current[0].request_id,
+                "turn_id": current[0].turn_id,
+                "generation": current[0].generation,
+                "protected": current[2],
+                "status": "cancelling" if current[1].cancelled else "running",
+            }
 
     async def has_protected_turn(self, *, owner: str, session_id: str) -> bool:
         async with self._lock:
             current = self._active.get((owner, session_id))
             return bool(current and current[2])
 
-    async def is_current(
-        self, lease: PublicationLease, token: CancellationToken
-    ) -> bool:
+    async def is_current(self, lease: PublicationLease, token: CancellationToken) -> bool:
         async with self._lock:
-            current = self._active.get((lease.owner, lease.session_id))
-            return bool(
-                current
-                and current[0] == lease.turn_id
-                and current[1] is token
-                and not token.cancelled
-            )
+            return bool(self._owned_turn(lease, token) and not token.cancelled)
 
     async def finish(self, lease: PublicationLease, token: CancellationToken) -> None:
-        key = (lease.owner, lease.session_id)
         async with self._lock:
-            current = self._active.get(key)
-            if current and current[0] == lease.turn_id and current[1] is token:
-                self._active.pop(key, None)
+            if self._owned_turn(lease, token):
+                self._active.pop((lease.owner, lease.session_id), None)

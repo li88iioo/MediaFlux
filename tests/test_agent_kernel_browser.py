@@ -115,8 +115,31 @@ MOCK_FETCH = r"""
     status,
     headers: {'Content-Type': 'application/json'},
   });
+  const sessionList = () => {
+    const value = window.__kernelConfig.sessions || {sessions: []};
+    return {...value, draft_scope: value.draft_scope || 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'};
+  };
+  const sessionSnapshot = (id, value = {}) => ({
+    session_id: id,
+    generation: 1,
+    messages: [],
+    pending_approval: null,
+    candidate_view: null,
+    active_turn: null,
+    last_turn: null,
+    draft_scope: sessionList().draft_scope,
+    ...value,
+  });
 
   const streamResponse = (events, options, delayMs = 0, holdOpen = false) => {
+    const request = JSON.parse(String(options.body || '{}'));
+    const streamTurnId = `turn-${request.request_id || 'fixture'}`;
+    events = events.map(event => ({
+      ...event,
+      session_id: request.session_id || event.session_id,
+      request_id: request.request_id || event.request_id,
+      turn_id: streamTurnId,
+    }));
     const encoder = new TextEncoder();
     let timer = null;
     let streamController = null;
@@ -160,7 +183,7 @@ MOCK_FETCH = r"""
       if (window.__kernelConfig.nextActionsDelayMs) await new Promise(resolve => setTimeout(resolve, window.__kernelConfig.nextActionsDelayMs));
       return jsonResponse(window.__kernelConfig.nextActions || {actions: [], snapshot_status: 'idle'}, window.__kernelConfig.nextActionsStatus || 200);
     }
-    if (path === '/api/agent/sessions') return jsonResponse(window.__kernelConfig.sessions || {sessions: []});
+    if (path === '/api/agent/sessions') return jsonResponse(sessionList());
     if (path.startsWith('/api/agent/sessions/') && options.method === 'PATCH') {
       const id = decodeURIComponent(path.split('/').pop());
       const item = (window.__kernelConfig.sessions?.sessions || []).find(item => item.session_id === id);
@@ -171,11 +194,18 @@ MOCK_FETCH = r"""
     }
     if (path.startsWith('/api/agent/sessions/') && (options.method || 'GET') === 'GET') {
       const id = decodeURIComponent(path.split('/').pop());
-      return jsonResponse((window.__kernelConfig.sessionDetails || {})[id] || {error: '会话不存在'},
-        (window.__kernelConfig.sessionDetails || {})[id] ? 200 : 404);
+      const details = (window.__kernelConfig.sessionDetails || {})[id];
+      if (details) return jsonResponse(sessionSnapshot(id, details));
+      if (window.__kernelConfig.sessionSnapshotFallback) return jsonResponse(sessionSnapshot(id));
+      return jsonResponse({error: '会话不存在'}, 404);
     }
     if (path.startsWith('/api/agent/sessions/') && options.method === 'DELETE') return jsonResponse({deleted: true});
     if (path === '/api/agent/query') {
+      const request = JSON.parse(String(options.body || '{}'));
+      if (request.session_id && request.message) {
+        window.__kernelConfig.lastQueryBySession ||= {};
+        window.__kernelConfig.lastQueryBySession[request.session_id] = request.message;
+      }
       return streamResponse(
         window.__kernelConfig.queryEvents || [],
         options,
@@ -183,7 +213,27 @@ MOCK_FETCH = r"""
         Boolean(window.__kernelConfig.holdQueryOpen),
       );
     }
-    if (path === '/api/agent/query/cancel') return jsonResponse({cancelled: true});
+    if (path === '/api/agent/query/cancel') {
+      const request = JSON.parse(String(options.body || '{}'));
+      const result = window.__kernelConfig.cancelResponse || {cancelled: true};
+      if (result.cancelled === true && request.session_id && request.request_id && !window.__kernelConfig.cancelPending) {
+        window.__kernelConfig.sessionDetails ||= {};
+        const snapshot = sessionSnapshot(request.session_id, window.__kernelConfig.sessionDetails[request.session_id] || {});
+        const turnId = snapshot.active_turn?.turn_id || `turn-${request.request_id}`;
+        if (!snapshot.messages.length && window.__kernelConfig.lastQueryBySession?.[request.session_id]) {
+          snapshot.messages = [{role: 'user', content: window.__kernelConfig.lastQueryBySession[request.session_id]}];
+        }
+        snapshot.active_turn = null;
+        snapshot.last_turn = {
+          request_id: request.request_id,
+          turn_id: turnId,
+          status: 'cancelled',
+          message: '本次任务已停止。',
+        };
+        window.__kernelConfig.sessionDetails[request.session_id] = snapshot;
+      }
+      return jsonResponse(result);
+    }
     if (path === '/api/agent/actions/confirm') {
       return streamResponse(
         window.__kernelConfig.confirmEvents || [],
@@ -603,6 +653,7 @@ Season 1 / S01E01
         }
         page = self.make_page({
             "sessions": {"sessions": []},
+            "sessionSnapshotFallback": True,
             "queryEvents": [
                 _event(1, "turn.started", {"kind": "query"}),
                 _event(2, "effect.approval_required", {
@@ -623,17 +674,19 @@ Season 1 / S01E01
         page.locator(".agent-confirmation-card").wait_for()
         page.locator("[data-effect-confirm]").click()
 
-        narrative = page.locator(".agent-result-card.has-narrative")
-        narrative.wait_for()
-        text = narrative.inner_text()
-        self.assertIn("暂停任务已提交", text)
-        self.assertIn("连接中断，后续结果尚未确认", text)
-        self.assertIn("可刷新会话核对", text)
-        self.assertIn("不要重复提交", text)
+        page.wait_for_function(
+            "() => document.querySelector('#agentResponseStatus').textContent.includes('任务状态未确认')"
+        )
+        transcript = page.locator("#agentTranscript")
+        self.assertIn("暂停任务已提交", transcript.text_content())
+        self.assertIn("不会自动重试", page.locator("#agentResponseStatus").inner_text())
         self.assertTrue(page.locator("#agentStop").is_hidden())
         self.assertFalse(page.locator("#agentSend").is_hidden())
         self.assertEqual(page.locator(".agent-streaming").count(), 0)
-        self.assertEqual(page.locator(".agent-cancelled, .is-interrupted").count(), 0)
+        self.assertEqual(page.locator(".agent-cancelled").count(), 0)
+        calls = page.evaluate("window.__kernelCalls")
+        self.assertEqual(sum(call["url"] == "/api/agent/query" for call in calls), 1)
+        self.assertEqual(sum(call["url"] == "/api/agent/actions/confirm" for call in calls), 1)
 
     def test_confirm_stream_continues_after_effect_completion_until_partial_turn(self):
         approval = {

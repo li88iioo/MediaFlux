@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator
@@ -157,3 +158,97 @@ class TelegramCancellationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.status, "cancelled")
         self.assertIn(AgentEventType.TURN_STARTED, observed)
         self.assertIn(AgentEventType.TURN_CANCELLED, observed)
+
+
+class WebDetachedTurnTests(unittest.IsolatedAsyncioTestCase):
+    async def wait_idle(self, session):
+        async def wait():
+            while await session.coordinator.describe(owner="owner", session_id="session") or session._detached_tasks:
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(wait(), 2)
+
+    def paused_session(self):
+        entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls = []
+        class PausedModel:
+            async def stream(self, request, *, cancellation):
+                calls.append(request)
+                entered.set()
+                try:
+                    await release.wait()
+                    yield ModelEvent(ModelEventType.TEXT_DELTA, text="离开页面后仍完成")
+                    yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+        session = make_session()
+        session.model = PausedModel()
+        return session, entered, release, cancelled, calls
+
+    async def test_web_disconnect_completes_once_and_can_be_observed_without_resubmitting(self):
+        session, entered, release, cancelled, calls = self.paused_session()
+        web = WebKernelTransport(session)
+        stream = web.query(QueryEnvelope(owner="owner", session_id="session", request_id="request", message="测试后台继续"))
+        self.assertEqual(json.loads(await anext(stream))["type"], "turn.started")
+        await asyncio.wait_for(entered.wait(), 1)
+        await stream.aclose()
+        for _ in range(3):
+            activity = await web.activity(owner="owner", session_id="session")
+            self.assertEqual(activity["request_id"], "request")
+            self.assertEqual(activity["status"], "running")
+            self.assertFalse(activity["protected"])
+        self.assertIsNone(await web.activity(owner="other", session_id="session"))
+        self.assertFalse(cancelled.is_set())
+        self.assertTrue(session._detached_tasks)
+        release.set()
+        await self.wait_idle(session)
+        state = await session.state_store.load(owner="owner", session_id="session")
+        self.assertEqual(state.conversation[-1]["content"], "离开页面后仍完成")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(sum(row["role"] == "user" for row in state.conversation), 1)
+
+    async def test_explicit_stop_interrupts_wait_for_first_token_and_matches_request(self):
+        session, entered, release, cancelled, calls = self.paused_session()
+        web = WebKernelTransport(session)
+        stream = web.query(QueryEnvelope(owner="owner", session_id="session", request_id="current", message="等待回复"))
+        await anext(stream)
+        await asyncio.wait_for(entered.wait(), 1)
+        await stream.aclose()
+        self.assertFalse(await web.cancel(owner="owner", session_id="session", request_id="old"))
+        self.assertFalse(await web.cancel(owner="other", session_id="session", request_id="current"))
+        self.assertTrue(await web.cancel(owner="owner", session_id="session", request_id="current"))
+        self.assertTrue(await web.cancel(owner="owner", session_id="session", request_id="current"))
+        await asyncio.wait_for(cancelled.wait(), 1)
+        await self.wait_idle(session)
+        self.assertFalse(release.is_set())
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(await web.cancel(owner="owner", session_id="session", request_id="current"))
+
+    async def test_non_web_consumer_close_keeps_original_cancellation_semantics(self):
+        from app.agent.kernel.state import AgentInput
+        session, entered, release, cancelled, calls = self.paused_session()
+        stream = session.run(AgentInput(owner="owner", session_id="session", message="原API取消", channel="api"))
+        await anext(stream)
+        await asyncio.wait_for(entered.wait(), 1)
+        await stream.aclose()
+        await asyncio.wait_for(cancelled.wait(), 1)
+        await self.wait_idle(session)
+        self.assertFalse(session._detached_tasks)
+
+    async def test_web_new_turn_still_blocks_old_turn_late_publication(self):
+        session, entered, release, cancelled, calls = self.paused_session()
+        web = WebKernelTransport(session)
+        stream = web.query(QueryEnvelope(owner="owner", session_id="session", request_id="first", message="第一条"))
+        await anext(stream)
+        await asyncio.wait_for(entered.wait(), 1)
+        await stream.aclose()
+        session.model = ReadThenAnswerModel()
+        events = [json.loads(chunk) async for chunk in web.query(QueryEnvelope(owner="owner", session_id="session", request_id="second", message="媒体库有多少集"))]
+        self.assertEqual(events[-1]["payload"]["answer"], "媒体库共有 37 集")
+        await asyncio.wait_for(cancelled.wait(), 1)
+        self.assertFalse(release.is_set())  # 顶替必须主动中断旧模型等待。
+        release.set()
+        await self.wait_idle(session)
+        state = await session.state_store.load(owner="owner", session_id="session")
+        self.assertEqual(state.conversation[-1]["content"], "媒体库共有 37 集")
+        self.assertNotIn("离开页面后仍完成", str(state.conversation))

@@ -7,7 +7,7 @@ import json
 import logging
 import secrets
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from contextlib import ExitStack
+from contextlib import ExitStack, aclosing, suppress
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -200,16 +200,18 @@ class AgentSession:
         # 只串行化极短的“取得 generation + 注册 active turn + 保存安全输入”窗口；
         # 已确认写操作一旦开始就不会被后续聊天抢占。
         self._start_lock = CrossLoopAsyncLock()
-        # 已确认写操作脱离客户端流后仍必须持有强引用直到可信终态。
-        # 普通聊天仍遵循“消费者断开即取消”，两者不能共享取消语义。
+        # Web轮次及已确认操作脱离观察者后仍持有强引用直到可信终态。
+        # 其它入口的普通轮次继续遵循各自的消费者取消约定。
         self._detached_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self, agent_input: AgentInput) -> AsyncIterator[AgentEvent]:
-        """运行一轮并实时产生事实事件；消费者断开时取消当前回合。"""
-        async for event in self._run_background(
-            lambda queue: self._drive(agent_input, queue)
-        ):
-            yield event
+        """Web轮次独立于页面存活，其它入口维持原消费者取消约定。"""
+        async with aclosing(self._run_background(
+            lambda queue: self._drive(agent_input, queue),
+            cancel_on_consumer_close=agent_input.channel != "web",
+        )) as events:
+            async for event in events:
+                yield event
 
     async def confirm(
         self,
@@ -220,21 +222,23 @@ class AgentSession:
         request_id: str = "",
         channel: str = "api",
     ) -> AsyncIterator[AgentEvent]:
-        async for event in self._run_background(
+        async with aclosing(self._run_background(
             lambda queue: self._drive(
                 AgentInput(message="继续已确认任务", owner=owner, session_id=session_id,
                            request_id=request_id, channel=channel),
                 queue, plan_id=str(plan_id or "").strip(),
             ),
             cancel_on_consumer_close=False,
-        ):
-            yield event
+        )) as events:
+            async for event in events:
+                yield event
 
-    async def cancel(self, *, owner: str, session_id: str) -> bool:
+    async def cancel(self, *, owner: str, session_id: str, request_id: str = "") -> bool:
         return await self.coordinator.cancel(
             owner=str(owner or "").strip(),
             session_id=str(session_id or "").strip(),
             reason="user_cancelled",
+            request_id=str(request_id or "").strip(),
         )
 
     async def cancel_effect(
@@ -296,23 +300,22 @@ class AgentSession:
                     break
                 yield item
         finally:
-            if task.done() or producer_finished:
-                try:
+            if task.done() or producer_finished or cancel_on_consumer_close:
+                if not producer_finished and not task.done():
+                    task.cancel()
+                with suppress(asyncio.CancelledError):
                     await task
-                except asyncio.CancelledError:
-                    pass
-            elif cancel_on_consumer_close:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
             else:
-                # 用户已经确认的副作用不能由刷新、断网或关闭标签页撤销。
-                # 生产者继续完成审计、状态提交和领域后置生命周期；队列会在
-                # 任务结束后与任务一同释放，不再依赖已断开的流消费者。
-                self._detached_tasks.add(task)
-                task.add_done_callback(self._detached_task_finished)
+                # 页面离开只取消观察。继续消费事件避免断流后内存队列积压，
+                # 真实结果仍由同一producer写入会话与事件日志。
+                async def drain_to_completion() -> None:
+                    while await queue.get() is not None:
+                        pass
+                    await task
+
+                observer = asyncio.create_task(drain_to_completion())
+                self._detached_tasks.add(observer)
+                observer.add_done_callback(self._detached_task_finished)
 
     def _detached_task_finished(self, task: asyncio.Task[None]) -> None:
         self._detached_tasks.discard(task)
@@ -321,7 +324,7 @@ class AgentSession:
         error = task.exception()
         if error is not None:
             logger.error(
-                "Agent detached confirmation failed type=%s",
+                "Agent detached turn failed type=%s",
                 type(error).__name__,
                 exc_info=(type(error), error, error.__traceback__),
             )
@@ -536,7 +539,7 @@ class AgentSession:
                     state = await self.state_store.load(owner=agent_input.owner, session_id=agent_input.session_id)
                     lease = PublicationLease(agent_input.owner, agent_input.session_id, state.generation,
                                              secrets.token_urlsafe(12), agent_input.request_id)
-                    token = await self.coordinator.begin(lease, protected=True)
+                    token = await self.coordinator.begin(lease, protected=True, task=asyncio.current_task())
                 messages = self._restore_messages(state)
                 last_user = next((row for row in reversed(state.conversation) if row.get("role") == "user"), None)
                 if last_user:
@@ -563,7 +566,7 @@ class AgentSession:
                             request_id=agent_input.request_id,
                             **begin_options,
                         )
-                        token = await self.coordinator.begin(lease)
+                        token = await self.coordinator.begin(lease, task=asyncio.current_task())
                         messages = self._restore_messages(state)
                         current_user_index = len(messages)
                         messages.append(ModelMessage(role="user", content=contextual_message))
@@ -870,6 +873,7 @@ class AgentSession:
                     round_index=round_index,
                     require_complete_answer=True,
                 )
+                token.interruptible = True
                 try:
                     async for model_event in self.model.stream(request, cancellation=token):
                         token.raise_if_cancelled()
@@ -917,6 +921,8 @@ class AgentSession:
                         raise
                     answer_recovery = True
                     continue
+                finally:
+                    token.interruptible = False  # 工具阶段协作停止，保留已完成的批量结果。
 
                 if not finish_reason:
                     raise ModelProviderError("Provider 回复未完整结束：缺少模型回合结束事件")
