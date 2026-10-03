@@ -282,6 +282,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
                 "tests.test_guangya_directory_scrape_ui",
                 "tests.test_media_profile_in_place_ui",
                 "tests.test_navigation_discovery_ui",
+                "tests.test_discovery_search_ui",
                 "tests.test_window_viewport_inset",
             },
         )

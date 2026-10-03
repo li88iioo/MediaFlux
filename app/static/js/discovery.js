@@ -18,6 +18,8 @@
     const INDEXER_DOWNLOAD_BATCH_PATH = '/api/indexers/download/batch';
     const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit';
     const RESOURCE_SELECTION_LIMIT = 50;
+    const COMBINED_RESOURCE_SITE_FILTER = '__combined_btbtla_1lou__';
+    const COMBINED_RESOURCE_SITE_IDS = new Set(['btbtla', '1lou']);
     const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);
     const RESOURCE_MANUAL_REVIEW_MESSAGE = '请核对下载列表/目标状态，必要时重新检索后人工处理';
     const DOWNLOAD_REQUEST_STATUS_LABELS = {
@@ -1563,6 +1565,14 @@
         return String(result?.site_id || result?.site_name || '');
     }
 
+    function isCombinedResourceSite(siteId) {
+        return COMBINED_RESOURCE_SITE_IDS.has(String(siteId || '').trim().toLowerCase());
+    }
+
+    function isCombinedResourceResult(result) {
+        return isCombinedResourceSite(result?.site_id);
+    }
+
     function resourceKnownNumber(value) {
         if (value === null || value === undefined || value === '') return null;
         const number = Number(value);
@@ -1620,9 +1630,11 @@
 
     function visibleResourceResults() {
         const results = [...state.resourceResults.values()];
-        const filtered = state.activeResourceSiteId
-            ? results.filter((result) => resourceSiteKey(result) === state.activeResourceSiteId)
-            : results;
+        const filtered = !state.activeResourceSiteId
+            ? results
+            : state.activeResourceSiteId === COMBINED_RESOURCE_SITE_FILTER
+                ? results.filter(isCombinedResourceResult)
+                : results.filter((result) => resourceSiteKey(result) === state.activeResourceSiteId);
         return sortedResourceResults(filtered);
     }
 
@@ -2029,6 +2041,10 @@
         return [...state.resourceResults.values()].filter((result) => resourceSiteKey(result) === siteId).length;
     }
 
+    function combinedResourceResultCount() {
+        return [...state.resourceResults.values()].filter(isCombinedResourceResult).length;
+    }
+
     function mergeResourceSiteStatuses(statuses, siteId = '') {
         if (!siteId) return asArray(statuses).map((status) => ({...status}));
         const merged = new Map(state.resourceSiteStatuses.map((status) => [String(status.site_id || ''), {...status}]));
@@ -2043,11 +2059,13 @@
     }
 
     function resourceSiteStatuses(statuses) {
+        const siteStatuses = asArray(statuses);
         const region = configureResourceSiteTrack(node('div', 'discovery-resource-sites'));
         const {frame, details, hint} = resourceSiteStatusFrame(region, '选择源站筛选资源；失败站点可单独重试');
         const detailMessages = new Map();
         const syncVisibleMessage = () => {
-            const activeChip = region.querySelector('.discovery-resource-site-status.has-detail:focus')
+            const focusedDetail = [...detailMessages].find(([, message]) => message.contains(document.activeElement));
+            const activeChip = focusedDetail?.[0] || region.querySelector('.discovery-resource-site-status.has-detail:focus')
                 || region.querySelector('.discovery-resource-site-status.has-detail.is-hovered')
                 || region.querySelector('.discovery-resource-site-status.has-detail[aria-pressed="true"]');
             let hasVisible = false;
@@ -2059,6 +2077,8 @@
             details.classList.toggle('is-visible', hasVisible);
             hint.hidden = true;
         };
+        details.addEventListener('focusin', syncVisibleMessage);
+        details.addEventListener('focusout', () => window.requestAnimationFrame(syncVisibleMessage));
         const createFilterButton = (siteId, label, accessibleLabel, status = 'success') => {
             const button = node('button', `discovery-resource-site-status is-${status} is-filter`);
             button.type = 'button';
@@ -2073,20 +2093,93 @@
             });
             return button;
         };
+        const attachDetailEvents = (chip) => {
+            chip.addEventListener('focus', syncVisibleMessage);
+            chip.addEventListener('blur', () => window.requestAnimationFrame(syncVisibleMessage));
+            chip.addEventListener('mouseenter', () => {
+                chip.classList.add('is-hovered');
+                syncVisibleMessage();
+            });
+            chip.addEventListener('mouseleave', () => {
+                chip.classList.remove('is-hovered');
+                syncVisibleMessage();
+            });
+        };
+        const attachDetails = (chip, entries) => {
+            if (!entries.length) return;
+            chip.classList.add('has-detail');
+            const status = entries.some((entry) => entry.status === 'error') ? 'error'
+                : entries.some((entry) => entry.status === 'fallback') ? 'fallback' : 'empty';
+            const message = node('div', `discovery-resource-site-message is-${status}`);
+            message.append(node('span', '', entries.map(({site, status}) =>
+                `${site.site_name || '未知站点'}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`
+            ).join('；')));
+            entries.forEach(({site, siteId, status}) => {
+                if (status !== 'error' || site.retryable === false || !siteId) return;
+                const retry = node('button', 'jump-btn discovery-resource-site-retry', `重试 ${site.site_name || siteId}`);
+                retry.type = 'button';
+                retry.setAttribute('data-resource-site-retry', siteId);
+                retry.setAttribute('aria-label', `重新检索 ${site.site_name || siteId}`);
+                retry.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    retry.disabled = true;
+                    retry.setAttribute('aria-busy', 'true');
+                    retryResourceSite(siteId).catch(() => {});
+                });
+                message.append(retry);
+            });
+            detailMessages.set(chip, message);
+            details.append(message);
+            attachDetailEvents(chip);
+        };
+        const labels = {success: '检索成功', fallback: '已补位', empty: '暂无结果', error: '检索失败', disabled: '未启用'};
+        const normalizedStatus = (site) => Object.prototype.hasOwnProperty.call(labels, site.status) ? site.status : 'error';
+        const statusFilterId = (site) => {
+            const status = normalizedStatus(site);
+            if (status === 'fallback' && site.fallback_site_id) return String(site.fallback_site_id);
+            return String(site.site_id || site.id || '');
+        };
+        const combinedStatuses = siteStatuses.filter((site) => isCombinedResourceSite(statusFilterId(site)));
+        const combinedCount = combinedResourceResultCount();
+        const combinedDescription = combinedStatuses.map((site) => {
+            const status = normalizedStatus(site);
+            const siteName = site.site_name || site.site_id || site.id || '未知站点';
+            return `${siteName}：${labels[status]}`
+                + (site.message ? `，${site.message}` : '')
+                + resourceSiteDiagnostic(site);
+        }).join('；');
+        const combinedStatus = combinedStatuses.some((site) => normalizedStatus(site) === 'error') ? 'error'
+            : combinedStatuses.some((site) => normalizedStatus(site) === 'fallback') ? 'fallback'
+                : combinedCount ? 'success' : 'empty';
+        const combinedLabel = `显示 BTBtla 与 1lou 的资源，共 ${combinedCount} 条`
+            + (combinedDescription ? `；${combinedDescription}` : '');
+        const combinedFilter = combinedStatuses.length || combinedCount
+            ? createFilterButton(COMBINED_RESOURCE_SITE_FILTER, `综合 ${combinedCount}`, combinedLabel, combinedStatus)
+            : null;
         const allButton = createFilterButton('', `全部 ${state.resourceResults.size}`, `显示全部 ${state.resourceResults.size} 条资源`);
         region.append(allButton);
-        const labels = {success: '检索成功', fallback: '已补位', empty: '暂无结果', error: '检索失败', disabled: '未启用'};
-        asArray(statuses).forEach((site) => {
-            const status = Object.prototype.hasOwnProperty.call(labels, site.status) ? site.status : 'error';
+        if (combinedFilter) {
+            combinedFilter.title = combinedLabel;
+            attachDetails(combinedFilter, combinedStatuses.map((site) => ({
+                site, siteId: String(site.site_id || site.id || ''), status: normalizedStatus(site),
+            })).filter(({status}) => ['error', 'empty', 'fallback'].includes(status)));
+            region.append(combinedFilter);
+        }
+
+        siteStatuses.forEach((site) => {
+            const status = normalizedStatus(site);
             const siteId = String(site.site_id || site.id || site.site_name || '');
             const filterSiteId = status === 'fallback' && site.fallback_site_id
                 ? String(site.fallback_site_id)
                 : siteId;
+            const isCombinedSite = isCombinedResourceSite(filterSiteId);
             const statusLabel = labels[status];
             const count = resourceSiteResultCount(filterSiteId);
             const accessibleLabel = `${site.site_name || '未知站点'}：${statusLabel}`
                 + (site.message ? `，${site.message}` : '')
                 + resourceSiteDiagnostic(site);
+            if (isCombinedSite) return;
+
             let chip;
             if (status !== 'disabled' && filterSiteId) {
                 const suffix = status === 'error' ? '失败' : status === 'empty' ? '0' : String(count);
@@ -2105,44 +2198,13 @@
                 chip.setAttribute('aria-label', accessibleLabel);
             }
             chip.title = accessibleLabel;
-            if (status === 'error' || status === 'empty' || status === 'fallback') {
-                chip.classList.add('has-detail');
-                const message = node('div', `discovery-resource-site-message is-${status}`);
-                const messageCopy = node(
-                    'span',
-                    '',
-                    `${site.site_name || '未知站点'}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`,
-                );
-                message.append(messageCopy);
-                if (status === 'error' && site.retryable !== false && siteId) {
-                    const retry = node('button', 'jump-btn discovery-resource-site-retry', `重试 ${site.site_name || siteId}`);
-                    retry.type = 'button';
-                    retry.setAttribute('data-resource-site-retry', siteId);
-                    retry.setAttribute('aria-label', `重新检索 ${site.site_name || siteId}`);
-                    retry.addEventListener('click', (event) => {
-                        event.stopPropagation();
-                        retry.disabled = true;
-                        retry.setAttribute('aria-busy', 'true');
-                        retryResourceSite(siteId).catch(() => {});
-                    });
-                    message.append(retry);
-                }
-                detailMessages.set(chip, message);
-                details.append(message);
-                chip.addEventListener('focus', syncVisibleMessage);
-                chip.addEventListener('blur', syncVisibleMessage);
-                chip.addEventListener('mouseenter', () => {
-                    chip.classList.add('is-hovered');
-                    syncVisibleMessage();
-                });
-                chip.addEventListener('mouseleave', () => {
-                    chip.classList.remove('is-hovered');
-                    syncVisibleMessage();
-                });
+            if (['error', 'empty', 'fallback'].includes(status)) {
+                attachDetails(chip, [{site, siteId, status}]);
             }
             if (site.message) chip.append(node('span', 'sr-only', site.message));
             region.append(chip);
         });
+
         syncResourceSiteFilterControls();
         syncVisibleMessage();
         return frame;
@@ -2566,6 +2628,7 @@
 
     function activeResourceSiteName() {
         if (!state.activeResourceSiteId) return '全部';
+        if (state.activeResourceSiteId === COMBINED_RESOURCE_SITE_FILTER) return '综合';
         const site = state.resourceSiteStatuses.find((status) => {
             const siteId = String(status.site_id || status.id || status.site_name || '');
             const fallbackId = String(status.fallback_site_id || '');

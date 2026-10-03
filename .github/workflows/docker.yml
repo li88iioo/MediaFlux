@@ -127,6 +127,7 @@ jobs:
               "tests.test_release_formats_browser",
               "tests.test_media_profile_in_place_ui",
               "tests.test_navigation_discovery_ui",
+              "tests.test_discovery_search_ui",
               "tests.test_window_viewport_inset",
           )
           suite = unittest.defaultTestLoader.loadTestsFromNames(modules)
