@@ -39,11 +39,22 @@
 
     function renderIcons(root) {
         if (!window.lucide) return;
-        window.lucide.createIcons({
-            attrs: {'stroke-width': 1.8, 'aria-hidden': 'true'},
-            nameAttr: 'data-lucide',
-            root: root || document,
-        });
+        // 内置 Lucide 的 createIcons 不支持 root，且会重建已有 SVG；这里只转换局部占位符。
+        const scope = root || document;
+        const placeholders = [...scope.querySelectorAll('i[data-lucide]')];
+        if (scope.matches?.('i[data-lucide]')) placeholders.unshift(scope);
+        for (const placeholder of placeholders) {
+            const name = placeholder.getAttribute('data-lucide');
+            const key = name.replace(/(\w)(\w*)(_|-|\s*)/g, (_, first, rest) => first.toUpperCase() + rest.toLowerCase());
+            const definition = window.lucide.icons[key];
+            if (!definition) continue;
+            const icon = window.lucide.createElement(definition);
+            icon.setAttribute('stroke-width', '1.8');
+            icon.setAttribute('aria-hidden', 'true');
+            for (const attr of placeholder.attributes) icon.setAttribute(attr.name, attr.value);
+            icon.classList.add('lucide', `lucide-${name}`);
+            placeholder.replaceWith(icon);
+        }
     }
 
     function initializeHelpTooltips() {
