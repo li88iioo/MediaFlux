@@ -5726,8 +5726,12 @@ class SecurityTests(InitializedWebTestCase):
         script = (root / "static" / "js" / "app.js").read_text(encoding="utf-8")
         template = (root / "templates" / "base.html").read_text(encoding="utf-8")
 
-        self.assertIn('class="card app-confirm-dialog" role="alertdialog"', template)
-        self.assertIn('class="card app-message-dialog" role="alertdialog"', template)
+        for kind, name in (("confirm", "Confirm"), ("message", "Message")):
+            self.assertIn(
+                f'<dialog class="app-modal app-{kind}-modal" id="app{name}Modal" '
+                'role="alertdialog" aria-modal="true"', template,
+            )
+            self.assertIn(f'<div class="card app-{kind}-dialog">', template)
         self.assertIn(".app-confirm-dialog,\n.app-message-dialog {", stylesheet)
         self.assertIn("width: min(460px, 100%);", stylesheet)
         self.assertIn("grid-template-columns: 48px minmax(0, 1fr);", stylesheet)
