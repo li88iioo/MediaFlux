@@ -124,7 +124,6 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
     errors = {error.site_id: error for error in result.errors}
     site_queries = getattr(result, "site_queries", {}) or {}
     site_attempt_counts = getattr(result, "site_attempt_counts", {}) or {}
-    site_fallbacks = getattr(result, "site_fallbacks", {}) or {}
     visible_counts = getattr(result, "site_visible_counts", {}) or {}
     page_states = getattr(result, "site_page_states", {}) or {}
     attempted = set(result.sites_attempted)
@@ -135,15 +134,10 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
     payload = []
     for site_id in service.registry.ids():
         adapter = service.registry.get(site_id)
-        fallback_site_id = str(site_fallbacks.get(site_id) or "")
         code = None
         retryable = False
         if site_id not in enabled_site_ids:
             status, message = "disabled", ""
-        elif fallback_site_id:
-            status, message = "fallback", f"原站点不可用，已由 {fallback_site_id.upper()} 补位"
-            if site_id in errors:
-                code, _safe_message, retryable = _safe_site_error(errors[site_id])
         elif site_id in errors:
             status = "error"
             code, message, retryable = _safe_site_error(errors[site_id])
@@ -166,7 +160,6 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
             "retryable": retryable,
             "query": str(site_queries.get(site_id) or ""),
             "attempts": max(0, int(site_attempt_counts.get(site_id, 0) or 0)),
-            "fallback_site_id": fallback_site_id,
             "pagination_supported": bool(
                 page_state.pagination_supported if page_state is not None else adapter.capabilities.pagination_supported
             ),

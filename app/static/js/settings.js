@@ -35,8 +35,8 @@
             field.addEventListener('change',gate.invalidate);
         });
     }
-    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','1lou','tpb','sukebei'];
-    const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','1lou','tpb'];
+    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','tpb','sukebei'];
+    const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','tpb'];
     const indexerSiteBox=form.querySelector('[data-indexer-site-box]');
     const indexerSiteField=indexerSiteBox?.querySelector('[data-key="INDEXER_ENABLED_SITES"]');
     const indexerSiteInputs=[...(indexerSiteBox?.querySelectorAll('[data-indexer-site]')||[])];
@@ -69,8 +69,9 @@
         if(!indexerSiteField)return;
         const selected=new Set(indexerSiteField.value.split(','));
         indexerSiteInputs.forEach(input=>{
-            if(input.indeterminate)return; // 旧配置只启用一站时，未操作该组不能扩大授权范围。
-            input.dataset.indexerSite.split(',').forEach(site=>input.checked?selected.add(site):selected.delete(site));
+            const site=input.dataset.indexerSite;
+            if(input.checked)selected.add(site);
+            else selected.delete(site);
         });
         indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
     }
@@ -88,9 +89,7 @@
         if(['1','true','yes','on'].includes(String(config.INDEXER_SUKEBEI_ENABLED||'').toLowerCase()))selected.add('sukebei');
         if(indexerSiteField)indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
         indexerSiteInputs.forEach(input=>{
-            const members=input.dataset.indexerSite.split(',');
-            input.checked=members.every(site=>selected.has(site));
-            input.indeterminate=!input.checked&&members.some(site=>selected.has(site));
+            input.checked=selected.has(input.dataset.indexerSite);
         });
         syncIndexerSiteAvailability();
     }
@@ -234,7 +233,7 @@
             config[key]=['1','true','yes','on','y'].includes(String(config[key]).trim().toLowerCase())?'1':'0';
         });
         fillConfigFields(form,config);
-        const configDefaults={TG_NOTIFICATION_ENABLED:'1',TG_NOTIFICATION_LEVEL:'standard',AGENT_ENABLED:'0',LOGIN_WALLPAPER_MODE:'default',DISCOVERY_CACHE_TTL_SECONDS:'21600',DISCOVERY_STALE_TTL_SECONDS:'604800',DISCOVERY_DOUBAN_ENABLED:'1',DISCOVERY_RESOURCE_RESULTS_ENABLED:'1',INDEXER_SEARCH_ENABLED:'1',INDEXER_BTBTLA_MIN_INTERVAL_SECONDS:'5',INDEXER_1LOU_MIN_INTERVAL_SECONDS:'5',INDEXER_1LOU_GOOGLE_ENABLED:'1',DOUBAN_CACHE_TTL_SECONDS:'21600',AI_RECOGNITION_ENABLED:'0',AI_RECOGNITION_CONFIDENCE_THRESHOLD:'0.8',AI_RECOGNITION_REQUESTS_PER_MINUTE:'6',AI_RECOGNITION_DAILY_REQUEST_LIMIT:'100',AI_RECOGNITION_MAX_CONCURRENCY:'2',AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS:'60',ORGANIZE_TAVILY_HINTS_ENABLED:'0',ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT:'20',TMDB_MATCH_MODE:'strict',WEB_SEARCH_ENABLED:'0',TAVILY_SEARCH_DEPTH:'basic',TAVILY_MAX_RESULTS:'5',TAVILY_CACHE_TTL_SECONDS:'900',TAVILY_DAILY_CREDIT_LIMIT:'100',TAVILY_TIMEOUT_SECONDS:'10',AGENT_LLM_ENABLED:'0',AGENT_LLM_PROTOCOL:'auto',AGENT_LLM_TIMEOUT_SECONDS:'12',AGENT_LLM_CONTEXT_WINDOW_TOKENS:'128000',AGENT_LIBRARY_PATROL_ENABLED:'0',AGENT_LIBRARY_PATROL_NOTIFY_ENABLED:'0',AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED:'1',AGENT_RECOGNITION_REVIEW_ENABLED:'0',AGENT_EPISODE_RESEARCH_ENABLED:'0',AGENT_EPISODE_RESEARCH_DAILY_LIMIT:'10',AGENT_NSFW_CLEAN_REVIEW_ENABLED:'0',AGENT_LIBRARY_PATROL_INTERVAL_HOURS:'24',AGENT_LIBRARY_PATROL_MAX_SERIES:'50'};
+        const configDefaults={TG_NOTIFICATION_ENABLED:'1',TG_NOTIFICATION_LEVEL:'standard',AGENT_ENABLED:'0',LOGIN_WALLPAPER_MODE:'default',DISCOVERY_CACHE_TTL_SECONDS:'21600',DISCOVERY_STALE_TTL_SECONDS:'604800',DISCOVERY_DOUBAN_ENABLED:'1',DISCOVERY_RESOURCE_RESULTS_ENABLED:'1',INDEXER_SEARCH_ENABLED:'1',INDEXER_BTBTLA_MIN_INTERVAL_SECONDS:'5',DOUBAN_CACHE_TTL_SECONDS:'21600',AI_RECOGNITION_ENABLED:'0',AI_RECOGNITION_CONFIDENCE_THRESHOLD:'0.8',AI_RECOGNITION_REQUESTS_PER_MINUTE:'6',AI_RECOGNITION_DAILY_REQUEST_LIMIT:'100',AI_RECOGNITION_MAX_CONCURRENCY:'2',AI_RECOGNITION_CIRCUIT_BREAKER_SECONDS:'60',ORGANIZE_TAVILY_HINTS_ENABLED:'0',ORGANIZE_TAVILY_HINTS_DAILY_CREDIT_LIMIT:'20',TMDB_MATCH_MODE:'strict',WEB_SEARCH_ENABLED:'0',TAVILY_SEARCH_DEPTH:'basic',TAVILY_MAX_RESULTS:'5',TAVILY_CACHE_TTL_SECONDS:'900',TAVILY_DAILY_CREDIT_LIMIT:'100',TAVILY_TIMEOUT_SECONDS:'10',AGENT_LLM_ENABLED:'0',AGENT_LLM_PROTOCOL:'auto',AGENT_LLM_TIMEOUT_SECONDS:'12',AGENT_LLM_CONTEXT_WINDOW_TOKENS:'128000',AGENT_LIBRARY_PATROL_ENABLED:'0',AGENT_LIBRARY_PATROL_NOTIFY_ENABLED:'0',AGENT_DOWNLOAD_VERIFICATION_NOTIFY_ENABLED:'1',AGENT_RECOGNITION_REVIEW_ENABLED:'0',AGENT_EPISODE_RESEARCH_ENABLED:'0',AGENT_EPISODE_RESEARCH_DAILY_LIMIT:'10',AGENT_NSFW_CLEAN_REVIEW_ENABLED:'0',AGENT_LIBRARY_PATROL_INTERVAL_HOURS:'24',AGENT_LIBRARY_PATROL_MAX_SERIES:'50'};
         Object.entries(configDefaults).forEach(([key,value])=>{if(config[key])return;const field=form.querySelector(`[data-key="${key}"]`);if(!field)return;if(field.type==='checkbox')field.checked=value==='1';else field.value=value;});
         loadIndexerSiteSelection(config);
         setConfigReady();

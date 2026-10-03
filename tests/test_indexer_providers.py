@@ -8,7 +8,6 @@ import httpx
 
 from app.indexers.errors import (
     IndexerInvalidResponse,
-    IndexerRateLimited,
     IndexerResultExpired,
     IndexerSecurityError,
     IndexerUnavailable,
@@ -16,9 +15,7 @@ from app.indexers.errors import (
 from app.indexers.http import BrowserImpersonatingHttpClient, FixedHostHttpClient, IndexerHttpResponse
 from app.indexers.models import IndexerItem, IndexerSearchRequest
 from app.indexers.providers.btbtla import BTBtlaAdapter
-from app.indexers.providers.google_site import GoogleSiteSearch
 from app.indexers.providers.mikan import MikanAdapter
-from app.indexers.providers.onelou import OneLouAdapter
 from app.indexers.providers.nyaa import NyaaAdapter
 from app.indexers.providers.piratebay import PirateBayAdapter
 from app.indexers.registry import IndexerRegistry, build_default_registry
@@ -41,53 +38,7 @@ BTBTLA_SEARCH_HTML = (_INDEXER_FIXTURES / "btbtla-search.html").read_bytes()
 BTBTLA_DETAIL_HTML = (_INDEXER_FIXTURES / "btbtla-detail.html").read_bytes()
 BTBTLA_DOWNLOAD_HTML = (_INDEXER_FIXTURES / "btbtla-download.html").read_bytes()
 
-ONELOU_GOOGLE_HTML = """
-<html><body>
-  <a href="https://www.1lou.me/thread-101.htm"><h3>Frieren Complete 1080p</h3></a>
-  <a href="/url?q=https%3A%2F%2Fwww.1lou.pro%2Fthread-102.htm"><h3>Frieren 夸克网盘</h3></a>
-  <a href="https://evil.example/thread-103.htm"><h3>Unsafe</h3></a>
-</body></html>
-""".encode()
-
-ONELOU_GOOGLE_CONFLICTING_META_HTML = """
-<html><head><meta charset="windows-1252"></head><body>
-  <a href="https://www.1lou.me/thread-101.htm"><h3>Frieren Complete 1080p</h3></a>
-  <a href="https://www.1lou.me/thread-102.htm"><h3>Frieren 夸克网盘</h3></a>
-</body></html>
-""".encode("utf-8")
-
-ONELOU_GOOGLE_INTERSTITIAL = """
-<html><body>Google Search 如果您在几秒钟内没有被重定向，请点击此处。</body></html>
-""".encode()
-
-ONELOU_GOOGLE_EMPTY_HTML = """
-<html><body>找不到和您查询的内容相符的任何文件。</body></html>
-""".encode()
-
-ONELOU_HTML = """
-<ul><li class="media thread"><div class="subject">
-  <a href="thread-201.htm">Frieren Legacy 1080p</a>
-</div></li></ul>
-""".encode()
-
-ONELOU_API_JSON = """
-{"ok": 1, "data": {"hits": [
-  {"subject": "<em>Frieren</em> Complete 1080p", "thread_url": "thread-101.htm",
-   "create_date": 1720000000, "fid": 4, "username": "u", "posts": 3},
-  {"subject": "Frieren 夸克网盘", "thread_url": "thread-102.htm",
-   "create_date": 1720000000, "fid": 4, "username": "u", "posts": 1}
-]}}
-""".encode()
-ONELOU_API_EMPTY = b'{"ok": 1, "data": {"hits": []}}'
-
-ONELOU_DETAIL_HTML = b'<a href="/attach-download-frieren.torrent">Frieren.torrent</a>'
-ONELOU_DETAIL_MAGNET_HTML = (
-    b'<a href="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=Frieren">magnet</a>'
-)
-
 TPB_JSON = (_INDEXER_FIXTURES / "tpb-search.json").read_bytes()
-
-
 
 
 class FakeHttpClient:
@@ -1013,341 +964,24 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             await adapter.resolve(stored)
         self.assertEqual(seen, ["https://www.btbtlb.com/detail/frieren"])
 
-    async def test_onelou_search_is_list_only_and_resolves_torrent_attachment_lazily(self):
-        http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
-        adapter = OneLouAdapter(http=http)
+    async def test_registry_closes_all_clients_exposed_by_adapter(self):
+        class FakeAdapter:
+            site_id = "fake"
 
-        page = await adapter.search(IndexerSearchRequest.create("Frieren", page=1))
+            def __init__(self, clients):
+                self.clients = clients
 
-        self.assertFalse(page.pagination_supported)
-        self.assertFalse(page.has_more)
-        self.assertEqual(len(http.calls), 1, "search must not visit thread pages")
-        self.assertIn("/search/api/search.php", http.calls[0]["url"])
-        self.assertEqual(http.calls[0]["params"]["fid"], "0")
-        self.assertEqual(http.calls[0]["params"]["sort"], "newest")
-        self.assertEqual(http.calls[0]["params"]["track"], "0")
-        self.assertEqual(len(page.items), 1, "cloud-drive-only results stay filtered")
-        item = page.items[0]
-        self.assertEqual(item.title, "Frieren Complete 1080p")
-        self.assertIsNotNone(item.published_at)
-        self.assertEqual(item.download_state, "resolvable")
-        self.assertEqual(item.download_kinds, ("torrent",))
-        self.assertEqual(item.detail_url, "https://www.1lou.me/thread-101.htm")
+            def iter_http_clients(self):
+                return self.clients
 
-        http.responses = [ONELOU_DETAIL_HTML]
-        http.content_type = "text/html; charset=utf-8"
-        resolved = await adapter.resolve(item)
-        self.assertEqual(len(http.calls), 2)
-        self.assertEqual(resolved.kind, "torrent")
-        self.assertEqual(resolved.value, "https://www.1lou.me/attach-download-frieren.torrent")
-        self.assertEqual(resolved.filename, "Frieren.torrent")
-
-    async def test_onelou_enforces_configured_minimum_search_interval(self):
-        current = [100.0]
-        sleeps = []
-
-        async def sleeper(seconds):
-            sleeps.append(seconds)
-            current[0] += seconds
-
-        adapter = OneLouAdapter(
-            http=FakeHttpClient(ONELOU_API_JSON, content_type="application/json"),
-            min_interval_seconds=5,
-            monotonic=lambda: current[0],
-            sleeper=sleeper,
-        )
-        request = IndexerSearchRequest.create("Frieren")
-
-        await adapter.wait_for_search_slot(request)
-        await adapter.wait_for_search_slot(request)
-
-        self.assertEqual(sleeps, [5.0])
-
-    async def test_onelou_prefers_native_newest_results_without_touching_google(self):
-        native_http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
-        google_http = FakeHttpClient(ONELOU_GOOGLE_HTML)
-        adapter = OneLouAdapter(
-            http=native_http,
-            google_search=GoogleSiteSearch(http=google_http),
-        )
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(native_http.calls), 1)
-        self.assertEqual(native_http.calls[0]["params"]["sort"], "newest")
-        self.assertEqual(google_http.calls, [])
-        self.assertEqual([item.title for item in page.items], ["Frieren Complete 1080p"])
-        self.assertEqual(page.items[0].detail_url, "https://www.1lou.me/thread-101.htm")
-
-    async def test_onelou_google_respects_http_charset_over_conflicting_meta(self):
-        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
-        google_http = FakeHttpClient(
-            ONELOU_GOOGLE_CONFLICTING_META_HTML,
-            content_type="text/html; charset=utf-8",
-        )
-        adapter = OneLouAdapter(
-            http=native_http,
-            google_search=GoogleSiteSearch(http=google_http),
-        )
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(native_http.calls), 1)
-        self.assertEqual([item.title for item in page.items], ["Frieren Complete 1080p"])
-
-    async def test_onelou_native_rate_limit_falls_back_to_google(self):
-        native_http = FakeHttpClient(b"slow down", status_code=429)
-        google_http = FakeHttpClient(ONELOU_GOOGLE_HTML)
-        adapter = OneLouAdapter(
-            http=native_http,
-            google_search=GoogleSiteSearch(http=google_http),
-        )
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(page.items), 1)
-        self.assertEqual(len(google_http.calls), 1)
-        self.assertEqual(len(native_http.calls), 2)
-
-    async def test_onelou_endpoint_timeouts_still_reach_google_fallback(self):
-        class SlowNativeHttp(FakeHttpClient):
-            async def get(self, url: str, *, params=None, headers=None, max_redirects=3):
-                self.calls.append({
-                    "url": url,
-                    "params": dict(params or {}),
-                    "headers": dict(headers or {}),
-                })
-                await asyncio.sleep(0.2)
-                raise AssertionError("timed-out native request must be cancelled")
-
-        native_http = SlowNativeHttp(ONELOU_API_EMPTY, content_type="application/json")
-        google_http = FakeHttpClient(ONELOU_GOOGLE_HTML)
-        adapter = OneLouAdapter(
-            http=native_http,
-            google_search=GoogleSiteSearch(http=google_http),
-            endpoint_timeout_seconds=0.01,
-        )
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual([item.title for item in page.items], ["Frieren Complete 1080p"])
-        self.assertEqual(len(native_http.calls), 2)
-        self.assertEqual(len(google_http.calls), 1)
-
-    async def test_onelou_google_interstitial_cools_down_after_native_empty(self):
-        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
-        google_http = FakeHttpClient(ONELOU_GOOGLE_INTERSTITIAL)
-        google = GoogleSiteSearch(http=google_http, cooldown_seconds=300)
-        adapter = OneLouAdapter(http=native_http, google_search=google)
-
-        first = await adapter.search(IndexerSearchRequest.create("Frieren"))
-        second = await adapter.search(IndexerSearchRequest.create("Frieren 2"))
-
-        self.assertEqual(first.items, [])
-        self.assertEqual(second.items, [])
-        self.assertEqual(len(google_http.calls), 1, "Google failure should open a local cooldown")
-        self.assertEqual(len(native_http.calls), 2)
-
-    async def test_onelou_google_timeout_returns_native_empty_with_independent_budget(self):
-        class SlowGoogleHttp(FakeHttpClient):
-            async def get(self, *args, **kwargs):
-                await asyncio.sleep(0.2)
-                return await super().get(*args, **kwargs)
-
-        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
-        google_http = SlowGoogleHttp(ONELOU_GOOGLE_HTML)
-        adapter = OneLouAdapter(
-            http=native_http,
-            google_search=GoogleSiteSearch(http=google_http, timeout_seconds=0.01),
-        )
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(page.items, [])
-        self.assertEqual(len(native_http.calls), 1)
-
-    async def test_onelou_google_explicit_empty_result_does_not_open_cooldown(self):
-        native_http = FakeHttpClient(ONELOU_API_EMPTY, content_type="application/json")
-        google_http = FakeHttpClient(ONELOU_GOOGLE_EMPTY_HTML)
-        adapter = OneLouAdapter(
-            http=native_http,
-            google_search=GoogleSiteSearch(http=google_http, cooldown_seconds=300),
-        )
-
-        first = await adapter.search(IndexerSearchRequest.create("Frieren"))
-        second = await adapter.search(IndexerSearchRequest.create("Frieren 2"))
-
-        self.assertEqual(first.items, [])
-        self.assertEqual(second.items, [])
-        self.assertEqual(len(google_http.calls), 2, "valid empty pages must not disable Google")
-        self.assertEqual(len(native_http.calls), 2)
-
-    async def test_onelou_native_api_path_accepts_legacy_html_without_extra_request(self):
-        http = FakeHttpClient(ONELOU_HTML)
-        adapter = OneLouAdapter(http=http)
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(http.calls), 1)
-        self.assertEqual([item.title for item in page.items], ["Frieren Legacy 1080p"])
-        self.assertEqual(page.items[0].detail_url, "https://www.1lou.me/thread-201.htm")
-
-    async def test_onelou_invalid_apis_fall_back_to_legacy_html_on_https_mirror(self):
-        http = FakeHttpClient(b"invalid", content_type="application/json")
-        http.responses = [b"invalid", b"invalid", ONELOU_HTML]
-        http.content_types = ["application/json", "application/json", "text/html"]
-        adapter = OneLouAdapter(http=http)
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(http.calls), 3)
-        self.assertIn("/search-Frieren.htm", http.calls[2]["url"])
-        self.assertEqual(page.items[0].detail_url, "https://www.1lou.me/thread-201.htm")
-
-    async def test_onelou_native_search_falls_back_to_pro_mirror(self):
-        http = FakeHttpClient(ONELOU_API_JSON, content_type="application/json")
-        http.responses = [b"slow down", ONELOU_API_JSON]
-        http.status_codes = [429, 200]
-        adapter = OneLouAdapter(http=http)
-
-        page = await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(http.calls), 2)
-        self.assertTrue(http.calls[0]["url"].startswith("https://www.1lou.me/"))
-        self.assertTrue(http.calls[1]["url"].startswith("https://www.1lou.pro/"))
-        self.assertEqual(page.items[0].detail_url, "https://www.1lou.pro/thread-101.htm")
-
-    async def test_onelou_classifies_http_200_verification_page_as_unavailable(self):
-        challenge = (
-            b"<html><title>Just a moment...</title>"
-            b"<div id='challenge-platform'>Verify you are human</div></html>"
-        )
-        http = FakeHttpClient(challenge)
-        adapter = OneLouAdapter(http=http)
-
-        with self.assertRaises(IndexerUnavailable):
-            await adapter.search(IndexerSearchRequest.create("Frieren"))
-
-        self.assertEqual(len(http.calls), 2, "verification pages should try the trusted mirror only")
-
-    async def test_onelou_resolve_rejects_http_200_verification_page(self):
-        challenge = b"<html><title>Just a moment...</title><div class='turnstile'>Verify you are human</div></html>"
-        adapter = OneLouAdapter(http=FakeHttpClient(challenge))
-        stored = IndexerItem(
-            site_id="1lou",
-            site_name="1lou",
-            title="Frieren",
-            detail_url="https://www.1lou.me/thread-101.htm",
-            download_state="resolvable",
-            download_kinds=("torrent", "magnet"),
-        )
-
-        with self.assertRaises(IndexerUnavailable):
-            await adapter.resolve(stored)
-
-    async def test_onelou_classifies_http_429_as_rate_limited_after_mirrors_fail(self):
-        http = FakeHttpClient(b"slow down", status_code=429)
-        adapter = OneLouAdapter(http=http)
-
-        with self.assertRaises(IndexerRateLimited):
-            await adapter.search(IndexerSearchRequest.create("Frieren"))
-        self.assertEqual(len(http.calls), 2)
-
-    async def test_onelou_preserves_rate_limit_when_mirror_fallback_is_structurally_invalid(self):
-        http = FakeHttpClient(b"slow down", status_code=429)
-        http.responses = [b"slow down", b"invalid", b"slow down"]
-        http.status_codes = [429, 200, 429]
-        http.content_types = ["text/html", "application/json", "text/html"]
-        adapter = OneLouAdapter(http=http)
-
-        with self.assertRaises(IndexerRateLimited):
-            await adapter.search(IndexerSearchRequest.create("Frieren"))
-        self.assertEqual(len(http.calls), 3)
-        self.assertTrue(http.calls[2]["url"].startswith("https://www.1lou.pro/"))
-
-    async def test_onelou_resolve_falls_back_to_magnet_when_no_attachment(self):
-        http = FakeHttpClient(ONELOU_DETAIL_MAGNET_HTML)
-        adapter = OneLouAdapter(http=http)
-        stored = IndexerItem(
-            site_id="1lou",
-            site_name="1lou",
-            title="Frieren",
-            detail_url="https://www.1lou.me/thread-101.htm",
-            download_state="resolvable",
-            download_kinds=("torrent",),
-        )
-
-        resolved = await adapter.resolve(stored)
-
-        self.assertEqual(resolved.kind, "magnet")
-        self.assertIn("btih:0123456789abcdef", resolved.value)
-
-    async def test_onelou_resolves_legacy_apex_domain_results(self):
-        http = FakeHttpClient(ONELOU_DETAIL_HTML)
-        adapter = OneLouAdapter(http=http)
-        stored = IndexerItem(
-            site_id="1lou",
-            site_name="1lou",
-            title="Frieren",
-            detail_url="https://1lou.me/thread-frieren.htm",
-            download_state="resolvable",
-            download_kinds=("torrent",),
-        )
-
-        resolved = await adapter.resolve(stored)
-
-        self.assertEqual(resolved.kind, "torrent")
-
-    async def test_onelou_pro_result_keeps_relative_attachment_on_pro_host(self):
-        http = FakeHttpClient(ONELOU_DETAIL_HTML)
-        adapter = OneLouAdapter(http=http)
-        stored = IndexerItem(
-            site_id="1lou",
-            site_name="1lou",
-            title="Frieren",
-            detail_url="https://www.1lou.pro/thread-101.htm",
-            download_state="resolvable",
-            download_kinds=("torrent",),
-        )
-
-        resolved = await adapter.resolve(stored)
-
-        self.assertEqual(resolved.value, "https://www.1lou.pro/attach-download-frieren.torrent")
-
-    async def test_onelou_rejects_off_host_attachment_and_page_two_does_not_search(self):
-        http = FakeHttpClient(b'<a href="https://evil.example/attach-download.torrent">evil</a>')
-        adapter = OneLouAdapter(http=http)
-        stored = IndexerItem(
-            site_id="1lou",
-            site_name="1lou",
-            title="Frieren",
-            detail_url="https://www.1lou.me/thread-frieren.htm",
-            download_state="resolvable",
-            download_kinds=("torrent",),
-        )
-
-        with self.assertRaises(IndexerSecurityError):
-            await adapter.resolve(stored)
-        second = await adapter.search(IndexerSearchRequest.create("Frieren", page=2))
-        self.assertEqual(second.items, [])
-        self.assertFalse(second.has_more)
-        self.assertFalse(second.pagination_supported)
-        self.assertEqual(len(http.calls), 1)
-
-    async def test_registry_closes_onelou_native_and_google_clients(self):
-        native_http = ClosableHttpClient(ONELOU_API_JSON, content_type="application/json")
-        google_http = ClosableHttpClient(ONELOU_GOOGLE_HTML)
-        registry = IndexerRegistry({
-            "1lou": OneLouAdapter(
-                http=native_http,
-                google_search=GoogleSiteSearch(http=google_http),
-            )
-        })
+        first_http = ClosableHttpClient(b"first")
+        second_http = ClosableHttpClient(b"second")
+        registry = IndexerRegistry({"fake": FakeAdapter((first_http, second_http))})
 
         await registry.aclose()
 
-        self.assertEqual(native_http.close_calls, 1)
-        self.assertEqual(google_http.close_calls, 1)
+        self.assertEqual(first_http.close_calls, 1)
+        self.assertEqual(second_http.close_calls, 1)
 
     def test_default_registry_uses_browser_transport_for_challenged_sites(self):
         registry = build_default_registry()
@@ -1362,11 +996,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mikanime.tv", registry.get("mikan").http.allowed_hosts)
         self.assertTrue(registry.get("nyaa").http.pin_resolved_address)
         self.assertTrue(registry.get("mikan").http.pin_resolved_address)
-        self.assertTrue(registry.get("1lou").http.pin_resolved_address)
         self.assertTrue(registry.get("tpb").http.pin_resolved_address)
-        self.assertEqual(registry.get("1lou").min_interval_seconds, 5)
-        self.assertIsNotNone(registry.get("1lou").google_search)
-        self.assertIn("www.1lou.pro", registry.get("1lou").http.allowed_hosts)
 
     def test_default_registry_contains_supported_sites_and_disabled_sukebei(self):
         clients = {
@@ -1374,13 +1004,11 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
             "sukebei": FakeHttpClient(NYAA_HTML),
             "mikan": FakeHttpClient(MIKAN_HTML),
             "btbtla": FakeHttpClient(BTBTLA_SEARCH_HTML),
-            "1lou": FakeHttpClient(ONELOU_API_JSON, content_type="application/json"),
-            "google": FakeHttpClient(ONELOU_GOOGLE_HTML),
             "tpb": FakeHttpClient(TPB_JSON, content_type="application/json"),
         }
         registry = build_default_registry(http_clients=clients)
 
-        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "tpb"))
+        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "tpb"))
         self.assertTrue(registry.get("nyaa").default_enabled)
         self.assertFalse(registry.get("sukebei").default_enabled)
         self.assertTrue(registry.get("sukebei").capabilities.pagination_supported)
@@ -1388,8 +1016,6 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(registry.get("mikan").default_enabled)
         self.assertTrue(registry.get("btbtla").default_enabled)
         self.assertTrue(registry.get("btbtla").capabilities.pagination_supported)
-        self.assertTrue(registry.get("1lou").default_enabled)
-        self.assertEqual(registry.get("1lou").capabilities.download_kinds, ("torrent", "magnet"))
         self.assertTrue(registry.get("tpb").default_enabled)
         self.assertEqual(registry.get("tpb").capabilities.download_kinds, ("magnet",))
 

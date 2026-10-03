@@ -146,7 +146,7 @@ class FixedHostHttpClient:
         self.pin_resolved_address = bool(pin_resolved_address)
         self.require_identity_encoding = bool(require_identity_encoding)
         if transport is None:
-            # 部分站点边缘节点（如 1lou 的 CDN）TCP 握手存在间歇性丢包，
+            # 部分站点边缘节点TCP 握手存在间歇性丢包，
             # 首连即卡满超时。retries 只重试连接建立阶段，请求一旦发出
             # 不会重放，对非幂等语义安全。
             transport = httpx.AsyncHTTPTransport(

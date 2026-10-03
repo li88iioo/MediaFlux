@@ -536,7 +536,7 @@
                         </article>
 
                         <div class="indexer-site-box" data-indexer-site-box{% if not resource_results_enabled %} hidden{% endif %} aria-hidden="{{ 'false' if resource_results_enabled else 'true' }}">
-                            <input type="hidden" data-key="INDEXER_ENABLED_SITES" value="nyaa,mikan,btbtla,1lou,tpb">
+                            <input type="hidden" data-key="INDEXER_ENABLED_SITES" value="nyaa,mikan,btbtla,tpb">
                             <div class="discovery-card-head">
                                 <span class="discovery-card-icon"><i data-lucide="archive"></i></span>
                                 <h3>索引源站点配置</h3>
@@ -546,13 +546,11 @@
                                 <div class="indexer-site-selector" data-indexer-site-selector role="group" aria-label="参与资源检索的站点">
                                     <label class="indexer-site-option" title="动漫与综合资源"><input type="checkbox" data-indexer-site="nyaa" checked><span data-indexer-site-chip><strong>Nyaa</strong></span></label>
                                     <label class="indexer-site-option" title="动漫资源"><input type="checkbox" data-indexer-site="mikan" checked><span data-indexer-site-chip><strong>Mikan</strong></span></label>
-                                    <label class="indexer-site-option" title="统一控制 BTBtla 与 1lou；虚线表示仅启用了其中一个站点"><input type="checkbox" data-indexer-site="btbtla,1lou" checked><span data-indexer-site-chip><strong>综合</strong></span></label>
+                                    <label class="indexer-site-option" title="综合资源索引"><input type="checkbox" data-indexer-site="btbtla" checked><span data-indexer-site-chip><strong>综合</strong></span></label>
                                     <label class="indexer-site-option" title="公共磁力索引"><input type="checkbox" data-indexer-site="tpb" checked><span data-indexer-site-chip><strong>The Pirate Bay</strong></span></label>
                                     <label class="indexer-site-option is-sensitive" title="成人内容，默认关闭"><input type="checkbox" data-indexer-site="sukebei"><span data-indexer-site-chip><strong>Sukebei</strong><small>成人</small></span></label>
                                 </div>
                                 <div class="form-row discovery-input-row"><div class="field-label"><div class="name">BTBTLA 最小请求间隔</div><div class="hint">0–60 秒；默认 5 秒，避免高频检索触发临时封禁</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="0" max="60" step="1" value="5" class="form-input" data-key="INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"><span>秒</span></div></div></div>
-                                <div class="form-row"><div class="field-label"><div class="name">1LOU Google 回退</div><div class="hint">原生 API 会按发布时间优先检索；仅在原生空结果或不可用时补充 Google site 搜索</div></div><div class="field-control"><label class="toggle"><input type="checkbox" data-key="INDEXER_1LOU_GOOGLE_ENABLED" data-bool="1" checked><span class="toggle-slider"></span></label></div></div>
-                                <div class="form-row discovery-input-row"><div class="field-label"><div class="name">1LOU 最小搜索间隔</div><div class="hint">0–10 秒；默认 5 秒，等待不占用单站点请求超时</div></div><div class="field-control"><div class="discovery-input-unit"><input type="number" min="0" max="10" step="1" value="5" class="form-input" data-key="INDEXER_1LOU_MIN_INTERVAL_SECONDS"><span>秒</span></div></div></div>
                             </div>
                         </div>
 

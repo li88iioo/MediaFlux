@@ -197,8 +197,7 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     "INDEXER_SITE_TIMEOUT_SECONDS", "INDEXER_TOTAL_TIMEOUT_SECONDS",
     "INDEXER_MAX_RESULTS_PER_SITE", "INDEXER_MAX_CONCURRENCY",
     "INDEXER_CACHE_TTL_SECONDS", "INDEXER_RESULT_TTL_SECONDS", "INDEXER_USER_AGENT",
-    "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS", "INDEXER_1LOU_MIN_INTERVAL_SECONDS",
-    "INDEXER_1LOU_GOOGLE_ENABLED",
+    "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS",
     "GY_STRM_SOURCE_DIRS", "GY_STRM_BASE_URL", "STRM_ROOT",
     "STRM_VIDEO_EXTS", "STRM_SKIP_THRESHOLD_MB", "STRM_METADATA_ENABLED",
     "STRM_METADATA_EXTS", "STRM_SCHEDULE_ENABLED", "STRM_SCHEDULE_CRON",
@@ -363,24 +362,14 @@ def _validate_indexer_updates(
         normalized["INDEXER_SEARCH_ENABLED"] = _normalize_discovery_boolean(
             "INDEXER_SEARCH_ENABLED", data["INDEXER_SEARCH_ENABLED"]
         )
-    if "INDEXER_1LOU_GOOGLE_ENABLED" in data:
-        normalized["INDEXER_1LOU_GOOGLE_ENABLED"] = _normalize_discovery_boolean(
-            "INDEXER_1LOU_GOOGLE_ENABLED", data["INDEXER_1LOU_GOOGLE_ENABLED"]
-        )
-    interval_labels = {
-        "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": "BTBTLA",
-        "INDEXER_1LOU_MIN_INTERVAL_SECONDS": "1LOU",
-    }
-    for key, label in interval_labels.items():
-        if key not in data:
-            continue
+    key = "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS"
+    if key in data:
         try:
             interval = int(str(data[key]).strip())
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"{label} 最小请求间隔必须是 0 到 60 的整数") from exc
-        maximum = 10 if key == "INDEXER_1LOU_MIN_INTERVAL_SECONDS" else 60
-        if not 0 <= interval <= maximum:
-            raise ValueError(f"{label} 最小请求间隔必须在 0 到 {maximum} 秒之间")
+            raise ValueError("BTBTLA 最小请求间隔必须是 0 到 60 的整数") from exc
+        if not 0 <= interval <= 60:
+            raise ValueError("BTBTLA 最小请求间隔必须在 0 到 60 秒之间")
         normalized[key] = str(interval)
     if "INDEXER_ENABLED_SITES" in data:
         sites = _normalize_indexer_sites(data.get("INDEXER_ENABLED_SITES"))
@@ -997,6 +986,7 @@ def get_config(request: Request):
         for key, value in config.all_items().items()
         if key not in ({
             "DOUBAN_FRODO_API_KEY", "DOUBAN_FRODO_API_SECRET",
+            "INDEXER_1LOU_MIN_INTERVAL_SECONDS", "INDEXER_1LOU_GOOGLE_ENABLED",
         } | _FIXED_ORGANIZE_NAMING_KEYS)
     }
     managed_fields = sorted(

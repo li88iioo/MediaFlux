@@ -21,7 +21,7 @@ class TenPassReverseContractTests(unittest.TestCase):
                 request = IndexerMediaSearchRequest.create(
                     title=title, season=season, episode=episode
                 )
-                for site in ("mikan", "nyaa", "tpb", "sukebei", "1lou", "btbtla"):
+                for site in ("mikan", "nyaa", "tpb", "sukebei", "btbtla"):
                     queries = build_site_queries(site, request)
                     self.assertLessEqual(len(queries), 3)
                     for query in queries:

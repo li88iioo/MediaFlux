@@ -18,7 +18,7 @@ class IndexerQueryPlanTests(unittest.TestCase):
         )
 
     def test_chinese_sites_start_with_localized_title_without_year(self):
-        for site_id in ("mikan", "1lou", "btbtla"):
+        for site_id in ("mikan", "btbtla"):
             with self.subTest(site_id=site_id):
                 queries = build_site_queries(site_id, self.request)
                 self.assertEqual(queries[0], "奇招百出的维多利亚")
@@ -62,7 +62,7 @@ class IndexerQueryPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            build_site_queries("1lou", request),
+            build_site_queries("btbtla", request),
             ("九门 S02E30", "九门 第2季 第30集", "九门"),
         )
         self.assertEqual(

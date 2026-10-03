@@ -137,7 +137,7 @@ class FakeStatusRegistry:
     def __init__(self):
         self.adapters = {
             "nyaa": FakeStatusAdapter("nyaa", "Nyaa"),
-            "1lou": FakeStatusAdapter("1lou", "一楼"),
+            "mikan": FakeStatusAdapter("mikan", "Mikan"),
             "btbtla": FakeStatusAdapter("btbtla", "BTBTLA"),
             "sukebei": FakeStatusAdapter("sukebei", "Sukebei"),
         }
@@ -496,7 +496,7 @@ class IndexerAPITests(unittest.TestCase):
         self.authenticate()
         service = SimpleNamespace(
             registry=FakeStatusRegistry(),
-            enabled_site_ids=frozenset({"nyaa", "1lou", "btbtla"}),
+            enabled_site_ids=frozenset({"nyaa", "mikan", "btbtla"}),
             search=AsyncMock(return_value=AggregatedIndexerResult(
                 query="Demo",
                 page=1,
@@ -508,8 +508,8 @@ class IndexerAPITests(unittest.TestCase):
                         title="Demo",
                     ),
                 ],
-                sites_attempted=("nyaa", "1lou", "btbtla"),
-                sites_succeeded=("nyaa", "1lou"),
+                sites_attempted=("nyaa", "mikan", "btbtla"),
+                sites_succeeded=("nyaa", "mikan"),
                 errors=[IndexerProviderError("btbtla", "unavailable", "站点不可用")],
             )),
         )
@@ -520,7 +520,7 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         statuses = {item["site_id"]: item for item in response.json()["site_statuses"]}
         self.assertEqual(statuses["nyaa"]["status"], "success")
-        self.assertEqual(statuses["1lou"]["status"], "empty")
+        self.assertEqual(statuses["mikan"]["status"], "empty")
         self.assertEqual(statuses["btbtla"]["status"], "error")
         self.assertEqual(statuses["btbtla"]["code"], "unavailable")
         self.assertIs(statuses["btbtla"]["retryable"], True)
@@ -529,34 +529,23 @@ class IndexerAPITests(unittest.TestCase):
         self.assertIs(statuses["sukebei"]["retryable"], False)
         self.assertNotIn("magnet", response.text)
 
-    def test_search_status_marks_btbtla_as_onelou_fallback(self):
-        service = SimpleNamespace(
-            registry=FakeStatusRegistry(),
-            enabled_site_ids=frozenset({"btbtla", "1lou"}),
-        )
+    def test_search_status_preserves_failed_source_when_another_source_succeeds(self):
+        service = SimpleNamespace(registry=FakeStatusRegistry(), enabled_site_ids=frozenset({"btbtla", "mikan"}))
         result = AggregatedIndexerResult(
-            query="Demo",
-            page=1,
-            items=[],
-            sites_attempted=("btbtla", "1lou"),
-            sites_succeeded=("1lou",),
-            site_item_counts={"1lou": 2},
-            errors=[IndexerProviderError("btbtla", "unavailable", "索引站点暂不可用")],
-            site_fallbacks={"btbtla": "1lou"},
-            partial=True,
+            query="Demo", page=1, items=[], sites_attempted=("btbtla", "mikan"),
+            sites_succeeded=("mikan",), site_item_counts={"mikan": 2},
+            errors=[IndexerProviderError("btbtla", "unavailable", "索引站点暂不可用")], partial=True,
         )
-
         statuses = {row["site_id"]: row for row in indexers_api._search_site_statuses(service, result)}
-
-        self.assertEqual(statuses["btbtla"]["status"], "fallback")
-        self.assertEqual(statuses["btbtla"]["fallback_site_id"], "1lou")
-        self.assertIn("1LOU", statuses["btbtla"]["message"] )
+        self.assertEqual(statuses["btbtla"]["status"], "error")
+        self.assertEqual(statuses["mikan"]["status"], "success")
+        self.assertTrue(statuses["btbtla"]["retryable"])
 
     def test_search_site_statuses_use_pre_dedupe_item_counts(self):
         self.authenticate()
         service = SimpleNamespace(
             registry=FakeStatusRegistry(),
-            enabled_site_ids=frozenset({"nyaa", "1lou"}),
+            enabled_site_ids=frozenset({"nyaa", "mikan"}),
             search=AsyncMock(return_value=AggregatedIndexerResult(
                 query="Demo",
                 page=1,
@@ -568,9 +557,9 @@ class IndexerAPITests(unittest.TestCase):
                         title="Shared hash",
                     ),
                 ],
-                sites_attempted=("nyaa", "1lou"),
-                sites_succeeded=("nyaa", "1lou"),
-                site_item_counts={"nyaa": 1, "1lou": 1},
+                sites_attempted=("nyaa", "mikan"),
+                sites_succeeded=("nyaa", "mikan"),
+                site_item_counts={"nyaa": 1, "mikan": 1},
             )),
         )
 
@@ -582,8 +571,8 @@ class IndexerAPITests(unittest.TestCase):
         statuses = {item["site_id"]: item for item in response.json()["site_statuses"]}
         self.assertEqual(statuses["nyaa"]["status"], "success")
         self.assertEqual(statuses["nyaa"]["count"], 1)
-        self.assertEqual(statuses["1lou"]["status"], "success")
-        self.assertEqual(statuses["1lou"]["count"], 1)
+        self.assertEqual(statuses["mikan"]["status"], "success")
+        self.assertEqual(statuses["mikan"]["count"], 1)
 
     def test_download_resolves_opaque_result_and_dispatches_magnet(self):
         headers = self.authenticate()

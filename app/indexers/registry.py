@@ -5,10 +5,8 @@ from collections.abc import Mapping
 from .http import BrowserImpersonatingHttpClient, FixedHostHttpClient
 from .providers.base import IndexerAdapter
 from .providers.btbtla import BTBtlaAdapter
-from .providers.google_site import GoogleSiteSearch
 from .providers.mikan import MikanAdapter
 from .providers.nyaa import NyaaAdapter
-from .providers.onelou import OneLouAdapter
 from .providers.piratebay import PirateBayAdapter
 
 
@@ -48,10 +46,7 @@ def build_default_registry(
     user_agent: str = "MediaFlux/1.0",
     nyaa_endpoint_timeout_seconds: float = 4,
     btbtla_min_interval_seconds: float = 5,
-    onelou_min_interval_seconds: float = 5,
-    onelou_endpoint_timeout_seconds: float = 3,
     tpb_min_interval_seconds: float = 1,
-    onelou_google_enabled: bool = True,
 ) -> IndexerRegistry:
     supplied = dict(http_clients or {})
     # nyaa.si 会按来源 IP 限流；nyaa.net 为同引擎镜像，主站失败时回落。
@@ -75,19 +70,6 @@ def build_default_registry(
         allowed_hosts={"www.btbtlb.com", "btbtlb.com"},
         sni_host="btbtlb.com",
     )
-    onelou_http = supplied.get("1lou") or FixedHostHttpClient(
-        allowed_hosts={"www.1lou.me", "1lou.me", "www.1lou.pro", "1lou.pro"},
-        user_agent=user_agent,
-        pin_resolved_address=True,
-    )
-    google_http = None
-    if onelou_google_enabled:
-        google_http = supplied.get("google") or FixedHostHttpClient(
-            allowed_hosts={"www.google.com"},
-            user_agent=user_agent,
-            max_redirects=0,
-            pin_resolved_address=True,
-        )
     tpb_http = supplied.get("tpb") or FixedHostHttpClient(
         allowed_hosts={"apibay.org"},
         user_agent=user_agent,
@@ -115,12 +97,6 @@ def build_default_registry(
             "btbtla": BTBtlaAdapter(
                 http=btbtla_http,
                 min_interval_seconds=btbtla_min_interval_seconds,
-            ),
-            "1lou": OneLouAdapter(
-                http=onelou_http,
-                google_search=GoogleSiteSearch(http=google_http) if google_http is not None else None,
-                min_interval_seconds=onelou_min_interval_seconds,
-                endpoint_timeout_seconds=onelou_endpoint_timeout_seconds,
             ),
             "tpb": PirateBayAdapter(
                 http=tpb_http,

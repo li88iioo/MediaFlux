@@ -347,7 +347,6 @@ class AggregatedIndexerResult:
     site_visible_counts: dict[str, int] = field(default_factory=dict)
     site_queries: dict[str, str] = field(default_factory=dict)
     site_attempt_counts: dict[str, int] = field(default_factory=dict)
-    site_fallbacks: dict[str, str] = field(default_factory=dict)
     site_page_states: dict[str, IndexerSitePageState] = field(default_factory=dict)
     has_more: bool = False
     errors: list[IndexerProviderError] = field(default_factory=list)
@@ -365,7 +364,6 @@ class AggregatedIndexerResult:
             site_visible_counts=dict(self.site_visible_counts),
             site_queries=dict(self.site_queries),
             site_attempt_counts=dict(self.site_attempt_counts),
-            site_fallbacks=dict(self.site_fallbacks),
             site_page_states=dict(self.site_page_states),
             has_more=self.has_more,
             errors=list(self.errors),

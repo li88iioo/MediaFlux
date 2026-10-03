@@ -255,6 +255,21 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_retired_site_in_old_request_never_executes_or_expands_scope(self):
+        active = FakeAdapter("btbtla", [item("btbtla", "valid resource")])
+        retired = FakeAdapter("1lou", error=AssertionError("retired adapter must never run"))
+        service = self.service([active, retired])
+        result = await service.search("Demo", site_ids=("1lou", "btbtla"))
+        self.assertEqual(result.sites_attempted, ("btbtla",))
+        self.assertEqual(active.calls, 1)
+        self.assertEqual(retired.calls, 0)
+        self.assertFalse(result.errors)
+        with self.assertRaises(IndexerValidationError) as caught:
+            await service.search("Demo", site_ids=("1lou",))
+        self.assertIn("重新选择", caught.exception.public_message)
+        self.assertEqual(active.calls, 1)
+        self.assertEqual(retired.calls, 0)
+
     async def test_partial_success_caps_each_site_and_returns_safe_error(self):
         good = FakeAdapter(
             "nyaa", [item("nyaa", "one"), item("nyaa", "two"), item("nyaa", "three")]
@@ -403,11 +418,11 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             episode=30,
         )
         adapter = QueryAwareAdapter(
-            "1lou",
+            "btbtla",
             {
                 "九门 S02E30": [
                     item(
-                        "1lou",
+                        "btbtla",
                         "九门[第30集].Mystic.Nine.S02.2026.1080p",
                         magnet=f"magnet:?xt=urn:btih:{HASH}",
                     )
@@ -416,7 +431,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         service = self.service([adapter])
 
-        result = await service.search_media(media, ("1lou",))
+        result = await service.search_media(media, ("btbtla",))
 
         self.assertEqual(adapter.queries, ["九门 S02E30"])
         self.assertEqual(adapter.sort_modes, ["published_desc"])
@@ -434,17 +449,17 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             episode=30,
         )
         range_item = item(
-            "1lou",
+            "btbtla",
             "九门[第29-30集].Mystic.Nine.S02.2026.1080p",
             magnet=f"magnet:?xt=urn:btih:{HASH}",
         )
         exact_item = item(
-            "1lou",
+            "btbtla",
             "九门[第30集].Mystic.Nine.S02.2026.1080p",
             magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
         )
         adapter = QueryAwareAdapter(
-            "1lou",
+            "btbtla",
             {
                 "九门 S02E30": [range_item],
                 "九门 第2季 第30集": [exact_item],
@@ -452,7 +467,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         service = self.service([adapter])
 
-        result = await service.search_media(media, ("1lou",))
+        result = await service.search_media(media, ("btbtla",))
 
         self.assertEqual(adapter.queries, ["九门 S02E30", "九门 第2季 第30集"])
         self.assertIn("episode_exact", result.items[0].match_reasons)
@@ -547,18 +562,18 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_episode_conflicts_stay_below_matching_ranges_even_when_newer(self):
         conflict = item(
-            "1lou",
+            "btbtla",
             "九门[第30集].Mystic.Nine.S01.2026.1080p",
             magnet=f"magnet:?xt=urn:btih:{HASH}",
             published_at=datetime(2026, 8, 27, tzinfo=timezone.utc),
         )
         matching = item(
-            "1lou",
+            "btbtla",
             "九门[第29-30集].Mystic.Nine.S02.2026.1080p",
             magnet="magnet:?xt=urn:btih:89abcdef0123456789abcdef0123456789abcdef",
             published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         )
-        service = self.service([FakeAdapter("1lou", [conflict, matching])])
+        service = self.service([FakeAdapter("btbtla", [conflict, matching])])
         media = IndexerMediaSearchRequest.create(
             title="九门",
             year=2026,
@@ -568,29 +583,22 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             episode=30,
         )
 
-        result = await service.search_media(media, ("1lou",))
+        result = await service.search_media(media, ("btbtla",))
 
         self.assertEqual(
             [entry.title for entry in result.items], [matching.title, conflict.title]
         )
 
-    async def test_btbtla_failure_is_marked_as_onelou_fallback_only_when_both_are_selected(
-        self,
-    ):
-        btbtla = FakeAdapter("btbtla", error=IndexerUnavailable("tls failed"))
-        onelou = FakeAdapter("1lou", [item("1lou", "fallback resource")])
-        service = self.service([btbtla, onelou])
-
-        result = await service.search("Demo", 1, ("btbtla", "1lou"))
-
-        self.assertEqual(result.site_fallbacks, {"btbtla": "1lou"})
-        self.assertEqual([entry.title for entry in result.items], ["fallback resource"])
-
-        isolated = self.service(
-            [FakeAdapter("btbtla", error=IndexerUnavailable("tls failed"))]
-        )
-        isolated_result = await isolated.search("Demo", 1, ("btbtla",))
-        self.assertEqual(isolated_result.site_fallbacks, {})
+    async def test_site_failure_stays_visible_when_other_site_has_resources(self):
+        service = self.service([
+            FakeAdapter("btbtla", error=IndexerUnavailable("tls failed")),
+            FakeAdapter("mikan", [item("mikan", "other site resource")]),
+        ])
+        result = await service.search("Demo", 1, ("btbtla", "mikan"))
+        self.assertTrue(result.partial)
+        self.assertEqual([error.site_id for error in result.errors], ["btbtla"])
+        self.assertEqual([entry.title for entry in result.items], ["other site resource"])
+        self.assertEqual(result.sites_succeeded, ("mikan",))
 
     async def test_magnet_infohash_dedupe_keeps_the_richer_cross_site_result(self):
         first = item(
@@ -623,18 +631,18 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.site_visible_counts, {"nyaa": 0, "mikan": 2})
 
     def test_alias_merge_upgrades_duplicate_to_richer_downloadable_representation(self):
-        detail_url = "https://www.1lou.me/thread-123.htm"
+        detail_url = "https://www.btbtlb.com/tdown/123.htm"
         first = IndexerItem(
-            site_id="1lou",
-            site_name="1LOU",
+            site_id="btbtla",
+            site_name="BTBtla",
             title="九门 第30集",
             detail_url=detail_url,
             download_state="resolvable",
             download_kinds=("torrent",),
         )
         richer = IndexerItem(
-            site_id="1lou",
-            site_name="1LOU",
+            site_id="btbtla",
+            site_name="BTBtla",
             title="九门 第30集 S02E30",
             detail_url=detail_url,
             seeders=20,
@@ -652,10 +660,10 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
     def test_alias_merge_prefers_more_relevant_actionable_duplicate_over_ready_state(
         self,
     ):
-        detail_url = "https://www.1lou.me/thread-456.htm"
+        detail_url = "https://www.btbtlb.com/tdown/456.htm"
         relevant = IndexerItem(
-            site_id="1lou",
-            site_name="1LOU",
+            site_id="btbtla",
+            site_name="BTBtla",
             title="九门 第29-30集 S02",
             detail_url=detail_url,
             relevance_score=96,
@@ -663,8 +671,8 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             download_kinds=("torrent",),
         )
         less_relevant = IndexerItem(
-            site_id="1lou",
-            site_name="1LOU",
+            site_id="btbtla",
+            site_name="BTBtla",
             title="九门 第30集 S01",
             detail_url=detail_url,
             relevance_score=52,
@@ -681,8 +689,8 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_search_slot_wait_does_not_consume_site_timeout(self):
         adapter = SlotDelayedAdapter(
-            "1lou",
-            [item("1lou", "paced", magnet=f"magnet:?xt=urn:btih:{HASH}")],
+            "btbtla",
+            [item("btbtla", "paced", magnet=f"magnet:?xt=urn:btih:{HASH}")],
             slot_delay=0.05,
         )
         service = self.service(
@@ -691,7 +699,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             total_timeout_seconds=0.2,
         )
 
-        result = await service.search("paced", 1, ("1lou",))
+        result = await service.search("paced", 1, ("btbtla",))
 
         self.assertEqual(adapter.slot_calls, 1)
         self.assertEqual([entry.title for entry in result.items], ["paced"])
@@ -699,8 +707,8 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_provider_timeout_overhead_preserves_primary_site_budget(self):
         adapter = TimeoutOverheadAdapter(
-            "1lou",
-            [item("1lou", "google fallback", magnet=f"magnet:?xt=urn:btih:{HASH}")],
+            "btbtla",
+            [item("btbtla", "bounded detail request", magnet=f"magnet:?xt=urn:btih:{HASH}")],
             delay=0.02,
             overhead_seconds=0.02,
         )
@@ -710,9 +718,9 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             total_timeout_seconds=0.1,
         )
 
-        result = await service.search("fallback", 1, ("1lou",))
+        result = await service.search("fallback", 1, ("btbtla",))
 
-        self.assertEqual([entry.title for entry in result.items], ["google fallback"])
+        self.assertEqual([entry.title for entry in result.items], ["bounded detail request"])
         self.assertEqual(result.errors, [])
 
     async def test_provider_timeout_overhead_extends_total_search_budget(self):
@@ -872,13 +880,13 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_resolve_rejects_disabled_stored_provider_without_calling_adapter(
         self,
     ):
-        adapter = FakeAdapter("1lou", default_enabled=False)
+        adapter = FakeAdapter("btbtla", default_enabled=False)
         stored_id = self.store.put(
             IndexerItem(
-                site_id="1lou",
-                site_name="1lou",
+                site_id="btbtla",
+                site_name="btbtla",
                 title="Frieren",
-                detail_url="https://1lou.me/thread.htm",
+                detail_url="https://btbtlb.com/tdown/123.html",
                 download_state="resolvable",
                 download_kinds=("torrent",),
             )
@@ -951,11 +959,11 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([entry.title for entry in recovered.items], ["recovered"])
 
     async def test_security_error_site_cools_down_immediately(self):
-        adapter = FakeAdapter("1lou", error=IndexerSecurityError("challenge"))
+        adapter = FakeAdapter("btbtla", error=IndexerSecurityError("challenge"))
         service = self.service([adapter], breaker_cooldown_seconds=300)
 
-        await service.search("sec-0", 1, ("1lou",))
-        cooled = await service.search("sec-1", 1, ("1lou",))
+        await service.search("sec-0", 1, ("btbtla",))
+        cooled = await service.search("sec-1", 1, ("btbtla",))
 
         self.assertEqual(adapter.calls, 1)
         self.assertEqual(cooled.errors[0].code, "security_error")

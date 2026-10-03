@@ -8,14 +8,13 @@ INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("nyaa", "Nyaa"),
     ("mikan", "Mikan"),
     ("btbtla", "BTBTLA"),
-    ("1lou", "1LOU"),
     ("tpb", "The Pirate Bay"),
     ("sukebei", "Sukebei"),
 )
 INDEXER_SITE_ORDER = tuple(site_id for site_id, _label in INDEXER_SITE_DEFINITIONS)
 INDEXER_SITE_LABELS = dict(INDEXER_SITE_DEFINITIONS)
-DEFAULT_INDEXER_SITE_IDS = ("nyaa", "mikan", "btbtla", "1lou", "tpb")
-_RETIRED_INDEXER_SITE_IDS = frozenset({"animetosho"})
+DEFAULT_INDEXER_SITE_IDS = ("nyaa", "mikan", "btbtla", "tpb")
+RETIRED_INDEXER_SITE_IDS = frozenset({"animetosho", "1lou"})
 
 
 def normalize_indexer_site_ids(value: Any) -> tuple[str, ...]:
@@ -25,7 +24,7 @@ def normalize_indexer_site_ids(value: Any) -> tuple[str, ...]:
 
 def normalize_persisted_indexer_site_ids(value: Any) -> tuple[str, ...]:
     """读取旧持久化配置时丢弃已下线站点，其他未知项仍严格报错。"""
-    return _normalize_indexer_site_ids(value, ignored=_RETIRED_INDEXER_SITE_IDS)
+    return _normalize_indexer_site_ids(value, ignored=RETIRED_INDEXER_SITE_IDS)
 
 
 def _normalize_indexer_site_ids(
@@ -39,7 +38,7 @@ def _normalize_indexer_site_ids(
             raise ValueError("INDEXER_ENABLED_SITES 格式无效")
         items: Iterable[Any] = raw.split(",")
     elif isinstance(value, (list, tuple)):
-        if len(value) > len(INDEXER_SITE_ORDER) * 2:
+        if len(value) > (len(INDEXER_SITE_ORDER) + len(ignored)) * 2:
             raise ValueError("资源站点数量超出允许范围")
         items = value
     else:
@@ -76,15 +75,15 @@ def build_indexer_site_updates(value: Any) -> dict[str, str]:
 
 # ===== 按媒体语义的站点路由 =====
 #
-# 只剔除确定无关的站点，永不返回空集合（fail-open 回退全量），
+# 对仍可用的站点保留 fail-open 回退；不重新启用已下线或成人站点，
 # 用户在订阅上显式配置的站点列表始终优先于自动路由。
-_ANIME_JA_PREFERRED = ("mikan", "nyaa", "1lou", "btbtla")
+_ANIME_JA_PREFERRED = ("mikan", "nyaa", "btbtla")
 _ANIME_JA_DROPPED = frozenset({"tpb"})
 # 国漫主要在中文站；Mikan 只收录日本番组。
-_ANIME_ZH_PREFERRED = ("1lou", "btbtla", "nyaa")
+_ANIME_ZH_PREFERRED = ("btbtla", "nyaa")
 _ANIME_ZH_DROPPED = frozenset({"mikan", "tpb"})
 # 真人影视不会出现在动漫专站。
-_LIVE_ACTION_PREFERRED = ("1lou", "btbtla", "tpb")
+_LIVE_ACTION_PREFERRED = ("btbtla", "tpb")
 _LIVE_ACTION_DROPPED = frozenset({"mikan", "nyaa"})
 
 
@@ -102,7 +101,7 @@ def plan_media_site_route(
     ordered = [
         str(site_id).strip().lower()
         for site_id in available
-        if str(site_id).strip() and str(site_id).strip().lower() != "sukebei"
+        if str(site_id).strip() and str(site_id).strip().lower() not in RETIRED_INDEXER_SITE_IDS | {"sukebei"}
     ]
     if is_animation:
         if str(original_language or "").strip().lower().startswith("zh"):

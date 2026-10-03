@@ -9,7 +9,7 @@ from app.indexers.ranking import annotate_clusters, rank_item
 
 class IndexerRankingTests(unittest.TestCase):
     @staticmethod
-    def _item(title: str, *, site_id: str = "1lou") -> IndexerItem:
+    def _item(title: str, *, site_id: str = "btbtla") -> IndexerItem:
         return IndexerItem(
             site_id=site_id,
             site_name=site_id.upper(),

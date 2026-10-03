@@ -33,7 +33,7 @@ class IndexerQueryBudgetAuditTests(unittest.TestCase):
                 season=season,
                 episode=episode,
             )
-            for provider in ("nyaa", "mikan", "1lou", "btbtla", "tpb", "sukebei"):
+            for provider in ("nyaa", "mikan", "btbtla", "tpb", "sukebei"):
                 with self.subTest(provider=provider, season=season, episode=episode):
                     queries = build_site_queries(provider, request)
                     self.assertGreater(len(queries), 0)

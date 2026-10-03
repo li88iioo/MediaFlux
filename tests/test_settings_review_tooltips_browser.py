@@ -160,7 +160,7 @@ class SettingsReviewTooltipsBrowserTests(unittest.TestCase):
 
 
 @unittest.skipUnless(fixture.sync_playwright is not None, "未安装 Playwright")
-class SettingsCombinedIndexerBrowserTests(unittest.TestCase):
+class SettingsIndexerSiteBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         fixture.NsfwCleanReviewSettingsBrowserTests.setUpClass()
@@ -180,76 +180,91 @@ class SettingsCombinedIndexerBrowserTests(unittest.TestCase):
         page.locator('[data-settings-target="discovery"]').click()
         box = page.locator('[data-indexer-site-box]')
         expect(box).to_be_visible()
-        return page, errors, box.locator('[data-indexer-site="btbtla,1lou"]')
+        return page, errors, box.locator('[data-indexer-site="btbtla"]')
 
     @staticmethod
     def selected(page):
-        return page.locator('[data-key="INDEXER_ENABLED_SITES"]').input_value().split(',')
+        return [site for site in page.locator('[data-key="INDEXER_ENABLED_SITES"]').input_value().split(',') if site]
 
-    def test_composite_label_toggle_and_save_preserve_other_sites_on_mobile_and_desktop(self):
+    def test_comprehensive_btbtla_toggle_and_save_preserves_other_sites_on_mobile_and_desktop(self):
         initial = 'nyaa,mikan,btbtla,1lou,tpb'
+        normalized = ['nyaa', 'mikan', 'btbtla', 'tpb']
         for width in (320, 1280):
             with self.subTest(width=width):
-                page, errors, group = self.ready({'INDEXER_ENABLED_SITES': initial}, width)
+                page, errors, site_toggle = self.ready({'INDEXER_ENABLED_SITES': initial}, width)
                 labels = page.locator('[data-indexer-site-chip] strong').all_text_contents()
                 self.assertEqual(labels, ['Nyaa', 'Mikan', '综合', 'The Pirate Bay', 'Sukebei'])
-                self.assertEqual(page.locator('[data-indexer-site="btbtla"], [data-indexer-site="1lou"]').count(), 0)
-                expect(group).to_be_checked()
-                before = group.locator('..').bounding_box()
-                group.locator('..').click()
+                self.assertEqual(page.locator('[data-indexer-site="btbtla"]').count(), 1)
+                self.assertEqual(self.selected(page), normalized)
+                expect(site_toggle).to_be_checked()
+                before = site_toggle.locator('..').bounding_box()
+                site_toggle.locator('..').click()
                 self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'tpb'])
-                after = group.locator('..').bounding_box()
+                after = site_toggle.locator('..').bounding_box()
                 self.assertEqual((before['width'], before['height']), (after['width'], after['height']))
                 page.locator('#settings-panel-discovery [data-save-settings]').click()
                 page.wait_for_function('window.__settingsWrites.length === 1')
                 self.assertEqual(page.evaluate('window.__settingsWrites[0].INDEXER_ENABLED_SITES'), 'nyaa,mikan,tpb')
                 page.evaluate('window.__resolveSettingsSave()')
                 expect(page.locator('#settings-panel-discovery [data-save-settings]')).to_be_enabled()
-                group.locator('..').click()
-                self.assertEqual(self.selected(page), initial.split(','))
+                site_toggle.locator('..').click()
+                self.assertEqual(self.selected(page), normalized)
                 self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
                 self.assertEqual(errors, [])
                 page.close()
 
-    def test_partial_legacy_selection_survives_other_changes_until_group_is_explicitly_toggled(self):
-        for old_site in ('btbtla', '1lou'):
-            with self.subTest(old_site=old_site):
-                initial = f'nyaa,{old_site}'
-                page, errors, group = self.ready({'INDEXER_ENABLED_SITES': initial})
-                self.assertTrue(group.evaluate('el => el.indeterminate'))
-                self.assertEqual(self.selected(page), initial.split(','))
-                self.assertNotIn('INDEXER_ENABLED_SITES', page.evaluate("collectConfigFields(document.getElementById('settings-panel-discovery'))"))
+    def test_legacy_1lou_is_dropped_without_defaulting_or_losing_other_sites(self):
+        cases = (
+            ('nyaa,mikan,btbtla,1lou,tpb', ['nyaa', 'mikan', 'btbtla', 'tpb']),
+            ('nyaa,1lou', ['nyaa']),
+            ('1lou', []),
+        )
+        for legacy_value, expected in cases:
+            with self.subTest(legacy_value=legacy_value):
+                page, errors, btbtla = self.ready({'INDEXER_ENABLED_SITES': legacy_value})
+                self.assertEqual(self.selected(page), expected)
+                self.assertNotIn('1lou', self.selected(page))
+                self.assertEqual(btbtla.is_checked(), 'btbtla' in expected)
+                config_fields = page.evaluate("collectConfigFields(document.getElementById('settings-panel-discovery'))")
+                self.assertEqual(config_fields['INDEXER_ENABLED_SITES'], ','.join(expected))
                 page.locator('[data-indexer-site="mikan"]').locator('..').click()
-                self.assertEqual(self.selected(page), ['nyaa', 'mikan', old_site])
-                self.assertTrue(group.evaluate('el => el.indeterminate'))
-                group.locator('..').click()
-                expect(group).to_be_checked()
-                self.assertFalse(group.evaluate('el => el.indeterminate'))
-                self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'btbtla', '1lou'])
-                group.locator('..').click()
-                self.assertEqual(self.selected(page), ['nyaa', 'mikan'])
+                expected_after_toggle = (
+                    [site for site in expected if site != 'mikan']
+                    if 'mikan' in expected else
+                    [site for site in ('nyaa', 'mikan', 'btbtla', 'tpb') if site in {*expected, 'mikan'}]
+                )
+                self.assertEqual(self.selected(page), expected_after_toggle)
                 self.assertEqual(errors, [])
                 page.close()
 
-    def test_missing_config_defaults_and_legacy_sensitive_flag_still_load(self):
-        page, errors, group = self.ready({'INDEXER_SUKEBEI_ENABLED': '1'})
-        expect(group).to_be_checked()
-        self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'btbtla', '1lou', 'tpb', 'sukebei'])
-        self.assertEqual(errors, [])
+    def test_missing_and_empty_config_defaults_and_legacy_sensitive_flag_still_load(self):
+        for config in (
+            {'INDEXER_SUKEBEI_ENABLED': '1'},
+            {'INDEXER_ENABLED_SITES': '', 'INDEXER_SUKEBEI_ENABLED': '1'},
+        ):
+            with self.subTest(config=config):
+                page, errors, btbtla = self.ready(config)
+                expect(btbtla).to_be_checked()
+                self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'btbtla', 'tpb', 'sukebei'])
+                self.assertEqual(errors, [])
+                page.close()
 
-    def test_root_toggle_does_not_change_group_members_and_off_group_restores_unchecked(self):
+    def test_root_toggle_does_not_change_selected_sites_or_comprehensive_site(self):
         for sites in ('nyaa', 'nyaa,btbtla'):
             with self.subTest(sites=sites):
-                page, errors, group = self.ready({'INDEXER_ENABLED_SITES': sites})
-                expect(group).not_to_be_checked()
+                page, errors, site_toggle = self.ready({'INDEXER_ENABLED_SITES': sites})
+                if 'btbtla' in sites:
+                    expect(site_toggle).to_be_checked()
+                else:
+                    expect(site_toggle).not_to_be_checked()
                 for key in ('INDEXER_SEARCH_ENABLED', 'DISCOVERY_RESOURCE_RESULTS_ENABLED'):
                     toggle = page.locator(f'[data-key="{key}"]')
                     toggle.locator('..').click()
-                    expect(group).to_be_disabled()
-                    self.assertEqual(self.selected(page), sites.split(','))
+                    expect(site_toggle).to_be_disabled()
+                    self.assertEqual(self.selected(page), [site for site in sites.split(',') if site])
                     toggle.locator('..').click()
-                    expect(group).to_be_enabled()
-                    self.assertEqual(self.selected(page), sites.split(','))
-                self.assertEqual(group.evaluate('el => el.indeterminate'), 'btbtla' in sites)
+                    expect(site_toggle).to_be_enabled()
+                    self.assertEqual(self.selected(page), [site for site in sites.split(',') if site])
+                self.assertFalse(site_toggle.evaluate('el => el.indeterminate'))
                 self.assertEqual(errors, [])
                 page.close()

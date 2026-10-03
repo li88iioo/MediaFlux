@@ -151,6 +151,22 @@ class DiscoveryConfigTests(unittest.TestCase):
         self.assertIn("不允许", self._payload(response)["error"])
         persist.assert_not_called()
 
+    def test_retired_indexer_settings_are_hidden_and_no_longer_writable(self):
+        retired = {"INDEXER_1LOU_GOOGLE_ENABLED": "1", "INDEXER_1LOU_MIN_INTERVAL_SECONDS": "5"}
+        with patch("app.routes.api.config.all_items", return_value={**retired, "INDEXER_ENABLED_SITES": "nyaa,1lou"}):
+            response = get_config(self.request)
+        self.assertFalse(set(retired) & response.keys())
+        # 保留用户已有站点选择原值供读取迁移，不自动替用户开启其它来源。
+        self.assertEqual(response["INDEXER_ENABLED_SITES"], "nyaa,1lou")
+        for key, value in retired.items():
+            with self.subTest(key=key):
+                result, persist = self._save({key: value})
+                self.assertEqual(result.status_code, 400)
+                persist.assert_not_called()
+        result, persist = self._save({"INDEXER_ENABLED_SITES": "1lou"})
+        self.assertEqual(result.status_code, 400)
+        persist.assert_not_called()
+
     def test_config_api_masks_dbcl2_and_omits_all_frodo_credentials(self):
         with patch(
             "app.routes.api.config.all_items",
@@ -290,19 +306,14 @@ class DiscoveryConfigTests(unittest.TestCase):
         response, persist = self._save({
             "INDEXER_SEARCH_ENABLED": "false",
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": "8",
-            "INDEXER_1LOU_MIN_INTERVAL_SECONDS": "6",
-            "INDEXER_1LOU_GOOGLE_ENABLED": "true",
         })
         self.assertEqual(response, {"success": True})
         persist.assert_called_once_with({
             "INDEXER_SEARCH_ENABLED": "0",
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": "8",
-            "INDEXER_1LOU_MIN_INTERVAL_SECONDS": "6",
-            "INDEXER_1LOU_GOOGLE_ENABLED": "1",
         })
         invalid_values = {
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS": ("-1", "61", "1.5"),
-            "INDEXER_1LOU_MIN_INTERVAL_SECONDS": ("-1", "11", "1.5"),
         }
         for key, values in invalid_values.items():
             for value in values:
@@ -362,8 +373,6 @@ class DiscoveryConfigTests(unittest.TestCase):
             "INDEXER_SEARCH_ENABLED",
             "INDEXER_ENABLED_SITES",
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS",
-            "INDEXER_1LOU_MIN_INTERVAL_SECONDS",
-            "INDEXER_1LOU_GOOGLE_ENABLED",
             "DOUBAN_FRODO_API_KEY",
             "DOUBAN_FRODO_API_SECRET",
             "DOUBAN_DBCL2",
@@ -385,8 +394,6 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_RESOURCE_RESULTS_ENABLED",
             "INDEXER_SEARCH_ENABLED",
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS",
-            "INDEXER_1LOU_MIN_INTERVAL_SECONDS",
-            "INDEXER_1LOU_GOOGLE_ENABLED",
             "DOUBAN_CACHE_TTL_SECONDS",
             "DOUBAN_DBCL2",
         ):

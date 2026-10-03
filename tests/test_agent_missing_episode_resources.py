@@ -304,7 +304,7 @@ class MissingEpisodeResourceToolTests(unittest.TestCase):
                 "result_id": f"episode-nine-result-{position:03}", "title": title,
                 "site_id": "nyaa", "site_name": "Nyaa", "download_state": "ready", "download_kinds": ["magnet"],
             } for position, title in enumerate(titles, 1)])
-            searched.data.update({"partial": True, "errors": [{"site_id": "1lou", "message": "timeout"}]})
+            searched.data.update({"partial": True, "errors": [{"site_id": "btbtla", "message": "timeout"}]})
             with self.subTest(extra=extra), patch(
                 "app.agent.episode_resource_actions.audit_series_episodes",
                 return_value=_audit_result(missing=[{"season": 1, "episode": 9}], target_missing=True),

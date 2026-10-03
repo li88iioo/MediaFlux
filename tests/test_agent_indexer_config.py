@@ -51,6 +51,16 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_indexer_site_ids("nyaa,animetosho")
 
+    def test_retired_source_is_removed_only_from_persisted_configuration(self):
+        self.assertEqual(normalize_persisted_indexer_site_ids("nyaa,1lou,btbtla"), ("nyaa", "btbtla"))
+        self.assertEqual(normalize_persisted_indexer_site_ids("1lou"), ())
+        legacy = ["nyaa", "mikan", "btbtla", "1lou", "tpb", "sukebei"] * 2
+        self.assertEqual(normalize_persisted_indexer_site_ids(legacy), ("nyaa", "mikan", "btbtla", "tpb", "sukebei"))
+        with self.assertRaises(ValueError):
+            normalize_indexer_site_ids("1lou")
+        with self.assertRaises(AgentToolError):
+            indexer_sites_arguments({"site_ids": ["1lou"]})
+
     def test_arguments_reject_arbitrary_configuration_and_empty_selection(self):
         self.assertEqual(
             indexer_sites_arguments({"site_ids": ["tpb", "nyaa"]}),

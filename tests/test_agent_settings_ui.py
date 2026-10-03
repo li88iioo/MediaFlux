@@ -146,8 +146,9 @@ class AgentSettingsUiTests(unittest.TestCase):
         telegram_panel = html[html.index('id="settings-panel-telegram"'):html.index('id="settings-panel-agent"')]
         discovery_panel = html[html.index('id="settings-panel-discovery"'):html.index('id="settings-panel-downloads"')]
         metadata_panel = html[html.index('id="settings-panel-metadata"'):html.index('id="settings-panel-discovery"')]
-        self.assertIn("1LOU Google 回退", discovery_panel)
+        self.assertNotIn("1LOU", discovery_panel)
         self.assertNotIn("1LOU 优先使用 Google", html)
+        self.assertNotIn('data-key="INDEXER_1LOU_', html)
         self.assertIn("TMDB 候选召回模式", metadata_panel)
         self.assertIn("AI 线索可信门槛", metadata_panel)
         self.assertNotIn('data-key="TMDB_PREVIEW_CONFIRM"', metadata_panel)

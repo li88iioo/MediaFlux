@@ -96,7 +96,7 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
         preferred_latin = latin_aliases[:1]
         remaining_latin = latin_aliases[1:]
         bases = [*preferred_latin, original, *remaining_latin, english, title, *other_aliases]
-    elif site_id in {"1lou", "btbtla"}:
+    elif site_id == "btbtla":
         bases = [title, english, original, *aliases]
     elif site_id == "tpb":
         bases = [english, *latin_aliases]
@@ -112,7 +112,7 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
     bases = list(_unique(bases, limit=8))
     if request.season is not None or request.episode is not None:
         positioned = [_with_position(value, request) for value in bases]
-        if site_id in {"1lou", "btbtla", "mikan"} and request.episode is not None:
+        if site_id in {"btbtla", "mikan"} and request.episode is not None:
             primary = bases[0] if bases else title
             localized = _with_chinese_episode(primary, request)
             candidates = [

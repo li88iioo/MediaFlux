@@ -11,6 +11,7 @@ from typing import cast
 
 from app.logger import get_logger
 
+from .config import RETIRED_INDEXER_SITE_IDS
 from .errors import (
     IndexerError,
     IndexerInvalidResponse,
@@ -428,16 +429,6 @@ class IndexerService:
             result_id = self.result_store.put(candidate)
             items.append(candidate.with_result_id(result_id))
 
-        site_fallbacks: dict[str, str] = {}
-        error_sites = {error.site_id for error in errors}
-        if (
-            "btbtla" in selected
-            and "1lou" in selected
-            and "btbtla" in error_sites
-            and site_item_counts.get("1lou", 0) > 0
-        ):
-            site_fallbacks["btbtla"] = "1lou"
-
         result = AggregatedIndexerResult(
             query=display_query,
             page=page,
@@ -448,7 +439,6 @@ class IndexerService:
             site_visible_counts=site_visible_counts,
             site_queries=site_queries,
             site_attempt_counts=site_attempt_counts,
-            site_fallbacks=site_fallbacks,
             site_page_states=site_page_states,
             has_more=has_more,
             errors=errors,
@@ -652,7 +642,7 @@ class IndexerService:
         selected: list[str] = []
         for raw_site_id in requested:
             site_id = str(raw_site_id or "").strip().lower()
-            if not site_id or site_id in selected:
+            if not site_id or site_id in selected or site_id in RETIRED_INDEXER_SITE_IDS:
                 continue
             if (
                 site_id not in self.registry.ids()
@@ -662,7 +652,8 @@ class IndexerService:
             selected.append(site_id)
         if not selected:
             raise IndexerValidationError(
-                "at least one enabled indexer site is required"
+                "at least one enabled indexer site is required",
+                public_message="未选择可用资源站点，请在设置中重新选择",
             )
         return tuple(selected)
 

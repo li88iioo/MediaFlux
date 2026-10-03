@@ -323,7 +323,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "row.dataset.resourceSiteId",
             "createFilterButton('', `全部 ${state.resourceResults.size}`",
             "const createFilterButton = (siteId, label, accessibleLabel, status = 'success')",
-            "if (status !== 'disabled' && filterSiteId)",
+            "if (status !== 'disabled' && siteId)",
         ):
             self.assertIn(contract, self.script)
         self.assertRegex(
@@ -617,7 +617,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             self.assertIn(contract, self.script)
         self.assertRegex(
             self.script,
-            re.compile(r"if \(status !== 'disabled' && filterSiteId\)[\s\S]*?createFilterButton\(", re.S),
+            re.compile(r"if \(status !== 'disabled' && siteId\)[\s\S]*?createFilterButton\(", re.S),
         )
         self.assertRegex(
             self.styles,
@@ -882,15 +882,12 @@ class DiscoveryResourceSiteFilterContractTests(unittest.TestCase):
     def setUp(self):
         self.script = SCRIPT.read_text(encoding="utf-8")
 
-    def test_btbtla_and_1lou_share_an_exclusive_filter_without_merging_statuses(self):
-        self.assertIn("const COMBINED_RESOURCE_SITE_IDS = new Set(['btbtla', '1lou'])", self.script)
-        self.assertRegex(
-            self.script,
-            re.compile(r"function isCombinedResourceResult\(result\)\s*\{\s*return isCombinedResourceSite\(result\?\.site_id\);", re.S),
-        )
-        self.assertIn("createFilterButton(COMBINED_RESOURCE_SITE_FILTER, `综合 ${combinedCount}`", self.script)
-        self.assertIn("if (isCombinedSite) return;", self.script)
-        self.assertIn("attachDetails(combinedFilter", self.script)
+    def test_comprehensive_filter_is_btbtla_and_fallback_status_mapping_is_removed(self):
+        self.assertNotIn("__combined_btbtla_1lou__", self.script)
+        self.assertNotIn("fallback_site_id", self.script)
+        self.assertNotIn("entry.status === 'fallback'", self.script)
+        self.assertIn("const siteName = siteId === 'btbtla' ? '综合'", self.script)
+        self.assertRegex(self.script, re.compile(r"createFilterButton\(\s*siteId,", re.S))
         self.assertIn("retryResourceSite(siteId)", self.script)
 
 
@@ -986,10 +983,11 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         )
         page.add_script_tag(content=self.script)
         page.locator("#profileLink").click()
-        page.locator("[data-resource-site-filter='__combined_btbtla_1lou__']").wait_for()
+        page.locator("[data-resource-site-filter='btbtla']").wait_for()
         page.locator("[data-discovery-resource-list]").wait_for()
         self.assertEqual(page_errors, [])
         return page
+
 
     @staticmethod
     def result(result_id, site_id, site_name, source_url):
@@ -1001,16 +999,14 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             "source_url": source_url,
         }
 
-    def test_combined_filter_includes_only_the_two_sites_and_keeps_result_identity(self):
+    def test_comprehensive_filter_uses_btbtla_only_and_keeps_result_identity(self):
         payload = {
             "items": [
                 self.result("bt-result-1", "btbtla", "BTBtla", "https://bt.example/item/1"),
-                self.result("lou-result-2", "1lou", "1lou", "https://lou.example/item/2"),
                 self.result("other-result-3", "other", "Other", "https://other.example/item/3"),
             ],
             "site_statuses": [
                 {"site_id": "btbtla", "site_name": "BTBtla", "status": "success"},
-                {"site_id": "1lou", "site_name": "1lou", "status": "success"},
                 {"site_id": "other", "site_name": "Other", "status": "success"},
             ],
         }
@@ -1018,19 +1014,18 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         filters = page.locator("[data-resource-site-filter]")
         self.assertEqual(
             filters.evaluate_all("nodes => nodes.map(node => node.dataset.resourceSiteFilter)"),
-            ["", "__combined_btbtla_1lou__", "other"],
+            ["", "btbtla", "other"],
         )
-        combined = page.locator("[data-resource-site-filter='__combined_btbtla_1lou__']")
-        self.assertEqual(combined.inner_text(), "综合 2")
+        comprehensive = page.locator("[data-resource-site-filter='btbtla']")
+        self.assertEqual(comprehensive.inner_text(), "综合 1")
 
         rows = page.locator("[data-resource-result-id]")
         self.assertEqual(
             rows.evaluate_all("nodes => nodes.map(node => [node.dataset.resourceResultId, node.dataset.resourceSiteId])"),
-            [["bt-result-1", "btbtla"], ["lou-result-2", "1lou"], ["other-result-3", "other"]],
+            [["bt-result-1", "btbtla"], ["other-result-3", "other"]],
         )
-        combined.click()
+        comprehensive.click()
         self.assertTrue(page.locator("[data-resource-result-id='bt-result-1']").is_visible())
-        self.assertTrue(page.locator("[data-resource-result-id='lou-result-2']").is_visible())
         self.assertFalse(page.locator("[data-resource-result-id='other-result-3']").is_visible())
         self.assertIn("（综合）", page.locator(".discovery-resource-head h3").inner_text())
         self.assertEqual(
@@ -1039,59 +1034,53 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             ),
             [
                 "https://bt.example/item/1",
-                "https://lou.example/item/2",
                 "https://other.example/item/3",
             ],
         )
         self.assertEqual(page.evaluate("window.__resourceSearchRequests.length"), 2)
 
-    def test_filter_keeps_global_pagination_and_all_site_ids_while_showing_composite_rows(self):
+    def test_btbtla_filter_keeps_global_pagination_and_real_site_ids(self):
         first_page = {
             "items": [
                 self.result("bt-result-p1", "btbtla", "BTBtla", "https://bt.example/p1"),
-                self.result("lou-result-p1", "1lou", "1lou", "https://lou.example/p1"),
                 self.result("nyaa-result-p1", "nyaa", "Nyaa", "https://nyaa.example/p1"),
             ],
             "has_more": True,
             "site_statuses": [
                 {"site_id": "btbtla", "site_name": "BTBtla", "status": "success", "has_more": True},
-                {"site_id": "1lou", "site_name": "1lou", "status": "success", "has_more": True},
                 {"site_id": "nyaa", "site_name": "Nyaa", "status": "success", "has_more": True},
             ],
         }
         second_page = {
             "items": [
                 self.result("bt-result-p2", "btbtla", "BTBtla", "https://bt.example/p2"),
-                self.result("lou-result-p2", "1lou", "1lou", "https://lou.example/p2"),
                 self.result("nyaa-result-p2", "nyaa", "Nyaa", "https://nyaa.example/p2"),
             ],
             "has_more": False,
             "site_statuses": [
                 {"site_id": "btbtla", "site_name": "BTBtla", "status": "success", "has_more": False},
-                {"site_id": "1lou", "site_name": "1lou", "status": "success", "has_more": False},
                 {"site_id": "nyaa", "site_name": "Nyaa", "status": "success", "has_more": False},
             ],
         }
         page = self.open_resource_panel(first_page, next_payload=second_page)
-        page.locator("[data-resource-site-filter='__combined_btbtla_1lou__']").click()
+        page.locator("[data-resource-site-filter='btbtla']").click()
         page.locator(".discovery-resource-load-more").click()
         page.wait_for_function("window.__resourceSearchRequests.length === 3")
         request = page.evaluate("window.__resourceSearchRequests[2]")
         request_payload = json.loads(request["body"])
         self.assertEqual(request["url"], "/api/indexers/search")
         self.assertEqual(request_payload["page"], 2)
-        self.assertEqual(request_payload["sites"], ["btbtla", "1lou", "nyaa"])
+        self.assertEqual(request_payload["sites"], ["btbtla", "nyaa"])
 
         self.assertTrue(page.locator("[data-resource-result-id='bt-result-p2']").is_visible())
-        self.assertTrue(page.locator("[data-resource-result-id='lou-result-p2']").is_visible())
         self.assertFalse(page.locator("[data-resource-result-id='nyaa-result-p2']").is_visible())
         self.assertEqual(
             page.locator("[data-resource-result-id]").evaluate_all(
                 "nodes => nodes.map(node => [node.dataset.resourceResultId, node.dataset.resourceSiteId])"
             ),
             [
-                ["bt-result-p1", "btbtla"], ["lou-result-p1", "1lou"], ["nyaa-result-p1", "nyaa"],
-                ["bt-result-p2", "btbtla"], ["lou-result-p2", "1lou"], ["nyaa-result-p2", "nyaa"],
+                ["bt-result-p1", "btbtla"], ["nyaa-result-p1", "nyaa"],
+                ["bt-result-p2", "btbtla"], ["nyaa-result-p2", "nyaa"],
             ],
         )
 
@@ -1102,36 +1091,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             "nyaa",
         )
 
-    def test_btbtla_fallback_to_1lou_is_counted_once(self):
-        payload = {
-            "items": [self.result("lou-fallback-result", "1lou", "1lou", "https://lou.example/item")],
-            "site_statuses": [
-                {
-                    "site_id": "btbtla", "fallback_site_id": "1lou", "site_name": "BTBtla",
-                    "status": "fallback", "message": "BTBtla 不可用，已回退到 1lou",
-                },
-                {"site_id": "1lou", "site_name": "1lou", "status": "success"},
-            ],
-        }
-        page = self.open_resource_panel(payload)
-        self.assertEqual(
-            page.locator("[data-resource-site-filter]").evaluate_all(
-                "nodes => nodes.map(node => node.dataset.resourceSiteFilter)"
-            ),
-            ["", "__combined_btbtla_1lou__"],
-        )
-        combined = page.locator("[data-resource-site-filter='__combined_btbtla_1lou__']")
-        self.assertEqual(combined.inner_text(), "综合 1")
-        self.assertIn("BTBtla 不可用，已回退到 1lou", combined.get_attribute("aria-label"))
-        self.assertEqual(page.locator("[data-resource-result-id]").count(), 1)
-        self.assertEqual(
-            page.locator("[data-resource-result-id]").evaluate_all(
-                "nodes => nodes.map(node => [node.dataset.resourceResultId, node.dataset.resourceSiteId])"
-            ),
-            [["lou-fallback-result", "1lou"]],
-        )
-
-    def test_combined_filter_keeps_each_site_error_and_retry_independent(self):
+    def test_site_errors_and_retries_remain_independent(self):
         payload = {
             "items": [self.result("other-result", "other", "Other", "https://other.example/item")],
             "site_statuses": [
@@ -1139,10 +1099,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                     "site_id": "btbtla", "site_name": "BTBtla", "status": "error",
                     "message": "BTBtla 独立错误", "retryable": True,
                 },
-                {
-                    "site_id": "1lou", "site_name": "1lou", "status": "error",
-                    "message": "1lou 独立错误", "retryable": True,
-                },
+                {"site_id": "nyaa", "site_name": "Nyaa", "status": "error", "message": "Nyaa 独立错误", "retryable": True},
                 {"site_id": "other", "site_name": "Other", "status": "success"},
             ],
         }
@@ -1150,26 +1107,26 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         filters = page.locator("[data-resource-site-filter]")
         self.assertEqual(
             filters.evaluate_all("nodes => nodes.map(node => node.dataset.resourceSiteFilter)"),
-            ["", "__combined_btbtla_1lou__", "other"],
+            ["", "btbtla", "nyaa", "other"],
         )
-        combined_selector = "[data-resource-site-filter='__combined_btbtla_1lou__']"
-        combined = page.locator(combined_selector)
-        self.assertEqual(combined.inner_text(), "综合 0")
-        self.assertIn("BTBtla 独立错误", combined.get_attribute("aria-label"))
-        self.assertIn("1lou 独立错误", combined.get_attribute("title"))
-        combined.focus()
+        btbtla = page.locator("[data-resource-site-filter='btbtla']")
+        nyaa = page.locator("[data-resource-site-filter='nyaa']")
+        self.assertEqual(btbtla.locator("span").first.inner_text(), "综合 失败")
+        self.assertIn("BTBtla 独立错误", btbtla.get_attribute("aria-label"))
+        self.assertIn("Nyaa 独立错误", nyaa.get_attribute("title"))
+        btbtla.focus()
         details = page.locator(".discovery-resource-site-details.is-visible")
         self.assertIn("BTBtla 独立错误", details.inner_text())
-        self.assertIn("1lou 独立错误", details.inner_text())
         self.assertEqual(
             page.locator("[data-resource-site-retry]").evaluate_all(
                 "nodes => nodes.map(node => node.dataset.resourceSiteRetry)"
             ),
-            ["btbtla", "1lou"],
+            ["btbtla", "nyaa"],
         )
-        for site_id in ("btbtla", "1lou"):
-            combined = page.locator(combined_selector)
-            combined.focus()
+        for site_id, chip in (("btbtla", btbtla), ("nyaa", nyaa)):
+            chip.focus()
+            expected_message = "BTBtla 独立错误" if site_id == "btbtla" else "Nyaa 独立错误"
+            self.assertIn(expected_message, details.inner_text())
             retry = page.locator(f'[data-resource-site-retry="{site_id}"]')
             self.assertTrue(retry.is_visible())
             request_count = page.evaluate("window.__resourceSearchRequests.length")
@@ -1182,27 +1139,29 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             self.assertEqual(request["url"], "/api/indexers/search")
             self.assertEqual(json.loads(request["body"])["sites"], [site_id])
 
-    def test_empty_and_disabled_states_still_render_only_one_composite_filter(self):
+    def test_empty_and_disabled_states_keep_direct_site_statuses(self):
         payload = {
             "items": [],
             "site_statuses": [
                 {"site_id": "btbtla", "site_name": "BTBtla", "status": "empty", "message": "没有匹配项"},
-                {"site_id": "1lou", "site_name": "1lou", "status": "disabled", "message": "站点未启用"},
+                {"site_id": "nyaa", "site_name": "Nyaa", "status": "disabled", "message": "站点未启用"},
             ],
         }
         page = self.open_resource_panel(payload)
         filters = page.locator("[data-resource-site-filter]")
         self.assertEqual(
             filters.evaluate_all("nodes => nodes.map(node => node.dataset.resourceSiteFilter)"),
-            ["", "__combined_btbtla_1lou__"],
+            ["", "btbtla"],
         )
-        combined = page.locator("[data-resource-site-filter='__combined_btbtla_1lou__']")
-        self.assertEqual(combined.inner_text(), "综合 0")
-        self.assertIn("BTBtla：暂无结果", combined.get_attribute("aria-label"))
-        self.assertIn("1lou：未启用", combined.get_attribute("title"))
-        combined.focus()
+        btbtla = page.locator("[data-resource-site-filter='btbtla']")
+        self.assertEqual(btbtla.locator("span").first.inner_text(), "综合 0")
+        self.assertIn("综合：暂无结果", btbtla.get_attribute("aria-label"))
+        btbtla.focus()
         self.assertIn("BTBtla：没有匹配项", page.locator(".discovery-resource-site-details.is-visible").inner_text())
-        self.assertEqual(page.locator(".discovery-resource-site-status.is-disabled").count(), 0)
+        disabled = page.locator(".discovery-resource-site-status.is-disabled")
+        self.assertEqual(disabled.count(), 1)
+        self.assertIn("Nyaa：未启用", disabled.get_attribute("aria-label"))
+
 
 
 

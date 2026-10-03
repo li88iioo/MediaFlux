@@ -79,8 +79,8 @@ def _sites():
             "message": "",
         },
         {
-            "site_id": "1lou",
-            "site_name": "1Lou",
+            "site_id": "btbtla",
+            "site_name": "BTBtla",
             "status": "error",
             "count": 0,
             "message": "响应超时",
@@ -219,7 +219,7 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertIn("<b>作品 A</b> · Nyaa · 1 项", text)
         self.assertIn("作品 A [1080p]", text)
         self.assertNotIn("作品 A 第 2 集", text)
-        self.assertIn("1Lou：响应超时", text)
+        self.assertIn("BTBtla：响应超时", text)
         self.assertTrue(
             any(button.text.startswith("✓ Nyaa") for button in markup.buttons)
         )

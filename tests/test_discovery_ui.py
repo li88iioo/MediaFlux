@@ -345,7 +345,7 @@ class DiscoveryPageTests(InitializedWebTestCase):
             'data-key="INDEXER_ENABLED_SITES"',
             'data-indexer-site="nyaa"',
             'data-indexer-site="mikan"',
-            'data-indexer-site="btbtla,1lou"',
+            'data-indexer-site="btbtla"',
             '<strong>综合</strong>',
             'data-indexer-site="tpb"',
             'data-indexer-site="sukebei"',
@@ -370,7 +370,11 @@ class DiscoveryPageTests(InitializedWebTestCase):
             '<strong>Sukebei</strong><small>成人</small>',
         ):
             self.assertIn(contract, html)
-        self.assertIn("const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','1lou','tpb'];", html)
+        self.assertIn("const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','tpb'];", html)
+        self.assertIn("const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','tpb','sukebei'];", html)
+        self.assertNotIn("configured.filter", html)
+        self.assertNotIn("INDEXER_1LOU_", html)
+        self.assertNotIn("1LOU", SETTINGS_TEMPLATE.read_text(encoding="utf-8"))
         self.assertNotIn("AnimeTosho", html)
         self.assertNotIn('data-indexer-site="animetosho"', html)
         styles = STYLES.read_text(encoding="utf-8")

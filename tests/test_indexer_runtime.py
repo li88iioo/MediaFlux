@@ -11,7 +11,7 @@ from app.indexers import runtime
 
 class FakeRegistry:
     def ids(self):
-        return ("nyaa", "sukebei", "mikan", "btbtla", "1lou", "tpb")
+        return ("nyaa", "sukebei", "mikan", "btbtla", "tpb")
 
     def enabled_ids(self):
         return ("nyaa",)
@@ -71,9 +71,6 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             user_agent="MediaFlux/Test",
             nyaa_endpoint_timeout_seconds=4.0,
             btbtla_min_interval_seconds=5,
-            onelou_min_interval_seconds=5,
-            onelou_endpoint_timeout_seconds=3.0,
-            onelou_google_enabled=True,
         )
         self.assertIs(service.registry, registry)
 
@@ -94,7 +91,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.enabled_site_ids,
-            frozenset({"nyaa", "mikan", "btbtla", "1lou", "tpb"}),
+            frozenset({"nyaa", "mikan", "btbtla", "tpb"}),
         )
 
     def test_build_service_ignores_retired_site_in_persisted_selection(self):
@@ -118,6 +115,15 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             service = runtime.build_indexer_service()
 
         self.assertEqual(service.enabled_site_ids, frozenset({"nyaa"}))
+
+    def test_old_onelou_only_selection_does_not_enable_other_providers(self):
+        with patch("app.indexers.runtime.config.get", side_effect=lambda key, default="": "1lou" if key == "INDEXER_ENABLED_SITES" else default), patch(
+            "app.indexers.runtime.config.get_int", side_effect=lambda key, default: default,
+        ), patch("app.indexers.runtime.config.get_bool", return_value=False), patch(
+            "app.indexers.runtime.build_default_registry", return_value=FakeRegistry(),
+        ):
+            service = runtime.build_indexer_service()
+        self.assertEqual(service.enabled_site_ids, frozenset())
 
     async def test_sync_bridge_without_binding_reuses_and_closes_standalone_loop(self):
         observed: list[asyncio.AbstractEventLoop] = []

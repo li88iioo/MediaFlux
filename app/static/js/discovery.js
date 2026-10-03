@@ -18,8 +18,6 @@
     const INDEXER_DOWNLOAD_BATCH_PATH = '/api/indexers/download/batch';
     const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit';
     const RESOURCE_SELECTION_LIMIT = 50;
-    const COMBINED_RESOURCE_SITE_FILTER = '__combined_btbtla_1lou__';
-    const COMBINED_RESOURCE_SITE_IDS = new Set(['btbtla', '1lou']);
     const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);
     const RESOURCE_MANUAL_REVIEW_MESSAGE = '请核对下载列表/目标状态，必要时重新检索后人工处理';
     const DOWNLOAD_REQUEST_STATUS_LABELS = {
@@ -1565,14 +1563,6 @@
         return String(result?.site_id || result?.site_name || '');
     }
 
-    function isCombinedResourceSite(siteId) {
-        return COMBINED_RESOURCE_SITE_IDS.has(String(siteId || '').trim().toLowerCase());
-    }
-
-    function isCombinedResourceResult(result) {
-        return isCombinedResourceSite(result?.site_id);
-    }
-
     function resourceKnownNumber(value) {
         if (value === null || value === undefined || value === '') return null;
         const number = Number(value);
@@ -1632,9 +1622,7 @@
         const results = [...state.resourceResults.values()];
         const filtered = !state.activeResourceSiteId
             ? results
-            : state.activeResourceSiteId === COMBINED_RESOURCE_SITE_FILTER
-                ? results.filter(isCombinedResourceResult)
-                : results.filter((result) => resourceSiteKey(result) === state.activeResourceSiteId);
+            : results.filter((result) => resourceSiteKey(result) === state.activeResourceSiteId);
         return sortedResourceResults(filtered);
     }
 
@@ -2041,10 +2029,6 @@
         return [...state.resourceResults.values()].filter((result) => resourceSiteKey(result) === siteId).length;
     }
 
-    function combinedResourceResultCount() {
-        return [...state.resourceResults.values()].filter(isCombinedResourceResult).length;
-    }
-
     function mergeResourceSiteStatuses(statuses, siteId = '') {
         if (!siteId) return asArray(statuses).map((status) => ({...status}));
         const merged = new Map(state.resourceSiteStatuses.map((status) => [String(status.site_id || ''), {...status}]));
@@ -2109,7 +2093,7 @@
             if (!entries.length) return;
             chip.classList.add('has-detail');
             const status = entries.some((entry) => entry.status === 'error') ? 'error'
-                : entries.some((entry) => entry.status === 'fallback') ? 'fallback' : 'empty';
+                : 'empty';
             const message = node('div', `discovery-resource-site-message is-${status}`);
             message.append(node('span', '', entries.map(({site, status}) =>
                 `${site.site_name || '未知站点'}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`
@@ -2132,60 +2116,27 @@
             details.append(message);
             attachDetailEvents(chip);
         };
-        const labels = {success: '检索成功', fallback: '已补位', empty: '暂无结果', error: '检索失败', disabled: '未启用'};
+        const labels = {success: '检索成功', empty: '暂无结果', error: '检索失败', disabled: '未启用'};
         const normalizedStatus = (site) => Object.prototype.hasOwnProperty.call(labels, site.status) ? site.status : 'error';
-        const statusFilterId = (site) => {
-            const status = normalizedStatus(site);
-            if (status === 'fallback' && site.fallback_site_id) return String(site.fallback_site_id);
-            return String(site.site_id || site.id || '');
-        };
-        const combinedStatuses = siteStatuses.filter((site) => isCombinedResourceSite(statusFilterId(site)));
-        const combinedCount = combinedResourceResultCount();
-        const combinedDescription = combinedStatuses.map((site) => {
-            const status = normalizedStatus(site);
-            const siteName = site.site_name || site.site_id || site.id || '未知站点';
-            return `${siteName}：${labels[status]}`
-                + (site.message ? `，${site.message}` : '')
-                + resourceSiteDiagnostic(site);
-        }).join('；');
-        const combinedStatus = combinedStatuses.some((site) => normalizedStatus(site) === 'error') ? 'error'
-            : combinedStatuses.some((site) => normalizedStatus(site) === 'fallback') ? 'fallback'
-                : combinedCount ? 'success' : 'empty';
-        const combinedLabel = `显示 BTBtla 与 1lou 的资源，共 ${combinedCount} 条`
-            + (combinedDescription ? `；${combinedDescription}` : '');
-        const combinedFilter = combinedStatuses.length || combinedCount
-            ? createFilterButton(COMBINED_RESOURCE_SITE_FILTER, `综合 ${combinedCount}`, combinedLabel, combinedStatus)
-            : null;
         const allButton = createFilterButton('', `全部 ${state.resourceResults.size}`, `显示全部 ${state.resourceResults.size} 条资源`);
         region.append(allButton);
-        if (combinedFilter) {
-            combinedFilter.title = combinedLabel;
-            attachDetails(combinedFilter, combinedStatuses.map((site) => ({
-                site, siteId: String(site.site_id || site.id || ''), status: normalizedStatus(site),
-            })).filter(({status}) => ['error', 'empty', 'fallback'].includes(status)));
-            region.append(combinedFilter);
-        }
 
         siteStatuses.forEach((site) => {
             const status = normalizedStatus(site);
             const siteId = String(site.site_id || site.id || site.site_name || '');
-            const filterSiteId = status === 'fallback' && site.fallback_site_id
-                ? String(site.fallback_site_id)
-                : siteId;
-            const isCombinedSite = isCombinedResourceSite(filterSiteId);
+            const siteName = siteId === 'btbtla' ? '综合' : site.site_name || siteId || '未知站点';
             const statusLabel = labels[status];
-            const count = resourceSiteResultCount(filterSiteId);
-            const accessibleLabel = `${site.site_name || '未知站点'}：${statusLabel}`
+            const count = resourceSiteResultCount(siteId);
+            const accessibleLabel = `${siteName}：${statusLabel}`
                 + (site.message ? `，${site.message}` : '')
                 + resourceSiteDiagnostic(site);
-            if (isCombinedSite) return;
 
             let chip;
-            if (status !== 'disabled' && filterSiteId) {
+            if (status !== 'disabled' && siteId) {
                 const suffix = status === 'error' ? '失败' : status === 'empty' ? '0' : String(count);
                 chip = createFilterButton(
-                    filterSiteId,
-                    `${site.site_name || siteId} ${suffix}`,
+                    siteId,
+                    `${siteName} ${suffix}`,
                     `${accessibleLabel}，点击筛选该站点资源`,
                     status,
                 );
@@ -2193,12 +2144,12 @@
                 chip = node(
                     'span',
                     `discovery-resource-site-status is-${status}`,
-                    site.site_name || siteId || '未知站点',
+                    siteName,
                 );
                 chip.setAttribute('aria-label', accessibleLabel);
             }
             chip.title = accessibleLabel;
-            if (['error', 'empty', 'fallback'].includes(status)) {
+            if (['error', 'empty'].includes(status)) {
                 attachDetails(chip, [{site, siteId, status}]);
             }
             if (site.message) chip.append(node('span', 'sr-only', site.message));
@@ -2628,11 +2579,10 @@
 
     function activeResourceSiteName() {
         if (!state.activeResourceSiteId) return '全部';
-        if (state.activeResourceSiteId === COMBINED_RESOURCE_SITE_FILTER) return '综合';
+        if (state.activeResourceSiteId === 'btbtla') return '综合';
         const site = state.resourceSiteStatuses.find((status) => {
             const siteId = String(status.site_id || status.id || status.site_name || '');
-            const fallbackId = String(status.fallback_site_id || '');
-            return siteId === state.activeResourceSiteId || fallbackId === state.activeResourceSiteId;
+            return siteId === state.activeResourceSiteId;
         });
         return site?.site_name || site?.name || state.activeResourceSiteId;
     }

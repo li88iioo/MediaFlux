@@ -13,19 +13,19 @@ from app.indexers.config import plan_media_site_route, tmdb_detail_is_animation
 from app.indexers.service import IndexerService
 from app.modules.media_subscriptions import _resolve_search_sites
 
-ALL_SITES = ("nyaa", "mikan", "btbtla", "1lou", "tpb")
+ALL_SITES = ("nyaa", "mikan", "btbtla", "tpb")
 
 
 class PlanMediaSiteRouteTests(unittest.TestCase):
     def test_japanese_anime_prefers_anime_trackers_and_drops_tpb(self):
         routed = plan_media_site_route(ALL_SITES, is_animation=True, original_language="ja")
 
-        self.assertEqual(routed, ("mikan", "nyaa", "1lou", "btbtla"))
+        self.assertEqual(routed, ("mikan", "nyaa", "btbtla"))
 
     def test_chinese_anime_prefers_cn_forums_and_drops_mikan(self):
         routed = plan_media_site_route(ALL_SITES, is_animation=True, original_language="zh")
 
-        self.assertEqual(routed, ("1lou", "btbtla", "nyaa"))
+        self.assertEqual(routed, ("btbtla", "nyaa"))
 
     def test_live_action_drops_anime_only_sites(self):
         for language in ("zh", "en", ""):
@@ -34,7 +34,11 @@ class PlanMediaSiteRouteTests(unittest.TestCase):
                     ALL_SITES, is_animation=False, original_language=language,
                 )
 
-                self.assertEqual(routed, ("1lou", "btbtla", "tpb"))
+                self.assertEqual(routed, ("btbtla", "tpb"))
+
+    def test_retired_sites_never_join_routing_even_if_supplied_by_old_config(self):
+        self.assertEqual(plan_media_site_route(("1lou", "btbtla"), is_animation=False), ("btbtla",))
+        self.assertEqual(plan_media_site_route(("1lou",), is_animation=False), ())
 
     def test_sukebei_never_joins_automatic_routing(self):
         routed = plan_media_site_route(
@@ -55,9 +59,9 @@ class PlanMediaSiteRouteTests(unittest.TestCase):
         self.assertEqual(routed, ("nyaa",))
 
     def test_blank_entries_are_ignored(self):
-        routed = plan_media_site_route(("", " 1LOU ", "tpb"), is_animation=False)
+        routed = plan_media_site_route(("", " BTBTLA ", "tpb"), is_animation=False)
 
-        self.assertEqual(routed, ("1lou", "tpb"))
+        self.assertEqual(routed, ("btbtla", "tpb"))
 
 
 class TmdbAnimationDetectionTests(unittest.TestCase):
@@ -81,21 +85,21 @@ class TmdbAnimationDetectionTests(unittest.TestCase):
 class ServiceMediaSiteRouteTests(unittest.TestCase):
     def test_route_uses_registry_order_and_enabled_subset(self):
         stub = SimpleNamespace(
-            registry=SimpleNamespace(ids=lambda: ("nyaa", "mikan", "btbtla", "1lou", "tpb", "sukebei")),
-            enabled_site_ids=frozenset({"nyaa", "1lou", "tpb", "sukebei"}),
+            registry=SimpleNamespace(ids=lambda: ("nyaa", "mikan", "btbtla", "tpb", "sukebei")),
+            enabled_site_ids=frozenset({"nyaa", "tpb", "sukebei"}),
         )
 
         routed = IndexerService.media_site_route(
             stub, is_animation=False, original_language="zh",
         )
 
-        self.assertEqual(routed, ("1lou", "tpb"))
+        self.assertEqual(routed, ("tpb",))
 
 
 class ResolveSearchSitesTests(unittest.TestCase):
     def test_explicit_subscription_sites_win_over_routing(self):
         service = SimpleNamespace(
-            media_site_route=lambda **_kwargs: ("1lou",),
+            media_site_route=lambda **_kwargs: ("btbtla",),
         )
 
         sites = _resolve_search_sites(["nyaa"], {"genres": [{"id": 16}]}, service)
@@ -107,14 +111,14 @@ class ResolveSearchSitesTests(unittest.TestCase):
 
         def route(**kwargs):
             captured.update(kwargs)
-            return ("1lou", "btbtla")
+            return ("btbtla",)
 
         service = SimpleNamespace(media_site_route=route)
         detail = {"genres": [{"id": 16}], "original_language": "zh"}
 
         sites = _resolve_search_sites([], detail, service)
 
-        self.assertEqual(sites, ["1lou", "btbtla"])
+        self.assertEqual(sites, ["btbtla"])
         self.assertTrue(captured["is_animation"])
         self.assertEqual(captured["original_language"], "zh")
 
