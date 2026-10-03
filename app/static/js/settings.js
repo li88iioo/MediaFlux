@@ -67,7 +67,11 @@
 
     function syncIndexerSiteSelection(){
         if(!indexerSiteField)return;
-        const selected=new Set(indexerSiteInputs.filter(input=>input.checked).map(input=>input.dataset.indexerSite));
+        const selected=new Set(indexerSiteField.value.split(','));
+        indexerSiteInputs.forEach(input=>{
+            if(input.indeterminate)return; // 旧配置只启用一站时，未操作该组不能扩大授权范围。
+            input.dataset.indexerSite.split(',').forEach(site=>input.checked?selected.add(site):selected.delete(site));
+        });
         indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
     }
     function syncIndexerSiteAvailability(){
@@ -82,8 +86,12 @@
         const configured=String(config.INDEXER_ENABLED_SITES||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean);
         const selected=new Set(configured.length?configured:DEFAULT_INDEXER_SITES);
         if(['1','true','yes','on'].includes(String(config.INDEXER_SUKEBEI_ENABLED||'').toLowerCase()))selected.add('sukebei');
-        indexerSiteInputs.forEach(input=>{input.checked=selected.has(input.dataset.indexerSite);});
-        syncIndexerSiteSelection();
+        if(indexerSiteField)indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
+        indexerSiteInputs.forEach(input=>{
+            const members=input.dataset.indexerSite.split(',');
+            input.checked=members.every(site=>selected.has(site));
+            input.indeterminate=!input.checked&&members.some(site=>selected.has(site));
+        });
         syncIndexerSiteAvailability();
     }
     indexerSiteInputs.forEach(input=>input.addEventListener('change',syncIndexerSiteSelection));

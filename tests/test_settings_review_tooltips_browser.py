@@ -157,3 +157,99 @@ class SettingsReviewTooltipsBrowserTests(unittest.TestCase):
         expect(page.locator('[data-key="AGENT_EPISODE_RESEARCH_ENABLED"]')).to_be_disabled()
         expect(page.locator('[data-key="AGENT_NSFW_CLEAN_REVIEW_ENABLED"]')).to_be_disabled()
         self.assertEqual(errors, [])
+
+
+@unittest.skipUnless(fixture.sync_playwright is not None, "未安装 Playwright")
+class SettingsCombinedIndexerBrowserTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        fixture.NsfwCleanReviewSettingsBrowserTests.setUpClass()
+        cls.browser = fixture.NsfwCleanReviewSettingsBrowserTests.browser
+
+    @classmethod
+    def tearDownClass(cls):
+        fixture.NsfwCleanReviewSettingsBrowserTests.tearDownClass()
+
+    _page = fixture.NsfwCleanReviewSettingsBrowserTests._page
+
+    def ready(self, config, width=390):
+        page, errors = self._page(width, {
+            "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1", "INDEXER_SEARCH_ENABLED": "1", **config,
+        })
+        fixture.NsfwCleanReviewSettingsBrowserTests._resolve_config(page)
+        page.locator('[data-settings-target="discovery"]').click()
+        box = page.locator('[data-indexer-site-box]')
+        expect(box).to_be_visible()
+        return page, errors, box.locator('[data-indexer-site="btbtla,1lou"]')
+
+    @staticmethod
+    def selected(page):
+        return page.locator('[data-key="INDEXER_ENABLED_SITES"]').input_value().split(',')
+
+    def test_composite_label_toggle_and_save_preserve_other_sites_on_mobile_and_desktop(self):
+        initial = 'nyaa,mikan,btbtla,1lou,tpb'
+        for width in (320, 1280):
+            with self.subTest(width=width):
+                page, errors, group = self.ready({'INDEXER_ENABLED_SITES': initial}, width)
+                labels = page.locator('[data-indexer-site-chip] strong').all_text_contents()
+                self.assertEqual(labels, ['Nyaa', 'Mikan', '综合', 'The Pirate Bay', 'Sukebei'])
+                self.assertEqual(page.locator('[data-indexer-site="btbtla"], [data-indexer-site="1lou"]').count(), 0)
+                expect(group).to_be_checked()
+                before = group.locator('..').bounding_box()
+                group.locator('..').click()
+                self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'tpb'])
+                after = group.locator('..').bounding_box()
+                self.assertEqual((before['width'], before['height']), (after['width'], after['height']))
+                page.locator('#settings-panel-discovery [data-save-settings]').click()
+                page.wait_for_function('window.__settingsWrites.length === 1')
+                self.assertEqual(page.evaluate('window.__settingsWrites[0].INDEXER_ENABLED_SITES'), 'nyaa,mikan,tpb')
+                page.evaluate('window.__resolveSettingsSave()')
+                expect(page.locator('#settings-panel-discovery [data-save-settings]')).to_be_enabled()
+                group.locator('..').click()
+                self.assertEqual(self.selected(page), initial.split(','))
+                self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+                self.assertEqual(errors, [])
+                page.close()
+
+    def test_partial_legacy_selection_survives_other_changes_until_group_is_explicitly_toggled(self):
+        for old_site in ('btbtla', '1lou'):
+            with self.subTest(old_site=old_site):
+                initial = f'nyaa,{old_site}'
+                page, errors, group = self.ready({'INDEXER_ENABLED_SITES': initial})
+                self.assertTrue(group.evaluate('el => el.indeterminate'))
+                self.assertEqual(self.selected(page), initial.split(','))
+                self.assertNotIn('INDEXER_ENABLED_SITES', page.evaluate("collectConfigFields(document.getElementById('settings-panel-discovery'))"))
+                page.locator('[data-indexer-site="mikan"]').locator('..').click()
+                self.assertEqual(self.selected(page), ['nyaa', 'mikan', old_site])
+                self.assertTrue(group.evaluate('el => el.indeterminate'))
+                group.locator('..').click()
+                expect(group).to_be_checked()
+                self.assertFalse(group.evaluate('el => el.indeterminate'))
+                self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'btbtla', '1lou'])
+                group.locator('..').click()
+                self.assertEqual(self.selected(page), ['nyaa', 'mikan'])
+                self.assertEqual(errors, [])
+                page.close()
+
+    def test_missing_config_defaults_and_legacy_sensitive_flag_still_load(self):
+        page, errors, group = self.ready({'INDEXER_SUKEBEI_ENABLED': '1'})
+        expect(group).to_be_checked()
+        self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'btbtla', '1lou', 'tpb', 'sukebei'])
+        self.assertEqual(errors, [])
+
+    def test_root_toggle_does_not_change_group_members_and_off_group_restores_unchecked(self):
+        for sites in ('nyaa', 'nyaa,btbtla'):
+            with self.subTest(sites=sites):
+                page, errors, group = self.ready({'INDEXER_ENABLED_SITES': sites})
+                expect(group).not_to_be_checked()
+                for key in ('INDEXER_SEARCH_ENABLED', 'DISCOVERY_RESOURCE_RESULTS_ENABLED'):
+                    toggle = page.locator(f'[data-key="{key}"]')
+                    toggle.locator('..').click()
+                    expect(group).to_be_disabled()
+                    self.assertEqual(self.selected(page), sites.split(','))
+                    toggle.locator('..').click()
+                    expect(group).to_be_enabled()
+                    self.assertEqual(self.selected(page), sites.split(','))
+                self.assertEqual(group.evaluate('el => el.indeterminate'), 'btbtla' in sites)
+                self.assertEqual(errors, [])
+                page.close()
