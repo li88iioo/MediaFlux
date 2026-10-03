@@ -1097,6 +1097,7 @@
         // 弹窗必须脱离带 transform/animation 的页面内容容器，否则 fixed 会相对
         // 容器而非浏览器视口定位，长页面中会出现在当前可视区域下方。
         if (modal.parentElement !== document.body) document.body.appendChild(modal);
+        const nativeDialog = typeof modal.showModal === 'function';
         const dialog = modal.querySelector('[role="dialog"], [role="alertdialog"]') || modal;
         const focusableSelector = [
             'a[href]', 'button:not([disabled])', 'input:not([disabled]):not([type="hidden"])',
@@ -1118,6 +1119,7 @@
         function close({restoreFocus = true} = {}) {
             focusGeneration += 1;
             const wasOpen = !modal.hidden;
+            if (nativeDialog && modal.open) modal.close();
             modal.hidden = true;
             unregisterModalLayer(layer);
             const target = returnFocus;
@@ -1138,6 +1140,7 @@
             returnFocus = trigger || document.activeElement;
             modal.hidden = false;
             registerModalLayer(layer);
+            if (nativeDialog && !modal.open) modal.showModal();
             requestAnimationFrame(() => {
                 if (generation !== focusGeneration || modal.hidden || topModalLayer() !== layer) return;
                 // 打开到下一帧之间，用户可能已切换输入框，不能抢走其焦点。
@@ -1145,6 +1148,14 @@
                 resolveInitialFocus(initialFocus)?.focus?.({preventScroll: true});
             });
             return true;
+        }
+        function onNativeCancel(event) {
+            event.preventDefault();
+            requestClose('escape');
+        }
+        function onNativeClose() {
+            // close事件可以晚于同一确认窗的下一次打开，不能关闭新请求。
+            if (!modal.open && !modal.hidden) requestClose('native-close');
         }
         function onControlClick() {
             requestClose('control');
@@ -1186,10 +1197,18 @@
             destroyed = true;
             closeControls.forEach((button) => button.removeEventListener?.('click', onControlClick));
             modal.removeEventListener?.('click', onBackdropClick);
+            if (nativeDialog) {
+                modal.removeEventListener('cancel', onNativeCancel);
+                modal.removeEventListener('close', onNativeClose);
+            }
             document.removeEventListener?.('keydown', onDocumentKeydown);
         }
         closeControls.forEach((button) => button.addEventListener('click', onControlClick));
         modal.addEventListener('click', onBackdropClick);
+        if (nativeDialog) {
+            modal.addEventListener('cancel', onNativeCancel);
+            modal.addEventListener('close', onNativeClose);
+        }
         document.addEventListener('keydown', onDocumentKeydown);
         return {
             open,
@@ -1202,7 +1221,6 @@
 
     const confirmModal = document.getElementById('appConfirmModal');
     if (confirmModal) {
-        const confirmDialog = confirmModal.querySelector('[role="alertdialog"]');
         const confirmTitle = document.getElementById('appConfirmTitle');
         const confirmMessage = document.getElementById('appConfirmMessage');
         const confirmKicker = document.getElementById('appConfirmKicker');

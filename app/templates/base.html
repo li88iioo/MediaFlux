@@ -82,8 +82,8 @@
             <div class="content">{% block content %}{% endblock %}</div>
         </main>
     </div>
-    <div class="app-modal app-confirm-modal" id="appConfirmModal" hidden>
-        <div class="card app-confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="appConfirmTitle" aria-describedby="appConfirmMessage">
+    <dialog class="app-modal app-confirm-modal" id="appConfirmModal" role="alertdialog" aria-modal="true" aria-labelledby="appConfirmTitle" aria-describedby="appConfirmMessage" hidden>
+        <div class="card app-confirm-dialog">
             <div class="app-confirm-icon" data-confirm-icon><i data-lucide="circle-help"></i></div>
             <div class="app-confirm-copy">
                 <span class="server-kicker" id="appConfirmKicker">CONFIRM ACTION</span>
@@ -99,9 +99,9 @@
                 <button type="button" class="btn btn-primary" id="appConfirmSubmit">确认</button>
             </div>
         </div>
-    </div>
-    <div class="app-modal app-message-modal" id="appMessageModal" hidden>
-        <div class="card app-message-dialog" role="alertdialog" aria-modal="true" aria-labelledby="appMessageTitle" aria-describedby="appMessageText">
+    </dialog>
+    <dialog class="app-modal app-message-modal" id="appMessageModal" role="alertdialog" aria-modal="true" aria-labelledby="appMessageTitle" aria-describedby="appMessageText" hidden>
+        <div class="card app-message-dialog">
             <div class="app-message-icon" data-message-icon><i data-lucide="info"></i></div>
             <div class="app-message-copy">
                 <span class="server-kicker" id="appMessageKicker">SYSTEM MESSAGE</span>
@@ -112,7 +112,7 @@
                 <button type="button" class="btn btn-primary" id="appMessageClose">知道了</button>
             </div>
         </div>
-    </div>
+    </dialog>
     <div class="app-toast-container" id="appToastContainer" aria-live="polite" aria-atomic="true"></div>
     <script src="{{ static_url('js/lucide.min.js') }}"></script>
     {% if active in ['dashboard', 'agent', 'downloads', 'guangya_strm', 'local_media', 'logs', 'rss'] %}

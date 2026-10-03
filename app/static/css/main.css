@@ -2659,6 +2659,9 @@ input[type="password"].form-input { padding-right: 44px; }
     animation: fade-in .18s both;
 }
 .app-modal[hidden] { display: none; }
+/* 公共确认/消息使用原生顶层，避免被媒体档案的 showModal 遮挡。 */
+dialog.app-modal { width: 100%; max-width: none; height: 100%; max-height: none; margin: 0; border: 0; box-sizing: border-box; color: inherit; }
+dialog.app-modal::backdrop { background: transparent; }
 .media-config-modal { position: fixed; inset: 0; z-index: 360; display: grid; place-items: center; padding: clamp(14px, 3vw, 30px); background: var(--overlay-strong); backdrop-filter: blur(12px); overflow: hidden; overscroll-behavior: contain; animation: fade-in .2s both; }
 .media-config-modal[hidden] { display: none; }
 body.modal-open,

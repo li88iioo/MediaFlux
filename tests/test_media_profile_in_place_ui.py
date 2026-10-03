@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright, expect
 except ImportError:  # pragma: no cover - 可选浏览器依赖
     sync_playwright = None
 
@@ -167,6 +167,187 @@ class MediaProfileInPlaceUiContractTests(unittest.TestCase):
             if browser is not None:
                 browser.close()
             playwright.stop()
+
+
+
+@unittest.skipIf(sync_playwright is None, "未安装 Playwright")
+class ResourceConfirmLayerBrowserTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        from jinja2 import Environment, FileSystemLoader
+        cls.playwright = sync_playwright().start()
+        executable = next((path for name in ('google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser') if (path := shutil.which(name))), None)
+        if not executable:
+            cls.playwright.stop()
+            raise unittest.SkipTest('未找到 Chromium')
+        cls.browser = cls.playwright.chromium.launch(executable_path=executable, headless=True, args=['--no-sandbox'])
+        env = Environment(loader=FileSystemLoader(ROOT / 'app/templates'), autoescape=True)
+        cls.html = env.from_string('''{% extends "base.html" %}{% block content %}
+            <a id="openProfile" data-media-profile-link href="/discovery?detail_provider=tmdb&detail_type=tv&detail_id=123">打开资源</a>
+            {% include "_media_profile_host.html" %}{% endblock %}
+            {% block scripts %}<script src="{{ static_url('js/discovery.js') }}"></script>{% endblock %}''').render(
+                active='global_search', app_version='offline-test', resource_results_enabled=True,
+                discovery_enabled=True, agent_enabled=False, csrf_token=lambda: 'offline-csrf',
+                static_url=lambda path: '/static/' + path, url_for=lambda name, **kwargs: '/' + name.split('.')[-1],
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.browser.close()
+        cls.playwright.stop()
+
+    def page(self, width=390, *, native=True):
+        import mimetypes
+        from urllib.parse import unquote, urlsplit
+        context = self.browser.new_context(viewport={'width': width, 'height': 844}, reduced_motion='reduce')
+        self.addCleanup(context.close)
+        if not native:
+            context.add_init_script('HTMLDialogElement.prototype.showModal = undefined')
+        page = context.new_page()
+        page.set_default_timeout(4000)
+        writes, errors, unexpected = [], [], []
+        resources = [{'result_id': f'resource-{i}', 'site_id': 'btbtla', 'site_name': 'BTBtla',
+                      'title': f'离线测试资源 {i}', 'download_state': 'resolvable', 'download_kinds': ['magnet']} for i in range(5)]
+        def route_request(route):
+            path = unquote(urlsplit(route.request.url).path)
+            if path == '/test':
+                route.fulfill(status=200, content_type='text/html', body=self.html)
+            elif path.startswith('/static/'):
+                asset = (ROOT / 'app' / path.lstrip('/')).resolve()
+                if asset.is_relative_to(ROOT / 'app/static') and asset.is_file():
+                    route.fulfill(status=200, content_type=mimetypes.guess_type(str(asset))[0] or 'application/octet-stream', body=asset.read_bytes())
+                else:
+                    route.abort()
+            elif path.startswith('/api/discovery/detail/'):
+                route.fulfill(json={'detail': {'provider': 'tmdb', 'media_type': 'tv', 'external_id': '123', 'tmdb_id': 123, 'title': '离线测试剧集', 'year': 2026}})
+            elif path == '/api/indexers/search':
+                route.fulfill(json={'items': resources, 'site_statuses': [{'site_id': 'btbtla', 'site_name': 'BTBtla', 'status': 'success'}]})
+            elif path == '/api/indexers/download/batch':
+                writes.append(route.request.post_data_json)
+                route.fulfill(json={'ok': True, 'items': [{'result_id': item['result_id'], 'ok': True, 'status': 'success', 'succeeded': ['guangya']} for item in resources]})
+            else:
+                unexpected.append(route.request.url)
+                route.abort()
+        context.route('**/*', route_request)
+        context.route_web_socket('**/*', lambda ws: ws.close())
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        page.goto('http://testserver/test')
+        page.locator('#openProfile').click()
+        expect(page.locator('[data-resource-result-id]')).to_have_count(5)
+        page.locator('[data-resource-select-all]').click()
+        expect(page.locator('[data-resource-batch-target="guangya"]')).to_be_enabled()
+        self.addCleanup(lambda: self.assertEqual(errors, []))
+        self.addCleanup(lambda: self.assertEqual(unexpected, []))
+        return page, writes
+
+    def assert_frontmost(self, page, modal_id):
+        self.assertTrue(page.locator('#' + modal_id).evaluate('el => el.matches(":modal")'))
+        self.assertTrue(page.locator('#' + modal_id).evaluate('''el => {
+            const card=el.querySelector('.card'); const r=card.getBoundingClientRect();
+            return el.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));
+        }'''))
+
+    def test_five_resource_confirmation_cancel_escape_and_single_submission(self):
+        for width in (1280, 390, 320):
+            with self.subTest(width=width):
+                page, writes = self.page(width)
+                trigger = page.locator('[data-resource-batch-target="guangya"]')
+                trigger.click()
+                self.assert_frontmost(page, 'appConfirmModal')
+                self.assertEqual(page.locator('#appConfirmTitle').inner_text(), '提交 5 条资源？')
+                self.assertEqual(page.locator('#appConfirmMessage').inner_text(), '目标：光鸭')
+                card = page.locator('.app-confirm-dialog').bounding_box()
+                self.assertGreaterEqual(card['x'], 0)
+                self.assertLessEqual(card['x'] + card['width'], width)
+                self.assertGreaterEqual(card['y'], 0)
+                self.assertLessEqual(card['y'] + card['height'], 844)
+                self.assertEqual(writes, [])
+                page.locator('#appConfirmCancel').click()
+                self.assertTrue(page.locator('#appConfirmModal').is_hidden())
+                self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+                self.assertTrue(trigger.evaluate('el => el === document.activeElement'))
+                self.assertEqual(page.locator('[data-resource-result-id] input:checked').count(), 5)
+                trigger.click()
+                page.keyboard.press('Escape')
+                self.assertTrue(page.locator('#appConfirmModal').is_hidden())
+                self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+                self.assertEqual(writes, [])
+                trigger.click()
+                page.locator('#appConfirmSubmit').click()
+                expect(page.locator('[data-resource-batch-summary]')).to_contain_text('成功 5')
+                expect(trigger).to_be_disabled()
+                expect(page.locator('[data-resource-batch-target="qb"]')).to_be_enabled()
+                self.assertEqual(page.locator('[data-resource-result-id] input:checked').count(), 5)
+                self.assertEqual(len(writes), 1)
+                self.assertEqual(writes[0]['result_ids'], [f'resource-{i}' for i in range(5)])
+                self.assertEqual(writes[0]['target'], 'guangya')
+                self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+                page.close()
+
+    def test_message_stacks_above_confirmation_without_closing_parent_dialog(self):
+        page, writes = self.page()
+        page.locator('[data-resource-batch-target="guangya"]').click()
+        page.evaluate('''() => { window.appAlert({message:'嵌套消息'}); }''')
+        self.assert_frontmost(page, 'appMessageModal')
+        page.keyboard.press('Escape')
+        self.assertTrue(page.locator('#appMessageModal').is_hidden())
+        self.assert_frontmost(page, 'appConfirmModal')
+        page.keyboard.press('Escape')
+        self.assertTrue(page.locator('#appConfirmModal').is_hidden())
+        self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+        self.assertEqual(writes, [])
+
+    def test_native_cancel_busy_guard_and_late_close_do_not_lose_active_confirmation(self):
+        page, writes = self.page()
+        page.evaluate('''() => {
+            window.confirmed=null;
+            window.appConfirm({onConfirm:()=>new Promise(resolve=>window.finishEffect=resolve)}).then(value=>window.confirmed=value);
+        }''')
+        page.locator('#appConfirmSubmit').click()
+        page.keyboard.press('Escape')
+        page.locator('#appConfirmModal').dispatch_event('cancel', {'cancelable': True})
+        self.assert_frontmost(page, 'appConfirmModal')
+        self.assertIsNone(page.evaluate('window.confirmed'))
+        page.evaluate('window.finishEffect(true)')
+        page.wait_for_function('window.confirmed === true')
+        page.evaluate('''() => {
+            window.appConfirm({title:'旧确认'});
+            document.getElementById('appConfirmModal').close();
+            window.appConfirm({title:'新确认'});
+        }''')
+        page.wait_for_timeout(50)
+        self.assert_frontmost(page, 'appConfirmModal')
+        self.assertEqual(page.locator('#appConfirmTitle').inner_text(), '新确认')
+        page.locator('#appConfirmCancel').click()
+        self.assertEqual(writes, [])
+
+    def test_non_native_browser_retains_shared_overlay_and_cancellation(self):
+        page, writes = self.page(native=False)
+        page.locator('[data-resource-batch-target="guangya"]').click()
+        self.assertTrue(page.locator('#appConfirmModal').evaluate('''el => {
+            const r=el.querySelector('.card').getBoundingClientRect();
+            return el.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2));
+        }'''))
+        page.locator('#appConfirmCancel').click()
+        self.assertTrue(page.locator('#appConfirmModal').is_hidden())
+        self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+        self.assertEqual(writes, [])
+
+    def test_external_native_close_settles_confirmation_and_backdrop_preserves_selection(self):
+        page, writes = self.page()
+        page.evaluate('''() => {
+            window.confirmed=null;
+            window.appConfirm({title:'外部关闭'}).then(value=>window.confirmed=value);
+            document.getElementById('appConfirmModal').close();
+        }''')
+        page.wait_for_function('window.confirmed === false')
+        trigger=page.locator('[data-resource-batch-target="guangya"]')
+        trigger.click()
+        page.mouse.click(3, 3)
+        self.assertTrue(page.locator('#appConfirmModal').is_hidden())
+        self.assertTrue(page.locator('#discovery-detail-dialog').evaluate('el => el.open'))
+        self.assertEqual(page.locator('[data-resource-result-id] input:checked').count(), 5)
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
