@@ -719,6 +719,7 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertTrue(result["outcome_unknown"])
         self.assertTrue(result["tracking_incomplete"])
+        self.assertFalse(result.get("retryable"))
         self.assertEqual(result["staging"]["cleanup_status"], "retained")
         client.list_dir.assert_not_called()
         client.delete.assert_not_called()
@@ -741,6 +742,8 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
 
         self.assertFalse(result["ok"])
         self.assertTrue(result["outcome_unknown"])
+        self.assertFalse(result.get("retryable"))
+        client.add_offline_selection.assert_called_once()
         self.assertEqual(result["staging"]["cleanup_status"], "retained")
         client.list_dir.assert_not_called()
         client.delete.assert_not_called()
@@ -817,6 +820,8 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
             )
 
         self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_code"], "guangya_manifest_unavailable")
+        self.assertTrue(result["retryable"])
         self.assertEqual(result["resolve_attempts"], 4)
         self.assertIn("已阻止整单下载", result["error"])
         self.assertEqual(client.resolve_url.call_count, 4)
@@ -840,6 +845,8 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
             )
 
         self.assertFalse(result["ok"])
+        self.assertEqual(result["failure_code"], "guangya_manifest_unavailable")
+        self.assertTrue(result["retryable"])
         self.assertEqual(result["resolve_attempts"], 4)
         self.assertIn("已阻止整单下载", result["error"])
         client.create_dir.assert_not_called()
@@ -992,7 +999,27 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("选择中包含被下载规则排除的文件", result["error"])
         self.assertIn("解析器标记为排除", result["error"])
+        self.assertFalse(result.get("retryable"))
         self.assertEqual(client.selection_calls, [])
+
+    def test_automatic_rule_no_match_is_not_retryable(self):
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        rules = replace(
+            self.rules,
+            exclude_keywords=("demo.release", "sample", "trailer"),
+            min_file_mb=0,
+        )
+
+        with patch.object(offline.OfflineRules, "from_config", return_value=rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:no-rule-match", client=client,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("没有符合仅视频规则的文件", result["error"])
+        self.assertFalse(result.get("retryable"))
+        self.assertEqual(client.selection_calls, [])
+        self.assertEqual(client.legacy_calls, [])
 
     def test_submit_uses_selected_create_task_after_server_validation(self):
         submit_selection = getattr(offline, "submit_offline_selection", None)
@@ -1051,6 +1078,69 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertEqual(result["remaining_indexes"], [1])
         self.assertEqual(result["failed_batch"], 2)
         self.assertEqual(result["error"], "cloud capacity limited")
+        self.assertFalse(result.get("retryable"))
+
+    def test_submit_rejection_and_ambiguous_write_results_do_not_opt_into_retry(self):
+        submit_selection = getattr(offline, "submit_offline_selection", None)
+        self.assertIsNotNone(submit_selection)
+        cases = (
+            {
+                "ok": False, "partial_success": False, "outcome_unknown": False,
+                "tracking_incomplete": False, "completed_batches": 0,
+                "completed_indexes": [], "task_ids": [], "error": "quota exceeded",
+            },
+            {
+                "ok": False, "partial_success": False, "outcome_unknown": False,
+                "tracking_incomplete": False, "completed_batches": 0,
+                "completed_indexes": [], "task_ids": ["task-a"], "error": "rejected",
+            },
+            {
+                "ok": False, "partial_success": True, "outcome_unknown": False,
+                "tracking_incomplete": False, "completed_batches": 1,
+                "completed_indexes": [0], "task_ids": [], "error": "partial",
+            },
+            {
+                "ok": False, "partial_success": False, "outcome_unknown": True,
+                "tracking_incomplete": False, "completed_batches": 0,
+                "completed_indexes": [], "task_ids": [], "error": "unknown",
+            },
+            {
+                "ok": False, "partial_success": True, "outcome_unknown": False,
+                "tracking_incomplete": True, "completed_batches": 1,
+                "completed_indexes": [0], "task_ids": [], "error": "untracked",
+            },
+        )
+
+        for selection_result in cases:
+            with self.subTest(selection_result=selection_result):
+                client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+                client.selection_result = selection_result
+                result = submit_selection(
+                    "magnet:?xt=urn:btih:write-boundary",
+                    selected_indexes=[0], client=client,
+                    rules=replace(self.rules, exclude_keywords=(), min_file_mb=0),
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertFalse(result.get("retryable"))
+                self.assertEqual(len(client.selection_calls), 1)
+
+    def test_selection_write_exception_does_not_set_retryable(self):
+        submit_selection = getattr(offline, "submit_offline_selection", None)
+        self.assertIsNotNone(submit_selection)
+        client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)
+        client.add_offline_selection = Mock(side_effect=TimeoutError("quota exceeded"))
+
+        result = submit_selection(
+            "magnet:?xt=urn:btih:write-exception",
+            selected_indexes=[0], client=client,
+            rules=replace(self.rules, exclude_keywords=(), min_file_mb=0),
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "光鸭任务创建失败: quota exceeded")
+        self.assertFalse(result.get("retryable"))
+        client.add_offline_selection.assert_called_once()
 
     def test_submit_without_file_tree_falls_back_to_legacy_create_task(self):
         submit_selection = getattr(offline, "submit_offline_selection", None)

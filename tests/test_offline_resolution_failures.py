@@ -66,11 +66,26 @@ class OfflineResolutionFailureTests(unittest.TestCase):
         self.assert_no_writes(client)
 
     def test_torrent_http_failures_preserve_safe_status_in_submit_and_public_summary(self):
+        expected_classification = {
+            400: (None, None),
+            401: ("guangya_auth_failed", False),
+            403: ("guangya_auth_failed", False),
+            415: (None, None),
+            429: ("guangya_rate_limited", True),
+            500: ("guangya_unavailable", True),
+            502: ("guangya_unavailable", True),
+            503: ("guangya_unavailable", True),
+            504: ("guangya_unavailable", True),
+        }
         for status in (400, 401, 403, 415, 429, 500, 502, 503, 504):
             with self.subTest(status=status):
                 client = self.client(self.http_error(status))
                 result = offline.submit_offline(self.url, client=client, torrent_data=b"fixture", isolate_task=True)
                 self.assert_safe_failure(result, client, f"HTTP {status}")
+                self.assertEqual(
+                    (result.get("failure_code"), result.get("retryable")),
+                    expected_classification[status],
+                )
                 self.assertEqual(result["resolve_attempts"], 1)
                 self.assertEqual(result["resolve_http_status"], status)
                 self.assertEqual(result["resolve_error_type"], "HTTPStatusError")
@@ -82,17 +97,20 @@ class OfflineResolutionFailureTests(unittest.TestCase):
                 self.assertEqual(summary["error"], f"光鸭资源解析请求失败（HTTP {status}）")
 
     def test_timeouts_transport_and_invalid_response_are_distinct(self):
-        for error, message in (
-            (httpx.ReadTimeout("fixture-secret"), "光鸭资源解析请求超时"),
-            (TimeoutError("fixture-secret"), "光鸭资源解析请求超时"),
-            (httpx.ConnectError("fixture-secret"), "光鸭资源解析网络异常"),
-            (ValueError("fixture-secret"), "光鸭资源解析响应无效"),
-            (RuntimeError("fixture-secret"), "光鸭资源解析失败"),
+        for error, message, failure_code, retryable in (
+            (httpx.ReadTimeout("fixture-secret"), "光鸭资源解析请求超时", "guangya_unavailable", True),
+            (TimeoutError("fixture-secret"), "光鸭资源解析请求超时", "guangya_unavailable", True),
+            (httpx.ConnectError("fixture-secret"), "光鸭资源解析网络异常", "guangya_unavailable", True),
+            (ConnectionError("fixture-secret"), "光鸭资源解析失败", "guangya_unavailable", True),
+            (ValueError("fixture-secret"), "光鸭资源解析响应无效", None, None),
+            (RuntimeError("fixture-secret"), "光鸭资源解析失败", None, None),
         ):
             with self.subTest(error=type(error).__name__):
                 client = self.client(error)
                 result = offline.submit_offline(self.url, client=client, torrent_data=b"fixture", isolate_task=True)
                 self.assert_safe_failure(result, client, message)
+                self.assertEqual(result.get("failure_code"), failure_code)
+                self.assertEqual(result.get("retryable"), retryable)
                 self.assertEqual(result["resolve_error_type"], type(error).__name__)
                 self.assertEqual(result["resolve_http_status"], 0)
                 summary = public_dispatch_summary({"failed": ["guangya"], "error": result["error"]})
@@ -111,6 +129,8 @@ class OfflineResolutionFailureTests(unittest.TestCase):
                     else:
                         result = offline.submit_offline_selection(protocol_url, selected_indexes=[0], client=client, rules=self.rules)
                     self.assert_safe_failure(result, client, "HTTP 403")
+                    self.assertEqual(result["failure_code"], "guangya_auth_failed")
+                    self.assertFalse(result["retryable"])
                     client.resolve_url.assert_called_once_with(protocol_url)
                     self.assertEqual(result["resolve_attempts"], 1)
 
@@ -121,8 +141,47 @@ class OfflineResolutionFailureTests(unittest.TestCase):
                 result = offline.submit_offline(self.url, client=client, torrent_data=b"fixture", isolate_task=True)
                 self.assertFalse(result["ok"])
                 self.assertIn("种子文件未解析到可验证文件列表", result["error"])
+                self.assertEqual(result["failure_code"], "guangya_manifest_unavailable")
+                self.assertTrue(result["retryable"])
                 self.assertNotIn("resolve_error_type", result)
                 self.assertEqual(result["resolve_attempts"], 4)
+                self.assert_no_writes(client)
+
+    def test_manual_selection_marks_empty_and_resolver_excluded_manifests_retryable(self):
+        for payload, selected_indexes in (
+            ({"data": {"files": []}}, [0]),
+            (RESOLVE_EXCLUDED_ONLY_FIXTURE, [0]),
+        ):
+            with self.subTest(payload=payload):
+                client = self.client(payload=payload)
+                result = offline.submit_offline_selection(
+                    self.url, selected_indexes=selected_indexes,
+                    client=client, rules=self.rules,
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["failure_code"], "guangya_manifest_unavailable")
+                self.assertTrue(result["retryable"])
+                self.assert_no_writes(client)
+
+    def test_not_logged_in_is_nonretryable_auth_failure_without_resolution(self):
+        for entry in ("automatic", "manual"):
+            with self.subTest(entry=entry):
+                client = self.client(payload=RESOLVE_SUBFILES_FIXTURE)
+                client.logged_in = False
+                if entry == "automatic":
+                    result = offline.submit_offline(self.url, client=client)
+                else:
+                    result = offline.submit_offline_selection(
+                        self.url, selected_indexes=[0], client=client, rules=self.rules,
+                    )
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], "光鸭未登录")
+                self.assertEqual(result["failure_code"], "guangya_auth_failed")
+                self.assertFalse(result["retryable"])
+                self.assertEqual(client.resolve_calls, [])
+                self.assertEqual(client.torrent_resolve_calls, [])
                 self.assert_no_writes(client)
 
     def test_valid_torrent_uses_only_verified_remote_indexes(self):

@@ -113,6 +113,19 @@ class OfflineManifestError(RuntimeError):
         self.http_status = (
             current.response.status_code if isinstance(current, httpx.HTTPStatusError) else 0
         )
+        self.failure_code = ""
+        self.retryable = False
+        if self.http_status == 429:
+            self.failure_code = "guangya_rate_limited"
+            self.retryable = True
+        elif self.http_status in (401, 403):
+            self.failure_code = "guangya_auth_failed"
+        elif 500 <= self.http_status < 600 or isinstance(
+            current, (httpx.TimeoutException, TimeoutError, httpx.TransportError, ConnectionError)
+        ):
+            self.failure_code = "guangya_unavailable"
+            self.retryable = True
+
         if self.http_status:
             message = f"光鸭资源解析请求失败（HTTP {self.http_status}）"
         elif isinstance(current, (httpx.TimeoutException, TimeoutError)):
@@ -126,7 +139,7 @@ class OfflineManifestError(RuntimeError):
         super().__init__(message)
 
     def as_result(self) -> dict:
-        return {
+        result = {
             "ok": False,
             "error": f"{self}，未创建下载任务",
             "resolve_attempts": self.attempts,
@@ -134,6 +147,10 @@ class OfflineManifestError(RuntimeError):
             "resolve_http_status": self.http_status,
             "resolve_diagnostic": f"解析异常={self.error_type}；HTTP={self.http_status or '-'}",
         }
+        if self.failure_code:
+            result["failure_code"] = self.failure_code
+            result["retryable"] = self.retryable
+        return result
 
 
 def _manifest_failure(exc: Exception) -> dict:
@@ -540,7 +557,10 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
     client = client or GuangYaClient()
     try:
         if not client.logged_in:
-            return {"ok": False, "decision": decision.as_dict(), "error": "光鸭未登录"}
+            return {
+                "ok": False, "decision": decision.as_dict(), "error": "光鸭未登录",
+                "failure_code": "guangya_auth_failed", "retryable": False,
+            }
 
         try:
             url, torrent_data = _prepare_offline_resource(url, torrent_data)
@@ -571,6 +591,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                 "error": (
                     f"{unresolved_error}已阻止整单下载；请稍后重试或更换资源。"
                 ),
+                "failure_code": "guangya_manifest_unavailable", "retryable": True,
             }
 
         selected = [int(item["index"]) for item in choices if item.get("selected")]
@@ -832,7 +853,10 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
     client = client or GuangYaClient()
     try:
         if not client.logged_in:
-            return {**base, "error": "光鸭未登录"}
+            return {
+                **base, "error": "光鸭未登录",
+                "failure_code": "guangya_auth_failed", "retryable": False,
+            }
         try:
             url, torrent_data = _prepare_offline_resource(url)
             resolution = _resolve_offline_manifest(
@@ -849,7 +873,12 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
 
         if not files:
             if decision.protocol == "magnet":
-                return {**base, "resolve_attempts": resolution.attempts, "resolve_diagnostic": resolution.diagnostic, "error": "磁力资源未解析到可验证的文件列表"}
+                return {
+                    **base, "resolve_attempts": resolution.attempts,
+                    "resolve_diagnostic": resolution.diagnostic,
+                    "error": "磁力资源未解析到可验证的文件列表",
+                    "failure_code": "guangya_manifest_unavailable", "retryable": True,
+                }
             if requested:
                 return {**base, "error": "资源没有可验证的文件列表，请重新预览"}
             try:
@@ -902,7 +931,13 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
                 for item in choices
             }
             detail = "；".join(f"{index}: {reasons.get(index, '不符合下载规则')}" for index in forbidden)
-            return {**base, "error": f"选择中包含被下载规则排除的文件: {detail}"}
+            error = f"选择中包含被下载规则排除的文件: {detail}"
+            if decision.protocol == "magnet" and _resolver_excluded_only(files):
+                return {
+                    **base, "error": error,
+                    "failure_code": "guangya_manifest_unavailable", "retryable": True,
+                }
+            return {**base, "error": error}
         try:
             created = client.add_offline_selection(url, decision.target_dir_id, requested)
         except Exception as exc:
