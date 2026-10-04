@@ -1077,10 +1077,18 @@ def _update_download_request_conn(
             values.append(value)
     if not sets:
         return False
+    accepted = {"submitted", "downloading", "completed"}
+    accepting = [key for key in ("qb_status", "gy_status") if fields.get(key) in accepted]
+    if accepting and not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    previous = conn.execute(
+        "SELECT qb_status,gy_status FROM download_requests WHERE id=?", (int(request_id),),
+    ).fetchone() if accepting else None
+    rss_accepted = previous is not None and any(previous[key] not in accepted for key in accepting)
     sets.append("updated_at=?")
     values.extend([timestamp, int(request_id)])
     conn.execute(f"UPDATE download_requests SET {', '.join(sets)} WHERE id=?", values)
-    if {"qb_status", "gy_status"}.intersection(fields):
+    if rss_accepted:
         from app.repositories.rss import _sync_rss_download_entries_conn
         _sync_rss_download_entries_conn(conn, int(request_id), timestamp)
     if {"strm_status", "strm_error", "strm_finished_at", "strm_run_id"}.intersection(fields):

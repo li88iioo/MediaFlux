@@ -345,6 +345,43 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
         db.record_rss_entry_failure(entry, "unknown_failure", False)
         self.assertEqual(db.get_rss_entry(entry)["status"], "skipped")
 
+    def test_startup_backfill_pages_past_more_than_500_unmatched_failures(self):
+        entry, _request = self.failed_entry()
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE rss_entries SET download_request_key='',download_backend='' WHERE id=?",
+                (entry,),
+            )
+            sub_id = int(conn.execute(
+                "SELECT rss_item_id FROM rss_entries WHERE id=?", (entry,)
+            ).fetchone()[0])
+            timestamp = db.now()
+            conn.executemany(
+                "INSERT INTO rss_entries(rss_item_id,title,status,processed,payload,created_at) "
+                "VALUES(?,?,'failed',0,?,?)",
+                [
+                    (
+                        sub_id,
+                        f"unmatched-{index}",
+                        json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{index + 1:040x}"}),
+                        timestamp,
+                    )
+                    for index in range(501)
+                ],
+            )
+
+        db.init_db()
+
+        recovered = db.get_rss_entry(entry)
+        self.assertTrue(recovered["download_request_key"])
+        self.assertEqual(recovered["status"], "failed")
+        with db.get_conn() as conn:
+            unmatched = conn.execute(
+                "SELECT COUNT(*) FROM rss_entries WHERE title LIKE 'unmatched-%' "
+                "AND status='failed' AND download_request_key=''"
+            ).fetchone()[0]
+        self.assertEqual(int(unmatched), 501)
+
     def test_legacy_http_torrent_failure_reconciles_only_verified_identity(self):
         from tests.test_download_http_identity_lifecycle import TORRENT_A, MIME
 
@@ -367,7 +404,7 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
                     conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (json.dumps({"torrent_url": "https://other.invalid/unrelated.torrent"}), entry))
             # Complete this request so the next fixture may submit identical torrent content.
             db.update_download_request(result["request_id"], status="completed", gy_status="completed")
-        db.list_rss_entries()
+        db.init_db()
         self.assertEqual(db.get_rss_entry(entries[0])["status"], "downloaded")
         self.assertEqual(db.get_rss_entry(entries[1])["status"], "failed")
         self.assertEqual(db.get_rss_entry(entries[2])["status"], "failed")
@@ -391,7 +428,6 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
         db.init_db()
         row = db.get_rss_entry(entry)
         self.assertEqual(row["status"], "failed")
-        self.assertEqual(row["download_request_key"], "")
+        self.assertTrue(row["download_request_key"])
         self.retry(request, "guangya")
-        db.list_rss_entries()
         self.assertEqual(db.get_rss_entry(entry)["status"], "downloaded")

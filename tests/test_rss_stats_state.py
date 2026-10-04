@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from unittest.mock import patch
 
@@ -90,6 +91,51 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         filtered = db.list_rss_entries(sub_id=sid, status="pending", keyword="pending", order="unprocessed_first")
         self.assertEqual([row["id"] for row in filtered], [pending])
         self.assertNotIn(pending, [row["id"] for row in db.list_rss_entries(sub_id=sid, limit=300)])
+
+    def test_repeated_entry_reads_do_not_scan_or_write_legacy_history(self) -> None:
+        sid = db.add_rss_subscription(
+            "legacy-read-trace", "https://example.invalid/legacy-read-trace"
+        )
+        timestamp = db.now()
+        with db.get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO rss_entries(rss_item_id,title,status,processed,payload,created_at) "
+                "VALUES(?,?,'failed',0,?,?)",
+                [
+                    (
+                        sid,
+                        f"legacy-{index}",
+                        json.dumps({
+                            "torrent_url": f"magnet:?xt=urn:btih:{index + 1:040x}"
+                        }),
+                        timestamp,
+                    )
+                    for index in range(500)
+                ],
+            )
+
+        # Historical work belongs to startup recovery, not each listing/page request.
+        db.init_db()
+        statements: list[str] = []
+        connect = db._connect
+
+        def traced_connect():
+            conn = connect()
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with patch.object(db, "_connect", side_effect=traced_connect):
+            for _ in range(10):
+                rows = db.list_rss_entries(limit=300)
+                self.assertEqual(len(rows), 300)
+
+        self.assertEqual(len(statements), 10)
+        self.assertTrue(all(statement.lstrip().upper().startswith("SELECT") for statement in statements))
+        history_sql = ("download_log", "download_requests", "download_request_keys")
+        self.assertFalse(any(any(table in statement for table in history_sql) for statement in statements))
+        self.assertFalse(any(statement.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+                             for statement in statements))
+
 
     def test_rss_stats_counts_global_active_and_pending_entries(self) -> None:
         self._seed()

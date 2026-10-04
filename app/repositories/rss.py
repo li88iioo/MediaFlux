@@ -335,42 +335,55 @@ def _sync_rss_download_entries_conn(conn: sqlite3.Connection, request_id: int, t
 
 
 def _reconcile_rss_download_entries_conn(conn: sqlite3.Connection) -> None:
-    """旧失败记录按原始链接/订阅日志及持久种子身份补关联，不按标题猜成功。"""
+    """启动时分页补关联旧失败，并只按原始链接/日志/持久种子身份确认结果。"""
     import json
-    from app.modules.download_dispatcher import DownloadInput, normalize_download_url, request_keys
+    from app.modules.download_dispatcher import (
+        DownloadInput,
+        normalize_download_url,
+        request_keys,
+    )
 
-    legacy = conn.execute(
-        "SELECT id,rss_item_id,title,payload FROM rss_entries WHERE status='failed' "
-        "AND COALESCE(processed,0)=0 AND download_request_key='' ORDER BY id DESC LIMIT 500"
-    ).fetchall()
-    for entry in legacy:
-        try:
-            payload = json.loads(entry["payload"] or "{}")
-            if not isinstance(payload, dict):
+    after_id = 0
+    while True:
+        legacy = conn.execute(
+            "SELECT id,rss_item_id,title,payload FROM rss_entries WHERE status='failed' "
+            "AND COALESCE(processed,0)=0 AND download_request_key='' AND id>? "
+            "ORDER BY id ASC LIMIT 500",
+            (after_id,),
+        ).fetchall()
+        if not legacy:
+            break
+        after_id = int(legacy[-1]["id"])
+        for entry in legacy:
+            try:
+                payload = json.loads(entry["payload"] or "{}")
+                if not isinstance(payload, dict):
+                    continue
+                item = normalize_download_url(str(payload.get("torrent_url") or payload.get("link") or ""))
+                previous = conn.execute(
+                    "SELECT r.*,l.source AS rss_backend FROM download_log l "
+                    "JOIN download_requests r ON r.id=l.request_id "
+                    "WHERE l.rss_item_id=? AND l.title=? AND r.source_value=? "
+                    "AND l.source IN ('qb','guangya') ORDER BY l.id DESC LIMIT 1",
+                    (entry["rss_item_id"], entry["title"], item.source_value),
+                ).fetchone()
+                if previous is None:
+                    continue
+                # HTTP 种子已被清掉时不能把可变URL冒充已验证内容；保持旧失败供人工核对。
+                if previous["kind"] == "http" and not previous["torrent_data"]:
+                    continue
+                key = request_keys(DownloadInput(
+                    previous["kind"], previous["title"] or "", previous["source_value"] or "",
+                    torrent_data=previous["torrent_data"],
+                ))[0]
+            except (ValueError, TypeError):
                 continue
-            item = normalize_download_url(str(payload.get("torrent_url") or payload.get("link") or ""))
-            previous = conn.execute(
-                "SELECT r.*,l.source AS rss_backend FROM download_log l "
-                "JOIN download_requests r ON r.id=l.request_id "
-                "WHERE l.rss_item_id=? AND l.title=? AND r.source_value=? "
-                "AND l.source IN ('qb','guangya') ORDER BY l.id DESC LIMIT 1",
-                (entry["rss_item_id"], entry["title"], item.source_value),
-            ).fetchone()
-            if previous is None:
-                continue
-            # HTTP 种子已被清掉时不能把可变URL冒充已验证内容；保持旧失败供人工核对。
-            if previous["kind"] == "http" and not previous["torrent_data"]:
-                continue
-            key = request_keys(DownloadInput(
-                previous["kind"], previous["title"] or "", previous["source_value"] or "",
-                torrent_data=previous["torrent_data"],
-            ))[0]
-        except (ValueError, TypeError):
-            continue
-        conn.execute(
-            "UPDATE rss_entries SET download_request_key=?,download_backend=? WHERE id=?",
-            (key, previous["rss_backend"], entry["id"]),
-        )
+            conn.execute(
+                "UPDATE rss_entries SET download_request_key=?,download_backend=? WHERE id=?",
+                (key, previous["rss_backend"], entry["id"]),
+            )
+
+    # 先完成关联，再投影已有明确受理的后端状态；不按标题或失效 URL 猜测成功。
     requests = conn.execute(
         "SELECT DISTINCT k.request_id FROM rss_entries e JOIN download_request_keys k "
         "ON k.request_key=e.download_request_key WHERE e.status IN ('failed','submitting') "
@@ -417,7 +430,6 @@ def list_rss_entries(
     sql += " LIMIT ?"
     params.append(max(1, int(limit)))
     with db.get_conn() as conn:
-        _reconcile_rss_download_entries_conn(conn)
         return conn.execute(sql, params).fetchall()
 
 
@@ -1333,6 +1345,7 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "< datetime('now','localtime','-15 minutes')",
         (timestamp,),
     )
+    _reconcile_rss_download_entries_conn(conn)
 
 
 # 在函数定义后绑定门面，兼容 repository-first 导入；运行期始终使用同一连接/时钟所有者。

@@ -198,6 +198,42 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
         untouched.assert_not_called()
 
 
+    def test_rss_feedback_runs_only_on_new_backend_acceptance(self):
+        from app.repositories import rss
+
+        request_id = self.request(target="guangya", peer_status="submitted")
+        with patch.object(rss, "_sync_rss_download_entries_conn", wraps=rss._sync_rss_download_entries_conn) as sync:
+            db.update_download_request(request_id, gy_status="failed")
+            db.update_download_request(request_id, gy_status="outcome_unknown")
+            sync.assert_not_called()
+            db.update_download_request(request_id, gy_status="submitted")
+            sync.assert_called_once()
+            for status in ("submitted", "downloading", "downloading", "completed"):
+                db.update_download_request(request_id, gy_status=status)
+            self.assertEqual(sync.call_count, 1)
+            db.update_download_request(request_id, qb_status="failed")
+            db.update_download_request(request_id, qb_status="submitted")
+            self.assertEqual(sync.call_count, 2)
+
+    def test_request_acceptance_and_rss_projection_rollback_together(self):
+        from app.repositories.download_requests import _update_download_request_conn
+        from app.repositories.rss import bind_rss_entry_download
+
+        request_id = self.request(target="guangya", peer_status="submitted")
+        sub = db.add_rss_subscription("rollback", "https://fixture.invalid/rss", download_method="guangya")
+        entry = db.add_rss_entry_with_media(sub, "rollback", "rollback")["id"]
+        self.assertTrue(db.claim_rss_entry(entry))
+        bind_rss_entry_download(entry, db.get_download_request(request_id)["request_key"], "guangya")
+        db.record_rss_entry_failure(entry, "guangya_manifest_unavailable", True)
+        with self.assertRaisesRegex(RuntimeError, "rollback fixture"):
+            with db.get_conn() as conn:
+                _update_download_request_conn(conn, request_id, {"gy_status": "submitted"}, db.now())
+                self.assertEqual(conn.execute("SELECT status FROM rss_entries WHERE id=?", (entry,)).fetchone()[0], "downloaded")
+                raise RuntimeError("rollback fixture")
+        self.assertEqual(db.get_download_request(request_id)["gy_status"], "failed")
+        self.assertEqual(db.get_rss_entry(entry)["status"], "failed")
+
+
 class GuangYaRetryDestinationTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
