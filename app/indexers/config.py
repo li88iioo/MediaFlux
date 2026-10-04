@@ -7,7 +7,7 @@ from typing import Any
 INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("nyaa", "Nyaa"),
     ("mikan", "Mikan"),
-    ("btbtla", "BTBTLA"),
+    ("btbtla", "综合"),
     ("tpb", "The Pirate Bay"),
     ("sukebei", "Sukebei"),
 )

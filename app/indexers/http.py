@@ -207,6 +207,19 @@ class FixedHostHttpClient:
                 "GET", url, params=params, headers=headers, max_redirects=max_redirects
             )
 
+    async def post_form(
+        self,
+        url: str,
+        *,
+        content: bytes,
+        headers: Mapping[str, str] | None = None,
+    ) -> IndexerHttpResponse:
+        """仅供站点搜索表单：允许标准 POST→GET 跳转，沿用逐跳主机校验。"""
+        return await self._request(
+            "POST", url, content=content,
+            headers={"Content-Type": "application/x-www-form-urlencoded", **(headers or {})},
+        )
+
     async def post_json(
         self,
         url: str,
@@ -295,6 +308,7 @@ class FixedHostHttpClient:
         *,
         params: Mapping[str, str | int] | None = None,
         json_body: Mapping[str, Any] | None = None,
+        content: bytes | None = None,
         headers: Mapping[str, str] | None = None,
         max_redirects: int | None = None,
     ) -> IndexerHttpResponse:
@@ -307,6 +321,7 @@ class FixedHostHttpClient:
         current = httpx.URL(url)
         current_params = params
         current_json = json_body
+        current_content = content
 
         for redirect_count in range(redirect_limit + 1):
             request_url, request_headers, extensions = await self._request_target(
@@ -317,6 +332,7 @@ class FixedHostHttpClient:
                 request_url,
                 params=current_params,
                 json=current_json,
+                content=current_content,
                 headers=request_headers,
                 extensions=extensions,
                 follow_redirects=False,
@@ -330,7 +346,13 @@ class FixedHostHttpClient:
                     if redirect_count >= redirect_limit:
                         raise IndexerSecurityError("redirect limit exceeded")
                     if verb == "POST" and response.status_code not in {307, 308}:
-                        raise IndexerSecurityError("unsafe POST redirect")
+                        if content is None:
+                            raise IndexerSecurityError("unsafe POST redirect")
+                        verb, current_content, current_json = "GET", None, None
+                        headers = {
+                            key: value for key, value in (headers or {}).items()
+                            if key.lower() not in {"content-type", "content-length"}
+                        }
                     current = httpx.URL(urljoin(str(current), location))
                     continue
 

@@ -371,8 +371,10 @@ class IndexerService:
                     outcome.attempts,
                 )
                 continue
-            succeeded.append(site_id)
             page_result = outcome.page
+            errors.extend(page_result.errors)
+            if page_result.items or not page_result.errors:
+                succeeded.append(site_id)
             page_has_more = bool(page < 100 and page_result and page_result.has_more)
             has_more = has_more or page_has_more
             site_page_states[site_id] = IndexerSitePageState(
@@ -412,7 +414,7 @@ class IndexerService:
                 "indexer.site_search site_id=%s outcome=%s duration_ms=%d attempts=%d item_count=%d",
                 site_id,
                 "partial"
-                if outcome.error is not None
+                if outcome.error is not None or page_result.errors
                 else ("success" if provider_items else "empty"),
                 outcome.duration_ms,
                 outcome.attempts,
@@ -816,6 +818,7 @@ class IndexerService:
         last_outcome: _ProviderOutcome | None = None
         last_error: _ProviderOutcome | None = None
         merged_items: list[IndexerItem] = []
+        page_errors: dict[tuple[str, str], IndexerProviderError] = {}
         contributed_query = ""
         has_more = False
         pagination_supported = bool(
@@ -859,6 +862,7 @@ class IndexerService:
             last_outcome = outcome
             if outcome.page is None:
                 continue
+            page_errors.update(((err.code, err.message), err) for err in outcome.page.errors)
             has_more = has_more or bool(outcome.page.has_more)
             pagination_supported = pagination_supported or bool(
                 outcome.page.pagination_supported
@@ -906,6 +910,7 @@ class IndexerService:
                     page=page,
                     has_more=has_more,
                     pagination_supported=pagination_supported,
+                    errors=tuple(page_errors.values()),
                 ),
                 query=contributed_query or (queries[0] if queries else ""),
                 attempts=attempts_made,
@@ -917,6 +922,8 @@ class IndexerService:
             last_error.duration_ms = duration_ms
             return last_error
         if last_outcome is not None:
+            if last_outcome.page is not None:
+                last_outcome.page.errors = tuple(page_errors.values())
             last_outcome.attempts = attempts_made
             last_outcome.duration_ms = duration_ms
             return last_outcome
@@ -952,8 +959,17 @@ class IndexerService:
                 positions.setdefault(key, position)
         for item in incoming:
             keys = cls._plan_item_keys(item)
+            # 同一影片详情可包含多个季集/清晰度；已知不同 hash 不能因 URL 相同合并。
             existing_position = next(
-                (positions[key] for key in keys if key in positions),
+                (
+                    positions[key] for key in keys if key in positions
+                    and not (
+                        key[0] == "url"
+                        and (existing_hash := magnet_infohash(output[positions[key]].magnet))
+                        and (incoming_hash := magnet_infohash(item.magnet))
+                        and existing_hash != incoming_hash
+                    )
+                ),
                 None,
             )
             if existing_position is not None:

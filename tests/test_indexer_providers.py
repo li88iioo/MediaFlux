@@ -986,12 +986,16 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
     def test_default_registry_uses_browser_transport_for_challenged_sites(self):
         registry = build_default_registry()
 
-        self.assertIsInstance(registry.get("btbtla").http, BrowserImpersonatingHttpClient)
-        self.assertEqual(registry.get("btbtla").base_url, "https://www.btbtlb.com/")
-        self.assertEqual(registry.get("btbtla").mirror_base_urls, ("https://btbtlb.com/",))
-        self.assertEqual(registry.get("btbtla").http.sni_host, "btbtlb.com")
-        self.assertIn("www.btbtlb.com", registry.get("btbtla").http.allowed_hosts)
-        self.assertIn("btbtlb.com", registry.get("btbtla").http.allowed_hosts)
+        combined = registry.get("btbtla")
+        self.assertEqual(combined.site_name, "综合")
+        self.assertEqual(tuple(member.site_id for member in combined.members), ("btbtla", "aipan", "dygang", "ys5266"))
+        btbtla = combined.members[0]
+        self.assertIsInstance(btbtla.http, BrowserImpersonatingHttpClient)
+        self.assertEqual(btbtla.base_url, "https://www.btbtlb.com/")
+        self.assertEqual(btbtla.mirror_base_urls, ("https://btbtlb.com/",))
+        self.assertEqual(btbtla.http.sni_host, "btbtlb.com")
+        self.assertIn("www.btbtlb.com", btbtla.http.allowed_hosts)
+        self.assertIn("btbtlb.com", btbtla.http.allowed_hosts)
         self.assertEqual(registry.get("mikan").mirror_base_urls, ("https://mikanime.tv/",))
         self.assertIn("mikanime.tv", registry.get("mikan").http.allowed_hosts)
         self.assertTrue(registry.get("nyaa").http.pin_resolved_address)

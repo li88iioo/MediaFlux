@@ -324,6 +324,7 @@ class IndexerPage:
     page: int
     has_more: bool
     pagination_supported: bool
+    errors: tuple[IndexerProviderError, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

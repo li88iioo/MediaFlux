@@ -197,6 +197,29 @@ class IndexerHttpTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(IndexerSecurityError):
             await client.get("https://nyaa.si/start")
 
+    async def test_search_form_redirects_to_get_without_replaying_body(self):
+        seen = []
+
+        def handler(request):
+            seen.append((request.method, request.content, request.headers.get("content-type")))
+            if request.url.path == "/search":
+                return httpx.Response(302, headers={"Location": "/results"})
+            return httpx.Response(200, content=b"matches")
+
+        client = self.make_client(handler)
+        result = await client.post_form("https://nyaa.si/search", content=b"keyboard=%C8%FD%CC%E5")
+        self.assertEqual(result.body, b"matches")
+        self.assertEqual(seen, [("POST", b"keyboard=%C8%FD%CC%E5", "application/x-www-form-urlencoded"), ("GET", b"", None)])
+
+    async def test_search_form_rejects_cross_host_redirect_and_json_stays_strict(self):
+        client = self.make_client(lambda request: httpx.Response(302, headers={"Location": "https://evil.example/search"}))
+        with self.assertRaises(IndexerSecurityError):
+            await client.post_form("https://nyaa.si/search", content=b"keyboard=test")
+        await client.aclose()
+        client = self.make_client(lambda request: httpx.Response(302, headers={"Location": "/result"}))
+        with self.assertRaises(IndexerSecurityError):
+            await client.post_json("https://nyaa.si/search", json={})
+
     async def test_enforces_declared_and_streamed_response_size_limits(self):
         client = self.make_client(
             lambda request: httpx.Response(200, headers={"Content-Length": "11"}, content=b"01234567890"),
