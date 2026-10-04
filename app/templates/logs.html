@@ -78,7 +78,7 @@
             <span class="inline-save-state" id="organizeBatchState"></span>
         </div>
         <div class="logs-batch-actions">
-            <button type="button" class="jump-btn" id="organizeBatchRenameBtn" disabled><i data-lucide="files"></i>批量改名</button>
+            <button type="button" class="jump-btn" id="organizeBatchRenameBtn" disabled><i data-lucide="scan-search"></i>批量纠正识别</button>
             <button type="button" class="jump-btn" id="organizeBatchRevertBtn" disabled><i data-lucide="undo-2"></i>批量回退</button>
             <button type="button" class="jump-btn danger" id="organizeBatchDeleteBtn" disabled><i data-lucide="trash-2"></i>批量移入光鸭回收站</button>
         </div>
@@ -133,12 +133,13 @@
                 <div class="organize-detail-section-head"><strong>识别解析</strong></div>
                 <div id="organizeReleaseParse" class="organize-release-parse-grid"></div>
             </section>
-            <section class="organize-detail-section">
+            <section class="organize-detail-section" id="organizeDetailFilesSection">
                 <div class="organize-detail-section-head"><strong>文件</strong></div>
                 <div id="organizeDetailItems" class="organize-item-list"></div>
             </section>
             <section class="organize-detail-section" id="organizeCorrectionPanel">
                 <div class="organize-detail-section-head"><strong id="organizeRecognitionTitle">重新识别</strong></div>
+                <div class="organize-batch-source-scope" id="organizeBatchSourceScope" role="status" hidden></div>
                 <div class="organize-search-grid">
                     <input type="text" class="form-input" id="organizeTmdbQuery" placeholder="输入片名或剧名" aria-label="识别搜索词">
                     <input type="text" class="form-input" id="organizeTmdbYear" placeholder="搜索年份（可选）" inputmode="numeric" data-recognition-tmdb-only>
@@ -148,11 +149,12 @@
                 <div class="organize-position-fields" id="organizePositionFields" hidden>
                     <span>剧集位置</span>
                     <label>季<input type="number" class="form-input" id="organizeSeasonOverride" min="0" max="999" inputmode="numeric" placeholder="自动"></label>
-                    <label>集<input type="number" class="form-input" id="organizeEpisodeOverride" min="1" max="999" inputmode="numeric" placeholder="自动"></label>
-                    <small>仅在原文件季号或集号不准确时覆盖；预览和实际整理使用同一值。</small>
+                    <label id="organizeEpisodeOverrideField">集<input type="number" class="form-input" id="organizeEpisodeOverride" min="1" max="999" inputmode="numeric" placeholder="自动"></label>
+                    <small id="organizePositionHelp">仅在原文件季号或集号不准确时覆盖；预览和实际整理使用同一值。</small>
                 </div>
                 <div id="organizeTmdbCandidates" class="candidate-list organize-candidates"></div>
                 <div id="organizeNamingPreview" class="naming-preview organize-naming-preview" hidden></div>
+                <div id="organizeBatchPreview" class="organize-batch-preview" aria-live="polite" hidden></div>
             </section>
             <section class="organize-detail-section" id="organizeOperationSection" hidden>
                 <div class="organize-detail-section-head"><strong>操作记录</strong></div>
@@ -165,11 +167,15 @@
         </div>
         <footer class="organize-detail-footer">
             <span id="organizeOperationState" class="inline-save-state"></span>
-            <div class="organize-detail-actions">
+            <div class="organize-detail-actions organize-single-actions">
                 <button type="button" class="jump-btn danger" id="organizeDeleteBtn"><i data-lucide="trash-2"></i>移入光鸭回收站</button>
                 <button type="button" class="jump-btn" id="organizeReturnBtn"><i data-lucide="corner-up-left"></i>送回源目录</button>
                 <button type="button" class="jump-btn" id="organizeRevertBtn"><i data-lucide="undo-2"></i>回退最近操作</button>
                 <button type="button" class="btn btn-primary" id="organizeReorganizeBtn"><i data-lucide="wand-sparkles"></i>执行重新整理</button>
+            </div>
+            <div class="organize-detail-actions organize-batch-actions" id="organizeBatchActions" hidden>
+                <button type="button" class="jump-btn" id="organizeBatchCancelBtn" data-modal-close>取消</button>
+                <button type="button" class="btn btn-primary" id="organizeBatchExecuteBtn" disabled><i data-lucide="wand-sparkles"></i>确认批量纠正</button>
             </div>
         </footer>
     </div>

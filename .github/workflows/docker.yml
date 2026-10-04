@@ -126,6 +126,7 @@ jobs:
               "tests.test_guangya_directory_scrape_ui",
               "tests.test_release_formats_browser",
               "tests.test_media_profile_in_place_ui",
+              "tests.test_logs_batch_correction_ui",
               "tests.test_navigation_discovery_ui",
               "tests.test_lucide_local_rendering",
               "tests.test_discovery_search_ui",

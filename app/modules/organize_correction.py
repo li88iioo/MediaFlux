@@ -5,6 +5,7 @@ OrganizeTaskManager 的统一写锁异步执行。历史或损坏快照只读展
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import re
@@ -19,6 +20,7 @@ from app.modules.organize import (
     OrganizeRules,
     Organizer,
     organize_rules_snapshot,
+    organize_rules_snapshot_matches,
     restore_organize_rules_snapshot,
 )
 from app.modules.organize_delete_audit import (
@@ -29,7 +31,9 @@ from app.modules.nsfw import (
 )
 from app.modules.organize_postprocess import companion_target_name, normalize_media_number
 from app.modules.organize_sources import normalize_organize_sources
-from app.modules.scraper import Candidate, MatchResult, TMDBScraper
+from app.modules.scraper import Candidate, MatchResult, TMDBScraper, extract_recognition_context
+from app.modules.organize_identity import _usable_filename_identity_hint
+from app.modules.recognition.cleaner import _comparison_key
 
 logger = get_logger(__name__)
 
@@ -209,7 +213,7 @@ class OrganizeCorrectionService:
             raise ValueError("不支持的批量操作")
         details = [self.detail(log_id) for log_id in unique_ids]
         movies = [str(item["id"]) for item in details if item.get("media_type") != "tv"]
-        if movies:
+        if movies and action != "reorganize":
             raise ValueError(
                 "批量操作仅支持剧集，选择中包含电影或未知类型日志: "
                 + ", ".join(f"#{item}" for item in movies)
@@ -223,19 +227,122 @@ class OrganizeCorrectionService:
                 "以下剧集日志当前不允许执行该批量操作: "
                 + ", ".join(f"#{item}" for item in blocked)
             )
-        if action == "reorganize":
-            missing = [str(item["id"]) for item in details if not item.get("tmdb_id")]
-            if missing:
-                raise ValueError(
-                    "批量改名要求每条剧集日志已有 TMDB 映射，缺失日志: "
-                    + ", ".join(f"#{item}" for item in missing)
-                )
         return details
 
-    def run_batch(self, action: str, entries: list[dict], confirm_text: str = "") -> dict:
-        """批量删除先全量预检并原子认领；其他操作保持逐条执行。"""
-        details = self.validate_batch([entry["log_id"] for entry in entries], action)
-        detail_map = {int(item["id"]): item for item in details}
+    @staticmethod
+    def _batch_candidate(candidate: dict | None) -> dict:
+        if not isinstance(candidate, dict):
+            raise ValueError("请先选择正确作品并预览整批纠正结果")
+        if "episode" in candidate:
+            raise ValueError("批量纠正必须保留每条记录的集号，不能统一覆盖集号")
+        tmdb_id = str(candidate.get("tmdb_id") or "").strip()
+        provider = str(candidate.get("provider") or "tmdb").strip().lower()
+        external_id = str(candidate.get("external_id") or tmdb_id).strip()
+        media_type = str(candidate.get("media_type") or "").strip()
+        if (provider not in {"tmdb", "metatube", "clean_title"}
+                or not external_id or media_type not in {"tv", "movie"}):
+            raise ValueError("请选择有效的媒体候选")
+        if provider == "tmdb":
+            if not external_id.isdigit() or int(external_id) <= 0 or (tmdb_id and tmdb_id != external_id):
+                raise ValueError("TMDB ID 无效或候选身份不一致")
+            tmdb_id = external_id
+        season = candidate.get("season")
+        if season is not None and (type(season) is not int or not 0 <= season <= 999):
+            raise ValueError("季号必须为 0–999 的整数")
+        return {
+            "tmdb_id": tmdb_id, "media_type": media_type,
+            "title": str(candidate.get("title") or "").strip(),
+            "year": str(candidate.get("year") or "").strip(),
+            "provider": provider, "external_id": external_id, "season": season,
+        }
+
+    def preview_batch(self, entries: list[dict], candidate: dict | None) -> dict:
+        """对明确候选统一做无写入预检；保留各文件位置，不采用旧身份。"""
+        selected = self._batch_candidate(candidate)
+        ids = [entry["log_id"] for entry in entries]
+        if len(ids) != len(set(ids)) or not 2 <= len(ids) <= 50:
+            raise ValueError("请选择 2–50 条不同的整理日志")
+        items: list[dict] = []
+        title_groups: dict[str, list[int]] = {}
+        destinations: dict[tuple[str, str, str], int] = {}
+        source_files: dict[str, int] = {}
+        directory_cache: dict[str, list[GuangYaFile]] = {}
+        errors: dict[int, str] = {}
+        for entry in entries:
+            log_id = int(entry["log_id"])
+            row = {"log_id": log_id, "original_name": ""}
+            try:
+                detail = self.detail(log_id)
+                row["original_name"] = detail.get("original_name") or detail.get("current_name") or ""
+                if detail["version"] != entry["expected_version"]:
+                    raise ValueError("日志状态或版本已变化，请刷新后重新预览")
+                if not detail.get("allowed_actions", {}).get("reorganize"):
+                    raise ValueError(detail.get("safety_notice") or "当前日志不允许纠正识别")
+                members = self._load_items(log_id)
+                video = self._video(members)
+                row["original_name"] = video.original_name
+                context = extract_recognition_context(video.original_name, str(detail.get("original_path") or ""))
+                # 只用原始标题分组，不用可能识别错的旧 title/TMDB ID。
+                title = _usable_filename_identity_hint(video.original_name) or context.folder_title
+                key = _comparison_key(title).replace(" ", "")
+                if key:
+                    title_groups.setdefault(key + ":" + (context.filename_year or context.folder_year or ""), []).append(log_id)
+                else:
+                    # 裸集号没有标题时，仅在同一原始目录中允许人工指定同一作品。
+                    title_groups.setdefault("directory:" + video.original_parent_id, []).append(log_id)
+                self._verify_items(members)
+                preview = self.preview_reorganize(log_id, **selected)
+                if not preview["target_root_id"]:
+                    raise ValueError("尚未配置归档目标目录")
+                target_dir = self.organizer._find_existing_dir_chain(
+                    preview["target_root_id"], preview["target_path"], directory_cache,
+                )
+                if target_dir is not None:
+                    self._verify_targets_available([
+                        (member, target_dir, planned["to_name"])
+                        for member, planned in zip(members, preview["items"])
+                    ])
+                if preview["match"]["media_type"] == "tv" and preview.get("episode") is None:
+                    raise ValueError("无法确定该文件集号，请先在单条详情中修正季集后再批量处理")
+                for member in preview["items"]:
+                    file_id = str(member["file_id"])
+                    target = (str(preview["target_root_id"]), preview["target_path"].casefold(), member["to_name"].casefold())
+                    other = source_files.get(file_id) or destinations.get(target)
+                    if other is not None:
+                        message = f"与日志 #{other} 指向同一文件或同一目标，请分开处理"
+                        errors[log_id] = message
+                        errors[other] = f"与日志 #{log_id} 指向同一文件或同一目标，请分开处理"
+                    source_files[file_id] = log_id
+                    destinations[target] = log_id
+                row.update(preview)
+            except Exception as exc:
+                errors[log_id] = str(exc)
+            items.append(row)
+        if len(title_groups) > 1:
+            for log_ids in title_groups.values():
+                for log_id in log_ids:
+                    errors.setdefault(log_id, "选中了不同作品或无法证明同一作品的文件，请按原始标题分组纠正")
+        for row in items:
+            if row["log_id"] in errors:
+                row["error"] = errors[row["log_id"]]
+        digest = hashlib.sha256(json.dumps(
+            {"entries": entries, "candidate": selected, "items": items},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode()).hexdigest() if not errors else ""
+        return {"items": items, "errors": [{"log_id": key, "error": value} for key, value in errors.items()],
+                "can_execute": not errors, "preview_digest": digest}
+
+    def run_batch(self, action: str, entries: list[dict], confirm_text: str = "", *,
+                  candidate: dict | None = None, preview_digest: str = "") -> dict:
+        """纠正识别先复核整批预览；复用单条写链路，保留逐条失败回执。"""
+        previews: dict[int, dict] = {}
+        if action == "reorganize":
+            batch = self.preview_batch(entries, candidate)
+            if not batch["can_execute"] or not preview_digest or batch["preview_digest"] != preview_digest:
+                raise ValueError("批量预览已失效或存在错误，请重新预览并确认")
+            previews = {item["log_id"]: item for item in batch["items"]}
+        else:
+            self.validate_batch([entry["log_id"] for entry in entries], action)
         completed: list[dict] = []
         failed: list[dict] = []
         warnings: list[str] = []
@@ -271,13 +378,9 @@ class OrganizeCorrectionService:
             log_id = int(entry["log_id"])
             token = str(entry["operation_token"])
             version = int(entry["expected_version"])
-            detail = detail_map[log_id]
             try:
                 if action == "reorganize":
-                    result = self.reorganize(
-                        log_id, token, version,
-                        str(detail.get("tmdb_id") or ""), "tv",
-                    )
+                    result = self._execute_reorganize(log_id, token, version, previews[log_id])
                 elif action == "revert":
                     result = self.revert_latest(log_id, token, version)
                 else:
@@ -548,19 +651,7 @@ class OrganizeCorrectionService:
             log_id, tmdb_id, media_type, title, year, season, episode,
             provider=provider, external_id=external_id,
         )
-        items = self._load_items(log_id)
-        self._verify_items(items)
-        if not db.claim_organize_log_operation(
-            log_id, operation_token, "reorganizing",
-            tuple(REORGANIZE_STATUSES), expected_version,
-        ):
-            raise RuntimeError("日志状态或版本已变化，请刷新后重试")
-        try:
-            return self._execute_reorganize(log_id, operation_token, preview, items)
-        except Exception as exc:
-            status = self._failure_status(log_id, "failed")
-            db.update_organize_log(log_id, status=status, error=str(exc))
-            raise
+        return self._execute_reorganize(log_id, operation_token, expected_version, preview)
 
     def _verify_item(self, item: CorrectionItem) -> GuangYaFile:
         remote = self.client.file_info(item.file_id)
@@ -1213,13 +1304,15 @@ class OrganizeCorrectionService:
         return warnings
 
     def _execute_reorganize(self, log_id: int, operation_token: str,
-                            preview: dict, items: list[CorrectionItem]) -> dict:
-        rules = restore_organize_rules_snapshot(
-            preview["rules_snapshot"],
-            trusted_rules=OrganizeRules.from_config().for_source(
-                str(self.detail(log_id).get("source_dir_id") or ""), client=self.client
-            ),
+                            expected_version: int, preview: dict) -> dict:
+        items = self._load_items(log_id)
+        self._verify_items(items)
+        current_rules = OrganizeRules.from_config().for_source(
+            str(self.detail(log_id).get("source_dir_id") or ""), client=self.client,
         )
+        if not organize_rules_snapshot_matches(preview["rules_snapshot"], current_rules):
+            raise ValueError("整理规则已变化，请重新预览并确认")
+        rules = restore_organize_rules_snapshot(preview["rules_snapshot"], trusted_rules=current_rules)
         before = db.capture_organize_business_snapshot(log_id)
         previous_log = db.get_organize_log(log_id)
         parent_path = str(previous_log["original_path"] or "") if previous_log else ""
@@ -1232,6 +1325,10 @@ class OrganizeCorrectionService:
             release_parse["manual_position"] = dict(preview["manual_position"])
         elif match["media_type"] != "tv":
             release_parse.pop("manual_position", None)
+        if not db.claim_organize_log_operation(
+            log_id, operation_token, "reorganizing", tuple(REORGANIZE_STATUSES), expected_version,
+        ):
+            raise RuntimeError("日志状态或版本已变化，请刷新后重试")
         created_dirs: list[str] = []
         completed: list[AppliedTransition] = []
         try:
@@ -1269,7 +1366,7 @@ class OrganizeCorrectionService:
                 release_parse_json=json.dumps(release_parse, ensure_ascii=False), error="",
             ):
                 raise RuntimeError("重整业务结果未能持久化")
-        except Exception:
+        except Exception as exc:
             self._rollback_transitions(completed)
             if completed and self._failure_status(log_id, "failed") != "partial_failed":
                 try:
@@ -1282,6 +1379,7 @@ class OrganizeCorrectionService:
                             error=f"业务前像恢复失败，必须人工核验: {type(restore_exc).__name__}",
                         )
             self._cleanup_created_dirs(created_dirs)
+            db.update_organize_log(log_id, status=self._failure_status(log_id, "failed"), error=str(exc))
             raise
         warnings = self._notify_reorganize_result(preview, items, rules)
         warnings.extend(self._run_post_actions(

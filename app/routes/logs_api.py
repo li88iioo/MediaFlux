@@ -292,8 +292,8 @@ def organize_timeline(
             "completed_at": row["completed_at"] or "",
             "actions": {
                 "detail": row_origin == "guangya",
-                # 待确认项尚未产生可回退的云端写操作，只允许查看详情。
-                "batch": row_origin == "guangya" and row["status"] != "manual",
+                # 未识别记录也可选择纠偏；各动作仍由完整快照与状态预检裁决。
+                "batch": row_origin == "guangya",
             },
         })
     return {
@@ -457,9 +457,32 @@ def _closing_operation(service: OrganizeCorrectionService, callback):
     return run
 
 
+@router.post("/organize/batch/preview")
+def preview_organize_batch(request: Request, data: dict | None = Body(default=None)):
+    require_api_login(request)
+    service = None
+    try:
+        data = data or {}
+        action, entries = _batch_operation_payload(data)
+        if action != "reorganize":
+            raise ValueError("批量预览仅用于纠正识别")
+        service = OrganizeCorrectionService()
+        return service.preview_batch(entries, data.get("candidate"))
+    except LookupError as exc:
+        return api_error(str(exc), 404)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+    except Exception as exc:
+        logger.error("批量纠正预览失败 type=%s", type(exc).__name__)
+        return api_error("批量纠正预览失败，请稍后重试", 409)
+    finally:
+        if service is not None:
+            service.close()
+
+
 @router.post("/organize/batch")
 def run_organize_batch(request: Request, data: dict | None = Body(default=None)):
-    """对已选择的剧集日志执行批量改名、回退或删除。"""
+    """对明确候选执行批量纠正，或按既有契约执行回退/删除。"""
     require_api_login(request)
     data = data or {}
     service = None
@@ -470,19 +493,28 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
         if action == "delete" and confirm_text != "DELETE":
             return api_error("请输入 DELETE 确认批量移入光鸭回收站", 400)
         service = OrganizeCorrectionService()
-        service.validate_batch([entry["log_id"] for entry in entries], action)
+        candidate = data.get("candidate")
+        preview_digest = str(data.get("preview_digest") or "")
+        if action == "reorganize":
+            preview = service.preview_batch(entries, candidate)
+            if not preview["can_execute"] or not preview_digest or preview_digest != preview["preview_digest"]:
+                raise ValueError("批量预览已失效或存在错误，请重新预览并确认")
+        else:
+            service.validate_batch([entry["log_id"] for entry in entries], action)
         if not service.client.logged_in:
             return api_error("光鸭未登录，无法执行剧集批量操作", 503)
         labels = {
-            "reorganize": "剧集批量改名",
+            "reorganize": "批量纠正识别",
             "revert": "剧集批量回退",
             "delete": "剧集批量移入光鸭回收站",
         }
         result = get_organize_manager().start_operation(
-            labels[action], f"{len(entries)} 条剧集日志",
+            labels[action], f"{len(entries)} 条整理日志",
             _closing_operation(
                 service,
-                lambda: service.run_batch(action, entries, confirm_text),
+                lambda: service.run_batch(
+                    action, entries, confirm_text, candidate=candidate, preview_digest=preview_digest,
+                ),
             ),
         )
         if not result["ok"]:

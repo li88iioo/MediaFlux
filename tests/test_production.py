@@ -1099,19 +1099,19 @@ class OrganizeCorrectionTests(unittest.TestCase):
                 "id": 1,
                 "media_type": "tv",
                 "tmdb_id": "11",
-                "allowed_actions": {"reorganize": True},
+                "allowed_actions": {"revert": True},
             },
             2: {
                 "id": 2,
                 "media_type": "movie",
                 "tmdb_id": "22",
-                "allowed_actions": {"reorganize": True},
+                "allowed_actions": {"revert": True},
             },
         }
         with patch.object(
             service, "detail", side_effect=lambda log_id: details[log_id]
         ), self.assertRaisesRegex(ValueError, "包含电影"):
-            service.validate_batch([1, 2], "reorganize")
+            service.validate_batch([1, 2], "revert")
         service.client.assert_not_called()
 
     def test_batch_validation_requires_unique_multiple_tv_logs(self):
@@ -1121,45 +1121,31 @@ class OrganizeCorrectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "重复 ID"):
             service.validate_batch([1, 1], "delete")
 
-    def test_batch_reorganize_uses_each_logs_snapshot_and_collects_failures(self):
+    def test_batch_reorganize_requires_explicit_identity_and_preview(self):
         service = OrganizeCorrectionService(client=object(), scraper=object())
-        details = {
-            1: {
-                "id": 1,
-                "media_type": "tv",
-                "tmdb_id": "101",
-                "allowed_actions": {"reorganize": True},
-            },
-            2: {
-                "id": 2,
-                "media_type": "tv",
-                "tmdb_id": "202",
-                "allowed_actions": {"reorganize": True},
-            },
-        }
         entries = [
             {"log_id": 1, "expected_version": 3, "operation_token": "a"},
             {"log_id": 2, "expected_version": 7, "operation_token": "b"},
         ]
+        with self.assertRaisesRegex(ValueError, "选择正确作品"):
+            service.run_batch("reorganize", entries)
+        previews = [{"log_id": 1, "match": {"tmdb_id": "99"}}, {"log_id": 2, "match": {"tmdb_id": "99"}}]
         with (
-            patch.object(service, "detail", side_effect=lambda log_id: details[log_id]),
-            patch.object(
-                service,
-                "reorganize",
-                side_effect=[
-                    {"success": True, "warnings": []},
-                    RuntimeError("simulated batch failure"),
-                ],
-            ) as reorganize,
+            patch.object(service, "preview_batch", return_value={
+                "items": previews, "can_execute": True, "preview_digest": "verified",
+            }),
+            patch.object(service, "_execute_reorganize", side_effect=[
+                {"success": True, "warnings": []}, RuntimeError("simulated batch failure"),
+            ]) as execute,
         ):
-            result = service.run_batch("reorganize", entries)
+            result = service.run_batch("reorganize", entries,
+                                       candidate={"tmdb_id": "99", "media_type": "tv"},
+                                       preview_digest="verified")
         self.assertFalse(result["success"])
         self.assertEqual([item["log_id"] for item in result["completed"]], [1])
-        self.assertEqual(
-            result["failed"], [{"log_id": 2, "error": "simulated batch failure"}]
-        )
-        self.assertEqual(reorganize.call_args_list[0].args, (1, "a", 3, "101", "tv"))
-        self.assertEqual(reorganize.call_args_list[1].args, (2, "b", 7, "202", "tv"))
+        self.assertEqual(result["failed"], [{"log_id": 2, "error": "simulated batch failure"}])
+        self.assertEqual(execute.call_args_list[0].args, (1, "a", 3, previews[0]))
+        self.assertEqual(execute.call_args_list[1].args, (2, "b", 7, previews[1]))
 
     def test_partial_failure_is_frozen_for_manual_reconciliation(self):
         service = OrganizeCorrectionService(client=object(), scraper=object())

@@ -279,7 +279,8 @@ for(const [search,origin,status] of [
         self.assertEqual(item["record_key"], f"guangya:{log_id}")
         self.assertEqual(item["status"], "manual")
         self.assertTrue(item["actions"]["detail"])
-        self.assertFalse(item["actions"]["batch"])
+        # 未识别记录可进入批量纠偏；能否写入仍由媒体组快照预检决定。
+        self.assertTrue(item["actions"]["batch"])
 
     def test_legacy_manual_skip_is_collapsed_after_later_success(self):
         pending_id = db.add_organize_log(
