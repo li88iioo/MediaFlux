@@ -20,8 +20,7 @@ from app.modules.strm import (
     generate_strm,
     sync_strm,
 )
-from tests.support import IsolatedDatabaseTestCase
-from tests.support import PagedDirectoryTestMixin
+from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin
 
 
 class _TreeClient(PagedDirectoryTestMixin):
@@ -80,6 +79,124 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
             self.assertFalse(any(row["source_id"] == source_id for row in db.list_strm_retired_sources()))
 
+    def test_invalid_cleanup_reports_missing_managed_path_idempotently(self) -> None:
+        source_id = f"missing-stale-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / STRM_SUBDIR / "Series" / "Missing.strm"
+            target.parent.mkdir(parents=True)
+            db.upsert_strm_index(
+                source_key, "missing-video", "etag", 1, "Missing.mkv",
+                str(target), self._fingerprint(b"formerly-owned"),
+            )
+
+            first = clean_invalid_strm(
+                root, source_key=source_key, valid_ids=set(), clean_empty_dirs=False,
+            )
+            second = clean_invalid_strm(
+                root, source_key=source_key, valid_ids=set(), clean_empty_dirs=False,
+            )
+
+        self.assertEqual(first["cleaned"], 0)
+        self.assertEqual(first["removed_paths"], [str(target)])
+        self.assertEqual(second["cleaned"], 0)
+        self.assertEqual(second["removed_paths"], [])
+        self.assertEqual(db.list_strm_index(source_key), [])
+
+    def test_invalid_cleanup_does_not_report_shared_active_or_external_path(self) -> None:
+        source_id = f"shared-stale-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            shared = Path(root) / STRM_SUBDIR / "Series" / "Shared.strm"
+            shared.parent.mkdir(parents=True)
+            db.upsert_strm_index(
+                source_key, "stale", "etag", 1, "Shared.mkv", str(shared), "",
+            )
+            db.upsert_strm_index(
+                source_key, "active", "etag", 1, "Shared.mkv", str(shared), "",
+            )
+            active = clean_invalid_strm(
+                root, source_key=source_key, valid_ids={"active"}, clean_empty_dirs=False,
+            )
+            self.assertEqual(active["removed_paths"], [])
+            self.assertEqual(
+                [row["file_id"] for row in db.list_strm_index(source_key)], ["active"],
+            )
+
+            external_key = f"guangya:{source_id}-external"
+            external = Path(outside) / "Outside.strm"
+            external.parent.mkdir(parents=True, exist_ok=True)
+            db.upsert_strm_index(
+                external_key, "outside", "etag", 1, "Outside.mkv", str(external), "",
+            )
+            blocked = clean_invalid_strm(
+                root, source_key=external_key, valid_ids=set(), clean_empty_dirs=False,
+            )
+
+        self.assertTrue(blocked["skipped"])
+        self.assertEqual(blocked["removed_paths"], [])
+        self.assertEqual(len(db.list_strm_index(external_key)), 1)
+
+    def test_retired_source_reports_missing_managed_path_idempotently(self) -> None:
+        source_id = f"retired-missing-{uuid.uuid4().hex}"
+        source_key = f"guangya:{source_id}"
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / STRM_SUBDIR / "Series" / "Missing.strm"
+            target.parent.mkdir(parents=True)
+            db.upsert_strm_index(
+                source_key, "missing-video", "etag", 1, "Missing.mkv",
+                str(target), self._fingerprint(b"formerly-owned"),
+            )
+            db.enqueue_strm_retired_source(source_id, "缺失文件来源", root)
+
+            first = clean_retired_strm_sources(set(), clean_empty_dirs=False)
+            second = clean_retired_strm_sources(set(), clean_empty_dirs=False)
+
+        self.assertEqual(first["cleaned"], 0)
+        self.assertGreaterEqual(first["index_cleaned"], 1)
+        self.assertEqual(first["removed_paths"], [str(target.resolve())])
+        self.assertEqual(second["removed_paths"], [])
+        self.assertEqual(db.list_strm_index(source_key), [])
+        self.assertFalse(any(
+            row["source_id"] == source_id for row in db.list_strm_retired_sources()
+        ))
+
+    def test_retired_source_does_not_report_missing_shared_or_external_path(self) -> None:
+        retired_id = f"retired-shared-{uuid.uuid4().hex}"
+        active_id = f"active-shared-{uuid.uuid4().hex}"
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            shared = Path(root) / STRM_SUBDIR / "Shared.strm"
+            shared.parent.mkdir(parents=True)
+            db.upsert_strm_index(
+                f"guangya:{retired_id}", "retired-file", "etag", 1,
+                "Shared.mkv", str(shared), "",
+            )
+            db.upsert_strm_index(
+                f"guangya:{active_id}", "active-file", "etag", 1,
+                "Shared.mkv", str(shared), "",
+            )
+            db.enqueue_strm_retired_source(retired_id, "共享路径来源", root)
+            shared_result = clean_retired_strm_sources(
+                {active_id}, clean_empty_dirs=False,
+            )
+
+            external_id = f"retired-external-{uuid.uuid4().hex}"
+            external = Path(outside) / "Outside.strm"
+            db.upsert_strm_index(
+                f"guangya:{external_id}", "external-file", "etag", 1,
+                "Outside.mkv", str(external), "",
+            )
+            db.enqueue_strm_retired_source(external_id, "越界来源", root)
+            external_result = clean_retired_strm_sources(set(), clean_empty_dirs=False)
+
+        self.assertEqual(shared_result["removed_paths"], [])
+        self.assertEqual(db.list_strm_index(f"guangya:{active_id}")[0]["file_id"], "active-file")
+        self.assertEqual(external_result["removed_paths"], [])
+        self.assertEqual(external_result["blocked"], 1)
+        self.assertEqual(len(db.list_strm_index(f"guangya:{external_id}")), 1)
+        db.delete_strm_index_ids(f"guangya:{external_id}", ["external-file"])
+        db.delete_strm_retired_source(external_id)
+
     def test_retired_source_preserves_locally_modified_metadata(self) -> None:
         source_id = f"retired-meta-{uuid.uuid4().hex}"
         with tempfile.TemporaryDirectory() as root:
@@ -100,6 +217,8 @@ class P2StrmOwnershipTests(IsolatedDatabaseTestCase):
             self.assertTrue(target.exists())
             self.assertEqual(len(db.list_strm_index(f"guangya-meta:{source_id}")), 1)
             self.assertTrue(any(row["source_id"] == source_id for row in db.list_strm_retired_sources()))
+            db.delete_strm_index_ids(f"guangya-meta:{source_id}", ["poster-1"])
+            db.delete_strm_retired_source(source_id)
 
     def test_sync_repairs_locally_modified_indexed_strm(self) -> None:
         source_id = f"modified-{uuid.uuid4().hex}"
@@ -709,8 +828,7 @@ class P2OwnershipRaceRegressionTests(IsolatedDatabaseTestCase):
 
             def modify_before_final_check(path, rows, action):
                 checks["count"] += 1
-                if checks["count"] == 2:
-                    Path(path).write_bytes(b"user-before-delete")
+                Path(path).write_bytes(b"user-before-delete")
                 return original_require(path, rows, action)
 
             with patch(

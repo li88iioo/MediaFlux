@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import uuid
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
@@ -12,12 +13,12 @@ from app.modules.strm import (
     STRM_SUBDIR,
     _build_video_index_maps,
     _update_video_index_snapshot,
+    clean_retired_strm_sources,
     generate_strm,
     sync_strm,
     sync_strm_incremental,
 )
-from tests.support import IsolatedDatabaseTestCase
-from tests.support import PagedDirectoryTestMixin
+from tests.support import IsolatedDatabaseTestCase, PagedDirectoryTestMixin
 
 
 class _IncrementalClient(PagedDirectoryTestMixin):
@@ -78,6 +79,48 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
     @staticmethod
     def _fingerprint(path: Path) -> str:
         return f"sha256:{hashlib.sha256(path.read_bytes()).hexdigest()}"
+
+    def _run_full_schedule(self, root: str, source: dict, scan, *, process_retirements=False):
+        scheduler = self._new_scheduler()
+        values = {
+            "GY_STRM_BASE_URL": "http://media.invalid",
+            "STRM_ROOT": root,
+            "STRM_VIDEO_EXTS": "mkv",
+            "STRM_METADATA_EXTS": "",
+        }
+        retirement = clean_retired_strm_sources if process_retirements else Mock(return_value={
+            "sources": 0, "blocked": 0, "cleaned": 0,
+            "empty_dirs_cleaned": 0, "removed_paths": [],
+            "removed_dir_paths": [], "errors": [], "stopped": False,
+            "empty_dir_roots": [],
+        })
+        with patch.object(scheduler, "validate_config", return_value=""), patch(
+            "app.modules.scheduler.configured_strm_source_plans",
+            return_value=([source], ""),
+        ), patch(
+            "app.modules.scheduler.sync_strm", side_effect=scan,
+        ), patch(
+            "app.modules.scheduler.clean_retired_strm_sources", side_effect=retirement,
+        ), patch(
+            "app.modules.scheduler.clean_empty_strm_dirs",
+            return_value={"empty_dirs_cleaned": 0, "removed_dir_paths": [], "stopped": False},
+        ), patch(
+            "app.modules.scheduler.db.cancel_retired_strm_metadata_jobs", return_value=0,
+        ), patch(
+            "app.modules.scheduler.reconcile_historical_strm",
+        ), patch(
+            "app.modules.scheduler.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch("app.modules.scheduler.get_int", return_value=0), patch(
+            "app.modules.scheduler.get_bool", return_value=False,
+        ), patch(
+            "app.modules.media_refresh_coordinator.enqueue_media_refresh_paths",
+            side_effect=RuntimeError("offline test dispatch"),
+        ), patch(
+            "app.modules.scheduler._publish_linked_notification_threads",
+        ), patch.object(scheduler, "_notify_scoped_results"):
+            result = scheduler.run_blocking("manual", force_full=True)
+        return result
 
     @staticmethod
     def _empty_stats(**updates) -> dict:
@@ -766,6 +809,87 @@ class StrmP2IncrementalTests(IsolatedDatabaseTestCase):
         incremental.assert_called_once()
         full.assert_called_once()
         self.assertEqual(db.get_last_task_run("strm_sync")["status"], "success")
+
+    def test_full_schedule_persists_missing_managed_strm_refresh_with_zero_deletes(self):
+        source_id = f"missing-refresh-{uuid.uuid4().hex}"
+        source = {"id": source_id, "name": "Series", "rel_prefix": ""}
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / STRM_SUBDIR / "Series" / "Missing.strm"
+            target.parent.mkdir(parents=True)
+            db.upsert_strm_index(
+                f"guangya:{source_id}", "missing-video", "etag", 1,
+                "Missing.mkv", str(target),
+                f"sha256:{hashlib.sha256(b'formerly-owned').hexdigest()}",
+            )
+
+            def scan(**kwargs):
+                return sync_strm(
+                    client=_TreeClient({source_id: []}), **kwargs,
+                )
+
+            result = self._run_full_schedule(root, source, scan)
+            entries = db.list_strm_refresh_entries()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stats"]["cleaned"], 0)
+        self.assertIn(str(target), result["stats"]["changed_strm_paths"])
+        self.assertIn(str(target.parent), {entry["path"] for entry in entries})
+        self.assertEqual(db.list_strm_index(f"guangya:{source_id}"), [])
+
+    def test_full_schedule_persists_retired_missing_path_to_refresh_outbox(self):
+        active_id = f"active-{uuid.uuid4().hex}"
+        retired_id = f"retired-refresh-{uuid.uuid4().hex}"
+        source = {"id": active_id, "name": "Series", "rel_prefix": ""}
+        with tempfile.TemporaryDirectory() as root:
+            target = Path(root) / STRM_SUBDIR / "Series" / "Retired.strm"
+            target.parent.mkdir(parents=True)
+            db.upsert_strm_index(
+                f"guangya:{retired_id}", "retired-video", "etag", 1,
+                "Retired.mkv", str(target),
+                f"sha256:{hashlib.sha256(b'formerly-owned').hexdigest()}",
+            )
+            db.enqueue_strm_retired_source(retired_id, "已移除来源", root)
+
+            def scan(**kwargs):
+                return sync_strm(client=_TreeClient({active_id: []}), **kwargs)
+
+            result = self._run_full_schedule(
+                root, source, scan, process_retirements=True,
+            )
+            entries = db.list_strm_refresh_entries()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stats"]["cleaned"], 0)
+        self.assertIn(str(target.resolve()), result["stats"]["changed_strm_paths"])
+        self.assertIn(str(target.parent), {entry["path"] for entry in entries})
+        self.assertEqual(db.list_strm_index(f"guangya:{retired_id}"), [])
+        self.assertFalse(any(
+            row["source_id"] == retired_id for row in db.list_strm_retired_sources()
+        ))
+
+    def test_full_schedule_has_no_refresh_without_paths_or_after_unsafe_scan(self):
+        scenarios = (
+            ("no-change", lambda: STRMScheduler._empty_stats()),
+            ("incomplete", lambda: {
+                **STRMScheduler._empty_stats(), "scan_incomplete": True, "scan_errors": 1,
+            }),
+            ("cancelled", lambda: {
+                **STRMScheduler._empty_stats(), "stopped": True, "clean_skipped": True,
+            }),
+        )
+        for label, make_stats in scenarios:
+            with self.subTest(scenario=label), tempfile.TemporaryDirectory() as root:
+                source_id = f"no-refresh-{label}-{uuid.uuid4().hex}"
+                source = {"id": source_id, "name": "Series", "rel_prefix": ""}
+                result = self._run_full_schedule(
+                    root, source, lambda _stats=make_stats, **_kwargs: _stats(),
+                )
+                root_prefix = str(Path(root) / STRM_SUBDIR)
+                self.assertFalse(any(
+                    entry["path"].startswith(root_prefix)
+                    for entry in db.list_strm_refresh_entries()
+                ))
+                self.assertEqual(result["stats"]["changed_strm_paths"], [])
 
     def test_jellyfin_refresh_skips_when_no_safe_change_target(self):
         values = {

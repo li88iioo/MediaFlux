@@ -3629,6 +3629,7 @@ def clean_retired_strm_sources(
             if not resolved.exists():
                 db.delete_strm_index_ids(namespace, [file_id])
                 result["index_cleaned"] += 1
+                result["removed_paths"].append(str(resolved))
                 continue
             if not resolved.is_file():
                 blocked += 1
@@ -3790,16 +3791,13 @@ def clean_invalid_strm(
         path_text = str(row["strm_path"] or "")
         path = Path(path_text) if path_text else None
         try:
-            if path and path_text not in active_paths and path.is_file():
-                try:
-                    _require_owned_file(path, [row], "清理失效 STRM")
-                except _STRMOwnershipError as exc:
-                    blocked_paths.append(path_text)
-                    logger.debug("STRM 所有权校验阻止清理 type=%s", type(exc).__name__)
-                    continue
-                _delete_owned_file(path, [row], "清理失效 STRM")
-                cleaned += 1
-                removed_paths.append(str(path))
+            if path and path_text not in active_paths:
+                deleted = _delete_owned_file(path, [row], "清理失效 STRM")
+                cleaned += int(deleted)
+                if deleted or not path.exists():
+                    # 预检已确认该索引路径位于 STRM 根内；缺失文件也交接刷新，
+                    # cleaned 仍只统计真实 unlink。
+                    removed_paths.append(str(path))
             removed_ids.append(row["file_id"])
         except _STRMOwnershipError as exc:
             blocked_paths.append(path_text)

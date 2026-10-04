@@ -1880,9 +1880,9 @@ class STRMScheduler:
                     active_ids_complete=not scoped_sources,
                 )
 
-            has_changes = any(int(aggregate.get(key, 0) or 0) > 0 for key in (
-                "generated", "metadata_generated", "cleaned", "metadata_cleaned",
-            ))
+            has_changes = bool(
+                aggregate.get("changed_strm_paths") or aggregate.get("changed_dirs")
+            )
             if stopped or self._stop_event.is_set():
                 media_refresh = {}
                 if has_changes:
