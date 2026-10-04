@@ -6073,11 +6073,13 @@ class SecurityTests(InitializedWebTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["succeeded"], ["guangya"])
         self.assertEqual(result["failed"], ["qb"])
-        self.assertIn("qB unavailable", result["error"])
+        self.assertTrue(result["outcome_unknown"])
+        self.assertIn("下载提交回执无法确认", result["error"])
+        self.assertNotIn("qB unavailable", result["error"])
         # 根状态由真实仓储在事务中归并，执行器不再传入另一份推导结果。
         self.assertNotIn("status", finalize.call_args.kwargs)
         self.assertEqual(finalize.call_args.kwargs["gy_status"], "submitted")
-        self.assertEqual(finalize.call_args.kwargs["qb_status"], "failed")
+        self.assertEqual(finalize.call_args.kwargs["qb_status"], "outcome_unknown")
         self.assertEqual(add_log.call_count, 2)
 
     def test_download_tracker_marks_qb_error_state_failed(self):

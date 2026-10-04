@@ -1072,24 +1072,31 @@ def _dispatch_claimed_targets(
     title = str(row["title"] or "未命名任务")
     source_value = str(row["source_value"] or "")
     results: dict[str, dict[str, Any]] = {}
-    if "qb" in claimed_targets:
-        results["qb"] = _safe_submit(
-            "qBittorrent",
-            _submit_qb,
-            row,
-            **_qb_submit_overrides(
-                save_path=qb_save_path,
-                category=qb_category,
-                runtime_config=qb_runtime_config,
-                task_id_hint=qb_task_id_hint,
-            ),
-        )
-    if "guangya" in claimed_targets:
-        results["guangya"] = _safe_submit(
-            "光鸭云盘", _submit_guangya, row,
-            target_dir_id=gy_target_dir,
-            target_dir_name=gy_target_name,
-        )
+    submissions = {
+        "qb": (_submit_qb, _qb_submit_overrides(
+            save_path=qb_save_path, category=qb_category,
+            runtime_config=qb_runtime_config, task_id_hint=qb_task_id_hint,
+        )),
+        "guangya": (_submit_guangya, {
+            "target_dir_id": gy_target_dir, "target_dir_name": gy_target_name,
+        }),
+    }
+    for source in claimed_targets:
+        submitter, kwargs = submissions[source]
+        try:
+            result = submitter(row, **kwargs)
+            if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+                raise ValueError("invalid backend submission receipt")
+        except Exception as exc:
+            # 进入提交边界后无法证明未写入，不能把未分类异常降为可重投失败。
+            logger.warning("下载回执无法确认 request=%s backend=%s type=%s",
+                           request_id, source, type(exc).__name__)
+            result = {
+                "ok": False, "outcome_unknown": True,
+                "failure_code": f"{source}_outcome_unknown",
+                "error": "下载提交回执无法确认，请先核对下载器，勿重复提交",
+            }
+        results[source] = result
 
     succeeded = [name for name, result in results.items() if result.get("ok")]
     failed = [name for name, result in results.items() if not result.get("ok")]
@@ -1100,7 +1107,9 @@ def _dispatch_claimed_targets(
     updates: dict[str, Any] = {"error": error}
     if "qb" in results:
         updates["qb_status"] = _backend_submission_status("qb", results["qb"])
-        updates["qb_task_id"] = results["qb"].get("task_id", "")
+        updates["qb_task_id"] = results["qb"].get("task_id") or (
+            torrent_identity(row) if updates["qb_status"] == "outcome_unknown" else ""
+        )
     if "guangya" in results:
         gy_result = results["guangya"]
         updates["gy_status"] = _backend_submission_status("guangya", gy_result)
@@ -1110,20 +1119,22 @@ def _dispatch_claimed_targets(
         updates["gy_batch_count"] = int(gy_result.get("batch_count") or len(task_ids))
         decision = gy_result.get("decision") or {}
         staging = gy_result.get("staging") or {}
-        updates["gy_target_dir"] = decision.get("target_dir_id", "")
-        updates["gy_target_name"] = decision.get("target_dir_name", "")
-        updates["gy_isolated"] = 1 if staging.get("isolated") else 0
-        updates["gy_staging_parent_dir"] = str(staging.get("parent_id") or "")
-        updates["gy_staging_name"] = str(staging.get("name") or "")
-        updates["gy_staging_cleanup_status"] = str(
-            staging.get("cleanup_status")
-            or ("pending" if staging.get("isolated") and (
-                gy_result.get("ok") or gy_result.get("partial_success")
-            ) else "")
-        )
-        updates["gy_staging_cleanup_error"] = str(
-            staging.get("cleanup_error") or ""
-        )[:500]
+        # 回调已在云写之前保存隔离身份；无回执不等于没有隔离目录。
+        if decision:
+            updates["gy_target_dir"] = decision.get("target_dir_id", "")
+            updates["gy_target_name"] = decision.get("target_dir_name", "")
+        if staging:
+            updates.update({
+                "gy_isolated": int(bool(staging.get("isolated"))),
+                "gy_staging_parent_dir": str(staging.get("parent_id") or ""),
+                "gy_staging_name": str(staging.get("name") or ""),
+                "gy_staging_cleanup_status": str(staging.get("cleanup_status") or (
+                    "pending" if staging.get("isolated") and (
+                        gy_result.get("ok") or gy_result.get("partial_success")
+                    ) else ""
+                )),
+                "gy_staging_cleanup_error": str(staging.get("cleanup_error") or "")[:500],
+            })
         updates["gy_expected_file_count"] = max(0, int(gy_result.get("selected_count") or 0))
         updates["gy_settle_observed_file_count"] = 0
         updates["gy_settle_attempts"] = 0
@@ -1408,17 +1419,6 @@ def parse_torrent_manifest(data: bytes) -> TorrentManifest:
             raise BencodeError("种子文件包含重复路径")
         seen.add(key)
     return TorrentManifest(name=name, version=version, files=tuple(files))
-
-
-def _safe_submit(name: str, submitter, row, **kwargs) -> dict[str, Any]:
-    try:
-        result = submitter(row, **kwargs)
-        if not isinstance(result, dict):
-            return {"ok": False, "task_id": "", "error": f"{name} 返回结果无效"}
-        return result
-    except Exception as exc:
-        logger.exception("%s 下载提交异常 request=%s type=%s", name, row["id"], type(exc).__name__)
-        return {"ok": False, "task_id": "", "error": str(exc) or f"{name} 提交异常"}
 
 
 def _submit_qb(

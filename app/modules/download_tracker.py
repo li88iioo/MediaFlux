@@ -44,28 +44,24 @@ _STALE_SUBMISSION_MINUTES = 15
 
 
 class _QBTaskIndex:
-    """一轮快照只建一次索引；重复键保持原先线性匹配的首项语义。"""
+    """一轮快照只建一次内容身份索引，名称不作为任务归属证据。"""
 
     def __init__(self, tasks: list):
         self.by_hash: dict[str, TorrentTask] = {}
-        self.by_title: dict[str, TorrentTask] = {}
         for task in tasks:
             self.by_hash.setdefault(str(getattr(task, "hash", "") or "").lower(), task)
-            self.by_title.setdefault(str(getattr(task, "name", "") or "").strip().lower(), task)
 
 
 class _GYTaskIndex:
     def __init__(self, tasks: list[dict]):
         self.by_id: dict[str, dict] = {}
         self.by_source: dict[str, dict] = {}
-        self.by_title: dict[str, dict] = {}
         self.unique_target: dict[str, dict | None] = {}
         for task in tasks:
             task_id = str(task.get("id") or "")
             self.by_id.setdefault(task_id, task)
             raw = task.get("raw") if isinstance(task.get("raw"), dict) else {}
             self.by_source.setdefault(str(raw.get("url") or raw.get("sourceUrl") or ""), task)
-            self.by_title.setdefault(str(task.get("name") or "").strip().lower(), task)
             target = str(task.get("target_dir") or "")
             self.unique_target[target] = None if target in self.unique_target else task
 
@@ -306,7 +302,12 @@ class DownloadTracker:
         ) in {"", "pending"}
         tracking_completed_qb = qb_status == "completed" and local_import_pending
         if qb_status in {"submitted", "downloading", "outcome_unknown"} or tracking_completed_qb:
-            task = self._match_qb(row, qb_tasks) if qb_available else None
+            from app.modules.download_dispatcher import torrent_identity
+
+            identity = str(self._row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
+            if qb_available and identity and not self._row_value(row, "qb_task_id", ""):
+                updates["qb_task_id"] = identity
+            task = qb_tasks.by_hash.get(identity) if qb_available and identity else None
             matched_qb_task = task
             if task:
                 progress = max(0.0, min(float(task.progress or 0), 1.0))
@@ -326,7 +327,7 @@ class DownloadTracker:
             elif (
                 not tracking_completed_qb
                 and qb_available
-                and str(self._row_value(row, "qb_task_id", "") or "")
+                and identity
             ):
                 missing_since = self._row_value(row, "qb_task_missing_since", "")
                 if not missing_since:
@@ -334,17 +335,10 @@ class DownloadTracker:
                 elif self._missing_expired(missing_since):
                     updates["qb_status"] = "manual_review"
                     updates["error"] = "qB 后端任务长时间未找到，请核对下载器后人工处理"
-            elif not tracking_completed_qb and qb_status == "outcome_unknown" and qb_available:
-                updates["qb_status"] = "manual_review"
-                updates["error"] = "qB 提交结果未知且无法提取任务标识，请人工核对下载器"
-            elif (
-                not tracking_completed_qb
-                and qb_available
-                and self._qb_submission_has_no_stable_identity(row)
-            ):
+            elif not tracking_completed_qb and qb_available:
                 updates["qb_status"] = "manual_review"
                 updates["error"] = (
-                    "qB 已接收直链任务，但当前下载器接口未返回可跟踪任务标识；"
+                    "qB 未返回可跟踪任务标识，且无法从原始资源恢复身份；"
                     "请在下载器中核对，勿直接重复提交"
                 )
 
@@ -1229,41 +1223,30 @@ class DownloadTracker:
         return guangya_offline_task_state(task.get("status"), task.get("progress"))
 
     @classmethod
-    def _qb_submission_has_no_stable_identity(cls, row) -> bool:
-        kind = str(cls._row_value(row, "kind", "") or "").strip().lower()
-        identity = str(cls._row_value(row, "qb_task_id", "") or "").strip()
-        return kind in {"http", "ed2k"} and not identity
-
-    @classmethod
     def _match_qb(cls, row, tasks: list | _QBTaskIndex):
         index = tasks if isinstance(tasks, _QBTaskIndex) else _QBTaskIndex(tasks)
-        identity = str(cls._row_value(row, "qb_task_id", "") or "").lower()
-        title = str(cls._row_value(row, "title", "") or "").strip().lower()
-        if identity:
-            return index.by_hash.get(identity)
-        # HTTP/ED2K 的标题不是稳定身份，不允许因此认领另一个同名任务。
-        if cls._qb_submission_has_no_stable_identity(row):
-            return None
-        return index.by_title.get(title) if title else None
+        from app.modules.download_dispatcher import torrent_identity
+
+        identity = str(cls._row_value(row, "qb_task_id", "") or torrent_identity(row)).lower()
+        return index.by_hash.get(identity) if identity else None
 
     @staticmethod
     def _match_gy(row, tasks: list[dict] | _GYTaskIndex):
         index = tasks if isinstance(tasks, _GYTaskIndex) else _GYTaskIndex(tasks)
         task_id = str(DownloadTracker._row_value(row, "gy_task_id", "") or "")
-        title = str(DownloadTracker._row_value(row, "title", "") or "").strip().lower()
         source_value = str(DownloadTracker._row_value(row, "source_value", "") or "")
         target_dir = str(DownloadTracker._row_value(row, "gy_target_dir", "") or "")
         isolated = bool(int(DownloadTracker._row_value(row, "gy_isolated", 0) or 0))
         if task_id:
             return index.by_id.get(task_id)
-        # 隔离目录只能唯一匹配，不回退 URL/标题；无 ID 非隔离任务保留原优先级。
+        # 隔离目录只能唯一匹配；历史非隔离任务按来源/独有目录核验，不凭标题认领。
         if isolated:
             return index.unique_target.get(target_dir) if target_dir else None
         if source_value and source_value in index.by_source:
             return index.by_source[source_value]
         if target_dir and index.unique_target.get(target_dir) is not None:
             return index.unique_target[target_dir]
-        return index.by_title.get(title) if title else None
+        return None
 
     def _loop(self) -> None:
         while not self._stop_event.is_set():

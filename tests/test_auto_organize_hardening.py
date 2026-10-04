@@ -571,11 +571,11 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
         self.assertIsNone(DownloadTracker._match_qb(row, tasks))
 
-    def test_tracker_keeps_legacy_qb_title_fallback_without_hash(self):
+    def test_tracker_does_not_claim_a_legacy_task_by_title_without_identity(self):
         row = {"qb_task_id": "", "title": "Same title"}
         task = SimpleNamespace(hash="other-hash", name="Same title")
 
-        self.assertIs(DownloadTracker._match_qb(row, [task]), task)
+        self.assertIsNone(DownloadTracker._match_qb(row, [task]))
 
     def test_tracker_does_not_title_match_http_submission_without_task_id(self):
         row = {"kind": "http", "qb_task_id": "", "title": "Same title"}
@@ -612,7 +612,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
         self.assertIsNone(DownloadTracker._match_gy(row, tasks))
 
-    def test_tracker_keeps_legacy_guangya_fallback_without_id(self):
+    def test_tracker_recovers_legacy_guangya_by_source_but_never_title(self):
         row = {
             "gy_task_id": "", "title": "Same title",
             "source_value": "magnet:?xt=urn:btih:same",
@@ -625,7 +625,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
         self.assertIs(DownloadTracker._match_gy(row, [source_task, title_task]), source_task)
         row["source_value"] = ""
-        self.assertIs(DownloadTracker._match_gy(row, [source_task, title_task]), title_task)
+        self.assertIsNone(DownloadTracker._match_gy(row, [source_task, title_task]))
 
     def test_automatic_plan_requires_strict_confidence(self):
         scraper = Mock()
