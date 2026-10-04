@@ -17,10 +17,8 @@ from app.modules.media_server_profiles import list_configured_profiles
 from app.modules.process_lock import CrossProcessLock
 from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
-    complete_media_refresh,
-    defer_media_refresh,
+    settle_media_refresh,
     enqueue_media_refresh,
-    fail_media_refresh,
     media_refresh_queue_status,
     next_media_refresh_due_in,
     recent_media_refresh_target_ids,
@@ -307,12 +305,12 @@ class MediaRefreshCoordinator:
                     "媒体库刷新 provider 已停用或配置不完整，将保留任务等待配置恢复 provider=%s",
                     provider,
                 )
-                fail_media_refresh(
-                    group_key,
+                settle_media_refresh(
+                    group_key, outcome="failed",
                     owner=self._owner,
                     lease_generation=generation,
                     error="媒体服务器已停用或配置不完整",
-                    retry_seconds=_retry_seconds(attempts),
+                    delay_seconds=_retry_seconds(attempts),
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 with self._state_lock:
@@ -345,12 +343,12 @@ class MediaRefreshCoordinator:
             if outcome.get("retryable") or not outcome.get("ok"):
                 # “不自动扩大刷新范围”不等于已完成。映射缺失、歧义或部分
                 # 未匹配仍要保留路径，等待配置恢复；不能只看 retryable。
-                fail_media_refresh(
-                    group_key,
+                settle_media_refresh(
+                    group_key, outcome="failed",
                     owner=self._owner,
                     lease_generation=generation,
                     error=outcome.get("fallback") or "媒体服务器刷新失败",
-                    retry_seconds=_retry_seconds(attempts),
+                    delay_seconds=_retry_seconds(attempts),
                     refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
@@ -365,18 +363,18 @@ class MediaRefreshCoordinator:
             if deduplicated:
                 # 同一媒体目标刚刷新过时，新的变化路径仍可能包含随后入库的剧集。
                 # 等去重窗口结束后再校准一次，不能把这批路径直接确认丢弃。
-                defer_media_refresh(
-                    group_key,
+                settle_media_refresh(
+                    group_key, outcome="deferred",
                     owner=self._owner,
                     lease_generation=generation,
                     delay_seconds=_recent_ttl_seconds(),
-                    reason=f"等待媒体库刷新去重窗口结束（{deduplicated} 项）",
+                    error=f"等待媒体库刷新去重窗口结束（{deduplicated} 项）",
                     refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
                     recent_ttl_seconds=_recent_ttl_seconds(),
                 )
                 return
-            complete_media_refresh(
-                group_key,
+            settle_media_refresh(
+                group_key, outcome="completed",
                 owner=self._owner,
                 lease_generation=generation,
                 refreshed_target_ids=outcome.get("succeeded_target_ids") or (),
@@ -392,12 +390,12 @@ class MediaRefreshCoordinator:
         except Exception as exc:
             safe_error = redact_sensitive_text(str(exc))[:300]
             try:
-                fail_media_refresh(
-                    group_key,
+                settle_media_refresh(
+                    group_key, outcome="failed",
                     owner=self._owner,
                     lease_generation=generation,
                     error=safe_error or type(exc).__name__,
-                    retry_seconds=_retry_seconds(attempts),
+                    delay_seconds=_retry_seconds(attempts),
                 )
             except Exception:
                 logger.exception("媒体库刷新失败后更新重试状态异常")

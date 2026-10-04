@@ -92,16 +92,16 @@ class HistoricalWorkflowRoundtripTests(unittest.TestCase):
                 new_lease["lease_generation"], old_lease["lease_generation"]
             )
             self.assertFalse(
-                queue.complete_media_refresh(
-                    group["group_key"],
+                queue.settle_media_refresh(
+                    group["group_key"], outcome="completed",
                     owner="old-worker",
                     lease_generation=old_lease["lease_generation"],
                     now_epoch=103,
                 )
             )
             self.assertTrue(
-                queue.complete_media_refresh(
-                    group["group_key"],
+                queue.settle_media_refresh(
+                    group["group_key"], outcome="completed",
                     owner="new-worker",
                     lease_generation=new_lease["lease_generation"],
                     refreshed_target_ids=("series-1",),

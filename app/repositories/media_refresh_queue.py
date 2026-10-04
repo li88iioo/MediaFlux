@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from types import ModuleType
@@ -300,15 +300,21 @@ def claim_due_media_refreshes(
     return claimed
 
 
-def complete_media_refresh(
+def settle_media_refresh(
     group_key: str,
     *,
     owner: str,
     lease_generation: int,
+    outcome: Literal["completed", "deferred", "failed"],
+    delay_seconds: int = 0,
+    error: object = "",
     refreshed_target_ids: object = (),
     recent_ttl_seconds: int = 90,
     now_epoch: float | None = None,
 ) -> bool:
+    """统一结算当前租约；完成只消费在途路径，延后/失败保留全部路径。"""
+    if outcome not in {"completed", "deferred", "failed"}:
+        raise ValueError("媒体库刷新结算结果无效")
     now_value = float(time.time() if now_epoch is None else now_epoch)
     database = _database()
     with database.get_conn() as conn:
@@ -329,112 +335,28 @@ def complete_media_refresh(
             expiry = now_value + ttl
             for item_id in _normalized_paths(refreshed_target_ids):
                 state["recent"][f"{provider}:{item_id}"] = expiry
-        pending = _normalized_paths(group.get("pending_paths"))
-        if pending:
-            group["inflight_paths"] = []
-            group["status"] = "queued"
-            group["attempts"] = 0
-            group["lease_owner"] = ""
-            group["lease_until"] = 0
-            group["last_error"] = ""
-            group["updated_at"] = now_value
-        else:
+        completed = outcome == "completed"
+        if completed and not _normalized_paths(group.get("pending_paths")):
             state["groups"].pop(str(group_key), None)
-        _prune_recent(state, now_value)
-        _write_state(conn, state)
-    return True
-
-
-def defer_media_refresh(
-    group_key: str,
-    *,
-    owner: str,
-    lease_generation: int,
-    delay_seconds: int,
-    reason: object = "",
-    refreshed_target_ids: object = (),
-    recent_ttl_seconds: int = 90,
-    now_epoch: float | None = None,
-) -> bool:
-    """不计失败次数地延后当前刷新，并保留执行中与新到达的全部路径。"""
-    now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        state = _read_state(conn)
-        group = state["groups"].get(str(group_key or ""))
-        if not isinstance(group, dict):
-            return False
-        if (
-            str(group.get("status") or "") != "running"
-            or str(group.get("lease_owner") or "") != str(owner or "")
-            or int(group.get("lease_generation") or 0) != int(lease_generation)
-        ):
-            return False
-        provider = str(group.get("provider") or "")
-        ttl = max(0, int(recent_ttl_seconds or 0))
-        if ttl:
-            expiry = now_value + ttl
-            for item_id in _normalized_paths(refreshed_target_ids):
-                state["recent"][f"{provider}:{item_id}"] = expiry
-        group["pending_paths"] = _merge_paths(
-            group.get("inflight_paths"), group.get("pending_paths")
-        )
-        group["inflight_paths"] = []
-        group["status"] = "retry_wait"
-        group["due_at"] = now_value + max(1, int(delay_seconds or 1))
-        group["lease_owner"] = ""
-        group["lease_until"] = 0
-        group["last_error"] = " ".join(str(reason or "").split())[:300]
-        group["updated_at"] = now_value
-        _prune_recent(state, now_value)
-        _write_state(conn, state)
-    return True
-
-
-def fail_media_refresh(
-    group_key: str,
-    *,
-    owner: str,
-    lease_generation: int,
-    error: object,
-    retry_seconds: int,
-    refreshed_target_ids: object = (),
-    recent_ttl_seconds: int = 90,
-    now_epoch: float | None = None,
-) -> bool:
-    now_value = float(time.time() if now_epoch is None else now_epoch)
-    database = _database()
-    with database.get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        state = _read_state(conn)
-        group = state["groups"].get(str(group_key or ""))
-        if not isinstance(group, dict):
-            return False
-        if (
-            str(group.get("status") or "") != "running"
-            or str(group.get("lease_owner") or "") != str(owner or "")
-            or int(group.get("lease_generation") or 0) != int(lease_generation)
-        ):
-            return False
-        provider = str(group.get("provider") or "")
-        ttl = max(0, int(recent_ttl_seconds or 0))
-        if ttl:
-            expiry = now_value + ttl
-            for item_id in _normalized_paths(refreshed_target_ids):
-                state["recent"][f"{provider}:{item_id}"] = expiry
-        attempts = max(0, int(group.get("attempts") or 0)) + 1
-        group["pending_paths"] = _merge_paths(
-            group.get("inflight_paths"), group.get("pending_paths")
-        )
-        group["inflight_paths"] = []
-        group["status"] = "retry_wait"
-        group["attempts"] = attempts
-        group["due_at"] = now_value + max(5, int(retry_seconds or 5))
-        group["lease_owner"] = ""
-        group["lease_until"] = 0
-        group["last_error"] = " ".join(str(error or "").split())[:300]
-        group["updated_at"] = now_value
+        else:
+            if completed:
+                group["attempts"] = 0
+            else:
+                group["pending_paths"] = _merge_paths(
+                    group.get("inflight_paths"), group.get("pending_paths")
+                )
+                if outcome == "failed":
+                    group["attempts"] = max(0, int(group.get("attempts") or 0)) + 1
+                minimum = 5 if outcome == "failed" else 1
+                group["due_at"] = now_value + max(minimum, int(delay_seconds or minimum))
+            group.update(
+                inflight_paths=[],
+                status="queued" if completed else "retry_wait",
+                lease_owner="",
+                lease_until=0,
+                last_error="" if completed else " ".join(str(error or "").split())[:300],
+                updated_at=now_value,
+            )
         _prune_recent(state, now_value)
         _write_state(conn, state)
     return True

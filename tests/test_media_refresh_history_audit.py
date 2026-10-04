@@ -123,8 +123,8 @@ class MediaRefreshHistoryAuditTests(unittest.TestCase):
                     worker.start()
                     self.assertTrue(entered_post.wait(5))
                     self.assertFalse(
-                        queue.complete_media_refresh(
-                            old_lease["group_key"],
+                        queue.settle_media_refresh(
+                            old_lease["group_key"], outcome="completed",
                             owner=old_worker._owner,
                             lease_generation=old_lease["lease_generation"],
                         )

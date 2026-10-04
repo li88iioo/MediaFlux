@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import json
 from unittest.mock import Mock, patch
+
+from app import database as db
 
 from app.modules.media_refresh_coordinator import MediaRefreshCoordinator
 from app.repositories.media_refresh_queue import (
     claim_due_media_refreshes,
     clear_media_refresh_queue,
-    complete_media_refresh,
-    defer_media_refresh,
+    settle_media_refresh,
     enqueue_media_refresh,
-    fail_media_refresh,
     media_refresh_queue_status,
     recent_media_refresh_target_ids,
     recover_media_refresh_leases,
@@ -47,8 +48,8 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=101,
         )
 
-        self.assertTrue(complete_media_refresh(
-            first["group_key"],
+        self.assertTrue(settle_media_refresh(
+            first["group_key"], outcome="completed",
             owner="worker",
             lease_generation=claimed["lease_generation"],
             now_epoch=102,
@@ -72,8 +73,8 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=131,
         )
 
-        self.assertTrue(complete_media_refresh(
-            queued["group_key"],
+        self.assertTrue(settle_media_refresh(
+            queued["group_key"], outcome="completed",
             owner="worker",
             lease_generation=claimed["lease_generation"],
             now_epoch=132,
@@ -118,12 +119,12 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         )
         claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
 
-        self.assertTrue(fail_media_refresh(
-            queued["group_key"],
+        self.assertTrue(settle_media_refresh(
+            queued["group_key"], outcome="failed",
             owner="worker",
             lease_generation=claimed["lease_generation"],
             error="one endpoint failed",
-            retry_seconds=30,
+            delay_seconds=30,
             refreshed_target_ids=("series-a",),
             recent_ttl_seconds=90,
             now_epoch=100,
@@ -142,8 +143,8 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
         )
         claimed = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
-        complete_media_refresh(
-            queued["group_key"],
+        settle_media_refresh(
+            queued["group_key"], outcome="completed",
             owner="worker",
             lease_generation=claimed["lease_generation"],
             refreshed_target_ids=("series-a",),
@@ -168,12 +169,12 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
             "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=101,
         )
 
-        self.assertTrue(defer_media_refresh(
-            queued["group_key"],
+        self.assertTrue(settle_media_refresh(
+            queued["group_key"], outcome="deferred",
             owner="worker",
             lease_generation=claimed["lease_generation"],
             delay_seconds=90,
-            reason="deduplicated",
+            error="deduplicated",
             refreshed_target_ids=("series-a",),
             recent_ttl_seconds=90,
             now_epoch=102,
@@ -192,6 +193,74 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
         retried = claim_due_media_refreshes(owner="worker", now_epoch=192)[0]
         self.assertEqual(retried["paths"], ["/media/A", "/media/B"])
         self.assertEqual(retried["attempts"], 0)
+
+    def test_settlement_preserves_paths_attempts_and_due_time_for_each_outcome(self):
+        for outcome in ("completed", "deferred", "failed"):
+            for pending in (False, True):
+                with self.subTest(outcome=outcome, pending=pending):
+                    clear_media_refresh_queue()
+                    queued = enqueue_media_refresh(
+                        "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
+                    )
+                    first = claim_due_media_refreshes(owner="worker", now_epoch=100)[0]
+                    settle_media_refresh(
+                        queued["group_key"], owner="worker",
+                        lease_generation=first["lease_generation"], outcome="failed",
+                        error="第一次失败", delay_seconds=5, now_epoch=101,
+                    )
+                    lease = claim_due_media_refreshes(owner="worker", now_epoch=106)[0]
+                    if pending:
+                        enqueue_media_refresh(
+                            "jellyfin", ["/media/B"], debounce_seconds=20, now_epoch=107,
+                        )
+                    arguments = dict(
+                        owner="worker", lease_generation=lease["lease_generation"],
+                        outcome=outcome, delay_seconds=0, error=" fixture\n reason ",
+                        refreshed_target_ids=["series-a"], now_epoch=108,
+                    )
+                    self.assertTrue(settle_media_refresh(queued["group_key"], **arguments))
+                    snapshot = db.kv_get("media_refresh_queue:v1")
+                    self.assertFalse(settle_media_refresh(queued["group_key"], **arguments))
+                    self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
+                    self.assertEqual(
+                        recent_media_refresh_target_ids("jellyfin", now_epoch=109),
+                        ("series-a",),
+                    )
+                    groups = json.loads(snapshot)["groups"]
+                    if outcome == "completed" and not pending:
+                        self.assertEqual(groups, {})
+                        continue
+                    group = groups[queued["group_key"]]
+                    self.assertEqual(group["lease_owner"], "")
+                    self.assertEqual(group["inflight_paths"], [])
+                    self.assertEqual(group["status"], "queued" if outcome == "completed" else "retry_wait")
+                    self.assertEqual(group["attempts"], {"completed": 0, "deferred": 1, "failed": 2}[outcome])
+                    self.assertEqual(group["due_at"], {"completed": 127, "deferred": 109, "failed": 113}[outcome])
+                    expected = [] if outcome == "completed" else ["/media/A"]
+                    self.assertEqual(group["pending_paths"], expected + (["/media/B"] if pending else []))
+                    self.assertEqual(group["last_error"], "" if outcome == "completed" else "fixture reason")
+
+    def test_every_settlement_rejects_superseded_lease_without_recording_success(self):
+        queued = enqueue_media_refresh(
+            "jellyfin", ["/media/A"], debounce_seconds=0, now_epoch=100,
+        )
+        old = claim_due_media_refreshes(owner="worker", lease_seconds=30, now_epoch=100)[0]
+        claim_due_media_refreshes(owner="worker", now_epoch=131)
+        snapshot = db.kv_get("media_refresh_queue:v1")
+        for outcome in ("completed", "deferred", "failed"):
+            with self.subTest(outcome=outcome):
+                self.assertFalse(settle_media_refresh(
+                    queued["group_key"], owner="worker",
+                    lease_generation=old["lease_generation"], outcome=outcome,
+                    refreshed_target_ids=["must-not-be-recorded"], now_epoch=132,
+                ))
+                self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
+        with self.assertRaises(ValueError):
+            settle_media_refresh(
+                queued["group_key"], owner="worker",
+                lease_generation=old["lease_generation"] + 1, outcome="invalid",
+            )
+        self.assertEqual(db.kv_get("media_refresh_queue:v1"), snapshot)
 
 
 class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
