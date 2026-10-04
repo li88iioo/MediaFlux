@@ -24,6 +24,7 @@ from app.modules.special_media import (
     special_media_position,
     special_parent_context,
     strip_special_media_markers,
+    title_hint_from_path,
 )
 
 
@@ -885,6 +886,32 @@ class SpecialFilenameIdentityHintTests(unittest.TestCase):
         for filename in ("NCOP.mkv", "NCED1.mkv", "OVA.mkv", "Specials.mkv"):
             with self.subTest(filename=filename):
                 self.assertEqual(_special_filename_identity_hint(filename), "")
+
+
+class PathTitleHintTests(unittest.TestCase):
+    def test_special_parent_can_still_use_informative_fallback(self):
+        self.assertEqual(
+            title_hint_from_path("动漫/Season 1/Extra", "Example Show"),
+            "Example Show",
+        )
+
+    def test_generic_path_and_fallback_do_not_return_category_or_season(self):
+        self.assertEqual(title_hint_from_path("动漫/Season 1", "动漫"), "")
+        self.assertEqual(title_hint_from_path("Extra", "Season 1"), "")
+        self.assertEqual(
+            title_hint_from_path("动漫/Example Show/Season 1/Extra", "动漫"),
+            "Example Show",
+        )
+        self.assertEqual(
+            title_hint_from_path(
+                "动漫/Season 1/Extra", "动漫/Season 2/Example Show"
+            ),
+            "Example Show",
+        )
+        self.assertEqual(
+            title_hint_from_path("Anime/Season 1/Extra", "动漫/Season 2"),
+            "",
+        )
 
 
 class SpecialMediaTokenTests(unittest.TestCase):

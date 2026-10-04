@@ -8,8 +8,10 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from app.modules.scraper import extract_recognition_context
-from app.modules.special_media import is_special_media_name, strip_special_media_markers
+from app.modules.scraper import _low_information_query, extract_recognition_context
+from app.modules.special_media import (
+    is_special_media_name, strip_special_media_markers, title_hint_from_path,
+)
 
 
 _MEDIA_IDENTITY_SEPARATORS_RE = re.compile(
@@ -53,17 +55,17 @@ def _usable_filename_identity_hint(filename: str) -> str:
     """提取可支撑目录级连续剧集包识别的文件名标题。
 
     目录名常混入发布组、编码组或打包者标签。只有目录已经形成连续剧集
-    证据时才会调用本函数，并且极短、纯数字和通用占位标题都会失败关闭，
-    回退到原有路径标题逻辑。
+    证据时才会调用本函数。沿用识别器的信息量规则，保留短中文作品名；
+    极短、纯数字和通用占位标题仍失败关闭，回退到路径标题。
     """
     context = extract_recognition_context(str(filename or ""), "")
     title = str(context.filename_title or context.normalized_title or "").strip()
     identity = _normalize_media_identity(title)
     if (
-        not title
-        or len(identity) < 4
+        _low_information_query(identity)
         or identity.isdigit()
         or identity in _GENERIC_FILENAME_IDENTITY_HINTS
+        or not title_hint_from_path(title)
     ):
         return ""
     return title

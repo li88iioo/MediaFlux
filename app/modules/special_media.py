@@ -104,7 +104,8 @@ _BARE_OP_ED_POSITION = re.compile(
     r"(?:[ ._-]*(?P<episode>\d{1,3}))?(?![a-z0-9])"
 )
 _GENERIC_CONTEXT_DIR = re.compile(
-    r"(?i)^(?:movies?|films?|tv|shows?|series|电影|影片|剧集|电视剧|动漫|纪录片|综艺|"
+    r"(?i)^(?:movies?|films?|tv|shows?|series|anime|animations?|"
+    r"电影|影片|剧集|电视剧|动漫|動漫|动画|動畫|纪录片|综艺|"
     r"season\s*\d+|s\d+|第\s*\d+\s*季|disc\s*\d+|cd\s*\d+|"
     r"720p|1080p|2160p|4k|uhd)$"
 )
@@ -276,8 +277,8 @@ def special_parent_context(value: str, fallback: str = "") -> str:
 
 def title_hint_from_path(value: str, fallback: str = "") -> str:
     """从作品路径中取最后一个非分类/季目录作为识别标题。"""
-    for part in reversed(split_path(value)):
+    for part in reversed([*split_path(fallback), *split_path(value)]):
         if is_special_directory_name(part) or _GENERIC_CONTEXT_DIR.fullmatch(part):
             continue
         return part
-    return str(fallback or "").strip()
+    return ""

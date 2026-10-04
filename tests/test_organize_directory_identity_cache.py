@@ -15,6 +15,7 @@ from app.modules.organize import (
     _directory_episode_identity_hint,
     _recognition_identity_year,
 )
+from app.modules.organize_identity import _usable_filename_identity_hint
 from app.modules.organize_scan import ScannedVideo
 from app.modules.scraper import (
     Candidate,
@@ -376,6 +377,110 @@ class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
             _directory_episode_identity_hint("Dune - 01.mkv", "Dune Prophecy"),
             "Dune",
         )
+
+    def test_filename_identity_hint_uses_information_not_a_four_character_floor(self):
+        for filename, expected in (
+            ("盜墓王 - 01.mkv", "盜墓王"),
+            ("貓與龍 - 01.mkv", "貓與龍"),
+            ("仙逆 - 01.mkv", "仙逆"),
+            ("诛仙 - 01.mkv", "诛仙"),
+            ("Cat - 01.mkv", "Cat"),
+        ):
+            with self.subTest(filename=filename):
+                self.assertEqual(_usable_filename_identity_hint(filename), expected)
+
+        for filename in (
+            "1917 - 01.mkv",
+            "Anime - 01.mkv",
+            "动漫 - 01.mkv",
+            "电视剧 - 01.mkv",
+            "Season1 - 01.mkv",
+            "A - 01.mkv",
+        ):
+            with self.subTest(filename=filename):
+                self.assertEqual(_usable_filename_identity_hint(filename), "")
+
+    def test_mixed_short_chinese_packages_keep_independent_probes_and_all_episodes(self):
+        titles = ("盜墓王", "貓與龍")
+        tmdb_ids = {"盜墓王": "297826", "貓與龍": "284029"}
+        files = [
+            GuangYaFile(
+                f"{title}-{episode}",
+                f"[ANi] {title} - {episode:02d} "
+                "[1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+                False,
+                1024,
+                f"etag-{title}-{episode}",
+                "source",
+            )
+            for title in titles
+            for episode in range(1, 13)
+        ]
+        source = GuangYaFile("source", "动漫", True, parent_id="0")
+        archive = GuangYaFile("archive", "整理", True, parent_id="0")
+        client = _TreeClient(
+            {"source": files, "archive": []},
+            {"source": source, "archive": archive},
+        )
+        scraper = TMDBScraper()
+        probe_names: list[str] = []
+
+        def match(filename, *_args, **_kwargs):
+            probe_names.append(filename)
+            title = next((title for title in titles if title in filename), "")
+            tmdb_id = tmdb_ids.get(title, "900000")
+            return MatchResult(
+                tmdb_id=tmdb_id,
+                external_id=tmdb_id,
+                provider="tmdb",
+                title=title or "Unresolved Category Probe",
+                year="2026",
+                media_type="tv",
+                confidence=1.0,
+                status="matched",
+                need_confirm=False,
+                matched_by="search",
+                directory_identity_cache_eligible=True,
+            )
+
+        scraper.match = Mock(side_effect=match)
+        scraper.get_detail = Mock(side_effect=lambda tmdb_id, *_args, **_kwargs: {
+            "id": tmdb_id,
+            "name": next((
+                title for title, value in tmdb_ids.items()
+                if value == str(tmdb_id)
+            ), "Unresolved Category Probe"),
+            "first_air_date": "2026-01-01",
+            "genres": [{"id": 16, "name": "动画"}],
+            "origin_country": ["JP"],
+            "seasons": [{"season_number": 1, "episode_count": 12}],
+        })
+
+        plans, stats = Organizer(client=client, scraper=scraper).organize(
+            "source", self._rules(), dry_run=True, automatic=True,
+        )
+
+        self.assertEqual(len(plans), 24)
+        self.assertEqual(len(probe_names), 2)
+        self.assertEqual({name.rsplit(".S01E", 1)[0] for name in probe_names}, set(titles))
+        self.assertTrue(all("动漫" not in name for name in probe_names))
+        self.assertEqual(stats["directory_identity_cache_hits"], 22)
+        self.assertTrue(all(plan.action == "move" for plan in plans))
+        self.assertEqual(
+            len({(plan.target_path, plan.new_name) for plan in plans}),
+            24,
+        )
+        for title in titles:
+            title_plans = [plan for plan in plans if plan.file_id.startswith(f"{title}-")]
+            self.assertTrue(all(
+                plan.match is not None
+                and plan.match.tmdb_id == tmdb_ids[title]
+                for plan in title_plans
+            ))
+            self.assertEqual(
+                sorted(plan.episode for plan in title_plans),
+                list(range(1, 13)),
+            )
 
     def test_directory_identity_year_uses_only_parsed_year_evidence(self):
         self.assertEqual(
