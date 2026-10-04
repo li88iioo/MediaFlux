@@ -321,6 +321,14 @@ def create_download_request(request_key: str, kind: str, title: str = "",
             request_id: int, created: bool,
             admission_source_ids: tuple[int, ...] = (),
         ) -> tuple[int, bool]:
+            if created and retry_source_request_id is not None:
+                # 重试继承用户路由，不继承旧隔离子目录。早期记录仅能从已知父目录恢复。
+                conn.execute(
+                    "UPDATE download_requests SET (gy_requested_target_dir,gy_requested_nsfw) = "
+                    "(SELECT COALESCE(NULLIF(gy_requested_target_dir,''),gy_staging_parent_dir,''), "
+                    "gy_requested_nsfw FROM download_requests WHERE id=?) WHERE id=?",
+                    (int(retry_source_request_id), int(request_id)),
+                )
             if created and initial_targets and not _claim_download_request_conn(
                 conn, int(request_id), initial_targets, timestamp
             ):
@@ -1034,6 +1042,7 @@ def list_protected_guangya_staging_ids() -> set[str]:
 
 _DOWNLOAD_REQUEST_UPDATE_FIELDS = {
     "targets", "status", "qb_task_id", "gy_task_id", "gy_task_ids", "gy_batch_count",
+    "gy_requested_target_dir", "gy_requested_nsfw",
     "gy_isolated", "gy_staging_parent_dir", "gy_staging_name",
     "gy_staging_cleanup_status", "gy_staging_cleanup_error",
     "gy_expected_file_count", "gy_settle_observed_file_count", "gy_settle_attempts",

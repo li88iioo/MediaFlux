@@ -1512,6 +1512,20 @@ def _submit_qb(
 
 
 def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") -> dict[str, Any]:
+    from app.modules.organize_sources import list_nsfw_download_sources
+
+    saved = dict(row)
+    requested = str(saved.get("gy_requested_target_dir") or saved.get("gy_staging_parent_dir") or "")
+    target_dir_id = str(target_dir_id or requested)
+    nsfw_sources = {source["id"]: source["name"] for source in list_nsfw_download_sources()}
+    nsfw = bool(saved.get("gy_requested_nsfw")) or target_dir_id in nsfw_sources
+    if nsfw and target_dir_id not in nsfw_sources:
+        return {"ok": False, "error": "原 NSFW 下载来源已停用或移除，请重新选择目录，未提交下载"}
+    if target_dir_id:
+        # 在解析种子/创建隔离目录之前持久化选择，早期失败也不能丢失重试路由。
+        db.update_download_request(int(row["id"]), gy_requested_target_dir=target_dir_id,
+                                   gy_requested_nsfw=int(nsfw))
+        target_dir_name = target_dir_name or nsfw_sources.get(target_dir_id, "")
     torrent_data = (
         row["torrent_data"] if row["kind"] in {"torrent", "http"}
         else _recover_guangya_magnet_torrent(row)

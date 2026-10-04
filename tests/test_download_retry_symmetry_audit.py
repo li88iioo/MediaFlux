@@ -196,3 +196,84 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(db.get_download_request(request_id)["qb_task_id"], "a" * 40)
         untouched.assert_not_called()
+
+
+class GuangYaRetryDestinationTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_test_database())
+        self.sources = [{"id": "adult-folder", "name": "NewNsfw"}]
+        self.enterContext(patch("app.modules.organize_sources.list_nsfw_download_sources", side_effect=lambda: self.sources))
+        self.enterContext(patch.object(dispatcher, "_recover_guangya_magnet_torrent", return_value=None))
+        self.enterContext(patch.object(dispatcher, "get", side_effect=lambda key, default="": "http://qb.invalid" if key == "QB_URL" else default))
+        self.enterContext(patch.object(dispatcher, "analyze_offline_url", return_value=SimpleNamespace(allowed=True, reason="")))
+
+    def request(self, serial):
+        return dispatcher.create_request(dispatcher.DownloadInput(
+            "magnet", "NSFW sample", f"magnet:?xt=urn:btih:{serial:040x}",
+        ), "", "retry-route-test")["id"]
+
+    def test_early_failure_preserves_nsfw_destination_for_both_retry_paths(self):
+        for serial, active_peer in enumerate((False, True), 1):
+            with self.subTest(active_peer=active_peer):
+                request_id = self.request(serial)
+                targets = "both" if active_peer else "guangya"
+                with patch.object(dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "q"}), patch.object(
+                    dispatcher, "submit_offline", return_value={"ok": False, "error": "解析暂不可用"},
+                ):
+                    dispatcher.dispatch_request(request_id, targets, gy_target_dir="adult-folder", gy_target_name="NewNsfw")
+                saved = db.get_download_request(request_id)
+                self.assertEqual(saved["gy_requested_target_dir"], "adult-folder")
+                self.assertEqual(saved["gy_requested_nsfw"], 1)
+                with patch.object(dispatcher, "submit_offline", return_value={"ok": True, "task_ids": ["accepted"]}) as submit:
+                    result = dispatcher.resubmit_download_request(request_id, "guangya")
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(submit.call_args.kwargs["target_dir_id"], "adult-folder")
+                self.assertEqual(result["request_id"] == request_id, active_peer)
+                successor = db.get_download_request(result["request_id"])
+                self.assertEqual(successor["gy_requested_target_dir"], "adult-folder")
+                self.assertEqual(successor["gy_requested_nsfw"], 1)
+
+    def test_removed_nsfw_source_fails_closed_but_does_not_block_qb_retry(self):
+        request_id = self.request(3)
+        with patch.object(dispatcher, "submit_offline", return_value={"ok": False, "error": "暂不可用"}):
+            dispatcher.dispatch_request(request_id, "guangya", gy_target_dir="adult-folder")
+        self.sources = []
+        with patch.object(dispatcher, "submit_offline") as submit:
+            result = dispatcher.resubmit_download_request(request_id, "guangya")
+        self.assertFalse(result["ok"])
+        self.assertIn("NSFW", result["error"])
+        submit.assert_not_called()
+        with patch.object(dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "q"}) as qb:
+            result = dispatcher.resubmit_download_request(result["request_id"], "qb")
+        self.assertTrue(result["ok"], result)
+        qb.assert_called_once()
+
+    def test_legacy_staging_parent_is_preserved_not_reused_as_staging_child(self):
+        request_id = self.request(4)
+        db.update_download_request(request_id, status="failed", targets="guangya", gy_status="failed",
+                                   gy_isolated=1, gy_target_dir="old-stage", gy_staging_parent_dir="adult-folder")
+        with patch.object(dispatcher, "submit_offline", return_value={"ok": True, "task_ids": ["accepted"]}) as submit:
+            result = dispatcher.resubmit_download_request(request_id, "guangya")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(submit.call_args.kwargs["target_dir_id"], "adult-folder")
+
+    def test_unselected_normal_request_keeps_offline_default_resolution(self):
+        request_id = self.request(5)
+        with patch.object(dispatcher, "submit_offline", return_value={"ok": True, "task_ids": ["accepted"]}) as submit:
+            result = dispatcher.dispatch_request(request_id, "guangya")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(submit.call_args.kwargs["target_dir_id"], "")
+
+    def test_existing_database_adds_routing_columns_without_changing_history(self):
+        request_id = self.request(6)
+        db.update_download_request(request_id, status="failed", gy_staging_parent_dir="adult-folder")
+        original = dict(db.get_download_request(request_id))
+        with db.get_conn() as conn:
+            conn.execute("ALTER TABLE download_requests DROP COLUMN gy_requested_target_dir")
+            conn.execute("ALTER TABLE download_requests DROP COLUMN gy_requested_nsfw")
+        db.init_db()
+        restored = dict(db.get_download_request(request_id))
+        self.assertEqual(restored["gy_requested_target_dir"], "")
+        self.assertEqual(restored["gy_requested_nsfw"], 0)
+        for key in ("id", "source_value", "status", "gy_staging_parent_dir"):
+            self.assertEqual(restored[key], original[key])
