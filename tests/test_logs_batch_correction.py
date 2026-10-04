@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -609,11 +610,22 @@ def test_batch_receipt_reports_partial_failure_without_replaying_completed_item(
     assert preview["can_execute"] is True
     harness.cloud.fail_rename_ids.add("file-2")
 
-    receipt = service.run_batch(
-        "reorganize", entries,
-        candidate=CANDIDATE,
-        preview_digest=preview["preview_digest"],
-    )
+    from app.modules.organize_tasks import OrganizeTaskManager
+    manager = OrganizeTaskManager()
+    manager._lock = threading.Lock()
+    manager._lock.acquire()
+    manager._task = {"id": "batch-files", "operation": "批量纠正", "status": "running"}
+    manager._run_operation("batch-files", "批量纠正", "2条日志", lambda: service.run_batch(
+        "reorganize", entries, candidate=CANDIDATE, preview_digest=preview["preview_digest"],
+    ))
+    assert manager.task_status()["status"] == "partial"
+    receipt = manager.task_result("batch-files")["result"]
+    # 新任务接管当前槽位后，原批次逐条回执仍可按 ID 取得。
+    manager._task = {"id": "later-task", "status": "running"}
+    assert manager.task_result("batch-files")["result"] == receipt
+    assert harness.cloud.files["file-1"]["path"].is_file()
+    assert harness.cloud.files["file-2"]["parent_id"] == "source"
+    assert harness.cloud.files["file-2"]["path"].is_file()
 
     assert receipt["success"] is False
     assert [item["log_id"] for item in receipt["completed"]] == [ids[0]]

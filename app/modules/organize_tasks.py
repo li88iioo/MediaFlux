@@ -156,38 +156,30 @@ def _merge_source_stats(aggregate: dict[str, object], stats: dict[str, Any]) -> 
             Organizer._append_reason(aggregate, key, value, limit=10)
 
 
-def _operation_result_is_partial(result: object) -> bool:
-    """识别单次操作结果中的非致命失败，避免把部分完成误报为成功。"""
+def _operation_result_status(result: object) -> str:
+    """按执行回执判定终态，单次/持久化操作共用，不能把返回字典当成功。"""
     if not isinstance(result, dict):
-        return False
+        return "completed"
+    if result.get("success") is False or result.get("ok") is False or result.get("failed"):
+        return "partial" if result.get("completed") or result.get("partial") else "failed"
     if result.get("partial") is True:
-        return True
+        return "partial"
     stats = result.get("stats")
     if not isinstance(stats, dict):
-        return False
+        return "completed"
     for key in (
-        "failed",
-        "replacement_cleanup_failed",
-        "empty_dir_cleanup_failed",
-        "source_dir_cleanup_failed",
-        "audit_failures",
-        "strm_trigger_failed",
-        "verification_failed",
-        "stopped",
+        "failed", "replacement_cleanup_failed", "empty_dir_cleanup_failed",
+        "source_dir_cleanup_failed", "audit_failures", "strm_trigger_failed",
+        "verification_failed", "stopped", "scan_errors",
     ):
         value = stats.get(key)
-        if isinstance(value, (list, tuple, set, dict)):
-            if value:
-                return True
-            continue
         try:
-            if int(value or 0) > 0:
-                return True
+            failed = int(value or 0) > 0
         except (TypeError, ValueError):
-            if value:
-                return True
-    scan_errors = stats.get("scan_errors")
-    return bool(scan_errors)
+            failed = bool(value)
+        if failed:
+            return "partial"
+    return "completed"
 
 
 def _credential_snapshot_is_current(client: Any, expected_generation: int | None) -> bool:
@@ -755,8 +747,8 @@ class OrganizeTaskManager:
                 if owner_digest and str(task.get("owner_digest") or "") != owner_digest:
                     continue
                 result = dict(task)
-                # 持久作业已统一为安全 {stats: ...}；不能套用普通整理 counters 协议。
-                if not result.get("durable") and isinstance(result.get("result"), dict):
+                # 只有普通扫描使用 counters；单次操作与持久作业保留各自的执行回执。
+                if not result.get("durable") and not result.get("operation") and isinstance(result.get("result"), dict):
                     result["result"] = read_organize_result(result["result"])
                 return result
         try:
@@ -1280,8 +1272,7 @@ class OrganizeTaskManager:
                     self._remember_task_locked(self._task)
                     self._remember_operation_locked(self._task)
         else:
-            partial = _operation_result_is_partial(result)
-            terminal_status = "partial" if partial else "completed"
+            terminal_status = _operation_result_status(result)
             safe_result = sanitize_organize_operation_result(result)
             try:
                 persisted = finish_organize_operation_job(
@@ -1301,7 +1292,8 @@ class OrganizeTaskManager:
                     self._task.update({
                         "status": memory_status,
                         "message": (
-                            f"{operation}部分完成" if persisted and partial
+                            f"{operation}部分完成" if persisted and terminal_status == "partial"
+                            else f"{operation}失败" if persisted and terminal_status == "failed"
                             else f"{operation}已完成" if persisted
                             else f"{operation}需要人工核验"
                         ),
@@ -1616,12 +1608,12 @@ class OrganizeTaskManager:
                        callback: Callable[[], object]) -> None:
         try:
             result = callback()
-            partial = _operation_result_is_partial(result)
+            terminal_status = _operation_result_status(result)
             with self._state_lock:
                 if self._task.get("id") == task_id:
                     self._task.update({
-                        "status": "partial" if partial else "completed",
-                        "message": f"{operation}部分完成" if partial else f"{operation}已完成",
+                        "status": terminal_status,
+                        "message": f"{operation}" + {"partial": "部分完成", "failed": "失败", "completed": "已完成"}[terminal_status],
                         "current_source": "",
                         "group_progress": {},
                         "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

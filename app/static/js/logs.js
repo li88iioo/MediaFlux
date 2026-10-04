@@ -6,7 +6,7 @@ let organizePage = 1;
 const ORGANIZE_LOG_PAGE_SIZE = 20;
 let runtimeSource = null, runtimePaused = false, runtimeLines = [], runtimeOffset = 0, runtimeStreamId = '', runtimeCheckpoint = '', runtimeGeneration = 0;
 let runtimeRequestSerial = 0, runtimeReconnectTimer = null, runtimeClearPending = false;
-let organizeDetail = null, selectedOrganizeCandidate = null, organizeTaskPolling = false;
+let organizeDetail = null, selectedOrganizeCandidate = null;
 let organizeRows = [], selectedOrganizeLogs = new Map();
 let batchCorrection = null, batchCorrectionSession = 0, organizeDetailSerial = 0, organizeSearchSerial = 0;
 const organizeModal = createAppModal(document.getElementById('organizeDetailModal'), {
@@ -164,7 +164,34 @@ document.getElementById('organizeNext').addEventListener('click',()=>loadOrganiz
 function updateOrganizeBatchState(){const count=selectedOrganizeLogs.size;const selectable=organizeRows.filter(row=>row.actions?.batch);document.getElementById('organizeBatchCount').textContent=`已选 ${count} 条光鸭记录`;['organizeBatchRenameBtn','organizeBatchRevertBtn','organizeBatchDeleteBtn'].forEach(id=>document.getElementById(id).disabled=count<2||count>50);document.querySelectorAll('.organize-row-select').forEach(input=>{input.disabled=!input.checked&&count>=50;});const all=selectable.length>0&&selectable.every(row=>selectedOrganizeLogs.has(row.record_key));document.getElementById('organizeSelectAll').checked=all;document.getElementById('organizeSelectAll').indeterminate=count>0&&!all;}
 function _setOrganizeBatchState(message,type=''){const el=document.getElementById('organizeBatchState');el.textContent=message||'';el.className='inline-save-state'+(type?' is-'+type:'');}
 document.getElementById('organizeSelectAll').addEventListener('change',event=>{const checked=event.currentTarget.checked;let remaining=Math.max(0,50-selectedOrganizeLogs.size);document.querySelectorAll('.organize-row-select').forEach(input=>{if(checked&&!input.checked&&remaining<=0)return;input.checked=checked;if(checked&&!selectedOrganizeLogs.has(input.dataset.key))remaining--;toggleOrganizeSelection(input.dataset.key,checked);});});
-async function runOrganizeBatch(action){if(action==='reorganize'){await openBatchCorrection();return;}const rows=[...selectedOrganizeLogs.values()];if(rows.length<2||rows.length>50)return;const movieRows=rows.filter(row=>row.media_type!=='tv');if(movieRows.length){_setOrganizeBatchState(`批量操作仅支持剧集，已混入 ${movieRows.length} 条电影或未知类型日志`,'error');return;}const labels={revert:'批量回退最近操作',delete:'将所选剧集媒体组移入光鸭回收站'};let confirmText='';const confirmed=await appConfirm({title:action==='delete'?'批量移入光鸭回收站':'确认剧集批量操作',message:`${labels[action]}，共 ${rows.length} 条日志。${action==='delete'?'这会将日志明确记录的媒体文件移入光鸭回收站。MediaFlux 不提供恢复按钮。':''}`,confirmText:action==='delete'?'移入回收站':'开始执行',danger:action==='delete',verifyText:action==='delete'?'DELETE':'',verifyLabel:'输入 DELETE 确认批量移入回收站'});if(!confirmed)return;if(action==='delete')confirmText='DELETE';const entries=rows.map(row=>({log_id:row.id,expected_version:row.version,operation_token:_operationToken()}));_setOrganizeBatchState('批量操作已提交，正在执行...');try{const response=await api('/api/logs/organize/batch',{method:'POST',body:JSON.stringify({action,entries,confirm:confirmText})});const data=await response.json();if(!response.ok)throw new Error(data.error||'批量操作提交失败');const task=await waitOrganizeTask(data.task_id,null,{reopen:false});const failed=task.result?.failed||[];_setOrganizeBatchState(failed.length?`批次完成，${failed.length} 条失败，可打开详情检查`:`批次完成，共处理 ${rows.length} 条` ,failed.length?'error':'success');loadOrganize();}catch(error){_setOrganizeBatchState(error.message,'error');}}
+let organizeBatchTaskSerial=0;
+async function runOrganizeBatch(action){
+    if(action==='reorganize'){await openBatchCorrection();return;}
+    const rows=[...selectedOrganizeLogs.values()];
+    if(rows.length<2||rows.length>50)return;
+    const movieRows=rows.filter(row=>row.media_type!=='tv');
+    if(movieRows.length){_setOrganizeBatchState(`批量操作仅支持剧集，已混入 ${movieRows.length} 条电影或未知类型日志`,'error');return;}
+    const labels={revert:'批量回退最近操作',delete:'将所选剧集媒体组移入光鸭回收站'};
+    let confirmText='';
+    const confirmed=await appConfirm({title:action==='delete'?'批量移入光鸭回收站':'确认剧集批量操作',message:`${labels[action]}，共 ${rows.length} 条日志。${action==='delete'?'这会将日志明确记录的媒体文件移入光鸭回收站。MediaFlux 不提供恢复按钮。':''}`,confirmText:action==='delete'?'移入回收站':'开始执行',danger:action==='delete',verifyText:action==='delete'?'DELETE':'',verifyLabel:'输入 DELETE 确认批量移入回收站'});
+    if(!confirmed)return;
+    if(action==='delete')confirmText='DELETE';
+    const serial=++organizeBatchTaskSerial;
+    const entries=rows.map(row=>({log_id:row.id,expected_version:row.version,operation_token:_operationToken()}));
+    _setOrganizeBatchState('批量操作已提交，正在执行...');
+    try{
+        const response=await api('/api/logs/organize/batch',{method:'POST',body:JSON.stringify({action,entries,confirm:confirmText})});
+        const data=await response.json();
+        if(!response.ok)throw new Error(data.error||'批量操作提交失败');
+        const task=await waitOrganizeTask(data.task_id,null);
+        if(serial!==organizeBatchTaskSerial)return;
+        const failed=Array.isArray(task.result?.failed)?task.result.failed:[];
+        if(failed.length){
+            const details=failed.map(item=>`${item.log_id!==undefined?`#${item.log_id} `:''}${item.error||item.message||'执行失败'}`).join('；');
+            _setOrganizeBatchState(`批次完成，${failed.length} 条失败：${details}`,'error');
+        }else _setOrganizeBatchState(`批次完成，共处理 ${rows.length} 条`,'success');
+    }catch(error){if(serial===organizeBatchTaskSerial)_setOrganizeBatchState(error.message,'error');}
+}
 
 function invalidateBatchCorrection(){
     organizeDetailSerial++;
@@ -421,6 +448,7 @@ async function executeBatchCorrection(){
     const state=batchCorrection;
     if(!state?.active||!state.executable||!state.previewDigest||state.confirming||state.executing||state.executed||state.submitted)return;
     const session=state.session;
+    const contextSerial=organizeDetailSerial;
     const entries=state.entries;
     const candidate=state.candidate;
     const previewDigest=state.previewDigest;
@@ -451,15 +479,15 @@ async function executeBatchCorrection(){
         }
         state.submitted=true;
         state.executable=false;
-        document.getElementById('organizeBatchCancelBtn').textContent='关闭';
+        if(contextSerial===organizeDetailSerial&&isBatchCorrectionSession(session))document.getElementById('organizeBatchCancelBtn').textContent='关闭';
         if(!data.task_id){
             state.executed=true;
             loadOverview();loadOrganize();
             throw new Error('执行接口未返回 task_id，已禁止重复提交；请刷新日志核实执行状态');
         }
-        const task=await waitOrganizeTask(data.task_id,null,{reopen:false});
-        const result=task.result;
-        if(!isBatchCorrectionSession(session))return;
+        const task=await waitOrganizeTask(data.task_id,null,contextSerial);
+        if(!task||!isBatchCorrectionSession(session)||contextSerial!==organizeDetailSerial)return;
+        const result=task.result||{};
         state.executed=true;
         const outcomes=batchOutcomeMap(result);
         renderBatchCorrectionPreview(state.preview,state,outcomes);
@@ -475,8 +503,6 @@ async function executeBatchCorrection(){
         if(failed)_setOrganizeState(`批量执行完成，但有 ${failed} 条失败；请逐行查看错误`,'error');
         else if(complete)_setOrganizeState(warnings.length?`纠正已完成；${warnings.length} 项联动警告，请查看详情`:`批量执行完成，共 ${state.rows.length} 条；逐条结果已返回`,warnings.length?'warning':'success');
         else _setOrganizeState(`执行请求已返回，但 ${state.rows.length-outcomes.size} 条缺少逐条结果；请刷新日志核实`,'error');
-        loadOverview();
-        loadOrganize();
     }catch(error){
         if(isBatchCorrectionSession(session))_setOrganizeState(error.message||'批量纠正执行失败','error');
     }finally{
@@ -720,7 +746,7 @@ function _renderOrganizeDetail(data){
     const deleteButton=document.getElementById('organizeDeleteBtn');
     deleteButton.disabled=!data.allowed_actions.delete;
     deleteButton.hidden=!data.allowed_actions.delete;
-    document.getElementById('organizeTmdbCandidates').replaceChildren();const namingPreview=document.getElementById('organizeNamingPreview');namingPreview.replaceChildren();namingPreview.hidden=true;if(!organizeTaskPolling)_setOrganizeState('');
+    document.getElementById('organizeTmdbCandidates').replaceChildren();const namingPreview=document.getElementById('organizeNamingPreview');namingPreview.replaceChildren();namingPreview.hidden=true;_setOrganizeState('');
     window.renderLucideIcons?.(document.getElementById('organizeDetailModal'));
 }
 async function openOrganizeDetail(logId,trigger){
@@ -775,8 +801,64 @@ function organizeCandidatePayload(candidate=selectedOrganizeCandidate){if(!candi
 let organizePreviewSequence=0;
 async function previewOrganizeCandidate(candidate){if(batchCorrection?.active){await previewBatchCorrection(candidate);return;}const payload=organizeCandidatePayload(candidate);if(!payload)return;const sequence=++organizePreviewSequence;_setOrganizeState('正在生成无副作用预览...');try{const response=await api(`/api/logs/organize/${organizeDetail.id}/reorganize/preview`,{method:'POST',body:JSON.stringify(payload)});const data=await response.json();if(sequence!==organizePreviewSequence)return;if(!response.ok)throw new Error(data.error||'预览失败');const box=document.getElementById('organizeNamingPreview');const fullTarget=[data.target_path,data.file_name].filter(Boolean).join('/');box.hidden=false;box.innerHTML=`<div><span class="text-muted">影片目录</span><code>${_esc(data.media_dir||data.target_path||'-')}</code></div><div><span class="text-muted">视频文件</span><code>${_esc(data.file_name||'-')}</code></div><div class="organize-preview-full"><span class="text-muted">完整目标</span><code>${_esc(fullTarget||'-')}</code></div><div class="organize-preview-rule"><span class="text-muted">规则来源</span><code>命名规则来自「整理规则 → 识别与命名」</code></div>${(data.items||[]).filter(item=>item.role!=='video').map(item=>`<div><span class="text-muted">${_esc(_formatRole(item.role))}</span><code>${_esc(item.to_name)}</code></div>`).join('')}`;_setOrganizeState('预览完成，尚未写入云盘','success');}catch(error){if(sequence===organizePreviewSequence)_setOrganizeState(error.message,'error');}}
 async function selectOrganizeCandidate(candidate,row){selectedOrganizeCandidate=candidate;document.querySelectorAll('.organize-candidate').forEach(item=>item.classList.toggle('selected',item===row));if(batchCorrection?.active&&!organizeRecognitionProfile().nsfw_only){document.getElementById('organizeTmdbType').value=candidate.media_type==='tv'?'tv':'movie';syncOrganizePositionFields();}await previewOrganizeCandidate(candidate);}
-async function waitOrganizeTask(taskId,logId,{reopen=true}={}){organizeTaskPolling=true;try{for(let attempt=0;attempt<180;attempt++){await new Promise(resolve=>setTimeout(resolve,1000));const response=await api('/api/guangya/organize/status');const task=await response.json();if(!response.ok)throw new Error(task.error||'任务状态读取失败');if(task.id!==taskId){continue;}if(task.status==='completed'){const warnings=task.result?.warnings||[];loadOverview();loadOrganize();if(reopen&&logId)await openOrganizeDetail(logId);_setOrganizeState(warnings.length?`云端操作已完成；${warnings.join('；')}`:'云端操作已完成','success');return task;}if(task.status==='failed'){throw new Error(task.error||task.message||'后台操作失败');}_setOrganizeState(task.message||'后台操作执行中...');}throw new Error('后台操作仍在执行，请稍后重新打开详情查看');}finally{organizeTaskPolling=false;}}
-async function runOrganizeAction(path,method='POST',extra={}){if(!organizeDetail)return;const logId=organizeDetail.id;_setOrganizeState('操作已提交，正在后台执行...');const response=await api(`/api/logs/organize/${logId}${path}`,{method,body:JSON.stringify({operation_token:_operationToken(),expected_version:organizeDetail.version,...extra})});const data=await response.json();if(!response.ok)throw new Error(data.error||'操作提交失败');_setOrganizeState(data.message||'操作已启动');await waitOrganizeTask(data.task_id,logId);}
+function organizeTaskFailure(task,batch=false){
+    const result=task.result||{};
+    const failed=Array.isArray(result.failed)?result.failed:[];
+    if(batch&&failed.length&&['completed','partial','failed'].includes(task.status))return '';
+    if(task.status==='completed'&&result.success!==false&&!result.error&&!failed.length)return '';
+    const fallback={stopped:'后台操作已停止',cancelled:'后台操作已取消',manual_review:'后台操作需要人工复核'};
+    return task.error||result.error||failed[0]?.error||task.message||fallback[task.status]||'后台操作未完整完成，请核对日志';
+}
+async function waitOrganizeTask(taskId,logId,contextSerial=null){
+    if(!taskId)throw new Error('操作接口未返回 task_id');
+    const batch=!logId;
+    const terminalStatuses=new Set(['completed','partial','failed','stopped','cancelled','manual_review']);
+    const isCurrent=()=>contextSerial===null||contextSerial===organizeDetailSerial;
+    try{
+        for(let attempt=0;attempt<180;attempt++){
+            await new Promise(resolve=>setTimeout(resolve,1000));
+            const response=await api(`/api/guangya/organize/status?task_id=${encodeURIComponent(taskId)}`);
+            const task=await response.json().catch(()=>({}));
+            if(!response.ok)throw new Error(task.error||'任务状态读取失败');
+            if(String(task.id)!==String(taskId))throw new Error('任务状态返回的 task_id 不匹配');
+            if(contextSerial!==null&&!isCurrent())return null;
+            const status=String(task.status||'').toLowerCase();
+            if(terminalStatuses.has(status)){
+                loadOverview();loadOrganize();
+                const failure=organizeTaskFailure(task,batch);
+                if(failure)throw new Error(failure);
+                if(batch)return task;
+                if(logId&&isCurrent()){
+                    const reopenRequest=openOrganizeDetail(logId);
+                    const reopenedSerial=organizeDetailSerial;
+                    await reopenRequest;
+                    if(reopenedSerial===organizeDetailSerial){
+                        const warnings=Array.isArray(task.result?.warnings)?task.result.warnings:[];
+                        _setOrganizeState(warnings.length?`云端操作已完成；${warnings.join('；')}`:'云端操作已完成','success');
+                    }
+                }
+                return task;
+            }
+            if((logId||contextSerial!==null)&&isCurrent())_setOrganizeState(task.message||'后台操作执行中...');
+        }
+        throw new Error('后台操作仍在执行，请稍后重新打开详情查看');
+    }catch(error){
+        if(contextSerial!==null&&!isCurrent())return null;
+        throw error;
+    }
+}
+async function runOrganizeAction(path,method='POST',extra={}){
+    if(!organizeDetail)return;
+    const logId=organizeDetail.id;
+    const contextSerial=organizeDetailSerial;
+    _setOrganizeState('操作已提交，正在后台执行...');
+    const response=await api(`/api/logs/organize/${logId}${path}`,{method,body:JSON.stringify({operation_token:_operationToken(),expected_version:organizeDetail.version,...extra})});
+    const data=await response.json();
+    if(contextSerial!==organizeDetailSerial)return;
+    if(!response.ok)throw new Error(data.error||'操作提交失败');
+    _setOrganizeState(data.message||'操作已启动');
+    await waitOrganizeTask(data.task_id,logId,contextSerial);
+}
 async function runOrganizeReorganize(){const serial=organizeDetailSerial;if(batchCorrection?.active){await executeBatchCorrection();return;}if(!selectedOrganizeCandidate){_setOrganizeState('请先选择一个识别候选并检查预览','error');return;}const payload=organizeCandidatePayload();const position=payload.media_type==='tv'?[payload.season!==undefined?`S${String(payload.season).padStart(2,'0')}`:'',payload.episode!==undefined?`E${String(payload.episode).padStart(2,'0')}`:''].filter(Boolean).join(''):'';const confirmed=await appConfirm({title:'重新整理媒体组',message:`按 ${payload.title||payload.external_id||payload.tmdb_id}${position?` · ${position}`:''} 重新整理整个媒体组。`,confirmText:'执行重新整理',danger:true});if(!confirmed||serial!==organizeDetailSerial)return;try{await runOrganizeAction('/reorganize','POST',payload);}catch(error){_setOrganizeState(error.message,'error');}}
 async function returnOrganizeToSource(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'送回源目录',message:'将视频和全部伴随文件送回各自保存的原始父目录，并恢复原文件名。',confirmText:'送回源目录',danger:true});if(!confirmed||serial!==organizeDetailSerial)return;try{await runOrganizeAction('/return-to-source');}catch(error){_setOrganizeState(error.message,'error');}}
 async function revertOrganize(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'回退最近操作',message:'按最近一次成功操作的持久化步骤回退，不会从路径猜测文件名。',confirmText:'执行回退',danger:true});if(!confirmed||serial!==organizeDetailSerial)return;try{await runOrganizeAction('/revert');}catch(error){_setOrganizeState(error.message,'error');}}

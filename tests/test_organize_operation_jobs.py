@@ -6,6 +6,10 @@ import time
 import unittest
 from unittest.mock import patch
 
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+from starlette.middleware.sessions import SessionMiddleware
+
 from app import database as db
 from app.modules.organize_tasks import OrganizeTaskManager
 from app.repositories.organize_operation_jobs import (
@@ -52,6 +56,59 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result["counters"]["moved"], 3)
                 manager._remember_task_locked(manager._task)
                 manager._task = {}
+
+    def test_batch_operation_terminal_status_and_receipt_survive_history(self) -> None:
+        for count, expected in ((2, "completed"), (1, "partial"), (0, "failed")):
+            with self.subTest(completed=count):
+                receipt = {
+                    "success": count == 2, "requested": 2,
+                    "completed": [{"log_id": index} for index in range(count)],
+                    "failed": [{"log_id": index, "error": "目标冲突"} for index in range(count, 2)],
+                    "warnings": ["联动通知延迟"],
+                }
+                manager = OrganizeTaskManager()
+                manager._lock = threading.Lock()
+                manager._lock.acquire()
+                manager._task = {"id": "batch", "operation": "批量纠正", "status": "running"}
+                with patch.object(manager, "_wake_download_tracker"):
+                    manager._run_operation("batch", "批量纠正", "2条日志", lambda: receipt)
+                self.assertEqual(manager.task_status()["status"], expected)
+                for source in ("current", "history"):
+                    with self.subTest(source=source):
+                        result = manager.task_result("batch")
+                        self.assertEqual(result["status"], expected)
+                        self.assertEqual(result["result"], receipt)
+                        manager._task = {"id": "next", "status": "running"}
+
+    def test_operation_status_endpoint_selects_original_task_and_requires_login(self) -> None:
+        from app.routes.guangya_api import router
+
+        manager = OrganizeTaskManager()
+        original = {"id": "batch", "operation": "批量纠正", "status": "partial",
+                    "result": {"completed": [{"log_id": 1}], "failed": [{"log_id": 2, "error": "目标冲突"}]}}
+        manager._remember_task_locked(original)
+        manager._task = {"id": "next", "status": "running"}
+        api = FastAPI()
+        api.add_middleware(SessionMiddleware, secret_key="isolated-status-test")
+        api.include_router(router)
+
+        @api.post("/__test/login")
+        def login(request: Request):
+            request.session["logged_in"] = True
+            return {"ok": True}
+
+        with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager), TestClient(api) as client:
+            self.assertIn(client.get("/api/guangya/organize/status?task_id=batch").status_code, (401, 403))
+            client.post("/__test/login")
+            response = client.get("/api/guangya/organize/status?task_id=batch")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["id"], "batch")
+            self.assertEqual(response.json()["result"], original["result"])
+            self.assertNotIn("operation_queue", response.json())
+            self.assertEqual(client.get("/api/guangya/organize/status?task_id=missing").status_code, 404)
+            self.assertEqual(client.get("/api/guangya/organize/status?task_id=next").status_code, 404)
+            manager._task = {"id": "private", "operation": "Agent任务", "durable": True, "owner_digest": "another-owner"}
+            self.assertEqual(client.get("/api/guangya/organize/status?task_id=private").status_code, 404)
 
     def test_enqueue_is_idempotent_and_public_reference_round_trips(self) -> None:
         first, first_replayed = self._enqueue()

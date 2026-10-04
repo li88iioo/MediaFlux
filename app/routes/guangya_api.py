@@ -473,11 +473,18 @@ def organize_run(request: Request, data: dict | None = Body(default=None)):
 
 
 @router.get("/organize/status")
-def organize_status(request: Request):
+def organize_status(request: Request, task_id: str = ""):
     require_api_login(request)
     from app.modules.organize_tasks import get_organize_manager
 
-    return get_organize_manager().status()
+    manager = get_organize_manager()
+    if not task_id:
+        return manager.status()
+    task = manager.task_result(task_id)
+    # 日志页只消费普通操作；Agent 持久任务继续使用绑定 owner 的查询链路。
+    if not task or not task.get("operation") or task.get("durable"):
+        return JSONResponse({"error": "未找到该整理操作，请刷新日志核对结果"}, status_code=404)
+    return {key: task.get(key) for key in ("id", "status", "message", "error", "result")}
 
 
 @router.post("/organize/stop")
