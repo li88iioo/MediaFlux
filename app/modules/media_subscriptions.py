@@ -1838,57 +1838,28 @@ class MediaSubscriptionService:
                 "下载请求已取消，可重新选择候选资源", status_code=409, code="cancelled"
             )
         manual_review = str(result.get("status") or "") == "manual_review"
-        if result.get("ok") or result.get("duplicate") or manual_review:
+        accepted = bool(result.get("ok") or result.get("duplicate") or manual_review)
+        if accepted:
             db.update_media_subscription_candidate(
                 int(candidate["id"]), status="submitted", request_id=request_id or None
             )
-            admission_status = {
-                "downloading": "downloading",
-                "completed": "processing",
-                "manual_review": "processing",
-            }.get(request_status, "processing" if manual_review else "submitted")
+        if request_id:
+            # 请求在写入前已与准入绑定；只从事务内的当前请求投影，不能回写旧快照。
+            db.sync_media_download_admission_for_request(request_id)
+        elif accepted:
             db.update_media_download_admission(
-                admission_id,
-                expected_statuses=(
-                    "claimed", "dispatching", "submitted", "downloading", "processing",
-                ),
-                status=admission_status, request_id=request_id or None,
-                error=(
-                    str(request_row["error"] or "")[:500]
-                    if request_status == "manual_review" and request_row
-                    else str(result.get("error") or "")[:500] if manual_review
-                    else ""
-                ),
+                admission_id, expected_statuses=("claimed", "dispatching"),
+                status="processing" if manual_review else "submitted",
+                error=str(result.get("error") or "")[:500] if manual_review else "",
             )
-        else:
+        if not accepted:
             message = str(result.get("error") or "下载提交失败")[:500]
             if request_id and message in {"下载提交失败", "下载处理失败"}:
                 dispatch_error = str(request_row["error"] or "").strip() if request_row else ""
                 if dispatch_error:
                     message = redact_sensitive_text(dispatch_error)[:500]
-            if request_id:
-                admission_status = {
-                    "failed": "failed",
-                    "submitted": "submitted",
-                    "downloading": "downloading",
-                    "completed": "processing",
-                    "manual_review": "processing",
-                }.get(request_status, "processing")
-                db.update_media_download_admission(
-                    admission_id,
-                    expected_statuses=(
-                        "claimed", "dispatching", "submitted", "downloading", "processing",
-                    ),
-                    status=admission_status, request_id=request_id, error=message,
-                    completed_at=(db.now() if admission_status == "failed" else None),
-                )
-            else:
-                db.update_media_download_admission(
-                    admission_id,
-                    expected_statuses=("claimed", "dispatching"),
-                    status="failed", request_id=None, error=message,
-                    completed_at=db.now(),
-                )
+            if not request_id:
+                db.fail_unbound_media_download_admission(admission_id, message)
             raise MediaSubscriptionError(
                 message, status_code=502, code="download_failed"
             )

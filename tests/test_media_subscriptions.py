@@ -567,14 +567,18 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             gy_status="failed",
             error="guangya: 磁力资源连续 4 次未解析到可验证文件列表 api_key=super-secret",
         )
+
+        async def submit_failure(_service, _result_id, _target, *, admission_id):
+            # 真实下载入口在副作用前绑定准入；替身也必须保留这一事务契约。
+            db.bind_media_download_admission_request(admission_id, request_id)
+            return {
+                "ok": False, "duplicate": False, "request_id": request_id,
+                "error": "下载提交失败",
+            }
+
         with patch(
             "app.modules.media_subscriptions.download_indexer_result_public",
-            new=AsyncMock(return_value={
-                "ok": False,
-                "duplicate": False,
-                "request_id": request_id,
-                "error": "下载提交失败",
-            }),
+            new=AsyncMock(side_effect=submit_failure),
         ), patch("app.modules.media_subscriptions.get_indexer_service", return_value=object()):
             with self.assertRaises(MediaSubscriptionError) as detailed_ctx:
                 asyncio.run(service.download_candidate(detailed_candidate, "guangya"))

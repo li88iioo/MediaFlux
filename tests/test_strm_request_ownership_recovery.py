@@ -329,13 +329,19 @@ class STRMRequestOwnershipRecoveryTests(unittest.TestCase):
             {"claimed", "dispatching", "submitted", "downloading", "processing"},
         )
 
-    @patch("app.modules.scheduler.threading.Thread", _ParkedThread)
     def test_successful_same_work_lease_retry_recovers_request_and_admission(self):
+        self._assert_same_work_lease_retry(legacy_error=False)
+
+    def test_same_work_lease_retry_recovers_legacy_unredacted_admission(self):
+        self._assert_same_work_lease_retry(legacy_error=True)
+
+    @patch("app.modules.scheduler.threading.Thread", _ParkedThread)
+    def _assert_same_work_lease_retry(self, *, legacy_error):
         """本任务失败后的新 lease 成功必须收敛状态，不依赖重新 trigger。"""
         request, admission, _ = self.seed()
         scheduler = self.scheduler()
         options = self.queue(scheduler, [request], [self.change()])
-        error = "synthetic transient source failure"
+        error = "synthetic transient source failure api_key=super-secret"
         with patch(
             "app.modules.scheduler.sync_strm_incremental", side_effect=OSError(error)
         ):
@@ -344,6 +350,13 @@ class STRMRequestOwnershipRecoveryTests(unittest.TestCase):
         self.assertEqual(first["error"], error)
         self.assertEqual(db.get_download_request(request)["strm_status"], "failed")
         self.assertEqual(self.admission(admission)["status"], "failed")
+        self.assertNotIn("super-secret", self.admission(admission)["error"])
+        if legacy_error:
+            with db.get_conn() as conn:
+                conn.execute(
+                    "UPDATE media_download_admissions SET error=? WHERE id=?",
+                    (f"下载后处理失败（STRM 联动）：{error}", admission),
+                )
         self.assertEqual(db.count_pending_strm_change_targets(), 1)
         self.assertEqual(len(list(self.root.rglob("*.strm"))), 0)
 

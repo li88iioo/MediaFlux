@@ -337,6 +337,43 @@ db.reconcile_startup_media_download_admissions()
                 self.assertEqual(self.admission(admission), before_admission)
                 self.assertIsNone(self.claim())
 
+    def test_late_service_result_preserves_newer_manual_review_projection(self):
+        original = db.update_media_subscription_candidate
+        observed = []
+
+        def change(candidate_id, **fields):
+            changed = original(candidate_id, **fields)
+            if fields.get("request_id"):
+                db.update_download_request_and_sync_media_admission(
+                    fields["request_id"], status="manual_review", error="新回执需要人工核验",
+                )
+                observed.append(dict(db.list_active_media_download_admissions(self.subscription)[0]))
+            return changed
+
+        with self.submission(), patch.object(db, "update_media_subscription_candidate", side_effect=change):
+            result = self.download()
+        current = self.admission(result["admission_id"])
+        self.assertEqual(current["status"], "processing")
+        self.assertEqual(current["error"], observed[0]["error"])
+        self.assertIsNone(current["completed_at"])
+        self.assert_active_owner(result["admission_id"])
+
+    def test_existing_completed_request_preserves_postprocessing_failure(self):
+        request = self.pending_request()
+        db.update_download_request(
+            request, status="completed", targets="guangya", gy_status="completed",
+            organize_status="failed", organize_error="归档失败，需要处理",
+        )
+        with self.submission() as backend:
+            result = self.download()
+        backend.assert_not_called()
+        current = self.admission(result["admission_id"])
+        self.assertEqual(current["status"], "failed")
+        self.assertIn("归档失败，需要处理", current["error"])
+        self.assertIsNotNone(current["completed_at"])
+        self.assertEqual(db.list_active_media_download_admissions(self.subscription), [])
+        self.assertEqual(db.sync_media_download_admission_for_request(request), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

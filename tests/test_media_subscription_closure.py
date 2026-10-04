@@ -546,7 +546,11 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
         subscription_id, candidate_id = self._seed()
         request_id, _ = db.create_download_request("both-key", "magnet", title="闭环资源")
         db.update_download_request(request_id, targets="both", status="submitted", qb_status="submitted", gy_status="submitted")
-        downloader = AsyncMock(return_value={
+        async def submit(_service, _result_id, _target, *, admission_id):
+            db.bind_media_download_admission_request(admission_id, request_id)
+            return downloader.return_value
+
+        downloader = AsyncMock(side_effect=submit, return_value={
             "ok": True, "duplicate": False, "request_id": request_id,
             "target": "both", "status": "submitted", "succeeded": ["qb", "guangya"], "failed": [],
         })
@@ -624,7 +628,11 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             targets="qb", status="manual_review", qb_status="manual_review",
             error="提交结果未知，请人工核验",
         )
-        downloader = AsyncMock(return_value={
+        async def submit(_service, _result_id, _target, *, admission_id):
+            db.bind_media_download_admission_request(admission_id, request_id)
+            return downloader.return_value
+
+        downloader = AsyncMock(side_effect=submit, return_value={
             "ok": False, "duplicate": False, "request_id": request_id,
             "target": "qb", "status": "manual_review",
             "succeeded": [], "failed": [],

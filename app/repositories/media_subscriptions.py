@@ -6,6 +6,8 @@ import sqlite3
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Iterable
 
+from app.logger import redact_sensitive_text
+
 if TYPE_CHECKING:
     from types import ModuleType
 
@@ -1099,7 +1101,7 @@ def _download_request_admission_projection(
         error = str(request["error"] or "下载任务需要人工核验")[:500]
     else:
         return None
-    return status, error, completed_at
+    return status, redact_sensitive_text(error)[:500], completed_at
 
 
 def _sync_media_download_admissions_conn(

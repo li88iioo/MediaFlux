@@ -7,6 +7,8 @@ import json
 import sqlite3
 from typing import Any
 
+from app.logger import redact_sensitive_text
+
 INTERRUPTED_ERROR = "上次进程在 STRM 同步或排队期间中断"
 REFRESH_PENDING_ERROR = "STRM 已完成，媒体库刷新等待后台重试"
 
@@ -351,9 +353,10 @@ def _update_strm_owner_state(
         ).fetchone()
         projection = _download_request_admission_projection(updated, stamp)
         if projection is not None and projection[0] == "processing":
+            prior_error = f"下载后处理失败（STRM 联动）：{old_error or '请在下载记录中重试'}"[:500]
             conn.execute(
                 "UPDATE media_download_admissions SET status='processing',error='',completed_at=NULL,updated_at=? "
-                "WHERE request_id=? AND status='failed' AND error=? "
+                "WHERE request_id=? AND status='failed' AND error IN (?,?) "
                 "AND NOT EXISTS(SELECT 1 FROM media_download_admissions newer "
                 "WHERE newer.media_key=media_download_admissions.media_key "
                 "AND newer.id<>media_download_admissions.id "
@@ -361,9 +364,9 @@ def _update_strm_owner_state(
                 (
                     stamp,
                     int(owner["request_id"]),
-                    f"下载后处理失败（STRM 联动）：{old_error or '请在下载记录中重试'}"[
-                        :500
-                    ],
+                    # 历史行可能尚未脱敏；两者均须匹配本归属的原始失败原因。
+                    prior_error,
+                    redact_sensitive_text(prior_error)[:500],
                 ),
             )
     from app.repositories.media_subscriptions import (
