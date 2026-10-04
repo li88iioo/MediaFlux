@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import json
-import unittest
 from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
 from app.modules.rss import RSSEngine
-from tests.support import isolated_test_database
+from tests.support import InitializedWebTestCase, isolated_test_database
 
 
-class RSSBatchReadAuditTests(unittest.TestCase):
+class RSSBatchReadAuditTests(InitializedWebTestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
         self.sid = db.add_rss_subscription(
@@ -164,3 +163,28 @@ class RSSBatchReadAuditTests(unittest.TestCase):
                 self.assertEqual(db.get_rss_entry(value)["id"], entry_id)
         self.assertIsNone(db.get_rss_entry(None))
         self.assertIsNone(db.get_rss_entry(-1))
+
+    def test_web_entries_keep_unprocessed_first_and_filters_after_reload(self):
+        from fastapi.testclient import TestClient
+        from app.main import create_app
+        from tests.test_rss_stats_state import RSSStatsStateTests
+
+        first, second = self.entries(2)
+        db.update_rss_entry_status(second, "downloaded")
+        with TestClient(create_app(start_background=False)) as client:
+            self.assertEqual(client.get("/api/rss/entries").status_code, 401)
+            csrf = RSSStatsStateTests._csrf(client.get("/login").text)
+            login = client.post("/login", data={
+                "username": "admin", "password": "123456", "csrf_token": csrf,
+            }, follow_redirects=False)
+            self.assertEqual(login.status_code, 302)
+            with patch.object(db, "list_rss_entries", wraps=db.list_rss_entries) as listing:
+                for _ in range(2):
+                    response = client.get("/api/rss/entries", params={"subscription_id": self.sid, "q": "  Episode  "})
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual([row["id"] for row in response.json()], [first, second])
+                    listing.assert_called_with(sub_id=self.sid, status=None, keyword="Episode", limit=300, order="unprocessed_first")
+                response = client.get("/api/rss/entries", params={"subscription_id": self.sid, "status": "downloaded", "q": "Episode"})
+                self.assertEqual([row["id"] for row in response.json()], [second])
+                listing.assert_called_with(sub_id=self.sid, status="downloaded", keyword="Episode", limit=300, order="unprocessed_first")
+                self.assertEqual(client.get("/api/rss/entries?subscription_id=bad").status_code, 400)

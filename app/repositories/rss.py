@@ -320,11 +320,14 @@ def list_rss_entries(
         sql += " ORDER BY e.id DESC"
     elif order == "received_asc":
         sql += " ORDER BY e.id ASC"
-    elif order == "published_desc":
+    elif order in {"published_desc", "unprocessed_first"}:
         # pub_date 由 parser 规范为 SQLite 可解析的 YYYY-MM-DD HH:MM；
         # 不可信或缺失日期回退本地入库时间，并用 id 保证稳定顺序。
+        sql += " ORDER BY "
+        if order == "unprocessed_first":
+            sql += "CASE WHEN COALESCE(e.processed,0)=0 THEN 0 ELSE 1 END,"
         sql += (
-            " ORDER BY CASE WHEN strftime('%s',e.pub_date) IS NULL THEN 1 ELSE 0 END,"
+            "CASE WHEN strftime('%s',e.pub_date) IS NULL THEN 1 ELSE 0 END,"
             " COALESCE(CAST(strftime('%s',e.pub_date) AS INTEGER),"
             " CAST(strftime('%s',e.created_at) AS INTEGER),0) DESC,e.id DESC"
         )

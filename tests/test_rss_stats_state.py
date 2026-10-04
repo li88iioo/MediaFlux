@@ -75,6 +75,22 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         received = db.list_rss_entries(sub_id=sid, order="received_desc")
         self.assertEqual(int(received[0]["id"]), int(unknown))
 
+    def test_unprocessed_sort_precedes_limit_and_preserves_filters(self) -> None:
+        sid = db.add_rss_subscription("priority", "https://example.invalid/priority")
+        pending = db.add_rss_entry_with_media(sid, "keep pending", "old", pub_date="2020-01-01 12:00")["id"]
+        failed = db.add_rss_entry_with_media(sid, "keep failed", "failed", pub_date="2021-01-01 12:00")["id"]
+        db.update_rss_entry_status(failed, "failed")
+        for i in range(305):
+            processed = db.add_rss_entry_with_media(sid, f"keep processed {i}", f"new-{i}", pub_date="2026-10-04 12:00")["id"]
+            db.update_rss_entry_status(processed, "downloaded")
+        for _ in range(2):
+            rows = db.list_rss_entries(sub_id=sid, keyword="keep", order="unprocessed_first", limit=300)
+            self.assertEqual([row["id"] for row in rows[:2]], [failed, pending])
+            self.assertEqual(len(rows), 300)
+        filtered = db.list_rss_entries(sub_id=sid, status="pending", keyword="pending", order="unprocessed_first")
+        self.assertEqual([row["id"] for row in filtered], [pending])
+        self.assertNotIn(pending, [row["id"] for row in db.list_rss_entries(sub_id=sid, limit=300)])
+
     def test_rss_stats_counts_global_active_and_pending_entries(self) -> None:
         self._seed()
         self.assertEqual(db.get_rss_stats(), {

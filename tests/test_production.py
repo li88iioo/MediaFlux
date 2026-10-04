@@ -5849,7 +5849,7 @@ class SecurityTests(InitializedWebTestCase):
             searched = self.client.get("/api/rss/entries?q=episode", headers=headers)
         self.assertEqual(searched.status_code, 200)
         entries.assert_called_once_with(
-            sub_id=None, status=None, keyword="episode", limit=300
+            sub_id=None, status=None, keyword="episode", limit=300, order="unprocessed_first"
         )
 
         from app.modules.rss_scheduler import RSSScheduler

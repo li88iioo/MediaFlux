@@ -140,6 +140,7 @@ def list_entries(
         status=status,
         keyword=q.strip(),
         limit=300,
+        order="unprocessed_first",
     )
     return api_response([{
         "id": r["id"],
