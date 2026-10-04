@@ -690,7 +690,7 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("种子文件未解析到可验证文件列表", result["error"])
         self.assertNotIn("磁力资源连续", result["error"])
-        self.assertEqual(client.torrent_resolve_calls, [b"private-torrent-bytes"])
+        self.assertEqual(client.torrent_resolve_calls, [b"private-torrent-bytes"] * 4)
 
     def test_unknown_submit_outcome_retains_isolated_task_directory(self):
         client = FakeSelectionClient(RESOLVE_SUBFILES_FIXTURE)

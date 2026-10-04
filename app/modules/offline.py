@@ -170,7 +170,7 @@ def _resolve_offline_manifest(
     from_torrent = bool(torrent_data)
     source_label = "种子" if from_torrent else "磁力"
     attempts = 1
-    if protocol == "magnet" and not from_torrent:
+    if protocol == "magnet":
         attempts = max(1, min(get_int("OFFLINE_MAGNET_RESOLVE_ATTEMPTS", 4), 6))
     delay = max(0.0, min(float(get("OFFLINE_MAGNET_RESOLVE_DELAY_SECONDS", "0.5") or 0.5), 5.0))
     last_response: dict = {}
@@ -192,7 +192,7 @@ def _resolve_offline_manifest(
                 "光鸭%s解析失败 attempts=%s type=%s http_status=%s",
                 source_label, attempt, failure.error_type, failure.http_status or "-",
             )
-            if failure.retry_manifest and attempt < attempts:
+            if failure.retry_manifest and not from_torrent and attempt < attempts:
                 if delay > 0:
                     time.sleep(delay * attempt)
                 continue

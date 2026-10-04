@@ -122,7 +122,7 @@ class OfflineResolutionFailureTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn("种子文件未解析到可验证文件列表", result["error"])
                 self.assertNotIn("resolve_error_type", result)
-                self.assertEqual(result["resolve_attempts"], 1)
+                self.assertEqual(result["resolve_attempts"], 4)
                 self.assert_no_writes(client)
 
     def test_valid_torrent_uses_only_verified_remote_indexes(self):

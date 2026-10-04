@@ -55,6 +55,64 @@ class RssGuangyaTorrentInputTests(unittest.TestCase):
         client.close = Mock()
         return client
 
+    def test_uploaded_torrent_retries_empty_manifest_then_submits_once(self):
+        client = self.client()
+        client.resolve_torrent = Mock(side_effect=[{}, TREE])
+
+        with patch.object(offline, "get_int", return_value=3), patch.object(
+            offline, "get", return_value="0"
+        ), patch.object(offline.time, "sleep"):
+            result = offline.submit_offline(
+                TORRENT_URL, client=client, torrent_data=TORRENT
+            )
+
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["resolve_attempts"], 2)
+        self.assertEqual(client.resolve_torrent.call_count, 2)
+        self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
+        self.assertEqual(len(client.selection_calls), 1)
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.legacy_calls, [])
+
+    def test_uploaded_torrent_empty_manifest_exhaustion_fails_without_writes(self):
+        client = self.client()
+        client.resolve_torrent = Mock(side_effect=[{}, {}, {}])
+
+        with patch.object(offline, "get_int", return_value=3), patch.object(
+            offline, "get", return_value="0"
+        ), patch.object(offline.time, "sleep"):
+            result = offline.submit_offline(
+                TORRENT_URL, client=client, torrent_data=TORRENT,
+                isolate_task=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["resolve_attempts"], 3)
+        self.assertEqual(client.resolve_torrent.call_count, 3)
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
+        self.assertEqual(client.legacy_calls, [])
+        self.assertIn("已阻止整单下载", result["error"])
+
+    def test_uploaded_torrent_resolver_exception_is_not_retried(self):
+        client = self.client()
+        client.resolve_torrent = Mock(side_effect=RuntimeError("authentication rejected"))
+
+        with patch.object(offline, "get_int", return_value=3), patch.object(
+            offline, "get", return_value="0"
+        ), patch.object(offline.time, "sleep"):
+            result = offline.submit_offline(
+                TORRENT_URL, client=client, torrent_data=TORRENT,
+                isolate_task=True,
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["resolve_attempts"], 1)
+        client.resolve_torrent.assert_called_once_with(TORRENT)
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
+        self.assertEqual(client.legacy_calls, [])
+
     def test_http_disabled_does_not_block_bt_torrent_link(self):
         client = self.client()
         result = offline.submit_offline(TORRENT_URL, client=client)
