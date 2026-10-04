@@ -36,8 +36,6 @@
     const VIEW_CACHE_LIMIT = 24;
     const SECTION_PRIMARY_CONCURRENCY = 3;
     const SECTION_BACKGROUND_CONCURRENCY = 2;
-    const CARD_NODE_CACHE_LIMIT = 800;
-    const SECTION_NODE_CACHE_LIMIT = 64;
     const RESOURCE_MATCH_REASON_LABELS = {
         title_exact: '标题精确',
         title_contains: '标题包含',
@@ -155,8 +153,8 @@
     const filterDefinitionsCache = new Map();
     const viewSnapshots = new Map();
     const tabLastView = new Map();
-    const cardNodeCache = new Map();
-    const sectionNodeCache = new Map();
+    const cardNodes = new Map();
+    const renderedSections = new WeakMap();
 
     function node(tag, className, text) {
         const element = document.createElement(tag);
@@ -215,7 +213,9 @@
         if (viewSnapshots.has(key)) viewSnapshots.delete(key);
         viewSnapshots.set(key, snapshot);
         while (viewSnapshots.size > VIEW_CACHE_LIMIT) {
-            viewSnapshots.delete(viewSnapshots.keys().next().value);
+            const oldest = viewSnapshots.keys().next().value;
+            viewSnapshots.delete(oldest);
+            tabLastView.forEach((viewKey, tabKey) => { if (viewKey === oldest) tabLastView.delete(tabKey); });
         }
     }
 
@@ -240,6 +240,8 @@
             appendError: state.appendError,
             statusPayload: state.statusPayload,
             savedAt: Date.now(),
+            scrollY: window.scrollY,
+            railOffsets: [...elements.sections.querySelectorAll('.discovery-rail')].map(rail => rail.scrollLeft),
         };
         rememberSnapshot(key, snapshot);
         tabLastView.set(activeTabKey(), key);
@@ -273,6 +275,10 @@
             }
             renderGrid(state.itemsData, false);
         }
+        elements.sections.querySelectorAll('.discovery-rail').forEach((rail, index) => {
+            rail.scrollLeft = snapshot.railOffsets[index] || 0;
+        });
+        window.scrollTo(0, snapshot.scrollY);
         updateProviderStatus(state.statusPayload || {});
         connectInfiniteScroll();
         return true;
@@ -742,22 +748,22 @@
         return card;
     }
 
-    function rememberNode(cache, key, entry, limit) {
-        if (cache.has(key)) cache.delete(key);
-        cache.set(key, entry);
-        while (cache.size > limit) cache.delete(cache.keys().next().value);
+    function releaseInactiveView() {
+        (state.mode === 'sections' ? elements.grid : elements.sections).replaceChildren();
+        // 只保留当前页面连接的节点，返回浏览用数据快照重建，不缓存隐藏海报。
+        for (const [key, entry] of cardNodes) if (!entry.node.isConnected) cardNodes.delete(key);
+        if (!state.activeCard?.isConnected) state.activeCard = null;
     }
 
     function reusableCard(item, index = 0, headingTag = 'h3', scope = 'grid') {
         const key = `${scope}:${itemKey(item)}`;
-        const cached = cardNodeCache.get(key);
+        const cached = cardNodes.get(key);
         if (cached?.item === item && cached.headingTag === headingTag) {
             cached.node.style.setProperty('--discovery-order', String(Math.min(index, 10)));
-            rememberNode(cardNodeCache, key, cached, CARD_NODE_CACHE_LIMIT);
             return cached.node;
         }
         const card = createCard(item, index, headingTag);
-        rememberNode(cardNodeCache, key, {item, headingTag, node: card}, CARD_NODE_CACHE_LIMIT);
+        cardNodes.set(key, {item, headingTag, node: card});
         return card;
     }
 
@@ -796,22 +802,13 @@
             rail.append(emptyPanel(message));
         }
         shelf.append(head, rail);
-        return shelf;
-    }
-
-    function reusableSectionShelf(section, sectionIndex) {
-        const key = `${sectionIdentity(section)}:${sectionIndex}`;
-        const cached = sectionNodeCache.get(key);
-        if (cached?.section === section) {
-            rememberNode(sectionNodeCache, key, cached, SECTION_NODE_CACHE_LIMIT);
-            return cached.node;
-        }
-        const shelf = createSectionShelf(section, sectionIndex);
-        rememberNode(sectionNodeCache, key, {section, node: shelf}, SECTION_NODE_CACHE_LIMIT);
+        renderedSections.set(shelf, section);
         return shelf;
     }
 
     function renderSections(sections) {
+        const previousShelves = [...elements.sections.children];
+        const railOffsets = [...elements.sections.querySelectorAll('.discovery-rail')].map(rail => rail.scrollLeft);
         elements.sections.hidden = false;
         elements.grid.hidden = true;
         elements.loadMoreRow.hidden = true;
@@ -820,12 +817,16 @@
         const usable = asArray(sections).filter(Boolean);
         if (!usable.length) {
             elements.sections.replaceChildren(emptyPanel('今日排期尚未生成，或所有资料源均未配置。'));
+            releaseInactiveView();
             return;
         }
         usable.forEach((section, sectionIndex) => {
-            fragment.append(reusableSectionShelf(section, sectionIndex));
+            const previous = previousShelves[sectionIndex];
+            fragment.append(renderedSections.get(previous) === section ? previous : createSectionShelf(section, sectionIndex));
         });
         elements.sections.replaceChildren(fragment);
+        elements.sections.querySelectorAll('.discovery-rail').forEach((rail, index) => { rail.scrollLeft = railOffsets[index] || 0; });
+        releaseInactiveView();
         renderIcons(elements.sections);
     }
 
@@ -857,6 +858,7 @@
             });
             elements.grid.append(fragment);
         }
+        releaseInactiveView();
         showPaginationControl();
         renderIcons(elements.grid);
     }
@@ -1222,6 +1224,7 @@
             } else if (!shouldPreserve) {
                 delete target.dataset.globalSkeleton;
                 target.replaceChildren(errorPanel(error, () => loadActive()));
+                releaseInactiveView();
             }
             elements.sections.hidden = state.mode !== 'sections';
             elements.grid.hidden = state.mode === 'sections';
@@ -2986,6 +2989,7 @@
         const activeTarget = state.mode === 'sections' ? elements.sections : elements.grid;
         delete activeTarget.dataset.globalSkeleton;
         activeTarget.replaceChildren();
+        releaseInactiveView();
         void loadActive({preserveContent: false});
     }
 
@@ -3051,6 +3055,7 @@
             state.statusPayload = null;
             delete elements.grid.dataset.globalSkeleton;
             elements.grid.replaceChildren();
+            releaseInactiveView();
         }
         await loadActive({preserveContent: Boolean(cachedSnapshot)});
     });

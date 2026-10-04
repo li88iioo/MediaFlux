@@ -1173,6 +1173,112 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         }""")
         self.assertTrue(page.locator("[data-resource-result-id='resource-page-2']").is_visible())
 
+    def open_gallery_cache_fixture(self, width=1100, delayed_section=False):
+        from jinja2 import Environment, FileSystemLoader
+        env = Environment(loader=FileSystemLoader(ROOT / "app/templates"))
+        content = re.search(r"{% block content %}(.*?){% endblock %}", TEMPLATE.read_text(), re.S).group(1)
+        body = env.from_string(content).render(resource_results_enabled=True, url_for=lambda *args, **kwargs: "#")
+        context = self.browser.new_context(viewport={"width": width, "height": 800})
+        self.addCleanup(context.close)
+        page = context.new_page()
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        self.addCleanup(lambda: self.assertEqual(errors, []))
+        page.route("http://gallery.test/**", lambda route: route.fulfill(content_type="text/html", body=f"<html><head><style>{self.styles}</style></head><body>{body}</body></html>"))
+        page.goto("http://gallery.test/discovery")
+        page.evaluate("""delayed => {
+            window.IntersectionObserver = undefined;
+            window.renderLucideIcons = () => {};
+            window.__galleryCalls = [];
+            const pixel = '/poster.png';
+            const cards = (prefix, offset=0, count=20) => Array.from({length:count}, (_,i) => ({
+                provider:'tmdb',media_type:'movie',external_id:`${prefix}-${offset+i}`,
+                title:`${prefix} 作品 ${offset+i}`,poster_url:pixel,
+            }));
+            const sections = [{key:'first',title:'首屏',provider:'tmdb',media_type:'movie',category:'popular',items:cards('section',0,12)}];
+            if(delayed) sections.push({key:'second',title:'稍后加载',provider:'douban',media_type:'tv',category:'popular',items:[]});
+            window.fetch = async input => {
+                const url=new URL(String(input),location.href);window.__galleryCalls.push(url.pathname+url.search);
+                let data={};
+                if(url.pathname==='/api/discovery/sections')data={sections};
+                else if(url.pathname.includes('/filters/'))data={filters:[{key:'genre',label:'类型',options:['A','B']}]};
+                else if(url.pathname==='/api/discovery/items') {
+                    if(delayed && url.searchParams.get('provider')==='douban') {
+                        await new Promise(resolve=>window.__releaseSection=resolve);
+                        data={items:cards('late',0,12)};
+                    } else {
+                        const page=Number(url.searchParams.get('page')||1);
+                        data={items:cards(url.searchParams.get('genre')||'all',(page-1)*20),has_more:page<2};
+                    }
+                }
+                return {ok:true,status:200,json:async()=>data};
+            };
+        }""", delayed_section)
+        # 有效的同源小图；不靠破图移除 img 来通过节点释放断言。
+        import base64
+        pixel = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j3ioAAAAASUVORK5CYII=')
+        page.route("**/poster.png", lambda route: route.fulfill(content_type="image/png", body=pixel))
+        page.add_script_tag(content=self.script)
+        page.wait_for_function("document.querySelectorAll('#discovery-sections .discovery-card').length >= 12")
+        return page
+
+    def test_gallery_releases_hidden_images_and_restores_data_filters_pages_and_scroll(self):
+        for width in (1100, 390):
+            with self.subTest(width=width):
+                page = self.open_gallery_cache_fixture(width)
+                page.evaluate("document.querySelector('.discovery-rail').scrollLeft=230")
+                rail_offset = page.evaluate("document.querySelector('.discovery-rail').scrollLeft")
+                self.assertGreater(rail_offset, 0)
+                page.evaluate("document.querySelector('#discovery-tab-tmdb-movie').click()")
+                page.wait_for_function("document.querySelectorAll('#discovery-grid .discovery-card').length===20")
+                self.assertEqual(page.locator('#discovery-sections img').count(), 0)
+                page.evaluate("""() => {const e=document.querySelector('#discovery-filter-region select');e.value='A';e.dispatchEvent(new Event('change',{bubbles:true}));}""")
+                page.wait_for_function("document.querySelector('#discovery-grid .discovery-card-title').textContent.startsWith('A ')")
+                page.evaluate("document.querySelector('#discovery-load-more').click()")
+                page.wait_for_function("document.querySelectorAll('#discovery-grid .discovery-card').length===40 && !document.querySelector('#discovery-search-submit').disabled")
+                snapshot = page.evaluate("""() => {
+                    window.__oldCard=new WeakRef(document.querySelector('#discovery-grid .discovery-card'));
+                    window.scrollTo(0,600);
+                    return {keys:[...document.querySelectorAll('#discovery-grid .discovery-card')].map(e=>e.dataset.mediaKey),scrollY,requests:window.__galleryCalls.length};
+                }""")
+                self.assertGreater(snapshot['scrollY'], 0)
+                page.evaluate("document.querySelector('#discovery-tab-sections').click()")
+                page.wait_for_function("!document.querySelector('#discovery-sections').hidden")
+                self.assertEqual(page.locator('#discovery-grid').evaluate('e=>e.childElementCount'), 0)
+                self.assertAlmostEqual(page.evaluate("document.querySelector('.discovery-rail').scrollLeft"), rail_offset, delta=1)
+                cdp = page.context.new_cdp_session(page)
+                cdp.send('HeapProfiler.collectGarbage')
+                self.assertTrue(page.evaluate("window.__oldCard.deref()===undefined"))
+                cdp.detach()
+                page.evaluate("document.querySelector('#discovery-tab-tmdb-movie').click()")
+                page.wait_for_function("document.querySelectorAll('#discovery-grid .discovery-card').length===40")
+                restored = page.evaluate("""() => ({keys:[...document.querySelectorAll('#discovery-grid .discovery-card')].map(e=>e.dataset.mediaKey),scrollY,requests:window.__galleryCalls.length,filter:document.querySelector('#discovery-filter-region select').value})""")
+                self.assertEqual(restored['keys'], snapshot['keys'])
+                self.assertEqual(restored['filter'], 'A')
+                self.assertEqual(restored['requests'], snapshot['requests'])
+                self.assertAlmostEqual(restored['scrollY'], snapshot['scrollY'], delta=1)
+                self.assertEqual(page.locator('#discovery-sections img').count(), 0)
+                page.close()
+
+    def test_section_hydration_reuses_unchanged_cards_and_keeps_horizontal_position(self):
+        page = self.open_gallery_cache_fixture(delayed_section=True)
+        page.wait_for_function("typeof window.__releaseSection==='function'")
+        before = page.evaluate("""() => {
+            const shelf=document.querySelector('.discovery-shelf');
+            shelf.querySelector('.discovery-rail').scrollLeft=245;
+            window.__firstCard=shelf.querySelector('.discovery-card');
+            const box=window.__firstCard.getBoundingClientRect();
+            return {scroll:shelf.querySelector('.discovery-rail').scrollLeft,width:box.width,height:box.height};
+        }""")
+        page.evaluate("window.__releaseSection()")
+        page.wait_for_function("document.querySelectorAll('.discovery-shelf')[1].querySelectorAll('.discovery-card').length===12")
+        after = page.evaluate("""() => {
+            const shelf=document.querySelector('.discovery-shelf'), card=shelf.querySelector('.discovery-card'),box=card.getBoundingClientRect();
+            return {same:card===window.__firstCard,scroll:shelf.querySelector('.discovery-rail').scrollLeft,width:box.width,height:box.height};
+        }""")
+        self.assertTrue(after.pop('same'))
+        self.assertEqual(after, before)
+
     def open_filter_controls(self, width=320):
         html = f"""<!doctype html>
         <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
