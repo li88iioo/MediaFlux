@@ -12,6 +12,7 @@ from app.bot.handlers import _recover_stale_progress_until_delivered
 from app.bot.progress import (
     TelegramProgress,
     _register_pending,
+    cancel_active_operations,
     _retry_terminal_until_delivered,
     deliver_terminal_to_existing_message,
     recover_stale_operations,
@@ -136,6 +137,36 @@ _TELEBOT = SimpleNamespace(types=SimpleNamespace(
 class TelegramProgressTests(IsolatedDatabaseTestCase):
     def setUp(self):
         db.kv_set("telegram_pending_operations_v1", "[]")
+
+    def test_stop_preserves_confirm_progress_until_real_terminal_cleanup(self):
+        bot = _EditBot()
+        with patch("app.bot.progress._active", {}) as active:
+            confirmed = TelegramProgress(
+                bot, _TELEBOT, "100", "Agent 确认执行",
+                timeout_seconds=60, prefer_persistent_message=True,
+                preserve_on_stop=True,
+            )
+            ordinary = TelegramProgress(bot, _TELEBOT, "100", "普通任务", timeout_seconds=60)
+            confirmed.begin("<b>正在确认执行</b>")
+            ordinary.begin("<b>普通任务运行中</b>")
+
+            self.assertEqual(cancel_active_operations(), 2)
+
+            self.assertFalse(confirmed._finished)
+            self.assertIs(active.get(confirmed.operation_id), confirmed)
+            self.assertTrue(ordinary._finished)
+            pending = json.loads(db.kv_get("telegram_pending_operations_v1", "[]"))
+            self.assertEqual([row["id"] for row in pending], [confirmed.operation_id])
+            self.assertTrue(any(
+                "请勿重复提交" in edit[2] and "当前结果尚未核实" in edit[2]
+                for edit in bot.edits
+            ))
+
+            self.assertTrue(confirmed.finish("<b>确认写操作已完成</b>"))
+            self.assertTrue(confirmed.finished_event.is_set())
+            self.assertNotIn(confirmed.operation_id, active)
+            self.assertEqual(bot.edits[-1][2], "<b>确认写操作已完成</b>")
+            self.assertEqual(db.kv_get("telegram_pending_operations_v1"), "[]")
 
     def test_existing_message_terminal_uses_edit_then_send_fallback(self):
         bot = _FailingFinalEditBot()

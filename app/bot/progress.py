@@ -291,6 +291,7 @@ class TelegramProgress:
     source_message: Any | None = None
     timeout_seconds: float = 180.0
     prefer_persistent_message: bool = False
+    preserve_on_stop: bool = field(default=False, kw_only=True)
     operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     mode: str = ""
     draft_id: int | None = None
@@ -1341,7 +1342,14 @@ def cancel_active_operations(reason: str = "服务正在停止，本次操作已
     with _active_lock:
         operations = list(_active.values())
     for operation in operations:
-        operation.finish(
-            f"<b>{html.escape(operation.label)}已中断</b>\n{html.escape(reason)}"
-        )
+        if operation.preserve_on_stop:
+            operation.update(
+                f"<b>{html.escape(operation.label)}仍在处理中</b>\n"
+                "服务正在停止，但已确认操作仍可能继续执行；当前结果尚未核实。"
+                "请勿重复提交，执行结束后将更新此消息。"
+            )
+        else:
+            operation.finish(
+                f"<b>{html.escape(operation.label)}已中断</b>\n{html.escape(reason)}"
+            )
     return len(operations)

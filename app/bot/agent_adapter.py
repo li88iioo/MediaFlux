@@ -397,6 +397,7 @@ class _ExistingMessageProgress(TelegramProgress):
             mode="edit", message_id=target.message_id, source_message=target,
             message_thread_id=_thread_kwargs(target).get("message_thread_id"),
             timeout_seconds=1800, prefer_persistent_message=True,
+            preserve_on_stop=True,
         )
         self._started = False
 

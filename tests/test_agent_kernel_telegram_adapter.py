@@ -100,6 +100,9 @@ class FakeBot:
     def edit_message_reply_markup(self, chat_id, message_id, **kwargs):
         self.edits.append(("", chat_id, message_id, kwargs))
 
+    def stop_polling(self):
+        pass
+
 
 class FakeDraftBot(FakeBot):
     def __init__(self):
@@ -1028,9 +1031,10 @@ class TelegramAgentExecutorTests(unittest.TestCase):
                 caller.join(2)
             executor.stop(timeout=3)
 
-    def test_real_confirmed_effect_survives_stop_timeout_and_blocks_bot_restart(self):
+    def test_confirmed_effect_survives_stop_timeout_settles_progress_and_blocks_restart(self):
         import asyncio
         import threading
+        from types import SimpleNamespace
         from app.bot import handlers
         from app.agent.kernel.capabilities import CapabilityRetriever, KernelToolSpec, ToolCatalog, ToolEffect
         from app.agent.kernel.effects import PreparedEffect
@@ -1038,16 +1042,18 @@ class TelegramAgentExecutorTests(unittest.TestCase):
         from app.agent.kernel.pipeline import ToolPipeline
         from app.agent.kernel.session import AgentSession
         from app.agent.kernel.state import InMemorySessionStateStore
-        from app.agent.kernel.transports import EffectEnvelope, QueryEnvelope, TelegramKernelTransport
+        from app.agent.kernel.transports import QueryEnvelope, TelegramKernelTransport
         from tests.test_agent_kernel_core import ScriptedModel
 
         entered, release, executed = threading.Event(), threading.Event(), threading.Event()
+
         def execute(arguments, snapshot, context):
             self.assertEqual(snapshot, "fixture")
             entered.set()
             self.assertTrue(release.wait(3))
             executed.set()
             return {"summary": "completed"}
+
         tool = KernelToolSpec(
             name="download.pause", domain="download", description="暂停下载", examples=("暂停下载",),
             input_schema={"type": "object", "properties": {}, "additionalProperties": False},
@@ -1065,26 +1071,81 @@ class TelegramAgentExecutorTests(unittest.TestCase):
         session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
             pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
         transport = TelegramKernelTransport(session)
-        preview = asyncio.run(transport.query(QueryEnvelope(owner="owner", session_id="session", message="暂停下载")))
+        owner = adapter.telegram_agent_owner(-100, 7)
+        session_id = adapter.telegram_agent_session_id(-100, 7)
+        preview = asyncio.run(transport.query(QueryEnvelope(
+            owner=owner, session_id=session_id, message="暂停下载",
+        )))
+        bot = FakeBot()
+        call = Call(
+            f"agk:c:{preview.approval.plan_id}",
+            Message("确认暂停下载", chat_id=-100, user_id=0, message_id=33),
+        )
+        runtime = SimpleNamespace(telegram=transport, store=state)
+        progress_instances = []
+        progress_class = adapter._ExistingMessageProgress
+
+        def make_progress(*args):
+            progress = progress_class(*args)
+            progress_instances.append(progress)
+            return progress
+
         executor = adapter.TelegramAgentExecutor()
         executor.start()
+        saved_bot_state = (
+            handlers._bot, handlers._bot_thread, handlers._bot_thread_stop,
+            handlers._progress_recovery_thread, handlers._progress_recovery_stop,
+            handlers._registered_bot_id,
+        )
+        handlers._bot = bot
+        handlers._bot_thread = handlers._bot_thread_stop = None
+        handlers._progress_recovery_thread = handlers._progress_recovery_stop = None
         try:
-            job = executor.submit(lambda: asyncio.run(transport.confirm(EffectEnvelope(
-                owner="owner", session_id="session", plan_id=preview.approval.plan_id,
-            ))), control=True)
-            self.assertTrue(entered.wait(1))
-            self.assertFalse(executor.stop(timeout=0.02))
-            self.assertFalse(asyncio.run(transport.cancel(owner="owner", session_id="session")))
-            with patch.object(adapter, "AGENT_EXECUTOR", executor), patch.object(
+            with patch.object(adapter, "telegram_agent_access", return_value="allowed"), patch.object(
+                adapter.agent_rate_limiter, "allow", return_value=True
+            ), patch.object(adapter, "AGENT_EXECUTOR", executor
+            ), patch.object(
+                adapter, "get_agent_kernel_runtime", return_value=runtime
+            ), patch.object(
+                adapter, "_ExistingMessageProgress", side_effect=make_progress
+            ), patch.object(
+                adapter, "_settle_candidate_draft"
+            ), patch.object(
                 handlers, "_configuration_complete", return_value=True
+            ), patch(
+                "app.bot.progress._register_pending"
+            ), patch(
+                "app.bot.progress._update_pending", return_value=True
+            ), patch(
+                "app.bot.progress._remove_pending"
+            ), patch(
+                "app.bot.progress.stop_terminal_delivery_retries"
+            ), patch(
+                "app.modules.telegram_resource_search.shutdown_telegram_indexer_worker"
             ):
+                job = executor.submit(
+                    lambda: adapter.handle_agent_callback(bot, call, TELEBOT),
+                    control=True,
+                )
+                self.assertTrue(entered.wait(1))
+                self.assertFalse(handlers.stop_bot(timeout=0.02))
+                self.assertFalse(executed.is_set())
+                self.assertTrue(progress_instances)
+                self.assertIn("勿重复提交", bot.edits[-1][0])
+                self.assertNotIn("已中断", bot.edits[-1][0])
+                self.assertFalse(progress_instances[0].finished_event.is_set())
                 self.assertFalse(handlers.start_bot())
-            self.assertFalse(job.done())
-            self.assertFalse(executed.is_set())
-            release.set()
-            self.assertEqual(job.result(2).status, "success")
-            self.assertTrue(executed.is_set())
-            self.assertTrue(executor.stop(timeout=1))
+                release.set()
+                job.result(2)
+                self.assertTrue(executed.is_set())
+                self.assertIn("completed", bot.edits[-1][0])
+                self.assertTrue(progress_instances[0].finished_event.is_set())
+                self.assertTrue(executor.stop(timeout=1))
         finally:
             release.set()
             executor.stop(timeout=3)
+            (
+                handlers._bot, handlers._bot_thread, handlers._bot_thread_stop,
+                handlers._progress_recovery_thread, handlers._progress_recovery_stop,
+                handlers._registered_bot_id,
+            ) = saved_bot_state
