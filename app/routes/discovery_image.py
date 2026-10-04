@@ -123,6 +123,10 @@ def _canonical_poster_key(provider: str, poster_key: str) -> tuple[str, str]:
     if provider == "bangumi":
         if not separator or host != "lain.bgm.tv" or not path:
             raise HTTPException(status_code=400, detail="invalid bangumi poster key")
+        # 统一限制显示尺寸；签发新 URL 与读取旧签名/缓存都走此处，不能只改 Provider。
+        path = re.sub(r"^(?:r/\d+(?:x\d+)?/)?pic/cover/[lcmsg]/", "r/800/pic/cover/l/", path)
+        if len(host) + len(path) + 1 > 1024:
+            raise HTTPException(status_code=400, detail="invalid bangumi poster key")
         return provider, f"{host}/{path}"
     raise HTTPException(status_code=404, detail="unknown poster provider")
 

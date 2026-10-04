@@ -35,6 +35,7 @@ _BANGUMI_IMAGE_HOSTS = {"lain.bgm.tv"}
 
 def _image_key(value: Any) -> str:
     if isinstance(value, dict):
+        # 保留原图标识；同源海报入口统一选择显示尺寸，避免使用上游 100/150px 的模糊小图。
         value = value.get("large") or value.get("common") or value.get("medium") or value.get("small")
     raw = str(value or "").strip()
     if not raw:

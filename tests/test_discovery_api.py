@@ -669,7 +669,7 @@ class DiscoveryPosterTests(_BaseClientTests):
         self.authenticate()
         cases = [
             ("douban", "img3.doubanio.com/view/photo/p7.jpg", "https://img3.doubanio.com/view/photo/p7.jpg"),
-            ("bangumi", "lain.bgm.tv/pic/cover/l/42.jpg", "https://lain.bgm.tv/pic/cover/l/42.jpg"),
+            ("bangumi", "lain.bgm.tv/pic/cover/l/42.jpg", "https://lain.bgm.tv/r/800/pic/cover/l/42.jpg"),
         ]
         for provider, key, expected in cases:
             upstream = self._image_response()
@@ -680,6 +680,48 @@ class DiscoveryPosterTests(_BaseClientTests):
             self.assertEqual(result.status_code, 200)
             self.assertEqual(session.get.call_args.args[0], expected)
             upstream.close.assert_called_once()
+
+    def test_bangumi_cached_cards_and_legacy_tokens_share_bounded_poster_policy(self):
+        from app.routes.discovery_api import _card_payload
+        from app.routes.discovery_image import _serializer, decode_poster_token, encode_poster_token
+        self.authenticate()
+        original_key = "lain.bgm.tv/pic/cover/l/ab/cd/42.jpg"
+        bounded_key = "lain.bgm.tv/r/800/pic/cover/l/ab/cd/42.jpg"
+        old_token = _serializer().dumps({"v": 1, "provider": "bangumi", "key": original_key})
+        card = MediaCard(provider="bangumi", media_type="tv", external_id="42", title="测试动画", poster_key=original_key)
+        # 旧数据库/服务缓存仍保存原 key，输出 URL 必须改变，避免复用浏览器中已缓存的超大图片。
+        payload = _card_payload(card)
+        new_token = payload["poster_url"].rsplit("/", 1)[-1]
+        self.assertNotEqual(new_token, old_token)
+        self.assertEqual(decode_poster_token("bangumi", new_token), bounded_key)
+        self.assertEqual(decode_poster_token("bangumi", old_token), bounded_key)
+        self.assertEqual(encode_poster_token("bangumi", bounded_key), new_token)
+        for token in (old_token, new_token):
+            with self.subTest(token_type="old" if token == old_token else "new"):
+                upstream = self._image_response()
+                session = self._mock_session(upstream)
+                with patch("app.routes.discovery_image._get_poster_session", return_value=session):
+                    response = self.client.get(f"/discovery-poster/bangumi/{token}")
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(session.get.call_args.args[0], f"https://{bounded_key}")
+                upstream.close.assert_called_once()
+        self.assertEqual(card.poster_key, original_key)
+
+    def test_bangumi_cover_variants_are_normalized_once_without_changing_other_images(self):
+        from app.routes.discovery_image import _canonical_poster_key, _upstream_url
+        for variant in ("pic/cover/l", "pic/cover/c", "pic/cover/m", "pic/cover/s", "pic/cover/g", "r/200/pic/cover/l", "r/800/pic/cover/l", "r/1600/pic/cover/l"):
+            with self.subTest(variant=variant):
+                provider, key = _canonical_poster_key("bangumi", f"lain.bgm.tv/{variant}/42.jpg")
+                self.assertEqual(key, "lain.bgm.tv/r/800/pic/cover/l/42.jpg")
+                self.assertEqual(_canonical_poster_key(provider, key), (provider, key))
+                self.assertEqual(_upstream_url(provider, key), f"https://{key}")
+        # 不签发经过尺寸规范化后已超出 decoder 长度限制的 token。
+        from fastapi import HTTPException
+        with self.assertRaises(HTTPException):
+            _canonical_poster_key("bangumi", "lain.bgm.tv/pic/cover/l/" + "a" * 996)
+        self.assertEqual(_upstream_url("bangumi", "lain.bgm.tv/img/no_icon_subject.png"), "https://lain.bgm.tv/img/no_icon_subject.png")
+        self.assertEqual(_upstream_url("tmdb", "poster.jpg"), "https://image.tmdb.org/t/p/w500/poster.jpg")
+        self.assertEqual(_upstream_url("douban", "img3.doubanio.com/view/photo/p7.jpg"), "https://img3.doubanio.com/view/photo/p7.jpg")
 
     def test_poster_token_rejects_encoded_traversal_unknown_host_and_tampering(self):
         from fastapi import HTTPException
