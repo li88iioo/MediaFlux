@@ -41,7 +41,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         )
         second = db.add_agent_action_history(
             owner_digest=OWNER_DIGEST,
-            tool_name="rss.retry_failed_to_qb",
+            tool_name="rss.retry_failed",
             risk="danger",
             status="failed",
             ok=False,
@@ -54,7 +54,7 @@ class AgentActionHistoryCoreTests(unittest.TestCase):
         rows = db.list_agent_action_history(owner_digest=OWNER_DIGEST, limit=10)
         self.assertEqual(
             [row["tool_name"] for row in rows],
-            ["rss.retry_failed_to_qb", "strm.run_once"],
+            ["rss.retry_failed", "strm.run_once"],
         )
         self.assertEqual(
             len(

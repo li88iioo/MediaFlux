@@ -578,116 +578,150 @@ def claim_pending_rss_qb_entries(
         return rows
 
 
-def get_retryable_failed_rss_qb_snapshot(
+_RSS_QB_RETRY_FAILURE_CODES = (
+    "qb_unavailable",
+    "qb_rate_limited",
+    "qb_server_error",
+)
+_RSS_GUANGYA_RETRY_FAILURE_CODES = (
+    "guangya_manifest_unavailable",
+    "guangya_unavailable",
+    "guangya_rate_limited",
+)
+_RSS_SAFE_RETRY_FAILURE_CODES = (
+    *_RSS_QB_RETRY_FAILURE_CODES,
+    *_RSS_GUANGYA_RETRY_FAILURE_CODES,
+)
+_RSS_RATE_LIMIT_FAILURE_CODES = ("qb_rate_limited", "guangya_rate_limited")
+_RSS_FAILURE_CODES = {
+    "invalid_payload",
+    "missing_torrent_url",
+    "qb_auth_failed",
+    "qb_rejected",
+    "qb_dedupe_busy",
+    "qb_outcome_unknown",
+    "submission_outcome_unknown",
+    "guangya_auth_failed",
+    "guangya_submit_failed",
+    "guangya_outcome_unknown",
+    "unknown_failure",
+    *_RSS_SAFE_RETRY_FAILURE_CODES,
+}
+_RSS_RETRY_ENTRY_SELECT = (
+    "SELECT rss_entries.id,rss_entries.rss_item_id,rss_entries.title,"
+    "rss_entries.status,rss_entries.processed,rss_entries.created_at,rss_entries.payload,"
+    "rss_entries.failure_code,rss_entries.failure_retryable,rss_entries.retry_count,"
+    "rss_entries.failed_at,COALESCE(i.download_method,'') AS download_method,"
+    "COALESCE(i.qb_save_path,'') AS qb_save_path,"
+    "COALESCE(i.gy_target_dir,'') AS gy_target_dir,"
+    "COALESCE(i.gy_target_dir_name,'') AS gy_target_dir_name "
+    "FROM rss_entries JOIN rss_items i ON rss_entries.rss_item_id=i.id "
+)
+
+
+def rss_retry_entry_snapshot(row) -> dict[str, object]:
+    """把 SQLite 行或确认字典归一为稳定的 RSS 重试快照。"""
+    data = dict(row)
+    return {
+        "id": int(data.get("id") or 0),
+        "rss_item_id": int(data.get("rss_item_id") or 0),
+        "title": str(data.get("title") or ""),
+        "payload": str(data.get("payload") or ""),
+        "created_at": str(data.get("created_at") or ""),
+        "failure_code": str(data.get("failure_code") or ""),
+        "failure_retryable": int(data.get("failure_retryable") or 0),
+        "retry_count": int(data.get("retry_count") or 0),
+        "failed_at": str(data.get("failed_at") or ""),
+        "download_method": str(data.get("download_method") or ""),
+        "qb_save_path": str(data.get("qb_save_path") or ""),
+        "gy_target_dir": str(data.get("gy_target_dir") or ""),
+        "gy_target_dir_name": str(data.get("gy_target_dir_name") or ""),
+    }
+
+
+def _rss_retry_eligibility_sql(default_method: str) -> tuple[str, tuple[str, ...]]:
+    """共享失败项安全条件；调用者传入 rss_entries 与 rss_items 的 i 联接。"""
+    method = "LOWER(COALESCE(NULLIF(TRIM(i.download_method),''),?))"
+    safe_codes = ",".join("?" for _ in _RSS_SAFE_RETRY_FAILURE_CODES)
+    qb_codes = ",".join("?" for _ in _RSS_QB_RETRY_FAILURE_CODES)
+    gy_codes = ",".join("?" for _ in _RSS_GUANGYA_RETRY_FAILURE_CODES)
+    rate_codes = ",".join("?" for _ in _RSS_RATE_LIMIT_FAILURE_CODES)
+    condition = (
+        "COALESCE(rss_entries.failure_retryable,0)=1 "
+        "AND COALESCE(rss_entries.retry_count,0)<5 "
+        f"AND rss_entries.failure_code IN ({safe_codes}) "
+        f"AND (({method}='qb' AND rss_entries.failure_code IN ({qb_codes})) "
+        f"OR ({method}='guangya' AND rss_entries.failure_code IN ({gy_codes}))) "
+        f"AND (rss_entries.failure_code NOT IN ({rate_codes}) OR ("
+        "NULLIF(rss_entries.failed_at,'') IS NOT NULL AND "
+        "datetime(rss_entries.failed_at)<=datetime('now','localtime','-60 seconds')))"
+    )
+    parameters = (
+        *_RSS_SAFE_RETRY_FAILURE_CODES,
+        default_method, *_RSS_QB_RETRY_FAILURE_CODES,
+        default_method, *_RSS_GUANGYA_RETRY_FAILURE_CODES,
+        *_RSS_RATE_LIMIT_FAILURE_CODES,
+    )
+    return condition, parameters
+
+
+def get_retryable_failed_rss_snapshot(
     default_method: str = "qb",
     limit: int = 21,
 ) -> list[sqlite3.Row]:
-    """返回 Agent 确认绑定所需的可安全重试 qB 失败条目快照。"""
+    """返回按订阅当前下载方式筛选的安全 RSS 失败快照。"""
     safe_limit = max(1, min(100, int(limit or 21)))
     normalized_default = str(default_method or "").strip().lower()
+    eligibility, parameters = _rss_retry_eligibility_sql(normalized_default)
     with db.get_conn() as conn:
-        return conn.execute(
-            "SELECT e.id,e.rss_item_id,e.title,e.status,e.processed,e.created_at,e.payload,"
-            "e.failure_code,e.failure_retryable,e.retry_count,e.failed_at,"
-            "COALESCE(i.download_method,'') AS download_method,"
-            "COALESCE(i.qb_save_path,'') AS qb_save_path "
-            "FROM rss_entries e JOIN rss_items i ON e.rss_item_id=i.id "
-            "WHERE e.status='failed' AND COALESCE(e.processed,0)=0 "
-            "AND COALESCE(e.failure_retryable,0)=1 "
-            "AND COALESCE(e.retry_count,0)<5 "
-            "AND (e.failure_code!='qb_rate_limited' OR ("
-            "NULLIF(e.failed_at,'') IS NOT NULL AND "
-            "datetime(e.failed_at)<=datetime('now','localtime','-60 seconds'))) "
-            "AND LOWER(COALESCE(NULLIF(TRIM(i.download_method),''),?))='qb' "
-            "ORDER BY COALESCE(NULLIF(e.failed_at,''),NULLIF(e.submitted_at,''),e.created_at) DESC, "
-            "e.id DESC LIMIT ?",
-            (normalized_default, safe_limit),
-        ).fetchall()
+        query = (
+            _RSS_RETRY_ENTRY_SELECT
+            + "WHERE rss_entries.status='failed' AND COALESCE(rss_entries.processed,0)=0 "
+            + f"AND {eligibility} "
+            + "ORDER BY COALESCE(NULLIF(rss_entries.failed_at,''),"
+            + "NULLIF(rss_entries.submitted_at,''),rss_entries.created_at) DESC, "
+            + "rss_entries.id DESC LIMIT ?"
+        )
+        return conn.execute(query, (*parameters, safe_limit)).fetchall()
 
 
-def claim_retryable_failed_rss_qb_entries(
+def claim_retryable_failed_rss_entries(
     expected_rows: list[dict],
     default_method: str = "qb",
 ) -> list[sqlite3.Row]:
-    """全有或全无地复核并认领 Agent 已确认的可重试 qB 失败集合。"""
+    """全有或全无地复核并认领 Agent 已确认的安全 RSS 失败集合。"""
     normalized_default = str(default_method or "").strip().lower()
-    expected = []
-    seen: set[int] = set()
-    for raw in expected_rows:
-        entry_id = int(raw.get("id") or 0)
-        if entry_id <= 0 or entry_id in seen:
-            return []
-        seen.add(entry_id)
-        expected.append({
-            "id": entry_id,
-            "rss_item_id": int(raw.get("rss_item_id") or 0),
-            "title": str(raw.get("title") or ""),
-            "payload": str(raw.get("payload") or ""),
-            "created_at": str(raw.get("created_at") or ""),
-            "failure_code": str(raw.get("failure_code") or ""),
-            "failure_retryable": int(raw.get("failure_retryable") or 0),
-            "retry_count": int(raw.get("retry_count") or 0),
-            "failed_at": str(raw.get("failed_at") or ""),
-            "download_method": str(raw.get("download_method") or ""),
-            "qb_save_path": str(raw.get("qb_save_path") or ""),
-        })
-    if not expected or len(expected) > 20:
+    expected = [rss_retry_entry_snapshot(raw) for raw in expected_rows]
+    ids = [item["id"] for item in expected]
+    if not ids or len(ids) > 20 or any(entry_id <= 0 for entry_id in ids):
+        return []
+    if len(set(ids)) != len(ids):
         return []
 
-    ids = [item["id"] for item in expected]
     placeholders = ",".join("?" for _ in ids)
+    eligibility, parameters = _rss_retry_eligibility_sql(normalized_default)
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        rows = conn.execute(
-            "SELECT e.id,e.rss_item_id,e.title,e.status,e.processed,e.created_at,e.payload,"
-            "e.failure_code,e.failure_retryable,e.retry_count,e.failed_at,"
-            "COALESCE(i.download_method,'') AS download_method,"
-            "COALESCE(i.qb_save_path,'') AS qb_save_path "
-            "FROM rss_entries e JOIN rss_items i ON e.rss_item_id=i.id "
-            f"WHERE e.id IN ({placeholders}) "
-            "AND e.status='failed' AND COALESCE(e.processed,0)=0 "
-            "AND COALESCE(e.failure_retryable,0)=1 AND COALESCE(e.retry_count,0)<5 "
-            "AND (e.failure_code!='qb_rate_limited' OR ("
-            "NULLIF(e.failed_at,'') IS NOT NULL AND "
-            "datetime(e.failed_at)<=datetime('now','localtime','-60 seconds'))) "
-            "ORDER BY COALESCE(NULLIF(e.failed_at,''),NULLIF(e.submitted_at,''),e.created_at) DESC, "
-            "e.id DESC",
-            ids,
-        ).fetchall()
-        eligible_rows = [
-            row for row in rows
-            if row["status"] == "failed"
-            and not bool(row["processed"])
-            and bool(row["failure_retryable"])
-            and (str(row["download_method"] or "").strip().lower() or normalized_default) == "qb"
-        ]
-        current = [{
-            "id": int(row["id"]),
-            "rss_item_id": int(row["rss_item_id"]),
-            "title": str(row["title"] or ""),
-            "payload": str(row["payload"] or ""),
-            "created_at": str(row["created_at"] or ""),
-            "failure_code": str(row["failure_code"] or ""),
-            "failure_retryable": int(row["failure_retryable"] or 0),
-            "retry_count": int(row["retry_count"] or 0),
-            "failed_at": str(row["failed_at"] or ""),
-            "download_method": str(row["download_method"] or ""),
-            "qb_save_path": str(row["qb_save_path"] or ""),
-        } for row in eligible_rows]
-        if current != expected:
+        query = (
+            _RSS_RETRY_ENTRY_SELECT
+            + f"WHERE rss_entries.id IN ({placeholders}) "
+            + "AND rss_entries.status='failed' AND COALESCE(rss_entries.processed,0)=0 "
+            + f"AND {eligibility} "
+            + "ORDER BY COALESCE(NULLIF(rss_entries.failed_at,''),"
+            + "NULLIF(rss_entries.submitted_at,''),rss_entries.created_at) DESC, "
+            + "rss_entries.id DESC"
+        )
+        rows = conn.execute(query, (*ids, *parameters)).fetchall()
+        if [rss_retry_entry_snapshot(row) for row in rows] != expected:
             conn.rollback()
             return []
+
         submitted_at = db.now()
         cur = conn.execute(
             f"UPDATE rss_entries SET status='submitting', submitted_at=?, "
             "failure_code='', failure_retryable=0, failed_at=NULL, "
             "retry_count=COALESCE(retry_count,0)+1 "
-            f"WHERE id IN ({placeholders}) AND status='failed' "
-            "AND COALESCE(processed,0)=0 AND COALESCE(failure_retryable,0)=1 "
-            "AND COALESCE(retry_count,0)<5 "
-            "AND (failure_code!='qb_rate_limited' OR ("
-            "NULLIF(failed_at,'') IS NOT NULL AND "
-            "datetime(failed_at)<=datetime('now','localtime','-60 seconds')))",
+            f"WHERE id IN ({placeholders}) AND status='failed' AND COALESCE(processed,0)=0",
             [submitted_at, *ids],
         )
         if int(cur.rowcount or 0) != len(expected):
@@ -697,34 +731,23 @@ def claim_retryable_failed_rss_qb_entries(
 
 
 def claim_rss_entry(entry_id: int) -> bool:
-    """原子认领条目，防止 Web/自动任务/TG 重复提交同一下载。"""
+    """原子认领待处理项或满足当前后端安全策略的失败项。"""
+    from app.config import get as get_config
+
+    default_method = str(get_config("RSS_DOWNLOAD_METHOD", "qb") or "qb").strip().lower()
+    eligibility, parameters = _rss_retry_eligibility_sql(default_method)
     with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE rss_entries SET status='submitting', submitted_at=?, "
             "retry_count=COALESCE(retry_count,0)+CASE WHEN status='failed' THEN 1 ELSE 0 END, "
             "failure_code='', failure_retryable=0, failed_at=NULL WHERE id=? "
-            "AND COALESCE(processed,0)=0 AND (status='pending' OR "
-            "(status='failed' AND COALESCE(failure_retryable,0)=1))",
-            (db.now(), entry_id),
+            "AND COALESCE(processed,0)=0 AND (status='pending' OR ("
+            "status='failed' AND EXISTS ("
+            "SELECT 1 FROM rss_items i WHERE i.id=rss_entries.rss_item_id AND "
+            f"({eligibility}))))",
+            (db.now(), int(entry_id), *parameters),
         )
         return cur.rowcount == 1
-
-
-_RSS_FAILURE_CODES = {
-    "invalid_payload",
-    "missing_torrent_url",
-    "qb_auth_failed",
-    "qb_rejected",
-    "qb_unavailable",
-    "qb_rate_limited",
-    "qb_dedupe_busy",
-    "qb_server_error",
-    "qb_outcome_unknown",
-    "submission_outcome_unknown",
-    "guangya_submit_failed",
-    "guangya_outcome_unknown",
-    "unknown_failure",
-}
 
 
 def record_rss_entry_failure(entry_id: int, failure_code: str, retryable: bool) -> None:

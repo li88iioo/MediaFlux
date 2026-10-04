@@ -188,3 +188,36 @@ class RSSBatchReadAuditTests(InitializedWebTestCase):
                 self.assertEqual([row["id"] for row in response.json()], [second])
                 listing.assert_called_with(sub_id=self.sid, status="downloaded", keyword="Episode", limit=300, order="unprocessed_first")
                 self.assertEqual(client.get("/api/rss/entries?subscription_id=bad").status_code, 400)
+
+    def test_authenticated_web_batch_retries_both_backends_without_replaying_unknown(self):
+        from fastapi.testclient import TestClient
+        from app.main import create_app
+        from app.modules import download_dispatcher as dispatcher
+        from tests.test_rss_stats_state import RSSStatsStateTests
+
+        qb_entry = self.entries(1)[0]
+        cloud_sub = db.add_rss_subscription("Cloud", "https://synthetic.invalid/cloud", download_method="guangya", gy_target_dir="chosen-dir")
+        cloud_entries = [int(db.add_rss_entry_with_media(
+            cloud_sub, f"cloud-{n}", f"cloud-{n}", payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{n:040x}"}),
+        )["id"]) for n in (100, 101)]
+        db.record_rss_entry_failure(qb_entry, "qb_unavailable", True)
+        db.record_rss_entry_failure(cloud_entries[0], "guangya_manifest_unavailable", True)
+        db.record_rss_entry_failure(cloud_entries[1], "guangya_outcome_unknown", False)
+        with TestClient(create_app(start_background=False)) as client:
+            csrf = RSSStatsStateTests._csrf(client.get("/login").text)
+            client.post("/login", data={"username": "admin", "password": "123456", "csrf_token": csrf}, follow_redirects=False)
+            headers = {"X-CSRF-Token": RSSStatsStateTests._csrf(client.get("/rss").text)}
+            with patch.object(dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "qb"}) as qb, patch.object(dispatcher, "_submit_guangya", return_value={"ok": True, "task_id": "gy"}) as gy:
+                response = client.post("/api/rss/entries/batch-download", headers=headers, json={"entry_ids": [qb_entry, *cloud_entries]})
+                self.assertEqual(response.status_code, 200, response.text)
+                result = response.json()["result"]
+                self.assertEqual(result["success_count"], 2, result)
+                self.assertEqual(result["failure_count"], 1, result)
+                qb.assert_called_once()
+                gy.assert_called_once()
+                self.assertEqual(gy.call_args.kwargs["target_dir_id"], "chosen-dir")
+                repeated = client.post("/api/rss/entries/batch-download", headers=headers, json={"entry_ids": [qb_entry, cloud_entries[0]]})
+                self.assertEqual(repeated.status_code, 200)
+                self.assertEqual(qb.call_count, 1)
+                self.assertEqual(gy.call_count, 1)
+        self.assertEqual(db.get_rss_entry(cloud_entries[1])["failure_code"], "guangya_outcome_unknown")

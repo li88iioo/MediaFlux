@@ -46,7 +46,7 @@ _TOOL_LABELS = {
     "rss.mark_entries": "RSS 条目标记",
     "rss.submit_entries_to_qb": "RSS 指定条目提交",
     "rss.submit_pending_to_qb": "RSS 待处理条目提交",
-    "rss.retry_failed_to_qb": "RSS 失败条目重试",
+    "rss.retry_failed": "RSS 失败条目重试",
     "rss.refresh_subscription": "RSS 订阅刷新",
     "rss.refresh_subscriptions": "RSS 订阅批量刷新",
     "rss.create_subscription": "RSS 订阅创建",
@@ -156,7 +156,7 @@ _SAFE_FIELDS = {
         "failed",
         "outcome_unknown",
     },
-    "rss.retry_failed_to_qb": {
+    "rss.retry_failed": {
         "target",
         "requested",
         "claimed",

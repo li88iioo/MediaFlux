@@ -1,8 +1,9 @@
-"""Media Agent 的可重试 RSS 失败条目受控 qB 重试动作。"""
+"""Media Agent 的可重试 RSS 失败条目受控重试动作。"""
 
 from __future__ import annotations
 
 import secrets
+from dataclasses import asdict
 from datetime import datetime
 from typing import Any
 
@@ -26,7 +27,7 @@ def rss_failure_retry_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("工具参数必须是 JSON 对象")
     if set(arguments) - {"limit"}:
-        raise AgentToolError("rss.retry_failed_to_qb 只接受 limit 参数")
+        raise AgentToolError("rss.retry_failed 只接受 limit 参数")
     limit = arguments.get("limit", _DEFAULT_LIMIT)
     if (
         isinstance(limit, bool)
@@ -37,63 +38,53 @@ def rss_failure_retry_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     return {"limit": limit}
 
 
-def _row_snapshot(row: Any) -> dict[str, Any]:
-    return {
-        "id": int(row["id"]),
-        "rss_item_id": int(row["rss_item_id"]),
-        "title": str(row["title"] or ""),
-        "payload": str(row["payload"] or ""),
-        "created_at": str(row["created_at"] or ""),
-        "failure_code": str(row["failure_code"] or ""),
-        "failure_retryable": int(row["failure_retryable"] or 0),
-        "retry_count": int(row["retry_count"] or 0),
-        "failed_at": str(row["failed_at"] or ""),
-        "download_method": str(row["download_method"] or ""),
-        "qb_save_path": str(row["qb_save_path"] or ""),
-    }
-
-
 def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
     from app.modules.rss import capture_rss_qb_runtime_config
+    from app.modules.offline import OfflineRules
 
     runtime_config, config_error = capture_rss_qb_runtime_config()
     limit = arguments["limit"]
-    rows = db.get_retryable_failed_rss_qb_snapshot(
+    rows = db.get_retryable_failed_rss_snapshot(
         default_method=str(runtime_config.get("default_method") or ""),
         limit=limit + 1,
     )
     has_more = len(rows) > limit
-    entries = [_row_snapshot(row) for row in rows[:limit]]
+    entries = [db.rss_retry_entry_snapshot(row) for row in rows[:limit]]
+    targets = sorted({
+        str(entry["download_method"] or runtime_config.get("default_method") or "qb").strip().lower()
+        for entry in entries
+    })
+    if "qb" not in targets:
+        config_error = ""
+        runtime_config = {"default_method": runtime_config.get("default_method") or "qb"}
+    target = "both" if len(targets) > 1 else ("qbittorrent" if targets == ["qb"] else "guangya")
+    cloud_rules = asdict(OfflineRules.from_config()) if "guangya" in targets else {}
     payload = {
         "limit": limit,
         "entries": entries,
         "has_more": has_more,
         "runtime_config": runtime_config,
         "config_error": str(config_error or ""),
+        "cloud_rules": cloud_rules,
+        "target": target,
     }
     return {
-        "limit": limit,
-        "entries": entries,
-        "has_more": has_more,
-        "runtime_config": runtime_config,
-        "config_error": str(config_error or ""),
-        "fingerprint": confirmation_context_fingerprint(
-            payload, domain="rss-retry-failed-to-qb"
-        ),
+        **payload,
+        "fingerprint": confirmation_context_fingerprint(payload, domain="rss-retry-failed"),
     }
 
 
 def _preview_rss_failure_retry(
     arguments: dict[str, Any], state: dict[str, Any]
 ) -> ToolResult:
-    """只读选择可安全重试的 failed qB 条目，不 claim、不访问网络。"""
+    """只读选择可安全重试的 failed 条目，不 claim、不访问网络。"""
     count = len(state["entries"])
     if count == 0:
         return ToolResult(
             ok=False,
             status="no_changes",
-            summary="当前没有可安全重试的 qBittorrent RSS 失败条目",
-            error="只有已分类为可重试的 qB 失败条目会进入本动作。",
+            summary="当前没有可安全重试的 RSS 失败条目",
+            error="只有已分类为可重试的 qB / 光鸭失败条目会进入本动作。",
             suggestions=["可先询问：诊断 RSS 失败状态。"],
         )
     if state["config_error"]:
@@ -110,14 +101,14 @@ def _preview_rss_failure_retry(
         status="confirmation_required",
         summary=f"确认后将重试 {count} 个可安全重试的 RSS 失败条目",
         data={
-            "action": "rss.retry_failed_to_qb",
-            "target": "qbittorrent",
+            "action": "rss.retry_failed",
+            "target": state["target"],
             "selected_count": count,
             "requested_limit": arguments["limit"],
             "has_more": bool(state["has_more"]),
             "effects": [
-                "所选失败条目将原子认领后按当前确认配置重新提交到 qBittorrent。",
-                "成功条目会标记为已下载；再次失败会记录新的稳定失败分类。",
+                "所选失败条目将原子认领后按各条目确认时的目标重新提交到 qBittorrent / 光鸭。",
+                "已明确受理的条目会标记为已处理；再次失败会记录新的稳定失败分类。",
             ],
             "limits": {
                 "max_items": _MAX_ITEMS,
@@ -144,10 +135,10 @@ def prepare_rss_failure_retry(
     return _preview_rss_failure_retry(arguments, state), str(state["fingerprint"])
 
 
-def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
+def _retry_failed_rss_state(state: dict[str, Any]) -> ToolResult:
     entries = list(state.get("entries") or [])
     runtime_config = dict(state.get("runtime_config") or {})
-    if not entries or len(entries) > _MAX_ITEMS or not runtime_config.get("url"):
+    if not entries or len(entries) > _MAX_ITEMS or state["config_error"]:
         return ToolResult(
             ok=False,
             status="conflict",
@@ -157,8 +148,8 @@ def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
 
     from app.modules.rss import RSSEngine
 
-    raw = RSSEngine().submit_qb_snapshot(
-        entries, runtime_config, claim=db.claim_retryable_failed_rss_qb_entries,
+    raw = RSSEngine().submit_snapshot(
+        entries, runtime_config, claim=db.claim_retryable_failed_rss_entries,
     )
     requested = max(0, int(raw.get("requested") or 0))
     claimed = max(0, int(raw.get("claimed") or 0))
@@ -172,7 +163,7 @@ def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
             status="conflict",
             summary="可重试 RSS 失败条目已变化，本次未提交",
             data={
-                "target": "qbittorrent",
+                "target": state["target"],
                 "requested": requested,
                 "claimed": 0,
                 "submitted": 0,
@@ -202,7 +193,7 @@ def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
         summary = f"本次 {failed} 个 RSS 失败条目仍未成功提交"
 
     logger.info(
-        "Agent RSS qB 失败重试完成 requested=%s claimed=%s submitted=%s failed=%s",
+        "Agent RSS 失败重试完成 requested=%s claimed=%s submitted=%s failed=%s",
         requested,
         claimed,
         submitted,
@@ -213,7 +204,7 @@ def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
         status=status,
         summary=summary,
         data={
-            "target": "qbittorrent",
+            "target": state["target"],
             "requested": requested,
             "claimed": claimed,
             "submitted": submitted,
@@ -223,24 +214,24 @@ def _retry_failed_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
         evidence=[
             Evidence(
                 "rss_retry",
-                "已按确认时冻结的失败集合与 qB 配置执行一次有界重试；响应仅包含聚合计数。",
+                "已按确认时冻结的失败集合与目标配置执行一次有界重试；响应仅包含聚合计数。",
                 _now(),
             )
         ],
         suggestions=(
-            ["请先核对 qBittorrent 中是否已存在对应任务，勿直接重复提交。"]
+            ["请先核对对应下载器中是否已存在对应任务，勿直接重复提交。"]
             if outcome_unknown
             else ([] if failed == 0 else ["请重新诊断 RSS 失败状态后再决定下一步。"])
         ),
         error=(
-            "部分提交结果未知，请先核对 qBittorrent，勿直接重试。"
+            "部分提交结果未知，请先核对对应下载器，勿直接重试。"
             if outcome_unknown
             else ("RSS 失败条目重试未全部成功。" if failed else "")
         ),
     )
 
 
-def retry_failed_rss_to_qb_confirmed(
+def retry_failed_rss_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:
     state = _capture(arguments)
@@ -248,7 +239,7 @@ def retry_failed_rss_to_qb_confirmed(
         str(state["fingerprint"]), str(expected_context or "")
     ):
         raise AgentToolError(
-            "RSS 失败条目或 qBittorrent 配置已变化，请重新预检",
+            "RSS 失败条目或下载目标/配置已变化，请重新预检",
             code="confirmation_stale",
         )
-    return _retry_failed_rss_to_qb_state(state)
+    return _retry_failed_rss_state(state)

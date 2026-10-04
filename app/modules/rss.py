@@ -831,7 +831,14 @@ class RSSEngine:
             return code or "qb_rejected", bool(backend.get("retryable")), False
         if review_required:
             return "guangya_outcome_unknown", False, True
-        return "guangya_submit_failed", False, False
+        # 只允许明确的提交前失败重试；带任务回执或部分/未知提交必须人工核对。
+        if backend.get("task_id") or backend.get("task_ids") or backend.get("partial_success") or backend.get("outcome_unknown"):
+            return "guangya_outcome_unknown", False, True
+        code = str(backend.get("failure_code") or "")
+        safe_codes = {"guangya_manifest_unavailable", "guangya_unavailable", "guangya_rate_limited"}
+        if code in safe_codes:
+            return code, bool(backend.get("retryable")), False
+        return (code if code == "guangya_auth_failed" else "guangya_submit_failed"), False, False
 
     def _download_entry(
         self,
@@ -881,7 +888,11 @@ class RSSEngine:
         if auto_guard is not None and not auto_guard():
             return {"ok": False, "cancelled": True, "error": RSS_REFRESH_CONFLICT_ERROR}
         if not entry_already_claimed and not db.claim_rss_entry(entry_id):
-            return {"error": "条目正在提交或已被处理", "ok": False, "method": method}
+            error = (
+                "失败条目暂不满足安全重试条件（冷却、次数上限或需核对），请在下载中心处理"
+                if entry["status"] == "failed" else "条目正在提交或已被处理"
+            )
+            return {"error": error, "ok": False, "method": method}
 
         request_id = 0
         try:
@@ -1129,7 +1140,7 @@ class RSSEngine:
             "review_required": outcome_unknown_count > 0,
         }
 
-    def submit_qb_snapshot(
+    def submit_snapshot(
         self,
         expected_entries: list[dict],
         runtime_config: dict,
@@ -1138,7 +1149,12 @@ class RSSEngine:
     ) -> dict:
         """按已选定的 pending/retry 原子认领规则执行确认快照。"""
         requested = len(expected_entries)
-        if not requested or requested > 20 or not str(runtime_config.get("url") or "").strip():
+        needs_qb = any(
+            (str(row.get("download_method") or "").strip().lower()
+             or runtime_config.get("default_method", "qb")) == "qb"
+            for row in expected_entries
+        )
+        if not requested or requested > 20 or (needs_qb and not str(runtime_config.get("url") or "").strip()):
             return {
                 "ok": False, "conflict": True, "requested": requested,
                 "claimed": 0, "submitted": 0, "failed": 0,
@@ -1152,41 +1168,25 @@ class RSSEngine:
                 "ok": False, "conflict": True, "requested": requested,
                 "claimed": 0, "submitted": 0, "failed": 0,
             }
-        submitted, failed, outcome_unknown = self._submit_claimed_qb_rows(
-            claimed_rows, runtime_config
-        )
-        result = {
+        submitted = failed = outcome_unknown = 0
+        for row in claimed_rows:
+            result = self._download_entry(
+                row, entry_already_claimed=True, qb_runtime_config=runtime_config,
+            )
+            if result.get("ok"):
+                submitted += 1
+            else:
+                failed += 1
+                outcome_unknown += bool(result.get("review_required"))
+        return {
             "ok": failed == 0,
             "conflict": False,
             "requested": requested,
             "claimed": len(claimed_rows),
             "submitted": submitted,
             "failed": failed,
+            **({"outcome_unknown": outcome_unknown} if outcome_unknown else {}),
         }
-        if outcome_unknown:
-            result["outcome_unknown"] = outcome_unknown
-        return result
-
-    def _submit_claimed_qb_rows(
-        self, claimed_rows: list, runtime_config: dict
-    ) -> tuple[int, int, int]:
-        """提交已由 Agent 原子确认的 RSS 条目，仍复用统一下载状态机。"""
-        submitted = 0
-        failed = 0
-        outcome_unknown_count = 0
-        for row in claimed_rows:
-            result = self._download_entry(
-                row,
-                entry_already_claimed=True,
-                qb_runtime_config=runtime_config,
-            )
-            if result.get("ok"):
-                submitted += 1
-            else:
-                failed += 1
-                if result.get("review_required"):
-                    outcome_unknown_count += 1
-        return submitted, failed, outcome_unknown_count
 
     def auto_download(self, sub_id: int, *, expected_revision: str = "") -> dict:
         """刷新后自动下载所有 pending 条目。"""

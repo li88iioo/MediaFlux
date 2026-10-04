@@ -171,7 +171,7 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
             self.assertTrue(submit_preview.ok)
             raw = {"requested": 2, "claimed": 2, "submitted": 2, "failed": 0}
             with patch(
-                "app.modules.rss.RSSEngine.submit_qb_snapshot", return_value=raw
+                "app.modules.rss.RSSEngine.submit_snapshot", return_value=raw
             ) as submit:
                 result = submit_rss_entries_confirmed(submit_args, submit_context)
         self.assertEqual(result.status, "completed")

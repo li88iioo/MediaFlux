@@ -148,7 +148,7 @@ def _submit_pending_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
 
     from app.modules.rss import RSSEngine
 
-    raw = RSSEngine().submit_qb_snapshot(
+    raw = RSSEngine().submit_snapshot(
         entries, runtime_config, claim=db.claim_pending_rss_qb_entries,
     )
     requested = max(0, int(raw.get("requested") or 0))

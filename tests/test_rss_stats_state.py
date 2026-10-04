@@ -136,6 +136,74 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         self.assertFalse(any(statement.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
                              for statement in statements))
 
+    def test_generic_retry_snapshot_and_claim_match_backend_and_safe_codes(self) -> None:
+        qb_sub = db.add_rss_subscription(
+            "retry-qb", "https://example.invalid/retry-qb", download_method="qb",
+            qb_save_path="/downloads/qb",
+        )
+        gy_sub = db.add_rss_subscription(
+            "retry-gy", "https://example.invalid/retry-gy", download_method="guangya",
+            gy_target_dir="target-gy", gy_target_dir_name="动漫",
+        )
+
+        def failed(sub_id: int, title: str, code: str, retryable: bool = True) -> int:
+            entry_id = int(db.add_rss_entry_with_media(sub_id, title, title)["id"])
+            db.record_rss_entry_failure(entry_id, code, retryable)
+            return entry_id
+
+        qb_entry = failed(qb_sub, "qb-safe", "qb_unavailable")
+        gy_entry = failed(gy_sub, "gy-safe", "guangya_manifest_unavailable")
+        failed(gy_sub, "old-qb-code-on-gy", "qb_unavailable")
+        failed(qb_sub, "gy-code-on-qb", "guangya_unavailable")
+        failed(qb_sub, "ordinary-qb-rejection", "qb_rejected")
+
+        snapshot = db.get_retryable_failed_rss_snapshot(default_method="qb", limit=21)
+        by_id = {int(row["id"]): row for row in snapshot}
+        self.assertEqual(set(by_id), {qb_entry, gy_entry})
+        self.assertEqual(by_id[gy_entry]["gy_target_dir"], "target-gy")
+        self.assertEqual(by_id[gy_entry]["gy_target_dir_name"], "动漫")
+        self.assertEqual(len(db.claim_retryable_failed_rss_entries(snapshot)), 2)
+        self.assertEqual(db.get_rss_entry(qb_entry)["retry_count"], 1)
+        self.assertEqual(db.get_rss_entry(gy_entry)["retry_count"], 1)
+
+    def test_manual_failed_claim_obeys_backend_attempts_and_rate_cooldown(self) -> None:
+        gy_sub = db.add_rss_subscription(
+            "manual-gy", "https://example.invalid/manual-gy", download_method="guangya"
+        )
+
+        def failed(title: str, code: str, retry_count: int = 0) -> int:
+            entry_id = int(db.add_rss_entry_with_media(gy_sub, title, title)["id"])
+            db.record_rss_entry_failure(entry_id, code, True)
+            if retry_count:
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE rss_entries SET retry_count=? WHERE id=?",
+                        (retry_count, entry_id),
+                    )
+            return entry_id
+
+        cooling = failed("cooling", "guangya_rate_limited")
+        capped = failed("capped", "guangya_unavailable", 5)
+        mismatched = failed("mismatched", "qb_unavailable")
+        ordinary = failed("ordinary", "guangya_submit_failed")
+        pending = int(db.add_rss_entry_with_media(gy_sub, "pending", "pending")["id"])
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE rss_entries SET retry_count=5 WHERE id=?", (pending,)
+            )
+
+        self.assertFalse(db.claim_rss_entry(cooling))
+        self.assertFalse(db.claim_rss_entry(capped))
+        self.assertFalse(db.claim_rss_entry(mismatched))
+        self.assertFalse(db.claim_rss_entry(ordinary))
+        self.assertTrue(db.claim_rss_entry(pending))
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE rss_entries SET failed_at=datetime('now','localtime','-61 seconds') WHERE id=?",
+                (cooling,),
+            )
+        self.assertTrue(db.claim_rss_entry(cooling))
+        self.assertEqual(db.get_rss_entry(cooling)["retry_count"], 1)
 
     def test_rss_stats_counts_global_active_and_pending_entries(self) -> None:
         self._seed()

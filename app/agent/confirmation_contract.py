@@ -254,10 +254,10 @@ _CONFIRMATION_COPY: dict[str, dict[str, str]] = {
         "impact": "会在 qBittorrent 中创建下载任务，并改变这些条目的处理状态。",
         "reversibility": "可在下载器中暂停或删除任务；已发出的提交请求无法撤回。",
     },
-    "rss.retry_failed_to_qb": {
+    "rss.retry_failed": {
         "action": "重试 RSS 失败条目",
         "object": "本次预检判定可安全重试的条目",
-        "impact": "会再次向 qBittorrent 提交任务，并更新失败条目的处理状态。",
+        "impact": "会再次向各条目指定的下载器提交任务，并更新失败条目的处理状态。",
         "reversibility": "可在下载器中暂停或删除任务；已发出的重试请求无法撤回。",
     },
     "discovery.confirm_mapping": {

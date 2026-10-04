@@ -67,8 +67,8 @@ class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
         for invalid in (
             {},
             {"action_key": 1},
-            {"action_key": "review_rss", "target_tool": "rss.retry_failed_to_qb"},
-            {"action_key": "rss.retry_failed_to_qb"},
+            {"action_key": "review_rss", "target_tool": "rss.retry_failed"},
+            {"action_key": "rss.retry_failed"},
         ):
             with self.subTest(invalid=invalid), self.assertRaises(AgentToolError):
                 workspace_action_handoff_arguments(invalid)

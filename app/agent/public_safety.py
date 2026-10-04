@@ -227,7 +227,7 @@ _PUBLIC_TOOL_LABELS: dict[str, str] = {
     "rss.recent_activity": "RSS 最近下载统计",
     "rss.refresh_subscription": "RSS 订阅刷新",
     "rss.refresh_subscriptions": "RSS 订阅批量刷新",
-    "rss.retry_failed_to_qb": "RSS 失败条目重试",
+    "rss.retry_failed": "RSS 失败条目重试",
     "rss.submit_entries_to_qb": "RSS 指定条目提交",
     "rss.submit_pending_to_qb": "RSS 待处理条目提交",
     "rss.subscription_summaries": "RSS 订阅列表",

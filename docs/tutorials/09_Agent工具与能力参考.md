@@ -233,7 +233,7 @@ RSS 规则订阅和影视追更订阅是不同对象；本组也维护观看/下
 | `rss.refresh_subscription` | WRITE | 预检并在用户确认后刷新一个指定 RSS 订阅；不自动下载且不返回 URL、过滤词、条目正文或凭据。 |
 | `rss.refresh_subscriptions` | WRITE | 预检并在用户确认后依次刷新一组 RSS 订阅，单次最多 32 个；不自动下载且不返回 URL、过滤词、条目正文或凭据。 |
 | `rss.submit_pending_to_qb` | DANGER | 预检并在用户确认后，将最新的待处理 RSS 条目有界提交到 qBittorrent；不返回条目、URL、路径或凭据。 |
-| `rss.retry_failed_to_qb` | DANGER | 预检并在用户确认后，有界重试已明确分类为可安全重试的 qBittorrent RSS 失败条目；不返回条目、URL、路径、失败原文或凭据。 |
+| `rss.retry_failed` | DANGER | 预检并在用户确认后，按各订阅目标有界重试已明确分类为可安全重试的 qBittorrent / 光鸭 RSS 失败条目；不返回条目、URL、路径、失败原文或凭据。 |
 
 ### 2.10 媒体自动化规则与摘要（3 项）
 

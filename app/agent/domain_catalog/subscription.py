@@ -88,7 +88,7 @@ from app.agent.rss_refresh_actions import (
 )
 from app.agent.rss_retry_actions import (
     prepare_rss_failure_retry,
-    retry_failed_rss_to_qb_confirmed,
+    retry_failed_rss_confirmed,
     rss_failure_retry_arguments,
 )
 from app.agent.rss_subscription_control_actions import (
@@ -928,8 +928,8 @@ def register_specs(
     )
     registry.register(
         ToolSpec(
-            name="rss.retry_failed_to_qb",
-            description="预检并在用户确认后，有界重试已明确分类为可安全重试的 qBittorrent RSS 失败条目；不返回条目、URL、路径、失败原文或凭据。",
+            name="rss.retry_failed",
+            description="预检并在用户确认后，按各订阅目标有界重试已明确分类为可安全重试的 qBittorrent / 光鸭 RSS 失败条目；不返回条目、URL、路径、失败原文或凭据。",
             risk=RiskLevel.DANGER,
             parameters={
                 "type": "object",
@@ -949,7 +949,7 @@ def register_specs(
                 prepare_rss_failure_retry
             ),
             context_confirmed_handler=ToolSpec.context_free_confirmed_handler(
-                retry_failed_rss_to_qb_confirmed
+                retry_failed_rss_confirmed
             ),
             examples=(
                 "重试 RSS 失败条目",

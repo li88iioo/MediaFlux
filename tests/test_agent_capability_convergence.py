@@ -149,7 +149,7 @@ _REQUIRED_PROJECT_TOOLS = {
     "rss.refresh_subscriptions",
     "rss.submit_entries_to_qb",
     "rss.submit_pending_to_qb",
-    "rss.retry_failed_to_qb",
+    "rss.retry_failed",
 }
 _REQUIRED_PROVIDER_OPERATIONS = {
     "media.system.info",

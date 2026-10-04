@@ -27,6 +27,10 @@ _SAFE_FAILURE_LABELS = {
     "qb_unavailable": "qBittorrent 暂不可用",
     "qb_submit_failed": "qBittorrent 提交失败",
     "guangya_submit_failed": "光鸭提交失败",
+    "guangya_manifest_unavailable": "光鸭暂未取得文件清单",
+    "guangya_unavailable": "光鸭解析服务暂不可用",
+    "guangya_rate_limited": "光鸭请求受限",
+    "guangya_auth_failed": "光鸭认证失败",
 }
 
 
@@ -350,7 +354,7 @@ def submit_rss_entries_confirmed(
         )
     from app.modules.rss import RSSEngine
 
-    raw = RSSEngine().submit_qb_snapshot(
+    raw = RSSEngine().submit_snapshot(
         state["entries"], state["runtime"], claim=db.claim_pending_rss_qb_entries,
     )
     requested = max(0, int(raw.get("requested") or 0))
