@@ -5939,7 +5939,6 @@ class SecurityTests(InitializedWebTestCase):
                     "gy_task_id": "",
                 },
             ),
-            patch("app.database.update_rss_entry_status"),
         ):
             first = engine.download(7)
             second = engine.download(7)

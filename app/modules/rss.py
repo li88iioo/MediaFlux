@@ -796,24 +796,6 @@ class RSSEngine:
         )
 
     @staticmethod
-    def _accepted_duplicate(summary: dict, request, method: str) -> bool:
-        if not summary.get("duplicate"):
-            return False
-        root_status = str(summary.get("existing_status") or "").strip().lower()
-        if root_status not in {
-            "pending", "submitting", "submitted", "downloading", "completed", "resubmitted",
-        }:
-            return False
-        if request is None:
-            return root_status == "pending"
-        backend_field = "qb_status" if method == "qb" else "gy_status"
-        try:
-            backend_status = str(request[backend_field] or "").strip().lower()
-        except (IndexError, KeyError, TypeError):
-            backend_status = ""
-        return backend_status in {"", "submitting", "submitted", "downloading", "completed"}
-
-    @staticmethod
     def _backend_failure(method: str, submission: dict) -> tuple[str, bool, bool]:
         """从统一分发内部结果提取 RSS 所需的稳定失败分类。"""
         summary = submission.get("summary") or {}
@@ -888,6 +870,10 @@ class RSSEngine:
         if auto_guard is not None and not auto_guard():
             return {"ok": False, "cancelled": True, "error": RSS_REFRESH_CONFLICT_ERROR}
         if not entry_already_claimed and not db.claim_rss_entry(entry_id):
+            current = db.get_rss_entry(entry_id)
+            if current is not None and current["status"] == "submitting":
+                return {"ok": False, "pending": True, "status": "submitting",
+                        "method": method, "infohash": infohash}
             error = (
                 "失败条目暂不满足安全重试条件（冷却、次数上限或需核对），请在下载中心处理"
                 if entry["status"] == "failed" else "条目正在提交或已被处理"
@@ -982,7 +968,14 @@ class RSSEngine:
         summary = submission.get("summary") or {}
         dispatch = submission.get("dispatch") or {}
         current_request = db.get_download_request(request_id) if request_id else None
-        existing = self._accepted_duplicate(summary, current_request, method)
+        current_entry = db.get_rss_entry(entry_id)
+        existing = bool(summary.get("duplicate") and current_entry is not None
+                        and current_entry["status"] == "downloaded")
+        backend_field = "qb_status" if method == "qb" else "gy_status"
+        if (summary.get("duplicate") and current_request is not None
+                and current_request[backend_field] == "submitting"):
+            return {"ok": False, "pending": True, "status": "submitting", "method": method,
+                    "request_id": request_id, "infohash": infohash}
         ok = str(summary.get("status") or "") in {"submitted", "partial"} or existing
         backend = (dispatch.get("results") or {}).get(method) or {}
         task_id = str(backend.get("task_id") or "")
@@ -992,7 +985,6 @@ class RSSEngine:
         error = str(summary.get("error") or "")
         review_required = False
         if ok:
-            db.update_rss_entry_status(entry_id, "downloaded")
             if summary.get("duplicate"):
                 db.add_download_log(
                     source=method,
@@ -1022,7 +1014,7 @@ class RSSEngine:
                     )
                     retryable = False
                     review_required = True
-            db.record_rss_entry_failure(entry_id, failure_code, retryable)
+            db.record_rss_entry_failure(entry_id, failure_code, retryable, request_id=request_id)
             if review_required:
                 error = "提交结果待核对，请先检查下载器状态，勿直接重复提交"
             elif not error:
@@ -1056,6 +1048,7 @@ class RSSEngine:
         unverified: list[dict] = []
         failed: list[dict] = []
         cancelled: list[dict] = []
+        pending: list[dict] = []
         jobs = list(enumerate(zip(ids, entries, strict=True)))
         groups: dict[str, list[tuple[int, tuple[int, object]]]] = {}
         for position, job in jobs:
@@ -1108,6 +1101,8 @@ class RSSEngine:
             }
             if result.get("cancelled"):
                 cancelled.append(item)
+            elif result.get("pending"):
+                pending.append(item)
             elif result.get("existing"):
                 existing.append(item)
             elif result.get("unverified") and result.get("ok"):
@@ -1128,6 +1123,7 @@ class RSSEngine:
         return {
             "total": len(ids),
             **({"cancelled_count": len(cancelled)} if cancelled else {}),
+            **({"pending": pending, "pending_count": len(pending)} if pending else {}),
             "succeeded": succeeded,
             "existing": existing,
             "unverified": unverified,
@@ -1168,18 +1164,21 @@ class RSSEngine:
                 "ok": False, "conflict": True, "requested": requested,
                 "claimed": 0, "submitted": 0, "failed": 0,
             }
-        submitted = failed = outcome_unknown = 0
+        submitted = failed = outcome_unknown = pending = 0
         for row in claimed_rows:
             result = self._download_entry(
                 row, entry_already_claimed=True, qb_runtime_config=runtime_config,
             )
-            if result.get("ok"):
+            if result.get("pending"):
+                pending += 1
+            elif result.get("ok"):
                 submitted += 1
             else:
                 failed += 1
                 outcome_unknown += bool(result.get("review_required"))
         return {
-            "ok": failed == 0,
+            "ok": failed == 0 and pending == 0,
+            **({"pending": pending} if pending else {}),
             "conflict": False,
             "requested": requested,
             "claimed": len(claimed_rows),
@@ -1255,7 +1254,7 @@ class RSSEngine:
         }
         # download_many 是面向 Web/TG 批量操作的受控接口，单次最多 20 条；
         # 自动订阅必须消费本轮全部 pending，不能把 API 上限误当成业务上限。
-        processed = 0
+        processed = pending = 0
         for offset in range(0, len(ids), _RSS_DOWNLOAD_BATCH_SIZE):
             if time.monotonic() >= deadline or not auto_guard():
                 break
@@ -1265,6 +1264,7 @@ class RSSEngine:
             processed += len(ids[offset:offset + _RSS_DOWNLOAD_BATCH_SIZE]) - int(
                 batch.get("cancelled_count") or 0
             )
+            pending += int(batch.get("pending_count") or 0)
             for key in ("succeeded", "existing", "unverified", "failed"):
                 result[key].extend(batch.get(key) or [])
             for key in (
@@ -1284,6 +1284,7 @@ class RSSEngine:
             # 抢占 scheduler 的人工核验告警分支。未开始任何提交才是整轮冲突。
             **({"cancelled": True, "conflict": processed == 0} if not auto_guard() else {}),
             "downloaded": result["success_count"],
+            **({"pending": pending} if pending else {}),
             "existing": result["existing_count"],
             "unverified": result["unverified_count"],
             "failed": result["failure_count"],

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from app import database as db
 from app.modules.rss import RSSEngine
 from tests.support import isolated_test_database
+from tests.support import seed_rss_entry_state
 
 
 class RSSBacklogSnapshotTests(unittest.TestCase):
@@ -46,7 +47,7 @@ class RSSBacklogSnapshotTests(unittest.TestCase):
         other = db.add_rss_subscription("Other", "https://synthetic.invalid/other")
         db.add_rss_entry_with_media(other, "Other entry", "other:1")
         done = db.add_rss_entry_with_media(self.sid, "Already done", "done:1")["id"]
-        db.update_rss_entry_status(done, "downloaded")
+        seed_rss_entry_state(done, "downloaded")
         self.assertEqual(self.run_round()["deferred"], 351)
 
     def test_filtered_rows_are_subtracted_once_from_full_pending_snapshot(self):

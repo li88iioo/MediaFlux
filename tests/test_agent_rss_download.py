@@ -6,13 +6,15 @@ import json
 from unittest.mock import MagicMock, patch
 
 from app import database as db
+from app.agent.errors import AgentToolError
 from app.agent.rss_download_actions import (
     prepare_rss_pending_download,
     submit_pending_rss_to_qb_confirmed,
 )
+from app.agent.rss_entry_actions import build_rss_submission_result
 from app.clients.qbittorrent import QBittorrentClient, TorrentAddResult
 from app.modules.rss import RSSEngine
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, seed_rss_entry_state
 
 
 def _clear_rss() -> None:
@@ -83,7 +85,7 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         gy_sub = self._subscription("GuangYa RSS", "guangya")
         ids = [self._entry(qb_sub, index) for index in range(1, 5)]
         self._entry(gy_sub, 90)
-        db.update_rss_entry_status(ids[0], "downloaded")
+        seed_rss_entry_state(ids[0], "downloaded")
         with patch(
             "app.clients.qbittorrent.QBittorrentClient.add_torrent_detailed"
         ) as add:
@@ -190,6 +192,199 @@ class RssPendingDownloadUnitTests(IsolatedDatabaseTestCase):
         self.assertIn("待核对 1", result.summary)
         self.assertIn("确认失败 1", result.summary)
         self.assertIn("勿直接重复提交", result.suggestions[0])
+
+    def test_no_pending_receipt_golden_matrix_preserves_all_three_agent_contracts(self):
+        cases = (
+            (
+                {"requested": 2, "claimed": 2, "submitted": 2, "failed": 0},
+                "completed",
+                True,
+                {
+                    "download": "已向 qBittorrent 提交 2 个 RSS 条目",
+                    "retry": "已成功重试 2 个 RSS 失败条目",
+                    "entry": "已向 qBittorrent 提交 2 个 RSS 条目",
+                },
+                {},
+                {},
+            ),
+            (
+                {"requested": 2, "claimed": 2, "submitted": 1, "failed": 1},
+                "partial",
+                True,
+                {
+                    "download": "RSS 条目部分提交完成：成功 1，失败 1",
+                    "retry": "RSS 失败条目部分重试完成：成功 1，失败 1",
+                    "entry": "RSS 条目部分提交完成：成功 1，失败 1",
+                },
+                {
+                    "download": "RSS 条目提交未全部成功。",
+                    "retry": "RSS 失败条目重试未全部成功。",
+                    "entry": "RSS 条目提交未全部成功。",
+                },
+                {
+                    "download": ["请在 RSS 订阅页和下载任务页核对失败项。"],
+                    "retry": ["请重新诊断 RSS 失败状态后再决定下一步。"],
+                    "entry": [],
+                },
+            ),
+            (
+                {"requested": 2, "claimed": 2, "submitted": 0, "failed": 2},
+                "failed",
+                False,
+                {
+                    "download": "本次 2 个 RSS 条目均未成功提交",
+                    "retry": "本次 2 个 RSS 失败条目仍未成功提交",
+                    "entry": "本次 2 个 RSS 条目均未成功提交",
+                },
+                {
+                    "download": "RSS 条目提交未全部成功。",
+                    "retry": "RSS 失败条目重试未全部成功。",
+                    "entry": "RSS 条目提交未全部成功。",
+                },
+                {
+                    "download": ["请在 RSS 订阅页和下载任务页核对失败项。"],
+                    "retry": ["请重新诊断 RSS 失败状态后再决定下一步。"],
+                    "entry": [],
+                },
+            ),
+            (
+                {
+                    "requested": 1,
+                    "claimed": 1,
+                    "submitted": 0,
+                    "failed": 1,
+                    "outcome_unknown": 1,
+                },
+                "review_required",
+                False,
+                {
+                    "download": "RSS 条目提交结果：成功 0，待核对 1，确认失败 0",
+                    "retry": "RSS 失败条目提交结果：成功 0，待核对 1，确认失败 0",
+                    "entry": "RSS 提交结果：成功 0，待核对 1，失败 0",
+                },
+                {
+                    "download": "部分提交结果未知，请先核对 qBittorrent，勿直接重试。",
+                    "retry": "部分提交结果未知，请先核对对应下载器，勿直接重试。",
+                    "entry": "部分提交结果未知。",
+                },
+                {
+                    "download": ["请先核对 qBittorrent 中是否已存在对应任务，勿直接重复提交。"],
+                    "retry": ["请先核对对应下载器中是否已存在对应任务，勿直接重复提交。"],
+                    "entry": ["请先在 qBittorrent 中核对待确认任务，勿直接重复提交。"],
+                },
+            ),
+        )
+        for kind in ("download", "retry", "entry"):
+            for raw, status, ok, summaries, errors, suggestions in cases:
+                with self.subTest(kind=kind, raw=raw):
+                    result = build_rss_submission_result(
+                        raw,
+                        kind=kind,
+                        target="qbittorrent",
+                        evidence_description="golden receipt",
+                    )
+                    expected_data = {
+                        "target": "qbittorrent",
+                        "requested": raw["requested"],
+                        "claimed": raw["claimed"],
+                        "submitted": raw["submitted"],
+                        "failed": raw["failed"],
+                    }
+                    if raw.get("outcome_unknown"):
+                        expected_data["outcome_unknown"] = raw["outcome_unknown"]
+                    self.assertEqual(result.data, expected_data)
+                    self.assertEqual(
+                        (result.ok, result.status, result.summary),
+                        (ok, status, summaries[kind]),
+                    )
+                    expected_error = errors.get(kind, "")
+                    expected_suggestions = suggestions.get(kind, [])
+                    self.assertEqual(result.error, expected_error)
+                    self.assertEqual(result.suggestions, expected_suggestions)
+
+    def test_shared_result_builder_preserves_each_entrypoint_conflict_contract(self):
+        raw = {"conflict": True, "requested": 3, "claimed": 1}
+        for kind, target, summary in (
+            ("download", "qbittorrent", "待处理 RSS 条目已变化，本次未提交"),
+            ("retry", "both", "可重试 RSS 失败条目已变化，本次未提交"),
+        ):
+            with self.subTest(kind=kind):
+                result = build_rss_submission_result(
+                    raw,
+                    kind=kind,
+                    target=target,
+                    evidence_description="unused on conflict",
+                )
+                self.assertEqual(
+                    result.to_dict(),
+                    {
+                        "ok": False,
+                        "status": "conflict",
+                        "summary": summary,
+                        "data": {
+                            "target": target,
+                            "requested": 3,
+                            "claimed": 0,
+                            "submitted": 0,
+                            "failed": 0,
+                        },
+                        "evidence": [],
+                        "suggestions": [],
+                        "error": "请重新预检后再确认。",
+                    },
+                )
+        with self.assertRaises(AgentToolError) as caught:
+            build_rss_submission_result(
+                raw,
+                kind="entry",
+                target="qbittorrent",
+                evidence_description="unused on conflict",
+            )
+        self.assertEqual(caught.exception.code, "confirmation_stale")
+        self.assertEqual(str(caught.exception), "RSS 条目在提交前发生变化，请重新预检")
+
+    def test_pending_snapshot_is_in_progress_not_completed(self):
+        sub_id = self._subscription()
+        self._entry(sub_id, 1)
+        raw = {
+            "ok": False,
+            "conflict": False,
+            "requested": 1,
+            "claimed": 1,
+            "submitted": 0,
+            "failed": 0,
+            "pending": 1,
+        }
+        fingerprint = prepare_rss_pending_download({"limit": 1})[1]
+        with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
+            result = submit_pending_rss_to_qb_confirmed({"limit": 1}, fingerprint)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "in_progress")
+        self.assertEqual(result.data["pending"], 1)
+        self.assertEqual(result.data["claimed"], 1)
+        self.assertIn("成功 0，提交中 1，失败 0，待核对 0", result.summary)
+        self.assertEqual(result.error, "")
+
+    def test_mixed_pending_and_accepted_submission_is_partial(self):
+        sub_id = self._subscription()
+        for index in range(1, 4):
+            self._entry(sub_id, index)
+        raw = {
+            "ok": False,
+            "conflict": False,
+            "requested": 3,
+            "claimed": 3,
+            "submitted": 1,
+            "failed": 1,
+            "pending": 1,
+        }
+        fingerprint = prepare_rss_pending_download({"limit": 3})[1]
+        with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
+            result = submit_pending_rss_to_qb_confirmed({"limit": 3}, fingerprint)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.data["pending"], 1)
+        self.assertIn("成功 1，提交中 1，失败 1，待核对 0", result.summary)
 
     def test_database_claim_is_all_or_nothing_and_pending_only(self):
         sub_id = self._subscription()

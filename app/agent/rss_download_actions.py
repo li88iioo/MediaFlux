@@ -10,6 +10,7 @@ from app import database as db
 from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.agent.rss_entry_actions import build_rss_submission_result
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -151,84 +152,23 @@ def _submit_pending_rss_to_qb_state(state: dict[str, Any]) -> ToolResult:
     raw = RSSEngine().submit_snapshot(
         entries, runtime_config, claim=db.claim_pending_rss_qb_entries,
     )
-    requested = max(0, int(raw.get("requested") or 0))
-    claimed = max(0, int(raw.get("claimed") or 0))
-    submitted = max(0, int(raw.get("submitted") or 0))
-    failed = max(0, int(raw.get("failed") or 0))
-    outcome_unknown = min(failed, max(0, int(raw.get("outcome_unknown") or 0)))
-    confirmed_failed = max(0, failed - outcome_unknown)
-    if raw.get("conflict") or claimed != requested:
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="待处理 RSS 条目已变化，本次未提交",
-            data={
-                "target": "qbittorrent",
-                "requested": requested,
-                "claimed": 0,
-                "submitted": 0,
-                "failed": 0,
-            },
-            error="请重新预检后再确认。",
-        )
-
-    if outcome_unknown:
-        ok = submitted > 0
-        status = "partial" if submitted or confirmed_failed else "review_required"
-        summary = (
-            f"RSS 条目提交结果：成功 {submitted}，待核对 {outcome_unknown}，"
-            f"确认失败 {confirmed_failed}"
-        )
-    elif failed == 0:
-        ok = True
-        status = "completed"
-        summary = f"已向 qBittorrent 提交 {submitted} 个 RSS 条目"
-    elif submitted:
-        ok = True
-        status = "partial"
-        summary = f"RSS 条目部分提交完成：成功 {submitted}，失败 {failed}"
-    else:
-        ok = False
-        status = "failed"
-        summary = f"本次 {failed} 个 RSS 条目均未成功提交"
-
+    result = build_rss_submission_result(
+        raw,
+        kind="download",
+        target="qbittorrent",
+        evidence_description=(
+            "已按确认时冻结的集合与 qB 配置执行一次有界提交；响应仅包含聚合计数。"
+        ),
+    )
     logger.info(
-        "Agent RSS qB 提交完成 requested=%s claimed=%s submitted=%s failed=%s",
-        requested,
-        claimed,
-        submitted,
-        failed,
+        "Agent RSS qB 提交结果 status=%s requested=%s claimed=%s submitted=%s failed=%s",
+        result.status,
+        result.data["requested"],
+        result.data["claimed"],
+        result.data["submitted"],
+        result.data["failed"],
     )
-    return ToolResult(
-        ok=ok,
-        status=status,
-        summary=summary,
-        data={
-            "target": "qbittorrent",
-            "requested": requested,
-            "claimed": claimed,
-            "submitted": submitted,
-            "failed": failed,
-            **({"outcome_unknown": outcome_unknown} if outcome_unknown else {}),
-        },
-        evidence=[
-            Evidence(
-                "rss_submission",
-                "已按确认时冻结的集合与 qB 配置执行一次有界提交；响应仅包含聚合计数。",
-                _now(),
-            )
-        ],
-        suggestions=(
-            ["请先核对 qBittorrent 中是否已存在对应任务，勿直接重复提交。"]
-            if outcome_unknown
-            else ([] if failed == 0 else ["请在 RSS 订阅页和下载任务页核对失败项。"])
-        ),
-        error=(
-            "部分提交结果未知，请先核对 qBittorrent，勿直接重试。"
-            if outcome_unknown
-            else ("RSS 条目提交未全部成功。" if failed else "")
-        ),
-    )
+    return result
 
 
 def submit_pending_rss_to_qb_confirmed(

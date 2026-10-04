@@ -9,6 +9,7 @@ from unittest.mock import patch
 from app import database as db
 from app.modules.rss import RSSEngine
 from tests.support import InitializedWebTestCase, isolated_test_database
+from tests.support import seed_rss_entry_state
 
 
 class RSSBatchReadAuditTests(InitializedWebTestCase):
@@ -170,7 +171,7 @@ class RSSBatchReadAuditTests(InitializedWebTestCase):
         from tests.test_rss_stats_state import RSSStatsStateTests
 
         first, second = self.entries(2)
-        db.update_rss_entry_status(second, "downloaded")
+        seed_rss_entry_state(second, "downloaded")
         with TestClient(create_app(start_background=False)) as client:
             self.assertEqual(client.get("/api/rss/entries").status_code, 401)
             csrf = RSSStatsStateTests._csrf(client.get("/login").text)

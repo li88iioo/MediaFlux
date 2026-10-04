@@ -20,6 +20,7 @@ from app.modules.rss import RSSEngine
 from tests.support import isolated_test_database
 from tests.test_local_move_transaction import Plan
 from tests.test_ten_pass_process_restore_audit import runtime_paths
+from tests.support import seed_rss_entry_state
 
 
 class LocalPublishAndRSSRecoveryTests(unittest.TestCase):
@@ -139,7 +140,7 @@ with patch("ctypes.CDLL", return_value=SimpleNamespace(renameat2=None)), patch("
         def complete(entry, **kwargs):
             self.assertEqual(entry["status"], "pending")
             submitted.append(int(entry["id"]))
-            db.update_rss_entry_status(int(entry["id"]), "downloaded")
+            seed_rss_entry_state(int(entry["id"]), "downloaded")
             return {"ok": True, "method": "qBittorrent"}
 
         with (
@@ -168,7 +169,8 @@ for n in range(451):
 submitted = []
 def complete(entry, **kwargs):
     submitted.append(int(entry["id"]))
-    db.update_rss_entry_status(int(entry["id"]), "downloaded")
+    with db.get_conn() as conn:
+        conn.execute("UPDATE rss_entries SET status='downloaded',processed=1,processed_at=? WHERE id=?", (db.now(), int(entry["id"])))
     return {"ok":True, "method":"qBittorrent"}
 engine = RSSEngine()
 with patch.object(engine, "refresh", return_value={"total":0,"new":0,"skipped":0}), patch.object(engine, "_download_entry", side_effect=complete):

@@ -277,6 +277,48 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
         self.assertIn("确认失败 1", result.summary)
         self.assertIn("勿直接重复提交", result.suggestions[0])
 
+    def test_pending_retry_is_in_progress_and_not_failed(self):
+        sub_id = self._subscription()
+        self._failed(sub_id, 1)
+        raw = {
+            "ok": False,
+            "conflict": False,
+            "requested": 1,
+            "claimed": 1,
+            "submitted": 0,
+            "failed": 0,
+            "pending": 1,
+        }
+        fingerprint = prepare_rss_failure_retry({"limit": 1})[1]
+        with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
+            result = retry_failed_rss_confirmed({"limit": 1}, fingerprint)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "in_progress")
+        self.assertEqual(result.data["pending"], 1)
+        self.assertIn("成功 0，提交中 1，失败 0，待核对 0", result.summary)
+        self.assertEqual(result.error, "")
+
+    def test_pending_retry_mixed_with_failure_is_partial_but_not_ok(self):
+        sub_id = self._subscription()
+        self._failed(sub_id, 1)
+        self._failed(sub_id, 2)
+        raw = {
+            "ok": False,
+            "conflict": False,
+            "requested": 2,
+            "claimed": 2,
+            "submitted": 0,
+            "failed": 1,
+            "pending": 1,
+        }
+        fingerprint = prepare_rss_failure_retry({"limit": 2})[1]
+        with patch.object(RSSEngine, "submit_snapshot", return_value=raw):
+            result = retry_failed_rss_confirmed({"limit": 2}, fingerprint)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.data["pending"], 1)
+        self.assertIn("成功 0，提交中 1，失败 1，待核对 0", result.summary)
+
     def test_retry_engine_propagates_unknown_outcome_count(self):
         sub_id = self._subscription()
         entry_id = self._failed(sub_id, 77)

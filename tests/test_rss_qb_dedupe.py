@@ -10,6 +10,7 @@ from app.modules.download_dispatcher import normalize_download_url, request_keys
 from app.modules.download_tracker import DownloadTracker
 from app.modules.rss import RSSEngine
 from tests.support import IsolatedDatabaseTestCase
+from tests.support import seed_rss_entry_state
 
 
 def _clear() -> None:
@@ -60,7 +61,7 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         )["id"]
         assert entry_id is not None
         if processed:
-            db.update_rss_entry_status(entry_id, "downloaded")
+            seed_rss_entry_state(entry_id, "downloaded")
         return entry_id
 
     @staticmethod
@@ -370,6 +371,141 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         self.assertEqual(entry["status"], "failed")
         self.assertEqual(entry["failure_code"], "submission_outcome_unknown")
         self.assertFalse(entry["failure_retryable"])
+
+
+
+    def test_concurrent_duplicate_waits_for_actual_backend_receipt(self) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from app.modules import download_dispatcher as dispatcher
+
+        for backend in ('qb', 'guangya'):
+            for outcome in ('accepted', 'rejected', 'unknown'):
+                with self.subTest(backend=backend, outcome=outcome):
+                    _clear()
+                    sid = db.add_rss_subscription('concurrent', 'https://fixture.invalid/rss', download_method=backend)
+                    entries = [self._entry(sid, str(i), 'magnet:?xt=urn:btih:' + 'a' * 40) for i in range(2)]
+                    entered, release = threading.Event(), threading.Event()
+
+                    def submit(*_args, **_kwargs):
+                        entered.set()
+                        if not release.wait(10):
+                            raise RuntimeError('fixture timeout')
+                        return {'ok': outcome == 'accepted', 'task_id': 'task' if outcome == 'accepted' else '',
+                                'outcome_unknown': outcome == 'unknown', 'failure_code': backend + '_rate_limited',
+                                'retryable': outcome == 'rejected', 'error': '' if outcome == 'accepted' else 'fixture rejection'}
+
+                    with patch.object(dispatcher, '_submit_qb' if backend == 'qb' else '_submit_guangya', side_effect=submit) as remote, ThreadPoolExecutor(max_workers=1) as pool:
+                        first = pool.submit(RSSEngine().download, entries[0])
+                        try:
+                            self.assertTrue(entered.wait(5))
+                            second = RSSEngine().download(entries[1])
+                            same_entry = RSSEngine().download(entries[0])
+                            before = dict(db.get_rss_entry(entries[1]))
+                        finally:
+                            release.set()
+                        first = first.result()
+                    remote.assert_called_once()
+                    self.assertTrue(second.get('pending'), second)
+                    self.assertTrue(same_entry.get('pending'), same_entry)
+                    self.assertFalse(second['ok'])
+                    self.assertEqual(second['status'], 'submitting')
+                    self.assertEqual((before['status'], before['processed']), ('submitting', 0))
+                    self.assertEqual(first['request_id'], second['request_id'])
+                    final = [db.get_rss_entry(entry_id) for entry_id in entries]
+                    self.assertEqual([row['status'] for row in final], ['downloaded' if outcome == 'accepted' else 'failed'] * 2)
+                    self.assertEqual([row['processed'] for row in final], [int(outcome == 'accepted')] * 2)
+                    if outcome != 'accepted':
+                        self.assertEqual(final[0]['failure_code'], final[1]['failure_code'])
+                        self.assertEqual(final[0]['failure_retryable'], final[1]['failure_retryable'])
+
+    def test_manual_mark_cannot_override_a_submission_in_progress(self) -> None:
+        from app.modules import download_dispatcher as dispatcher
+
+        sid = self._subscription()
+        entry = self._entry(sid, 'user-mark', 'magnet:?xt=urn:btih:' + 'b' * 40)
+        def submit(*_args, **_kwargs):
+            self.assertEqual(db.update_rss_entries_processed([entry], True), 0)
+            return {'ok': True, 'task_id': 'b' * 40}
+        with patch.object(dispatcher, '_submit_qb', side_effect=submit):
+            result = RSSEngine().download(entry)
+        self.assertTrue(result['ok'])
+        self.assertEqual(db.get_rss_entry(entry)['status'], 'downloaded')
+
+
+    def test_failure_feedback_ignores_superseded_request_and_other_backends(self) -> None:
+        from app.repositories.rss import bind_rss_entry_download
+        from app.modules.download_dispatcher import request_key
+
+        sid = self._subscription()
+        url = 'magnet:?xt=urn:btih:' + 'c' * 40
+        key = request_key(normalize_download_url(url))
+        entries = [self._entry(sid, str(i), url) for i in range(3)]
+        old, _ = db.create_download_request(key, 'magnet', source_value=url)
+        db.update_download_request(old, status='failed', qb_status='failed')
+        new, _ = db.create_download_request(key, 'magnet', source_value=url)
+        self.assertNotEqual(old, new)
+        for entry_id, backend in zip(entries, ('qb', 'qb', 'guangya')):
+            self.assertTrue(db.claim_rss_entry(entry_id))
+            bind_rss_entry_download(entry_id, key, backend)
+        db.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=old)
+        self.assertEqual([db.get_rss_entry(i)['status'] for i in entries], ['submitting'] * 3)
+        db.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=new)
+        self.assertEqual([db.get_rss_entry(i)['status'] for i in entries], ['failed', 'failed', 'submitting'])
+
+
+    def test_failure_feedback_covers_current_verified_content_aliases(self) -> None:
+        from dataclasses import replace
+        from app.repositories.rss import bind_rss_entry_download
+
+        item = replace(normalize_download_url('https://fixture.invalid/seed.torrent'),
+                       torrent_data=b'd4:infod6:lengthi10485760e4:name9:Movie.mkvee')
+        keys = request_keys(item)
+        self.assertEqual(len(keys), 2)
+        request, _ = db.create_download_request(keys[0], 'http', source_value=item.source_value,
+            torrent_data=item.torrent_data, alternate_request_keys=keys[1:])
+        sid = self._subscription()
+        entries = [self._entry(sid, str(i), item.source_value) for i in range(3)]
+        for entry, key, backend in zip(entries, (keys[0], keys[1], keys[1]), ('qb', 'qb', 'guangya')):
+            self.assertTrue(db.claim_rss_entry(entry))
+            bind_rss_entry_download(entry, key, backend)
+        db.record_rss_entry_failure(entries[0], 'qb_rate_limited', True, request_id=request)
+        self.assertEqual([db.get_rss_entry(i)['status'] for i in entries], ['failed', 'failed', 'submitting'])
+
+
+    def test_batch_and_confirmed_snapshot_do_not_count_inflight_as_submitted(self) -> None:
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from app.modules import download_dispatcher as dispatcher
+
+        sid = self._subscription()
+        entries = [self._entry(sid, str(i), 'magnet:?xt=urn:btih:' + 'd' * 40) for i in range(4)]
+        entered, release = threading.Event(), threading.Event()
+        def submit(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(10):
+                raise RuntimeError('fixture timeout')
+            return {'ok': True, 'task_id': 'd' * 40}
+        with patch.object(dispatcher, '_submit_qb', side_effect=submit) as remote, ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(RSSEngine().download, entries[0])
+            try:
+                self.assertTrue(entered.wait(5))
+                engine = RSSEngine()
+                batch = engine.download_many(entries[1:3])
+                snapshot = engine.submit_snapshot(
+                    [dict(row) for row in db.get_pending_rss_qb_snapshot()],
+                    {'url': 'http://qb.local', 'default_method': 'qb'},
+                    claim=db.claim_pending_rss_qb_entries,
+                )
+                self.assertEqual((batch['pending_count'], batch['success_count'], batch['existing_count'], batch['failure_count']), (2, 0, 0, 0))
+                self.assertEqual((snapshot['pending'], snapshot['submitted'], snapshot['failed']), (1, 0, 0))
+                self.assertFalse(snapshot['ok'])
+                self.assertEqual([db.get_rss_entry(i)['status'] for i in entries], ['submitting'] * 4)
+            finally:
+                release.set()
+            self.assertTrue(first.result()['ok'])
+        remote.assert_called_once()
+        self.assertEqual([db.get_rss_entry(i)['status'] for i in entries], ['downloaded'] * 4)
 
 
 if __name__ == "__main__":

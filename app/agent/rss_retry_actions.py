@@ -11,6 +11,7 @@ from app import database as db
 from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.agent.rss_entry_actions import build_rss_submission_result
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -151,84 +152,23 @@ def _retry_failed_rss_state(state: dict[str, Any]) -> ToolResult:
     raw = RSSEngine().submit_snapshot(
         entries, runtime_config, claim=db.claim_retryable_failed_rss_entries,
     )
-    requested = max(0, int(raw.get("requested") or 0))
-    claimed = max(0, int(raw.get("claimed") or 0))
-    submitted = max(0, int(raw.get("submitted") or 0))
-    failed = max(0, int(raw.get("failed") or 0))
-    outcome_unknown = min(failed, max(0, int(raw.get("outcome_unknown") or 0)))
-    confirmed_failed = max(0, failed - outcome_unknown)
-    if raw.get("conflict") or claimed != requested:
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="可重试 RSS 失败条目已变化，本次未提交",
-            data={
-                "target": state["target"],
-                "requested": requested,
-                "claimed": 0,
-                "submitted": 0,
-                "failed": 0,
-            },
-            error="请重新预检后再确认。",
-        )
-
-    if outcome_unknown:
-        ok = submitted > 0
-        status = "partial" if submitted or confirmed_failed else "review_required"
-        summary = (
-            f"RSS 失败条目提交结果：成功 {submitted}，待核对 {outcome_unknown}，"
-            f"确认失败 {confirmed_failed}"
-        )
-    elif failed == 0:
-        ok = True
-        status = "completed"
-        summary = f"已成功重试 {submitted} 个 RSS 失败条目"
-    elif submitted:
-        ok = True
-        status = "partial"
-        summary = f"RSS 失败条目部分重试完成：成功 {submitted}，失败 {failed}"
-    else:
-        ok = False
-        status = "failed"
-        summary = f"本次 {failed} 个 RSS 失败条目仍未成功提交"
-
+    result = build_rss_submission_result(
+        raw,
+        kind="retry",
+        target=state["target"],
+        evidence_description=(
+            "已按确认时冻结的失败集合与目标配置执行一次有界重试；响应仅包含聚合计数。"
+        ),
+    )
     logger.info(
-        "Agent RSS 失败重试完成 requested=%s claimed=%s submitted=%s failed=%s",
-        requested,
-        claimed,
-        submitted,
-        failed,
+        "Agent RSS 失败重试结果 status=%s requested=%s claimed=%s submitted=%s failed=%s",
+        result.status,
+        result.data["requested"],
+        result.data["claimed"],
+        result.data["submitted"],
+        result.data["failed"],
     )
-    return ToolResult(
-        ok=ok,
-        status=status,
-        summary=summary,
-        data={
-            "target": state["target"],
-            "requested": requested,
-            "claimed": claimed,
-            "submitted": submitted,
-            "failed": failed,
-            **({"outcome_unknown": outcome_unknown} if outcome_unknown else {}),
-        },
-        evidence=[
-            Evidence(
-                "rss_retry",
-                "已按确认时冻结的失败集合与目标配置执行一次有界重试；响应仅包含聚合计数。",
-                _now(),
-            )
-        ],
-        suggestions=(
-            ["请先核对对应下载器中是否已存在对应任务，勿直接重复提交。"]
-            if outcome_unknown
-            else ([] if failed == 0 else ["请重新诊断 RSS 失败状态后再决定下一步。"])
-        ),
-        error=(
-            "部分提交结果未知，请先核对对应下载器，勿直接重试。"
-            if outcome_unknown
-            else ("RSS 失败条目重试未全部成功。" if failed else "")
-        ),
-    )
+    return result
 
 
 def retry_failed_rss_confirmed(

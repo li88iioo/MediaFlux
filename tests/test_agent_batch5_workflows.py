@@ -50,7 +50,7 @@ from app.agent.strm_history_actions import get_strm_run_history
 from app.discovery.models import MediaCard
 from app.modules.agent_library_patrol_scheduler import AgentLibraryPatrolScheduler
 from app.modules.directory_scrape_errors import DirectoryScrapeGoneError
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, seed_rss_entry_state
 
 
 class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
@@ -182,11 +182,50 @@ class Batch5AgentWorkflowTests(IsolatedDatabaseTestCase):
         submitted_rows = submit.call_args.args[0]
         self.assertEqual({row["id"] for row in submitted_rows}, {first, second})
 
+    def test_exact_rss_submit_reports_pending_and_mixed_outcomes(self) -> None:
+        _sid, first, second = self._rss()
+        runtime = {
+            "url": "http://qb.internal",
+            "username": "u",
+            "password": "secret",
+            "api_key": "key",
+            "category": "rss",
+            "default_save_path": "/private",
+            "default_method": "qb",
+            "timeout": 10,
+        }
+        scenarios = (
+            ([first], {"requested": 1, "claimed": 1, "submitted": 0, "failed": 0, "pending": 1}, "in_progress", True),
+            ([first, second], {"requested": 2, "claimed": 2, "submitted": 1, "failed": 0, "pending": 1}, "partial", True),
+            ([first], {"requested": 1, "claimed": 1, "submitted": 0, "failed": 1}, "failed", False),
+        )
+        with patch(
+            "app.modules.rss.capture_rss_qb_runtime_config", return_value=(runtime, "")
+        ):
+            for numbers, raw, expected_status, expected_ok in scenarios:
+                with self.subTest(raw=raw):
+                    arguments = {"entry_numbers": numbers}
+                    preview, context = prepare_submit_rss_entries(arguments)
+                    self.assertTrue(preview.ok)
+                    with patch(
+                        "app.modules.rss.RSSEngine.submit_snapshot", return_value=raw
+                    ):
+                        result = submit_rss_entries_confirmed(arguments, context)
+                    self.assertEqual(result.status, expected_status)
+                    self.assertEqual(result.ok, expected_ok)
+                    if raw.get("pending"):
+                        self.assertEqual(result.data["pending"], raw["pending"])
+                        self.assertIn("提交中 1", result.summary)
+                    else:
+                        self.assertNotIn("pending", result.data)
+                    if raw["failed"]:
+                        self.assertIn("未成功提交", result.summary)
+
     def test_rss_mark_snapshot_fails_closed_after_state_change(self) -> None:
         _sid, first, _second = self._rss()
         args = {"entry_numbers": [first], "processed": True}
         _preview, fingerprint = prepare_mark_rss_entries(args)
-        db.update_rss_entry_status(first, "downloaded")
+        seed_rss_entry_state(first, "downloaded")
         with self.assertRaises(AgentToolError) as caught:
             mark_rss_entries_confirmed(args, fingerprint)
         self.assertEqual(caught.exception.code, "confirmation_stale")

@@ -734,12 +734,13 @@ async function batchDownload(trigger){
         const success=Number(result.success_count)||0;
         const existing=Number(result.existing_count)||0;
         const unverified=Number(result.unverified_count)||0;
+        const pending=Number(result.pending_count)||0;
         const failed=Number(result.failure_count)||0;
         const handled=success+existing+unverified;
         await appAlert({
-            type:failed&&!handled?'error':failed||unverified?'warning':'success',
-            title:failed?'批量提交部分失败':unverified?'批量提交待核验':'批量提交完成',
-            message:`新增提交 ${success} 条\nqB 已存在 ${existing} 条\n待核验 ${unverified} 条\n失败 ${failed} 条`
+            type:pending?'warning':failed&&!handled?'error':failed||unverified?'warning':'success',
+            title:pending?'正在提交，尚未确认受理':failed?'批量提交部分失败':unverified?'批量提交待核验':'批量提交完成',
+            message:`新增提交 ${success} 条\n已存在 ${existing} 条\n待核验 ${unverified} 条${pending?`\n正在提交，尚未确认受理 ${pending} 条`:''}\n失败 ${failed} 条`
         });
         loadEntries();
     }catch(error){await appAlert({type:'error',title:'批量提交失败',message:error.message||'请求失败'});}
@@ -759,12 +760,13 @@ async function dlEntry(id,trigger){
         const d=await rssApiJSON('/api/rss/entries/'+id+'/download',{method:'POST'});
         const result=d.result||{};
         const ok=Boolean(result.ok);
+        const pending=Boolean(result.pending);
         const existing=Boolean(result.existing);
         const unverified=Boolean(result.unverified);
         await appAlert({
-            type:ok?(unverified?'warning':'success'):'error',
-            title:existing?'qB 任务已存在':unverified?'提交成功，等待核验':ok?'下载已提交':'下载提交失败',
-            message:existing?'相同种子已经在 qB 中，本次未重复添加。':unverified?'下载请求已发送，但当前链接无法提取 infohash，请在 qB 中确认。':ok?'条目已推送到下载后端。':'请检查下载器配置和连接状态。'
+            type:pending?'warning':ok?(unverified?'warning':'success'):'error',
+            title:pending?'正在提交，尚未确认受理':existing?'资源已存在':unverified?'提交成功，等待核验':ok?'下载已提交':'下载提交失败',
+            message:pending?'请求已发出，但尚未确认下载目标受理。':existing?'相同资源已经存在，本次未重复提交。':unverified?'下载请求已发送，请进一步核对目标状态。':ok?'条目已推送到下载后端。':'请检查下载目标配置和连接状态。'
         });
         await loadEntries();
     }catch(error){await appAlert({type:'error',title:'下载提交失败',message:error.message||'请求失败，请检查网络和服务状态。'});}

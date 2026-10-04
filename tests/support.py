@@ -15,6 +15,20 @@ from app import database as db
 _TEST_DATABASE_LOCK = threading.RLock()
 
 
+def seed_rss_entry_state(entry_id: int, status: str) -> None:
+    """仅为历史/迁移测试造状态；生产受理由下载请求事务投影，不能调用此夹具。"""
+    processed = status in {"downloaded", "skipped"}
+    timestamp = db.now()
+    with db.get_conn() as conn:
+        conn.execute(
+            "UPDATE rss_entries SET status=?,processed=?,processed_at=?,submitted_at=?,"
+            "failed_at=?,failure_code='',failure_retryable=0 WHERE id=?",
+            (status, int(processed), timestamp if processed else None,
+             timestamp if status in {"submitting", "downloaded", "failed"} else None,
+             timestamp if status == "failed" else None, int(entry_id)),
+        )
+
+
 @contextmanager
 def isolated_test_database(filename: str = "test.db") -> Iterator[Path]:
     """初始化临时 SQLite，并在退出时恢复此前的数据库配置。"""

@@ -2102,7 +2102,6 @@ from app.repositories.rss import (  # noqa: E402,F401
     skip_pending_rss_entries,
     update_rss_entries_processed,
     update_rss_entries_processed_snapshot,
-    update_rss_entry_status,
     update_rss_subscription,
 )
 

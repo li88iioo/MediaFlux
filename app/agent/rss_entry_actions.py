@@ -38,6 +38,116 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+def build_rss_submission_result(
+    raw: dict[str, Any], *, kind: str, target: str, evidence_description: str
+) -> ToolResult:
+    requested = max(0, int(raw.get("requested") or 0))
+    claimed = max(0, int(raw.get("claimed") or 0))
+    retry, exact = kind == "retry", kind == "entry"
+    if raw.get("conflict") or claimed != requested:
+        if exact:
+            raise AgentToolError(
+                "RSS 条目在提交前发生变化，请重新预检", code="confirmation_stale"
+            )
+        return ToolResult(
+            ok=False,
+            status="conflict",
+            summary=(
+                "可重试 RSS 失败条目已变化，本次未提交"
+                if retry
+                else "待处理 RSS 条目已变化，本次未提交"
+            ),
+            data={
+                "target": target,
+                "requested": requested,
+                "claimed": 0,
+                "submitted": 0,
+                "failed": 0,
+            },
+            error="请重新预检后再确认。",
+        )
+
+    submitted = max(0, int(raw.get("submitted") or 0))
+    failed = max(0, int(raw.get("failed") or 0))
+    unknown = min(failed, max(0, int(raw.get("outcome_unknown") or 0)))
+    confirmed_failed = failed - unknown
+    pending = max(0, int(raw.get("pending") or 0))
+    subject = "RSS 失败条目" if retry else "RSS 条目"
+
+    if pending:
+        pending_only = submitted == 0 and failed == 0
+        status = "in_progress" if pending_only else "partial"
+        ok = pending_only or submitted > 0
+        summary = (
+            f"{subject}{'重试' if retry else '提交'}状态：成功 {submitted}，"
+            f"提交中 {pending}，失败 {confirmed_failed}，待核对 {unknown}"
+        )
+    elif unknown:
+        status = "partial" if submitted or (confirmed_failed and not exact) else "review_required"
+        ok = submitted > 0
+        heading = "RSS 提交结果" if exact else f"{subject}提交结果"
+        failure = failed - unknown if exact else confirmed_failed
+        label = "失败" if exact else "确认失败"
+        summary = f"{heading}：成功 {submitted}，待核对 {unknown}，{label} {failure}"
+    elif failed:
+        status, ok = ("partial", True) if submitted else ("failed", False)
+        summary = (
+            f"{subject}部分{'重试' if retry else '提交'}完成：成功 {submitted}，失败 {failed}"
+            if submitted
+            else f"本次 {failed} 个 {subject}{'仍未成功提交' if retry else '均未成功提交'}"
+        )
+    else:
+        status, ok = "completed", True
+        summary = (
+            f"已成功重试 {submitted} 个 RSS 失败条目"
+            if retry
+            else f"已向 qBittorrent 提交 {submitted} 个 RSS 条目"
+        )
+
+    if unknown:
+        suggestions = (
+            ["请先核对对应下载器中是否已存在对应任务，勿直接重复提交。"]
+            if retry
+            else ["请先在 qBittorrent 中核对待确认任务，勿直接重复提交。"]
+            if exact
+            else ["请先核对 qBittorrent 中是否已存在对应任务，勿直接重复提交。"]
+        )
+        error = (
+            "部分提交结果未知。"
+            if exact
+            else f"部分提交结果未知，请先核对{'对应下载器' if retry else ' qBittorrent'}，勿直接重试。"
+        )
+    else:
+        suggestions = (
+            ["请重新诊断 RSS 失败状态后再决定下一步。"]
+            if failed and retry
+            else ["请在 RSS 订阅页和下载任务页核对失败项。"]
+            if failed and kind == "download"
+            else []
+        )
+        error = f"{subject}{'重试' if retry else '提交'}未全部成功。" if failed else ""
+
+    return ToolResult(
+        ok=ok,
+        status=status,
+        summary=summary,
+        data={
+            "target": target,
+            "requested": requested,
+            "claimed": claimed,
+            "submitted": submitted,
+            "failed": failed,
+            **({"outcome_unknown": unknown} if unknown else {}),
+            **({"pending": pending} if pending else {}),
+        },
+        evidence=[
+            Evidence("rss_retry" if retry else "rss_submission", evidence_description, _now())
+        ],
+        suggestions=suggestions,
+        error=error,
+    )
+
+
 def _positive_ids(value: Any, *, maximum: int) -> list[int]:
     if not isinstance(value, list) or not value or len(value) > maximum:
         raise AgentToolError(f"entry_numbers 必须包含 1 到 {maximum} 个条目编号")
@@ -357,59 +467,17 @@ def submit_rss_entries_confirmed(
     raw = RSSEngine().submit_snapshot(
         state["entries"], state["runtime"], claim=db.claim_pending_rss_qb_entries,
     )
-    requested = max(0, int(raw.get("requested") or 0))
-    claimed = max(0, int(raw.get("claimed") or 0))
-    submitted = max(0, int(raw.get("submitted") or 0))
-    failed = max(0, int(raw.get("failed") or 0))
-    unknown = min(failed, max(0, int(raw.get("outcome_unknown") or 0)))
-    if raw.get("conflict") or claimed != requested:
-        raise AgentToolError(
-            "RSS 条目在提交前发生变化，请重新预检", code="confirmation_stale"
-        )
-    if unknown:
-        status, ok = ("partial", True) if submitted else ("review_required", False)
-        summary = (
-            f"RSS 提交结果：成功 {submitted}，待核对 {unknown}，失败 {failed - unknown}"
-        )
-    elif failed and submitted:
-        status, ok, summary = (
-            "partial",
-            True,
-            f"RSS 条目部分提交完成：成功 {submitted}，失败 {failed}",
-        )
-    elif failed:
-        status, ok, summary = "failed", False, f"本次 {failed} 个 RSS 条目均未成功提交"
-    else:
-        status, ok, summary = (
-            "completed",
-            True,
-            f"已向 qBittorrent 提交 {submitted} 个 RSS 条目",
-        )
+    result = build_rss_submission_result(
+        raw,
+        kind="entry",
+        target="qbittorrent",
+        evidence_description="已按确认时冻结的精确集合执行一次提交。",
+    )
     logger.info(
-        "Agent 精确 RSS qB 提交 requested=%s submitted=%s failed=%s",
-        requested,
-        submitted,
-        failed,
+        "Agent 精确 RSS qB 提交结果 status=%s requested=%s submitted=%s failed=%s",
+        result.status,
+        result.data["requested"],
+        result.data["submitted"],
+        result.data["failed"],
     )
-    return ToolResult(
-        ok=ok,
-        status=status,
-        summary=summary,
-        data={
-            "target": "qbittorrent",
-            "requested": requested,
-            "claimed": claimed,
-            "submitted": submitted,
-            "failed": failed,
-            **({"outcome_unknown": unknown} if unknown else {}),
-        },
-        evidence=[
-            Evidence("rss_submission", "已按确认时冻结的精确集合执行一次提交。", _now())
-        ],
-        suggestions=["请先在 qBittorrent 中核对待确认任务，勿直接重复提交。"]
-        if unknown
-        else [],
-        error="部分提交结果未知。"
-        if unknown
-        else ("RSS 条目提交未全部成功。" if failed else ""),
-    )
+    return result

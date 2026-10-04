@@ -14,6 +14,7 @@ from app import runtime_paths as runtime_paths_module
 from app.modules.backup import BackupError, restore_backup, verify_backup
 from app.runtime_paths import RuntimePaths
 from tests.support import IsolatedDatabaseTestCase
+from tests.support import seed_rss_entry_state
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
@@ -405,9 +406,9 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
         )["id"]
         assert qb_entry is not None and gy_entry is not None
         assert uncertain_entry is not None
-        db.update_rss_entry_status(qb_entry, "downloaded")
-        db.update_rss_entry_status(gy_entry, "downloaded")
-        db.update_rss_entry_status(uncertain_entry, "submitting")
+        seed_rss_entry_state(qb_entry, "downloaded")
+        seed_rss_entry_state(gy_entry, "downloaded")
+        seed_rss_entry_state(uncertain_entry, "submitting")
 
         with db.get_conn() as conn:
             conn.executescript(
@@ -506,9 +507,9 @@ class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
             assert entry_id is not None
             entry_ids[label] = entry_id
             if label != "uncertain_qb":
-                db.update_rss_entry_status(entry_id, "downloaded")
+                seed_rss_entry_state(entry_id, "downloaded")
             else:
-                db.update_rss_entry_status(entry_id, "submitting")
+                seed_rss_entry_state(entry_id, "submitting")
 
             canonical_key = hashlib.sha256(
                 f"btih:{infohash}".encode("utf-8")

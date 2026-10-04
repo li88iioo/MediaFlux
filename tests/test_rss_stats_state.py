@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from app import database as db
 from app.main import create_app
 from tests.support import IsolatedDatabaseTestCase
+from tests.support import seed_rss_entry_state
 
 
 class RSSStatsStateTests(IsolatedDatabaseTestCase):
@@ -35,7 +36,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
             for index in range(5)
         ]
         for entry_id, status in zip(entry_ids, ["pending", "failed", "skipped", "submitting", "downloaded"]):
-            db.update_rss_entry_status(int(entry_id), status)
+            seed_rss_entry_state(int(entry_id), status)
         return active, [int(item) for item in entry_ids]
 
     def test_entry_creation_exposes_only_the_media_aware_api(self) -> None:
@@ -80,10 +81,10 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         sid = db.add_rss_subscription("priority", "https://example.invalid/priority")
         pending = db.add_rss_entry_with_media(sid, "keep pending", "old", pub_date="2020-01-01 12:00")["id"]
         failed = db.add_rss_entry_with_media(sid, "keep failed", "failed", pub_date="2021-01-01 12:00")["id"]
-        db.update_rss_entry_status(failed, "failed")
+        seed_rss_entry_state(failed, "failed")
         for i in range(305):
             processed = db.add_rss_entry_with_media(sid, f"keep processed {i}", f"new-{i}", pub_date="2026-10-04 12:00")["id"]
-            db.update_rss_entry_status(processed, "downloaded")
+            seed_rss_entry_state(processed, "downloaded")
         for _ in range(2):
             rows = db.list_rss_entries(sub_id=sid, keyword="keep", order="unprocessed_first", limit=300)
             self.assertEqual([row["id"] for row in rows[:2]], [failed, pending])

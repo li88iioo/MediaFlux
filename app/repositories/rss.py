@@ -311,6 +311,14 @@ def bind_rss_entry_download(entry_id: int, request_key: str, backend: str) -> No
         ).rowcount
         if not changed:
             raise ValueError("RSS 条目状态已变化，请刷新后重试")
+        # 先绑定与受理回写处于同一事务，既有受理与并发受理都不漏投影。
+        existing = conn.execute(
+            "SELECT request_id FROM download_request_keys WHERE request_key=? UNION "
+            "SELECT id FROM download_requests WHERE request_key=? LIMIT 1",
+            (request_key, request_key),
+        ).fetchone()
+        if existing:
+            _sync_rss_download_entries_conn(conn, int(existing[0]), db.now())
 
 
 def _sync_rss_download_entries_conn(conn: sqlite3.Connection, request_id: int, timestamp: str) -> int:
@@ -750,7 +758,9 @@ def claim_rss_entry(entry_id: int) -> bool:
         return cur.rowcount == 1
 
 
-def record_rss_entry_failure(entry_id: int, failure_code: str, retryable: bool) -> None:
+def record_rss_entry_failure(
+    entry_id: int, failure_code: str, retryable: bool, *, request_id: int = 0,
+) -> None:
     """记录稳定失败分类；不保存上游正文、URL 或异常原文。"""
     normalized = str(failure_code or "").strip().lower()
     if normalized not in _RSS_FAILURE_CODES:
@@ -758,32 +768,30 @@ def record_rss_entry_failure(entry_id: int, failure_code: str, retryable: bool) 
         retryable = False
     failed_at = db.now()
     with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        scope, params = "id=?", [int(entry_id)]
+        if request_id:
+            # 仅当前资源身份的请求可以结束等待者；迟到旧回执不能覆盖后继提交。
+            binding = conn.execute(
+                "SELECT download_request_key,download_backend FROM rss_entries e WHERE id=? "
+                "AND download_request_key IN (SELECT request_key FROM download_request_keys "
+                "WHERE request_id=? UNION SELECT request_key FROM download_requests WHERE id=?)",
+                (int(entry_id), int(request_id), int(request_id)),
+            ).fetchone()
+            if binding is None:
+                return
+            scope += (
+                " OR (status='submitting' AND download_backend=? AND download_request_key IN ("
+                "SELECT request_key FROM download_request_keys WHERE request_id=? UNION "
+                "SELECT request_key FROM download_requests WHERE id=?))"
+            )
+            params.extend((binding["download_backend"], int(request_id), int(request_id)))
         conn.execute(
             "UPDATE rss_entries SET status='failed', processed=0, processed_at=NULL, "
-            "submitted_at=?, failure_code=?, failure_retryable=?, failed_at=? WHERE id=? AND COALESCE(processed,0)=0",
-            (failed_at, normalized, 1 if retryable else 0, failed_at, entry_id),
+            "submitted_at=?, failure_code=?, failure_retryable=?, failed_at=? "
+            f"WHERE COALESCE(processed,0)=0 AND ({scope})",
+            (failed_at, normalized, int(bool(retryable)), failed_at, *params),
         )
-
-
-def update_rss_entry_status(entry_id: int, status: str) -> None:
-    processed = 1 if status in ("downloaded", "skipped") else 0
-    processed_at = db.now() if processed else None
-    submitted_at = db.now() if status in ("submitting", "downloaded", "failed") else None
-    with db.get_conn() as conn:
-        if status == "failed":
-            conn.execute(
-                "UPDATE rss_entries SET status=?, processed=0, processed_at=NULL, "
-                "submitted_at=COALESCE(?, submitted_at), failed_at=COALESCE(failed_at, ?) "
-                "WHERE id=?",
-                (status, submitted_at, submitted_at, entry_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE rss_entries SET status=?, processed=?, processed_at=?, "
-                "submitted_at=COALESCE(?, submitted_at), failure_code='', "
-                "failure_retryable=0, failed_at=NULL WHERE id=?",
-                (status, processed, processed_at, submitted_at, entry_id),
-            )
 
 
 def skip_pending_rss_entries(entry_ids: Iterable[int], reason: str) -> int:

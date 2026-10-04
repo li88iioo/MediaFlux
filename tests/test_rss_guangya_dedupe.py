@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app import database as db
 from app.modules.rss import RSSEngine
 from tests.support import IsolatedDatabaseTestCase
+from tests.support import seed_rss_entry_state
 
 
 def _clear() -> None:
@@ -249,7 +250,7 @@ class RSSGuangYaUnifiedDownloadTests(IsolatedDatabaseTestCase):
     )
     def test_processed_entry_never_resubmits(self, submit) -> None:
         _, entry_id = self._entry("processed", "e" * 40)
-        db.update_rss_entry_status(entry_id, "downloaded")
+        seed_rss_entry_state(entry_id, "downloaded")
 
         result = RSSEngine().download(entry_id)
 
