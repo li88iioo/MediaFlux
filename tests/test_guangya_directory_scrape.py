@@ -2033,6 +2033,7 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
 
         result = self.service.execute_preview("owner", self.preview_id)
 
+        self.assertEqual(set(result), {"preview_id", "directory", "stats", "log_ids"})
         self.assertEqual(result["stats"]["moved"], 1)
         self.assertEqual(result["stats"]["skipped"], 1)
         self.assertEqual(
@@ -2065,6 +2066,111 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(result["stats"]["failed"], 0)
         self.assertNotEqual(self.client.infos["v1"].parent_id, "movie-dir")
         self.scraper.confirm.assert_called_once()
+        with self.assertRaisesRegex(KeyError, "不存在或已过期"):
+            self.service.execute_preview("owner", self.preview_id)
+
+    def test_prewrite_error_releases_preview_and_preserves_original_error(self):
+        with (
+            patch.object(
+                self.service, "_inspect_scope", side_effect=RuntimeError("prewrite read failed")
+            ),
+            self.assertRaisesRegex(RuntimeError, "prewrite read failed"),
+        ):
+            self.service.execute_preview("owner", self.preview_id)
+
+        self.assertFalse(self.store.get_preview("owner", self.preview_id).claimed)
+        self.assertEqual(self.client.infos["v1"].parent_id, "movie-dir")
+        result = self.service.execute_preview("owner", self.preview_id)
+        self.assertEqual(result["stats"]["moved"], 1)
+
+    def test_postwrite_receipt_error_survives_worker_archive_and_agent_status(self):
+        import threading
+
+        from app.agent.domain_catalog.cloud_runtime import guangya_organize_status
+        from app.agent.models import ToolContext
+        from app.modules.organize_tasks import OrganizeTaskManager
+        from app.repositories.organize_operation_jobs import (
+            claim_organize_operation_job,
+            enqueue_organize_operation_job,
+            organize_operation_public_ref,
+        )
+
+        owner = "owner"
+        created, _ = enqueue_organize_operation_job(
+            job_kind="agent_directory_scrape",
+            owner=owner,
+            operation="目录刮削",
+            reference="已确认目录",
+            payload={"version": 1},
+            dedupe_key="receipt-read-failure",
+        )
+        claimed = claim_organize_operation_job(str(created["job_id"]))
+        self.assertIsNotNone(claimed)
+        manager = OrganizeTaskManager()
+        manager._lock = threading.Lock()
+        manager._lock.acquire()
+        manager._task = {
+            "id": str(created["job_id"]),
+            "operation": "目录刮削",
+            "status": "running",
+            "durable": True,
+        }
+        execution_results = []
+
+        def execute_service(_row):
+            result = self.service.execute_preview(owner, self.preview_id)
+            execution_results.append(result)
+            return result
+
+        with (
+            patch.object(manager, "_execute_durable_operation", side_effect=execute_service),
+            patch.object(manager, "_wake_download_tracker"),
+            patch(
+                "app.modules.directory_scrape.db.list_organize_logs_by_operation_token",
+                side_effect=RuntimeError("receipt database read failed"),
+            ),
+        ):
+            manager._run_durable_operation(dict(claimed))
+
+        operation_ref = organize_operation_public_ref(str(created["job_id"]))
+        terminal = manager.task_result(operation_ref, owner=owner)
+        self.assertEqual(terminal["status"], "partial")
+        self.assertEqual(set(execution_results[0]), {"preview_id", "directory", "stats", "log_ids"})
+        self.assertEqual(execution_results[0]["log_ids"], [])
+        self.assertEqual(execution_results[0]["stats"]["moved"], 1)
+        self.assertEqual(execution_results[0]["stats"]["audit_failures"], 1)
+        self.assertEqual(terminal["result"]["stats"]["moved"], 1)
+        self.assertEqual(terminal["result"]["stats"]["audit_failures"], 1)
+        self.assertNotEqual(self.client.infos["v1"].parent_id, "movie-dir")
+
+        with (
+            patch("app.modules.organize_tasks.get_organize_manager", return_value=manager),
+            patch.object(
+                manager,
+                "status",
+                return_value={"schedule": {}, "operation_queue": {"total": 0}},
+            ),
+        ):
+            agent_result = guangya_organize_status(
+                {"operation_ref": operation_ref}, ToolContext(owner=owner)
+            )
+        self.assertEqual(agent_result.status, "attention")
+        self.assertEqual(agent_result.data["task"]["stats"]["moved"], 1)
+        self.assertEqual(agent_result.data["task"]["stats"]["audit_failures"], 1)
+        self.assertIn("核对实际状态", agent_result.error)
+        with self.assertRaisesRegex(KeyError, "不存在或已过期"):
+            self.service.execute_preview(owner, self.preview_id)
+
+    def test_repeated_confirmation_after_success_cannot_replay_preview(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeGoneError
+
+        with patch.object(self.client, "move", wraps=self.client.move) as move:
+            first = self.service.execute_preview("owner", self.preview_id)
+            calls_after_commit = move.call_count
+            self.assertEqual(first["stats"]["moved"], 1)
+            with self.assertRaises(DirectoryScrapeGoneError):
+                self.service.execute_preview("owner", self.preview_id)
+            self.assertEqual(move.call_count, calls_after_commit)
 
     def test_execute_preview_keeps_probe_cache_only_to_match_preview(self):
         from app.modules.organize import Organizer
@@ -2175,6 +2281,34 @@ class PartialDirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             store=self.store,
             rules_loader=lambda: self.rules,
         )
+
+    def test_multiple_files_keep_partial_stats_when_one_real_move_fails(self):
+        inspection = self.service.inspect("owner", "show-dir")
+        preview = self.service.preview(
+            "owner", inspection["inspection_id"], "123", "tv",
+        )
+        original_move = self.client.move
+
+        def fail_second_video(file_ids, parent_id):
+            if "e2" in file_ids:
+                raise RuntimeError("injected second-file write failure")
+            return original_move(file_ids, parent_id)
+
+        with patch.object(self.client, "move", side_effect=fail_second_video):
+            result = self.service.execute_preview("owner", preview["preview_id"])
+
+        self.assertGreater(result["stats"]["moved"], 0)
+        self.assertGreater(result["stats"]["failed"], 0)
+        actual_moved = sum(
+            self.client.infos[f"e{episode}"].parent_id != "show-dir"
+            for episode in range(1, 5)
+        )
+        self.assertEqual(result["stats"]["moved"], actual_moved)
+        self.assertEqual(set(result), {"preview_id", "directory", "stats", "log_ids"})
+        self.assertNotEqual(self.client.infos["e1"].parent_id, "show-dir")
+        self.assertEqual(self.client.infos["e2"].parent_id, "show-dir")
+        with self.assertRaises(KeyError):
+            self.service.execute_preview("owner", preview["preview_id"])
 
     def test_preview_and_execute_only_process_primary_series_group(self):
         inspection = self.service.inspect("owner", "show-dir")

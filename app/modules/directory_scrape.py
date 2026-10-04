@@ -1394,45 +1394,45 @@ class DirectoryScrapeService:
                 operation_token=operation_token,
                 notification_context=notification_context,
             )
-            if cancellation_requested():
-                stats["stopped"] = 1
-            self._apply_pending_stats(stats, current)
-            if not stats.get("stopped"):
-                self._cleanup_selected_source(
-                    record,
-                    current,
-                    stats,
-                    cancel_check=cancellation_requested,
-                )
-            if cancellation_requested():
-                stats["stopped"] = 1
-            if not stats.get("stopped"):
-                Organizer.notify_directory_results(
-                    stats,
-                    record.rules,
-                    source_name=record.inspection.directory_name,
-                )
-            if cancellation_requested():
-                stats["stopped"] = 1
-            if not stats.get("stopped"):
-                Organizer.trigger_post_actions(
-                    stats,
-                    record.rules,
-                    source_name=record.inspection.directory_name,
-                )
-            new_rows = db.list_organize_logs_by_operation_token(operation_token)
-            log_ids = [int(row["id"]) for row in new_rows]
-            self._record_successful_manual_confirmations(record, new_rows)
-            self.store.consume_preview(owner, preview_id)
-            return {
-                "preview_id": preview_id,
-                "directory": record.inspection.directory_name,
-                "stats": stats,
-                "log_ids": sorted(log_ids),
-            }
         except Exception:
             self.store.release_preview(owner, preview_id)
             raise
+
+        # Organizer 返回即代表写入执行已结算；后续回执失败不能重新开放预览。
+        self.store.consume_preview(owner, preview_id)
+        self._apply_pending_stats(stats, current)
+        # 所有收尾步骤共用取消门，顺序仍为源目录清理、通知、联动。
+        for finish in (
+            lambda: self._cleanup_selected_source(
+                record, current, stats, cancel_check=cancellation_requested),
+            lambda: Organizer.notify_directory_results(
+                stats, record.rules, source_name=record.inspection.directory_name),
+            lambda: Organizer.trigger_post_actions(
+                stats, record.rules, source_name=record.inspection.directory_name),
+        ):
+            if cancellation_requested():
+                stats["stopped"] = 1
+            if stats.get("stopped"):
+                break
+            finish()
+        log_ids = []
+        try:
+            new_rows = db.list_organize_logs_by_operation_token(operation_token)
+            log_ids = sorted(int(row["id"]) for row in new_rows)
+        except Exception as exc:
+            stats["audit_failures"] = int(stats.get("audit_failures") or 0) + 1
+            logger.warning(
+                "目录刮削已执行但回执读取失败 type=%s",
+                type(exc).__name__,
+            )
+        else:
+            self._record_successful_manual_confirmations(record, new_rows)
+        return {
+            "preview_id": preview_id,
+            "directory": record.inspection.directory_name,
+            "stats": stats,
+            "log_ids": log_ids,
+        }
 
     def _record_successful_manual_confirmations(
         self,
