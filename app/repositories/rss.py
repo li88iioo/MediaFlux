@@ -299,6 +299,87 @@ def _rss_entry_filters(sub_id: int | None = None, status: str | None = None,
     return sql, params
 
 
+def bind_rss_entry_download(entry_id: int, request_key: str, backend: str) -> None:
+    """在副作用前绑定已验证内容身份与目标，重试沿统一请求键自动接续。"""
+    if backend not in {"qb", "guangya"} or not request_key:
+        raise ValueError("RSS 下载目标或资源身份无效")
+    with db.get_conn() as conn:
+        changed = conn.execute(
+            "UPDATE rss_entries SET download_request_key=?,download_backend=? "
+            "WHERE id=? AND status='submitting' AND COALESCE(processed,0)=0",
+            (request_key, backend, int(entry_id)),
+        ).rowcount
+        if not changed:
+            raise ValueError("RSS 条目状态已变化，请刷新后重试")
+
+
+def _sync_rss_download_entries_conn(conn: sqlite3.Connection, request_id: int, timestamp: str) -> int:
+    """只投影选定后端的明确受理；已处理不是文件下载完成，不重写手动标记。"""
+    row = conn.execute("SELECT status,qb_status,gy_status FROM download_requests WHERE id=?", (request_id,)).fetchone()
+    if row is None or row["status"] in {"cancelled", "resubmitted"}:
+        return 0
+    accepted = tuple(backend for backend, field in (("qb", "qb_status"), ("guangya", "gy_status"))
+                     if row[field] in {"submitted", "downloading", "completed"})
+    if not accepted:
+        return 0
+    placeholders = ",".join("?" for _ in accepted)
+    return conn.execute(
+        "UPDATE rss_entries SET status='downloaded',processed=1,processed_at=?, "
+        "failure_code='',failure_retryable=0,failed_at=NULL WHERE COALESCE(processed,0)=0 "
+        "AND status IN ('failed','submitting') AND download_request_key IN ("
+        "SELECT request_key FROM download_request_keys WHERE request_id=? UNION "
+        "SELECT request_key FROM download_requests WHERE id=?) "
+        f"AND download_backend IN ({placeholders})",
+        (timestamp, request_id, request_id, *accepted),
+    ).rowcount
+
+
+def _reconcile_rss_download_entries_conn(conn: sqlite3.Connection) -> None:
+    """旧失败记录按原始链接/订阅日志及持久种子身份补关联，不按标题猜成功。"""
+    import json
+    from app.modules.download_dispatcher import DownloadInput, normalize_download_url, request_keys
+
+    legacy = conn.execute(
+        "SELECT id,rss_item_id,title,payload FROM rss_entries WHERE status='failed' "
+        "AND COALESCE(processed,0)=0 AND download_request_key='' ORDER BY id DESC LIMIT 500"
+    ).fetchall()
+    for entry in legacy:
+        try:
+            payload = json.loads(entry["payload"] or "{}")
+            if not isinstance(payload, dict):
+                continue
+            item = normalize_download_url(str(payload.get("torrent_url") or payload.get("link") or ""))
+            previous = conn.execute(
+                "SELECT r.*,l.source AS rss_backend FROM download_log l "
+                "JOIN download_requests r ON r.id=l.request_id "
+                "WHERE l.rss_item_id=? AND l.title=? AND r.source_value=? "
+                "AND l.source IN ('qb','guangya') ORDER BY l.id DESC LIMIT 1",
+                (entry["rss_item_id"], entry["title"], item.source_value),
+            ).fetchone()
+            if previous is None:
+                continue
+            # HTTP 种子已被清掉时不能把可变URL冒充已验证内容；保持旧失败供人工核对。
+            if previous["kind"] == "http" and not previous["torrent_data"]:
+                continue
+            key = request_keys(DownloadInput(
+                previous["kind"], previous["title"] or "", previous["source_value"] or "",
+                torrent_data=previous["torrent_data"],
+            ))[0]
+        except (ValueError, TypeError):
+            continue
+        conn.execute(
+            "UPDATE rss_entries SET download_request_key=?,download_backend=? WHERE id=?",
+            (key, previous["rss_backend"], entry["id"]),
+        )
+    requests = conn.execute(
+        "SELECT DISTINCT k.request_id FROM rss_entries e JOIN download_request_keys k "
+        "ON k.request_key=e.download_request_key WHERE e.status IN ('failed','submitting') "
+        "AND COALESCE(e.processed,0)=0"
+    ).fetchall()
+    for row in requests:
+        _sync_rss_download_entries_conn(conn, int(row[0]), db.now())
+
+
 def list_rss_entries(
     sub_id: int | None = None,
     status: str | None = None,
@@ -336,6 +417,7 @@ def list_rss_entries(
     sql += " LIMIT ?"
     params.append(max(1, int(limit)))
     with db.get_conn() as conn:
+        _reconcile_rss_download_entries_conn(conn)
         return conn.execute(sql, params).fetchall()
 
 
@@ -643,7 +725,7 @@ def record_rss_entry_failure(entry_id: int, failure_code: str, retryable: bool) 
     with db.get_conn() as conn:
         conn.execute(
             "UPDATE rss_entries SET status='failed', processed=0, processed_at=NULL, "
-            "submitted_at=?, failure_code=?, failure_retryable=?, failed_at=? WHERE id=?",
+            "submitted_at=?, failure_code=?, failure_retryable=?, failed_at=? WHERE id=? AND COALESCE(processed,0)=0",
             (failed_at, normalized, 1 if retryable else 0, failed_at, entry_id),
         )
 

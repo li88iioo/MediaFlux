@@ -154,14 +154,17 @@ class RSSGuangYaUnifiedDownloadTests(IsolatedDatabaseTestCase):
         engine = RSSEngine()
 
         first_result = engine.download(first)
+        self.assertEqual(db.get_rss_entry(first)["status"], "failed")
+        self.assertEqual(db.get_rss_entry(first)["failure_code"], "guangya_submit_failed")
         second_result = engine.download(second)
 
         self.assertFalse(first_result["ok"])
         self.assertTrue(second_result["ok"])
         self.assertNotEqual(first_result["request_id"], second_result["request_id"])
         self.assertEqual(submit.call_count, 2)
-        self.assertEqual(db.get_rss_entry(first)["status"], "failed")
-        self.assertEqual(db.get_rss_entry(first)["failure_code"], "guangya_submit_failed")
+        self.assertEqual(db.get_rss_entry(first)["status"], "downloaded")
+        self.assertEqual(db.get_rss_entry(first)["failure_code"], "")
+        self.assertEqual(db.get_download_request(first_result["request_id"])["status"], "failed")
         self.assertEqual(db.get_rss_entry(second)["status"], "downloaded")
 
     @patch("app.modules.download_dispatcher.submit_offline")
@@ -253,3 +256,142 @@ class RSSGuangYaUnifiedDownloadTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["existing"])
         submit.assert_not_called()
+
+
+class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
+    """运行真实RSS/dispatcher/SQLite链路，仅替换下载器网络边界。"""
+
+    def setUp(self):
+        from types import SimpleNamespace
+        from app.modules import download_dispatcher as dispatcher
+
+        _clear()
+        self.dispatcher = dispatcher
+        self.enterContext(patch.object(
+            dispatcher, "get", side_effect=lambda key, default="": (
+                "http://qb.invalid" if key == "QB_URL" else default
+            ),
+        ))
+        self.enterContext(patch.object(
+            dispatcher, "analyze_offline_url", return_value=SimpleNamespace(allowed=True, reason=""),
+        ))
+        self.enterContext(patch("socket.socket.connect", side_effect=AssertionError("unexpected network")))
+        self.serial = 0
+
+    def failed_entry(self, backend="guangya", *, url="", payload=None):
+        self.serial += 1
+        sub = db.add_rss_subscription(
+            f"retry-{self.serial}", f"https://feed.invalid/{self.serial}",
+            download_method=backend, gy_target_dir="target-id", gy_target_dir_name="测试",
+        )
+        entry = int(db.add_rss_entry_with_media(
+            sub, f"same-title-{self.serial}", f"guid-{self.serial}",
+            payload=json.dumps(payload if payload is not None else {
+                "torrent_url": url or f"magnet:?xt=urn:btih:{self.serial:040x}"
+            }),
+        )["id"])
+        method = "_submit_guangya" if backend == "guangya" else "_submit_qb"
+        with patch.object(self.dispatcher, method, return_value={"ok": False, "error": "fixture rejected"}):
+            result = RSSEngine().download(entry)
+        self.assertFalse(result["ok"], result)
+        self.assertEqual(db.get_rss_entry(entry)["status"], "failed")
+        return entry, result.get("request_id")
+
+    def retry(self, request_id, backend):
+        method = "_submit_guangya" if backend == "guangya" else "_submit_qb"
+        with patch.object(self.dispatcher, method, return_value={"ok": True, "task_id": "accepted"}) as submit:
+            result = self.dispatcher.resubmit_download_request(request_id, backend)
+        self.assertTrue(result["ok"], result)
+        submit.assert_called_once()
+        return result
+
+    def test_download_center_successor_updates_rss_for_both_backends(self):
+        for backend in ("guangya", "qb"):
+            with self.subTest(backend=backend):
+                entry, request = self.failed_entry(backend)
+                result = self.retry(request, backend)
+                self.assertNotEqual(result["request_id"], request)
+                row = db.get_rss_entry(entry)
+                self.assertEqual((row["status"], row["processed"], row["failure_code"]), ("downloaded", 1, ""))
+                db.record_rss_entry_failure(entry, "unknown_failure", False)
+                self.assertEqual(db.get_rss_entry(entry)["status"], "downloaded")
+                with patch.object(self.dispatcher, "_submit_guangya") as gy, patch.object(self.dispatcher, "_submit_qb") as qb:
+                    repeated = self.dispatcher.resubmit_download_request(result["request_id"], backend)
+                    self.assertFalse(repeated["ok"])
+                    db.list_rss_entries()
+                    db.list_rss_entries()
+                    gy.assert_not_called()
+                    qb.assert_not_called()
+
+    def test_peer_success_unknown_outcome_and_in_place_retry(self):
+        for backend, prefix, peer in (("guangya", "gy", "qb"), ("qb", "qb", "gy")):
+            with self.subTest(backend=backend):
+                entry, request = self.failed_entry(backend)
+                db.update_download_request(request, status="submitted", targets="both", **{f"{peer}_status": "submitted"})
+                db.list_rss_entries()
+                self.assertEqual(db.get_rss_entry(entry)["status"], "failed")
+                db.update_download_request(request, **{f"{prefix}_status": "outcome_unknown"})
+                self.assertEqual(db.get_rss_entry(entry)["status"], "failed")
+                db.update_download_request(request, **{f"{prefix}_status": "failed"})
+                result = self.retry(request, backend)
+                self.assertEqual(result["request_id"], request)
+                self.assertEqual(db.get_rss_entry(entry)["status"], "downloaded")
+                self.assertEqual(db.get_download_request(request)[f"{peer}_status"], "submitted")
+
+    def test_manual_processed_state_is_not_rewritten(self):
+        entry, request = self.failed_entry()
+        db.update_rss_entries_processed([entry], True)
+        self.retry(request, "guangya")
+        db.record_rss_entry_failure(entry, "unknown_failure", False)
+        self.assertEqual(db.get_rss_entry(entry)["status"], "skipped")
+
+    def test_legacy_http_torrent_failure_reconciles_only_verified_identity(self):
+        from tests.test_download_http_identity_lifecycle import TORRENT_A, MIME
+
+        fetch = self.enterContext(patch("app.modules.rss._fetch_rss_payload"))
+        entries = []
+        for number, suffix in enumerate(("verified", "purged", "different-source")):
+            fetch.return_value = (TORRENT_A.replace(b"Movie.mkv", f"Film{number}.mkv".encode()), {"content-type": MIME})
+            entry, request = self.failed_entry(url=f"https://feed.invalid/{suffix}.torrent")
+            entries.append(entry)
+            with db.get_conn() as conn:
+                conn.execute("UPDATE rss_entries SET download_request_key='',download_backend='' WHERE id=?", (entry,))
+            # Retried through the same shared pipeline, but the pre-upgrade RSS row has no binding.
+            result = self.retry(request, "guangya")
+            self.assertEqual(db.get_rss_entry(entry)["status"], "failed")
+            if suffix == "purged":
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE download_requests SET torrent_data=NULL WHERE id=?", (request,))
+            elif suffix == "different-source":
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (json.dumps({"torrent_url": "https://other.invalid/unrelated.torrent"}), entry))
+            # Complete this request so the next fixture may submit identical torrent content.
+            db.update_download_request(result["request_id"], status="completed", gy_status="completed")
+        db.list_rss_entries()
+        self.assertEqual(db.get_rss_entry(entries[0])["status"], "downloaded")
+        self.assertEqual(db.get_rss_entry(entries[1])["status"], "failed")
+        self.assertEqual(db.get_rss_entry(entries[2])["status"], "failed")
+
+    def test_bad_payload_does_not_abort_other_batch_entries(self):
+        bad, _ = self.failed_entry(payload=[])
+        good, _ = self.failed_entry()
+        db.update_rss_entries_processed([bad, good], False)
+        with patch.object(self.dispatcher, "_submit_guangya", return_value={"ok": True, "task_id": "accepted"}) as submit:
+            result = RSSEngine().download_many([bad, good])
+        self.assertEqual(db.get_rss_entry(bad)["status"], "failed")
+        self.assertEqual(db.get_rss_entry(good)["status"], "downloaded", result)
+        submit.assert_called_once()
+
+    def test_old_schema_adds_binding_columns_without_losing_failed_entry(self):
+        entry, request = self.failed_entry()
+        with db.get_conn() as conn:
+            conn.execute("DROP INDEX idx_rss_entries_download_request")
+            conn.execute("ALTER TABLE rss_entries DROP COLUMN download_request_key")
+            conn.execute("ALTER TABLE rss_entries DROP COLUMN download_backend")
+        db.init_db()
+        row = db.get_rss_entry(entry)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["download_request_key"], "")
+        self.retry(request, "guangya")
+        db.list_rss_entries()
+        self.assertEqual(db.get_rss_entry(entry)["status"], "downloaded")

@@ -241,6 +241,7 @@ def _persist_and_dispatch(
     qb_runtime_config: dict[str, Any] | None = None,
     qb_task_id_hint: str = "",
     rss_item_id: int | None = None,
+    rss_entry_id: int | None = None,
     log_path: str | None = None,
 ) -> tuple[dict[str, Any], int, dict[str, Any]]:
     dispatch_kwargs: dict[str, Any] = {}
@@ -263,6 +264,9 @@ def _persist_and_dispatch(
 
     item = prepare_download_input(item, target)
     keys = request_keys(item)
+    if rss_entry_id is not None:
+        from app.repositories.rss import bind_rss_entry_download
+        bind_rss_entry_download(rss_entry_id, keys[0], target)
     existing = db.get_download_request_by_request_key(keys[0])
     if existing is None and len(keys) > 1:
         existing = db.get_download_request_by_request_keys(
@@ -401,6 +405,7 @@ def submit_download_input(
     qb_runtime_config: dict[str, Any] | None = None,
     qb_task_id_hint: str = "",
     rss_item_id: int | None = None,
+    rss_entry_id: int | None = None,
     log_path: str | None = None,
 ) -> dict[str, Any]:
     """持久化并分发一个已规范化下载输入。
@@ -427,6 +432,7 @@ def submit_download_input(
         qb_runtime_config=qb_runtime_config,
         qb_task_id_hint=str(qb_task_id_hint or ""),
         rss_item_id=rss_item_id,
+        rss_entry_id=rss_entry_id,
         log_path=log_path,
     )
     return {

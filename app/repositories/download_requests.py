@@ -1080,6 +1080,9 @@ def _update_download_request_conn(
     sets.append("updated_at=?")
     values.extend([timestamp, int(request_id)])
     conn.execute(f"UPDATE download_requests SET {', '.join(sets)} WHERE id=?", values)
+    if {"qb_status", "gy_status"}.intersection(fields):
+        from app.repositories.rss import _sync_rss_download_entries_conn
+        _sync_rss_download_entries_conn(conn, int(request_id), timestamp)
     if {"strm_status", "strm_error", "strm_finished_at", "strm_run_id"}.intersection(fields):
         # 非当前队列工作写入的新状态会撤销旧失败的重试授权，即使错误文本相同。
         conn.execute(

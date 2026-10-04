@@ -216,10 +216,12 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         engine = RSSEngine()
 
         first_result = engine.download(first)
+        self.assertTrue(db.get_rss_entry(first)["failure_retryable"])
         second_result = engine.download(second)
 
         self.assertFalse(first_result["ok"])
-        self.assertTrue(db.get_rss_entry(first)["failure_retryable"])
+        self.assertEqual(db.get_rss_entry(first)["status"], "downloaded")
+        self.assertFalse(db.get_rss_entry(first)["failure_retryable"])
         self.assertTrue(second_result["ok"])
         self.assertNotEqual(first_result["request_id"], second_result["request_id"])
         self.assertEqual(client_cls.return_value.add_torrent_detailed.call_count, 2)

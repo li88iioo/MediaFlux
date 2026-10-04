@@ -762,7 +762,7 @@ class RSSEngine:
             payload = json.loads(entry["payload"] or "{}")
         except (TypeError, ValueError):
             payload = {}
-        return str(payload.get("torrent_url") or payload.get("link") or "").strip()
+        return str(payload.get("torrent_url") or payload.get("link") or "").strip() if isinstance(payload, dict) else ""
 
     @classmethod
     def _download_input(cls, entry, torrent_url: str):
@@ -910,6 +910,7 @@ class RSSEngine:
                 qb_runtime_config=runtime,
                 qb_task_id_hint=infohash if method == "qb" else "",
                 rss_item_id=int(entry["rss_item_id"]),
+                rss_entry_id=entry_id,
                 log_path=_safe_download_source_marker(torrent_url),
             )
             request_id = int(submission.get("request_id") or 0)

@@ -552,12 +552,16 @@ CREATE TABLE IF NOT EXISTS rss_entries (
     failure_retryable INTEGER NOT NULL DEFAULT 0,
     retry_count INTEGER NOT NULL DEFAULT 0,
     failed_at TEXT,
+    download_request_key TEXT NOT NULL DEFAULT '',
+    download_backend TEXT NOT NULL DEFAULT '',
     pub_date TEXT,
     guid TEXT,
     payload TEXT,                    -- 原始 JSON
     created_at TEXT NOT NULL,
     FOREIGN KEY (rss_item_id) REFERENCES rss_items(id)
 );
+CREATE INDEX IF NOT EXISTS idx_rss_entries_download_request
+    ON rss_entries(download_request_key, download_backend);
 CREATE INDEX IF NOT EXISTS idx_rss_entries_status_processed
     ON rss_entries(status, processed);
 CREATE INDEX IF NOT EXISTS idx_rss_entries_subscription_status
