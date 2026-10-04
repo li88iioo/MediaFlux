@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,7 +39,151 @@ def make_paths(root: Path) -> RuntimePaths:
     )
 
 
+_LIFECYCLE_RESTORE_SCRIPT = r"""
+import tests
+import asyncio
+import subprocess
+import sys
+import threading
+from pathlib import Path
+from unittest.mock import patch
+from app import config, database as db
+from app.modules import backup, media_proxy
+from app.runtime_paths import RuntimePaths
+
+root = Path(sys.argv[1])
+archive = Path(sys.argv[2])
+stop_succeeds = sys.argv[3] == "1"
+paths = RuntimePaths(root / "program", root / "data", root / "config", root / "cache", root / "logs", root / "strm", root / "trash")
+paths.ensure_writable_dirs()
+paths.env_file.write_text("WEB_PORT=1258\n", encoding="utf-8")
+config.PATHS = paths
+config.ENV_FILE = paths.env_file
+config._cache = None
+db.configure_database(paths.database_path, test_mode=True)
+db.init_db()
+db.kv_set("audit.restore_boundary", "archived-state")
+backup.create_backup(paths, output=archive)
+db.kv_set("audit.restore_boundary", "live-before-stop")
+
+started = threading.Event()
+release = threading.Event()
+worker_errors = []
+worker = None
+
+def write_after_stop_timeout():
+    started.set()
+    if not release.wait(20):
+        worker_errors.append("worker release timeout")
+        return
+    db.kv_set("audit.restore_boundary", "late-worker-write")
+
+def start_workers():
+    global worker
+    worker = threading.Thread(target=write_after_stop_timeout, daemon=True)
+    worker.start()
+    assert started.wait(5)
+
+def stop_workers():
+    if not stop_succeeds:
+        return False
+    release.set()
+    worker.join(5)
+    return not worker.is_alive()
+
+class FakeProxyManager:
+    async def start(self):
+        return None
+    async def stop(self):
+        return None
+
+import app.main as main
+async def exercise():
+    with (
+        patch.object(main, "start_background_services", side_effect=start_workers),
+        patch.object(main, "stop_background_services", side_effect=stop_workers),
+        patch.object(media_proxy, "get_media_proxy_manager", return_value=FakeProxyManager()),
+        patch.object(media_proxy, "start_signed_media_probe_runtime"),
+        patch.object(media_proxy, "shutdown_signed_media_probe_runtime", return_value=True),
+    ):
+        async with main.app.router.lifespan_context(main.app):
+            assert worker.is_alive()
+
+asyncio.run(exercise())
+main.app.state.release_startup_lifecycle_guard()
+main.app.state.release_startup_lifecycle_guard()
+restore_script = r'''
+import tests
+import sys
+from pathlib import Path
+from app.modules.backup import BackupError, restore_backup
+from app.runtime_paths import RuntimePaths
+root = Path(sys.argv[1])
+paths = RuntimePaths(root / "program", root / "data", root / "config", root / "cache", root / "logs", root / "strm", root / "trash")
+try:
+    restore_backup(paths, Path(sys.argv[2]))
+except BackupError as exc:
+    if "服务正在运行" not in str(exc):
+        raise
+    print("restore blocked by live lifecycle")
+    raise SystemExit(27)
+print("restore succeeded")
+'''
+restored = subprocess.run([sys.executable, "-c", restore_script, str(root), str(archive)], capture_output=True, text=True, timeout=30)
+if stop_succeeds:
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert db.kv_get("audit.restore_boundary") == "archived-state"
+else:
+    assert restored.returncode == 27, restored.stdout + restored.stderr
+    assert worker.is_alive()
+    release.set()
+    worker.join(5)
+    assert not worker.is_alive()
+    assert not worker_errors, worker_errors
+    assert db.kv_get("audit.restore_boundary") == "late-worker-write"
+"""
+
+
 class BackupTests(unittest.TestCase):
+    def _run_lifecycle_restore_case(self, root: Path, *, stop_succeeds: bool) -> Path:
+        archive = root / "synthetic-backup.zip"
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                _LIFECYCLE_RESTORE_SCRIPT,
+                str(root),
+                str(archive),
+                "1" if stop_succeeds else "0",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return archive
+
+    def test_failed_stop_keeps_restore_blocked_until_old_writer_process_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = self._run_lifecycle_restore_case(root, stop_succeeds=False)
+            paths = make_paths(root)
+            previous_path = database.DB_PATH
+            previous_test_mode = database._configured_test_mode
+            try:
+                database.configure_database(paths.database_path, test_mode=True)
+                self.assertEqual(database.kv_get("audit.restore_boundary"), "late-worker-write")
+                restore_backup(paths, archive)
+                database.configure_database(paths.database_path, test_mode=True)
+                self.assertEqual(database.kv_get("audit.restore_boundary"), "archived-state")
+            finally:
+                database.configure_database(previous_path, test_mode=previous_test_mode)
+
+    def test_successful_lifespan_stop_releases_restore_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self._run_lifecycle_restore_case(root, stop_succeeds=True)
+
     def test_create_backup_rejects_authoritative_runtime_outputs(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))
@@ -140,33 +286,27 @@ class BackupTests(unittest.TestCase):
     def test_background_app_releases_startup_guard_when_late_construction_fails(self) -> None:
         from app import main
 
-        events: list[str] = []
+        with tempfile.TemporaryDirectory() as directory:
+            paths = make_paths(Path(directory))
+            paths.ensure_writable_dirs()
+            with patch.object(main.config, "PATHS", paths), patch.object(
+                main, "_secret_key", return_value="test-secret"
+            ), patch.object(
+                main,
+                "FastAPI",
+                side_effect=RuntimeError("late app construction failure"),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "late app construction failure"
+                ):
+                    main.create_app(start_background=True)
 
-        @contextmanager
-        def lifecycle_guard(_paths):
-            events.append("enter")
+            # 工厂失败发生在进入 ASGI lifespan 之前，真实文件锁也必须已释放。
+            lock = CrossProcessLock("runtime-lifecycle", directory=paths.data_dir)
             try:
-                yield
+                self.assertTrue(lock.acquire(blocking=False))
             finally:
-                events.append("exit")
-
-        with patch(
-            "app.modules.backup.runtime_lifecycle_guard",
-            side_effect=lifecycle_guard,
-        ), patch(
-            "app.modules.backup.recover_pending_restore",
-            return_value=False,
-        ), patch.object(
-            main, "_secret_key", return_value="test-secret"
-        ), patch.object(
-            main,
-            "FastAPI",
-            side_effect=RuntimeError("late app construction failure"),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "late app construction failure"):
-                main.create_app(start_background=True)
-
-        self.assertEqual(events, ["enter", "exit"])
+                lock.release()
 
     def test_normal_startup_guard_unregisters_atexit_callback_when_released(self) -> None:
         from app import main

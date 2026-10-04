@@ -6,7 +6,7 @@ import atexit
 import hmac
 import os
 import threading
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from urllib.parse import parse_qs
 
 import uvicorn
@@ -497,29 +497,29 @@ def create_app(*, start_background: bool = False) -> FastAPI:
     # 完成恢复，否则本进程会拿着恢复前后的混合快照运行到下一次重启。
     from app.modules.backup import recover_pending_restore, runtime_lifecycle_guard
 
-    startup_guard = runtime_lifecycle_guard(config.PATHS) if start_background else None
+    startup_guard = ExitStack()
     startup_guard_state_lock = threading.Lock()
-    startup_guard_released = startup_guard is None
+    startup_guard_released = not start_background
+    startup_guard_writers_stopped = True
     startup_guard_atexit_registered = False
 
     def release_startup_guard() -> None:
         nonlocal startup_guard_released, startup_guard_atexit_registered
         with startup_guard_state_lock:
-            if startup_guard_released:
+            if startup_guard_released or not startup_guard_writers_stopped:
                 return
             startup_guard_released = True
-        assert startup_guard is not None
         try:
-            startup_guard.__exit__(None, None, None)
+            startup_guard.close()
         finally:
             if startup_guard_atexit_registered:
                 atexit.unregister(release_startup_guard)
                 startup_guard_atexit_registered = False
 
-    if startup_guard is not None:
-        startup_guard.__enter__()
+    if start_background:
+        startup_guard.enter_context(runtime_lifecycle_guard(config.PATHS))
     try:
-        if startup_guard is not None:
+        if start_background:
             recovered = recover_pending_restore(
                 config.PATHS,
                 lifecycle_lock_held=True,
@@ -539,9 +539,12 @@ def create_app(*, start_background: bool = False) -> FastAPI:
         raise
 
     @asynccontextmanager
-    async def runtime_lifespan(_app: FastAPI):
+    async def lifespan(_app: FastAPI):
+        nonlocal startup_guard_writers_stopped
         _app.state.ready = False
-        with runtime_lifecycle_guard(config.PATHS):
+        with ExitStack() as lifetime:
+            lifetime.callback(release_startup_guard)
+            lifetime.enter_context(runtime_lifecycle_guard(config.PATHS))
             database.init_db()
             try:
                 from app.modules.strm import parse_strm_sources
@@ -618,6 +621,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                 # 后台媒体订阅线程可能立即使用全局 Indexer；必须先绑定其唯一
                 # 异步运行循环，避免启动窗口内创建跨循环的 HTTP 客户端。
                 if start_background:
+                    startup_guard_writers_stopped = False
                     start_signed_media_probe_runtime()
                     start_background_services()
                     await proxy_manager.start()
@@ -625,6 +629,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                 yield
             finally:
                 _app.state.ready = False
+                shutdown_complete = startup_guard_writers_stopped
                 # 先停止会调用 discovery/indexer 的后台生产者及工作线程，
                 # 再释放其运行时，避免关机窗口内出现资源已关闭但巡检仍在访问。
                 from app.indexers.runtime import begin_indexer_shutdown
@@ -641,8 +646,10 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                         runtime_safe_to_close = await asyncio.to_thread(
                             stop_background_services
                         )
+                        shutdown_complete = bool(runtime_safe_to_close)
                     except Exception as exc:
                         runtime_safe_to_close = False
+                        shutdown_complete = False
                         logger.warning(
                             "停止后台服务失败，保留运行时直到进程退出 type=%s",
                             type(exc).__name__,
@@ -671,6 +678,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                             try:
                                 closed = closer()
                             except Exception as exc:
+                                shutdown_complete = False
                                 logger.warning(
                                     "关闭 %s 运行时失败 type=%s",
                                     label,
@@ -678,6 +686,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                                 )
                             else:
                                 if closed is False:
+                                    shutdown_complete = False
                                     logger.warning(
                                         "关闭 %s 运行时尚未完成，已保留资源供后续重试",
                                         label,
@@ -685,6 +694,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                         try:
                             await shutdown_indexer_service()
                         except Exception as exc:
+                            shutdown_complete = False
                             logger.warning(
                                 "关闭 indexer 运行时失败 type=%s",
                                 type(exc).__name__,
@@ -705,6 +715,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                             await proxy_manager.stop()
                             proxy_runtime_stopped = True
                         except Exception as exc:
+                            shutdown_complete = False
                             logger.warning(
                                 "关闭媒体反代运行时失败 type=%s",
                                 type(exc).__name__,
@@ -716,10 +727,12 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                                 5.0,
                             )
                             if not probe_runtime_stopped:
+                                shutdown_complete = False
                                 logger.warning(
                                     "媒体直链探测线程仍在收尾，已停止新任务准入"
                                 )
                         except Exception as exc:
+                            shutdown_complete = False
                             logger.warning(
                                 "关闭媒体直链探测线程池失败 type=%s",
                                 type(exc).__name__,
@@ -739,14 +752,7 @@ def create_app(*, start_background: bool = False) -> FastAPI:
                         indexer_event_loop.set_exception_handler(
                             previous_exception_handler
                         )
-
-    @asynccontextmanager
-    async def lifespan(_app: FastAPI):
-        try:
-            async with runtime_lifespan(_app):
-                yield
-        finally:
-            release_startup_guard()
+                    startup_guard_writers_stopped = shutdown_complete
 
     try:
         app = FastAPI(title="MediaFlux", docs_url=None, redoc_url=None, lifespan=lifespan)
