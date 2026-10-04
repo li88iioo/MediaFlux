@@ -1721,7 +1721,6 @@ from app.repositories.download_requests import (  # noqa: E402,F401
     bind_media_download_admission_request,
     bind_pending_download_request_owner,
     claim_failed_share_transfer_request,
-    clear_download_request_attention,
     clear_download_request_attentions,
     count_download_logs,
     count_download_requests_requiring_attention,

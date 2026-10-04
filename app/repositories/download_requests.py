@@ -1,6 +1,7 @@
 """下载日志与统一下载请求的数据访问。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
@@ -605,66 +606,44 @@ def list_download_requests_requiring_attention(
         ).fetchall()
 
 
-def clear_download_request_attention(request_id: int) -> str:
-    """确认并隐藏一条待处理告警，同时保留原始状态、错误与下载日志。"""
-    timestamp = db.now()
-    note = "用户已将本记录移出待处理；原状态、错误与下载日志均保留"
-    with db.get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        cur = conn.execute(
-            "UPDATE download_requests SET attention_cleared_at=?,attention_clear_note=?,updated_at=? "
-            f"WHERE id=? AND COALESCE(attention_cleared_at,'')='' AND ({_DOWNLOAD_ATTENTION_BASE_WHERE})",
-            (timestamp, note, timestamp, int(request_id)),
-        )
-        if cur.rowcount == 1:
-            return "cleared"
-        row = conn.execute(
-            "SELECT attention_cleared_at FROM download_requests WHERE id=?",
-            (int(request_id),),
-        ).fetchone()
-        if not row:
-            return "not_found"
-        if str(row["attention_cleared_at"] or ""):
-            return "already_cleared"
-        return "not_attention"
-
-
-def clear_download_request_attentions(request_ids: list[int]) -> dict[str, list[int]]:
-    """原子确认多条待处理告警，保留原请求、错误、日志、任务与文件。"""
+def clear_download_request_attentions(
+    request_ids: list[int], *, batch: bool = True,
+) -> dict[str, list[int]]:
+    """统一确认告警；batch 只区分审计文案，不改变事务、状态与文件边界。"""
     normalized = list(dict.fromkeys(
         int(value) for value in request_ids if int(value) > 0
     ))
-    result = {
-        "cleared": [],
-        "already_cleared": [],
-        "not_attention": [],
-        "not_found": [],
-    }
+    result = {"cleared": [], "already_cleared": [], "not_attention": [], "not_found": []}
     if not normalized:
         return result
     timestamp = db.now()
-    note = "用户已批量将本记录移出待处理；原状态、错误与下载日志均保留"
+    note = f"用户已{'批量' if batch else ''}将本记录移出待处理；原状态、错误与下载日志均保留"
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        for request_id in normalized:
-            cur = conn.execute(
-                "UPDATE download_requests SET attention_cleared_at=?,attention_clear_note=?,updated_at=? "
-                f"WHERE id=? AND COALESCE(attention_cleared_at,'')='' AND ({_DOWNLOAD_ATTENTION_BASE_WHERE})",
-                (timestamp, note, timestamp, request_id),
+        rows = {
+            int(row["id"]): row for row in conn.execute(
+                "SELECT id,attention_cleared_at,"
+                f"({_DOWNLOAD_ATTENTION_BASE_WHERE}) AS needs_attention "
+                "FROM download_requests WHERE id IN (SELECT value FROM json_each(?))",
+                (json.dumps(normalized),),
             )
-            if cur.rowcount == 1:
-                result["cleared"].append(request_id)
-                continue
-            row = conn.execute(
-                "SELECT attention_cleared_at FROM download_requests WHERE id=?",
-                (request_id,),
-            ).fetchone()
-            if not row:
-                result["not_found"].append(request_id)
+        }
+        for request_id in normalized:
+            row = rows.get(request_id)
+            if row is None:
+                state = "not_found"
             elif str(row["attention_cleared_at"] or ""):
-                result["already_cleared"].append(request_id)
+                state = "already_cleared"
             else:
-                result["not_attention"].append(request_id)
+                state = "cleared" if row["needs_attention"] else "not_attention"
+            result[state].append(request_id)
+        if result["cleared"]:
+            # 同一写事务内按当前快照分类，整批一次写入；不逐条重复试写/查询。
+            conn.execute(
+                "UPDATE download_requests SET attention_cleared_at=?,attention_clear_note=?,updated_at=? "
+                "WHERE id IN (SELECT value FROM json_each(?))",
+                (timestamp, note, timestamp, json.dumps(result["cleared"])),
+            )
     return result
 
 

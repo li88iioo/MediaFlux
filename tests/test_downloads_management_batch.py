@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+import threading
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -95,6 +97,119 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(db.count_download_logs(), 1)
         self.assertEqual(db.list_download_logs()[0]["id"], log_id)
         self.assertIn("批量", db.get_download_request(first)["attention_clear_note"])
+
+    def test_batch_clear_uses_bounded_sql_and_preserves_all_other_fields(self):
+        request_ids = [self._attention(f"query-budget:{index}") for index in range(80)]
+        self.assertEqual(
+            db.clear_download_request_attentions(request_ids[30:50])["cleared"],
+            request_ids[30:50],
+        )
+        for request_id in request_ids[50:]:
+            db.update_download_request(request_id, status="pending", qb_status="")
+        before = {request_id: dict(db.get_download_request(request_id)) for request_id in request_ids}
+        log_id = db.add_download_log("qb", title="审计记录", request_id=request_ids[0])
+        headers = self._headers()
+        statements = []
+        original_connect = db._connect
+
+        def connect():
+            conn = original_connect()
+            conn.set_trace_callback(statements.append)
+            return conn
+
+        with patch.object(db, "_connect", side_effect=connect):
+            response = self.client.post(
+                "/api/downloads/issues/batch/clear", headers=headers,
+                json={"request_ids": request_ids + list(range(999900, 999920))},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            "ok": True, "requested": 100, "cleared": 30,
+            "already_cleared": 20, "skipped": 50,
+        })
+        for request_id, original in before.items():
+            current = dict(db.get_download_request(request_id))
+            if request_id in request_ids[:30]:
+                self.assertTrue(current["attention_cleared_at"])
+                self.assertEqual(current["attention_clear_note"], "用户已批量将本记录移出待处理；原状态、错误与下载日志均保留")
+                for field in ("attention_cleared_at", "attention_clear_note", "updated_at"):
+                    current[field] = original[field]
+            self.assertEqual(current, original)
+        self.assertEqual([row["id"] for row in db.list_download_logs()], [log_id])
+        queries = [sql for sql in statements if "download_requests" in sql.lower()
+                   and sql.lstrip().upper().startswith(("SELECT", "UPDATE"))]
+        self.assertLessEqual(len(queries), 2, f"100条记录执行了{len(queries)}条下载请求SQL")
+
+    def test_single_clear_preserves_response_note_and_missing_status(self):
+        request_id = self._attention("single-clear:contract")
+        headers = self._headers()
+        path = f"/api/downloads/issues/{request_id}/clear"
+        first = self.client.post(path, headers=headers)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json(), {
+            "ok": True, "request_id": request_id,
+            "already_cleared": False, "message": "已移出待处理",
+        })
+        self.assertEqual(
+            db.get_download_request(request_id)["attention_clear_note"],
+            "用户已将本记录移出待处理；原状态、错误与下载日志均保留",
+        )
+        snapshot = dict(db.get_download_request(request_id))
+        repeated = self.client.post(path, headers=headers)
+        self.assertEqual(repeated.json(), {**first.json(), "already_cleared": True})
+        self.assertEqual(dict(db.get_download_request(request_id)), snapshot)
+        for missing in (0, -1, 999999):
+            with self.subTest(missing=missing):
+                response = self.client.post(f"/api/downloads/issues/{missing}/clear", headers=headers)
+                self.assertEqual(response.status_code, 404)
+
+    def test_batch_clear_sql_failure_rolls_back_every_record(self):
+        ids = [self._attention(f"clear-rollback:{index}") for index in range(3)]
+        before = [dict(db.get_download_request(request_id)) for request_id in ids]
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_attention_clear BEFORE UPDATE OF attention_cleared_at "
+                f"ON download_requests WHEN NEW.id={ids[1]} "
+                "BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END"
+            )
+        try:
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "synthetic write failure"):
+                db.clear_download_request_attentions(ids)
+            self.assertEqual([dict(db.get_download_request(request_id)) for request_id in ids], before)
+        finally:
+            with db.get_conn() as conn:
+                conn.execute("DROP TRIGGER reject_attention_clear")
+
+    def test_single_and_batch_clear_share_one_serialized_decision(self):
+        ids = [self._attention(f"clear-race:{index}") for index in range(5)]
+        gate = threading.Barrier(3)
+        results, errors = [], []
+
+        def clear(batch):
+            try:
+                gate.wait(timeout=5)
+                results.append((batch, db.clear_download_request_attentions(
+                    ids if batch else ids[:1], batch=batch,
+                )))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=clear, args=(batch,)) for batch in (False, True)]
+        for thread in threads:
+            thread.start()
+        gate.wait(timeout=5)
+        for thread in threads:
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(len(result["cleared"]) for _, result in results), 5)
+        self.assertEqual(sum(len(result["already_cleared"]) for _, result in results), 1)
+        for batch, result in results:
+            for request_id in result["cleared"]:
+                self.assertEqual(
+                    db.get_download_request(request_id)["attention_clear_note"],
+                    f"用户已{'批量' if batch else ''}将本记录移出待处理；原状态、错误与下载日志均保留",
+                )
 
     def test_batch_clear_logs_deletes_only_selected_audit_rows(self):
         request_id = self._attention("batch-log:request")

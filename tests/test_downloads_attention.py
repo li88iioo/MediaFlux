@@ -729,9 +729,9 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         request_id = _create_interrupted_request()
         before = db.get_download_request(request_id)
 
-        result = db.clear_download_request_attention(request_id)
+        result = db.clear_download_request_attentions([request_id], batch=False)
 
-        self.assertEqual(result, "cleared")
+        self.assertEqual(result["cleared"], [request_id])
         self.assertEqual(db.count_download_requests_requiring_attention(), 0)
         self.assertEqual(db.get_dashboard_automation_summary()["downloads_review"], 0)
         after = db.get_download_request(request_id)
@@ -741,7 +741,10 @@ class DownloadAttentionDatabaseTests(IsolatedDatabaseTestCase):
         self.assertEqual(after["organize_error"], before["organize_error"])
         self.assertTrue(after["attention_cleared_at"])
         self.assertIn("原状态", after["attention_clear_note"])
-        self.assertEqual(db.clear_download_request_attention(request_id), "already_cleared")
+        self.assertEqual(
+            db.clear_download_request_attentions([request_id], batch=False)["already_cleared"],
+            [request_id],
+        )
 
 
 class DownloadAttentionApiTests(IsolatedDatabaseTestCase):

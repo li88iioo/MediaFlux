@@ -553,15 +553,15 @@ def resubmit_issue(
 def clear_issue(request_id: int, request: Request):
     """仅确认并隐藏待处理告警，不删除任务、文件、请求或日志。"""
     require_api_login(request)
-    result = db.clear_download_request_attention(request_id)
-    if result == "not_found":
+    result = db.clear_download_request_attentions([request_id], batch=False)
+    if result["not_found"] or not any(result.values()):
         return api_error("待处理请求不存在", 404)
-    if result == "not_attention":
+    if result["not_attention"]:
         return api_error("该请求当前无需处理", 409)
     return api_response({
         "ok": True,
         "request_id": int(request_id),
-        "already_cleared": result == "already_cleared",
+        "already_cleared": bool(result["already_cleared"]),
         "message": "已移出待处理",
     })
 

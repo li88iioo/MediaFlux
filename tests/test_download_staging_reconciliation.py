@@ -190,7 +190,7 @@ class DownloadStagingReconciliationTests(IsolatedDatabaseTestCase):
                 if mutation == 'duplicate':
                     self.request('duplicate', 'stage')
                 elif mutation == 'hidden':
-                    self.assertEqual(db.clear_download_request_attention(self.request_id), 'cleared')
+                    self.assertEqual(db.clear_download_request_attentions([self.request_id], batch=False)['cleared'], [self.request_id])
                 elif mutation == 'cleared':
                     db.update_download_request(self.request_id, organize_status='cleared')
                 elif mutation == 'delete_unknown':
