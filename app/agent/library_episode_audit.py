@@ -367,8 +367,8 @@ def _tmdb_snapshot(
     deadline_exhausted = False
 
     for season_number in season_numbers[:_MAX_TMDB_SEASONS]:
-        if time.monotonic() >= deadline_at:
-            deadline_exhausted = True
+        deadline_exhausted = time.monotonic() >= deadline_at
+        if deadline_exhausted or remote_count >= _MAX_TMDB_EPISODES:
             truncated = True
             break
         _consume_request_budget(request_budget)
@@ -403,9 +403,6 @@ def _tmdb_snapshot(
                 expected.add((season_number, episode_number))
             else:
                 future_count += 1
-        if remote_count >= _MAX_TMDB_EPISODES:
-            break
-
     return {
         "title": str(details.get("name") or "").strip()[:120],
         "expected": expected,

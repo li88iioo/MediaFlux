@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from datetime import date
 from unittest.mock import ANY, MagicMock, patch
 
 from app.clients.base import SeriesCandidate, SeriesEpisodeInventory, SeriesSearchResult
@@ -265,6 +266,57 @@ class MediaLibraryEpisodeAuditTests(unittest.TestCase):
             )
         }
         return client
+
+    @staticmethod
+    def _snapshot_with_season_sizes(season_sizes):
+        from app.agent.library_episode_audit import _tmdb_snapshot
+
+        # 仅以本地 MagicMock 合成 TMDB 响应，不访问真实 provider。
+        client = MagicMock()
+        client.tv_season_detail.side_effect = lambda _tmdb_id, season, **_kwargs: {
+            "episodes": [
+                {"episode_number": episode, "air_date": "2020-01-01"}
+                for episode in range(1, season_sizes[season] + 1)
+            ]
+        }
+        details = {
+            "name": "边界测试剧",
+            "seasons": [{"season_number": season} for season in season_sizes],
+        }
+        snapshot = _tmdb_snapshot(
+            client,
+            "12345",
+            as_of=date(2026, 8, 3),
+            deadline_at=time.monotonic() + 30,
+            request_budget={"remaining": 10},
+            details=details,
+        )
+        return snapshot, client
+
+    def test_tmdb_episode_cap_marks_unread_later_season_truncated(self):
+        snapshot, client = self._snapshot_with_season_sizes({1: 2000, 2: 1})
+
+        self.assertEqual(len(snapshot["expected"]), 2000)
+        self.assertNotIn((2, 1), snapshot["expected"])
+        self.assertTrue(snapshot["truncated"])
+        self.assertEqual(
+            [call.args[1] for call in client.tv_season_detail.call_args_list],
+            [1],
+        )
+
+    def test_tmdb_episode_cap_marks_overlong_current_season_truncated(self):
+        snapshot, client = self._snapshot_with_season_sizes({1: 2001})
+
+        self.assertEqual(len(snapshot["expected"]), 2000)
+        self.assertTrue(snapshot["truncated"])
+        self.assertEqual(client.tv_season_detail.call_count, 1)
+
+    def test_tmdb_episode_cap_exactly_reached_at_final_season_is_complete(self):
+        snapshot, client = self._snapshot_with_season_sizes({1: 2000})
+
+        self.assertEqual(len(snapshot["expected"]), 2000)
+        self.assertFalse(snapshot["truncated"])
+        self.assertEqual(client.tv_season_detail.call_count, 1)
 
     def test_cross_server_series_are_grouped_by_tmdb_id_and_missing_is_bounded(self):
         from app.agent.library_episode_audit import audit_library_episodes
