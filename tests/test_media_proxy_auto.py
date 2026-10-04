@@ -14,6 +14,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlsplit
 
+import anyio
 import httpx
 from fastapi.testclient import TestClient
 from starlette.datastructures import Headers
@@ -139,6 +140,178 @@ class _FakeGuangYaClient:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class _TrackingMediaStream(httpx.AsyncByteStream):
+    def __init__(self, *, failure: Exception | None = None, block_after_chunk: bool = False):
+        self.failure = failure
+        self.block_after_chunk = block_after_chunk
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b"media-chunk"
+        if self.failure is not None:
+            raise self.failure
+        if self.block_after_chunk:
+            await asyncio.Event().wait()
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class UpstreamStreamingResponseLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def _make_response(
+        self,
+        *,
+        failure: Exception | None = None,
+        block_after_chunk: bool = False,
+    ):
+        stream = _TrackingMediaStream(
+            failure=failure,
+            block_after_chunk=block_after_chunk,
+        )
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                206,
+                headers={"content-type": "video/mp4"},
+                stream=stream,
+                request=request,
+            )
+
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            trust_env=False,
+        )
+        self.addAsyncCleanup(client.aclose)
+        request = client.build_request("GET", "http://fixture.invalid/media")
+        response = await client.send(request, stream=True)
+        return client, response, stream
+
+    async def _serve(self, response, *, mode: str, spec_version: str = "2.3") -> None:
+        first_body_sent = asyncio.Event()
+
+        async def receive():
+            if mode == "disconnect":
+                await first_body_sent.wait()
+                return {"type": "http.disconnect"}
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if mode == "start-failure" and message["type"] == "http.response.start":
+                raise OSError("synthetic downstream start failure")
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_body_sent.set()
+                if mode == "body-failure":
+                    raise OSError("synthetic downstream send failure")
+                if mode == "cancel":
+                    cancel_scope.cancel()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": spec_version},
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/fixture/media",
+            "raw_path": b"/fixture/media",
+            "query_string": b"",
+            "root_path": "",
+            "headers": [],
+            "client": ("127.0.0.1", 10000),
+            "server": ("127.0.0.1", 8000),
+            "state": {},
+        }
+        with anyio.CancelScope() as cancel_scope:
+            await response(scope, receive, send)
+        if mode == "cancel":
+            self.assertTrue(cancel_scope.cancel_called)
+
+    @staticmethod
+    def _managed(response, *, owned_client=None):
+        return media_proxy._UpstreamStreamingResponse(
+            response,
+            upstream_client=owned_client,
+            status_code=response.status_code,
+            headers={"content-type": "video/mp4"},
+        )
+
+    async def test_send_start_failure_closes_response_and_owned_relay_client(self):
+        for spec_version in ("2.3", "2.4"):
+            with self.subTest(spec_version=spec_version):
+                client, upstream, stream = await self._make_response()
+                response = self._managed(upstream, owned_client=client)
+
+                with self.assertRaises((OSError, media_proxy.ClientDisconnect)):
+                    await self._serve(
+                        response,
+                        mode="start-failure",
+                        spec_version=spec_version,
+                    )
+
+                self.assertTrue(upstream.is_closed)
+                self.assertTrue(stream.closed)
+                self.assertTrue(client.is_closed)
+
+    async def test_mid_body_send_failure_closes_response_but_preserves_shared_pool(self):
+        for spec_version in ("2.3", "2.4"):
+            with self.subTest(spec_version=spec_version):
+                client, upstream, stream = await self._make_response()
+                response = self._managed(upstream)
+
+                with self.assertRaises((OSError, media_proxy.ClientDisconnect)):
+                    await self._serve(
+                        response,
+                        mode="body-failure",
+                        spec_version=spec_version,
+                    )
+
+                self.assertTrue(upstream.is_closed)
+                self.assertTrue(stream.closed)
+                self.assertFalse(client.is_closed)
+
+    async def test_upstream_read_error_closes_response_but_preserves_shared_pool(self):
+        client, upstream, stream = await self._make_response(
+            failure=httpx.ReadError("synthetic upstream reset")
+        )
+        response = self._managed(upstream)
+
+        with self.assertRaises(httpx.ReadError):
+            await self._serve(response, mode="read-error")
+
+        self.assertTrue(upstream.is_closed)
+        self.assertTrue(stream.closed)
+        self.assertFalse(client.is_closed)
+
+    async def test_asgi_client_disconnect_closes_response_but_preserves_shared_pool(self):
+        client, upstream, stream = await self._make_response(block_after_chunk=True)
+        response = self._managed(upstream)
+
+        await self._serve(response, mode="disconnect")
+
+        self.assertTrue(upstream.is_closed)
+        self.assertTrue(stream.closed)
+        self.assertFalse(client.is_closed)
+
+    async def test_anyio_cancel_scope_closes_response_and_owned_relay_client(self):
+        client, upstream, stream = await self._make_response(block_after_chunk=True)
+        response = self._managed(upstream, owned_client=client)
+
+        await self._serve(response, mode="cancel")
+
+        self.assertTrue(upstream.is_closed)
+        self.assertTrue(stream.closed)
+        self.assertTrue(client.is_closed)
+
+    async def test_normal_eof_closes_response_and_owned_relay_client(self):
+        client, upstream, stream = await self._make_response()
+        response = self._managed(upstream, owned_client=client)
+
+        await self._serve(response, mode="eof")
+
+        self.assertTrue(upstream.is_closed)
+        self.assertTrue(stream.closed)
+        self.assertTrue(client.is_closed)
 
 
 class HybridMediaProxyTests(unittest.TestCase):
@@ -1782,6 +1955,8 @@ class HybridMediaProxyTests(unittest.TestCase):
             TestClient(app, raise_server_exceptions=False) as client,
         ):
             response = client.get("/emby/redirect", follow_redirects=False)
+            shared_client = _FakeAsyncClient.instances[0]
+            self.assertFalse(shared_client.closed)
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(
@@ -1790,6 +1965,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         )
         self.assertNotIn("set-cookie", response.headers)
         self.assertTrue(upstream.closed)
+        self.assertTrue(shared_client.closed)
 
     def test_generic_same_origin_redirect_rejects_encoded_path_traversal(self):
         instance = {
@@ -4153,6 +4329,7 @@ class HybridMediaProxyTests(unittest.TestCase):
             "https://signed.invalid/native-probe-file",
         )
         self.assertEqual(_FakeGuangYaClient.calls, ["native-probe-file"])
+        self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
 
     def test_native_head_probe_preserves_range_conditions_and_avoids_cdn_406(self):
         media_proxy._dynamic_guangya_mappings.register(
@@ -4493,6 +4670,7 @@ class HybridMediaProxyTests(unittest.TestCase):
                 )
                 for value in invalid_ranges
             ]
+            self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
 
         for response in responses:
             self.assertEqual(response.status_code, 416)
@@ -5120,6 +5298,7 @@ class HybridMediaProxyTests(unittest.TestCase):
         self.assertEqual(_FakeAsyncClient.requests[1].headers["Host"], "edge.invalid")
         self.assertTrue(first.closed)
         self.assertTrue(second.closed)
+        self.assertTrue(all(client.closed for client in _FakeAsyncClient.instances))
 
     def test_signed_media_target_rejects_local_and_credentialed_urls(self):
         for value in (

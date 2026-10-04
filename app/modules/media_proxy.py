@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit
 
+import anyio
 import httpx
 import uvicorn
 from aiohttp import (
@@ -34,7 +35,6 @@ from aiohttp import (
 from aiohttp.abc import AbstractResolver
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
-from starlette.background import BackgroundTask
 from starlette.requests import ClientDisconnect
 
 from app import database
@@ -3837,23 +3837,33 @@ def media_content_type(filename: str) -> str:
     )
 
 
-async def _close_upstream(response: httpx.Response) -> None:
-    await response.aclose()
+class _UpstreamStreamingResponse(StreamingResponse):
+    """在整个 ASGI 发送生命周期内释放上游响应及可选的请求级 client。"""
 
+    def __init__(
+        self,
+        response: httpx.Response,
+        *,
+        upstream_client: httpx.AsyncClient | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._upstream_response = response
+        self._upstream_client = upstream_client
+        super().__init__(response.aiter_raw(), **kwargs)
 
-async def _stream_and_close(
-    response: httpx.Response,
-    client: httpx.AsyncClient | None = None,
-):
-    try:
-        async for chunk in response.aiter_raw():
-            yield chunk
-    finally:
+    async def __call__(self, scope, receive, send) -> None:
         try:
-            await response.aclose()
+            await super().__call__(scope, receive, send)
         finally:
-            if client is not None:
-                await client.aclose()
+            with anyio.CancelScope(shield=True):
+                try:
+                    await self.body_iterator.aclose()
+                finally:
+                    try:
+                        await self._upstream_response.aclose()
+                    finally:
+                        if self._upstream_client is not None:
+                            await self._upstream_client.aclose()
 
 
 def _binding_value(binding: Any, key: str) -> Any:
@@ -4789,8 +4799,9 @@ def create_proxy_app(
                         headers=response_headers,
                     )
                 streaming_client, relay_client = relay_client, None
-                return StreamingResponse(
-                    _stream_and_close(response, streaming_client),
+                return _UpstreamStreamingResponse(
+                    response,
+                    upstream_client=streaming_client,
                     status_code=response.status_code,
                     headers=response_headers,
                 )
@@ -5884,11 +5895,10 @@ def create_proxy_app(
                 headers=redirect_headers,
             )
 
-        return StreamingResponse(
-            response.aiter_raw(),
+        return _UpstreamStreamingResponse(
+            response,
             status_code=response.status_code,
             headers=_response_headers(response.headers),
-            background=BackgroundTask(_close_upstream, response),
         )
 
     return app
