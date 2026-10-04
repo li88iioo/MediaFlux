@@ -1521,13 +1521,19 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         wrapper = page.locator(".discovery-filter-control").first
         select = wrapper.locator("select")
 
-        def focus_metrics():
-            return page.evaluate("""() => {
+        def focus_metrics(*, focused=False):
+            # 等当前焦点和 CSS 过渡稳定后，在同一次浏览器求值中取得快照；
+            # 分开等待阴影再读取，可能跨过原生 select 的焦点/动画切换。
+            snapshot = page.wait_for_function("""focused => {
                 const wrapper = document.querySelector('.discovery-filter-control');
                 const select = wrapper.querySelector('select');
                 const rect = wrapper.getBoundingClientRect();
                 const style = getComputedStyle(wrapper);
                 const selectStyle = getComputedStyle(select);
+                if (focused && (document.activeElement !== select
+                    || !wrapper.matches(':focus-within')
+                    || wrapper.getAnimations().some(animation =>
+                        animation.pending || animation.playState === 'running'))) return false;
                 return {
                     rect: [rect.x, rect.y, rect.width, rect.height],
                     focusWithin: wrapper.matches(':focus-within'),
@@ -1538,12 +1544,16 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                     selectOutline: selectStyle.outlineStyle,
                     selectShadow: selectStyle.boxShadow,
                 };
-            }""")
+            }""", arg=focused)
+            try:
+                return snapshot.json_value()
+            finally:
+                snapshot.dispose()
 
         initial = focus_metrics()
         select.click()
-        page.wait_for_function("getComputedStyle(document.querySelector('.discovery-filter-control')).boxShadow.includes('1px inset')")
-        clicked = focus_metrics()
+        page.keyboard.press("Escape")
+        clicked = focus_metrics(focused=True)
         self.assertTrue(clicked["focusWithin"])
         self.assertIn("1px inset", clicked["wrapperShadow"])
         self.assertEqual(len(set(clicked["wrapperBorders"])), 1)
@@ -1555,8 +1565,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.evaluate("document.activeElement.blur()")
         page.locator("#discovery-search-submit").focus()
         page.keyboard.press("Tab")
-        page.wait_for_function("getComputedStyle(document.querySelector('.discovery-filter-control')).boxShadow.includes('1px inset')")
-        keyboard = focus_metrics()
+        keyboard = focus_metrics(focused=True)
         self.assertTrue(keyboard["focusWithin"])
         self.assertTrue(keyboard["active"])
         self.assertTrue(keyboard["focusVisible"])
