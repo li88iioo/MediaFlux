@@ -872,3 +872,36 @@ def test_provider_projection_preserves_dotted_name_without_relaxing_other_fields
         allow_open_url=True,
     )
     assert project_provider_value({"name": "/secret/Hidden.Show.mkv"})["name"] == ""
+
+
+@pytest.mark.parametrize("failure", ["timeout", "invalid_payload", "server_error"])
+def test_emby_counts_failure_reaches_agent_instead_of_zero_inventory(monkeypatch, failure):
+    import requests
+
+    profile = MediaServerProfile(
+        source="configured:emby", server_type="emby", label="Emby",
+        url="http://media.invalid", credential="test-only", enabled=True, user_id="viewer-1",
+    )
+    monkeypatch.setattr("app.agent.providers.media_server.list_configured_profiles", lambda: [profile])
+    paths = []
+
+    def get(_session, url, **_kwargs):
+        paths.append(url)
+        response = requests.Response()
+        response.status_code = 200
+        response.url = url
+        if url.endswith("/Items/Counts"):
+            if failure == "timeout":
+                raise requests.Timeout("synthetic unavailable upstream")
+            response.status_code = 503 if failure == "server_error" else 200
+            response._content = b"[]"
+        else:
+            assert url.endswith("/Users/viewer-1/Items")
+            response._content = b'{"TotalRecordCount":3200,"Items":[]}'
+        return response
+
+    monkeypatch.setattr(requests.Session, "get", get)
+    with pytest.raises(ProviderGatewayError) as error:
+        MediaServerProviderTransport().execute_read("configured:emby", "media.items.counts", {})
+    assert error.value.code == "provider_unavailable"
+    assert len(paths) == 2

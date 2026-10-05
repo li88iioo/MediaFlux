@@ -5,6 +5,8 @@ Emby 和 Jellyfin 10.x 的页面路由。
 """
 from __future__ import annotations
 
+import requests
+
 from app.clients.base import (
     Library,
     MediaItem,
@@ -300,16 +302,21 @@ class EmbyClient(MediaServerClient):
         return int(data.get("TotalRecordCount", 0) or 0)
 
     def get_media_counts(self) -> dict[str, int]:
-        """读取兼容节点媒体计数；旧 Emby 不支持 Counts 时保留总项数。"""
+        """读取计数；仅旧服务未提供端点时降级为总项数。"""
         total_items = max(0, int(self._total_items() or 0))
-        counts: dict = {}
         try:
-            payload = self._request(
+            counts = self._request(
                 "/Items/Counts", params={"userId": self._user_id()}
             )
-            counts = payload if isinstance(payload, dict) else {}
-        except Exception:
+        except requests.HTTPError as exc:
+            if (
+                exc.response is None
+                or exc.response.status_code not in {404, 405, 501}
+            ):
+                raise
             counts = {}
+        if not isinstance(counts, dict):
+            raise TypeError("媒体服务器计数响应无效")
         return {
             "total_items": total_items,
             "movie_count": max(0, int(counts.get("MovieCount", 0) or 0)),

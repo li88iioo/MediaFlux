@@ -5,6 +5,8 @@ import unittest
 from datetime import datetime
 from unittest.mock import Mock, patch
 
+import requests
+
 from app.clients.base import MediaItem
 from app.clients.emby import EmbyClient
 from app.clients.jellyfin import JellyfinClient
@@ -88,6 +90,51 @@ class DashboardMediaCountTests(unittest.TestCase):
             "/Items/Counts",
             params={"userId": "user-id"},
         )
+
+    def test_emby_temporary_counts_failure_is_not_reported_as_zero(self):
+        client = EmbyClient("http://legacy.local", "token")
+        client._cached_user_id = "user-id"
+        client._total_items = Mock(return_value=3200)
+        server_error = requests.Response()
+        server_error.status_code = 500
+        for failure in (
+            requests.Timeout("synthetic timeout"),
+            requests.HTTPError("synthetic server error", response=server_error),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                client._request = Mock(side_effect=failure)
+                with self.assertRaises(type(failure)):
+                    client.get_media_counts()
+
+    def test_emby_invalid_counts_payload_is_not_reported_as_zero(self):
+        client = EmbyClient("http://legacy.local", "token")
+        client._cached_user_id = "user-id"
+        client._total_items = Mock(return_value=3200)
+        client._request = Mock(return_value=[])
+
+        with self.assertRaisesRegex(TypeError, "计数响应无效"):
+            client.get_media_counts()
+
+    def test_emby_unsupported_counts_endpoint_keeps_total_only_fallback(self):
+        client = EmbyClient("http://legacy.local", "token")
+        client._cached_user_id = "user-id"
+        client._total_items = Mock(return_value=3200)
+        expected = {
+            "total_items": 3200,
+            "movie_count": 0,
+            "series_count": 0,
+            "episode_count": 0,
+        }
+        for status_code in (404, 405, 501):
+            with self.subTest(status_code=status_code):
+                response = requests.Response()
+                response.status_code = status_code
+                client._request = Mock(
+                    side_effect=requests.HTTPError(
+                        "unsupported", response=response
+                    )
+                )
+                self.assertEqual(client.get_media_counts(), expected)
 
     def test_library_media_counts_are_scoped_to_selected_library_and_user(self):
         expected = {
