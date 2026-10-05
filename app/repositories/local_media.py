@@ -1816,21 +1816,6 @@ def reset_local_media_task_if_current(
     )
 
 
-def delete_local_library_target(
-    source_id: int, category: str, *, owner: str = "admin"
-) -> bool:
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            "DELETE FROM local_library_targets WHERE source_id=? AND category=? AND owner=?",
-            (
-                int(source_id),
-                str(category or "").strip().lower(),
-                _local_media_owner(owner),
-            ),
-        )
-        return cur.rowcount == 1
-
-
 def _recover_after_restart(conn, timestamp: str, *, writer_available: bool) -> None:
     """只在调用方持有 writer 锁时恢复任务；关联请求始终投影权威状态。"""
     if writer_available:

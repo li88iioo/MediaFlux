@@ -31,6 +31,10 @@ class DatabaseModuleImportTests(unittest.TestCase):
             local_media._LOCAL_MEDIA_TERMINAL_TASK_STATUSES,
         )
 
+    def test_unused_single_target_delete_is_not_exported(self):
+        self.assertFalse(hasattr(local_media, "delete_local_library_target"))
+        self.assertFalse(hasattr(db, "delete_local_library_target"))
+
     def test_schema_and_migration_registry_have_one_owner(self):
         self.assertIs(db._SCHEMA, database_schema._SCHEMA)
         migrations = database_migrations._SCHEMA_MIGRATIONS
