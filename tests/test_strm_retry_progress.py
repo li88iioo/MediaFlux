@@ -893,6 +893,65 @@ class StrmRetrySourcePlanningAndConfigTests(IsolatedDatabaseTestCase):
 
         self.assertEqual(result["resolved"], 2)
 
+    def test_overlapping_source_retry_restores_each_failed_namespace(self):
+        for reverse in (False, True):
+            for retry_all in (False, True):
+                with self.subTest(reverse=reverse, retry_all=retry_all), tempfile.TemporaryDirectory() as root:
+                    sources = strm_module.plan_strm_sources([
+                        {"id": "outer", "name": "Outer"}, {"id": "inner", "name": "Inner"},
+                    ])
+                    video = GuangYaFile("shared-video", "Episode.mkv", False, 10, "etag", "inner")
+                    client = _TreeClient({
+                        "outer": [GuangYaFile("inner", "Show", True, parent_id="outer")],
+                        "inner": [video],
+                    })
+                    ids = [self._failure(source["id"], source["name"], video.file_id, video.name) for source in sources]
+                    runtime = {"sources": list(reversed(sources)) if reverse else sources,
+                               "strm_root": root, "base_url": "http://mediaflux.invalid"}
+                    if retry_all:
+                        result = strm_module.retry_all_strm_failures("", "generate", "manual", client=client, runtime_config=runtime)
+                    else:
+                        result = strm_module.retry_strm_failures(ids, "manual", client=client, runtime_config=runtime)
+                    self.assertEqual(result["resolved"], 2)
+                    for source in sources:
+                        rows = db.list_strm_index(source["source_key"])
+                        self.assertEqual(len(rows), 1)
+                        target = Path(rows[0]["strm_path"])
+                        self.assertTrue(target.is_file())
+                        self.assertIn(source["rel_prefix"], target.parts)
+                        self.assertIn("/playgy/shared-video/", target.read_text())
+                    self.assertTrue(all(row["status"] == "resolved" for row in db.list_strm_failures(status="all", ids=ids)))
+
+    def test_retry_does_not_relocate_from_an_unreadable_original_source(self):
+        sources = strm_module.plan_strm_sources([
+            {"id": "peer", "name": "Peer"}, {"id": "original", "name": "Original"},
+        ])
+        video = GuangYaFile("shared-video", "Episode.mkv", False, 10, "etag", "peer")
+        failure_id = self._failure("original", "Original", video.file_id, video.name)
+        client = _TreeClient({"peer": [video], "original": RuntimeError("scan failed")})
+        with tempfile.TemporaryDirectory() as root:
+            runtime = {"sources": sources, "strm_root": root, "base_url": "http://mediaflux.invalid"}
+            result = strm_module.retry_strm_failures([failure_id], "manual", client=client, runtime_config=runtime)
+            self.assertEqual(result["resolved"], 0)
+            self.assertEqual(result["deferred"], 1)
+            self.assertTrue(result["scan_incomplete"])
+            self.assertFalse(list(Path(root).rglob("*.strm")))
+        self.assertEqual(db.list_strm_failures(status="open", ids=[failure_id])[0]["source_id"], "original")
+
+    def test_retry_relocates_only_after_original_source_is_completely_checked(self):
+        sources = strm_module.plan_strm_sources([
+            {"id": "new", "name": "New"}, {"id": "old", "name": "Old"},
+        ])
+        video = GuangYaFile("moved", "Episode.mkv", False, 10, "etag", "new")
+        failure_id = self._failure("old", "Old", video.file_id, video.name)
+        client = _TreeClient({"new": [video], "old": []})
+        with tempfile.TemporaryDirectory() as root:
+            runtime = {"sources": sources, "strm_root": root, "base_url": "http://mediaflux.invalid"}
+            result = strm_module.retry_strm_failures([failure_id], "manual", client=client, runtime_config=runtime)
+            self.assertEqual(result["resolved"], 1)
+            self.assertIn("old", client.list_calls)
+            self.assertTrue((Path(root) / strm_module.STRM_SUBDIR / "New" / "Episode.strm").is_file())
+
     def test_moved_file_uses_new_source_prefix_and_namespace(self):
         old_source, new_source, peer_source = "old-source", "new-source-333333", "peer-444444"
         failure_id = self._failure(old_source, "旧来源", "moved", "Old.mkv")

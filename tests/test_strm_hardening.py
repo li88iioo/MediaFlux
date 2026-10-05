@@ -613,9 +613,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
             ],
         })
         lookup = strm_module._locate_retry_files(
-            client, [{"id": source_id, "rel_prefix": ""}], {"wanted"},
+            client, [{"id": source_id, "rel_prefix": ""}], {(source_id, "wanted")},
         )
-        self.assertIn("wanted", lookup.located)
+        self.assertIn((source_id, "wanted"), lookup.located)
         self.assertFalse(lookup.scan_incomplete)
         self.assertFalse(lookup.stopped)
         self.assertEqual(calls, {source_id: 1, "dir-a": 1})
@@ -666,9 +666,9 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 )
                 with clock:
                     lookup = strm_module._locate_retry_files(
-                        client, [{"id": "source", "rel_prefix": ""}], {"wanted"},
+                        client, [{"id": "source", "rel_prefix": ""}], {("source", "wanted")},
                     )
-                self.assertNotIn("wanted", lookup.located)
+                self.assertNotIn(("source", "wanted"), lookup.located)
                 self.assertTrue(lookup.scan_incomplete)
                 self.assertEqual(lookup.scan_limit_reason, reason)
                 self.assertLessEqual(lookup.entries, limits[1])
@@ -691,7 +691,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         client = PagingClient()
         with patch("app.modules.strm._scan_limits", return_value=(100, 1, 100, 60)):
             lookup = strm_module._locate_retry_files(
-                client, [{"id": "source", "rel_prefix": ""}], {"wanted"},
+                client, [{"id": "source", "rel_prefix": ""}], {("source", "wanted")},
             )
 
         self.assertEqual(client.yielded, 1)

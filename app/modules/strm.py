@@ -3080,7 +3080,7 @@ def capture_strm_retry_runtime_config() -> tuple[dict, str]:
 
 @dataclass(frozen=True)
 class _RetryLookupResult:
-    located: dict[str, tuple[GuangYaFile, str, dict[str, str]]]
+    located: dict[tuple[str, str], tuple[GuangYaFile, str, dict[str, str]]]
     directories: int
     entries: int
     scan_incomplete: bool
@@ -3091,54 +3091,54 @@ class _RetryLookupResult:
 def _locate_retry_files(
     client,
     sources: list[dict[str, str]],
-    wanted: set[str],
+    wanted: set[tuple[str, str]],
     *,
     should_stop: Callable[[], bool] | None = None,
 ) -> _RetryLookupResult:
-    """在有界目录树中重新定位失败项，并显式返回扫描完整性。"""
-    located: dict[str, tuple[GuangYaFile, str, dict[str, str]]] = {}
+    """按原来源定位失败项；原来源完整查无对象后才允许跨来源迁移。"""
+    located: dict[tuple[str, str], tuple[GuangYaFile, str, dict[str, str]]] = {}
+    remaining = set(wanted)
+    wanted_files = {file_id for _, file_id in wanted}
+    wanted_sources = {source_id for source_id, _ in wanted}
+    exhausted = wanted_sources - {str(source["id"]) for source in sources}
+    alternatives: dict[str, tuple[GuangYaFile, str, dict[str, str]]] = {}
     max_directories, max_entries, _max_candidates, deadline_seconds = _scan_limits()
     scan_deadline = time.monotonic() + deadline_seconds
-    directories = 0
-    entries = 0
-    scan_incomplete = False
+    directories = entries = 0
+    scan_incomplete = stopped = False
     scan_limit_reason = ""
-    stopped = False
 
     def mark_incomplete(reason: str) -> None:
         nonlocal scan_incomplete, scan_limit_reason
         scan_incomplete = True
-        if not scan_limit_reason:
-            scan_limit_reason = reason
-
-    def stop_requested() -> bool:
-        nonlocal stopped
-        if should_stop is not None and should_stop():
-            stopped = True
-            return True
-        return False
-
-    def deadline_exceeded() -> bool:
-        if time.monotonic() >= scan_deadline:
-            mark_incomplete("deadline")
-            return True
-        return False
+        scan_limit_reason = scan_limit_reason or reason
 
     abort_scan = False
-    for source in sources:
-        if abort_scan or wanted <= located.keys():
+
+    def scan_stop_requested() -> bool:
+        nonlocal stopped, abort_scan
+        if should_stop is not None and should_stop():
+            stopped = True
+        elif time.monotonic() >= scan_deadline:
+            mark_incomplete("deadline")
+        elif entries >= max_entries:
+            mark_incomplete("entries")
+        else:
+            return False
+        abort_scan = True
+        return True
+
+    for source in sorted(sources, key=lambda item: str(item["id"]) not in wanted_sources):
+        if abort_scan or not remaining:
             break
+        source_id = str(source["id"])
         try:
             prefix = str(source.get("rel_prefix") or "")
             initial = (safe_path_component(prefix),) if prefix else ()
-            stack: list[tuple[str, tuple[str, ...]]] = [(str(source["id"]), initial)]
+            stack = [(source_id, initial)]
             visited_dir_ids: set[str] = set()
-            while stack and not wanted <= located.keys():
-                if stop_requested():
-                    abort_scan = True
-                    break
-                if deadline_exceeded():
-                    abort_scan = True
+            while stack and remaining:
+                if scan_stop_requested():
                     break
                 if directories >= max_directories:
                     mark_incomplete("directories")
@@ -3149,34 +3149,12 @@ def _locate_retry_files(
                     continue
                 visited_dir_ids.add(dir_id)
                 directories += 1
-
-                def page_scan_stop_requested() -> bool:
-                    if stop_requested():
-                        return True
-                    if deadline_exceeded():
-                        return True
-                    if entries >= max_entries:
-                        mark_incomplete("entries")
-                        return True
-                    return False
-
-                items = client.iter_dir(
-                    dir_id,
-                    should_stop=page_scan_stop_requested,
-                    max_items=max_entries - entries,
-                )
-                child_dirs: list[tuple[str, tuple[str, ...]]] = []
-                items = iter(items)
-                while not wanted <= located.keys():
-                    if stop_requested():
-                        abort_scan = True
-                        break
-                    if deadline_exceeded():
-                        abort_scan = True
-                        break
-                    if entries >= max_entries:
-                        mark_incomplete("entries")
-                        abort_scan = True
+                items = iter(client.iter_dir(
+                    dir_id, should_stop=scan_stop_requested, max_items=max_entries - entries,
+                ))
+                child_dirs = []
+                while remaining:
+                    if scan_stop_requested():
                         break
                     try:
                         item = next(items)
@@ -3184,28 +3162,33 @@ def _locate_retry_files(
                         break
                     entries += 1
                     if item.is_dir:
-                        child_dirs.append((
-                            str(item.file_id),
-                            (*rel_parts, safe_path_component(item.name)),
-                        ))
-                    elif str(item.file_id) in wanted and str(item.file_id) not in located:
-                        rel_dir = str(Path(*rel_parts)) if rel_parts else ""
-                        located[str(item.file_id)] = (item, rel_dir, source)
+                        child_dirs.append((str(item.file_id), (*rel_parts, safe_path_component(item.name))))
+                    elif str(item.file_id) in wanted_files:
+                        key = (source_id, str(item.file_id))
+                        resolved = (item, str(Path(*rel_parts)) if rel_parts else "", source)
+                        alternatives.setdefault(key[1], resolved)
+                        if key in remaining:
+                            located[key] = resolved
+                            remaining.remove(key)
                 if abort_scan:
                     break
                 stack.extend(reversed(child_dirs))
+            if not abort_scan:
+                exhausted.add(source_id)
         except Exception as exc:
             mark_incomplete("directory_error")
-            logger.warning("重试重新解析来源失败 %s: %s", source["id"], exc)
-    if wanted <= located.keys():
+            logger.warning("重试重新解析来源失败 %s: %s", source_id, exc)
+        # 不可用的原来源不是“已移走”；不得借其它来源的副本虚报恢复成功。
+        for key in tuple(remaining):
+            if key[0] in exhausted and key[1] in alternatives:
+                located[key] = alternatives[key[1]]
+                remaining.remove(key)
+    if not remaining:
         scan_incomplete = False
         scan_limit_reason = ""
     return _RetryLookupResult(
-        located=located,
-        directories=directories,
-        entries=entries,
-        scan_incomplete=scan_incomplete,
-        scan_limit_reason=scan_limit_reason,
+        located=located, directories=directories, entries=entries,
+        scan_incomplete=scan_incomplete, scan_limit_reason=scan_limit_reason,
         stopped=stopped,
     )
 
@@ -3258,7 +3241,7 @@ def _process_claimed_strm_failures(
                     raise RuntimeError("STRM deferred 状态已变化，拒绝覆盖")
                 result["deferred"] += 1
                 continue
-            resolved = located.get(str(row["file_id"]))
+            resolved = located.get((str(row["source_id"]), str(row["file_id"])))
             if resolved is None:
                 if lookup.scan_incomplete or lookup.stopped:
                     deferred_error = (
@@ -3397,7 +3380,7 @@ def _retry_strm_failures_locked(
         lookup = _locate_retry_files(
             runtime_client,
             runtime["sources"],
-            {str(row["file_id"]) for row in rows},
+            {(str(row["source_id"]), str(row["file_id"])) for row in rows},
             should_stop=should_stop,
         )
         result.update({
@@ -3460,7 +3443,7 @@ def retry_all_strm_failures(
             "ok": False, "error": "STRM 同步或重试任务正在运行",
         }
     try:
-        snapshot: list[tuple[int, str]] = []
+        snapshot: list[tuple[int, str, str]] = []
         before_id: int | None = None
         while True:
             candidates = db.list_strm_failures(
@@ -3473,7 +3456,7 @@ def retry_all_strm_failures(
             if not candidates:
                 break
             snapshot.extend(
-                (int(row["id"]), str(row["file_id"])) for row in candidates
+                (int(row["id"]), str(row["source_id"]), str(row["file_id"])) for row in candidates
             )
             before_id = min(int(row["id"]) for row in candidates)
 
@@ -3491,7 +3474,7 @@ def retry_all_strm_failures(
             lookup = _locate_retry_files(
                 runtime_client,
                 runtime["sources"],
-                {file_id for _, file_id in snapshot},
+                {(source, file_id) for _, source, file_id in snapshot},
                 should_stop=should_stop,
             )
             result.update({
@@ -3509,7 +3492,7 @@ def retry_all_strm_failures(
             for offset in range(0, total, 1000):
                 batch = snapshot[offset:offset + 1000]
                 rows = db.claim_strm_failures(
-                    [failure_id for failure_id, _ in batch], limit=1000
+                    [failure_id for failure_id, _, _ in batch], limit=1000
                 )
                 result["batches"] += 1
                 result["matched"] += len(rows)
