@@ -165,12 +165,17 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
                 code, message, retryable = _safe_site_error(errors[site_id])
             else:
                 code, message, retryable = "unavailable", "站点未返回有效状态", True
+        if result.site_truncated_counts.get(site_id, 0):
+            hint = "达到候选上限，可细化片名、年份或季集后重搜"
+            message = f"{message}；{hint}" if message else hint
         page_state = page_states.get(site_id)
         payload.append({
             "site_id": site_id,
             "site_name": adapter.site_name,
             "status": status,
             "count": counts.get(site_id, 0),
+            "collected_count": result.site_collected_counts.get(site_id, counts.get(site_id, 0)),
+            "truncated_count": result.site_truncated_counts.get(site_id, 0),
             "visible_count": max(0, int(visible_counts.get(site_id, counts.get(site_id, 0)) or 0)),
             "message": message,
             "code": code,
@@ -198,6 +203,7 @@ def _search_payload(service, result) -> dict[str, Any]:
         "errors": [_public_provider_error(error) for error in result.errors],
         "site_statuses": _search_site_statuses(service, result),
         "partial": result.partial,
+        "truncated": any(result.site_truncated_counts.values()),
         "cached": result.cached,
         "has_more": bool(getattr(result, "has_more", False)),
         "complete": bool(getattr(result, "complete", True)),

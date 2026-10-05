@@ -349,6 +349,9 @@ def search_resources(
                    else "本轮未找到匹配资源，部分来源未完成，暂不能确认是否无资源")
     elif not items:
         summary = "已完成多站搜索，暂未找到匹配资源"
+    truncated = any(result.site_truncated_counts.values()) or len(result.items) > len(items)
+    if truncated:
+        summary += "；候选已按上限截取，可细化条件后重搜，不代表已穷尽资源"
     tool_result = ToolResult(
         ok=ok,
         status=status,
@@ -368,6 +371,9 @@ def search_resources(
             "partial": bool(result.partial),
             "cached": bool(result.cached),
             "has_more": bool(result.has_more),
+            "truncated": truncated,
+            "site_collected_counts": dict(result.site_collected_counts),
+            "site_truncated_counts": dict(result.site_truncated_counts),
         },
         evidence=[
             Evidence(

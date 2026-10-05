@@ -89,6 +89,7 @@ class GeneralAdapter(IndexerAdapter):
             errors=tuple(page.errors),
             source_statuses=tuple(page.source_statuses),
             complete=page.complete,
+            total_items=page.total_items,
         )
 
     def _cache_entry(self, member: IndexerAdapter, request: IndexerSearchRequest, *, allow_stale: bool = False) -> _CachedPage | None:

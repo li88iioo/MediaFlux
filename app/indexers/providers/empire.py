@@ -33,7 +33,8 @@ from .base import (
 
 _SEARCH_TIMEOUT_SECONDS = 8.0
 _DETAIL_TIMEOUT_SECONDS = 6.0
-_DETAIL_LIMIT = 3
+_DETAIL_CONCURRENCY = 3
+_DETAIL_CANDIDATE_LIMIT = 6
 _MAGNET_CANDIDATE = re.compile(r"magnet:\?[^\s\"'<>]+", re.IGNORECASE)
 _DATE = re.compile(r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}")
 _DYGANG_DETAIL_PATH = re.compile(r"^/[a-z0-9]+/\d{4,8}/[a-z0-9_-]+\.html?$", re.IGNORECASE)
@@ -108,47 +109,57 @@ class EmpireAdapter(DirectResultAdapter):
         if not results:
             return IndexerPage(items=[], page=1, has_more=False, pagination_supported=False)
 
-        tasks = [
-            asyncio.create_task(self._fetch_detail(result, result_url))
-            for result in results[:_DETAIL_LIMIT]
-        ]
-        done: set[asyncio.Task] = set()
-        try:
-            done, _ = await asyncio.wait(
-                tasks,
-                timeout=min(
-                    _DETAIL_TIMEOUT_SECONDS,
-                    max(0.0, deadline - loop.time()),
-                ),
-            )
-        finally:
-            unfinished = [task for task in tasks if not task.done()]
-            for task in unfinished:
-                task.cancel()
-            if unfinished:
-                cleanup = asyncio.gather(*unfinished, return_exceptions=True)
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    await cleanup
-                    raise
-
+        detail_deadline = min(deadline, loop.time() + _DETAIL_TIMEOUT_SECONDS)
         items: list[IndexerItem] = []
         errors: list[IndexerProviderError] = []
         seen_infohashes: set[str] = set()
-        for result, task in zip(results[:_DETAIL_LIMIT], tasks):
-            if task not in done:
-                errors.append(self._detail_error(IndexerTimeout("detail timed out")))
-                continue
-            found, error = task.result()
-            if error is not None:
-                errors.append(error)
-            for item in found:
-                infohash = magnet_infohash(item.magnet)
-                if infohash is None or infohash.lower() in seen_infohashes:
+        stop_detail_search = False
+
+        for offset in range(0, len(results), _DETAIL_CONCURRENCY):
+            batch = results[offset : offset + _DETAIL_CONCURRENCY]
+            if loop.time() >= detail_deadline:
+                errors.append(self._detail_error(IndexerTimeout("detail budget exhausted")))
+                break
+            tasks = [
+                asyncio.create_task(self._fetch_detail(result, result_url))
+                for result in batch
+            ]
+            done: set[asyncio.Task] = set()
+            try:
+                done, _ = await asyncio.wait(
+                    tasks,
+                    timeout=max(0.0, detail_deadline - loop.time()),
+                )
+            finally:
+                unfinished = [task for task in tasks if not task.done()]
+                for task in unfinished:
+                    task.cancel()
+                if unfinished:
+                    cleanup = asyncio.gather(*unfinished, return_exceptions=True)
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                        raise
+
+            batch_timed_out = len(done) < len(tasks)
+            for result, task in zip(batch, tasks):
+                if task not in done:
+                    errors.append(self._detail_error(IndexerTimeout("detail timed out")))
                     continue
-                seen_infohashes.add(infohash.lower())
-                items.append(item)
+                found, error, hard_stop = task.result()
+                if error is not None:
+                    errors.append(error)
+                stop_detail_search |= hard_stop
+                for item in found:
+                    infohash = magnet_infohash(item.magnet)
+                    if infohash is None or infohash.lower() in seen_infohashes:
+                        continue
+                    seen_infohashes.add(infohash.lower())
+                    items.append(item)
+
+            if items or stop_detail_search or batch_timed_out:
+                break
 
         return IndexerPage(
             items=items,
@@ -192,7 +203,7 @@ class EmpireAdapter(DirectResultAdapter):
                 continue
             seen_urls.add(detail_url)
             results.append(_SearchResult(title=title, detail_url=detail_url))
-            if len(results) == _DETAIL_LIMIT:
+            if len(results) == _DETAIL_CANDIDATE_LIMIT:
                 break
 
         if results:
@@ -204,7 +215,7 @@ class EmpireAdapter(DirectResultAdapter):
 
     async def _fetch_detail(
         self, result: _SearchResult, referer: str,
-    ) -> tuple[list[IndexerItem], IndexerProviderError | None]:
+    ) -> tuple[list[IndexerItem], IndexerProviderError | None, bool]:
         try:
             response = await self.http.get(
                 result.detail_url,
@@ -214,7 +225,9 @@ class EmpireAdapter(DirectResultAdapter):
             require_html_response(response)
             body = response.body.decode("gbk", errors="replace")
             if is_likely_challenge_page(body):
-                raise IndexerInvalidResponse("detail page is a challenge page")
+                return [], self._detail_error(
+                    IndexerInvalidResponse("detail page is a challenge page"),
+                ), True
             soup = BeautifulSoup(body, "lxml")
             if not body.strip() or not (
                 soup.get_text(" ", strip=True)
@@ -229,7 +242,7 @@ class EmpireAdapter(DirectResultAdapter):
             ]
             if not valid:
                 # ed2k、网盘及纯介绍页不是解析失败，只是不提供本适配器支持的磁力下载。
-                return [], None
+                return [], None, False
 
             published_at = self._extract_date(body)
             items = [
@@ -245,11 +258,13 @@ class EmpireAdapter(DirectResultAdapter):
                 )
                 for magnet, link_text in valid
             ]
-            return items, None
+            return items, None, False
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return [], self._detail_error(exc)
+            return [], self._detail_error(exc), isinstance(
+                exc, (IndexerRateLimited, IndexerSecurityError),
+            )
 
     @staticmethod
     def _extract_magnets(body: str, soup: BeautifulSoup) -> list[tuple[str, str]]:

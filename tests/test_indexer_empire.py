@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from unittest.mock import patch
 from urllib.parse import unquote_to_bytes
 
 from app.indexers.errors import IndexerInvalidResponse, IndexerUnavailable
 from app.indexers.http import IndexerHttpResponse
 from app.indexers.models import IndexerSearchRequest
-from app.indexers.providers.empire import EmpireAdapter
+from app.indexers.providers.empire import EmpireAdapter, _DETAIL_TIMEOUT_SECONDS
 
 _DYGANG_RESULT = '''
 <html><body>
@@ -260,6 +261,180 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(page.items), 1)
         self.assertEqual(page.items[0].magnet and page.items[0].magnet.split("&", 1)[0], f"magnet:?xt=urn:btih:{_VALID_HASH}")
 
+    async def test_fourth_candidate_fills_when_first_three_have_no_magnet(self):
+        search_url = "https://www.dygang.tv/e/search/result.html"
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 5)]
+        search = "".join(
+            f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
+            for index, path in enumerate(paths, start=1)
+        )
+        details = {
+            f"https://www.dygang.tv{path}": _response(
+                f"https://www.dygang.tv{path}",
+                (
+                    f'<a href="magnet:?xt=urn:btih:{_VALID_HASH}&amp;dn=第四候选">资源</a>'
+                    if index == 4
+                    else f"<html><body>第 {index} 个详情只有介绍</body></html>"
+                ),
+            )
+            for index, path in enumerate(paths, start=1)
+        }
+        details[f"https://www.dygang.tv{paths[1]}"] = IndexerUnavailable("fixture failure")
+        http = _EmpireHttp(_response(search_url, search), details)
+
+        page = await _adapter("dygang", http).search(IndexerSearchRequest.create("电影"))
+
+        self.assertEqual(len(http.get_calls), 4)
+        self.assertEqual([item.detail_url for item in page.items], [f"https://www.dygang.tv{paths[3]}"])
+        self.assertEqual(len(page.errors), 1)
+        self.assertEqual(page.errors[0].code, "unavailable")
+
+    async def test_successful_first_batch_does_not_fetch_later_candidates(self):
+        search_url = "https://www.dygang.tv/e/search/result.html"
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 5)]
+        search = "".join(
+            f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
+            for index, path in enumerate(paths, start=1)
+        )
+        details = {
+            f"https://www.dygang.tv{path}": _response(
+                f"https://www.dygang.tv{path}",
+                (
+                    f'<a href="magnet:?xt=urn:btih:{_VALID_HASH}&amp;dn=首批资源">资源</a>'
+                    if index == 1
+                    else f"<html><body>第 {index} 个详情</body></html>"
+                ),
+            )
+            for index, path in enumerate(paths, start=1)
+        }
+        http = _EmpireHttp(_response(search_url, search), details)
+
+        page = await _adapter("dygang", http).search(IndexerSearchRequest.create("电影"))
+
+        self.assertEqual(len(http.get_calls), 3)
+        self.assertEqual(len(page.items), 1)
+
+    async def test_expired_shared_deadline_prevents_creating_next_batch(self):
+        search_url = "https://www.dygang.tv/e/search/result.html"
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 7)]
+        search = "".join(
+            f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
+            for index, path in enumerate(paths, start=1)
+        )
+        details = {
+            f"https://www.dygang.tv{path}": _response(
+                f"https://www.dygang.tv{path}", f"<html><body>第 {index} 个详情</body></html>",
+            )
+            for index, path in enumerate(paths, start=1)
+        }
+        http = _EmpireHttp(_response(search_url, search), details)
+        loop = asyncio.get_running_loop()
+        real_loop_time = loop.time
+        deadline_offset = [0.0]
+        real_wait = asyncio.wait
+        wait_calls = 0
+
+        def controlled_time():
+            return real_loop_time() + deadline_offset[0]
+
+        async def wait_then_expire_deadline(
+            tasks, *, timeout=None, return_when=asyncio.ALL_COMPLETED,
+        ):
+            nonlocal wait_calls
+            done, pending = await real_wait(
+                tasks, timeout=timeout, return_when=return_when,
+            )
+            wait_calls += 1
+            if wait_calls == 1:
+                # 首批正常完成但没有磁力时，共享详情预算已经耗尽。
+                deadline_offset[0] = _DETAIL_TIMEOUT_SECONDS + 1
+            return done, pending
+
+        with patch.object(loop, "time", side_effect=controlled_time):
+            with patch(
+                "app.indexers.providers.empire.asyncio.wait",
+                side_effect=wait_then_expire_deadline,
+            ):
+                page = await _adapter("dygang", http).search(
+                    IndexerSearchRequest.create("电影"),
+                )
+
+        self.assertEqual([error.code for error in page.errors], ["timeout"])
+        self.assertEqual(wait_calls, 1)
+        self.assertEqual(len(http.get_calls), 3)
+        self.assertEqual(http.active_details, 0)
+        self.assertEqual(page.items, [])
+
+    async def test_total_detail_requests_are_capped_at_six(self):
+        search_url = "https://www.dygang.tv/e/search/result.html"
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 10)]
+        search = "".join(
+            f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
+            for index, path in enumerate(paths, start=1)
+        )
+        details = {
+            f"https://www.dygang.tv{path}": _response(
+                f"https://www.dygang.tv{path}", f"<html><body>第 {index} 个详情</body></html>",
+            )
+            for index, path in enumerate(paths, start=1)
+        }
+        http = _EmpireHttp(_response(search_url, search), details)
+
+        await _adapter("dygang", http).search(IndexerSearchRequest.create("电影"))
+
+        self.assertEqual(len(http.get_calls), 6)
+        self.assertLessEqual(http.max_active_details, 3)
+
+    async def test_rate_limit_or_challenge_stops_follow_up_candidates(self):
+        search_url = "https://www.dygang.tv/e/search/result.html"
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 5)]
+        search = "".join(
+            f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
+            for index, path in enumerate(paths, start=1)
+        )
+
+        for stop_response, expected_code in (
+            (_response("unused", "限流", status=429), "rate_limited"),
+            (_response("unused", "<html><body>Just a moment... verify you are human</body></html>"), "invalid_response"),
+        ):
+            with self.subTest(expected_code=expected_code):
+                details = {
+                    f"https://www.dygang.tv{path}": _response(
+                        f"https://www.dygang.tv{path}", "<html><body>无磁力详情</body></html>",
+                    )
+                    for path in paths
+                }
+                details[f"https://www.dygang.tv{paths[0]}"] = stop_response
+                http = _EmpireHttp(_response(search_url, search), details)
+
+                page = await _adapter("dygang", http).search(IndexerSearchRequest.create("电影"))
+
+                self.assertEqual(len(http.get_calls), 3)
+                self.assertEqual(page.errors[0].code, expected_code)
+
+    async def test_detail_timeout_cancels_batch_and_does_not_start_follow_up(self):
+        search_url = "https://www.dygang.tv/e/search/result.html"
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 5)]
+        search = "".join(
+            f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
+            for index, path in enumerate(paths, start=1)
+        )
+        details = {
+            f"https://www.dygang.tv{path}": _response(
+                f"https://www.dygang.tv{path}", "<html><body>无磁力详情</body></html>",
+            )
+            for path in paths
+        }
+        http = _EmpireHttp(_response(search_url, search), details, block_details=True)
+
+        with patch("app.indexers.providers.empire._DETAIL_TIMEOUT_SECONDS", 0.01):
+            page = await _adapter("dygang", http).search(IndexerSearchRequest.create("电影"))
+
+        self.assertEqual(len(http.get_calls), 3)
+        self.assertEqual(http.cancelled_details, 3)
+        self.assertEqual(http.active_details, 0)
+        self.assertEqual(len(page.errors), 3)
+
     async def test_later_pages_return_empty_without_network(self):
         http = _EmpireHttp(None)
 
@@ -271,7 +446,7 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_external_cancellation_cancels_and_reaps_all_detail_tasks(self):
         search_url = "https://www.dygang.tv/e/search/result.html"
-        paths = [f"/ys/2025/{index}.htm" for index in range(1, 4)]
+        paths = [f"/ys/2025/{index}.htm" for index in range(1, 5)]
         search = "".join(
             f'<a class="classlinkclass" href="{path}">电影 {index}</a>'
             for index, path in enumerate(paths, start=1)

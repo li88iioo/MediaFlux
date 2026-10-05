@@ -558,7 +558,7 @@ class IndexerAPITests(unittest.TestCase):
     def test_search_uses_aggregated_has_more_instead_of_guessing_from_items(self):
         self.authenticate()
         service = FakeIndexerService()
-        service.search = AsyncMock(return_value=SimpleNamespace(
+        service.search = AsyncMock(return_value=AggregatedIndexerResult(
             query="Demo",
             page=1,
             items=[service.result_store.item],
@@ -612,6 +612,21 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(statuses["sukebei"]["status"], "disabled")
         self.assertIs(statuses["sukebei"]["retryable"], False)
         self.assertNotIn("magnet", response.text)
+
+    def test_capped_search_reports_counts_without_false_site_failure(self):
+        service = SimpleNamespace(registry=FakeStatusRegistry(), enabled_site_ids=frozenset({"nyaa"}))
+        result = AggregatedIndexerResult(
+            query="Demo", page=1, items=[], sites_attempted=("nyaa",), sites_succeeded=("nyaa",),
+            site_item_counts={"nyaa": 40}, site_collected_counts={"nyaa": 60}, site_truncated_counts={"nyaa": 20},
+        )
+        payload = indexers_api._search_payload(service, result)
+        self.assertTrue(payload["truncated"])
+        self.assertFalse(payload["partial"])
+        self.assertFalse(payload["has_more"])
+        status = next(row for row in payload["site_statuses"] if row["site_id"] == "nyaa")
+        self.assertEqual((status["collected_count"], status["truncated_count"]), (60, 20))
+        self.assertEqual(status["status"], "success")
+        self.assertIn("候选上限", status["message"])
 
     def test_search_status_preserves_failed_source_when_another_source_succeeds(self):
         service = SimpleNamespace(registry=FakeStatusRegistry(), enabled_site_ids=frozenset({"btbtla", "mikan"}))

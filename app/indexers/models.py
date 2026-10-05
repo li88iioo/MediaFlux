@@ -338,6 +338,7 @@ class IndexerPage:
     errors: tuple[IndexerProviderError, ...] = ()
     source_statuses: tuple[IndexerSourceStatus, ...] = ()
     complete: bool = True
+    total_items: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,6 +369,8 @@ class AggregatedIndexerResult:
     cached: bool = False
     complete: bool = True
     source_statuses: dict[str, tuple[IndexerSourceStatus, ...]] = field(default_factory=dict)
+    site_collected_counts: dict[str, int] = field(default_factory=dict)
+    site_truncated_counts: dict[str, int] = field(default_factory=dict)
 
     def clone(self, *, cached: bool | None = None) -> "AggregatedIndexerResult":
         return AggregatedIndexerResult(
@@ -387,6 +390,8 @@ class AggregatedIndexerResult:
             cached=self.cached if cached is None else cached,
             complete=self.complete,
             source_statuses=dict(self.source_statuses),
+            site_collected_counts=dict(self.site_collected_counts),
+            site_truncated_counts=dict(self.site_truncated_counts),
         )
 
 

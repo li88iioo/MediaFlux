@@ -502,6 +502,25 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         result = await service.search_media(IndexerMediaSearchRequest.create(title="Demo", year=2026, sort_mode="source_order"))
         self.assertEqual([row.title for row in result.items], ["Other 2020", "Demo 2026"])
 
+    async def test_candidate_cap_is_visible_without_inventing_pagination_or_outage(self):
+        rows = [item("btbtla", f"Demo 2026 version{n}", magnet=f"magnet:?xt=urn:btih:{n + 1:040x}")
+                for n in range(60)]
+        service = self.service([FakeAdapter("btbtla", rows)], max_results_per_site=40)
+        request = IndexerMediaSearchRequest.create(title="Demo", year=2026)
+        first = await service.search_media(request)
+        cached = await service.search_media(request)
+        self.assertTrue(cached.cached)
+        for result in (first, cached):
+            self.assertEqual(len(result.items), 40)
+            self.assertEqual(result.site_collected_counts, {"btbtla": 60})
+            self.assertEqual(result.site_truncated_counts, {"btbtla": 20})
+            self.assertFalse(result.partial)
+            self.assertFalse(result.has_more)
+            self.assertEqual(result.errors, [])
+        cached.site_truncated_counts["btbtla"] = 999
+        again = await service.search_media(request)
+        self.assertEqual(again.site_truncated_counts["btbtla"], 20)
+
     async def test_requested_sort_mode_controls_final_aggregate_order(self):
         newer = item(
             "nyaa",

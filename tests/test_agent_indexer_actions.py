@@ -1,8 +1,8 @@
 """Media Agent 多站资源搜索与确认提交测试。"""
 
 from __future__ import annotations
-
 import asyncio
+
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
@@ -269,6 +269,30 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertEqual(result.data["sites_attempted"], ["sukebei"])
         self.assertEqual(result.data["sites_succeeded"], ["sukebei"])
         self.assertEqual(result.data["items"][0]["site_id"], "sukebei")
+
+    def test_search_reports_service_and_tool_caps_without_site_failure(self):
+        service = FakeIndexerService(partial=False)
+        for service_capped in (True, False):
+            with self.subTest(service_capped=service_capped):
+                result = AggregatedIndexerResult(query="Demo", page=1, items=[service.item],
+                                                 sites_attempted=("nyaa",), sites_succeeded=("nyaa",))
+                if service_capped:
+                    result.site_collected_counts = {"nyaa": 60}
+                    result.site_truncated_counts = {"nyaa": 20}
+                else:
+                    result.items = [service.item, service.item]
+                with (
+                    patch("app.agent.indexer_actions.config.get_bool", return_value=True),
+                    patch("app.agent.indexer_actions.get_indexer_service", return_value=service),
+                    patch.object(service, "search_media", new=AsyncMock(return_value=result)),
+                ):
+                    output = search_resources({"title": "Demo", "original_title": "", "english_title": "",
+                                               "aliases": [], "year": None, "media_type": "",
+                                               "page": 1, "sites": ["nyaa"], "limit": 1})
+                self.assertTrue(output.ok)
+                self.assertEqual(output.status, "success")
+                self.assertTrue(output.data["truncated"])
+                self.assertIn("不代表已穷尽", output.summary)
 
     def test_search_resources_returns_only_public_projection(self):
         service = FakeIndexerService()

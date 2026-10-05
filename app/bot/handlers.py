@@ -496,6 +496,9 @@ def _resource_search_view(
         "<b>🔎 媒体资源搜索</b>",
         f"<b>{query}</b> · {scope} · {len(items)} 项",
     ]
+    if any(site.get("truncated_count", 0) for site in snapshot["sites"]
+           if not selected_site or site.get("site_id") == selected_site):
+        lines.append("部分来源达到候选上限，可细化片名、年份或季集后重搜；不代表已穷尽资源。")
     if visible:
         lines.append("")
         for offset, item in enumerate(visible, start=start + 1):

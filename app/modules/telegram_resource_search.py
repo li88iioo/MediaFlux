@@ -379,6 +379,7 @@ def _search_snapshot(service, result) -> dict[str, Any]:
                 "site_name": adapter.site_name,
                 "status": status,
                 "count": counts.get(site_id, 0),
+                "truncated_count": result.site_truncated_counts.get(site_id, 0),
                 "message": message,
             }
         )

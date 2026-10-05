@@ -207,6 +207,14 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
             chat_id="100", user_id="9", query="作品 A", items=_items(), sites=_sites()
         )
 
+    def test_candidate_cap_hint_survives_session_and_source_filter(self):
+        sites = _sites()
+        sites[0]["truncated_count"] = 20
+        session_id = self.store.create_session(chat_id="100", user_id="9", query="Demo", items=_items(), sites=sites)
+        for site_id, expected in (("", True), (sites[0]["site_id"], True), (sites[1]["site_id"], False)):
+            text, _ = _resource_search_view(_TELEBOT, session_id, chat_id="100", user_id="9", site_id=site_id, store=self.store)
+            self.assertEqual("候选上限" in text, expected)
+
     def test_site_filter_changes_visible_resources_and_keeps_error_reason(self):
         text, markup = _resource_search_view(
             _TELEBOT,

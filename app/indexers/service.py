@@ -431,6 +431,8 @@ class IndexerService:
         succeeded: list[str] = []
         errors: list[IndexerProviderError] = []
         site_item_counts: dict[str, int] = {}
+        site_collected_counts: dict[str, int] = {}
+        site_truncated_counts: dict[str, int] = {}
         site_visible_counts: dict[str, int] = {site_id: 0 for site_id in selected}
         site_queries: dict[str, str] = {}
         site_attempt_counts: dict[str, int] = {}
@@ -506,6 +508,9 @@ class IndexerService:
                 enumerate(provider_items),
                 key=lambda entry: self._candidate_sort_key((site_index, entry[0], entry[1]), sort_mode),
             )][: self.max_results_per_site]
+            collected = max(len(page_result.items), page_result.total_items or 0)
+            site_collected_counts[site_id] = collected
+            site_truncated_counts[site_id] = max(0, collected - len(provider_items))
             site_item_counts[site_id] = 0
             for provider_index, candidate in enumerate(provider_items):
                 if candidate.site_id != site_id:
@@ -554,6 +559,8 @@ class IndexerService:
             sites_attempted=selected,
             sites_succeeded=tuple(succeeded),
             site_item_counts=site_item_counts,
+            site_collected_counts=site_collected_counts,
+            site_truncated_counts=site_truncated_counts,
             site_visible_counts=site_visible_counts,
             site_queries=site_queries,
             site_attempt_counts=site_attempt_counts,
@@ -1030,6 +1037,7 @@ class IndexerService:
                 site_id=site_id,
                 page=IndexerPage(
                     items=ranked_items[: self.max_results_per_site],
+                    total_items=len(ranked_items),
                     page=page,
                     has_more=has_more,
                     pagination_supported=pagination_supported,

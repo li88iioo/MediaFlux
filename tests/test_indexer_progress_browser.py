@@ -343,6 +343,20 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").count(), 2)
         self.assertIn("本轮 2 条结果", page.locator(".discovery-resource-site-status[aria-live='polite']").get_attribute("aria-label"))
 
+    def test_candidate_cap_is_information_not_failure_or_hidden_load_more(self):
+        page = self.open_profile()
+        payload = self.progress_payload([
+            {"result_id": "r1", "site_id": "alpha", "title": "Demo"},
+        ], [{"site_id": "alpha", "site_name": "Alpha", "status": "success", "message": "达到候选上限，可细化条件"}], complete=True)
+        payload["truncated"] = True
+        payload["has_more"] = False
+        self.push_event(page, 0, "complete", payload)
+        page.wait_for_function("window.__readerCancelCalls.includes(0)")
+        progress = page.locator(".discovery-resource-site-status[aria-live='polite']")
+        self.assertIn("候选上限", progress.get_attribute("aria-label"))
+        self.assertNotIn("失败", progress.get_attribute("aria-label"))
+        self.assertEqual(page.locator("[data-resource-result-id]").count(), 1)
+
     def test_source_diagnostic_focus_survives_progress_and_completion(self):
         page = self.open_profile()
         items = [{"result_id": "r1", "site_id": "alpha", "title": "资源"}]

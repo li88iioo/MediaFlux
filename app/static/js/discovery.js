@@ -2123,7 +2123,7 @@
             state.resourceSearchProgress = {
                 phase: 'complete',
                 status: 'success',
-                text: `搜索完成 · 本轮 ${count} 条结果${failures || partial ? '（部分站点未成功）' : ''}`,
+                text: `搜索完成 · 本轮 ${count} 条结果${failures || partial ? '（部分站点未成功）' : ''}${payload?.truncated ? ' · 部分来源达到候选上限，可细化条件' : ''}`,
             };
         } else if (failures === statuses.length && failures > 0 && !waiting) {
             state.resourceSearchProgress = {phase: 'error', status: 'error', text: '综合搜索失败 · 所有站点均未成功'};
@@ -2437,7 +2437,7 @@
                 chip.setAttribute('aria-label', accessibleLabel);
             }
             chip.title = accessibleLabel;
-            if (['error', 'empty'].includes(status) || (status === 'partial' && site.message)
+            if (['error', 'empty'].includes(status) || site.message
                 || asArray(site.diagnostics).length) {
                 attachDetails(chip, [{site, siteId, status}]);
             }
