@@ -11,11 +11,6 @@ RUN npm run build:static -- --input /src/app/static --output /out
 
 FROM python:3.13-slim@sha256:ffb752e139c0a19692a43af8d8523b274222dd68eebad5d583b45c2201c6e30a
 
-ARG VERSION_REF=v0.0.0-dev
-ARG GIT_SHA=development
-ARG SOURCE_DATE_EPOCH
-ARG TARGETARCH
-
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -48,6 +43,12 @@ COPY --from=static-builder /out/ /app/app/static/
 COPY mediaflux.py /app/
 COPY packaging/scripts/docker-entrypoint.sh /usr/local/bin/mediaflux-entrypoint
 COPY packaging/scripts/generate_build_info.py /tmp/generate_build_info.py
+
+# 版本信息仅影响元数据层，不能让每次提交都重装系统包和 Python 依赖。
+ARG VERSION_REF=v0.0.0-dev
+ARG GIT_SHA=development
+ARG SOURCE_DATE_EPOCH
+ARG TARGETARCH
 
 RUN case "${TARGETARCH:-amd64}" in \
       amd64) MEDIAFLUX_ARCH=x86_64 ;; \

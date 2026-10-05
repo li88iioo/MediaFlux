@@ -50,6 +50,15 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertNotRegex(self.dockerfile, r"--workers(?:=|\s+)[2-9]")
         self.assertIn("# 后台调度器与 Telegram Bot 采用进程内单例", self.dockerfile)
 
+    def test_build_identity_arguments_are_scoped_after_dependency_installation(self) -> None:
+        dependencies = self.dockerfile.index("RUN pip install --no-cache-dir --require-hashes")
+        metadata = self.dockerfile.index('RUN case "${TARGETARCH:-amd64}"')
+        for name in ("VERSION_REF", "GIT_SHA", "SOURCE_DATE_EPOCH", "TARGETARCH"):
+            with self.subTest(argument=name):
+                declaration = self.dockerfile.index(f"ARG {name}")
+                self.assertGreater(declaration, dependencies)
+                self.assertLess(declaration, metadata)
+
     def test_image_declares_compatible_writable_runtime_paths(self) -> None:
         expected = {
             "MEDIAFLUX_DATA_DIR": "/app/db",
