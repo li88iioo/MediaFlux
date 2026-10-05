@@ -280,17 +280,28 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.queries, ["Fanren Xiu Xian Chuan S01E192", "凡人修仙传"])
         self.assertEqual(len(result.items), 1)
 
-    async def test_keyword_auto_aliases_are_ranked_and_do_not_expand_other_sites(self):
-        primary = "A Record of a Mortal's Journey to Immortality"
+    async def test_keyword_search_does_not_guess_aliases_or_reuse_media_alias_cache(self):
+        primary = "Caller Supplied English Title"
         nyaa = QueryAwareAdapter("nyaa", {primary: [
             item("nyaa", primary + " S01E192 [4K]", magnet=f"magnet:?xt=urn:btih:{HASH}"),
         ]})
         mikan = QueryAwareAdapter("mikan", {})
-        result = await self.service([nyaa, mikan]).search("凡人修仙传")
-        self.assertEqual(nyaa.queries[:2], [primary, "凡人修仙传"])
+        service = self.service([nyaa, mikan])
+        result = await service.search("凡人修仙传")
+        self.assertEqual(nyaa.queries, ["凡人修仙传"])
         self.assertEqual(mikan.queries, ["凡人修仙传"])
-        self.assertIn("title_contains", result.items[0].match_reasons)
-        self.assertEqual(result.query, "凡人修仙传")
+        self.assertEqual(result.items, [])
+        media = IndexerMediaSearchRequest.create(title="凡人修仙传", english_title=primary)
+        explicit = await service.search_media(media, ("nyaa",))
+        self.assertEqual(nyaa.queries, ["凡人修仙传", primary, "凡人修仙传"])
+        self.assertIn("title_contains", explicit.items[0].match_reasons)
+        plain = await service.search_media(IndexerMediaSearchRequest.create(title="凡人修仙传"), ("nyaa",))
+        self.assertEqual(plain.items, [])
+        self.assertEqual(nyaa.queries[-1], "凡人修仙传")
+        cached = await service.search("凡人修仙传")
+        self.assertTrue(cached.cached)
+        self.assertEqual(cached.items, [])
+        self.assertEqual(nyaa.calls, 4)
 
     async def test_nyaa_bilingual_rate_limit_keeps_earlier_verified_candidates(self):
         media = IndexerMediaSearchRequest.create(title="凡人修仙传", english_title="Fanren Xiu Xian Chuan")

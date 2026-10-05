@@ -32,7 +32,7 @@ from .models import (
 )
 from .providers.base import magnet_infohash
 from .providers.base import page_observer, report_page
-from .query_plan import build_site_queries, enrich_media_aliases, needs_bilingual_search
+from .query_plan import build_site_queries, needs_bilingual_search
 from .ranking import annotate_clusters, match_priority, rank_item
 from .registry import IndexerRegistry
 from .release import parse_indexer_release_position
@@ -152,13 +152,7 @@ class IndexerService:
             sort_mode=sort_mode,
         )
         selected = self._select_sites(site_ids)
-        media = IndexerMediaSearchRequest.create(title=request.query, page=page, sort_mode=request.sort_mode)
-        enriched = enrich_media_aliases(media) if "nyaa" in selected else media
-        ranking_context = enriched if enriched != media else None
-        plans = {
-            site_id: build_site_queries(site_id, enriched) if site_id == "nyaa" and ranking_context else (request.query,)
-            for site_id in selected
-        }
+        plans = {site_id: (request.query,) for site_id in selected}
         cache_key = (
             "query",
             request.query,
@@ -172,7 +166,7 @@ class IndexerService:
             selected=selected,
             plans=plans,
             cache_key=cache_key,
-            ranking_context=ranking_context,
+            ranking_context=None,
             sort_mode=request.sort_mode,
             on_progress=on_progress,
         )
@@ -187,12 +181,11 @@ class IndexerService:
         if not isinstance(request, IndexerMediaSearchRequest):
             raise IndexerValidationError("invalid media search request")
         selected = self._select_sites(site_ids)
-        ranking_context = enrich_media_aliases(request) if "nyaa" in selected else request
-        plans = {site_id: build_site_queries(site_id, ranking_context if site_id == "nyaa" else request) for site_id in selected}
+        plans = {site_id: build_site_queries(site_id, request) for site_id in selected}
         plan_identity = tuple((site_id, plans[site_id]) for site_id in selected)
         cache_key = (
             "media",
-            ranking_context.cache_identity(),
+            request.cache_identity(),
             request.page,
             selected,
             plan_identity,
@@ -203,7 +196,7 @@ class IndexerService:
             selected=selected,
             plans=plans,
             cache_key=cache_key,
-            ranking_context=ranking_context,
+            ranking_context=request,
             sort_mode=request.sort_mode,
             on_progress=on_progress,
         )

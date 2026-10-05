@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import replace
 import re
 
 from .models import MAX_SEARCH_TEXT_LENGTH, IndexerMediaSearchRequest
@@ -9,28 +8,6 @@ from .models import MAX_SEARCH_TEXT_LENGTH, IndexerMediaSearchRequest
 _HAN = re.compile(r"[\u3400-\u9fff]")
 _JAPANESE_KANA = re.compile(r"[\u3040-\u30ff]")
 _LATIN = re.compile(r"[A-Za-z]")
-_DONGHUA_ALIASES = {
-    "师兄啊师兄": ("My Senior Brother is Too Steady", "My Senior Brother"),
-    "大主宰": ("The Great Ruler",),
-    "沧元图": ("The Demon Hunter",),
-    "诛仙": ("Jade Dynasty",),
-    "凡人修仙传": (
-        "A Record of a Mortal's Journey to Immortality",
-        "Fanren Xiu Xian Chuan",
-    ),
-    "光阴之外": ("Beyond Time's Gaze",),
-    "择日飞升": ("A Good Day to Ascend", "Zeri Feisheng"),
-    "牧神记": ("Tales of Herding Gods",),
-    "将夜": ("Ever Night",),
-    "完美世界": ("Perfect World",),
-    "斗破苍穹": ("Battle Through the Heavens",),
-    "遮天": ("Shrouding the Heavens",),
-    "仙逆": ("Renegade Immortal",),
-    "吞噬星空": ("Swallowed Star",),
-    "斗罗大陆": ("Soul Land",),
-    "修罗武神": ("Martial God Asura",),
-    "神印王座": ("Throne of Seal",),
-}
 _POSITION_MARKER = re.compile(
     r"(?ix)(?:"
     r"(?<![a-z0-9])s\s*0*\d{1,3}(?:[ ._\-]*e\s*0*\d{1,4})?"
@@ -114,20 +91,6 @@ def _with_chinese_episode(title: str, request: IndexerMediaSearchRequest) -> str
     return _append_position_suffix(normalized, f"第{request.episode}集")
 
 
-def enrich_media_aliases(request: IndexerMediaSearchRequest) -> IndexerMediaSearchRequest:
-    """Add non-authoritative search hints for exact known Chinese title matches."""
-
-    aliases = _DONGHUA_ALIASES.get(request.title)
-    has_explicit_latin_name = any(
-        _is_latin(value)
-        for value in (request.original_title, request.english_title, *request.aliases)
-    )
-    if request.media_type != "movie" and aliases and not has_explicit_latin_name:
-        additions = aliases[: max(0, 8 - len(request.aliases))]
-        return replace(request, aliases=_unique((*request.aliases, *additions), limit=8))
-    return request
-
-
 def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tuple[str, ...]:
     """Return at most three stable, year-free query variants for one provider.
 
@@ -137,9 +100,6 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
     """
 
     site_id = str(site_id or "").strip().lower()
-    if site_id == "nyaa":
-        request = enrich_media_aliases(request)
-
     aliases = list(request.aliases)
     latin_aliases = [value for value in aliases if _is_latin(value)]
     other_aliases = [value for value in aliases if value not in latin_aliases]
