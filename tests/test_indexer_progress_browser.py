@@ -291,6 +291,44 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id]").first.get_attribute("data-resource-result-id"), "correct")
         self.assertEqual(page.locator("[data-resource-result-id]").count(), 11)
 
+    def test_resort_transfers_selection_only_to_the_same_resource_new_reference(self):
+        page = self.open_profile()
+        statuses = [{"site_id": "alpha", "status": "success"}]
+        first = {"result_id": "old", "resource_key": "hash-a", "site_id": "alpha", "title": "相同标题", "download_state": "ready"}
+        self.push_event(page, 0, "complete", self.progress_payload([first], statuses, complete=True))
+        page.wait_for_function("window.__readerCancelCalls.includes(0)")
+        page.locator("[data-resource-result-id='old'] .discovery-resource-select").check()
+        page.locator("[data-resource-sort]").select_option("size_desc")
+        page.wait_for_function("window.__resourceSearchRequests.length === 2")
+        fresh = [{**first, "result_id": "new-b", "resource_key": "hash-b"}, {**first, "result_id": "new-a"}]
+        self.push_event(page, 1, "complete", self.progress_payload(fresh, statuses, complete=True))
+        page.wait_for_function("window.__readerCancelCalls.includes(1)")
+        self.assertTrue(page.locator("[data-resource-result-id='new-a'] .discovery-resource-select").is_checked())
+        self.assertFalse(page.locator("[data-resource-result-id='new-b'] .discovery-resource-select").is_checked())
+        self.assertIn("已选 1 条", page.locator("[data-resource-batch-summary]").inner_text())
+        self.assertFalse(page.locator("[data-resource-batch-target='qb']").is_disabled())
+        # 等待下一轮排序期间取消勾选，后到的同资源不可再自动恢复选择。
+        page.locator("[data-resource-sort]").select_option("published_desc")
+        page.wait_for_function("window.__resourceSearchRequests.length === 3")
+        page.locator("[data-resource-result-id='new-a'] .discovery-resource-select").uncheck()
+        self.push_event(page, 2, "complete", self.progress_payload([{**first, "result_id": "third-a"}], statuses, complete=True))
+        page.wait_for_function("window.__readerCancelCalls.includes(2)")
+        self.assertFalse(page.locator("[data-resource-result-id='third-a'] .discovery-resource-select").is_checked())
+        self.assertIn("已选 0 条", page.locator("[data-resource-batch-summary]").inner_text())
+
+    def test_source_order_uses_server_snapshot_order_instead_of_arrival_or_score(self):
+        page = self.open_profile()
+        page.locator("[data-resource-sort]").select_option("source_order")
+        page.wait_for_function("window.__resourceSearchRequests.length === 2")
+        statuses = [{"site_id": "alpha", "status": "success"}]
+        early = {"result_id": "early", "site_id": "alpha", "title": "先到且高分", "relevance_score": 99, "match_priority": 0}
+        later = {"result_id": "later", "site_id": "alpha", "title": "源站本来排在前面", "relevance_score": 1, "match_priority": 3}
+        self.push_event(page, 1, "progress", self.progress_payload([early], statuses))
+        page.locator("[data-resource-result-id='early']").wait_for()
+        self.push_event(page, 1, "complete", self.progress_payload([later, early], statuses, complete=True))
+        page.wait_for_function("window.__readerCancelCalls.includes(1)")
+        self.assertEqual(page.locator("[data-resource-result-id]").evaluate_all("rows => rows.map(row => row.dataset.resourceResultId)"), ["later", "early"])
+
     def test_completion_count_includes_retained_earlier_candidates(self):
         page = self.open_profile()
         statuses = [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]

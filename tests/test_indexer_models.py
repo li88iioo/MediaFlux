@@ -37,6 +37,11 @@ class IndexerModelTests(unittest.TestCase):
         with self.assertRaises(IndexerValidationError):
             IndexerSearchRequest.create("valid", media_type="person")
 
+    def test_source_order_is_valid_without_forcing_nyaa_sort(self):
+        from app.indexers.providers.nyaa import _search_sort_params
+        self.assertEqual(IndexerMediaSearchRequest.create(title="Demo", sort_mode="source_order").sort_mode, "source_order")
+        self.assertEqual(_search_sort_params("source_order"), {})
+
     def test_media_search_request_normalizes_titles_aliases_and_metadata(self):
         request = IndexerMediaSearchRequest.create(
             title="  奇招百出的维多利亚  ",

@@ -495,6 +495,13 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.partial)
         self.assertEqual(result.errors[0].code, "timeout")
 
+    async def test_source_order_does_not_reorder_by_relevance_before_or_after_limit(self):
+        rows = [item("btbtla", title, magnet=f"magnet:?xt=urn:btih:{n + 1:040x}")
+                for n, title in enumerate(("Other 2020", "Demo 2026", "Demo 2026 4K"))]
+        service = self.service([FakeAdapter("btbtla", rows)], max_results_per_site=2)
+        result = await service.search_media(IndexerMediaSearchRequest.create(title="Demo", year=2026, sort_mode="source_order"))
+        self.assertEqual([row.title for row in result.items], ["Other 2020", "Demo 2026"])
+
     async def test_requested_sort_mode_controls_final_aggregate_order(self):
         newer = item(
             "nyaa",

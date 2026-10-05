@@ -3007,6 +3007,9 @@
             && previousContext.item === item
             && previousContext.detail === detail
             && previousContext.detailRequestId === detailRequestId);
+        let restoreSelectionKeys = null;
+        const sourceOrderOffset = append && state.resourceSourceOrder.size
+            ? Math.max(...state.resourceSourceOrder.values()) + 1 : 0;
         const preserveExistingResults = sameSearchContext && state.resourceResults.size > 0 && !append;
         const resourceSkeletonShownAt = !append && !merge && !resort && !preserveExistingResults ? Date.now() : 0;
         if (resourceSkeletonShownAt) list.replaceChildren(resourceLoadingRows());
@@ -3064,6 +3067,12 @@
                 && sameSearchContext
                 && state.resourceResults.size > 0;
             if (firstSnapshot) {
+                // 首批到达时读取最新选择，避免把等待期间已取消的勾选恢复回来。
+                restoreSelectionKeys = new Set(resort && sameSearchContext
+                    ? [...state.selectedResourceIds]
+                        .filter((id) => !resourceResultTerminal(id) && !resourceResultSubmitting(id))
+                        .map((id) => state.resourceResults.get(id)?.resource_key).filter(Boolean)
+                    : []);
                 initialized = true;
                 if (!terminalNoFreshResults) {
                     if (merge) {
@@ -3097,6 +3106,11 @@
                 const resultId = String(result.result_id || '');
                 if (!resultId) return;
                 receivedResultIds.add(resultId);
+                if (result.resource_key && restoreSelectionKeys.has(result.resource_key) && isDownloadableResult(result)) {
+                    setResourceSelected(resultId, true);
+                    restoreSelectionKeys.delete(result.resource_key);
+                }
+
                 const previous = state.resourceResults.get(resultId);
                 if (previous) {
                     if (JSON.stringify(previous) !== JSON.stringify(result)) {
@@ -3110,6 +3124,13 @@
                 if (renderedIds.has(resultId)) changedIds.add(resultId);
                 nextSourceIndex += 1;
             });
+
+            if (state.resourceSort === 'source_order') {
+                const snapshotIds = results.map((result) => String(result.result_id || '')).filter(Boolean);
+                const present = new Set(snapshotIds);
+                [...snapshotIds, ...[...receivedResultIds].filter((id) => !present.has(id))]
+                    .forEach((id, index) => state.resourceSourceOrder.set(id, sourceOrderOffset + index));
+            }
 
             const incomingStatuses = resourceSearchSiteStatuses(payload.site_statuses, payload.diagnostics);
             state.resourceSiteStatuses = mergeResourceSiteStatuses(

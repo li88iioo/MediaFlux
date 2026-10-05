@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any
 from urllib.parse import urlsplit
@@ -19,6 +20,7 @@ from app.indexers.errors import (
 from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
 from app.indexers.ranking import match_priority
 from app.indexers.release import parse_indexer_release_position
+from app.indexers.service import IndexerService
 from app.indexers.runtime import get_indexer_service
 from app.indexers.downloads import (
     DownloadRequestCreationError as _DownloadRequestCreationError,
@@ -88,6 +90,8 @@ def _public_search_item(item, service=None) -> dict[str, Any]:
     payload = item.to_public_dict()
     payload["source_url"] = _public_source_url(service, item)
     payload["match_priority"] = match_priority(item)
+    # 稳定身份只供展示/勾选迁移；下载仍必须使用当前result_id并经过确认。
+    payload["resource_key"] = hashlib.sha256(repr(IndexerService._result_identity(item)).encode("utf-8")).hexdigest()
     payload.update(parse_indexer_release_position(item.title))
     return payload
 

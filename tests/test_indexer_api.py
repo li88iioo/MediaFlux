@@ -356,6 +356,33 @@ class IndexerAPITests(unittest.TestCase):
         self.assertNotIn("magnet", payload)
         self.assertNotIn("torrent_url", payload)
 
+    def test_every_web_sort_option_is_accepted_by_the_real_route(self):
+        script = (Path(__file__).resolve().parents[1] / "app/static/js/discovery.js").read_text()
+        options = script.split("const RESOURCE_SORT_OPTIONS = [", 1)[1].split("];", 1)[0]
+        modes = re.findall(r"\['([^']+)'", options)
+        self.assertEqual(len(modes), 7)
+        headers = self.authenticate()
+        service = FakeIndexerService()
+        with patch("app.routes.indexers_api.get_indexer_service", return_value=service):
+            for mode in modes:
+                with self.subTest(mode=mode):
+                    result = self.client.post("/api/indexers/search", headers=headers, json={"title": "Demo", "sort_mode": mode})
+                    self.assertEqual(result.status_code, 200, result.text)
+                    self.assertEqual(service.media_search_calls[-1][0].sort_mode, mode)
+
+    def test_public_resource_identity_is_stable_without_exposing_or_reusing_download_refs(self):
+        from dataclasses import replace
+        original = FakeIndexerService().result_store.item
+        one = indexers_api._public_search_item(original)
+        two = indexers_api._public_search_item(replace(original, result_id="new-reference", title="Demo 4K"))
+        different = indexers_api._public_search_item(replace(original, magnet="magnet:?xt=urn:btih:" + "b" * 40))
+        self.assertEqual(one["resource_key"], two["resource_key"])
+        self.assertNotEqual(one["result_id"], two["result_id"])
+        self.assertNotEqual(one["resource_key"], different["resource_key"])
+        self.assertNotIn("magnet", one)
+        self.assertNotIn("torrent_url", one)
+        self.assertNotEqual(one["resource_key"], one["result_id"])
+
     def test_structured_media_search_uses_post_route(self):
         headers = self.authenticate()
         service = FakeIndexerService()

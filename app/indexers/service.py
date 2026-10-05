@@ -860,6 +860,8 @@ class IndexerService:
         sort_mode: str,
     ) -> tuple[object, ...]:
         site_index, provider_index, item = entry
+        if sort_mode == "source_order":
+            return site_index, provider_index
         relevance = int(item.relevance_score or 0)
         seeders = int(item.seeders if item.seeders is not None else -1)
         size = item.size_bytes

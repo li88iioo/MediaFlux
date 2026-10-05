@@ -13,6 +13,7 @@ _QUERY_WHITESPACE = re.compile(r"\s+")
 _DOWNLOAD_STATES = frozenset({"ready", "resolvable", "unavailable"})
 _DOWNLOAD_KINDS = frozenset({"magnet", "torrent"})
 _SORT_MODES = frozenset({
+    "source_order",
     "published_desc",
     "relevance_desc",
     "episode_desc",

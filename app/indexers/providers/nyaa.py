@@ -322,6 +322,8 @@ def _integer(value: str) -> int | None:
 
 
 def _search_sort_params(sort_mode: str) -> dict[str, str]:
+    if sort_mode == "source_order":
+        return {}
     mappings = {
         "published_desc": ("id", "desc"),
         "episode_desc": ("id", "desc"),
