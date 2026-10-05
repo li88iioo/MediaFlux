@@ -6,6 +6,7 @@ import re
 import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from urllib.parse import parse_qs, urljoin, urlsplit
 
 from app.concurrency import CrossLoopAsyncLock
@@ -23,6 +24,16 @@ _CHALLENGE_MARKERS = (
     "cf-browser-verification",
     "turnstile",
 )
+
+
+# 当前执行上下文的只读页通知，不保存独立结果，也不创建额外搜索任务。
+page_observer: ContextVar[Callable[[str, IndexerPage], None] | None] = ContextVar("indexer_page_observer", default=None)
+
+
+def report_page(site_id: str, page: IndexerPage) -> None:
+    observer = page_observer.get()
+    if observer is not None:
+        observer(site_id, page)
 
 
 class IndexerAdapter(ABC):

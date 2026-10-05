@@ -318,6 +318,16 @@ class IndexerSitePageState:
     next_page: int | None
 
 
+@dataclass(frozen=True, slots=True)
+class IndexerSourceStatus:
+    site_id: str
+    site_name: str
+    status: str
+    count: int = 0
+    cached: bool = False
+    code: str = ""
+
+
 @dataclass(slots=True)
 class IndexerPage:
     items: list[IndexerItem]
@@ -325,6 +335,8 @@ class IndexerPage:
     has_more: bool
     pagination_supported: bool
     errors: tuple[IndexerProviderError, ...] = ()
+    source_statuses: tuple[IndexerSourceStatus, ...] = ()
+    complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,6 +365,8 @@ class AggregatedIndexerResult:
     errors: list[IndexerProviderError] = field(default_factory=list)
     partial: bool = False
     cached: bool = False
+    complete: bool = True
+    source_statuses: dict[str, tuple[IndexerSourceStatus, ...]] = field(default_factory=dict)
 
     def clone(self, *, cached: bool | None = None) -> "AggregatedIndexerResult":
         return AggregatedIndexerResult(
@@ -370,7 +384,34 @@ class AggregatedIndexerResult:
             errors=list(self.errors),
             partial=self.partial,
             cached=self.cached if cached is None else cached,
+            complete=self.complete,
+            source_statuses=dict(self.source_statuses),
         )
+
+
+def indexer_site_status(result, site_id: str, count: int) -> str | None:
+    """Web/TG共用可用性判断：子源故障不是有结果的综合服务整体故障。"""
+    sources = (getattr(result, "source_statuses", {}) or {}).get(site_id, ())
+    count = max(count, (getattr(result, "site_item_counts", {}) or {}).get(site_id, 0))
+    failed = any(error.site_id == site_id for error in result.errors)
+    succeeded = site_id in result.sites_succeeded
+    if site_id not in result.sites_attempted and not (sources or count or failed or succeeded):
+        return None
+    if sources and count:
+        return "success"
+    if not getattr(result, "complete", True) and (
+        not succeeded and not failed or any(row.status in {"pending", "searching"} for row in sources)
+    ):
+        return "searching"
+    if sources and failed and any(row.status in {"success", "empty", "partial"} for row in sources):
+        return "partial"
+    if failed:
+        return "error"
+    if succeeded:
+        return "success" if count else "empty"
+    if site_id in result.sites_attempted:
+        return "error"
+    return None
 
 
 @dataclass(frozen=True, slots=True)

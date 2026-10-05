@@ -51,6 +51,7 @@ def build_default_registry(
     btbtla_min_interval_seconds: float = 5,
     tpb_min_interval_seconds: float = 1,
     general_timeout_seconds: float = 9,
+    general_cache_ttl_seconds: float = 120,
 ) -> IndexerRegistry:
     supplied = dict(http_clients or {})
     # nyaa.si 会按来源 IP 限流；nyaa.net 为同引擎镜像，主站失败时回落。
@@ -113,7 +114,7 @@ def build_default_registry(
                 default_enabled=False,
             ),
             "mikan": MikanAdapter(http=mikan_http),
-            "btbtla": GeneralAdapter(general_sources, timeout_seconds=general_timeout_seconds),
+            "btbtla": GeneralAdapter(general_sources, timeout_seconds=general_timeout_seconds, cache_ttl_seconds=general_cache_ttl_seconds),
             "tpb": PirateBayAdapter(
                 http=tpb_http,
                 min_interval_seconds=tpb_min_interval_seconds,

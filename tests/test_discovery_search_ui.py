@@ -461,6 +461,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             re.compile(
                 r"renderDetail\([^;]+;\s*"
                 r"if \(state\.resourceResultsEnabled\)\s*\{\s*"
+                r"(?:if \([^)]*\)\s*\{\s*focusResourceWorkbench\(\);\s*\}\s*)?"
                 r"(?:const\s+\w+\s*=\s*)?await loadResources\(",
                 re.S,
             ),
@@ -1005,7 +1006,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                         : url === '/api/indexers/search'
                             ? searchBody.page > 1 ? window.__resourceSearchNextPayload : window.__resourceSearchPayload
                             : {};
-                    return {ok: true, status: 200, json: async () => body};
+                    return new Response(JSON.stringify(body), {headers: {'Content-Type': 'application/json'}});
                 };
             }""",
             {"initial": payload, "next": next_payload},
@@ -1033,6 +1034,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                     return new Promise(resolve => window.__pendingResourceSearches.push(() => resolve({
                         ok: true,
                         status: 200,
+                        headers: new Headers({'Content-Type': 'application/json'}),
                         json: async () => {
                             window.__deferredResourceResponses += 1;
                             return window.__resourceSearchNextPayload;
@@ -1211,7 +1213,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                         data={items:cards(url.searchParams.get('genre')||'all',(page-1)*20),has_more:page<2};
                     }
                 }
-                return {ok:true,status:200,json:async()=>data};
+                return new Response(JSON.stringify(data), {headers: {'Content-Type': 'application/json'}});
             };
         }""", delayed_section)
         # 有效的同源小图；不靠破图移除 img 来通过节点释放断言。
@@ -1333,7 +1335,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                             {key: 'sort', label: '排序', all_label: '默认排序', options: ['最新']},
                         ]}
                         : path.startsWith('/api/discovery/items?') ? {items: []} : {};
-                return {ok: true, status: 200, json: async () => body};
+                return new Response(JSON.stringify(body), {headers: {'Content-Type': 'application/json'}});
             };
         }""")
         page.add_script_tag(content=self.script)
@@ -1426,6 +1428,8 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(request_payload["page"], 2)
         self.assertEqual(request_payload["sites"], ["btbtla", "nyaa"])
 
+        # 请求已发出不等于真实 Response 的 JSON 已解析并渲染。
+        page.locator("[data-resource-result-id='bt-result-p2']").wait_for(state="visible")
         self.assertTrue(page.locator("[data-resource-result-id='bt-result-p2']").is_visible())
         self.assertFalse(page.locator("[data-resource-result-id='nyaa-result-p2']").is_visible())
         self.assertEqual(

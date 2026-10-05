@@ -285,6 +285,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
                 "tests.test_navigation_discovery_ui",
                 "tests.test_lucide_local_rendering",
                 "tests.test_discovery_search_ui",
+                "tests.test_indexer_progress_browser",
                 "tests.test_window_viewport_inset",
             },
         )

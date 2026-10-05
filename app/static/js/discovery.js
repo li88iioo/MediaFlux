@@ -18,6 +18,7 @@
     const INDEXER_DOWNLOAD_BATCH_PATH = '/api/indexers/download/batch';
     const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit';
     const RESOURCE_SELECTION_LIMIT = 50;
+    const MAX_INDEXER_EVENT_CHARS = 1024 * 1024;
     const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);
     const RESOURCE_MANUAL_REVIEW_MESSAGE = '请核对下载列表/目标状态，必要时重新检索后人工处理';
     const DOWNLOAD_REQUEST_STATUS_LABELS = {
@@ -136,6 +137,7 @@
         resourceHasMore: false,
         resourceLoadingMore: false,
         resourceSiteStatuses: [],
+        resourceSearchProgress: null,
         resourceSearchContext: null,
         resourceSubmitState: new Map(),
         resourceBatchBusy: false,
@@ -1466,6 +1468,7 @@
         state.resourceHasMore = false;
         state.resourceLoadingMore = false;
         state.resourceSiteStatuses = [];
+        state.resourceSearchProgress = null;
         state.resourceSearchContext = null;
         state.resourceSubmitState.clear();
         state.resourceBatchBusy = false;
@@ -1483,6 +1486,7 @@
     function renderResourceNotice(notification) {
         const notice = elements.dialogBody.querySelector('[data-resource-notice]');
         if (!notice) return false;
+        notice.hidden = false;
         notice.className = `discovery-resource-notice is-${notification.type || 'info'}`;
         notice.setAttribute('role', notification.type === 'error' ? 'alert' : 'status');
         notice.textContent = notification.message || '';
@@ -1639,23 +1643,36 @@
         });
     }
 
-    function renderResourceResultsList(forceReorder = false) {
+    function renderResourceResultsList(forceReorder = false, preserveExistingOrder = false, updatedIds = new Set()) {
         const list = elements.dialogBody?.querySelector('[data-discovery-resource-list]');
         if (!list) return;
-        const existingRows = new Map(
-            [...list.querySelectorAll('[data-resource-result-id]')]
-                .map((row) => [row.dataset.resourceResultId || '', row]),
-        );
-        let rowsChanged = forceReorder || existingRows.size !== state.resourceResults.size;
-        const orderedRows = sortedResourceResults().map((result) => {
-            const existing = existingRows.get(result.result_id);
-            if (existing && !forceReorder) return existing;
-            if (!existing) rowsChanged = true;
-            return existing || resourceRow(result);
-        });
-        if (rowsChanged && orderedRows.length) {
-            list.replaceChildren(...orderedRows);
-            renderIcons(list);
+        const currentRows = [...list.querySelectorAll('[data-resource-result-id]')];
+        const existingRows = new Map(currentRows.map((row) => [row.dataset.resourceResultId || '', row]));
+        const sorted = sortedResourceResults();
+        if (state.resourceResults.size) list.querySelector('[data-resource-search-empty]')?.remove();
+        if (preserveExistingOrder) {
+            currentRows.forEach((row) => {
+                const resultId = row.dataset.resourceResultId || '';
+                const result = state.resourceResults.get(resultId);
+                if (result && updatedIds.has(resultId)) updateResourceRowContent(row, result);
+            });
+            const additions = sorted
+                .filter((result) => !existingRows.has(result.result_id))
+                .map(resourceRow);
+            if (additions.length) list.append(...additions);
+            if (additions.length || updatedIds.size) renderIcons(list);
+        } else {
+            let rowsChanged = forceReorder || existingRows.size !== state.resourceResults.size;
+            const orderedRows = sorted.map((result) => {
+                const existing = existingRows.get(result.result_id);
+                if (existing && updatedIds.has(result.result_id)) updateResourceRowContent(existing, result);
+                if (!existing) rowsChanged = true;
+                return existing || resourceRow(result);
+            });
+            if (rowsChanged && orderedRows.length) {
+                list.replaceChildren(...orderedRows);
+                renderIcons(list);
+            }
         }
         const rows = [...list.querySelectorAll('[data-resource-result-id]')];
         const visibleIds = new Set(visibleResourceResults().map((result) => result.result_id));
@@ -1664,7 +1681,9 @@
         });
         list.querySelector('[data-resource-filter-empty]')?.remove();
         if (!state.resourceResults.size) {
-            list.replaceChildren(emptyPanel('暂未找到匹配资源，可稍后重试。'));
+            const empty = emptyPanel(resourceSearchEmptyMessage());
+            empty.dataset.resourceSearchEmpty = 'true';
+            list.replaceChildren(empty);
         } else if (!visibleIds.size) {
             const empty = emptyPanel('当前站点暂无匹配资源，请切换其他站点或查看全部。');
             empty.dataset.resourceFilterEmpty = 'true';
@@ -2044,10 +2063,234 @@
         return [...merged.values()];
     }
 
+    function resourceSearchSiteStatuses(statuses, diagnostics) {
+        const normalized = asArray(statuses).map((site) => ({...site, diagnostics: asArray(site.diagnostics)}));
+        asArray(diagnostics).forEach((diagnostic) => {
+            const diagnosticName = String(diagnostic?.site_name || diagnostic?.site_id || '').trim().toLocaleLowerCase();
+            if (!diagnosticName) return;
+            const site = normalized.find((candidate) => [candidate.site_id, candidate.site_name]
+                .some((name) => String(name || '').trim().toLocaleLowerCase() === diagnosticName));
+            if (site && !site.diagnostics.includes(diagnostic)) {
+                site.diagnostics.push(diagnostic);
+                return;
+            }
+            if (site) return;
+            normalized.push({
+                ...diagnostic,
+                site_id: diagnostic.site_id || diagnostic.site_name,
+                site_name: diagnostic.site_name || diagnostic.site_id,
+                status: diagnostic.status || 'error',
+                diagnostics: [diagnostic],
+            });
+        });
+        return normalized;
+    }
+
+    function resourceDiagnosticMessage(diagnostic, fallbackName) {
+        const labels = {success: '检索成功', partial: '部分完成', searching: '搜索中', empty: '暂无结果', error: '检索失败'};
+        const name = diagnostic?.site_name || fallbackName || '未知站点';
+        const status = labels[diagnostic?.status] || diagnostic?.status || '诊断信息';
+        let message = `${name}：${diagnostic?.message || status}`;
+        if (diagnostic?.code) message += `（${diagnostic.code}）`;
+        if (diagnostic?.count !== undefined && diagnostic?.count !== null) message += `，${diagnostic.count} 条`;
+        if (diagnostic?.cached) message += '，来自缓存';
+        return message;
+    }
+
+    function updateResourceSearchProgress(payload, eventType, resultCount = state.resourceResults.size, currentSiteIds = null) {
+        const requestedSites = currentSiteIds ? new Set(currentSiteIds) : null;
+        const statuses = asArray(payload?.site_statuses).filter((site) => {
+            if (site.status === 'disabled') return false;
+            if (!requestedSites) return true;
+            return requestedSites.has(String(site.site_id || site.id || ''));
+        });
+        const failures = statuses.filter((site) => site.status === 'error').length;
+        const partial = statuses.some((site) => site.status === 'partial');
+        const waiting = statuses.some((site) => ['searching', 'pending'].includes(site.status));
+        const isComplete = eventType === 'complete' && payload?.complete === true;
+        const count = Math.max(0, Number(resultCount) || 0);
+        if (!isComplete) {
+            state.resourceSearchProgress = {
+                phase: 'searching',
+                status: 'pending',
+                text: partial
+                    ? (count ? `已找到 ${count} 条，部分站点仍在搜索` : '部分站点已返回，仍在搜索')
+                    : `${count ? `本轮已找到 ${count} 条，` : ''}正在搜索站点`,
+            };
+            return;
+        }
+        if (count) {
+            state.resourceSearchProgress = {
+                phase: 'complete',
+                status: 'success',
+                text: `搜索完成 · 本轮 ${count} 条结果${failures || partial ? '（部分站点未成功）' : ''}`,
+            };
+        } else if (failures === statuses.length && failures > 0 && !waiting) {
+            state.resourceSearchProgress = {phase: 'error', status: 'error', text: '综合搜索失败 · 所有站点均未成功'};
+        } else if (failures || partial || waiting) {
+            state.resourceSearchProgress = {phase: 'partial', status: 'pending', text: '搜索结束 · 部分站点未成功或未完成'};
+        } else {
+            state.resourceSearchProgress = {phase: 'complete', status: 'empty', text: '搜索完成 · 本轮暂无匹配结果'};
+        }
+    }
+
+    function resourceSearchEmptyMessage() {
+        const progress = state.resourceSearchProgress;
+        if (progress?.phase === 'searching') return progress.text;
+        if (progress?.phase === 'error') return '综合搜索失败，请查看站点诊断后重试。';
+        if (progress?.phase === 'partial') return '没有可展示的资源，请查看未成功站点的诊断信息。';
+        if (progress?.phase === 'incomplete') return '搜索中断，本次搜索未完成；请查看已返回的站点状态。';
+        return '暂未找到匹配资源，可稍后重试。';
+    }
+
+    async function consumeIndexerSearchResponse(response, signal, onSnapshot) {
+        const contentType = response.headers?.get?.('content-type')?.toLowerCase() || '';
+        const jsonNegotiated = contentType.includes('application/json');
+        if (!response.ok) {
+            if (jsonNegotiated) return responseJSON(response);
+            throw new Error(`索引搜索请求失败 (${response.status || 'HTTP'})`);
+        }
+        if (jsonNegotiated) {
+            const payload = await responseJSON(response);
+            await onSnapshot({...payload, complete: true}, 'complete');
+            return true;
+        }
+        if (!contentType.includes('text/event-stream')) {
+            throw new Error(`无法读取索引响应类型：${contentType || '未声明 Content-Type'}`);
+        }
+        if (!response.body?.getReader) throw new Error('当前浏览器无法读取索引搜索流');
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let lineParts = [];
+        let lineLength = 0;
+        let skipNextLF = false;
+        let eventName = '';
+        let dataLines = [];
+        let eventChars = 0;
+        let completed = false;
+        const appendLine = (part) => {
+            if (!part) return;
+            lineLength += part.length;
+            if (lineLength > MAX_INDEXER_EVENT_CHARS) throw new Error('索引搜索事件超过允许大小');
+            lineParts.push(part);
+            if (lineParts.length > 64) lineParts = [lineParts.join('')];
+        };
+        const takeLine = () => {
+            const line = lineParts.length === 1 ? lineParts[0] : lineParts.join('');
+            lineParts = [];
+            lineLength = 0;
+            return line;
+        };
+        const dispatch = async () => {
+            const name = eventName;
+            const data = dataLines.join('\n');
+            eventName = '';
+            dataLines = [];
+            eventChars = 0;
+            if (!data || !['progress', 'complete', 'error'].includes(name)) return;
+            const payload = JSON.parse(data);
+            if (name === 'error') {
+                const error = new Error(payload?.error || '索引搜索终止失败');
+                error.code = payload?.code || '';
+                error.payload = payload;
+                error.isIndexerSearchError = true;
+                throw error;
+            }
+            if (name === 'complete' && payload?.complete !== true) {
+                throw new Error('索引搜索完成事件缺少 complete 标记');
+            }
+            await onSnapshot(payload, name);
+            if (name === 'complete') completed = true;
+        };
+        const handleLine = async (line) => {
+            if (!line) {
+                await dispatch();
+                return;
+            }
+            eventChars += line.length + 1;
+            if (eventChars > MAX_INDEXER_EVENT_CHARS) throw new Error('索引搜索事件超过允许大小');
+            if (line.startsWith(':')) return;
+            const separator = line.indexOf(':');
+            const field = separator < 0 ? line : line.slice(0, separator);
+            let value = separator < 0 ? '' : line.slice(separator + 1);
+            if (value.startsWith(' ')) value = value.slice(1);
+            if (field === 'event') eventName = value;
+            else if (field === 'data') dataLines.push(value);
+        };
+        const consumeText = async (text) => {
+            let offset = 0;
+            if (skipNextLF) {
+                skipNextLF = false;
+                if (text.startsWith('\n')) offset = 1;
+            }
+            while (offset < text.length) {
+                const cr = text.indexOf('\r', offset);
+                const lf = text.indexOf('\n', offset);
+                const boundary = cr < 0 ? lf : lf < 0 ? cr : Math.min(cr, lf);
+                if (boundary < 0) {
+                    appendLine(text.slice(offset));
+                    break;
+                }
+                appendLine(text.slice(offset, boundary));
+                await handleLine(takeLine());
+                if (completed) return;
+                const isCR = text[boundary] === '\r';
+                offset = boundary + 1;
+                if (isCR) {
+                    if (text[offset] === '\n') offset += 1;
+                    else if (offset === text.length) skipNextLF = true;
+                }
+            }
+        };
+        try {
+            while (true) {
+                if (signal?.aborted) {
+                    const abortError = new Error('请求已取消');
+                    abortError.name = 'AbortError';
+                    throw abortError;
+                }
+                const {done, value} = await reader.read();
+                if (done) break;
+                await consumeText(decoder.decode(value, {stream: true}));
+                if (completed) break;
+            }
+            await consumeText(decoder.decode());
+            if (lineLength) await handleLine(takeLine());
+            if (dataLines.length) await dispatch();
+        } finally {
+            try {
+                await reader.cancel();
+            } catch (_) {
+                // 读取结束、取消或协议错误时都释放底层流。
+            }
+            reader.releaseLock();
+        }
+        if (!completed) throw new Error('搜索连接中断，本次搜索未收到完成事件');
+        return true;
+    }
+
     function retryResourceSite(siteId) {
         const context = state.resourceSearchContext;
         if (!context || !siteId) return Promise.resolve();
         return loadResources(context.item, context.detail, context.detailRequestId, {siteId, merge: true});
+    }
+
+    function updateResourceSiteStatuses(panel) {
+        const previous = panel.querySelector('[data-discovery-resource-sites]');
+        if (!previous) return;
+        const focused = previous.contains(document.activeElement) ? document.activeElement : null;
+        const filter = focused?.getAttribute('data-resource-site-filter');
+        const retry = focused?.getAttribute('data-resource-site-retry');
+        const replacement = resourceSiteStatuses(state.resourceSiteStatuses);
+        previous.replaceWith(replacement);
+        if (filter != null || retry != null) {
+            const attribute = retry != null ? 'data-resource-site-retry' : 'data-resource-site-filter';
+            const value = retry ?? filter;
+            const target = [...replacement.querySelectorAll(`[${attribute}]`)]
+                .find((button) => button.getAttribute(attribute) === value);
+            target?.focus({preventScroll: true});
+        }
     }
 
     function resourceSiteStatuses(statuses) {
@@ -2100,12 +2343,23 @@
         const attachDetails = (chip, entries) => {
             if (!entries.length) return;
             chip.classList.add('has-detail');
-            const status = entries.some((entry) => entry.status === 'error') ? 'error'
+            const status = entries.some(({site, status: siteStatus}) => siteStatus === 'error'
+                || asArray(site.diagnostics).some((diagnostic) => diagnostic.status === 'error')) ? 'error'
                 : 'empty';
             const message = node('div', `discovery-resource-site-message is-${status}`);
-            message.append(node('span', '', entries.map(({site, status}) =>
-                `${site.site_name || '未知站点'}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`
-            ).join('；')));
+            const descriptions = entries.flatMap(({site, status}) => {
+                const lines = [];
+                if (site.message || ['error', 'empty'].includes(status)) {
+                    lines.push(
+                        `${site.site_name || '未知站点'}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`,
+                    );
+                }
+                lines.push(...asArray(site.diagnostics).map((diagnostic) => {
+                    return resourceDiagnosticMessage(diagnostic, site.site_name);
+                }));
+                return lines;
+            });
+            message.append(node('span', '', descriptions.join('；')));
             entries.forEach(({site, siteId, status}) => {
                 if (status !== 'error' || site.retryable === false || !siteId) return;
                 const retry = node('button', 'jump-btn discovery-resource-site-retry', `重试 ${site.site_name || siteId}`);
@@ -2124,8 +2378,29 @@
             details.append(message);
             attachDetailEvents(chip);
         };
-        const labels = {success: '检索成功', empty: '暂无结果', error: '检索失败', disabled: '未启用'};
+        const labels = {
+            success: '检索成功', partial: '部分完成', searching: '搜索中', pending: '等待中',
+            empty: '暂无结果', error: '检索失败', disabled: '未启用',
+        };
         const normalizedStatus = (site) => Object.prototype.hasOwnProperty.call(labels, site.status) ? site.status : 'error';
+        const displayStatus = (status, count) => {
+            if (status === 'searching' || status === 'pending') return 'pending';
+            if (status === 'partial') return count ? 'success' : 'pending';
+            return status;
+        };
+        if (state.resourceSearchProgress) {
+            const progress = node(
+                'span',
+                `discovery-resource-site-status is-${state.resourceSearchProgress.status}`,
+                '检索',
+            );
+            progress.append(node('span', 'sr-only', state.resourceSearchProgress.text));
+            progress.setAttribute('role', 'status');
+            progress.setAttribute('aria-live', 'polite');
+            progress.setAttribute('aria-label', state.resourceSearchProgress.text);
+            progress.title = state.resourceSearchProgress.text;
+            region.append(progress);
+        }
         const allButton = createFilterButton('', `全部 ${state.resourceResults.size}`, `显示全部 ${state.resourceResults.size} 条资源`);
         region.append(allButton);
 
@@ -2135,29 +2410,35 @@
             const siteName = siteId === 'btbtla' ? '综合' : site.site_name || siteId || '未知站点';
             const statusLabel = labels[status];
             const count = resourceSiteResultCount(siteId);
+            const chipStatus = displayStatus(status, count);
             const accessibleLabel = `${siteName}：${statusLabel}`
                 + (site.message ? `，${site.message}` : '')
-                + resourceSiteDiagnostic(site);
+                + resourceSiteDiagnostic(site)
+                + (asArray(site.diagnostics).length ? `，${site.diagnostics.length} 条诊断信息` : '');
 
             let chip;
             if (status !== 'disabled' && siteId) {
-                const suffix = status === 'error' ? '失败' : status === 'empty' ? '0' : String(count);
+                const suffix = status === 'error' ? '失败'
+                    : status === 'empty' ? '0'
+                        : status === 'partial' ? '部分'
+                            : ['searching', 'pending'].includes(status) ? labels[status] : String(count);
                 chip = createFilterButton(
                     siteId,
                     `${siteName} ${suffix}`,
                     `${accessibleLabel}，点击筛选该站点资源`,
-                    status,
+                    chipStatus,
                 );
             } else {
                 chip = node(
                     'span',
-                    `discovery-resource-site-status is-${status}`,
+                    `discovery-resource-site-status is-${chipStatus}`,
                     siteName,
                 );
                 chip.setAttribute('aria-label', accessibleLabel);
             }
             chip.title = accessibleLabel;
-            if (['error', 'empty'].includes(status)) {
+            if (['error', 'empty'].includes(status) || (status === 'partial' && site.message)
+                || asArray(site.diagnostics).length) {
                 attachDetails(chip, [{site, siteId, status}]);
             }
             if (site.message) chip.append(node('span', 'sr-only', site.message));
@@ -2376,6 +2657,7 @@
     }
 
     function resourceActionButton(result, label, target, iconName) {
+        const resultId = String(result?.result_id || '');
         const button = node('button', 'jump-btn discovery-resource-action');
         button.type = 'button';
         button.dataset.resourceSubmitTarget = target;
@@ -2384,19 +2666,20 @@
         button.disabled = unavailable;
         if (unavailable) button.title = '当前资源暂不可下载';
         button.addEventListener('click', async () => {
-            if (button.disabled || !result.result_id) return;
-            const wasSelected = state.selectedResourceIds.has(result.result_id);
+            const currentResult = state.resourceResults.get(resultId) || result;
+            if (button.disabled || !resultId || !currentResult.result_id) return;
+            const wasSelected = state.selectedResourceIds.has(resultId);
             const submission = beginResourceSubmission(
                 state.detailRequestId,
-                [result.result_id],
+                [resultId],
                 target,
             );
             state.resourceBatchSummary = '';
             button.disabled = true;
             button.classList.add('is-busy');
             button.setAttribute('aria-busy', 'true');
-            state.resourceSubmitState.set(result.result_id, {
-                result_id: result.result_id,
+            state.resourceSubmitState.set(resultId, {
+                result_id: resultId,
                 status: 'submitting',
                 message: `正在提交到${label}…`,
             });
@@ -2405,28 +2688,28 @@
                 const payload = await api(INDEXER_DOWNLOAD_PATH, {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({result_id: result.result_id, target}),
+                    body: JSON.stringify({result_id: resultId, target}),
                 });
                 const item = resourceSubmissionState(
                     {...payload, result_id: result.result_id},
                     true,
-                    state.resourceSubmitState.get(result.result_id),
+                    state.resourceSubmitState.get(resultId),
                 );
                 const complete = isCompleteResourceSuccess(item);
                 const terminalSelection = isTerminalResourceSelection(item);
                 const message = complete ? `已发送到${label}。` : resourceStatusLabel(item);
                 const notification = item.duplicate
-                    ? resourceDuplicateNotification(result.result_id, item, target, label)
+                    ? resourceDuplicateNotification(resultId, item, target, label)
                     : {
                         type: complete ? 'success' : (item.status === 'partial' ? 'warning' : 'error'),
                         title: complete ? '已提交' : (item.status === 'partial' ? '部分完成' : '提交失败'),
                         message,
-                    };
+                };
                 if (resourceSubmissionContextActive(submission)) {
-                    state.resourceSubmitState.set(result.result_id, item);
-                    if (terminalSelection) state.selectedResourceIds.delete(result.result_id);
-                    else if (wasSelected) state.selectedResourceIds.add(result.result_id);
-                    else state.selectedResourceIds.delete(result.result_id);
+                    state.resourceSubmitState.set(resultId, item);
+                    if (terminalSelection) state.selectedResourceIds.delete(resultId);
+                    else if (wasSelected) state.selectedResourceIds.add(resultId);
+                    else state.selectedResourceIds.delete(resultId);
                     button.disabled = false;
                     button.classList.remove('is-busy');
                     button.setAttribute('aria-busy', 'false');
@@ -2444,20 +2727,20 @@
                     result_id: result.result_id,
                     ok: Boolean(payload.ok),
                     error: payload.error || error.message || '资源下载提交失败。',
-                }, responseReceived, state.resourceSubmitState.get(result.result_id));
+                }, responseReceived, state.resourceSubmitState.get(resultId));
                 const message = resourceStatusLabel(item);
                 if (resourceSubmissionContextActive(submission)) {
-                    state.resourceSubmitState.set(result.result_id, item);
-                    if (isTerminalResourceSelection(item)) state.selectedResourceIds.delete(result.result_id);
-                    else if (wasSelected) state.selectedResourceIds.add(result.result_id);
-                    else state.selectedResourceIds.delete(result.result_id);
+                    state.resourceSubmitState.set(resultId, item);
+                    if (isTerminalResourceSelection(item)) state.selectedResourceIds.delete(resultId);
+                    else if (wasSelected) state.selectedResourceIds.add(resultId);
+                    else state.selectedResourceIds.delete(resultId);
                     button.disabled = false;
                     button.classList.remove('is-busy');
                     button.setAttribute('aria-busy', 'false');
                     syncResourceControls();
                 }
                 const notification = item.duplicate
-                    ? resourceDuplicateNotification(result.result_id, item, target, label)
+                    ? resourceDuplicateNotification(resultId, item, target, label)
                     : {
                         type: item.status === 'request_unknown' || item.status === 'expired' ? 'warning' : 'error',
                         title: item.status === 'expired' ? '资源已过期' : item.status === 'request_unknown' ? '状态未知' : '提交失败',
@@ -2551,6 +2834,36 @@
         actions.append(actionHead, actionButtons);
         row.append(checkbox, copy, actions);
         return row;
+    }
+
+    function updateResourceRowContent(row, result) {
+        row.dataset.resourceSiteId = resourceSiteKey(result);
+        const checkbox = row.querySelector('.discovery-resource-select');
+        if (checkbox) {
+            checkbox.disabled = !isDownloadableResult(result);
+            checkbox.setAttribute('aria-label', `选择资源 ${result.title || '未命名资源'}`);
+        }
+        const currentCopy = row.querySelector('.discovery-resource-copy');
+        const nextRow = resourceRow(result);
+        const nextCopy = nextRow.querySelector('.discovery-resource-copy');
+        if (currentCopy && nextCopy) currentCopy.replaceChildren(...nextCopy.childNodes);
+
+        const currentActions = row.querySelector('.discovery-resource-action-buttons');
+        const nextActions = nextRow.querySelector('.discovery-resource-action-buttons');
+        const currentSource = currentActions?.querySelector('.discovery-resource-source-link');
+        const nextSource = nextActions?.querySelector('.discovery-resource-source-link');
+        if (currentSource && nextSource) {
+            currentSource.href = nextSource.href;
+            currentSource.title = nextSource.title;
+            currentSource.setAttribute('aria-label', nextSource.getAttribute('aria-label') || '核验源站');
+        } else if (currentSource) {
+            currentSource.remove();
+        } else if (nextSource && currentActions) {
+            currentActions.prepend(nextSource);
+        }
+        row.querySelectorAll('.discovery-resource-action').forEach((button) => {
+            button.title = isDownloadableResult(result) ? '' : '当前资源暂不可下载';
+        });
     }
 
     function resourceLoadingRows() {
@@ -2648,7 +2961,7 @@
         const loadMore = node('button', 'jump-btn discovery-resource-load-more', '加载更多资源');
         loadMore.type = 'button';
         loadMore.addEventListener('click', async () => {
-            if (state.resourceLoadingMore || !state.resourceHasMore) return;
+            if (state.resourceSearchController || state.resourceLoadingMore || !state.resourceHasMore) return;
             const context = state.resourceSearchContext;
             if (!context) return;
             const siteIds = state.resourceSiteStatuses
@@ -2665,7 +2978,7 @@
         return panel;
     }
 
-    function focusResourceWorkbench(searchSucceeded = true) {
+    function focusResourceWorkbench() {
         const panel = elements.dialogBody.querySelector('[data-discovery-resource-panel]');
         if (!panel) return;
         panel.tabIndex = -1;
@@ -2673,9 +2986,7 @@
             const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
             panel.scrollIntoView({behavior: reducedMotion ? 'auto' : 'smooth', block: 'start'});
             panel.focus({preventScroll: true});
-            announce(searchSucceeded
-                ? '资源搜索完成，已定位到资源结果'
-                : '已定位到资源搜索区域，请查看错误提示');
+            announce('已定位到资源检索区域，结果将陆续显示');
         });
     }
 
@@ -2690,11 +3001,20 @@
         const resort = Boolean(options.resort);
         const requestedPage = Math.max(1, Number.parseInt(options.page || 1, 10) || 1);
         const siteIds = asArray(options.siteIds).map((value) => String(value || '')).filter(Boolean);
-        const resourceSkeletonShownAt = !append && !merge && !resort ? Date.now() : 0;
+        const previousContext = state.resourceSearchContext;
+        const sameSearchContext = Boolean(previousContext
+            && previousContext.item === item
+            && previousContext.detail === detail
+            && previousContext.detailRequestId === detailRequestId);
+        const preserveExistingResults = sameSearchContext && state.resourceResults.size > 0 && !append;
+        const resourceSkeletonShownAt = !append && !merge && !resort && !preserveExistingResults ? Date.now() : 0;
         if (resourceSkeletonShownAt) list.replaceChildren(resourceLoadingRows());
         const searchPayload = resourceSearchPayload(item, detail, requestedPage);
         if (siteId) searchPayload.sites = [siteId];
         else if (siteIds.length) searchPayload.sites = siteIds;
+        const currentSearchSiteIds = Array.isArray(searchPayload.sites)
+            ? new Set(searchPayload.sites.map((value) => String(value || '')))
+            : null;
         if (!searchPayload.title) {
             list.replaceChildren(emptyPanel('缺少可用于资源检索的标题。'));
             return false;
@@ -2704,73 +3024,166 @@
         const loadMoreButton = pagination?.querySelector('.discovery-resource-load-more');
         const {controller, resourceSearchRequestId} = beginResourceSearch();
         state.resourceLoadingMore = append;
+        state.resourceSearchProgress = {phase: 'searching', status: 'pending', text: '正在搜索站点'};
+        updateResourceSiteStatuses(panel);
         if (loadMoreButton) {
-            loadMoreButton.disabled = append;
-            loadMoreButton.textContent = append ? '正在加载更多…' : '加载更多资源';
+            loadMoreButton.disabled = true;
+            loadMoreButton.textContent = append ? '正在加载更多…' : '正在搜索…';
         }
-        try {
-            const payload = await api(
-                INDEXER_SEARCH_PATH,
-                {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(searchPayload),
-                },
-                controller.signal,
-            );
-            if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return false;
-            const remainingSkeletonTime = RESOURCE_SKELETON_MIN_VISIBLE_MS - (Date.now() - resourceSkeletonShownAt);
-            if (resourceSkeletonShownAt && remainingSkeletonTime > 0) await delay(remainingSkeletonTime);
-            if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return false;
-            const results = uniqueResourceResults(extractItems(payload));
-            if (merge) {
-                [...state.resourceResults.entries()].forEach(([resultId, result]) => {
-                    if (resourceSiteKey(result) !== siteId) return;
-                    state.resourceResults.delete(resultId);
-                    state.resourceSourceOrder.delete(resultId);
-                    state.selectedResourceIds.delete(resultId);
-                    state.resourceSubmitState.delete(resultId);
-                });
-            } else if (!append) {
-                state.resourceResults.clear();
-                state.resourceSourceOrder.clear();
-                if (!resort) state.activeResourceSiteId = '';
-                state.resourceSubmitState.clear();
-                state.selectedResourceIds.clear();
+        let initialized = false;
+        let receivedResultCount = 0;
+        const receivedResultIds = new Set();
+        let terminalNoFreshResults = false;
+        const consumeSnapshot = async (payload, eventType) => {
+            if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return;
+            if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+                throw new Error('索引搜索返回了无效结果');
             }
-            state.resourceBatchSummary = '';
-            const nextSourceIndex = state.resourceSourceOrder.size
+            const firstSnapshot = !initialized;
+            const results = uniqueResourceResults(extractItems(payload));
+            if (firstSnapshot && eventType === 'progress' && results.length === 0) {
+                const incomingStatuses = resourceSearchSiteStatuses(payload.site_statuses, payload.diagnostics);
+                state.resourceSiteStatuses = mergeResourceSiteStatuses(
+                    incomingStatuses, merge ? siteId : append ? '__append__' : '',
+                );
+                updateResourceSearchProgress(payload, eventType, receivedResultCount, currentSearchSiteIds);
+                updateResourceSiteStatuses(panel);
+                return;
+            }
+            if (firstSnapshot && resourceSkeletonShownAt) {
+                const remaining = RESOURCE_SKELETON_MIN_VISIBLE_MS - (Date.now() - resourceSkeletonShownAt);
+                if (remaining > 0) await delay(remaining);
+                if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return;
+            }
+            terminalNoFreshResults = firstSnapshot
+                && eventType === 'complete'
+                && payload.complete === true
+                && results.length === 0
+                && !append
+                && sameSearchContext
+                && state.resourceResults.size > 0;
+            if (firstSnapshot) {
+                initialized = true;
+                if (!terminalNoFreshResults) {
+                    if (merge) {
+                        [...state.resourceResults.entries()].forEach(([resultId, result]) => {
+                            if (resourceSiteKey(result) !== siteId) return;
+                            state.resourceResults.delete(resultId);
+                            state.resourceSourceOrder.delete(resultId);
+                            state.selectedResourceIds.delete(resultId);
+                            state.resourceSubmitState.delete(resultId);
+                        });
+                    } else if (!append) {
+                        state.resourceResults.clear();
+                        state.resourceSourceOrder.clear();
+                        if (!resort) state.activeResourceSiteId = '';
+                        state.resourceSubmitState.clear();
+                        state.selectedResourceIds.clear();
+                    }
+                    state.resourceBatchSummary = '';
+                }
+            }
+
+            const changedIds = new Set();
+            const renderedIds = new Set(
+                [...list.querySelectorAll('[data-resource-result-id]')]
+                    .map((row) => row.dataset.resourceResultId || ''),
+            );
+            let nextSourceIndex = state.resourceSourceOrder.size
                 ? Math.max(...state.resourceSourceOrder.values()) + 1
                 : 0;
-            results.forEach((result, index) => {
-                if (!result.result_id) return;
-                state.resourceResults.set(result.result_id, result);
-                state.resourceSourceOrder.set(result.result_id, nextSourceIndex + index);
+            results.forEach((result) => {
+                const resultId = String(result.result_id || '');
+                if (!resultId) return;
+                receivedResultIds.add(resultId);
+                const previous = state.resourceResults.get(resultId);
+                if (previous) {
+                    if (JSON.stringify(previous) !== JSON.stringify(result)) {
+                        state.resourceResults.set(resultId, result);
+                        changedIds.add(resultId);
+                    }
+                    return;
+                }
+                state.resourceResults.set(resultId, result);
+                state.resourceSourceOrder.set(resultId, nextSourceIndex);
+                if (renderedIds.has(resultId)) changedIds.add(resultId);
+                nextSourceIndex += 1;
             });
+
+            const incomingStatuses = resourceSearchSiteStatuses(payload.site_statuses, payload.diagnostics);
             state.resourceSiteStatuses = mergeResourceSiteStatuses(
-                payload.site_statuses, merge ? siteId : append ? '__append__' : '',
+                incomingStatuses, merge ? siteId : append ? '__append__' : '',
             );
             state.resourcePage = append ? requestedPage : 1;
-            state.resourceHasMore = Boolean(payload.has_more);
-            sites.replaceWith(resourceSiteStatuses(state.resourceSiteStatuses));
-            const nextPagination = panel.querySelector('[data-resource-pagination]');
-            if (nextPagination) nextPagination.hidden = !state.resourceHasMore;
+            if (typeof payload.has_more === 'boolean') state.resourceHasMore = payload.has_more;
+            receivedResultCount = receivedResultIds.size;
+            updateResourceSearchProgress(payload, eventType, receivedResultCount, currentSearchSiteIds);
+            updateResourceSiteStatuses(panel);
+            const currentPagination = panel.querySelector('[data-resource-pagination]');
+            if (currentPagination) currentPagination.hidden = !state.resourceHasMore;
             list.querySelector('[data-resource-filter-empty]')?.remove();
-            renderResourceResultsList(true);
+            renderResourceResultsList(firstSnapshot && !terminalNoFreshResults, !firstSnapshot || terminalNoFreshResults, changedIds);
+            if (terminalNoFreshResults) {
+                const incomplete = ['partial', 'error'].includes(state.resourceSearchProgress?.phase);
+                renderResourceNotice({
+                    type: incomplete ? 'warning' : 'info',
+                    message: `${incomplete ? '本轮检索不完整，未取得新结果' : '本轮未取得新结果'}；已保留 ${state.resourceResults.size} 条现有结果`,
+                });
+            }
             syncResourceControls();
             renderIcons(elements.dialogBody);
-            return true;
+        };
+        try {
+            const completed = await fetch(INDEXER_SEARCH_PATH, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json', 'Accept': 'text/event-stream'},
+                body: JSON.stringify(searchPayload),
+                signal: controller.signal,
+            }).then((response) => consumeIndexerSearchResponse(response, controller.signal, consumeSnapshot));
+            if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return false;
+            return Boolean(completed && !terminalNoFreshResults);
         } catch (error) {
             if (error.name === 'AbortError') return false;
             const remainingSkeletonTime = RESOURCE_SKELETON_MIN_VISIBLE_MS - (Date.now() - resourceSkeletonShownAt);
             if (resourceSkeletonShownAt && remainingSkeletonTime > 0) await delay(remainingSkeletonTime);
             if (!resourceSearchIsCurrent(resourceSearchRequestId, detailRequestId)) return false;
+            const resultCount = state.resourceResults.size;
+            if (error.isIndexerSearchError) {
+                state.resourceSearchProgress = {
+                    phase: 'incomplete',
+                    status: resultCount ? 'pending' : 'error',
+                    text: `综合检索已终止 · ${error.message || '本次搜索未完成'}`,
+                };
+                updateResourceSiteStatuses(panel);
+                if (resultCount || initialized) {
+                    renderResourceResultsList(false, true);
+                    renderResourceNotice({
+                        type: 'warning',
+                        message: `综合检索已终止：${error.message || '本次搜索未完成'}${error.code ? `（${error.code}）` : ''}；已保留 ${resultCount} 条已显示结果`,
+                    });
+                } else {
+                    const failure = node('div', 'discovery-resource-state is-error');
+                    failure.append(icon('triangle-alert'), node('span', '', `综合检索已终止：${error.message || '本次搜索未完成'}`));
+                    list.replaceChildren(failure);
+                    renderIcons(panel);
+                }
+                return false;
+            }
+            state.resourceSearchProgress = {
+                phase: 'incomplete',
+                status: resultCount ? 'pending' : 'error',
+                text: '搜索中断 · 本次搜索未完成',
+            };
+            updateResourceSiteStatuses(panel);
             if (append) {
-                renderResourceNotice({type: 'error', message: '更多资源加载失败，现有结果已保留'});
+                renderResourceNotice({type: 'warning', message: `更多资源搜索中断，本次未完成；已保留 ${resultCount} 条结果`});
                 return false;
             }
             if (resort) {
-                renderResourceNotice({type: 'error', message: '排序刷新失败，现有结果已保留'});
+                renderResourceNotice({
+                    type: 'warning',
+                    message: `排序刷新失败，现有结果已保留；本次搜索未完成（${resultCount} 条已到达结果）`,
+                });
                 return false;
             }
             if (merge) {
@@ -2785,18 +3198,23 @@
                     code: error.payload?.code || 'unavailable',
                     retryable: true,
                 }], siteId);
-                sites.replaceWith(resourceSiteStatuses(state.resourceSiteStatuses));
+                updateResourceSiteStatuses(panel);
                 renderResourceNotice({type: 'error', message: `${current.site_name || siteId} 检索失败，其他源站结果已保留`});
                 renderIcons(elements.dialogBody);
                 return false;
             }
-            state.resourceResults.clear();
-            state.resourceSourceOrder.clear();
-            state.activeResourceSiteId = '';
+            if (resultCount || initialized) {
+                renderResourceResultsList(false, true);
+                renderResourceNotice({
+                    type: resultCount ? 'warning' : 'error',
+                    message: `搜索连接中断，本次搜索未完成；已保留 ${resultCount} 条结果`,
+                });
+                return false;
+            }
             state.resourceSiteStatuses = [];
-            sites.replaceWith(resourceSiteStatuses([]));
+            updateResourceSiteStatuses(panel);
             const failure = node('div', 'discovery-resource-state is-error');
-            failure.append(icon('triangle-alert'), node('span', '', error.message || '资源索引暂不可用'));
+            failure.append(icon('triangle-alert'), node('span', '', '搜索连接中断，本次搜索未完成'));
             const retry = node('button', 'jump-btn discovery-resource-retry', '重试资源检索');
             retry.type = 'button';
             retry.addEventListener('click', () => loadResources(item, detail, detailRequestId));
@@ -2919,12 +3337,10 @@
             if (detailRequestId === state.detailRequestId) {
                 renderDetail(payload, resolvedItem, card, mapping);
                 if (state.resourceResultsEnabled) {
-                    const resourceSearchSucceeded = await loadResources(
-                        resolvedItem, detail, detailRequestId,
-                    );
                     if (item.resource_focus && detailRequestId === state.detailRequestId) {
-                        focusResourceWorkbench(Boolean(resourceSearchSucceeded));
+                        focusResourceWorkbench();
                     }
+                    await loadResources(resolvedItem, detail, detailRequestId);
                 }
             }
         } catch (error) {

@@ -71,6 +71,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
             user_agent="MediaFlux/Test",
             nyaa_endpoint_timeout_seconds=4.0,
             general_timeout_seconds=9.0,
+            general_cache_ttl_seconds=120,
             btbtla_min_interval_seconds=5,
         )
         self.assertIs(service.registry, registry)

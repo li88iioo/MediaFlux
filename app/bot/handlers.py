@@ -507,11 +507,18 @@ def _resource_search_view(
             lines.append(f"<b>{offset}. {title}</b>")
             lines.append(html.escape(_resource_item_meta(item, include_site=False)))
     else:
-        lines.extend(["", "当前站点没有匹配资源。"])
+        uncertain = any(
+            site.get("status") in {"partial", "searching", "error"}
+            for site in snapshot["sites"]
+            if not selected_site or site.get("site_id") == selected_site
+        )
+        lines.extend(["", "本轮未找到匹配资源，部分来源未完成检索。" if uncertain else "当前站点没有匹配资源。"])
 
     failures = [
-        site for site in snapshot["sites"] if str(site.get("status") or "") == "error"
+        site for site in snapshot["sites"] if str(site.get("status") or "") in {"error", "partial"}
     ]
+    if visible and snapshot.get("partial") and not failures:
+        lines.extend(["", "已保留可用结果，部分来源未完成检索。"])
     if failures:
         lines.append("")
         lines.append("<b>站点状态</b>")

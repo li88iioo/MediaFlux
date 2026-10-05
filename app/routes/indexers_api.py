@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app import config
 from app.indexers.errors import (
@@ -15,7 +16,7 @@ from app.indexers.errors import (
     IndexerResultNotFound,
     IndexerValidationError,
 )
-from app.indexers.models import IndexerMediaSearchRequest
+from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
 from app.indexers.release import parse_indexer_release_position
 from app.indexers.runtime import get_indexer_service
 from app.indexers.downloads import (
@@ -127,8 +128,6 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
     site_attempt_counts = getattr(result, "site_attempt_counts", {}) or {}
     visible_counts = getattr(result, "site_visible_counts", {}) or {}
     page_states = getattr(result, "site_page_states", {}) or {}
-    attempted = set(result.sites_attempted)
-    succeeded = set(result.sites_succeeded)
     enabled_site_ids = getattr(service, "enabled_site_ids", None)
     if enabled_site_ids is None:
         enabled_site_ids = frozenset(service.registry.enabled_ids())
@@ -137,18 +136,29 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
         adapter = service.registry.get(site_id)
         code = None
         retryable = False
-        if site_id not in enabled_site_ids:
-            status, message = "disabled", ""
-        elif site_id in errors:
-            status = "error"
-            code, message, retryable = _safe_site_error(errors[site_id])
-        elif site_id in succeeded:
-            status, message = ("success" if counts.get(site_id, 0) else "empty"), ""
-        elif site_id in attempted:
-            status, message = "error", "站点未返回有效状态"
-            code, retryable = "unavailable", True
-        else:
+        sources = (getattr(result, "source_statuses", {}) or {}).get(site_id, ())
+        diagnostics = [{
+            "site_id": row.site_id, "site_name": row.site_name, "status": row.status,
+            "count": row.count, "cached": bool(result.cached or row.cached), "code": row.code or None,
+            "message": (
+                ("本轮未完整核验，暂保留缓存结果" if result.cached or row.cached else "部分结果未能取得，已保留成功结果")
+                if row.status == "partial" else
+                _SITE_ERROR_CATALOG.get(row.code, ("来源检索未完成", True))[0] if row.code else ""
+            ),
+        } for row in sources]
+        status = "disabled" if site_id not in enabled_site_ids else indexer_site_status(result, site_id, counts.get(site_id, 0))
+        message = ""
+        if status is None:
             continue
+        if status == "searching":
+            message = "正在补充检索"
+        elif status == "partial":
+            message, retryable = "本轮未找到匹配资源，部分来源未完成", True
+        elif status == "error":
+            if site_id in errors:
+                code, message, retryable = _safe_site_error(errors[site_id])
+            else:
+                code, message, retryable = "unavailable", "站点未返回有效状态", True
         page_state = page_states.get(site_id)
         payload.append({
             "site_id": site_id,
@@ -159,6 +169,7 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
             "message": message,
             "code": code,
             "retryable": retryable,
+            "diagnostics": diagnostics,
             "query": str(site_queries.get(site_id) or ""),
             "attempts": max(0, int(site_attempt_counts.get(site_id, 0) or 0)),
             "pagination_supported": bool(
@@ -183,7 +194,48 @@ def _search_payload(service, result) -> dict[str, Any]:
         "partial": result.partial,
         "cached": result.cached,
         "has_more": bool(getattr(result, "has_more", False)),
+        "complete": bool(getattr(result, "complete", True)),
     }
+
+
+async def _stream_search(request: Request, service, run_search):
+    """相同搜索管线的SSE表现形式：队列仅保留最新快照，断开即撤销本消费者。"""
+    updates = asyncio.Queue(maxsize=1)
+
+    def receive(result):
+        if updates.full():
+            updates.get_nowait()
+        updates.put_nowait(result)
+
+    task = asyncio.create_task(run_search(receive))
+    update = asyncio.create_task(updates.get())
+    try:
+        while True:
+            done, _ = await asyncio.wait((task, update), timeout=10, return_when=asyncio.FIRST_COMPLETED)
+            if await request.is_disconnected():
+                break
+            if task in done:
+                result = task.result()
+                yield "event: complete\ndata: " + json.dumps(_search_payload(service, result), ensure_ascii=False) + "\n\n"
+                break
+            if update in done:
+                yield "event: progress\ndata: " + json.dumps(_search_payload(service, update.result()), ensure_ascii=False) + "\n\n"
+                update = asyncio.create_task(updates.get())
+            elif not done:
+                yield ": keepalive\n\n"
+    except IndexerError as exc:
+        yield "event: error\ndata: " + json.dumps({"error": exc.public_message, "code": exc.code}, ensure_ascii=False) + "\n\n"
+    finally:
+        for pending in (task, update):
+            if not pending.done():
+                pending.cancel()
+        await asyncio.gather(task, update, return_exceptions=True)
+
+
+def _stream_response(request, service, run_search):
+    return StreamingResponse(_stream_search(request, service, run_search), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "X-Accel-Buffering": "no",
+    })
 
 
 def _media_request(payload: Any) -> tuple[IndexerMediaSearchRequest, list[str] | None]:
@@ -256,6 +308,8 @@ async def search(
         return api_error("sites 参数过长", 400)
     site_ids = [value.strip().lower() for value in sites.split(",") if value.strip()] or None
     service = get_indexer_service()
+    if "text/event-stream" in request.headers.get("accept", ""):
+        return _stream_response(request, service, lambda observer: service.search(q, page, site_ids, sort_mode=sort, on_progress=observer))
     try:
         result = await service.search(q, page, site_ids, sort_mode=sort)
     except IndexerError as exc:
@@ -269,6 +323,8 @@ async def search_media(request: Request, payload: Any = Body(...)):
     try:
         media_request, site_ids = _media_request(payload)
         service = get_indexer_service()
+        if "text/event-stream" in request.headers.get("accept", ""):
+            return _stream_response(request, service, lambda observer: service.search_media(media_request, site_ids, on_progress=observer))
         result = await service.search_media(media_request, site_ids)
     except IndexerError as exc:
         return _error_response(exc)

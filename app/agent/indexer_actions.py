@@ -345,7 +345,8 @@ def search_resources(
     ok = bool(result.sites_succeeded)
     summary = f"找到 {len(items)} 项可查看资源"
     if result.partial:
-        summary += "，部分站点暂不可用"
+        summary = (f"找到 {len(items)} 项可查看资源，部分来源未完成" if items
+                   else "本轮未找到匹配资源，部分来源未完成，暂不能确认是否无资源")
     elif not items:
         summary = "已完成多站搜索，暂未找到匹配资源"
     tool_result = ToolResult(

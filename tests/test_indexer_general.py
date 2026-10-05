@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import tests  # noqa: F401
 from app.indexers.errors import IndexerRateLimited, IndexerSecurityError
@@ -29,6 +29,7 @@ class Member(DirectResultAdapter):
         self.http = type("Http", (), {"aclose": AsyncMock()})()
         self.delay, self.error = delay, error
         self.calls = 0
+        self.starts: list[tuple[str, float]] = []
         self.cancelled = False
         self.items = [IndexerItem(
             site_id=site_id, site_name=site_id, title="Example S01E01 1080p",
@@ -38,6 +39,7 @@ class Member(DirectResultAdapter):
 
     async def search(self, request):
         self.calls += 1
+        self.starts.append((request.query, asyncio.get_running_loop().time()))
         try:
             await asyncio.sleep(self.delay)
             if self.error:
@@ -58,14 +60,81 @@ class GeneralTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.items[0].site_name, "healthy")
         self.assertEqual({e.code for e in page.errors}, {"timeout", "rate_limited"})
         self.assertTrue(slow.cancelled)
-        await adapter.search(IndexerSearchRequest.create("Example"))
-        self.assertEqual((healthy.calls, slow.calls, limited.calls), (2, 1, 1))
+        cached = await adapter.search(IndexerSearchRequest.create("Example"))
+        self.assertEqual((healthy.calls, slow.calls, limited.calls), (1, 1, 1))
+        self.assertTrue(cached.source_statuses[0].cached)
 
     async def test_followup_pages_only_query_paginated_sources(self):
-        first, second = Member("first", paginated=True), Member("second")
-        page = await GeneralAdapter((first, second)).search(IndexerSearchRequest.create("Example", 2))
-        self.assertEqual((first.calls, second.calls), (1, 0))
+        first = Member("first", paginated=True)
+        second = Member("second", paginated=True)
+        unsupported = Member("unsupported")
+        page = await GeneralAdapter((first, second, unsupported)).search(IndexerSearchRequest.create("Example", 2))
+        self.assertEqual((first.calls, second.calls, unsupported.calls), (1, 1, 0))
         self.assertTrue(page.has_more)
+        self.assertEqual([status.site_id for status in page.source_statuses], ["first", "second"])
+
+    async def test_observed_slow_healthy_bt_stays_in_first_wave_and_reduces_total_latency(self):
+        async def make_observed_adapter():
+            members = (
+                Member("btbtla", delay=0.15),
+                Member("dygang", delay=0.04),
+                Member("aipan", delay=0.005),
+            )
+            adapter = GeneralAdapter(members)
+            await adapter.search(IndexerSearchRequest.create("Example"))
+            delays = {"btbtla": 0.30, "dygang": 0.18, "aipan": 0.01}
+            for member in members:
+                member.delay = delays[member.site_id]
+                member.items[0].title = "Example New S01E01 1080p"
+            return adapter, members
+
+        async def measure(adapter, members):
+            from app.indexers.providers.base import page_observer
+
+            loop = asyncio.get_running_loop()
+            started_at = loop.time()
+            first_result_at = None
+
+            def observe(_site_id, page):
+                nonlocal first_result_at
+                if page.items and first_result_at is None:
+                    first_result_at = loop.time() - started_at
+
+            token = page_observer.set(observe)
+            try:
+                await adapter.search(IndexerSearchRequest.create("Example New"))
+            finally:
+                page_observer.reset(token)
+            total_at = loop.time() - started_at
+            starts = [
+                member.site_id
+                for member in sorted(
+                    (m for m in members if m.starts and m.starts[-1][0] == "Example New"),
+                    key=lambda m: m.starts[-1][1],
+                )
+            ]
+            self.assertIsNotNone(first_result_at)
+            return first_result_at, total_at, starts
+
+        adapter, members = await make_observed_adapter()
+        first_result, total, starts = await measure(adapter, members)
+        self.assertEqual(starts[:2], ["aipan", "btbtla"])
+
+        control, control_members = await make_observed_adapter()
+        with patch.object(GeneralAdapter, "_initial_members", lambda _self, ordered: ordered[:2]):
+            control_first, control_total, control_starts = await measure(control, control_members)
+
+        self.assertEqual(control_starts[:2], ["aipan", "dygang"])
+        self.assertLess(first_result, total)
+        self.assertLess(control_first, control_total)
+        self.assertGreater(
+            control_total,
+            total + 0.08,
+            (
+                f"reserved-BT first-result={first_result:.3f}s total={total:.3f}s; "
+                f"speed-only first-result={control_first:.3f}s total={control_total:.3f}s"
+            ),
+        )
 
     async def test_origin_routed_resolve_and_legacy_btbtla_origin(self):
         first, second = Member("first"), Member("btbtla")
@@ -80,7 +149,9 @@ class GeneralTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_general_torrent_bytes_and_url_use_origin_client_and_size_limit(self):
         from types import SimpleNamespace
+
         import httpx
+
         from app.indexers.downloads import _resolved_download_input
         from app.indexers.errors import IndexerResponseTooLarge
         from app.indexers.http import FixedHostHttpClient

@@ -31,6 +31,7 @@ from .models import (
     ResolvedDownload,
 )
 from .providers.base import magnet_infohash
+from .providers.base import page_observer
 from .query_plan import build_site_queries
 from .ranking import annotate_clusters, rank_item
 from .registry import IndexerRegistry
@@ -128,6 +129,9 @@ class IndexerService:
             tuple[asyncio.AbstractEventLoop, tuple[object, ...]],
             asyncio.Task[object],
         ] = {}
+        self._progress_callbacks: dict[tuple, set[Callable[[AggregatedIndexerResult], None]]] = {}
+        self._progress_last: dict[tuple, AggregatedIndexerResult] = {}
+        self._search_waiters: dict[tuple, int] = {}
         self._loop_semaphores: dict[asyncio.AbstractEventLoop, asyncio.Semaphore] = {}
         self._closing = False
         self._closed = False
@@ -140,6 +144,7 @@ class IndexerService:
         site_ids: Iterable[str] | None = None,
         *,
         sort_mode: str = "relevance_desc",
+        on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
     ) -> AggregatedIndexerResult:
         request = IndexerSearchRequest.create(
             query,
@@ -163,12 +168,15 @@ class IndexerService:
             cache_key=cache_key,
             ranking_context=None,
             sort_mode=request.sort_mode,
+            on_progress=on_progress,
         )
 
     async def search_media(
         self,
         request: IndexerMediaSearchRequest,
         site_ids: Iterable[str] | None = None,
+        *,
+        on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
     ) -> AggregatedIndexerResult:
         if not isinstance(request, IndexerMediaSearchRequest):
             raise IndexerValidationError("invalid media search request")
@@ -190,6 +198,7 @@ class IndexerService:
             cache_key=cache_key,
             ranking_context=request,
             sort_mode=request.sort_mode,
+            on_progress=on_progress,
         )
 
     async def _search_plans(
@@ -202,6 +211,7 @@ class IndexerService:
         cache_key: tuple[object, ...],
         ranking_context: IndexerMediaSearchRequest | None,
         sort_mode: str,
+        on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
     ) -> AggregatedIndexerResult:
         self._ensure_open()
         cached = self._get_cached(cache_key)
@@ -209,8 +219,22 @@ class IndexerService:
             return cached
         loop = asyncio.get_running_loop()
         inflight_key = (loop, cache_key)
+        pinned: dict[tuple, IndexerItem] = {}
+        def stable_view(result: AggregatedIndexerResult) -> AggregatedIndexerResult:
+            view = result.clone()
+            view.items = [replace(pinned.setdefault(self._result_identity(item), item)) for item in result.items]
+            return view
+        def notify(result: AggregatedIndexerResult) -> None:
+            if on_progress is not None:
+                on_progress(stable_view(result))
         with self._runtime_condition:
             self._ensure_open_locked()
+            self._search_waiters[inflight_key] = self._search_waiters.get(inflight_key, 0) + 1
+            if on_progress is not None:
+                self._progress_callbacks.setdefault(inflight_key, set()).add(notify)
+                latest = self._progress_last.get(inflight_key)
+                if latest is not None:
+                    notify(latest.clone())
             task = self._inflight.get(inflight_key)
             created = task is None
             if task is None:
@@ -234,26 +258,54 @@ class IndexerService:
                     with self._runtime_condition:
                         if self._inflight.get(key) is done_task:
                             self._inflight.pop(key, None)
+                            self._progress_last.pop(key, None)
                         active_loops = {active_key[0] for active_key in self._inflight}
                         if key[0] not in active_loops:
                             self._loop_semaphores.pop(key[0], None)
                         self._runtime_condition.notify_all()
 
                 task.add_done_callback(cleanup)
-        result = await asyncio.shield(task)
-        if created:
-            return result
-        cached = self._get_cached(cache_key)
-        if cached is not None:
-            return cached
-        clone = result.clone(cached=False)
-        clone.items = [
-            replace(
-                item, result_id=self.result_store.put(replace(item, result_id=None))
-            )
-            for item in clone.items
-        ]
-        return clone
+        try:
+            result = await asyncio.shield(task)
+            if on_progress is not None:
+                return stable_view(result)
+            if created:
+                return result
+            cached = self._get_cached(cache_key)
+            if cached is not None:
+                return cached
+            clone = result.clone(cached=False)
+            clone.items = [
+                replace(item, result_id=self.result_store.put(replace(item, result_id=None)))
+                for item in clone.items
+            ]
+            return clone
+        finally:
+            with self._runtime_condition:
+                callbacks = self._progress_callbacks.get(inflight_key)
+                if callbacks is not None and on_progress is not None:
+                    callbacks.discard(notify)
+                    if not callbacks:
+                        self._progress_callbacks.pop(inflight_key, None)
+                remaining = self._search_waiters.get(inflight_key, 1) - 1
+                if remaining:
+                    self._search_waiters[inflight_key] = remaining
+                else:
+                    self._search_waiters.pop(inflight_key, None)
+                    if not task.done():
+                        task.cancel()
+            if not remaining and not task.done():
+                await asyncio.gather(task, return_exceptions=True)
+
+    def _publish_progress(self, key: tuple, result: AggregatedIndexerResult) -> None:
+        with self._runtime_condition:
+            self._progress_last[key] = result.clone()
+            callbacks = tuple(self._progress_callbacks.get(key, ()))
+        for callback in callbacks:
+            try:
+                callback(result.clone())
+            except Exception:
+                logger.warning("indexer.progress consumer callback failed", exc_info=True)
 
     async def _search_plans_uncached(
         self,
@@ -269,54 +321,95 @@ class IndexerService:
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
+        loop = asyncio.get_running_loop()
+        key = (loop, cache_key)
+        progress = asyncio.Event()
+        outcomes: dict[str, _ProviderOutcome] = {}
+        published_items: dict[tuple, IndexerItem] = {}
 
-        tasks = {
-            site_id: asyncio.create_task(
-                self._search_site_plan(
-                    site_id,
-                    plans[site_id],
-                    page,
-                    ranking_context=ranking_context,
-                    sort_mode=sort_mode,
+        def observe(site_id: str, result_page: IndexerPage) -> None:
+            if site_id not in selected:
+                return
+            previous = outcomes.get(site_id)
+            if previous is not None and previous.page is not None:
+                result_page = replace(result_page, items=self._merge_plan_items(previous.page.items, result_page.items))
+            outcomes[site_id] = _ProviderOutcome(site_id, page=result_page, query=plans[site_id][0])
+            progress.set()
+
+        def finish(outcome: _ProviderOutcome) -> None:
+            previous = outcomes.get(outcome.site_id)
+            if outcome.page is None and previous is not None and previous.page is not None:
+                outcome.page = replace(
+                    previous.page, complete=True,
+                    source_statuses=tuple(
+                        replace(row, status="error", code=outcome.error.code if outcome.error else "unavailable")
+                        if row.status in {"pending", "searching"} else row
+                        for row in previous.page.source_statuses
+                    ),
                 )
-            )
-            for site_id in selected
-        }
-        total_timeout_seconds = (
-            self.total_timeout_seconds + self._maximum_timeout_overhead(selected)
-        )
+            outcomes[outcome.site_id] = outcome
+
+        token = page_observer.set(observe)
+        tasks = {site_id: asyncio.create_task(self._search_site_plan(
+            site_id, plans[site_id], page, ranking_context=ranking_context, sort_mode=sort_mode,
+        )) for site_id in selected}
+        page_observer.reset(token)
+        pending = set(tasks.values())
+        deadline = loop.time() + self.total_timeout_seconds + self._maximum_timeout_overhead(selected)
+        notifier = asyncio.create_task(progress.wait())
         try:
-            done, pending = await asyncio.wait(
-                tasks.values(), timeout=total_timeout_seconds
-            )
-            outcome_by_site: dict[str, _ProviderOutcome] = {}
-            for task in done:
-                outcome = task.result()
-                outcome_by_site[outcome.site_id] = outcome
-            if pending:
-                pending_sites = {
-                    site_id for site_id, task in tasks.items() if task in pending
-                }
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                for site_id in pending_sites:
-                    queries = plans.get(site_id, ())
-                    outcome_by_site[site_id] = _ProviderOutcome(
-                        site_id=site_id,
-                        error=self._public_error(
-                            site_id, IndexerTimeout("total search timeout")
-                        ),
-                        query=queries[0] if queries else "",
-                        attempts=0,
+            while pending:
+                done, _ = await asyncio.wait(pending | {notifier}, timeout=max(0, deadline - loop.time()), return_when=asyncio.FIRST_COMPLETED)
+                if not done:
+                    break
+                for task in done & pending:
+                    outcome = task.result()
+                    finish(outcome)
+                    pending.remove(task)
+                if notifier in done:
+                    progress.clear()
+                    notifier = asyncio.create_task(progress.wait())
+                if pending and self._progress_callbacks.get(key):
+                    snapshot = self._aggregate_outcomes(
+                        display_query=display_query, page=page, selected=selected,
+                        outcome_by_site=outcomes, ranking_context=ranking_context,
+                        sort_mode=sort_mode, complete=False, published_items=published_items,
                     )
+                    self._publish_progress(key, snapshot)
+            for site_id, task in tasks.items():
+                if task in pending:
+                    finish(_ProviderOutcome(
+                        site_id, error=self._public_error(site_id, IndexerTimeout("total search timeout")),
+                        query=plans[site_id][0],
+                    ))
         finally:
-            unfinished = tuple(task for task in tasks.values() if not task.done())
+            unfinished = [task for task in (*tasks.values(), notifier) if not task.done()]
             for task in unfinished:
                 task.cancel()
             if unfinished:
                 await asyncio.gather(*unfinished, return_exceptions=True)
+        result = self._aggregate_outcomes(
+            display_query=display_query, page=page, selected=selected,
+            outcome_by_site=outcomes, ranking_context=ranking_context,
+            sort_mode=sort_mode, complete=True, published_items=published_items,
+        )
+        cache_ttl = self._cache_ttl_for(result)
+        if cache_ttl is not None:
+            self._put_cached(cache_key, result, cache_ttl)
+        return result.clone(cached=False)
 
+    @staticmethod
+    def _result_identity(item: IndexerItem) -> tuple:
+        infohash = magnet_infohash(item.magnet)
+        return ("hash", infohash) if infohash else (item.site_id, item.detail_url, item.title)
+
+    def _aggregate_outcomes(
+        self, *, display_query: str, page: int, selected: tuple[str, ...],
+        outcome_by_site: dict[str, _ProviderOutcome],
+        ranking_context: IndexerMediaSearchRequest | None, sort_mode: str,
+        complete: bool, published_items: dict[tuple, IndexerItem],
+    ) -> AggregatedIndexerResult:
+        log = logger.info if complete else logger.debug
         candidates: list[tuple[int, int, IndexerItem]] = []
         succeeded: list[str] = []
         errors: list[IndexerProviderError] = []
@@ -337,6 +430,8 @@ class IndexerService:
                 )
             )
             if outcome is None:
+                if not complete:
+                    continue
                 errors.append(
                     self._public_error(
                         site_id, IndexerTimeout("missing provider outcome")
@@ -373,7 +468,9 @@ class IndexerService:
                 continue
             page_result = outcome.page
             errors.extend(page_result.errors)
-            if page_result.items or not page_result.errors:
+            if page_result.items or (not page_result.errors and outcome.error is None and page_result.complete) or any(
+                row.status in {"success", "empty", "partial"} for row in page_result.source_statuses
+            ):
                 succeeded.append(site_id)
             page_has_more = bool(page < 100 and page_result and page_result.has_more)
             has_more = has_more or page_has_more
@@ -387,9 +484,11 @@ class IndexerService:
                 has_more=page_has_more,
                 next_page=page + 1 if page_has_more else None,
             )
-            provider_items = (page_result.items if page_result is not None else [])[
-                : self.max_results_per_site
-            ]
+            provider_items = [rank_item(item, media=ranking_context, fallback_query=display_query, now=self._clock()) for item in page_result.items]
+            provider_items = [entry[1] for entry in sorted(
+                enumerate(provider_items),
+                key=lambda entry: self._candidate_sort_key((site_index, entry[0], entry[1]), sort_mode),
+            )][: self.max_results_per_site]
             site_item_counts[site_id] = 0
             for provider_index, candidate in enumerate(provider_items):
                 if candidate.site_id != site_id:
@@ -403,14 +502,8 @@ class IndexerService:
                     )
                     continue
                 site_item_counts[site_id] += 1
-                ranked = rank_item(
-                    candidate,
-                    media=ranking_context,
-                    fallback_query=display_query,
-                    now=self._clock(),
-                )
-                candidates.append((site_index, provider_index, ranked))
-            logger.info(
+                candidates.append((site_index, provider_index, candidate))
+            log(
                 "indexer.site_search site_id=%s outcome=%s duration_ms=%d attempts=%d item_count=%d",
                 site_id,
                 "partial"
@@ -428,8 +521,13 @@ class IndexerService:
         ranked_items = annotate_clusters([entry[2] for entry in candidates])
         items: list[IndexerItem] = []
         for candidate in ranked_items:
-            result_id = self.result_store.put(candidate)
-            items.append(candidate.with_result_id(result_id))
+            identity = self._result_identity(candidate)
+            frozen = published_items.get(identity) if not complete else None
+            if frozen is None:
+                frozen = candidate.with_result_id(self.result_store.put(candidate))
+                if not complete:
+                    published_items[identity] = frozen
+            items.append(replace(frozen))
 
         result = AggregatedIndexerResult(
             query=display_query,
@@ -446,18 +544,17 @@ class IndexerService:
             errors=errors,
             partial=bool(errors),
             cached=False,
+            complete=complete,
+            source_statuses={key: outcome.page.source_statuses for key, outcome in outcome_by_site.items() if outcome.page is not None and outcome.page.source_statuses},
         )
-        logger.info(
+        log(
             "indexer.search sites_attempted=%d sites_succeeded=%d items=%d partial=%s cached=false",
             len(selected),
             len(succeeded),
             len(items),
             bool(errors),
         )
-        cache_ttl = self._cache_ttl_for(result)
-        if cache_ttl is not None:
-            self._put_cached(cache_key, result, cache_ttl)
-        return result.clone(cached=False)
+        return result
 
     async def resolve(self, result_id: str) -> ResolvedDownload:
         self._ensure_open()
@@ -911,6 +1008,7 @@ class IndexerService:
                     has_more=has_more,
                     pagination_supported=pagination_supported,
                     errors=tuple(page_errors.values()),
+                    source_statuses=last_outcome.page.source_statuses if last_outcome is not None and last_outcome.page is not None else (),
                 ),
                 query=contributed_query or (queries[0] if queries else ""),
                 attempts=attempts_made,

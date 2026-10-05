@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app import config
-from app.indexers.models import IndexerMediaSearchRequest
+from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
 from app.indexers.runtime import build_indexer_service
 from app.logger import get_logger
 from app.indexers.downloads import download_indexer_result_public
@@ -359,22 +359,20 @@ def _search_snapshot(service, result) -> dict[str, Any]:
         counts[site_id] = counts.get(site_id, 0) + 1
     errors = {str(error.site_id): str(error.code or "unavailable") for error in result.errors}
     attempted = set(result.sites_attempted)
-    succeeded = set(result.sites_succeeded)
     sites = []
     for site_id in service.registry.ids():
         if site_id not in attempted and site_id not in counts:
             continue
         adapter = service.registry.get(site_id)
         code = errors.get(site_id, "")
-        if code:
-            status = "error"
-            message = _SITE_ERROR_MESSAGES.get(code, "检索失败")
-        elif site_id in succeeded:
-            status = "success" if counts.get(site_id, 0) else "empty"
-            message = ""
-        else:
-            status = "error"
-            message = "未返回有效状态"
+        status = indexer_site_status(result, site_id, counts.get(site_id, 0)) or "error"
+        message = ""
+        if status == "partial":
+            message = "本轮未找到匹配资源，部分来源未完成"
+        elif status == "searching":
+            message = "正在补充检索"
+        elif status == "error":
+            message = _SITE_ERROR_MESSAGES.get(code, "未返回有效状态")
         sites.append(
             {
                 "site_id": site_id,
