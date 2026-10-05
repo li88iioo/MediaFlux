@@ -264,6 +264,45 @@ class RSSQBUnifiedDownloadTests(IsolatedDatabaseTestCase):
         self.assertTrue(result["existing"])
         client_cls.assert_not_called()
 
+    @patch("app.indexers.downloads.submit_download_input")
+    def test_processed_entries_preserve_receipt_despite_missing_or_invalid_payload(self, enqueue) -> None:
+        payloads = ("{broken-json", "null", "[]", "{}", '{"torrent_url":""}')
+        for method in ("qb", "guangya"):
+            sub_id = db.add_rss_subscription(
+                name=method, urls="https://example.com/feed.xml", download_method=method,
+            )
+            for index, payload in enumerate(payloads):
+                with self.subTest(method=method, payload=payload):
+                    entry_id = self._entry(sub_id, f"processed-{index}", "", processed=True)
+                    with db.get_conn() as conn:
+                        conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (payload, entry_id))
+                    before = dict(db.get_rss_entry(entry_id))
+                    for _ in range(2):
+                        result = RSSEngine().download(entry_id)
+                        self.assertTrue(result["ok"])
+                        self.assertTrue(result["existing"])
+                        self.assertTrue(result["already_processed"])
+                        self.assertEqual(result["method"], method)
+                    self.assertEqual(dict(db.get_rss_entry(entry_id)), before)
+        enqueue.assert_not_called()
+
+    @patch("app.indexers.downloads.submit_download_input")
+    def test_unprocessed_bad_payloads_keep_specific_failure_codes(self, enqueue) -> None:
+        sub_id = self._subscription()
+        for index, (payload, code) in enumerate((
+            ("{broken-json", "invalid_payload"), ("null", "invalid_payload"),
+            ("[]", "invalid_payload"), ("{}", "missing_torrent_url"),
+        )):
+            with self.subTest(payload=payload):
+                entry_id = self._entry(sub_id, f"invalid-{index}", "")
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (payload, entry_id))
+                self.assertFalse(RSSEngine().download(entry_id)["ok"])
+                row = db.get_rss_entry(entry_id)
+                self.assertEqual(row["status"], "failed")
+                self.assertEqual(row["failure_code"], code)
+        enqueue.assert_not_called()
+
     @patch.object(DownloadTracker, "_notify_completion")
     @patch.object(DownloadTracker, "_start_local_import")
     def test_local_path_never_overrides_incomplete_qb_api_state(

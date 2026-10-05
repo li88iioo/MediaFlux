@@ -844,18 +844,11 @@ class RSSEngine:
             payload = json.loads(entry["payload"] or "{}")
         except (TypeError, ValueError):
             payload = None
-        if not isinstance(payload, dict):
-            if entry_already_claimed or db.claim_rss_entry(entry_id):
-                db.record_rss_entry_failure(entry_id, "invalid_payload", False)
-            return {"error": "条目数据无效", "ok": False, "method": method}
-
-        torrent_url = str(payload.get("torrent_url") or payload.get("link") or "").strip()
-        if not torrent_url:
-            if entry_already_claimed or db.claim_rss_entry(entry_id):
-                db.record_rss_entry_failure(entry_id, "missing_torrent_url", False)
-            return {"error": "条目无种子链接", "ok": False, "method": method}
-
-        infohash = self._torrent_infohash(torrent_url)
+        torrent_url = (
+            str(payload.get("torrent_url") or payload.get("link") or "").strip()
+            if isinstance(payload, dict) else ""
+        )
+        infohash = self._torrent_infohash(torrent_url) if torrent_url else ""
         if entry["status"] == "downloaded" or bool(entry["processed"]):
             return {
                 "ok": True,
@@ -865,6 +858,12 @@ class RSSEngine:
                 "infohash": infohash,
                 "already_processed": True,
             }
+        if not torrent_url:
+            code, message = ("missing_torrent_url", "条目无种子链接") if isinstance(payload, dict) else ("invalid_payload", "条目数据无效")
+            if entry_already_claimed or db.claim_rss_entry(entry_id):
+                db.record_rss_entry_failure(entry_id, code, False)
+            return {"error": message, "ok": False, "method": method}
+
         # 自动任务在真正领取前重新读取配置；手动入口不传 guard，保留暂停后
         # 显式下载能力。已经开始的外部写入不能因后续暂停而释放防重状态。
         if auto_guard is not None and not auto_guard():
