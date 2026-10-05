@@ -3,7 +3,11 @@ from __future__ import annotations
 import unittest
 
 from app.indexers.models import IndexerMediaSearchRequest
-from app.indexers.query_plan import build_site_queries
+from app.indexers.query_plan import (
+    build_site_queries,
+    enrich_media_aliases,
+    needs_bilingual_search,
+)
 
 
 class IndexerQueryPlanTests(unittest.TestCase):
@@ -25,11 +29,15 @@ class IndexerQueryPlanTests(unittest.TestCase):
                 self.assertLessEqual(len(queries), 3)
                 self.assertNotIn("2026", " ".join(queries))
 
-    def test_anime_sites_prefer_latin_alias_then_original_title(self):
+    def test_nyaa_preserves_japanese_original_title_in_existing_plan(self):
         queries = build_site_queries("nyaa", self.request)
 
-        self.assertEqual(queries[0], "Tefuda ga Oome no Victoria")
+        self.assertEqual(
+            queries[:2],
+            ("Tefuda ga Oome no Victoria", "手札が多めのビクトリア"),
+        )
         self.assertIn("手札が多めのビクトリア", queries)
+        self.assertFalse(needs_bilingual_search(queries))
         self.assertLessEqual(len(queries), 3)
 
     def test_tpb_uses_english_and_latin_only_when_available(self):
@@ -51,7 +59,7 @@ class IndexerQueryPlanTests(unittest.TestCase):
         self.assertEqual(queries[0], "デモ作品")
         self.assertEqual(sum(query.casefold() == "demo" for query in queries), 1)
 
-    def test_episode_intent_is_queried_before_broad_title_aliases(self):
+    def test_nyaa_episode_search_keeps_chinese_broad_query_second(self):
         request = IndexerMediaSearchRequest.create(
             title="九门",
             english_title="Mystic Nine",
@@ -67,29 +75,110 @@ class IndexerQueryPlanTests(unittest.TestCase):
         )
         self.assertEqual(
             build_site_queries("nyaa", request),
-            ("The Mystic Nine S02E30", "Mystic Nine S02E30", "九门 S02E30"),
+            ("The Mystic Nine S02E30", "九门", "Mystic Nine"),
+        )
+        self.assertTrue(needs_bilingual_search(build_site_queries("nyaa", request)))
+
+    def test_bilingual_search_predicate_requires_two_queries_in_different_scripts(self):
+        self.assertTrue(needs_bilingual_search(("The Great Ruler", "大主宰")))
+        self.assertFalse(needs_bilingual_search(("Renegade Immortal", "仙逆の物語")))
+        self.assertFalse(needs_bilingual_search(("The Great Ruler", "Perfect World")))
+        self.assertFalse(needs_bilingual_search(("The Great Ruler", "大主宰 Renegade Immortal")))
+        self.assertFalse(needs_bilingual_search(("大主宰",)))
+
+    def test_nyaa_prefers_original_cjk_title_for_the_second_broad_query(self):
+        request = IndexerMediaSearchRequest.create(
+            title="本地标题",
+            original_title="原題",
+            aliases=["Romanized Alias", "English Alias"],
+            media_type="tv",
         )
 
-    def test_gm_team_chinese_title_keeps_broad_fallback_for_all_sites(self):
+        queries = build_site_queries("nyaa", request)
+
+        self.assertEqual(queries, ("Romanized Alias", "原題", "English Alias"))
+        self.assertTrue(needs_bilingual_search(queries))
+
+    def test_known_chinese_title_gets_exact_builtin_aliases_without_mutation(self):
         request = IndexerMediaSearchRequest.create(
             title="凡人修仙传",
+            year=2024,
             media_type="tv",
+            page=3,
+            sort_mode="seeders_desc",
             season=1,
             episode=192,
         )
 
+        enriched = enrich_media_aliases(request)
+
+        self.assertIsNot(enriched, request)
         self.assertEqual(
-            build_site_queries("mikan", request),
-            ("凡人修仙传 S01E192", "凡人修仙传 第1季 第192集", "凡人修仙传"),
+            enriched.aliases,
+            ("A Record of a Mortal's Journey to Immortality", "Fanren Xiu Xian Chuan"),
         )
+        self.assertEqual(request.aliases, ())
+        self.assertEqual(
+            enriched.cache_identity(),
+            (
+                request.title,
+                request.original_title,
+                request.english_title,
+                enriched.aliases,
+                request.year,
+                request.media_type,
+                request.sort_mode,
+                request.season,
+                request.episode,
+            ),
+        )
+        self.assertEqual((enriched.page, enriched.year, enriched.season, enriched.episode), (3, 2024, 1, 192))
         self.assertEqual(
             build_site_queries("nyaa", request),
-            ("凡人修仙传 S01E192", "凡人修仙传"),
+            ("A Record of a Mortal's Journey to Immortality S01E192", "凡人修仙传", "Fanren Xiu Xian Chuan"),
         )
+        self.assertLessEqual(len(build_site_queries("nyaa", request)), 3)
+
+    def test_chinese_short_word_does_not_match_longer_builtin_title(self):
+        request = IndexerMediaSearchRequest.create(title="凡人")
+
+        enriched = enrich_media_aliases(request)
+
+        self.assertEqual(enriched.aliases, ())
+        self.assertEqual(build_site_queries("nyaa", request), ("凡人",))
+
+    def test_explicit_latin_aliases_take_precedence_over_builtin_aliases(self):
+        request = IndexerMediaSearchRequest.create(
+            title="凡人修仙传",
+            english_title="Caller English Title",
+            aliases=["Caller Latin Alias"],
+            media_type="tv",
+            season=2,
+            episode=4,
+        )
+
+        enriched = enrich_media_aliases(request)
+
+        self.assertEqual(enriched.aliases, request.aliases)
         self.assertEqual(
-            build_site_queries("tpb", request),
-            ("凡人修仙传 S01E192", "凡人修仙传"),
+            build_site_queries("nyaa", request),
+            ("Caller Latin Alias S02E04", "凡人修仙传", "Caller English Title"),
         )
+
+    def test_movie_and_unknown_chinese_titles_are_not_guessed(self):
+        movie = IndexerMediaSearchRequest.create(title="凡人修仙传", media_type="movie")
+        unknown = IndexerMediaSearchRequest.create(title="未知国漫标题", media_type="tv")
+
+        self.assertEqual(enrich_media_aliases(movie).aliases, ())
+        self.assertEqual(build_site_queries("nyaa", movie), ("凡人修仙传",))
+        self.assertEqual(enrich_media_aliases(unknown).aliases, ())
+        self.assertEqual(build_site_queries("nyaa", unknown), ("未知国漫标题",))
+
+    def test_anime_aliases_are_not_added_to_other_sites(self):
+        request = IndexerMediaSearchRequest.create(title="仙逆", media_type="tv")
+
+        self.assertEqual(build_site_queries("mikan", request), ("仙逆",))
+        self.assertEqual(build_site_queries("tpb", request), ("仙逆",))
 
     def test_unknown_site_falls_back_to_stable_input_order(self):
         self.assertEqual(

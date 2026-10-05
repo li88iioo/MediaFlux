@@ -255,6 +255,88 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_nyaa_bilingual_search_merges_even_after_a_strong_first_hit(self):
+        media = IndexerMediaSearchRequest.create(title="凡人修仙传", english_title="Fanren Xiu Xian Chuan", season=1, episode=192)
+        shared = f"magnet:?xt=urn:btih:{HASH}"
+        first = item("nyaa", "Fanren Xiu Xian Chuan S01E192 [4K]", magnet=shared)
+        second = item("nyaa", "凡人修仙传 S01E192 [1080p]", magnet="magnet:?xt=urn:btih:" + "b" * 40)
+        adapter = QueryAwareAdapter("nyaa", {"Fanren Xiu Xian Chuan S01E192": [first], "凡人修仙传": [first, second]})
+        service = self.service([adapter])
+        result = await service.search_media(media)
+        self.assertEqual(adapter.queries, ["Fanren Xiu Xian Chuan S01E192", "凡人修仙传"])
+        self.assertEqual({row.magnet for row in result.items}, {shared, second.magnet})
+        self.assertFalse(result.partial)
+        cached = await service.search_media(media)
+        self.assertTrue(cached.cached)
+        self.assertEqual(adapter.calls, 2)
+        self.assertNotEqual([row.result_id for row in result.items], [row.result_id for row in cached.items])
+
+    async def test_nyaa_empty_second_language_does_not_trigger_needless_third_query(self):
+        media = IndexerMediaSearchRequest.create(title="凡人修仙传", english_title="Fanren Xiu Xian Chuan", season=1, episode=192)
+        adapter = QueryAwareAdapter("nyaa", {"Fanren Xiu Xian Chuan S01E192": [
+            item("nyaa", "Fanren Xiu Xian Chuan S01E192 [4K]", magnet=f"magnet:?xt=urn:btih:{HASH}"),
+        ]})
+        result = await self.service([adapter]).search_media(media)
+        self.assertEqual(adapter.queries, ["Fanren Xiu Xian Chuan S01E192", "凡人修仙传"])
+        self.assertEqual(len(result.items), 1)
+
+    async def test_keyword_auto_aliases_are_ranked_and_do_not_expand_other_sites(self):
+        primary = "A Record of a Mortal's Journey to Immortality"
+        nyaa = QueryAwareAdapter("nyaa", {primary: [
+            item("nyaa", primary + " S01E192 [4K]", magnet=f"magnet:?xt=urn:btih:{HASH}"),
+        ]})
+        mikan = QueryAwareAdapter("mikan", {})
+        result = await self.service([nyaa, mikan]).search("凡人修仙传")
+        self.assertEqual(nyaa.queries[:2], [primary, "凡人修仙传"])
+        self.assertEqual(mikan.queries, ["凡人修仙传"])
+        self.assertIn("title_contains", result.items[0].match_reasons)
+        self.assertEqual(result.query, "凡人修仙传")
+
+    async def test_nyaa_bilingual_rate_limit_keeps_earlier_verified_candidates(self):
+        media = IndexerMediaSearchRequest.create(title="凡人修仙传", english_title="Fanren Xiu Xian Chuan")
+        adapter = PartiallyFailingQueryAdapter("nyaa", {"Fanren Xiu Xian Chuan": [
+            item("nyaa", "Fanren Xiu Xian Chuan [4K]", magnet=f"magnet:?xt=urn:btih:{HASH}"),
+        ]}, failing_query="凡人修仙传", error=IndexerRateLimited())
+        result = await self.service([adapter]).search_media(media)
+        self.assertEqual(adapter.queries, ["Fanren Xiu Xian Chuan", "凡人修仙传"])
+        self.assertEqual(len(result.items), 1)
+        self.assertTrue(result.partial)
+        self.assertEqual(result.errors[0].code, "rate_limited")
+
+    async def test_bilingual_first_results_arrive_before_slow_second_and_cancel_reaps_it(self):
+        class DelayedChinese(QueryAwareAdapter):
+            cancelled = False
+            async def search(self, request):
+                if request.query == "凡人修仙传":
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        self.cancelled = True
+                return await super().search(request)
+        primary = "Fanren Xiu Xian Chuan"
+        adapter = DelayedChinese("nyaa", {primary: [item("nyaa", primary + " [4K]", magnet=f"magnet:?xt=urn:btih:{HASH}")]})
+        service = self.service([adapter], site_timeout_seconds=2, total_timeout_seconds=3)
+        arrived = asyncio.Event()
+        frames = []
+        def progress(result):
+            if result.items:
+                frames.append(result)
+                arrived.set()
+        task = asyncio.create_task(service.search_media(
+            IndexerMediaSearchRequest.create(title="凡人修仙传", english_title=primary), on_progress=progress,
+        ))
+        try:
+            await asyncio.wait_for(arrived.wait(), 1)
+            self.assertFalse(task.done())
+            self.assertFalse(frames[0].complete)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+            await service.aclose()
+        self.assertTrue(adapter.cancelled)
+
     async def test_retired_site_in_old_request_never_executes_or_expands_scope(self):
         active = FakeAdapter("btbtla", [item("btbtla", "valid resource")])
         retired = FakeAdapter("1lou", error=AssertionError("retired adapter must never run"))

@@ -31,8 +31,8 @@ from .models import (
     ResolvedDownload,
 )
 from .providers.base import magnet_infohash
-from .providers.base import page_observer
-from .query_plan import build_site_queries
+from .providers.base import page_observer, report_page
+from .query_plan import build_site_queries, enrich_media_aliases, needs_bilingual_search
 from .ranking import annotate_clusters, match_priority, rank_item
 from .registry import IndexerRegistry
 from .release import parse_indexer_release_position
@@ -152,7 +152,13 @@ class IndexerService:
             sort_mode=sort_mode,
         )
         selected = self._select_sites(site_ids)
-        plans = {site_id: (request.query,) for site_id in selected}
+        media = IndexerMediaSearchRequest.create(title=request.query, page=page, sort_mode=request.sort_mode)
+        enriched = enrich_media_aliases(media) if "nyaa" in selected else media
+        ranking_context = enriched if enriched != media else None
+        plans = {
+            site_id: build_site_queries(site_id, enriched) if site_id == "nyaa" and ranking_context else (request.query,)
+            for site_id in selected
+        }
         cache_key = (
             "query",
             request.query,
@@ -166,7 +172,7 @@ class IndexerService:
             selected=selected,
             plans=plans,
             cache_key=cache_key,
-            ranking_context=None,
+            ranking_context=ranking_context,
             sort_mode=request.sort_mode,
             on_progress=on_progress,
         )
@@ -181,11 +187,12 @@ class IndexerService:
         if not isinstance(request, IndexerMediaSearchRequest):
             raise IndexerValidationError("invalid media search request")
         selected = self._select_sites(site_ids)
-        plans = {site_id: build_site_queries(site_id, request) for site_id in selected}
+        ranking_context = enrich_media_aliases(request) if "nyaa" in selected else request
+        plans = {site_id: build_site_queries(site_id, ranking_context if site_id == "nyaa" else request) for site_id in selected}
         plan_identity = tuple((site_id, plans[site_id]) for site_id in selected)
         cache_key = (
             "media",
-            request.cache_identity(),
+            ranking_context.cache_identity(),
             request.page,
             selected,
             plan_identity,
@@ -196,7 +203,7 @@ class IndexerService:
             selected=selected,
             plans=plans,
             cache_key=cache_key,
-            ranking_context=request,
+            ranking_context=ranking_context,
             sort_mode=request.sort_mode,
             on_progress=on_progress,
         )
@@ -958,9 +965,14 @@ class IndexerService:
         )
         attempts_made = 0
         duration_ms = 0
+        minimum_queries = 2 if site_id == "nyaa" and needs_bilingual_search(queries) else 1
         for attempts, query in enumerate(queries, start=1):
             remaining_seconds = plan_budget_seconds - (perf_counter() - plan_started)
             if attempts > 1 and remaining_seconds <= 0:
+                if attempts <= minimum_queries:
+                    last_error = _ProviderOutcome(site_id=site_id, error=self._public_error(
+                        site_id, IndexerTimeout("bilingual search budget exhausted"),
+                    ))
                 break
             attempts_made = attempts
             media_type = (
@@ -1009,12 +1021,19 @@ class IndexerService:
                     for item in outcome.page.items
                 ]
                 merged_items = self._merge_plan_items(merged_items, plan_items)
-                if self._site_plan_quality_satisfied(
-                    merged_items,
-                    media=ranking_context,
-                    fallback_query=query,
-                ):
-                    break
+            if merged_items and attempts >= minimum_queries and self._site_plan_quality_satisfied(
+                merged_items,
+                media=ranking_context,
+                fallback_query=query,
+            ):
+                break
+            if merged_items and site_id == "nyaa" and attempts < len(queries):
+                # 平滑查询间先交付已知结果，下一别名失败/取消不抹掉已返回证据。
+                report_page(site_id, IndexerPage(
+                    items=list(merged_items), page=page, has_more=has_more,
+                    pagination_supported=pagination_supported, complete=False,
+                    errors=tuple(page_errors.values()),
+                ))
         if merged_items:
             ranked_items = [
                 rank_item(
