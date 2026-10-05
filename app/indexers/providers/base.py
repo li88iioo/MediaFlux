@@ -55,6 +55,12 @@ class IndexerAdapter(ABC):
         raise last_error
 
 
+    def http_client_for_result(self, stored_result: IndexerItem):
+        """外围读取来源链接/种子时，使用该冻结结果所属的客户端。"""
+        if stored_result.site_id != self.site_id:
+            raise IndexerSecurityError("result provider mismatch")
+        return self.http
+
     def iter_http_clients(self) -> tuple[object, ...]:
         client = getattr(self, "http", None)
         return (client,) if client is not None else ()

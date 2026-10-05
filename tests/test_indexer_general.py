@@ -78,6 +78,42 @@ class GeneralTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(IndexerSecurityError):
             await adapter.resolve(first.items[0])
 
+    async def test_general_torrent_bytes_and_url_use_origin_client_and_size_limit(self):
+        from types import SimpleNamespace
+        import httpx
+        from app.indexers.downloads import _resolved_download_input
+        from app.indexers.errors import IndexerResponseTooLarge
+        from app.indexers.http import FixedHostHttpClient
+        from app.indexers.models import ResolvedDownload
+        from app.indexers.providers.aipan import AipanAdapter
+        from app.indexers.providers.btbtla import BTBtlaAdapter
+
+        torrent = b"d4:infod4:name4:Testee"
+        requests = []
+        def serve(request):
+            requests.append(str(request.url))
+            return httpx.Response(200, content=torrent, headers={"content-type": "application/x-bittorrent"})
+        client = FixedHostHttpClient(allowed_hosts={"www.btbtlb.com"}, transport=httpx.MockTransport(serve),
+            resolver=lambda host, port: [(2, 1, 6, "", ("93.184.216.34", port))])
+        wrong_client = SimpleNamespace(get=AsyncMock(), allowed_hosts={"www.aipan.me"})
+        registry = IndexerRegistry({"btbtla": GeneralAdapter((AipanAdapter(http=wrong_client), BTBtlaAdapter(http=client)))})
+        service = SimpleNamespace(registry=registry)
+        stored = IndexerItem(site_id="btbtla", site_name="not used for routing", title="Test", detail_url="https://www.btbtlb.com/tdown/1.htm")
+        try:
+            for value in ("https://www.btbtlb.com/file.torrent", torrent):
+                result = await _resolved_download_input(service, stored, ResolvedDownload(kind="torrent", value=value))
+                self.assertEqual(result.torrent_data, torrent)
+                self.assertEqual(result.title, "Test")
+            self.assertEqual(requests, ["https://www.btbtlb.com/file.torrent"])
+            wrong_client.get.assert_not_awaited()
+            client.max_response_bytes = len(torrent) - 1
+            with self.assertRaises(IndexerResponseTooLarge):
+                await _resolved_download_input(service, stored, ResolvedDownload(kind="torrent", value=torrent))
+            with self.assertRaises(IndexerSecurityError):
+                await _resolved_download_input(service, stored, ResolvedDownload(kind="torrent", value="https://www.aipan.me/file.torrent"))
+        finally:
+            await registry.aclose()
+
     async def test_cancellation_cancels_all_member_requests(self):
         members = (Member("a", delay=1), Member("b", delay=1))
         task = asyncio.create_task(GeneralAdapter(members).search(IndexerSearchRequest.create("Example")))

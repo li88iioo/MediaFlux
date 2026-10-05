@@ -95,19 +95,16 @@ async def _resolved_download_input(service, stored, resolved: ResolvedDownload):
     try:
         if resolved.kind == "magnet":
             return normalize_download_url(str(resolved.value or ""))
+        client = service.registry.get(stored.site_id).http_client_for_result(stored)
         if isinstance(resolved.value, bytes):
-            adapter = service.registry.get(stored.site_id)
-            max_bytes = int(
-                getattr(adapter.http, "max_response_bytes", 2 * 1024 * 1024)
-            )
+            max_bytes = int(getattr(client, "max_response_bytes", 2 * 1024 * 1024))
             if len(resolved.value) > max_bytes:
                 raise IndexerResponseTooLarge(
                     "provider returned oversized torrent bytes"
                 )
             return torrent_download_input(_torrent_filename(resolved), resolved.value)
 
-        adapter = service.registry.get(stored.site_id)
-        response = await adapter.http.get(str(resolved.value or ""))
+        response = await client.get(str(resolved.value or ""))
         if response.status_code != 200:
             raise IndexerUnavailable("torrent upstream failed")
         content_type = str(response.headers.get("content-type") or "").split(

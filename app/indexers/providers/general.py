@@ -76,14 +76,22 @@ class GeneralAdapter(IndexerAdapter):
             errors=tuple(dict.fromkeys(error for page in pages for error in page.errors)),
         )
 
-    async def resolve(self, stored_result: IndexerItem) -> ResolvedDownload:
+    def _member_for_result(self, stored_result: IndexerItem) -> IndexerAdapter:
         if stored_result.site_id != self.site_id:
             raise IndexerSecurityError("result provider mismatch")
-        # 来源取冻结结果的已校验URL，不相信展示名称，更不能接受调用方指定解析器。
+        # 来源取冻结结果的已校验URL，不相信展示名称，也不跨子站借用客户端。
         host = urlsplit(stored_result.detail_url or "").hostname
         for member in self.members:
             for base in (member.base_url, *getattr(member, "mirror_base_urls", ())):
                 if host == urlsplit(base).hostname:
                     fixed_host_join(base, stored_result.detail_url or "")
-                    return await member.resolve(replace(stored_result, site_id=member.site_id))
+                    return member
         raise IndexerSecurityError("result origin is not a registered general source")
+
+    def http_client_for_result(self, stored_result: IndexerItem):
+        member = self._member_for_result(stored_result)
+        return member.http_client_for_result(replace(stored_result, site_id=member.site_id))
+
+    async def resolve(self, stored_result: IndexerItem) -> ResolvedDownload:
+        member = self._member_for_result(stored_result)
+        return await member.resolve(replace(stored_result, site_id=member.site_id))

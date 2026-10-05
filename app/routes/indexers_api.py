@@ -66,8 +66,9 @@ def _public_source_url(service, item) -> str | None:
     try:
         parsed = urlsplit(value)
         adapter = service.registry.get(item.site_id)
-        allowed_hosts = {str(host).rstrip(".").lower() for host in getattr(adapter.http, "allowed_hosts", ())}
-    except (KeyError, TypeError, ValueError):
+        client = adapter.http_client_for_result(item)
+        allowed_hosts = {str(host).rstrip(".").lower() for host in getattr(client, "allowed_hosts", ())}
+    except (IndexerError, KeyError, TypeError, ValueError):
         return None
     try:
         host = (parsed.hostname or "").rstrip(".").lower()
