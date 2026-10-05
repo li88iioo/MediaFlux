@@ -143,16 +143,21 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
                 text = result.inner_text()
                 self.assertNotIn('通过写后校验', text)
                 self.assertNotIn('✅', text)
-                self.assertIn('连接中断，后续结果尚未确认', text)
-                self.assertIn('可刷新会话核对', text)
-                self.assertIn('不要重复提交', text)
+                if suffix and suffix[0]['type'] == 'turn.completed':
+                    self.assertIn('执行结果尚未确认', text)
+                    self.assertIn('勿直接重复提交', text)
+                else:
+                    self.assertIn('连接中断，后续结果尚未确认', text)
+                    self.assertIn('可刷新会话核对', text)
+                    self.assertIn('不要重复提交', text)
                 self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
 
     def test_failed_dto_survives_generic_turn_failure(self):
         result = self.confirm([_event(1, 'turn.started', {}),
-            _event(2, 'effect.failed', {'result': FAILURE, 'message': WARNING}),
+            _event(2, 'effect.failed', {'result': FAILURE, 'message': WARNING, 'receipt': format_public_result(FAILURE)}),
             _event(3, 'turn.failed', {'message': '已确认操作未能完成'})])
-        self.assertIn(WARNING, result.inner_text())
+        self.assertIn('请先核对下载器', result.inner_text())
+        self.assertIn('勿直接重复提交', result.inner_text())
         self.assertIn('光鸭云盘', result.inner_text())
         self.assertIn('提交结果未知', result.inner_text())
         self.assertTrue(result.evaluate("el => el.matches('.is-interrupted') || !!el.querySelector('.is-interrupted')"))
@@ -198,7 +203,7 @@ class AgentConfirmationBoundaryBrowserTests(unittest.TestCase):
 
     def test_transport_error_after_trusted_effect_does_not_erase_business_result(self):
         for kind, payload in (('effect.completed', {'result': {'ok': True, 'summary': '任务已暂停'}}),
-                              ('effect.failed', {'result': FAILURE, 'message': WARNING})):
+                              ('effect.failed', {'result': FAILURE, 'message': WARNING, 'receipt': format_public_result(FAILURE)})):
             with self.subTest(kind=kind):
                 result = self.confirm([_event(1, 'turn.started', {}), _event(2, kind, payload)],
                                       malformed_tail='{invalid-json')

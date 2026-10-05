@@ -896,12 +896,14 @@
             turn.followupFailed = true;
             turn.card.classList.remove('agent-streaming', 'is-interrupted', 'agent-cancelled');
             turn.card.classList.add('has-narrative', 'is-conversation');
+            turn.card.classList.toggle('is-interrupted', Boolean(turn.effectError));
             turn.item?.classList.remove('is-confirmation');
             setTurnStatus(turn, '已保留服务端回执，后续状态需核对', 'triangle-alert');
             turn.text.className = 'agent-narrative agent-rich-text';
             replaceRichText(
                 turn.text,
-                `${trustedReceipt}\n\n⚠️ 后续流程未完成：${finalMessage}`,
+                turn.effectError && [...turn.effectReceipts.values()].every(value => value.receipt)
+                    ? trustedReceipt : `${trustedReceipt}\n\n⚠️ 后续流程未完成：${finalMessage}`,
             );
             const trace = buildToolTrace(turn);
             if (trace) turn.card.append(trace);
@@ -1338,7 +1340,7 @@
             } else if (status === 'effect_completed') {
                 const answer = typeof payload.answer === 'string' ? payload.answer : '';
                 if (answer.trim()) finalizeAnswer(turn, answer);
-                else finalizeError(turn, '服务端已结束操作，但未提供最终答复；请以执行回执核对状态。');
+                else finalizeError(turn, `${unconfirmedEffectMessage}服务端未提供最终答复。`);
             }
             break;
         }

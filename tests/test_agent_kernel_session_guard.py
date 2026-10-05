@@ -190,9 +190,9 @@ def test_independent_owner_session_can_confirm_while_first_scope_is_writing(isol
                 from app.indexers.models import ResolvedDownload
                 from tests.test_agent_ux_backend import _resources
                 items = {item["result_id"]: SimpleNamespace(**item) for item in _resources().data["items"]}
-                async def resolve(_):
+                async def resolve(_, *, scope="manual"):
                     return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + "c" * 40)
-                get_service.return_value = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__),
+                get_service.return_value = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__), get_result=lambda key, **_kw: items[key],
                                                            enabled_site_ids=("demo",), resolve=resolve)
                 assert_completed(await confirmation(other, plan2, owner=other_owner, session_id=other_session))
             await lifecycle_for(other, other_pipeline, other_store).reset(owner=other_owner, session_id=other_session)
@@ -215,7 +215,7 @@ def _process_confirm(db_path, plan, pipe):
     db.configure_database(db_path, test_mode=True)
     items = {item["result_id"]: SimpleNamespace(**item) for item in _resources().data["items"]}
 
-    async def resolve(_):
+    async def resolve(_, *, scope="manual"):
         return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + "a" * 40)
 
     def remote_write(row, **kwargs):
@@ -223,7 +223,7 @@ def _process_confirm(db_path, plan, pipe):
         assert pipe.recv() == "finish"
         return {"ok": True, "task_id": "fake-gy"}
 
-    service = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__),
+    service = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__), get_result=lambda key, **_kw: items[key],
                               enabled_site_ids=("demo",), resolve=resolve)
     try:
         with (
