@@ -266,7 +266,7 @@ class PendingPlanAtomicCleanupTests(unittest.IsolatedAsyncioTestCase):
                     state, context, pipeline, plan_id, clock, execute = await self._fixture(kind)
                     if expired:
                         clock[0] += 61
-                    cancelled = await pipeline.cancel_effect(plan_id, context=context)
+                    cancelled = await pipeline.cancel_effect(plan_id, lease=context.lease)
                     self.assertEqual(cancelled, not expired)
                     self.assertEqual(await self._pending(state, context), "")
                     execute.assert_not_called()
@@ -280,7 +280,7 @@ class PendingPlanAtomicCleanupTests(unittest.IsolatedAsyncioTestCase):
                         clock[0] += 61
                     new = await pipeline.execute("downloads.submit", {}, context=context)
                     new_id = new.effect_plan.plan_id
-                    self.assertFalse(await pipeline.cancel_effect(old_id, context=context))
+                    self.assertFalse(await pipeline.cancel_effect(old_id, lease=context.lease))
                     self.assertEqual(await self._pending(state, context), new_id)
                     claimed = pipeline.effect_store.claim(owner=context.owner, session_id=context.session_id,
                                                          generation=context.lease.generation, plan_id=new_id)
@@ -323,7 +323,7 @@ class PendingPlanAtomicCleanupTests(unittest.IsolatedAsyncioTestCase):
 
                     with patch.object(state, "commit", side_effect=publish_new_plan_before_commit):
                         if operation == "cancel":
-                            self.assertTrue(await pipeline.cancel_effect(old_id, context=context))
+                            self.assertTrue(await pipeline.cancel_effect(old_id, lease=context.lease))
                         else:
                             await pipeline.execute_confirmed(old_id, context=context)
                     self.assertEqual(await self._pending(state, context), replacements[0])

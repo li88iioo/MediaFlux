@@ -259,21 +259,7 @@ class AgentSession:
             turn_id=secrets.token_urlsafe(12),
             request_id=request_id or secrets.token_urlsafe(12),
         )
-        token = CancellationToken()
-
-        async def ignore_progress(_payload: Mapping[str, Any]) -> None:
-            return None
-
-        context = ToolCallContext(
-            owner=owner,
-            session_id=session_id,
-            request_id=lease.request_id,
-            turn_id=lease.turn_id,
-            lease=lease,
-            cancellation=token,
-            report_progress=ignore_progress,
-        )
-        return await self.pipeline.cancel_effect(plan_id, context=context)
+        return await self.pipeline.cancel_effect(plan_id, lease=lease)
 
     async def _run_background(
         self,
@@ -538,6 +524,9 @@ class AgentSession:
                 scope.enter_context(session_scope_guard(agent_input.owner, agent_input.session_id, kind="effect"))
                 async with self._start_lock:
                     state = await self.state_store.load(owner=agent_input.owner, session_id=agent_input.session_id)
+                    # 无效/重复点击没有回合所有权，不能先抢占正在运行的续行再拒绝。
+                    if not plan_id or state.pending_effect_plan_id != plan_id:
+                        raise ConfirmationClaimError()
                     lease = PublicationLease(agent_input.owner, agent_input.session_id, state.generation,
                                              secrets.token_urlsafe(12), agent_input.request_id)
                     token = await self.coordinator.begin(lease, protected=True, task=asyncio.current_task())
@@ -762,8 +751,7 @@ class AgentSession:
             # 但点击时又只能得到 stale plan，形成确认死状态。
             if state.pending_effect_plan_id and plan_id is None:
                 await self.pipeline.cancel_effect(
-                    state.pending_effect_plan_id,
-                    context=tool_context,
+                    state.pending_effect_plan_id, lease=lease,
                 )
 
             if validated_selection is not None:

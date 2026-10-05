@@ -3035,3 +3035,266 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         await consume_events(session.confirm(owner='owner', session_id='confirm-recovery', plan_id=preview.approval.plan_id))
         self.assertEqual(writes, [1])
         self.assertEqual(len(model.requests), 3)
+
+
+class ConfirmationPendingOwnershipTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from tests.support import isolated_test_database
+        self.database = isolated_test_database("confirmation-pending.db")
+        self.database.__enter__()
+
+    async def asyncTearDown(self):
+        self.database.__exit__(None, None, None)
+
+    def runtime(self, persistent, now):
+        from app.agent.confirmation import ConfirmationStore, SQLiteConfirmationStore
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.persistence import SQLiteKernelStore
+
+        writes = []
+        tool = KernelToolSpec(
+            name="cloud.change", domain="cloud", description="分步变更",
+            input_schema={"type": "object", "properties": {"step": {"type": "integer"}}},
+            effect=ToolEffect.WRITE,
+            prepare=lambda a, _: PreparedEffect(preview={"summary": f"步骤 {a['step']}"}, snapshot_fingerprint="snapshot"),
+            execute_confirmed=lambda a, *_: writes.append(a["step"]) or {"ok": True, "summary": f"步骤 {a['step']} 已完成"},
+        )
+        model = ScriptedModel([
+            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(f"step-{step}", tool.name, {"step": step})),
+             ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
+            for step in (1, 2)
+        ] + [[ModelEvent(ModelEventType.TEXT_DELTA, text="两步均已完成。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        catalog = ToolCatalog([tool])
+        state = SQLiteKernelStore() if persistent else InMemorySessionStateStore()
+        tickets = (SQLiteConfirmationStore if persistent else ConfirmationStore)(clock=lambda: now[0])
+        pipeline = ToolPipeline(catalog=catalog, state_store=state, effect_store=ConfirmationEffectPlanStore(tickets))
+        return AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=state), writes
+
+    async def preview(self, session, session_id):
+        view = await consume_events(session.run(AgentInput(owner="owner", session_id=session_id, message="先改名再移动")))
+        self.assertIsNotNone(view.approval)
+        return view.approval.plan_id
+
+    async def confirm(self, session, session_id, plan_id):
+        return await collect(session.confirm(owner="owner", session_id=session_id, plan_id=plan_id))
+
+    def active(self, session, state, plan_id):
+        return session.pipeline.effect_store.get_active_plan(
+            owner=state.owner, session_id=state.session_id, generation=state.generation, plan_id=plan_id,
+        )
+
+    def assert_rejected(self, events):
+        self.assertEqual(events[-1].type, AgentEventType.TURN_FAILED, [(e.type.value, e.payload) for e in events])
+        self.assertEqual(events[-1].payload["code"], "confirmation_invalid")
+        self.assertFalse(any(e.type in {AgentEventType.TOOL_STARTED, AgentEventType.EFFECT_COMPLETED, AgentEventType.EFFECT_FAILED} for e in events))
+
+    async def test_expired_confirmation_clears_pending_without_rewriting_history(self):
+        from app.agent.kernel.persistence import SQLiteKernelStore
+        from app.agent.kernel.ux_display import session_summary
+        from app.agent.public_view import public_conversation_messages
+
+        for persistent in (False, True):
+            for continuation in (False, True):
+                with self.subTest(persistent=persistent, continuation=continuation):
+                    now = [1000.0]
+                    session, writes = self.runtime(persistent, now)
+                    sid = f"expiry-{persistent}-{continuation}"
+                    plan_id = await self.preview(session, sid)
+                    if continuation:
+                        view = await consume_events(_events_stream(await self.confirm(session, sid, plan_id)))
+                        plan_id = view.approval.plan_id
+                    before = await session.state_store.load(owner="owner", session_id=sid)
+                    now[0] = self.active(session, before, plan_id).expires_at + 1
+                    requests = len(session.model.requests)
+                    self.assert_rejected(await self.confirm(session, sid, plan_id))
+                    store = SQLiteKernelStore() if persistent else session.state_store
+                    after = await store.load(owner="owner", session_id=sid)
+                    self.assertEqual(after.pending_effect_plan_id, "", "过期确认拒绝后不能继续报告待确认")
+                    self.assertFalse(session_summary(after, updated_at=now[0])["pending_approval"])
+                    self.assertIsNone(self.active(session, after, plan_id))
+                    self.assertEqual(after.conversation, before.conversation)
+                    self.assertEqual(after.metadata, before.metadata, "失败确认不能接管既有回执的发布权")
+                    self.assertEqual(public_conversation_messages(after.conversation), public_conversation_messages(before.conversation))
+                    self.assertEqual(writes, [1] if continuation else [])
+                    self.assert_rejected(await self.confirm(session, sid, plan_id))
+                    self.assertEqual(len(session.model.requests), requests)
+
+    async def test_cancel_continuation_clears_pending_but_preserves_confirmed_receipt(self):
+        for persistent in (False, True):
+            for expired in (False, True):
+                with self.subTest(persistent=persistent, expired=expired):
+                    now = [1000.0]
+                    session, writes = self.runtime(persistent, now)
+                    sid = f"cancel-{persistent}-{expired}"
+                    first = await self.preview(session, sid)
+                    view = await consume_events(_events_stream(await self.confirm(session, sid, first)))
+                    second = view.approval.plan_id
+                    before = await session.state_store.load(owner="owner", session_id=sid)
+                    if expired:
+                        now[0] = self.active(session, before, second).expires_at + 1
+                    cancelled = await session.cancel_effect(owner="owner", session_id=sid, plan_id=second)
+                    self.assertEqual(cancelled, not expired)
+                    after = await session.state_store.load(owner="owner", session_id=sid)
+                    self.assertEqual(after.pending_effect_plan_id, "")
+                    self.assertEqual(after.conversation, before.conversation)
+                    self.assertEqual(after.metadata, before.metadata)
+                    self.assertIsNone(self.active(session, after, second))
+                    self.assert_rejected(await self.confirm(session, sid, second))
+                    self.assertFalse(await session.cancel_effect(owner="owner", session_id=sid, plan_id=second))
+                    self.assertEqual(writes, [1])
+
+    async def test_old_and_foreign_confirmations_cannot_clear_new_pending_plan(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                session, writes = self.runtime(persistent, [1000.0])
+                sid = f"replay-{persistent}"
+                first = await self.preview(session, sid)
+                view = await consume_events(_events_stream(await self.confirm(session, sid, first)))
+                second = view.approval.plan_id
+                before = await session.state_store.load(owner="owner", session_id=sid)
+                self.assert_rejected(await self.confirm(session, sid, first))
+                for owner, other_sid in (("other-owner", sid), ("owner", "other-session")):
+                    self.assert_rejected(await collect(session.confirm(owner=owner, session_id=other_sid, plan_id=second)))
+                self.assertFalse(await session.cancel_effect(owner="owner", session_id=sid, plan_id=first))
+                after = await session.state_store.load(owner="owner", session_id=sid)
+                self.assertEqual(after.pending_effect_plan_id, second)
+                self.assertEqual(after.metadata, before.metadata)
+                self.assertEqual(after.conversation, before.conversation)
+                self.assertIsNotNone(self.active(session, after, second))
+                final = await consume_events(_events_stream(await self.confirm(session, sid, second)))
+                self.assertEqual(final.status, "success")
+                self.assert_rejected(await self.confirm(session, sid, second))
+                self.assertEqual(writes, [1, 2])
+
+    async def test_late_pending_cleanup_is_atomic_and_never_grants_publication(self):
+        from app.agent.kernel.state import StateUpdate
+        from unittest.mock import patch
+
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                session, _ = self.runtime(persistent, [1000.0])
+                sid = f"late-cleanup-{persistent}"
+                first = await self.preview(session, sid)
+                view = await consume_events(_events_stream(await self.confirm(session, sid, first)))
+                second = view.approval.plan_id
+                store = session.state_store
+                before = await store.load(owner="owner", session_id=sid)
+                owner_lease = PublicationLease("owner", sid, before.generation, before.metadata["confirmed_publication"]["turn_id"], "owner")
+                late = PublicationLease("owner", sid, before.generation, "late-confirmation", "late")
+                cleanup = (StateUpdate("pending_effect_plan_id", second, mode="clear_if_equals"),)
+                entered, release = asyncio.Event(), asyncio.Event()
+                commit = store.commit
+
+                async def delayed_commit(lease, *, conversation=None, updates=()):
+                    if lease == late:
+                        entered.set()
+                        await release.wait()
+                    return await commit(lease, conversation=conversation, updates=updates)
+
+                with patch.object(store, "commit", side_effect=delayed_commit):
+                    task = asyncio.create_task(store.commit(late, updates=cleanup))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        await store.commit(owner_lease, updates=(StateUpdate("pending_effect_plan_id", "new-plan"),))
+                    finally:
+                        release.set()
+                    await task
+                after = await store.load(owner="owner", session_id=sid)
+                self.assertEqual(after.pending_effect_plan_id, "new-plan", "晚到 CAS 不能按旧快照清除新计划")
+                self.assertEqual(after.metadata, before.metadata)
+                self.assertEqual(after.conversation, before.conversation)
+                self.assertFalse(await store.is_current(late))
+                self.assertTrue(await store.is_current(owner_lease))
+                for conversation, updates in (
+                    ([], cleanup),
+                    (None, cleanup + (StateUpdate("summary", "late"),)),
+                    (None, (StateUpdate("pending_effect_plan_id", ""),)),
+                    (None, (StateUpdate("metadata.confirmed_publication", {}),)),
+                ):
+                    with self.assertRaises(StalePublicationError):
+                        await store.commit(late, conversation=conversation, updates=updates)
+                fresh, _ = await store.begin_turn(owner="owner", session_id=sid, request_id="new-generation")
+                await store.commit(fresh, updates=(StateUpdate("pending_effect_plan_id", second),))
+                with self.assertRaises(StalePublicationError):
+                    await store.commit(late, updates=cleanup)
+                self.assertEqual((await store.load(owner="owner", session_id=sid)).pending_effect_plan_id, second)
+
+    async def test_duplicate_confirm_does_not_cancel_running_continuation(self):
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                session, writes = self.runtime(persistent, [1000.0])
+                sid = f"duplicate-running-{persistent}"
+                first = await self.preview(session, sid)
+                entered, release = asyncio.Event(), asyncio.Event()
+                model_stream = session.model.stream
+
+                async def delayed_stream(request, *, cancellation):
+                    entered.set()
+                    await release.wait()
+                    async for event in model_stream(request, cancellation=cancellation):
+                        yield event
+
+                session.model.stream = delayed_stream
+                task = asyncio.create_task(self.confirm(session, sid, first))
+                try:
+                    await asyncio.wait_for(entered.wait(), 1)
+                    self.assert_rejected(await self.confirm(session, sid, first))
+                finally:
+                    release.set()
+                events = await asyncio.wait_for(task, 1)
+                view = await consume_events(_events_stream(events))
+                self.assertEqual(view.status, "approval_required", "重复确认不能取消已执行操作的后续规划")
+                after = await session.state_store.load(owner="owner", session_id=sid)
+                self.assertEqual(after.pending_effect_plan_id, view.approval.plan_id)
+                self.assertEqual(writes, [1])
+
+    async def test_transient_claim_failure_keeps_active_pending_plan(self):
+        from unittest.mock import patch
+
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                session, writes = self.runtime(persistent, [1000.0])
+                sid = f"claim-unavailable-{persistent}"
+                plan_id = await self.preview(session, sid)
+                before = await session.state_store.load(owner="owner", session_id=sid)
+                with patch.object(session.pipeline.effect_store, "claim", side_effect=RuntimeError("storage unavailable")):
+                    self.assert_rejected(await self.confirm(session, sid, plan_id))
+                after = await session.state_store.load(owner="owner", session_id=sid)
+                self.assertEqual(after.pending_effect_plan_id, plan_id)
+                self.assertIsNotNone(self.active(session, after, plan_id))
+                self.assertEqual(after.conversation, before.conversation)
+                self.assertEqual(writes, [])
+
+    async def test_cancel_cannot_revoke_ticket_while_confirmation_is_claiming_it(self):
+        from app.agent.kernel.state import SessionBusyError
+        from unittest.mock import patch
+
+        for persistent in (False, True):
+            with self.subTest(persistent=persistent):
+                session, writes = self.runtime(persistent, [1000.0])
+                sid = f"claim-cancel-{persistent}"
+                plan_id = await self.preview(session, sid)
+                before = await session.state_store.load(owner="owner", session_id=sid)
+                tickets = session.pipeline.effect_store.store
+                claim = tickets.claim_and_rotate_owner
+                entered, release = threading.Event(), threading.Event()
+
+                def delayed_claim(**kwargs):
+                    entered.set()
+                    if not release.wait(3):
+                        raise AssertionError("confirmation claim was not released")
+                    return claim(**kwargs)
+
+                with patch.object(tickets, "claim_and_rotate_owner", side_effect=delayed_claim):
+                    task = asyncio.create_task(self.confirm(session, sid, plan_id))
+                    try:
+                        self.assertTrue(await asyncio.to_thread(entered.wait, 2))
+                        with self.assertRaises(SessionBusyError):
+                            await session.cancel_effect(owner="owner", session_id=sid, plan_id=plan_id)
+                        self.assertIsNotNone(self.active(session, before, plan_id), "取消被拒绝时不得已先撤销票据")
+                    finally:
+                        release.set()
+                        events = await asyncio.wait_for(task, 3)
+                view = await consume_events(_events_stream(events))
+                self.assertEqual(view.status, "approval_required")
+                self.assertEqual(writes, [1])

@@ -136,7 +136,13 @@ def publication_commit_matches(
             "plan_id": state.pending_effect_plan_id,
         }
     )
-    confirmed = None if handoff or candidate_metadata_only(
+    # 撤销/过期收束只做计划 ID 的原子条件清理，不接管已确认回执的发布权。
+    pending_clear = (
+        conversation is None and len(updates) == 1
+        and updates[0].key == "pending_effect_plan_id"
+        and updates[0].mode == "clear_if_equals"
+    )
+    confirmed = None if handoff or pending_clear or candidate_metadata_only(
         conversation, updates
     ) else state.metadata.get("confirmed_publication")
     return publication_matches(

@@ -18,6 +18,7 @@ from .capabilities import KernelToolSpec, ToolCatalog, ToolEffect
 from .effects import (
     ConfirmationEffectPlanStore,
     EffectPlan,
+    EffectPlanError,
     EffectPlanStore,
     PreparedEffect,
 )
@@ -50,6 +51,9 @@ class ToolPipelineError(RuntimeError):
 
 class ConfirmationClaimError(ToolPipelineError):
     """未认领票据的请求错误，不代表一次已确认操作的业务终态。"""
+
+    def __init__(self) -> None:
+        super().__init__("确认计划无效、已过期或已被使用", code="confirmation_invalid")
 
 
 ProgressSink = Callable[[Mapping[str, Any]], Awaitable[None]]
@@ -581,10 +585,12 @@ class ToolPipeline:
         except ToolPipelineError:
             raise
         except Exception as exc:
-            raise ConfirmationClaimError(
-                "确认计划无效、已过期或已被使用",
-                code="confirmation_invalid",
-            ) from exc
+            # 只有确定失效的当前计划才清理；存储故障不能撤销仍可确认的计划。
+            if isinstance(exc, EffectPlanError) and current.pending_effect_plan_id == plan_id:
+                await self._commit_updates(context.lease, (
+                    StateUpdate("pending_effect_plan_id", plan_id, mode="clear_if_equals"),
+                ))
+            raise ConfirmationClaimError() from exc
 
         try:
             # 只有真实领到票据才接管同 generation 的发布权。该标记在原状态
@@ -691,27 +697,25 @@ class ToolPipeline:
         )
 
     async def cancel_effect(
-        self,
-        plan_id: str,
-        *,
-        context: ToolCallContext,
+        self, plan_id: str, *, lease: PublicationLease,
     ) -> bool:
-        cancelled_plan = await asyncio.to_thread(
-            self.effect_store.cancel,
-            owner=context.owner,
-            session_id=context.session_id,
-            generation=context.lease.generation,
-            plan_id=plan_id,
-        )
-        if cancelled_plan is not None:
-            self._notify_effect("cancelled", plan=cancelled_plan)
-        # 过期的当前票据也应清理，但旧票据不能清掉新 pending。
-        # 比较在 store.commit 原子应用时执行，而不是先 load 再无条件写。
-        await self._commit_updates(
-            context.lease,
-            (StateUpdate("pending_effect_plan_id", plan_id, mode="clear_if_equals"),),
-        )
-        return cancelled_plan is not None
+        with session_scope_guard(lease.owner, lease.session_id, kind="effect"):
+            cancelled_plan = await asyncio.to_thread(
+                self.effect_store.cancel,
+                owner=lease.owner,
+                session_id=lease.session_id,
+                generation=lease.generation,
+                plan_id=plan_id,
+            )
+            if cancelled_plan is not None:
+                self._notify_effect("cancelled", plan=cancelled_plan)
+            # 过期的当前票据也应清理，但旧票据不能清掉新 pending。
+            # 比较在 store.commit 原子应用时执行，而不是先 load 再无条件写。
+            await self._commit_updates(
+                lease,
+                (StateUpdate("pending_effect_plan_id", plan_id, mode="clear_if_equals"),),
+            )
+            return cancelled_plan is not None
 
     async def _resolve_references(
         self,
