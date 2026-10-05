@@ -15,6 +15,7 @@ from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.naming import sanitize_name
+from app.indexers.providers.base import augment_public_magnet
 
 logger = get_logger(__name__)
 
@@ -532,6 +533,7 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                    target_dir_id: str = "", target_dir_name: str = "", *,
                    isolate_task: bool = False, task_key: str = "",
                    torrent_data: bytes | None = None,
+                   public_magnet_title: str | None = None,
                    on_staging_created: Callable[[dict], None] | None = None) -> dict:
     """按正式离线规则提交任务。
 
@@ -564,6 +566,9 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
 
         try:
             url, torrent_data = _prepare_offline_resource(url, torrent_data)
+            # 路由先基于原始输入决定；仅传输增强，原始种子（包括private）保持不变。
+            if public_magnet_title is not None and torrent_data is None:
+                url = augment_public_magnet(url, public_magnet_title)
             resolution = _resolve_offline_manifest(
                 client,
                 url,

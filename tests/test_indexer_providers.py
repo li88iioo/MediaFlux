@@ -98,8 +98,8 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item.leechers, 3)
         self.assertIn("urn:btih:0123456789abcdef0123456789abcdef01234567", item.magnet)
         self.assertIn("dn=Frieren%20S01%201080p", item.magnet)
-        self.assertIn("tr=udp%3A%2F%2Ftracker.coppersurfer.tk%3A6969%2Fannounce", item.magnet)
-        self.assertIn("tr=udp%3A%2F%2Ftracker.leechers-paradise.org%3A6969", item.magnet)
+        self.assertIn("tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce", item.magnet)
+        self.assertIn("tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce", item.magnet)
         self.assertIn("tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce", item.magnet)
 
     async def test_tpb_normalizes_query_punctuation_before_local_filtering(self):

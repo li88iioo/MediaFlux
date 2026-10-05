@@ -4,18 +4,12 @@ import json
 import re
 import unicodedata
 from datetime import datetime, timezone
-from urllib.parse import quote, urlsplit
 
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerUnavailable
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest
-from .base import DirectResultAdapter, SearchRequestPacer
+from .base import DirectResultAdapter, SearchRequestPacer, PUBLIC_TRACKERS, augment_public_magnet
 
 _INFO_HASH = re.compile(r"^[0-9a-fA-F]{40}$")
-_TRACKERS = (
-    "udp://tracker.coppersurfer.tk:6969/announce",
-    "udp://tracker.leechers-paradise.org:6969",
-    "udp://open.demonii.com:1337/announce",
-)
 _CATEGORIES = {
     "1": "Audio",
     "2": "Video",
@@ -45,7 +39,7 @@ class PirateBayAdapter(DirectResultAdapter):
         trackers: tuple[str, ...] | None = None,
     ) -> None:
         self.http = http
-        self.trackers = _normalize_trackers(trackers if trackers is not None else _TRACKERS)
+        self.trackers = trackers if trackers is not None else PUBLIC_TRACKERS
         self._search_pacer = SearchRequestPacer(
             min_interval_seconds,
             monotonic=monotonic,
@@ -102,9 +96,8 @@ class PirateBayAdapter(DirectResultAdapter):
         if any(value is _INVALID_NUMBER for value in (size_bytes, seeders, leechers, added)):
             return None
         normalized_hash = info_hash.lower()
-        magnet = (
-            f"magnet:?xt=urn:btih:{normalized_hash}&dn={quote(title, safe='')}"
-            + "".join(f"&tr={quote(tracker, safe='')}" for tracker in self.trackers)
+        magnet = augment_public_magnet(
+            f"magnet:?xt=urn:btih:{normalized_hash}", title, trackers=self.trackers,
         )
         return IndexerItem(
             site_id=self.site_id,
@@ -161,24 +154,6 @@ def _integer(value) -> int | None | object:
     except (TypeError, ValueError, OverflowError):
         return _INVALID_NUMBER
     return result if result >= 0 else _INVALID_NUMBER
-
-
-def _normalize_trackers(values) -> tuple[str, ...]:
-    trackers: list[str] = []
-    for value in values or ():
-        tracker = str(value or "").strip()
-        parsed = urlsplit(tracker)
-        if (
-            parsed.scheme.lower() not in {"http", "https", "udp"}
-            or not parsed.hostname
-            or parsed.username
-            or parsed.password
-            or parsed.fragment
-        ):
-            continue
-        if tracker not in trackers:
-            trackers.append(tracker)
-    return tuple(trackers)
 
 
 def _timestamp(value: int | None) -> datetime | None:

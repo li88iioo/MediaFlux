@@ -7,11 +7,18 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from urllib.parse import parse_qs, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 
 from app.concurrency import CrossLoopAsyncLock
 from ..errors import IndexerInvalidResponse, IndexerSecurityError
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
+
+# 有限公开Tracker种子列表；不在运行时拉取远程列表，也不承诺可用性或下载速度。
+PUBLIC_TRACKERS = (
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://open.demonii.com:1337/announce",
+)
 
 _INFOHASH_HEX = re.compile(r"^[0-9a-fA-F]{40}$")
 _INFOHASH_BASE32 = re.compile(r"^[A-Z2-7]{32}$", re.IGNORECASE)
@@ -161,6 +168,35 @@ def magnet_infohash(value: str | None) -> str | None:
             if _BTMH_SHA256.fullmatch(multihash):
                 return multihash[4:44].lower()
     return None
+
+
+def augment_public_magnet(value: str, title: str = "", *, trackers=PUBLIC_TRACKERS) -> str:
+    """仅供已知公开资源：保留原参数/编码/哈希，只补缺失名称和有限Tracker。"""
+    if not magnet_infohash(value):
+        return value
+    params = parse_qs(urlsplit(value).query, keep_blank_values=True)
+    extra: list[tuple[str, str]] = []
+    if title.strip() and not any(name.strip() for name in params.get("dn", ())):
+        extra.append(("dn", title.strip()))
+    seen = {tracker.rstrip("/").casefold() for tracker in params.get("tr", ())}
+    added = 0
+    for tracker in trackers:
+        tracker = str(tracker or "").strip()
+        parsed = urlsplit(tracker)
+        key = tracker.rstrip("/").casefold()
+        if (key in seen or parsed.scheme not in {"udp", "http", "https"} or not parsed.hostname
+                or parsed.username or parsed.password or parsed.fragment):
+            continue
+        seen.add(key)
+        extra.append(("tr", tracker))
+        added += 1
+        if added == len(PUBLIC_TRACKERS):
+            break
+    if not extra:
+        return value
+    body, separator, fragment = value.partition("#")
+    joiner = "" if body.endswith(("?", "&")) else "&"
+    return body + joiner + urlencode(extra, quote_via=quote) + separator + fragment
 
 
 def is_likely_challenge_page(

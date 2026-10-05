@@ -18,7 +18,7 @@ from app.clients.qbittorrent import (
     close_qbittorrent_client,
 )
 from app.config import get
-from app.indexers.providers.base import magnet_infohash
+from app.indexers.providers.base import magnet_infohash, augment_public_magnet
 from app.logger import get_logger
 from app.modules.offline import analyze_offline_url, detect_protocol, submit_offline
 from app.repositories.download_requests import download_display_title, usable_download_title
@@ -1429,6 +1429,18 @@ def parse_torrent_manifest(data: bytes) -> TorrentManifest:
     return TorrentManifest(name=name, version=version, files=tuple(files))
 
 
+def _public_magnet_title(row) -> str | None:
+    # 来源不明的手动/RSS磁力与原始种子不做公共Tracker推断。
+    origin = str(row["origin"] or "") if "origin" in row.keys() else ""
+    namespace, _, site = origin.partition(":")
+    if (row["kind"] != "magnet" or namespace not in {"indexer", "agent"}
+            or site not in {"nyaa", "sukebei", "mikan", "tpb", "btbtla"}
+            or row["torrent_data"]):
+        return None
+    title = download_display_title(row)
+    return title if usable_download_title(title) else ""
+
+
 def _submit_qb(
     row,
     *,
@@ -1483,6 +1495,9 @@ def _submit_qb(
     )
     torrents = row["torrent_data"] if row["kind"] in {"torrent", "http"} else None
     urls = "" if torrents else str(row["source_value"] or "")
+    public_title = _public_magnet_title(row)
+    if not torrents and public_title is not None:
+        urls = augment_public_magnet(urls, public_title)
     try:
         result = client.add_torrent_detailed(
             urls=urls,
@@ -1581,6 +1596,7 @@ def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") 
         task_key=str(row["id"]),
         torrent_data=torrent_data,
         on_staging_created=persist_staging,
+        public_magnet_title=_public_magnet_title(row),
     )
     task_ids = [str(item) for item in (result.get("task_ids") or []) if str(item)]
     return {**result, "task_id": task_ids[0] if task_ids else ""}
