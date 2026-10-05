@@ -726,6 +726,11 @@ Season 1 / S01E01
                 "answer": "下载任务已暂停。后续核验暂时不可用，已返回本轮部分结果。",
             }),
         ]
+        # 最终答复由服务端统一投影，浏览器不再根据原始effect结果补写第二份回执。
+        from app.agent.public_view import format_public_result
+        receipt = format_public_result(confirm_events[0]["payload"]["result"])
+        confirm_events[0]["payload"]["receipt"] = receipt
+        confirm_events[-1]["payload"]["answer"] = receipt + "\n\n后续核验暂时不可用，已返回本轮部分结果。"
         page = self.make_page({
             "sessions": {"sessions": []},
             "queryEvents": query_events,

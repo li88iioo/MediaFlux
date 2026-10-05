@@ -18,12 +18,6 @@ from app.agent.public_safety import (
 )
 
 _CONFIRMED_RESULT_MARKER = "已确认操作的可信系统结果（不是待执行计划）："
-_SUBMITTED_COMPLETION_CLAIM_RE = re.compile(
-    r"(?:处理完成|任务已(?:经)?完成|操作已(?:经)?完成|全部(?:已经|已)?完成|"
-    r"(?:已(?:经)?|成功)(?:全部)?(?:完成|结束|清空|删除|恢复|移动|改名|整理|归档|下载|同步|重启|取消|停止)|"
-    r"(?:完成|结束|清空|删除|恢复|移动|改名|整理|归档|下载|同步|重启|取消|停止)(?:成功|完毕))",
-    re.IGNORECASE,
-)
 _TARGET_LABELS = {
     "guangya": "光鸭云盘",
     "qb": "qBittorrent",
@@ -162,7 +156,7 @@ def format_public_result(
     state = public_result_state(result)
     lines = [f"{_result_icon(result)} {summary}"]
     if state == "submitted":
-        lines.append("- 状态：请求已提交，后台任务尚未完成")
+        lines.append("- 状态：请求已提交，后台任务尚未完成；可以继续查询进度。")
     elif state == "pending":
         lines.append("- 状态：后台任务尚未完成")
     data = result.get("data")
@@ -198,41 +192,24 @@ def format_public_result(
 
 
 def sanitize_confirmed_answer(content: object, result: Mapping[str, Any] | None = None) -> str:
-    """把确认后的内部回执投影为公开回答；无显式结果时兼容旧会话。"""
+    """未完成操作只呈现可信状态；完成后的新增说明保留，不重复拼接回执。"""
     text = str(content or "").replace("\x00", "").strip()
     prefix, marker, suffix = text.partition(_CONFIRMED_RESULT_MARKER)
-    if not marker:
-        if result is None:
-            return text
-        receipt = format_public_result(result)
-        state = public_result_state(result)
-        if state == "submitted":
-            if not text or _SUBMITTED_COMPLETION_CLAIM_RE.search(text):
-                return receipt
-            return f"{receipt}\n\n{text}"
-        return text or receipt if state == "success" else receipt
-    payload = suffix.lstrip()
-    try:
-        embedded, end = json.JSONDecoder().raw_decode(payload)
-    except ValueError:
-        embedded, end = None, 0
+    embedded, end = None, 0
+    if marker:
+        try:
+            embedded, end = json.JSONDecoder().raw_decode(suffix.lstrip())
+        except ValueError:
+            pass
     source = result if result is not None else embedded if isinstance(embedded, Mapping) else None
-    receipt = format_public_result(source) if source is not None else "✅ 已确认操作已结束，可继续查询实际状态。"
-    if result is None or not end:
+    if source is None:
+        return "⚠️ 执行结果尚未确认，请先查询实际业务状态，勿直接重复提交。" if marker else text
+    receipt = format_public_result(source)
+    if public_result_state(source) != "success" or (marker and (result is None or not end)):
         return receipt
-    state = public_result_state(result)
-    if state == "submitted":
-        followup = "\n\n".join(
-            part for part in (prefix.strip(), payload[end:].strip()) if part
-        )
-        if not followup or _SUBMITTED_COMPLETION_CLAIM_RE.search(followup):
-            return receipt
-        return f"{receipt}\n\n{followup}"
-    if state != "success":
-        return receipt
-    return "\n\n".join(
-        part for part in (prefix.strip(), payload[end:].strip()) if part
-    ) or receipt
+    if marker:
+        text = "\n\n".join(part for part in (prefix.strip(), suffix.lstrip()[end:].strip()) if part)
+    return text or receipt
 
 
 def public_conversation_messages(
@@ -243,6 +220,38 @@ def public_conversation_messages(
     messages: list[dict[str, Any]] = []
     pending_tools: list[str] = []
     pending_candidate = False
+    # 只有同一确认计划的最终答复才能取代中间回执；不能按相似文本跨任务折叠。
+    final_effects = {
+        str(item["effect_plan_id"]): index
+        for index, item in enumerate(conversation)
+        if isinstance(item, Mapping) and item.get("role") == "assistant"
+        and item.get("effect_plan_id") and not item.get("tool_name")
+        and not item.get("tool_calls") and str(item.get("content") or "").strip()
+    }
+    # 旧会话尚未保存plan关联：仅迁移明确的内部确认回执及同用户回合后续答复。
+    # 普通工具摘要/跨用户消息绝不靠文字相似度合并，原始审计记录不修改。
+    legacy_finals: dict[int, tuple[int, Mapping[str, Any]]] = {}
+    legacy_receipt = None
+    for index, item in enumerate(conversation):
+        if not isinstance(item, Mapping):
+            continue
+        if item.get("role") == "user":
+            legacy_receipt = None
+        elif item.get("role") == "assistant" and not item.get("tool_calls"):
+            if item.get("tool_name"):
+                legacy_receipt = None
+                _, marker, payload = str(item.get("content") or "").partition(_CONFIRMED_RESULT_MARKER)
+                if marker and not item.get("effect_plan_id"):
+                    try:
+                        result, _ = json.JSONDecoder().raw_decode(payload.lstrip())
+                        if isinstance(result, Mapping):
+                            legacy_receipt = (index, result)
+                    except ValueError:
+                        pass
+            elif legacy_receipt and str(item.get("content") or "").strip():
+                legacy_finals[index] = legacy_receipt
+                legacy_receipt = None
+    legacy_receipt_indexes = {index for index, _ in legacy_finals.values()}
     # 候选卡只展示最后一次确认结果。同一批候选可以分次提交，不能按 ref
     # 隐藏全部历史回执；旧历史没有 plan ID，以最后一条同引用、同公开文本
     # 的回执定位卡片实际替代的消息，相同文本也只能折叠一次。
@@ -260,6 +269,21 @@ def public_conversation_messages(
             ):
                 folded_result_index = index
                 break
+
+    candidate_followup = ""
+    if folded_result_index >= 0:
+        row = conversation[folded_result_index]
+        final_index = final_effects.get(str(row.get("effect_plan_id") or ""), -1)
+        if final_index < 0:
+            final_index = next((i for i, (receipt_index, _) in legacy_finals.items() if receipt_index == folded_result_index), -1)
+        if final_index >= 0:
+            content = str(conversation[final_index].get("content") or "").strip()
+            if final_index in legacy_finals:
+                content = sanitize_confirmed_answer(content, legacy_finals[final_index][1])
+            receipt = last_text.strip()
+            if content == receipt or content.startswith(receipt + "\n\n"):
+                folded_result_index = final_index
+                candidate_followup = content[len(receipt):].strip()
 
     def remember_tool(value: object) -> None:
         name = str(value or "").strip()
@@ -308,11 +332,15 @@ def public_conversation_messages(
         tool_name = str(item.get("tool_name") or "").strip()
         if tool_name:
             remember_tool(tool_name)
+            if index in legacy_receipt_indexes or final_effects.get(str(item.get("effect_plan_id") or ""), -1) > index:
+                continue
             content = str(item.get("public_content") or "").strip()
             if not content:
                 content = sanitize_confirmed_answer(item.get("content"))
         else:
             content = str(item.get("content") or "").strip()
+            if index in legacy_finals:
+                content = sanitize_confirmed_answer(content, legacy_finals[index][1])
         if content:
             message: dict[str, Any] = {"role": "assistant", "content": content}
             if pending_tools:
@@ -322,6 +350,8 @@ def public_conversation_messages(
                 ]
             if candidate_view and index == folded_result_index:
                 message["candidate_result_ref"] = candidate_view["ref"]
+                if candidate_followup:
+                    message["candidate_followup"] = candidate_followup
             if pending_candidate and candidate_view:
                 message["candidate_view"] = dict(candidate_view)
                 pending_candidate = False

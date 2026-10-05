@@ -282,7 +282,9 @@ class AgentPageTests(InitializedWebTestCase):
 
         self.assertIn("applyEvent(turn, event)", source)
         self.assertIn("phase === 'background_job'", source)
-        self.assertIn("effectResults", source)
+        self.assertIn("effectReceipts", source)
+        self.assertNotIn("function formatEffectResult", source)
+        self.assertNotIn("answerWithTrustedEffectReceipts", source)
         self.assertIn("case 'effect.completed':", source)
         self.assertIn("return event.type === 'turn.completed' && TERMINAL_TURN_STATUSES.includes(", source)
         self.assertIn("status === 'effect_completed'", source)

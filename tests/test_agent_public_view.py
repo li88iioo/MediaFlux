@@ -207,6 +207,55 @@ class AgentKernelPublicViewTests(unittest.TestCase):
                 self.assertNotIn("处理完成", public)
                 self.assertNotIn("全部已经完成", public)
 
+    def test_submitted_model_paraphrases_do_not_duplicate_the_canonical_receipt(self):
+        result = {"ok": True, "status": "submitted", "summary": "下载请求 #276 已提交", "data": {"target": "guangya"}}
+        text = "📤 下载请求 #276 已提交\n后台任务正在执行中\n磁力链接已识别并成功提交下载，任务编号 #276。"
+        public = sanitize_confirmed_answer(text, result)
+        self.assertEqual(public, format_public_result(result))
+        self.assertEqual(public.count("#276"), 1)
+        self.assertNotIn("✅", public)
+
+    def test_invalid_internal_receipt_does_not_claim_success(self):
+        text = sanitize_confirmed_answer("已确认操作的可信系统结果（不是待执行计划）：\nbroken-json")
+        self.assertIn("尚未确认", text)
+        self.assertNotIn("✅", text)
+        self.assertNotIn("broken-json", text)
+
+    def test_restore_folds_only_receipt_with_a_matching_final_plan(self):
+        receipt = {"role": "assistant", "tool_name": "ingest.submit", "effect_plan_id": "plan-1", "public_content": "📤 请求已提交", "content": "internal"}
+        final = {"role": "assistant", "effect_plan_id": "plan-1", "content": "📤 请求已提交\n后台任务尚未完成"}
+        conversation = [{"role": "user", "content": "下载"}, receipt, {"role": "tool", "tool_name": "download.inspect", "content": "internal"}, final]
+        messages = public_conversation_messages(conversation)
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[-1]["content"], final["content"])
+        self.assertEqual(messages[-1]["tools"], ["ingest.submit", "download.inspect"])
+        self.assertEqual(len(public_conversation_messages(conversation[:-1])), 2, "中断时必须保留已执行回执")
+        other = {**receipt, "effect_plan_id": "plan-2"}
+        self.assertEqual(len(public_conversation_messages([receipt, other, final])), 2, "不能隐藏其它计划")
+        self.assertEqual(len(public_conversation_messages([{k: v for k, v in receipt.items() if k != "effect_plan_id"}, final])), 2, "旧历史无关联证据时不能误删")
+
+    def test_folded_candidate_receipt_moves_to_matching_final_answer_only(self):
+        receipt = {"role": "assistant", "tool_name": "ingest.submit", "effect_plan_id": "p", "candidate_result_ref": "r", "public_content": "已提交", "content": "internal"}
+        final = {"role": "assistant", "effect_plan_id": "p", "content": "已提交"}
+        view = {"ref": "r", "last_result": {"text": "已提交"}}
+        messages = public_conversation_messages([receipt, final], candidate_view=view)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["candidate_result_ref"], "r")
+        final["content"] = "已提交\n\n后续还有新事实。"
+        messages = public_conversation_messages([receipt, final], candidate_view=view)
+        self.assertEqual(messages[0]["candidate_result_ref"], "r")
+        self.assertEqual(messages[0]["candidate_followup"], "后续还有新事实。", "候选卡不能吞掉后续说明")
+
+    def test_legacy_submitted_history_merges_only_explicit_internal_receipt(self):
+        result = {"ok": True, "status": "submitted", "summary": "下载请求 #276 已提交"}
+        receipt = {"role": "assistant", "tool_name": "ingest.submit", "content": "已确认操作的可信系统结果（不是待执行计划）：\n" + json.dumps(result)}
+        final = {"role": "assistant", "content": "下载请求 #276 已提交。任务 #276 正在执行中。"}
+        messages = public_conversation_messages([receipt, final])
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["content"].count("#276"), 1)
+        self.assertEqual(len(public_conversation_messages([receipt])), 1)
+        self.assertEqual(len(public_conversation_messages([receipt, {"role": "user", "content": "另一个问题"}, final])), 3)
+
     def test_partial_result_uses_compact_human_labels(self) -> None:
         text = format_public_result(
             {

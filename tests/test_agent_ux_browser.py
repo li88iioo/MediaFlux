@@ -12,6 +12,15 @@ from tests import test_agent_kernel_browser as harness
 SCOPE = 'a' * 64
 SESSION_A = 'session_agent_ux_000000001'
 SESSION_B = 'session_agent_ux_000000002'
+SUBMITTED_276_RESULT = {
+    'ok': True, 'status': 'submitted', 'summary': '下载请求 #276 已提交',
+    'data': {'target': 'guangya'},
+}
+SUBMITTED_276_RECEIPT = (
+    '📤 下载请求 #276 已提交\n'
+    '- 状态：请求已提交，后台任务尚未完成；可以继续查询进度。\n'
+    '- 目标：光鸭云盘'
+)
 
 
 def candidate_view(*, expires_at: float | None = None) -> dict:
@@ -613,6 +622,7 @@ class AgentUXBrowserTests(unittest.TestCase):
                 harness._event(4, 'effect.completed', {
                     'plan_id': approval['plan_id'],
                     'result': {'ok': True, 'summary': '下载任务已暂停'},
+                    'receipt': '下载任务已暂停。',
                 }),
                 harness._event(5, 'model.started', {'round': 2}),
                 harness._event(6, 'tool.started', {'call_id': 'background-1', 'tool': 'guangya.job'}),
@@ -645,6 +655,245 @@ class AgentUXBrowserTests(unittest.TestCase):
         page.locator('.agent-narrative').wait_for()
         self.assertIn('后续核验完成', page.locator('.agent-narrative').inner_text())
 
+    def test_submitted_276_receipt_is_rendered_once_at_desktop_and_mobile_widths(self):
+        approval = {
+            'plan_id': 'plan_submitted_276_0001', 'tool_name': 'indexer.submit', 'effect': 'WRITE',
+            'preview': {'summary': '提交已选资源'}, 'confirmation': {},
+        }
+        reports = []
+        evidence_dir = os.getenv('MEDIAFLUX_BROWSER_EVIDENCE_DIR')
+        for viewport in ({'width': 1280, 'height': 800}, {'width': 390, 'height': 844}):
+            with self.subTest(viewport=viewport):
+                page = self.page({
+                    'queryEvents': [
+                        harness._event(1, 'turn.started'),
+                        harness._event(2, 'effect.approval_required', {'tool': 'indexer.submit', 'plan': approval}),
+                        harness._event(3, 'turn.completed', {'status': 'approval_required'}),
+                    ],
+                    'confirmEvents': [
+                        harness._event(4, 'effect.completed', {
+                            'plan_id': approval['plan_id'],
+                            'result': SUBMITTED_276_RESULT,
+                            'receipt': SUBMITTED_276_RECEIPT,
+                        }),
+                        harness._event(5, 'turn.completed', {
+                            'status': 'success', 'answer': SUBMITTED_276_RECEIPT,
+                        }),
+                    ],
+                }, viewport=viewport)
+                page.locator('#agentPrompt').fill('提交已选资源')
+                page.locator('#agentSend').click()
+                page.locator('.agent-confirmation-card [data-effect-confirm]').click()
+                page.locator('.agent-narrative').wait_for()
+
+                metrics = page.evaluate("""() => {
+                  const text = document.querySelector('.agent-narrative')?.innerText || '';
+                  const effectSteps = [...document.querySelectorAll('.agent-stream-step[data-step-key^="effect:"]')];
+                  return {
+                    viewportWidth: innerWidth,
+                    narrativeCount: document.querySelectorAll('.agent-narrative').length,
+                    receiptReferenceCount: (text.match(/#276/g) || []).length,
+                    traceCount: document.querySelectorAll('.agent-tool-trace').length,
+                    effectStepCount: effectSteps.length,
+                    effectCompletionCheckCount: effectSteps.filter(step => step.querySelector('[data-lucide="check"]')).length,
+                    narrativeText: text,
+                  };
+                }""")
+                self.assertEqual(metrics['viewportWidth'], viewport['width'])
+                self.assertEqual(metrics['narrativeCount'], 1)
+                self.assertEqual(metrics['receiptReferenceCount'], 1)
+                self.assertEqual(metrics['traceCount'], 1)
+                self.assertEqual(metrics['effectStepCount'], 1)
+                self.assertEqual(metrics['effectCompletionCheckCount'], 0)
+                self.assertIn('后台任务尚未完成', metrics['narrativeText'])
+                self.assertNotIn('✅', metrics['narrativeText'])
+                reports.append(metrics)
+                if evidence_dir:
+                    self.snapshot(page, f'submitted-276-{viewport["width"]}')
+                page.close()
+
+        if evidence_dir:
+            output = Path(evidence_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            (output / 'submitted-276-dom-counts.json').write_text(
+                json.dumps(reports, ensure_ascii=False, indent=2) + '\n', encoding='utf-8',
+            )
+
+    def test_restored_candidate_receipt_does_not_hide_followup_facts(self):
+        view = candidate_view()
+        view['last_result'] = {'text': '下载请求 #276 已提交', 'target': 'guangya', 'handled_positions': [1]}
+        payload = {'candidate_view': view, 'messages': [{'role': 'assistant', 'content': '找到资源', 'candidate_view': view}, {
+            'role': 'assistant', 'content': '下载请求 #276 已提交\n\n还有一个目录待处理。',
+            'candidate_result_ref': view['ref'], 'candidate_followup': '还有一个目录待处理。',
+        }]}
+        page = self.page({'sessionDetails': {SESSION_A: payload}}, stored_session=SESSION_A)
+        page.locator('.agent-narrative').last.wait_for()
+        self.assertEqual(page.locator('.agent-narrative').last.inner_text(), '还有一个目录待处理。')
+        self.assertEqual(page.locator('#agentTranscript').inner_text().count('#276'), 1)
+
+    def test_confirmation_continues_to_later_plan_and_reuses_one_trace(self):
+        first = {
+            'plan_id': 'plan_ux_continue_0001', 'tool_name': 'download.pause', 'effect': 'WRITE',
+            'preview': {'summary': '暂停下载任务'}, 'confirmation': {},
+        }
+        second = {
+            'plan_id': 'plan_ux_continue_0002', 'tool_name': 'download.resume', 'effect': 'WRITE',
+            'preview': {'summary': '继续下载任务'}, 'confirmation': {},
+        }
+        page = self.page({
+            'queryEvents': [
+                harness._event(1, 'turn.started'),
+                harness._event(2, 'effect.approval_required', {'tool': 'download.pause', 'plan': first}),
+                harness._event(3, 'turn.completed', {'status': 'approval_required'}),
+            ],
+            'confirmEvents': [
+                harness._event(4, 'effect.completed', {
+                    'plan_id': first['plan_id'], 'receipt': '暂停请求已受理，等待核验。',
+                    'result': {'ok': True, 'status': 'submitted', 'summary': '暂停请求已受理'},
+                }),
+                harness._event(5, 'model.started', {'round': 2}),
+                harness._event(6, 'tool.completed', {
+                    'call_id': 'followup-read-1', 'tool': 'downloads.list',
+                    'result': {'summary': '查询到 3 个下载任务'},
+                }),
+                harness._event(7, 'effect.approval_required', {'tool': 'download.resume', 'plan': second}),
+                harness._event(8, 'turn.completed', {'status': 'approval_required'}),
+            ],
+        })
+        page.locator('#agentPrompt').fill('先暂停，再查询并继续')
+        page.locator('#agentSend').click()
+        page.locator('[data-effect-confirm="plan_ux_continue_0001"]').click()
+
+        next_plan = page.locator('.agent-confirmation-card[data-plan-id="plan_ux_continue_0002"]')
+        next_plan.wait_for()
+        self.assertEqual(page.locator('.agent-tool-trace').count(), 1)
+        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-steps').count(), 1)
+        self.assertIn('查询下载任务完成', ' '.join(page.locator('.agent-tool-trace .agent-stream-step').all_text_contents()))
+        self.assertEqual(next_plan.inner_text().count('暂停请求已受理'), 1)
+        self.assertNotIn('上一项已完成', next_plan.inner_text())
+
+        page.evaluate('(events) => { window.__kernelConfig.confirmEvents = events; }', [
+            harness._event(9, 'effect.completed', {
+                'plan_id': second['plan_id'], 'receipt': '继续请求已受理，等待核验。',
+                'result': {'ok': True, 'status': 'submitted', 'summary': '继续请求已受理'},
+            }),
+            harness._event(10, 'turn.completed', {
+                'status': 'success', 'answer': '后续真实查询发现 3 个下载任务；继续请求已受理。',
+            }),
+        ])
+        page.locator('[data-effect-confirm="plan_ux_continue_0002"]').click()
+        page.locator('.agent-narrative').wait_for()
+
+        self.assertEqual(page.locator('.agent-tool-trace').count(), 1)
+        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-steps').count(), 1)
+        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-step').count(), 5)
+        self.assertEqual(
+            page.locator('.agent-narrative').inner_text(),
+            '后续真实查询发现 3 个下载任务；继续请求已受理。',
+        )
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 2)
+
+    def test_disconnect_after_effect_event_preserves_server_receipt(self):
+        approval = {
+            'plan_id': 'plan_ux_disconnect_0001', 'tool_name': 'indexer.submit', 'effect': 'WRITE',
+            'preview': {'summary': '提交资源'}, 'confirmation': {},
+        }
+        receipt = (
+            '📤 下载请求 #276 已提交\n'
+            '- 状态：请求已提交，后台任务尚未完成；可以继续查询进度。'
+        )
+        page = self.page({
+            'queryEvents': [
+                harness._event(1, 'turn.started'),
+                harness._event(2, 'effect.approval_required', {'tool': 'indexer.submit', 'plan': approval}),
+                harness._event(3, 'turn.completed', {'status': 'approval_required'}),
+            ],
+            'confirmEvents': [],
+        })
+        page.locator('#agentPrompt').fill('提交资源')
+        page.locator('#agentSend').click()
+        page.locator('.agent-confirmation-card').wait_for()
+        page.evaluate("""({event, draftScope}) => {
+          const originalFetch = window.fetch;
+          const originalSetTimeout = window.setTimeout.bind(window);
+          window.__uxConfirmCalls = 0;
+          window.setTimeout = (callback, delay = 0, ...args) =>
+            originalSetTimeout(callback, delay === 1750 ? 5 : delay, ...args);
+          window.fetch = async (url, options = {}) => {
+            const path = new URL(String(url), location.href).pathname;
+            if (path === '/api/agent/actions/confirm') {
+              window.__uxConfirmCalls += 1;
+              const request = JSON.parse(options.body || '{}');
+              const payload = {...event, request_id: request.request_id,
+                session_id: request.session_id, turn_id: `turn-${request.request_id}`};
+              return new Response(new ReadableStream({
+                start(controller) {
+                  controller.enqueue(new TextEncoder().encode(`${JSON.stringify(payload)}\\n`));
+                  window.setTimeout(() => controller.error(new Error('simulated stream disconnect')), 10);
+                },
+              }), {status: 200, headers: {'Content-Type': 'application/x-ndjson'}});
+            }
+            if (path.startsWith('/api/agent/sessions/')) {
+              return new Response(JSON.stringify({
+                session_id: decodeURIComponent(path.split('/').pop()), generation: 1, messages: [],
+                pending_approval: null, candidate_view: null, active_turn: null, last_turn: null,
+                draft_scope: draftScope,
+              }), {status: 200, headers: {'Content-Type': 'application/json'}});
+            }
+            return originalFetch(url, options);
+          };
+        }""", {
+            'event': harness._event(4, 'effect.completed', {
+                'plan_id': approval['plan_id'], 'receipt': receipt,
+                'result': SUBMITTED_276_RESULT,
+            }),
+            'draftScope': SCOPE,
+        })
+        page.locator('[data-effect-confirm]').click()
+        page.locator('.agent-narrative').wait_for()
+
+        text = page.locator('.agent-narrative').inner_text()
+        self.assertIn('下载请求 #276 已提交', text)
+        self.assertIn('后台任务尚未完成', text)
+        self.assertIn('任务状态未确认', text)
+        self.assertEqual(text.count('#276'), 1)
+        self.assertEqual(page.locator('.agent-tool-trace').count(), 1)
+        self.assertEqual(page.locator('.agent-tool-trace .agent-stream-step[data-step-key^="effect:"]').count(), 1)
+        self.assertEqual(page.evaluate('window.__uxConfirmCalls'), 1)
+
+    def test_legacy_effect_summary_without_receipt_is_marked_unknown(self):
+        approval = {
+            'plan_id': 'plan_ux_legacy_receipt_0001', 'tool_name': 'indexer.submit', 'effect': 'WRITE',
+            'preview': {'summary': '提交资源'}, 'confirmation': {},
+        }
+        page = self.page({
+            'queryEvents': [
+                harness._event(1, 'turn.started'),
+                harness._event(2, 'effect.approval_required', {'tool': 'indexer.submit', 'plan': approval}),
+                harness._event(3, 'turn.completed', {'status': 'approval_required'}),
+            ],
+            'confirmEvents': [
+                harness._event(4, 'effect.completed', {
+                    'plan_id': approval['plan_id'],
+                    'result': SUBMITTED_276_RESULT,
+                }),
+                harness._event(5, 'turn.failed', {'message': '连接中断'}),
+            ],
+        })
+        page.locator('#agentPrompt').fill('提交资源')
+        page.locator('#agentSend').click()
+        page.locator('[data-effect-confirm]').click()
+        page.locator('.agent-narrative').wait_for()
+
+        text = page.locator('.agent-narrative').inner_text()
+        self.assertIn('执行状态未知', text)
+        self.assertIn('服务端摘要：下载请求 #276 已提交', text)
+        self.assertNotIn('✅', text)
+        effect_step = page.locator('.agent-tool-trace .agent-stream-step[data-step-key^="effect:"]')
+        self.assertEqual(effect_step.count(), 1)
+        self.assertIn('执行状态未知', effect_step.text_content())
+        self.assertEqual(effect_step.locator('[data-lucide="check"]').count(), 0)
+
     def test_confirmation_rejects_stop_while_protected_job_stream_waits(self):
         approval = {
             'plan_id': 'plan_ux_waiting_0001',
@@ -664,6 +913,7 @@ class AgentUXBrowserTests(unittest.TestCase):
                 harness._event(4, 'effect.completed', {
                     'plan_id': approval['plan_id'],
                     'result': {'ok': True, 'summary': '暂停任务已提交，等待实际状态'},
+                    'receipt': '暂停请求已提交；实际状态尚未确认。',
                 }),
                 harness._event(5, 'tool.progress', {
                     'tool': 'guangya.job',

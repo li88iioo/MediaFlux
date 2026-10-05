@@ -454,6 +454,10 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(
             event.type is AgentEventType.MODEL_DELTA for event in events
         ))
+        from app.agent.public_view import format_public_result, public_conversation_messages
+        effect = next(event for event in events if event.type is AgentEventType.EFFECT_COMPLETED)
+        self.assertEqual(effect.payload["receipt"], format_public_result(effect.payload["result"]))
+        self.assertEqual(final.answer.count("本地媒体任务 1"), 1)
         self.assertEqual(len(model.requests), 2, "已提交结果应继续交给 Agent 汇总")
         self.assertEqual(len(model.rounds), 0)
         stored = await state.load(owner="owner", session_id="session")
@@ -462,10 +466,38 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             if "可信系统结果" in str(row.get("content") or "")
         ]
         self.assertEqual(len(internal_rows), 1)
+        restored = public_conversation_messages(stored.conversation)
+        self.assertEqual(sum("重新排队" in row["content"] for row in restored if row["role"] == "assistant"), 1)
+        self.assertEqual(stored.conversation[-1]["effect_plan_id"], preview.approval.plan_id)
+
         self.assertIn("public_content", internal_rows[0])
         self.assertNotIn(
             "可信系统结果", str(internal_rows[0].get("public_content") or "")
         )
+
+    async def test_submitted_receipt_preserves_followup_checks_without_model_echo(self):
+        writes = []
+        write = KernelToolSpec(name="cloud.submit", domain="cloud", description="提交任务",
+            input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+            prepare=lambda *_: PreparedEffect(preview={"summary": "预览"}, snapshot_fingerprint="snapshot"),
+            execute_confirmed=lambda *_: writes.append(1) or {"ok": True, "status": "submitted", "summary": "请求 #276 已提交"})
+        read = KernelToolSpec(name="cloud.inspect", domain="cloud", description="检查后续任务",
+            input_schema={"type": "object", "properties": {}}, effect=ToolEffect.READ,
+            read=lambda *_: {"ok": True, "summary": "另一目录还有2项待处理"})
+        model = ScriptedModel([
+            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("submit", write.name, {})), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
+            [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("inspect", read.name, {})), ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")],
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="请求 #276 已提交，已提交请求 #276。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
+        ])
+        catalog, store = ToolCatalog([write, read]), InMemorySessionStateStore()
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+            pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
+        preview = await consume_events(session.run(AgentInput(message="提交并检查后续任务", owner="o", session_id="s")))
+        final = await consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id))
+        self.assertEqual(writes, [1])
+        self.assertEqual(final.answer.count("#276"), 1)
+        self.assertIn("另一目录还有2项待处理", final.answer)
+        self.assertEqual(len(model.requests), 3)
 
     async def test_confirm_without_restored_user_returns_submitted_receipt_not_fake_completion(self):
         tool = KernelToolSpec(

@@ -447,6 +447,7 @@ class AgentSession:
                     + safe_content
                 ),
                 tool_name=tool_name,
+                effect_plan_id=plan_id or "",
             ).to_dict()
             safe_public_content = str(public_content or "").strip()
             if safe_public_content:
@@ -492,7 +493,7 @@ class AgentSession:
             )
             if confirmed_result is not None or has_tool_result:
                 answer = progress_answer(message)
-                messages.append(ModelMessage(role="assistant", content=answer))
+                messages.append(ModelMessage(role="assistant", content=answer, effect_plan_id=plan_id or ""))
                 await preserve_checkpoint()
                 event = failure_factory.create(AgentEventType.TURN_COMPLETED, {"status": "partial", "answer": answer, "finish_reason": code})
             else:
@@ -663,6 +664,7 @@ class AgentSession:
                 failed = public_result.get("ok") is False
                 await publish(AgentEventType.EFFECT_FAILED if failed else AgentEventType.EFFECT_COMPLETED, {
                     "plan_id": plan_id, "tool": result.tool.name if result else "confirmed_effect", "result": public_result,
+                    "receipt": format_public_result(public_result),
                     "code": str(public_result.get("status") or "effect_failed") if failed else "",
                     "message": str(public_result.get("error") or public_result.get("summary") or "执行未完成") if failed else "",
                     "elapsed_ms": result.elapsed_ms if result else 0,
@@ -675,17 +677,7 @@ class AgentSession:
                     await failure("receipt_unavailable", "执行结果已取得，但会话记录保存失败，未继续后续步骤；请先核对任务状态。")
                     return
                 result_state = public_result_state(public_result)
-                if result_state not in {"success", "submitted"}:
-                    await publish(AgentEventType.TURN_COMPLETED, {
-                        "status": "success",
-                        "answer": format_public_result(public_result),
-                        "finish_reason": f"effect_{result_state}",
-                        "usage": {},
-                        "model_calls": 0,
-                        "tool_calls": 0,
-                    })
-                    return
-                if not last_user:
+                if result_state not in {"success", "submitted"} or not last_user:
                     await publish(AgentEventType.TURN_COMPLETED, {
                         "status": "success",
                         "answer": format_public_result(public_result),
@@ -746,7 +738,13 @@ class AgentSession:
             async def finish_answer(answer: str, status: str, reason: str, model_calls: int) -> None:
                 """正常回答与预算收尾共用一次持久化/终态发布，不丢失工具调用协议。"""
                 public_answer = sanitize_confirmed_answer(answer, confirmed_result) if confirmed_result is not None else answer
-                messages.append(ModelMessage(role="assistant", content=public_answer))
+                if confirmed_result is not None and public_result_state(confirmed_result) == "submitted" and progress_results:
+                    # 续行检查仍执行并交付真实新事实，不让模型把提交回执复述成多份。
+                    public_answer += "\n\n后续检查：\n" + "\n".join(dict.fromkeys(
+                        f"• {label}：{sanitize_public_text(value.get('summary') or value.get('error') or value.get('status'), limit=300)}"
+                        for label, value in progress_results[-8:]
+                    ))
+                messages.append(ModelMessage(role="assistant", content=public_answer, effect_plan_id=plan_id or ""))
                 await persist_conversation()
                 await publish(AgentEventType.TURN_COMPLETED, {
                     "status": status, "answer": public_answer, "finish_reason": reason,
@@ -841,7 +839,8 @@ class AgentSession:
                         "\n当前回合是用户点击确认后的续行，不是原预览请求的重放。"
                         "上一张冻结计划已获授权并已消费；对话末尾的可信系统结果是本次真实执行回执。"
                         "历史中的‘只预览/等待确认/approval_required’描述的是授权前状态，不能覆盖新回执。"
-                        "先依据回执的状态、实际动作计数说明已完成或未完成部分；运行中/未知不等于完成。"
+                        "系统会展示本次可信回执，不要原样或改写复述；请继续处理原任务剩余步骤，只补充新的核验结果或下一步阻塞。"
+                        "运行中/未知不等于完成。"
                         "accepted/submitted 只表示请求已提交，绝不等于后台任务完成；应明确说明仍在后台执行或可继续查询。"
                         "不能再次索要这张卡的确认或重复执行；若还有其他写步骤，必须另建确认卡。"
                     )
