@@ -19,8 +19,7 @@
     const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit';
     const RESOURCE_SELECTION_LIMIT = 50;
     const RESOURCE_SITE_NAMES = {
-        nyaa: 'Nyaa', mikan: 'Mikan', btbtla: 'BTBtla', aipan: '爱盼',
-        dygang: '电影港', ys5266: '5266影视', tpb: 'The Pirate Bay', sukebei: 'Sukebei',
+        nyaa: 'Nyaa', mikan: 'Mikan', btbtla: '综合', tpb: 'The Pirate Bay', sukebei: 'Sukebei',
     };
     const MAX_INDEXER_EVENT_CHARS = 1024 * 1024;
     const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);

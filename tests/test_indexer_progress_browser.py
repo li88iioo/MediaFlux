@@ -593,12 +593,68 @@ class IndexerProgressBrowserTests(unittest.TestCase):
                 self.assertIn(expected_text, summary.inner_text())
                 self.assertTrue(summary.evaluate("(el, className) => el.classList.contains(className)", expected_class))
 
+    def test_manual_site_label_fallback_uses_current_product_name(self):
+        page = self.open_profile(json_payload={
+            "items": [], "site_statuses": [{"site_id": "btbtla", "status": "empty"}],
+        })
+        chip = page.locator("[data-resource-site-filter='btbtla']")
+        chip.wait_for()
+        self.assertEqual(chip.inner_text(), "综合 0")
+
+    def test_media_profile_uses_manual_catalogue_from_real_search_service(self):
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from app.indexers.config import INDEXER_SITE_DEFINITIONS, AGENT_ONLY_INDEXER_SITE_IDS
+        from app.indexers.models import IndexerCapabilities, IndexerItem, IndexerPage
+        from app.indexers.registry import IndexerRegistry
+        from app.indexers.result_store import IndexerResultStore
+        from app.indexers.service import IndexerService
+        from app.routes.indexers_api import _search_payload
+
+        adapters = {
+            site_id: SimpleNamespace(
+                site_id=site_id, site_name=name, default_enabled=True,
+                capabilities=IndexerCapabilities(False, ("magnet",)),
+                search=AsyncMock(return_value=IndexerPage(items=[IndexerItem(
+                    site_id=site_id, site_name=name, title="测试作品 123",
+                )], page=1, has_more=False, pagination_supported=False)),
+            )
+            for site_id, name in INDEXER_SITE_DEFINITIONS
+        }
+        service = IndexerService(
+            registry=IndexerRegistry(adapters), result_store=IndexerResultStore(),
+        )
+
+        async def search():
+            try:
+                return _search_payload(service, await service.search("测试作品 123"))
+            finally:
+                await service.aclose()
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            payload = worker.submit(lambda: asyncio.run(search())).result(timeout=10)
+        expected = {"nyaa", "mikan", "btbtla", "tpb", "sukebei"}
+        self.assertEqual(set(payload["sites_attempted"]), expected)
+        self.assertEqual({site["site_id"] for site in payload["site_statuses"]}, expected)
+        for site_id in AGENT_ONLY_INDEXER_SITE_IDS:
+            adapters[site_id].search.assert_not_called()
+        page = self.open_profile(json_payload=payload)
+        page.locator("[data-resource-site-filter='btbtla']").wait_for()
+        self.assertEqual(set(page.locator("[data-resource-site-filter]").evaluate_all(
+            "els => els.map(el => el.dataset.resourceSiteFilter).filter(Boolean)"
+        )), expected)
+        self.assertEqual(page.locator("[data-resource-site-filter='btbtla']").inner_text(), "综合 1")
+        for site_id in AGENT_ONLY_INDEXER_SITE_IDS:
+            self.assertEqual(page.locator(f"[data-resource-site-filter='{site_id}']").count(), 0)
+
     def test_independent_site_labels_and_diagnostics_use_provider_site_names(self):
         site_names = {
-            'btbtla': 'BTBtla',
-            'aipan': '爱盼',
-            'dygang': '电影港',
-            'ys5266': '5266影视',
+            'btbtla': '综合',
+            'nyaa': 'Nyaa',
+            'mikan': 'Mikan',
+            'tpb': 'The Pirate Bay',
         }
         items = [
             {'result_id': f'{site_id}-result', 'site_id': site_id, 'site_name': site_name,
@@ -623,28 +679,28 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         btbtla_filter.focus()
         diagnostics = page.locator('.discovery-resource-site-details')
         page.wait_for_function("el => el.classList.contains('is-visible')", arg=diagnostics.element_handle())
-        self.assertIn('BTBtla：源站响应超时', diagnostics.inner_text())
-        self.assertIn('BTBtla：请求超时', diagnostics.inner_text())
+        self.assertIn('综合：源站响应超时', diagnostics.inner_text())
+        self.assertIn('综合：请求超时', diagnostics.inner_text())
 
-        page.locator("[data-resource-site-filter='aipan']").click()
-        self.assertEqual(page.locator('.discovery-resource-head-hint').inner_text(), '（爱盼）')
-        self.assertTrue(page.locator("[data-resource-result-id='aipan-result']").is_visible())
+        page.locator("[data-resource-site-filter='nyaa']").click()
+        self.assertEqual(page.locator('.discovery-resource-head-hint').inner_text(), '（Nyaa）')
+        self.assertTrue(page.locator("[data-resource-result-id='nyaa-result']").is_visible())
         self.assertFalse(page.locator("[data-resource-result-id='btbtla-result']").is_visible())
 
     def test_btbtla_pagination_appends_without_losing_selection_or_site_filter(self):
         page = self.open_profile()
         btbtla_first = {
-            'result_id': 'btbtla-page-1', 'site_id': 'btbtla', 'site_name': 'BTBtla',
+            'result_id': 'btbtla-page-1', 'site_id': 'btbtla', 'site_name': '综合',
             'title': '较新资源', 'download_state': 'ready',
         }
-        aipan_first = {
-            'result_id': 'aipan-page-1', 'site_id': 'aipan', 'site_name': '爱盼',
-            'title': '爱盼资源', 'download_state': 'ready',
+        nyaa_first = {
+            'result_id': 'nyaa-page-1', 'site_id': 'nyaa', 'site_name': 'Nyaa',
+            'title': 'Nyaa资源', 'download_state': 'ready',
         }
         first_page = self.progress_payload(
-            [btbtla_first, aipan_first], [
-                {'site_id': 'btbtla', 'site_name': 'BTBtla', 'status': 'success', 'has_more': True},
-                {'site_id': 'aipan', 'site_name': '爱盼', 'status': 'success', 'has_more': False},
+            [btbtla_first, nyaa_first], [
+                {'site_id': 'btbtla', 'site_name': '综合', 'status': 'success', 'has_more': True},
+                {'site_id': 'nyaa', 'site_name': 'Nyaa', 'status': 'success', 'has_more': False},
             ], complete=True)
         first_page['has_more'] = True
         self.push_event(page, 0, 'complete', first_page)
@@ -654,7 +710,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         selected.check()
         page.locator("[data-resource-site-filter='btbtla']").click()
         self.assertTrue(page.locator("[data-resource-site-filter='btbtla']").get_attribute('aria-pressed') == 'true')
-        self.assertFalse(page.locator("[data-resource-result-id='aipan-page-1']").is_visible())
+        self.assertFalse(page.locator("[data-resource-result-id='nyaa-page-1']").is_visible())
 
         page.locator('.discovery-resource-load-more').click()
         page.wait_for_function('window.__resourceSearchRequests.length === 2')
@@ -662,12 +718,12 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(next_request['page'], 2)
         self.assertEqual(next_request['sites'], ['btbtla'])
         btbtla_early = {
-            'result_id': 'btbtla-page-2', 'site_id': 'btbtla', 'site_name': 'BTBtla',
+            'result_id': 'btbtla-page-2', 'site_id': 'btbtla', 'site_name': '综合',
             'title': '较早资源', 'download_state': 'ready',
         }
         next_page = self.progress_payload(
             [btbtla_early], [
-                {'site_id': 'btbtla', 'site_name': 'BTBtla', 'status': 'success', 'has_more': False},
+                {'site_id': 'btbtla', 'site_name': '综合', 'status': 'success', 'has_more': False},
             ], complete=True)
         next_page['has_more'] = False
         self.push_event(page, 1, 'complete', next_page)
@@ -676,12 +732,12 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator("[data-resource-result-id='btbtla-page-1']").count(), 1)
         self.assertTrue(selected.is_checked())
         self.assertTrue(page.locator("[data-resource-site-filter='btbtla']").get_attribute('aria-pressed') == 'true')
-        self.assertEqual(page.locator('.discovery-resource-head-hint').inner_text(), '（BTBtla）')
+        self.assertEqual(page.locator('.discovery-resource-head-hint').inner_text(), '（综合）')
         visible_ids = page.locator('[data-resource-result-id]:visible').evaluate_all(
             "rows => rows.map(row => row.dataset.resourceResultId)")
         self.assertCountEqual(visible_ids, ['btbtla-page-1', 'btbtla-page-2'])
-        self.assertEqual(page.locator("[data-resource-result-id='aipan-page-1']").count(), 1)
-        self.assertTrue(page.locator("[data-resource-result-id='aipan-page-1']").is_hidden())
+        self.assertEqual(page.locator("[data-resource-result-id='nyaa-page-1']").count(), 1)
+        self.assertTrue(page.locator("[data-resource-result-id='nyaa-page-1']").is_hidden())
         self.assertFalse(page.locator('[data-resource-pagination]').is_visible())
         self.assertEqual(page.locator("[data-resource-result-id='btbtla-page-1']").get_attribute('data-resource-result-id'), 'btbtla-page-1')
 
