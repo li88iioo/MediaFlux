@@ -222,7 +222,12 @@ class IndexerService:
         pinned: dict[tuple, IndexerItem] = {}
         def stable_view(result: AggregatedIndexerResult) -> AggregatedIndexerResult:
             view = result.clone()
-            view.items = [replace(pinned.setdefault(self._result_identity(item), item)) for item in result.items]
+            view.items = []
+            for item in result.items:
+                identity = self._result_identity(item)
+                current = self._with_frozen_target(item, pinned.get(identity, item))
+                pinned[identity] = current
+                view.items.append(current)
             return view
         def notify(result: AggregatedIndexerResult) -> None:
             if on_progress is not None:
@@ -399,6 +404,18 @@ class IndexerService:
         return result.clone(cached=False)
 
     @staticmethod
+    def _with_frozen_target(candidate: IndexerItem, anchor: IndexerItem) -> IndexerItem:
+        # 同一资源的新展示证据可以补全；已发出的执行引用、来源和下载目标不变。
+        values = {name: getattr(anchor, name) for name in (
+            "result_id", "site_id", "site_name", "detail_url", "magnet", "torrent_url",
+            "download_state", "download_kinds",
+        )}
+        for name in ("size_text", "size_bytes", "seeders", "leechers", "downloads", "published_at"):
+            if getattr(candidate, name) is None:
+                values[name] = getattr(anchor, name)
+        return replace(candidate, **values)
+
+    @staticmethod
     def _result_identity(item: IndexerItem) -> tuple:
         infohash = magnet_infohash(item.magnet)
         return ("hash", infohash) if infohash else (item.site_id, item.detail_url, item.title)
@@ -525,9 +542,10 @@ class IndexerService:
             frozen = published_items.get(identity) if not complete else None
             if frozen is None:
                 frozen = candidate.with_result_id(self.result_store.put(candidate))
-                if not complete:
-                    published_items[identity] = frozen
-            items.append(replace(frozen))
+            display = self._with_frozen_target(candidate, frozen)
+            if not complete:
+                published_items[identity] = display
+            items.append(display)
 
         result = AggregatedIndexerResult(
             query=display_query,
@@ -764,6 +782,20 @@ class IndexerService:
             value = value.replace(tzinfo=timezone.utc)
         return value.timestamp()
 
+    @staticmethod
+    def _match_order(item: IndexerItem) -> tuple[int, int]:
+        if "episode_exact" in item.match_reasons:
+            position_priority = 0
+        elif "episode_range" in item.match_reasons:
+            position_priority = 1
+        elif "season_match" in item.match_reasons:
+            position_priority = 2
+        elif "episode_conflict" in item.match_reasons:
+            position_priority = 4
+        else:
+            position_priority = 3
+        return position_priority, match_priority(item)
+
     @classmethod
     def _candidate_preference(
         cls,
@@ -787,6 +819,7 @@ class IndexerService:
         )
         return (
             actionable_rank,
+            *(-value for value in cls._match_order(item)),
             int(item.relevance_score or 0),
             state_rank,
             int(item.seeders if item.seeders is not None else -1),
@@ -835,21 +868,11 @@ class IndexerService:
         season = position.get("season")
         episode = position.get("episode")
         episode_end = position.get("episode_end") or episode
-        if "episode_exact" in item.match_reasons:
-            position_priority = 0
-        elif "episode_range" in item.match_reasons:
-            position_priority = 1
-        elif "season_match" in item.match_reasons:
-            position_priority = 2
-        elif "episode_conflict" in item.match_reasons:
-            position_priority = 4
-        else:
-            position_priority = 3
-        identity = () if sort_mode == "source_order" else (match_priority(item),)
+        priority = cls._match_order(item)
         stable = (-relevance, -seeders, -published_value, site_index, provider_index)
         if sort_mode == "published_desc":
             return (
-                position_priority, *identity,
+                *priority,
                 -published_value,
                 -relevance,
                 -seeders,
@@ -858,7 +881,7 @@ class IndexerService:
             )
         if sort_mode == "episode_desc":
             return (
-                position_priority, *identity,
+                *priority,
                 -(season if season is not None else -1),
                 -(episode_end if episode_end is not None else -1),
                 -(episode if episode is not None else -1),
@@ -866,7 +889,7 @@ class IndexerService:
             )
         if sort_mode == "seeders_desc":
             return (
-                position_priority, *identity,
+                *priority,
                 -seeders,
                 -relevance,
                 -published_value,
@@ -875,19 +898,19 @@ class IndexerService:
             )
         if sort_mode == "size_desc":
             return (
-                position_priority, *identity,
+                *priority,
                 size is None,
                 -(size if size is not None else 0),
                 *stable,
             )
         if sort_mode == "size_asc":
             return (
-                position_priority, *identity,
+                *priority,
                 size is None,
                 size if size is not None else 0,
                 *stable,
             )
-        return (position_priority, *identity, *stable)
+        return (*priority, *stable)
 
     async def _search_site_plan(
         self,

@@ -34,6 +34,25 @@ class IndexerRankingTests(unittest.TestCase):
                 candidate = rank_item(self._item(title), media=media, fallback_query="起义")
                 self.assertEqual(match_priority(candidate), expected)
 
+    def test_year_extraction_ignores_marked_technical_values_only(self):
+        media = IndexerMediaSearchRequest.create(title="起义", year=2026)
+        cases = [
+            ("起义.1920x1080.WEB-DL", False, False, 1),
+            ("起义.1080x1920.WEB-DL", False, False, 1),
+            ("起义.1920×1080.WEB-DL", False, False, 1),
+            ("起义.1920kbps.WEB-DL", False, False, 1),
+            ("起义.1920.WEB-DL", True, False, 3),
+            ("起义.1920.1920x1080.WEB-DL", True, False, 3),
+            ("起义.2026.1920x1080.WEB-DL", False, True, 0),
+        ]
+
+        for title, has_conflict, has_match, expected_priority in cases:
+            with self.subTest(title=title):
+                ranked = rank_item(self._item(title), media=media, fallback_query="起义")
+                self.assertEqual("year_conflict" in ranked.match_reasons, has_conflict)
+                self.assertEqual("year_match" in ranked.match_reasons, has_match)
+                self.assertEqual(match_priority(ranked), expected_priority)
+
     def test_short_cjk_title_requires_a_title_boundary(self):
         media = IndexerMediaSearchRequest.create(
             title="九门",

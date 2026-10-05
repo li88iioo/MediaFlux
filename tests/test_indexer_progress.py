@@ -123,13 +123,30 @@ class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
         source.first = replace(original, title="Demo S01E01 4K More metadata", seeders=99)
         source.release.set()
         streamed_result, normal_result = await asyncio.gather(streamed, normal)
-        self.assertEqual(next(i.title for i in streamed_result.items if i.magnet == original.magnet), original.title)
+        self.assertEqual(next(i.title for i in streamed_result.items if i.magnet == original.magnet), source.first.title)
+        shown = next(i for i in streamed_result.items if i.magnet == original.magnet)
+        self.assertEqual(shown.seeders, 99)
+        self.assertEqual(shown.result_id, frames[0].items[0].result_id)
+        self.assertEqual(shown.magnet, original.magnet)
         self.assertEqual(next(i.title for i in normal_result.items if i.magnet == original.magnet), source.first.title)
         cached = await service.search("Demo")
         self.assertTrue(cached.cached)
         self.assertEqual(next(i.title for i in cached.items if i.magnet == original.magnet), source.first.title)
         self.assertEqual(service.result_store.get(frames[0].items[0].result_id).title, original.title)
         await service.aclose()
+
+    def test_display_update_never_rebinds_the_download_target(self):
+        from dataclasses import replace
+        source = ProgressiveSource()
+        anchor = replace(source.first, result_id="frozen", size_bytes=123)
+        better = replace(anchor, title="Demo 2026 2160p", site_name="Another source",
+                         detail_url="https://example.com/other", magnet=anchor.magnet + "&dn=updated",
+                         download_kinds=("torrent",), size_bytes=None, seeders=22, cluster_size=3)
+        view = IndexerService._with_frozen_target(better, anchor)
+        self.assertEqual((view.result_id, view.detail_url, view.magnet, view.download_kinds),
+                         (anchor.result_id, anchor.detail_url, anchor.magnet, anchor.download_kinds))
+        self.assertEqual(view.site_name, anchor.site_name)
+        self.assertEqual((view.title, view.seeders, view.size_bytes, view.cluster_size), (better.title, 22, 123, 3))
 
     async def test_last_disconnect_cancels_underlying_search(self):
         source = ProgressiveSource(delayed=True)

@@ -18,6 +18,11 @@ _SEPARATORS = re.compile(r"[^0-9a-z\u3400-\u9fff\u3040-\u30ff]+", re.IGNORECASE)
 _HAN_ONLY = re.compile(r"^[\u3400-\u9fff]+$")
 _HAN_CHAR = re.compile(r"[\u3400-\u9fff]")
 _YEAR = re.compile(r"(?<!\d)(18\d{2}|19\d{2}|20\d{2}|21\d{2}|2200)(?!\d)")
+_TECHNICAL_YEAR_VALUE = re.compile(
+    r"(?<!\d)\d{3,5}\s*[x×]\s*\d{3,5}(?!\d)"
+    r"|(?<!\d)\d+(?:[.,]\d+)?\s*(?:[kmgt]?(?:bps|b/s|bits?/s))(?![a-z])",
+    re.IGNORECASE,
+)
 _BRACKET_GROUP = re.compile(r"[\[【(（]([^\]】)）]{1,80})[\]】)）]")
 _RELEASE_POSITION = re.compile(
     r"(?ix)(?:"
@@ -114,7 +119,8 @@ def rank_item(
         reasons.append("title_weak")
 
     request_year = media.year if media is not None else None
-    title_years = {int(value) for value in _YEAR.findall(item.title)}
+    year_text = _TECHNICAL_YEAR_VALUE.sub(" ", item.title)
+    title_years = {int(value) for value in _YEAR.findall(year_text)}
     if request_year and request_year in title_years:
         score += 9
         reasons.append("year_match")
