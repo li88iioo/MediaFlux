@@ -1434,7 +1434,10 @@ def _public_magnet_title(row) -> str | None:
     origin = str(row["origin"] or "") if "origin" in row.keys() else ""
     namespace, _, site = origin.partition(":")
     if (row["kind"] != "magnet" or namespace not in {"indexer", "agent"}
-            or site not in {"nyaa", "sukebei", "mikan", "tpb", "btbtla"}
+            or site not in {
+                "nyaa", "sukebei", "mikan", "tpb", "btbtla",
+                "aipan", "dygang", "ys5266",
+            }
             or row["torrent_data"]):
         return None
     title = download_display_title(row)

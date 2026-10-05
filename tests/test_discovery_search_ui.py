@@ -680,7 +680,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
         self.assertRegex(
             self.script,
             re.compile(
-                r"`\$\{site\.site_name \|\| '未知站点'\}："
+                r"`\$\{resourceSiteName\(siteId, site\.site_name\)\}："
                 r"\$\{site\.message \|\| \(status === 'empty'",
                 re.S,
             ),
@@ -912,11 +912,11 @@ class DiscoveryResourceSiteFilterContractTests(unittest.TestCase):
     def setUp(self):
         self.script = SCRIPT.read_text(encoding="utf-8")
 
-    def test_comprehensive_filter_is_btbtla_and_fallback_status_mapping_is_removed(self):
+    def test_independent_btbtla_filter_has_no_combined_fallback_mapping(self):
         self.assertNotIn("__combined_btbtla_1lou__", self.script)
         self.assertNotIn("fallback_site_id", self.script)
         self.assertNotIn("entry.status === 'fallback'", self.script)
-        self.assertIn("const siteName = siteId === 'btbtla' ? '综合'", self.script)
+        self.assertIn("const siteName = resourceSiteName(siteId, site.site_name);", self.script)
         self.assertRegex(self.script, re.compile(r"createFilterButton\(\s*siteId,", re.S))
         self.assertIn("retryResourceSite(siteId)", self.script)
 
@@ -1355,7 +1355,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             "source_url": source_url,
         }
 
-    def test_comprehensive_filter_uses_btbtla_only_and_keeps_result_identity(self):
+    def test_independent_btbtla_filter_keeps_result_identity(self):
         payload = {
             "items": [
                 self.result("bt-result-1", "btbtla", "BTBtla", "https://bt.example/item/1"),
@@ -1373,7 +1373,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             ["", "btbtla", "other"],
         )
         comprehensive = page.locator("[data-resource-site-filter='btbtla']")
-        self.assertEqual(comprehensive.inner_text(), "综合 1")
+        self.assertEqual(comprehensive.inner_text(), "BTBtla 1")
 
         rows = page.locator("[data-resource-result-id]")
         self.assertEqual(
@@ -1383,7 +1383,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         comprehensive.click()
         self.assertTrue(page.locator("[data-resource-result-id='bt-result-1']").is_visible())
         self.assertFalse(page.locator("[data-resource-result-id='other-result-3']").is_visible())
-        self.assertIn("（综合）", page.locator(".discovery-resource-head h3").inner_text())
+        self.assertIn("（BTBtla）", page.locator(".discovery-resource-head h3").inner_text())
         self.assertEqual(
             page.locator("[data-resource-result-id] .discovery-resource-source-link").evaluate_all(
                 "nodes => nodes.map(node => node.href)"
@@ -1469,7 +1469,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         )
         btbtla = page.locator("[data-resource-site-filter='btbtla']")
         nyaa = page.locator("[data-resource-site-filter='nyaa']")
-        self.assertEqual(btbtla.locator("span").first.inner_text(), "综合 失败")
+        self.assertEqual(btbtla.locator("span").first.inner_text(), "BTBtla 失败")
         self.assertIn("BTBtla 独立错误", btbtla.get_attribute("aria-label"))
         self.assertIn("Nyaa 独立错误", nyaa.get_attribute("title"))
         btbtla.focus()
@@ -1512,8 +1512,8 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             ["", "btbtla"],
         )
         btbtla = page.locator("[data-resource-site-filter='btbtla']")
-        self.assertEqual(btbtla.locator("span").first.inner_text(), "综合 0")
-        self.assertIn("综合：暂无结果", btbtla.get_attribute("aria-label"))
+        self.assertEqual(btbtla.locator("span").first.inner_text(), "BTBtla 0")
+        self.assertIn("BTBtla：暂无结果", btbtla.get_attribute("aria-label"))
         btbtla.focus()
         self.assertIn("BTBtla：没有匹配项", page.locator(".discovery-resource-site-details.is-visible").inner_text())
         disabled = page.locator(".discovery-resource-site-status.is-disabled")

@@ -129,27 +129,28 @@ def test_invalid_or_unidentified_magnets_are_returned_unchanged():
 
 
 def test_qb_transport_enriches_known_indexer_and_agent_without_mutating_rows():
-    for origin in ("indexer:nyaa", "agent:nyaa"):
-        row = public_row(origin=origin)
-        before = copy.deepcopy(row)
-        captured = {}
+    for site in ("nyaa", "sukebei", "mikan", "tpb", "btbtla", "aipan", "dygang", "ys5266"):
+        for namespace in ("indexer", "agent"):
+            row = public_row(origin=f"{namespace}:{site}")
+            before = copy.deepcopy(row)
+            captured = {}
 
-        class FixtureQB:
-            def add_torrent_detailed(self, **kwargs):
-                captured.update(kwargs)
-                return SimpleNamespace(ok=True, failure_code="", task_ids=["fixture-task"], retryable=False)
+            class FixtureQB:
+                def add_torrent_detailed(self, **kwargs):
+                    captured.update(kwargs)
+                    return SimpleNamespace(ok=True, failure_code="", task_ids=["fixture-task"], retryable=False)
 
-        with (
-            patch.object(download_dispatcher, "QBittorrentClient", return_value=FixtureQB()),
-            patch.object(download_dispatcher, "close_qbittorrent_client"),
-        ):
-            result = download_dispatcher._submit_qb(row, runtime_config={"url": "http://qb.fixture"})
+            with (
+                patch.object(download_dispatcher, "QBittorrentClient", return_value=FixtureQB()),
+                patch.object(download_dispatcher, "close_qbittorrent_client"),
+            ):
+                result = download_dispatcher._submit_qb(row, runtime_config={"url": "http://qb.fixture"})
 
-        assert result["ok"] is True
-        assert query(captured["urls"])["dn"] == ["Public Release"]
-        assert query(captured["urls"])["tr"] == list(PUBLIC_TRACKERS)
-        assert row == before
-        assert magnet_infohash(captured["urls"]) == magnet_infohash(row["source_value"])
+            assert result["ok"] is True
+            assert query(captured["urls"])["dn"] == ["Public Release"]
+            assert query(captured["urls"])["tr"] == list(PUBLIC_TRACKERS)
+            assert row == before
+            assert magnet_infohash(captured["urls"]) == magnet_infohash(row["source_value"])
 
 
 def test_qb_transport_does_not_enrich_unknown_source_provenance():

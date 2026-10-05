@@ -13,7 +13,12 @@ from app import config
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
 from app.defaults import DEFAULT_DISCOVERY_ENABLED, DEFAULT_INDEXER_SEARCH_ENABLED
-from app.indexers.config import DEFAULT_INDEXER_SITE_IDS, INDEXER_SITE_ORDER
+from app.indexers.config import (
+    DEFAULT_INDEXER_SITE_IDS,
+    INDEXER_SITE_CONFIG_VERSION_KEY,
+    INDEXER_SITE_ORDER,
+    expand_legacy_indexer_site_ids,
+)
 from app.logger import get_logger
 
 logger = get_logger(__name__)
@@ -133,11 +138,15 @@ def _enabled_sites() -> tuple[str, ...]:
         "INDEXER_ENABLED_SITES",
         ",".join(DEFAULT_INDEXER_SITE_IDS),
     )
-    requested = {
+    known = {
         part.strip().lower()
         for part in str(configured or "").split(",")
-        if part.strip()
+        if part.strip().lower() in _INDEXER_SITE_IDS
     }
+    requested = set(expand_legacy_indexer_site_ids(
+        known,
+        format_version=config.get(INDEXER_SITE_CONFIG_VERSION_KEY),
+    ))
     if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
         requested.add("sukebei")
     return tuple(sorted(requested & _INDEXER_SITE_IDS))

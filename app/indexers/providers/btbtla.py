@@ -126,6 +126,8 @@ class BTBtlaAdapter(IndexerAdapter):
                 if not windows and (not native.has_more or fetches == 2):
                     windows = [[]]
                 catalog.pages.extend(windows)
+                if not any(catalog.pages):
+                    catalog.expires_at = min(catalog.expires_at, self._monotonic() + 8)
                 catalog.next_native_page = (
                     catalog.next_native_page + 1
                     if native.has_more and len(catalog.pages) < _MAX_CATALOG_PAGES else None

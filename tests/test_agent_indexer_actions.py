@@ -518,6 +518,31 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertFalse(blocked.ok)
         self.assertEqual(blocked.status, "validation_error")
 
+    def test_preview_expires_legacy_combined_ticket_without_rebinding_child_site(self):
+        service = FakeIndexerService(
+            item=_resource_item(
+                site_id="btbtla",
+                site_name="综合",
+                detail_url="https://www.aipan.me/movie/legacy-resource",
+            ),
+            enabled_site_ids=("btbtla", "aipan"),
+        )
+        with (
+            patch("app.agent.indexer_actions.config.get_bool", return_value=True),
+            patch(
+                "app.agent.indexer_actions.get_indexer_service", return_value=service
+            ),
+            patch("app.agent.indexer_actions.download_target_readiness") as readiness,
+        ):
+            expired, _context = prepare_submit_resource(
+                {"result_id": _RESULT_ID, "target": "qb"}
+            )
+
+        self.assertFalse(expired.ok)
+        self.assertEqual(expired.status, "result_expired")
+        self.assertIn("旧资源确认已过期，请重新搜索", expired.error)
+        readiness.assert_not_called()
+
     def test_confirmation_context_changes_when_resource_changes(self):
         service = FakeIndexerService()
         arguments = {"result_id": _RESULT_ID, "target": "qb"}

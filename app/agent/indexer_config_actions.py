@@ -16,7 +16,9 @@ from app.indexers.config import (
     DEFAULT_INDEXER_SITE_IDS,
     INDEXER_SITE_LABELS,
     INDEXER_SITE_ORDER,
+    INDEXER_SITE_CONFIG_VERSION_KEY,
     build_indexer_site_updates,
+    expand_legacy_indexer_site_ids,
     normalize_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
@@ -26,6 +28,7 @@ logger = get_logger(__name__)
 _TARGET_KEYS = (
     "INDEXER_SEARCH_ENABLED",
     "INDEXER_ENABLED_SITES",
+    INDEXER_SITE_CONFIG_VERSION_KEY,
     "INDEXER_SUKEBEI_ENABLED",
 )
 _ALLOWED_ARGUMENTS = {"site_ids", "enable_search"}
@@ -87,19 +90,26 @@ def current_indexer_site_ids(*, strict: bool = False) -> tuple[str, ...]:
         ",".join(DEFAULT_INDEXER_SITE_IDS),
     )
     raw = str(configured or "")
+    format_version = config.get(INDEXER_SITE_CONFIG_VERSION_KEY)
     try:
-        requested = set(normalize_persisted_indexer_site_ids(raw))
+        requested = set(expand_legacy_indexer_site_ids(
+            normalize_persisted_indexer_site_ids(raw),
+            format_version=format_version,
+        ))
     except ValueError as exc:
         if strict:
             raise AgentToolError(
                 "当前资源站点配置包含未知或无效项，请先在设置页修复",
                 code="precondition_failed",
             ) from exc
-        requested = {
-            part.strip().lower()
-            for part in raw.split(",")
-            if part.strip().lower() in INDEXER_SITE_ORDER
-        }
+        requested = set(expand_legacy_indexer_site_ids(
+            (
+                part.strip().lower()
+                for part in raw.split(",")
+                if part.strip().lower() in INDEXER_SITE_ORDER
+            ),
+            format_version=format_version,
+        ))
     if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
         requested.add("sukebei")
     return tuple(site_id for site_id in INDEXER_SITE_ORDER if site_id in requested)
@@ -153,6 +163,7 @@ def _capture(arguments: dict[str, Any]) -> dict[str, Any]:
         "snapshot_sha256": hashlib.sha256(snapshot or b"").hexdigest(),
         "persisted_search": values.get("INDEXER_SEARCH_ENABLED", "<unset>"),
         "persisted_sites": values.get("INDEXER_ENABLED_SITES", "<unset>"),
+        "persisted_site_version": values.get(INDEXER_SITE_CONFIG_VERSION_KEY, "<unset>"),
         "persisted_sukebei": values.get("INDEXER_SUKEBEI_ENABLED", "<unset>"),
         "current_search_enabled": config.get_bool("INDEXER_SEARCH_ENABLED"),
         "current_site_ids": current,
@@ -170,6 +181,7 @@ def _fingerprint(state: dict[str, Any]) -> str:
         "snapshot_sha256": state["snapshot_sha256"],
         "persisted_search": state["persisted_search"],
         "persisted_sites": state["persisted_sites"],
+        "persisted_site_version": state["persisted_site_version"],
         "persisted_sukebei": state["persisted_sukebei"],
         "current_search_enabled": state["current_search_enabled"],
         "current_site_ids": list(state["current_site_ids"]),

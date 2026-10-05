@@ -7,7 +7,6 @@ from .providers.base import IndexerAdapter
 from .providers.btbtla import BTBtlaAdapter
 from .providers.aipan import AipanAdapter
 from .providers.empire import EmpireAdapter
-from .providers.general import GeneralAdapter
 from .providers.mikan import MikanAdapter
 from .providers.nyaa import NyaaAdapter
 from .providers.piratebay import PirateBayAdapter
@@ -49,9 +48,9 @@ def build_default_registry(
     user_agent: str = "MediaFlux/1.0",
     nyaa_endpoint_timeout_seconds: float = 4,
     btbtla_min_interval_seconds: float = 5,
+    btbtla_page_size: int = 40,
+    btbtla_cache_ttl_seconds: int = 120,
     tpb_min_interval_seconds: float = 1,
-    general_timeout_seconds: float = 9,
-    general_cache_ttl_seconds: float = 120,
 ) -> IndexerRegistry:
     supplied = dict(http_clients or {})
     # nyaa.si 会按来源 IP 限流；nyaa.net 为同引擎镜像，主站失败时回落。
@@ -80,20 +79,14 @@ def build_default_registry(
         user_agent=user_agent,
         pin_resolved_address=True,
     )
-    general_sources = (
-        BTBtlaAdapter(http=btbtla_http, min_interval_seconds=btbtla_min_interval_seconds),
-        AipanAdapter(http=supplied.get("aipan") or FixedHostHttpClient(
-            allowed_hosts={"www.aipan.me"}, user_agent=user_agent, pin_resolved_address=True,
-        )),
-        *(EmpireAdapter(
-            site_id=site_id, site_name=site_name, base_url=f"https://{host}/",
-            http=supplied.get(site_id) or FixedHostHttpClient(
-                allowed_hosts={host}, user_agent=user_agent, pin_resolved_address=True,
-            ),
-        ) for site_id, site_name, host in (
-            ("dygang", "电影港", "www.dygang.tv"),
-            ("ys5266", "5266影视", "www.5266ys.net"),
-        )),
+    aipan_http = supplied.get("aipan") or FixedHostHttpClient(
+        allowed_hosts={"www.aipan.me"}, user_agent=user_agent, pin_resolved_address=True,
+    )
+    dygang_http = supplied.get("dygang") or FixedHostHttpClient(
+        allowed_hosts={"www.dygang.tv"}, user_agent=user_agent, pin_resolved_address=True,
+    )
+    ys5266_http = supplied.get("ys5266") or FixedHostHttpClient(
+        allowed_hosts={"www.5266ys.net"}, user_agent=user_agent, pin_resolved_address=True,
     )
     return IndexerRegistry(
         {
@@ -114,7 +107,25 @@ def build_default_registry(
                 default_enabled=False,
             ),
             "mikan": MikanAdapter(http=mikan_http),
-            "btbtla": GeneralAdapter(general_sources, timeout_seconds=general_timeout_seconds, cache_ttl_seconds=general_cache_ttl_seconds),
+            "btbtla": BTBtlaAdapter(
+                http=btbtla_http,
+                min_interval_seconds=btbtla_min_interval_seconds,
+                page_size=btbtla_page_size,
+                cache_ttl_seconds=btbtla_cache_ttl_seconds,
+            ),
+            "aipan": AipanAdapter(http=aipan_http),
+            "dygang": EmpireAdapter(
+                site_id="dygang",
+                site_name="电影港",
+                base_url="https://www.dygang.tv/",
+                http=dygang_http,
+            ),
+            "ys5266": EmpireAdapter(
+                site_id="ys5266",
+                site_name="5266影视",
+                base_url="https://www.5266ys.net/",
+                http=ys5266_http,
+            ),
             "tpb": PirateBayAdapter(
                 http=tpb_http,
                 min_interval_seconds=tpb_min_interval_seconds,

@@ -576,7 +576,7 @@ class IndexerProgressBrowserTests(unittest.TestCase):
             (
                 [
                     {"site_id": "sukebei", "site_name": "Sukebei", "status": "disabled"},
-                    {"site_id": "btbtla", "site_name": "综合", "status": "error"},
+                    {"site_id": "btbtla", "site_name": "BTBtla", "status": "error"},
                 ],
                 "综合搜索失败",
                 "is-error",
@@ -592,6 +592,98 @@ class IndexerProgressBrowserTests(unittest.TestCase):
                 summary = page.locator(".discovery-resource-site-status[aria-live='polite']")
                 self.assertIn(expected_text, summary.inner_text())
                 self.assertTrue(summary.evaluate("(el, className) => el.classList.contains(className)", expected_class))
+
+    def test_independent_site_labels_and_diagnostics_use_provider_site_names(self):
+        site_names = {
+            'btbtla': 'BTBtla',
+            'aipan': '爱盼',
+            'dygang': '电影港',
+            'ys5266': '5266影视',
+        }
+        items = [
+            {'result_id': f'{site_id}-result', 'site_id': site_id, 'site_name': site_name,
+             'title': f'{site_name} 独立结果'}
+            for site_id, site_name in site_names.items()
+        ]
+        statuses = [
+            {'site_id': site_id, 'site_name': site_name, 'status': 'error' if site_id == 'btbtla' else 'success',
+             **({'message': '源站响应超时', 'diagnostics': [
+                 {'site_id': site_id, 'site_name': site_name, 'status': 'error',
+                  'code': 'timeout', 'message': '请求超时'}], 'retryable': True} if site_id == 'btbtla' else {})}
+            for site_id, site_name in site_names.items()
+        ]
+        page = self.open_profile(json_payload={'items': items, 'site_statuses': statuses})
+        for site_id, site_name in site_names.items():
+            row = page.locator(f"[data-resource-result-id='{site_id}-result']")
+            row.wait_for()
+            self.assertEqual(row.locator('.discovery-resource-site').inner_text(), site_name)
+            self.assertIn(site_name, page.locator(f"[data-resource-site-filter='{site_id}']").inner_text())
+
+        btbtla_filter = page.locator("[data-resource-site-filter='btbtla']")
+        btbtla_filter.focus()
+        diagnostics = page.locator('.discovery-resource-site-details')
+        page.wait_for_function("el => el.classList.contains('is-visible')", arg=diagnostics.element_handle())
+        self.assertIn('BTBtla：源站响应超时', diagnostics.inner_text())
+        self.assertIn('BTBtla：请求超时', diagnostics.inner_text())
+
+        page.locator("[data-resource-site-filter='aipan']").click()
+        self.assertEqual(page.locator('.discovery-resource-head-hint').inner_text(), '（爱盼）')
+        self.assertTrue(page.locator("[data-resource-result-id='aipan-result']").is_visible())
+        self.assertFalse(page.locator("[data-resource-result-id='btbtla-result']").is_visible())
+
+    def test_btbtla_pagination_appends_without_losing_selection_or_site_filter(self):
+        page = self.open_profile()
+        btbtla_first = {
+            'result_id': 'btbtla-page-1', 'site_id': 'btbtla', 'site_name': 'BTBtla',
+            'title': '较新资源', 'download_state': 'ready',
+        }
+        aipan_first = {
+            'result_id': 'aipan-page-1', 'site_id': 'aipan', 'site_name': '爱盼',
+            'title': '爱盼资源', 'download_state': 'ready',
+        }
+        first_page = self.progress_payload(
+            [btbtla_first, aipan_first], [
+                {'site_id': 'btbtla', 'site_name': 'BTBtla', 'status': 'success', 'has_more': True},
+                {'site_id': 'aipan', 'site_name': '爱盼', 'status': 'success', 'has_more': False},
+            ], complete=True)
+        first_page['has_more'] = True
+        self.push_event(page, 0, 'complete', first_page)
+        page.wait_for_function('window.__readerCancelCalls.includes(0)')
+
+        selected = page.locator("[data-resource-result-id='btbtla-page-1'] .discovery-resource-select")
+        selected.check()
+        page.locator("[data-resource-site-filter='btbtla']").click()
+        self.assertTrue(page.locator("[data-resource-site-filter='btbtla']").get_attribute('aria-pressed') == 'true')
+        self.assertFalse(page.locator("[data-resource-result-id='aipan-page-1']").is_visible())
+
+        page.locator('.discovery-resource-load-more').click()
+        page.wait_for_function('window.__resourceSearchRequests.length === 2')
+        next_request = page.evaluate('JSON.parse(window.__resourceSearchRequests[1].body)')
+        self.assertEqual(next_request['page'], 2)
+        self.assertEqual(next_request['sites'], ['btbtla'])
+        btbtla_early = {
+            'result_id': 'btbtla-page-2', 'site_id': 'btbtla', 'site_name': 'BTBtla',
+            'title': '较早资源', 'download_state': 'ready',
+        }
+        next_page = self.progress_payload(
+            [btbtla_early], [
+                {'site_id': 'btbtla', 'site_name': 'BTBtla', 'status': 'success', 'has_more': False},
+            ], complete=True)
+        next_page['has_more'] = False
+        self.push_event(page, 1, 'complete', next_page)
+        page.wait_for_function('window.__readerCancelCalls.includes(1)')
+
+        self.assertEqual(page.locator("[data-resource-result-id='btbtla-page-1']").count(), 1)
+        self.assertTrue(selected.is_checked())
+        self.assertTrue(page.locator("[data-resource-site-filter='btbtla']").get_attribute('aria-pressed') == 'true')
+        self.assertEqual(page.locator('.discovery-resource-head-hint').inner_text(), '（BTBtla）')
+        visible_ids = page.locator('[data-resource-result-id]:visible').evaluate_all(
+            "rows => rows.map(row => row.dataset.resourceResultId)")
+        self.assertCountEqual(visible_ids, ['btbtla-page-1', 'btbtla-page-2'])
+        self.assertEqual(page.locator("[data-resource-result-id='aipan-page-1']").count(), 1)
+        self.assertTrue(page.locator("[data-resource-result-id='aipan-page-1']").is_hidden())
+        self.assertFalse(page.locator('[data-resource-pagination]').is_visible())
+        self.assertEqual(page.locator("[data-resource-result-id='btbtla-page-1']").get_attribute('data-resource-result-id'), 'btbtla-page-1')
 
     def test_json_response_remains_a_single_complete_snapshot(self):
         payload = {

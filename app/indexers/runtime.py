@@ -12,7 +12,11 @@ from typing import Any, TypeVar
 from app import config
 from app.logger import get_logger
 
-from .config import DEFAULT_INDEXER_SITE_IDS
+from .config import (
+    DEFAULT_INDEXER_SITE_IDS,
+    INDEXER_SITE_CONFIG_VERSION_KEY,
+    expand_legacy_indexer_site_ids,
+)
 from .registry import build_default_registry
 from .result_store import IndexerResultStore
 from .service import IndexerService
@@ -387,10 +391,6 @@ async def run_indexer_awaitable(
         raise TimeoutError("索引器调用超时") from None
 
 
-def _csv(value: str) -> list[str]:
-    return list(dict.fromkeys(part.strip().lower() for part in str(value or "").split(",") if part.strip()))
-
-
 def _bounded_int(key: str, default: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(config.get_int(key, default), maximum))
 
@@ -406,21 +406,31 @@ def _user_agent() -> str:
 def build_indexer_service() -> IndexerService:
     site_timeout_seconds = _bounded_int("INDEXER_SITE_TIMEOUT_SECONDS", 10, 2, 60)
     cache_ttl_seconds = _bounded_int("INDEXER_CACHE_TTL_SECONDS", 120, 30, 600)
+    max_results_per_site = _bounded_int("INDEXER_MAX_RESULTS_PER_SITE", 40, 1, 100)
     # Nyaa 有主站和镜像两个端点；单端点预算必须显著短于总站点预算，
     # 否则主站卡满后服务层会取消整个适配器，镜像永远没有执行机会。
     nyaa_endpoint_timeout_seconds = max(0.5, min(4.0, site_timeout_seconds * 0.4))
     registry = build_default_registry(
         user_agent=_user_agent(),
         nyaa_endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
-        general_timeout_seconds=site_timeout_seconds * 0.9,
-        general_cache_ttl_seconds=cache_ttl_seconds,
         btbtla_min_interval_seconds=_bounded_int(
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS", 5, 0, 60
         ),
+        btbtla_page_size=max_results_per_site,
+        btbtla_cache_ttl_seconds=cache_ttl_seconds,
     )
-    configured = _csv(
-        config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS))
+    raw_sites = str(
+        config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS)) or ""
     )
+    known_sites = {
+        site_id.strip().lower()
+        for site_id in raw_sites.split(",")
+        if site_id.strip().lower() in registry.ids()
+    }
+    configured = list(expand_legacy_indexer_site_ids(
+        known_sites,
+        format_version=config.get(INDEXER_SITE_CONFIG_VERSION_KEY),
+    ))
     if config.get_bool("INDEXER_SUKEBEI_ENABLED", False) and "sukebei" not in configured:
         configured.append("sukebei")
     enabled = [site_id for site_id in configured if site_id in registry.ids()]
@@ -432,7 +442,7 @@ def build_indexer_service() -> IndexerService:
         ),
         site_timeout_seconds=site_timeout_seconds,
         total_timeout_seconds=_bounded_int("INDEXER_TOTAL_TIMEOUT_SECONDS", 15, 3, 120),
-        max_results_per_site=_bounded_int("INDEXER_MAX_RESULTS_PER_SITE", 40, 1, 100),
+        max_results_per_site=max_results_per_site,
         max_concurrency=_bounded_int("INDEXER_MAX_CONCURRENCY", 5, 1, 10),
         cache_ttl_seconds=cache_ttl_seconds,
         enabled_site_ids=enabled,

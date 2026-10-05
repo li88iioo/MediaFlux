@@ -22,7 +22,14 @@ from app.defaults import (
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
 from app.discovery.models import ProviderError
-from app.indexers.config import build_indexer_site_updates, encode_indexer_site_ids
+from app.indexers.config import (
+    DEFAULT_INDEXER_SITE_IDS,
+    INDEXER_SITE_CONFIG_VERSION_KEY,
+    build_indexer_site_updates,
+    encode_indexer_site_ids,
+    expand_legacy_indexer_site_ids,
+    normalize_persisted_indexer_site_ids,
+)
 from app.logger import configure_telebot_logging, get_logger
 from app.security import redact_config
 from app.services import build_dashboards
@@ -989,10 +996,13 @@ def get_config(request: Request):
             "INDEXER_1LOU_MIN_INTERVAL_SECONDS", "INDEXER_1LOU_GOOGLE_ENABLED",
         } | _FIXED_ORGANIZE_NAMING_KEYS)
     }
-    managed_fields = sorted(
+    managed_field_set = {
         key for key in _CONFIG_UI_SAVEABLE_KEYS
         if config.has_external_override(key)
-    )
+    }
+    if config.has_external_override(INDEXER_SITE_CONFIG_VERSION_KEY):
+        managed_field_set.add("INDEXER_ENABLED_SITES")
+    managed_fields = sorted(managed_field_set)
     managed_field_set = set(managed_fields)
     # 新授权独立默认关闭，不能继承旧的主动复核权限。
     items.setdefault(
@@ -1022,6 +1032,22 @@ def get_config(request: Request):
     for key in managed_fields:
         default = str(items.get(key, _AGENT_SETTINGS_DEFAULTS.get(key, "")) or "")
         items[key] = config.get(key, default)
+    raw_sites = items.get(
+        "INDEXER_ENABLED_SITES",
+        config.get("INDEXER_ENABLED_SITES", ",".join(DEFAULT_INDEXER_SITE_IDS)),
+    )
+    try:
+        persisted_sites = normalize_persisted_indexer_site_ids(raw_sites)
+        if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
+            persisted_sites = (*persisted_sites, "sukebei")
+        items["INDEXER_ENABLED_SITES"] = ",".join(
+            expand_legacy_indexer_site_ids(
+                persisted_sites,
+                format_version=config.get(INDEXER_SITE_CONFIG_VERSION_KEY),
+            )
+        )
+    except ValueError:
+        items["INDEXER_ENABLED_SITES"] = str(raw_sites or "")
     redacted = redact_config(items)
     if items.get("DOUBAN_DBCL2"):
         redacted["DOUBAN_DBCL2"] = _CONFIG_MASK
@@ -1096,17 +1122,22 @@ def save_config(request: Request, data: Any = Body(default=None)):
     unknown = sorted(set(data) - allowed)
     if unknown:
         return api_error(f"包含不允许的配置项: {', '.join(unknown[:5])}", 400)
-    managed_updates = sorted(
+    managed_updates = {
         key
         for key, value in data.items()
         if key in _CONFIG_UI_SAVEABLE_KEYS
         and not _is_config_mask(value)
         and config.has_external_override(key)
-    )
+    }
+    if (
+        "INDEXER_ENABLED_SITES" in data
+        and config.has_external_override(INDEXER_SITE_CONFIG_VERSION_KEY)
+    ):
+        managed_updates.add("INDEXER_ENABLED_SITES")
     if managed_updates:
         return api_error(
             "以下配置由部署环境管理，不能在页面修改: "
-            + ", ".join(managed_updates[:5]),
+            + ", ".join(sorted(managed_updates)[:5]),
             409,
         )
 

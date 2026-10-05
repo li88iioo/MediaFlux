@@ -6452,13 +6452,15 @@ class SecurityTests(InitializedWebTestCase):
         with (
             patch("app.routes.api.config.all_items", return_value={}),
             patch("app.routes.api.config.has_external_override", return_value=False),
-            patch("app.routes.api.config.get", return_value="/data/strm") as get_value,
+            patch("app.routes.api.config.get", side_effect=lambda key, default="": "/data/strm" if key == "STRM_ROOT" else default) as get_value,
+            patch("app.routes.api.config.set_and_save") as save,
         ):
             response = self.client.get("/api/config", headers=headers)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["STRM_ROOT"], "/data/strm")
-        get_value.assert_called_once_with("STRM_ROOT", "")
+        get_value.assert_any_call("STRM_ROOT", "")
+        save.assert_not_called()
 
     def test_sensitive_config_is_masked_and_mask_is_not_saved(self):
         headers = self._authenticated()

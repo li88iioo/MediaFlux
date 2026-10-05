@@ -346,12 +346,14 @@ class DiscoveryPageTests(InitializedWebTestCase):
             'data-indexer-site="nyaa"',
             'data-indexer-site="mikan"',
             'data-indexer-site="btbtla"',
-            '<strong>综合</strong>',
+            '<strong>BTBtla</strong>',
+            'data-indexer-site="aipan"',
+            'data-indexer-site="dygang"',
+            'data-indexer-site="ys5266"',
             'data-indexer-site="tpb"',
             'data-indexer-site="sukebei"',
             '成人内容，默认关闭',
             'const INDEXER_SITE_ORDER=',
-            'const DEFAULT_INDEXER_SITES=',
             'function syncIndexerSiteSelection',
             'function loadIndexerSiteSelection',
             'indexerSiteBox.hidden=!enabled',
@@ -370,8 +372,8 @@ class DiscoveryPageTests(InitializedWebTestCase):
             '<strong>Sukebei</strong><small>成人</small>',
         ):
             self.assertIn(contract, html)
-        self.assertIn("const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','tpb'];", html)
-        self.assertIn("const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','tpb','sukebei'];", html)
+        self.assertNotIn("const DEFAULT_INDEXER_SITES=", html)
+        self.assertIn("const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','aipan','dygang','ys5266','tpb','sukebei'];", html)
         self.assertNotIn("configured.filter", html)
         self.assertNotIn("INDEXER_1LOU_", html)
         self.assertNotIn("1LOU", SETTINGS_TEMPLATE.read_text(encoding="utf-8"))

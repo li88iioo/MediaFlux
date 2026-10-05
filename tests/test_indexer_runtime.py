@@ -11,7 +11,7 @@ from app.indexers import runtime
 
 class FakeRegistry:
     def ids(self):
-        return ("nyaa", "sukebei", "mikan", "btbtla", "tpb")
+        return ("nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb", "sukebei")
 
     def enabled_ids(self):
         return ("nyaa",)
@@ -47,6 +47,34 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "sukebei"}))
 
+    def test_legacy_sukebei_switch_survives_combined_site_migration(self):
+        registry = FakeRegistry()
+
+        def get_value(key, default=""):
+            if key == "INDEXER_ENABLED_SITES":
+                return "btbtla"
+            if key == "INDEXER_SITE_CONFIG_VERSION":
+                return ""
+            return default
+
+        def get_bool(key, default=False):
+            if key == "INDEXER_SUKEBEI_ENABLED":
+                return True
+            return default
+
+        with patch("app.indexers.runtime.config.get", side_effect=get_value), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch("app.indexers.runtime.config.get_bool", side_effect=get_bool), patch(
+            "app.indexers.runtime.build_default_registry", return_value=registry,
+        ):
+            service = runtime.build_indexer_service()
+
+        self.assertEqual(
+            service.enabled_site_ids,
+            frozenset({"btbtla", "aipan", "dygang", "ys5266", "sukebei"}),
+        )
+
     def test_build_service_passes_configured_user_agent_to_registry(self):
         registry = FakeRegistry()
 
@@ -70,9 +98,9 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         build.assert_called_once_with(
             user_agent="MediaFlux/Test",
             nyaa_endpoint_timeout_seconds=4.0,
-            general_timeout_seconds=9.0,
-            general_cache_ttl_seconds=120,
             btbtla_min_interval_seconds=5,
+            btbtla_page_size=40,
+            btbtla_cache_ttl_seconds=120,
         )
         self.assertIs(service.registry, registry)
 
@@ -93,8 +121,76 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.enabled_site_ids,
-            frozenset({"nyaa", "mikan", "btbtla", "tpb"}),
+            frozenset({"nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb"}),
         )
+
+    def test_unversioned_combined_selection_expands_only_legacy_btbtla(self):
+        registry = FakeRegistry()
+
+        def get_value(key, default=""):
+            if key == "INDEXER_ENABLED_SITES":
+                return "nyaa,btbtla,tpb"
+            if key == "INDEXER_SITE_CONFIG_VERSION":
+                return ""
+            return default
+
+        with patch("app.indexers.runtime.config.get", side_effect=get_value), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch("app.indexers.runtime.config.get_bool", return_value=False), patch(
+            "app.indexers.runtime.build_default_registry", return_value=registry,
+        ):
+            service = runtime.build_indexer_service()
+
+        self.assertEqual(
+            service.enabled_site_ids,
+            frozenset({"nyaa", "btbtla", "aipan", "dygang", "ys5266", "tpb"}),
+        )
+
+    def test_versioned_site_selection_keeps_disabled_legacy_children_disabled(self):
+        registry = FakeRegistry()
+
+        def get_value(key, default=""):
+            if key == "INDEXER_ENABLED_SITES":
+                return "nyaa,btbtla,ys5266"
+            if key == "INDEXER_SITE_CONFIG_VERSION":
+                return "2"
+            return default
+
+        with patch("app.indexers.runtime.config.get", side_effect=get_value), patch(
+            "app.indexers.runtime.config.get_int",
+            side_effect=lambda _key, default: default,
+        ), patch("app.indexers.runtime.config.get_bool", return_value=False), patch(
+            "app.indexers.runtime.build_default_registry", return_value=registry,
+        ):
+            service = runtime.build_indexer_service()
+
+        self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "btbtla", "ys5266"}))
+
+    def test_default_registry_registers_each_former_combined_source_independently(self):
+        from types import SimpleNamespace
+
+        from app.indexers.registry import build_default_registry
+
+        clients = {site_id: object() for site_id in FakeRegistry().ids()}
+        btbtla_adapter = SimpleNamespace(site_id="btbtla", default_enabled=True)
+        with patch(
+            "app.indexers.registry.BTBtlaAdapter", return_value=btbtla_adapter
+        ) as build_btbtla:
+            registry = build_default_registry(
+                http_clients=clients,
+                btbtla_page_size=37,
+                btbtla_cache_ttl_seconds=73,
+            )
+
+        self.assertEqual(
+            registry.ids(),
+            ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb"),
+        )
+        self.assertEqual(build_btbtla.call_args.kwargs["page_size"], 37)
+        self.assertEqual(build_btbtla.call_args.kwargs["cache_ttl_seconds"], 73)
+        for site_id in ("aipan", "dygang", "ys5266"):
+            self.assertEqual(registry.get(site_id).site_id, site_id)
 
     def test_build_service_ignores_retired_site_in_persisted_selection(self):
         registry = FakeRegistry()

@@ -986,10 +986,10 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
     def test_default_registry_uses_browser_transport_for_challenged_sites(self):
         registry = build_default_registry()
 
-        combined = registry.get("btbtla")
-        self.assertEqual(combined.site_name, "综合")
-        self.assertEqual(tuple(member.site_id for member in combined.members), ("btbtla", "aipan", "dygang", "ys5266"))
-        btbtla = combined.members[0]
+        btbtla = registry.get("btbtla")
+        self.assertEqual(btbtla.site_name, "BTBtla")
+        for site in ("aipan", "dygang", "ys5266"):
+            self.assertEqual(registry.get(site).site_id, site)
         self.assertIsInstance(btbtla.http, BrowserImpersonatingHttpClient)
         self.assertEqual(btbtla.base_url, "https://www.btbtlb.com/")
         self.assertEqual(btbtla.mirror_base_urls, ("https://btbtlb.com/",))
@@ -1012,7 +1012,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         }
         registry = build_default_registry(http_clients=clients)
 
-        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "tpb"))
+        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb"))
         self.assertTrue(registry.get("nyaa").default_enabled)
         self.assertFalse(registry.get("sukebei").default_enabled)
         self.assertTrue(registry.get("sukebei").capabilities.pagination_supported)

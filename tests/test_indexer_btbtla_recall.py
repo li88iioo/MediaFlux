@@ -166,6 +166,14 @@ class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
         await adapter.search(IndexerSearchRequest.create('Demo'))
         self.assertEqual(len(http.calls),4)
 
+        empty_http=FakeHttpClient(_EMPTY)
+        empty_http.responses=[_EMPTY,search,detail]
+        empty_adapter=BTBtlaAdapter(http=empty_http,cache_ttl_seconds=120,monotonic=lambda:clock[0])
+        self.assertFalse((await empty_adapter.search(IndexerSearchRequest.create('Demo'))).items)
+        clock[0]+=9
+        self.assertTrue((await empty_adapter.search(IndexerSearchRequest.create('Demo'))).items)
+        self.assertEqual(len(empty_http.calls),3)
+
     async def test_empty_native_page_is_skipped_within_read_budget(self):
         search, empty = self.catalog_html(0, next_native=True)
         second_search, second_detail = self.catalog_html(1)

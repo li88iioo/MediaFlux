@@ -11,6 +11,7 @@ from unittest.mock import patch
 from app import config
 from app.agent.errors import AgentToolError
 from app.agent.indexer_config_actions import (
+    current_indexer_site_ids,
     indexer_sites_arguments,
     prepare_indexer_sites_confirmation,
     summarize_indexer_sites,
@@ -19,11 +20,14 @@ from app.agent.indexer_config_actions import (
 from app.agent.models import Evidence, RiskLevel, ToolReference, ToolResult
 from app.agent.public_view import format_public_result
 from app.indexers.config import (
+    INDEXER_SITE_CONFIG_VERSION,
+    INDEXER_SITE_CONFIG_VERSION_KEY,
     build_indexer_site_updates,
+    expand_legacy_indexer_site_ids,
     normalize_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
-from app.routes.api import _normalize_indexer_sites
+from app.routes.api import _normalize_indexer_sites, get_config
 from tests.agent_kernel_test_harness import (
     build_kernel_test_registry as build_tool_registry,
 )
@@ -39,6 +43,7 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
             build_indexer_site_updates("tpb, nyaa, sukebei, tpb"),
             {
                 "INDEXER_ENABLED_SITES": "nyaa,tpb,sukebei",
+                INDEXER_SITE_CONFIG_VERSION_KEY: INDEXER_SITE_CONFIG_VERSION,
                 "INDEXER_SUKEBEI_ENABLED": "1",
             },
         )
@@ -60,6 +65,67 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
             normalize_indexer_site_ids("1lou")
         with self.assertRaises(AgentToolError):
             indexer_sites_arguments({"site_ids": ["1lou"]})
+
+    def test_legacy_bundle_expands_only_without_the_explicit_v2_marker(self):
+        old_sites = normalize_persisted_indexer_site_ids("nyaa,btbtla,tpb")
+        self.assertEqual(
+            expand_legacy_indexer_site_ids(old_sites),
+            ("nyaa", "btbtla", "aipan", "dygang", "ys5266", "tpb"),
+        )
+        self.assertEqual(
+            expand_legacy_indexer_site_ids(old_sites, format_version="2"),
+            ("nyaa", "btbtla", "tpb"),
+        )
+        self.assertEqual(
+            expand_legacy_indexer_site_ids(old_sites, format_version="3"),
+            ("nyaa", "btbtla", "tpb"),
+        )
+
+    def test_agent_current_site_projection_obeys_the_format_marker(self):
+        values = {
+            "INDEXER_ENABLED_SITES": "nyaa,btbtla,tpb",
+            "INDEXER_SITE_CONFIG_VERSION": "",
+        }
+        with patch(
+            "app.agent.indexer_config_actions.config.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch(
+            "app.agent.indexer_config_actions.config.get_bool", return_value=False,
+        ):
+            self.assertEqual(
+                current_indexer_site_ids(),
+                ("nyaa", "btbtla", "aipan", "dygang", "ys5266", "tpb"),
+            )
+            values["INDEXER_SITE_CONFIG_VERSION"] = "2"
+            self.assertEqual(
+                current_indexer_site_ids(), ("nyaa", "btbtla", "tpb")
+            )
+
+    def test_settings_projection_preserves_legacy_enabled_children_until_saved(self):
+        persisted = {"INDEXER_ENABLED_SITES": "nyaa,mikan,btbtla,tpb"}
+        format_version = [""]
+
+        def get_value(key, default=""):
+            if key == "INDEXER_SITE_CONFIG_VERSION":
+                return format_version[0]
+            return default
+
+        with patch("app.routes.api.require_api_login"), patch(
+            "app.routes.api.config.all_items", return_value=persisted,
+        ), patch(
+            "app.routes.api.config.has_external_override", return_value=False,
+        ), patch("app.routes.api.config.get", side_effect=get_value):
+            old_settings = get_config(object())
+            format_version[0] = "2"
+            new_settings = get_config(object())
+
+        self.assertEqual(
+            old_settings["INDEXER_ENABLED_SITES"],
+            "nyaa,mikan,btbtla,aipan,dygang,ys5266,tpb",
+        )
+        self.assertEqual(
+            new_settings["INDEXER_ENABLED_SITES"], "nyaa,mikan,btbtla,tpb"
+        )
 
     def test_arguments_reject_arbitrary_configuration_and_empty_selection(self):
         self.assertEqual(
@@ -235,6 +301,7 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                 b"persisted",
                 {
                     "INDEXER_ENABLED_SITES": "nyaa,tpb",
+                    "INDEXER_SITE_CONFIG_VERSION": "2",
                     "INDEXER_SUKEBEI_ENABLED": "0",
                     "INDEXER_SEARCH_ENABLED": "1",
                 },

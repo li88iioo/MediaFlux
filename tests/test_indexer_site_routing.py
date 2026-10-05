@@ -63,6 +63,23 @@ class PlanMediaSiteRouteTests(unittest.TestCase):
 
         self.assertEqual(routed, ("btbtla", "tpb"))
 
+    def test_split_legacy_sources_remain_in_automatic_routes_when_enabled(self):
+        sites = (
+            "nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb", "sukebei",
+        )
+        self.assertEqual(
+            plan_media_site_route(sites, is_animation=True, original_language="ja"),
+            ("mikan", "nyaa", "btbtla", "aipan", "dygang", "ys5266"),
+        )
+        self.assertEqual(
+            plan_media_site_route(sites, is_animation=True, original_language="zh"),
+            ("btbtla", "aipan", "dygang", "ys5266", "nyaa"),
+        )
+        self.assertEqual(
+            plan_media_site_route(sites, is_animation=False),
+            ("btbtla", "aipan", "dygang", "ys5266", "tpb"),
+        )
+
 
 class TmdbAnimationDetectionTests(unittest.TestCase):
     def test_detects_genre_id_and_names(self):

@@ -1,4 +1,4 @@
-"""两项授权说明tooltip的真实Chromium回归；沿用设置页离线fixture。"""
+"""设置页说明提示与索引站点选择的真实 Chromium 浏览器回归。"""
 from __future__ import annotations
 
 import unittest
@@ -186,70 +186,60 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
     def selected(page):
         return [site for site in page.locator('[data-key="INDEXER_ENABLED_SITES"]').input_value().split(',') if site]
 
-    def test_comprehensive_btbtla_toggle_and_save_preserves_other_sites_on_mobile_and_desktop(self):
-        initial = 'nyaa,mikan,btbtla,1lou,tpb'
-        normalized = ['nyaa', 'mikan', 'btbtla', 'tpb']
+    def test_eight_independent_sites_wrap_and_save_in_contract_order(self):
+        default_sites = ['nyaa', 'mikan', 'btbtla', 'aipan', 'dygang', 'ys5266', 'tpb']
+        labels = ['Nyaa', 'Mikan', 'BTBtla', '爱盼', '电影港', '5266影视', 'The Pirate Bay', 'Sukebei']
+        site_order = ['nyaa', 'mikan', 'btbtla', 'aipan', 'dygang', 'ys5266', 'tpb', 'sukebei']
         for width in (320, 1280):
             with self.subTest(width=width):
-                page, errors, site_toggle = self.ready({'INDEXER_ENABLED_SITES': initial}, width)
-                labels = page.locator('[data-indexer-site-chip] strong').all_text_contents()
-                self.assertEqual(labels, ['Nyaa', 'Mikan', '综合', 'The Pirate Bay', 'Sukebei'])
-                self.assertEqual(page.locator('[data-indexer-site="btbtla"]').count(), 1)
-                self.assertEqual(self.selected(page), normalized)
-                expect(site_toggle).to_be_checked()
+                page, errors, site_toggle = self.ready({'INDEXER_ENABLED_SITES': ','.join(default_sites)}, width)
+                self.assertEqual(page.locator('[data-indexer-site-chip] strong').all_text_contents(), labels)
+                self.assertEqual(page.locator('[data-indexer-site]').evaluate_all(
+                    "inputs => inputs.map(input => input.dataset.indexerSite)"), site_order)
+                self.assertEqual(self.selected(page), default_sites)
+                expect(page.locator('[data-indexer-site="sukebei"]')).not_to_be_checked()
+                geometry = page.locator('[data-indexer-site-selector]').evaluate("""selector => {
+                    const bounds = [...selector.children].map(option => option.getBoundingClientRect());
+                    const rect = selector.getBoundingClientRect();
+                    return {
+                        inside: bounds.every(option => option.left >= rect.left - 0.5 && option.right <= rect.right + 0.5),
+                        rows: new Set(bounds.map(option => Math.round(option.top))).size,
+                        width: rect.width,
+                        height: rect.height,
+                    };
+                }""")
+                self.assertTrue(geometry['inside'])
+                self.assertGreaterEqual(geometry['rows'], 2 if width == 320 else 1)
+                self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
+
                 before = site_toggle.locator('..').bounding_box()
                 site_toggle.locator('..').click()
-                self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'tpb'])
+                remaining = ['nyaa', 'mikan', 'aipan', 'dygang', 'ys5266', 'tpb']
+                self.assertEqual(self.selected(page), remaining)
                 after = site_toggle.locator('..').bounding_box()
                 self.assertEqual((before['width'], before['height']), (after['width'], after['height']))
                 page.locator('#settings-panel-discovery [data-save-settings]').click()
                 page.wait_for_function('window.__settingsWrites.length === 1')
-                self.assertEqual(page.evaluate('window.__settingsWrites[0].INDEXER_ENABLED_SITES'), 'nyaa,mikan,tpb')
+                self.assertEqual(page.evaluate('window.__settingsWrites[0].INDEXER_ENABLED_SITES'), ','.join(remaining))
                 page.evaluate('window.__resolveSettingsSave()')
                 expect(page.locator('#settings-panel-discovery [data-save-settings]')).to_be_enabled()
-                site_toggle.locator('..').click()
-                self.assertEqual(self.selected(page), normalized)
-                self.assertTrue(page.evaluate('document.documentElement.scrollWidth <= innerWidth'))
                 self.assertEqual(errors, [])
                 page.close()
 
-    def test_legacy_1lou_is_dropped_without_defaulting_or_losing_other_sites(self):
-        cases = (
-            ('nyaa,mikan,btbtla,1lou,tpb', ['nyaa', 'mikan', 'btbtla', 'tpb']),
-            ('nyaa,1lou', ['nyaa']),
-            ('1lou', []),
-        )
-        for legacy_value, expected in cases:
-            with self.subTest(legacy_value=legacy_value):
-                page, errors, btbtla = self.ready({'INDEXER_ENABLED_SITES': legacy_value})
-                self.assertEqual(self.selected(page), expected)
-                self.assertNotIn('1lou', self.selected(page))
-                self.assertEqual(btbtla.is_checked(), 'btbtla' in expected)
-                config_fields = page.evaluate("collectConfigFields(document.getElementById('settings-panel-discovery'))")
-                self.assertEqual(config_fields['INDEXER_ENABLED_SITES'], ','.join(expected))
-                page.locator('[data-indexer-site="mikan"]').locator('..').click()
-                expected_after_toggle = (
-                    [site for site in expected if site != 'mikan']
-                    if 'mikan' in expected else
-                    [site for site in ('nyaa', 'mikan', 'btbtla', 'tpb') if site in {*expected, 'mikan'}]
-                )
-                self.assertEqual(self.selected(page), expected_after_toggle)
-                self.assertEqual(errors, [])
-                page.close()
+    def test_api_site_list_is_authoritative_and_legacy_sensitive_flag_is_ignored(self):
+        page, errors, btbtla = self.ready({
+            'INDEXER_ENABLED_SITES': 'aipan',
+            'INDEXER_SUKEBEI_ENABLED': '1',
+        })
+        self.assertEqual(self.selected(page), ['aipan'])
+        self.assertFalse(btbtla.is_checked())
+        expect(page.locator('[data-indexer-site="aipan"]')).to_be_checked()
+        expect(page.locator('[data-indexer-site="sukebei"]')).not_to_be_checked()
+        self.assertNotIn('INDEXER_ENABLED_SITES', page.evaluate("collectConfigFields(document.getElementById('settings-panel-discovery'))"))
+        self.assertEqual(errors, [])
+        page.close()
 
-    def test_missing_and_empty_config_defaults_and_legacy_sensitive_flag_still_load(self):
-        for config in (
-            {'INDEXER_SUKEBEI_ENABLED': '1'},
-            {'INDEXER_ENABLED_SITES': '', 'INDEXER_SUKEBEI_ENABLED': '1'},
-        ):
-            with self.subTest(config=config):
-                page, errors, btbtla = self.ready(config)
-                expect(btbtla).to_be_checked()
-                self.assertEqual(self.selected(page), ['nyaa', 'mikan', 'btbtla', 'tpb', 'sukebei'])
-                self.assertEqual(errors, [])
-                page.close()
-
-    def test_root_toggle_does_not_change_selected_sites_or_comprehensive_site(self):
+    def test_root_toggle_does_not_change_selected_sites_or_btbtla(self):
         for sites in ('nyaa', 'nyaa,btbtla'):
             with self.subTest(sites=sites):
                 page, errors, site_toggle = self.ready({'INDEXER_ENABLED_SITES': sites})

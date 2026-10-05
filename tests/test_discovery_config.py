@@ -115,6 +115,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         persist.assert_called_once_with({
             "INDEXER_ENABLED_SITES": "nyaa,mikan",
             "INDEXER_SUKEBEI_ENABLED": "0",
+            "INDEXER_SITE_CONFIG_VERSION": "2",
         })
         shutdown_web.assert_awaited_once()
         shutdown_telegram.assert_called_once_with(timeout=5.0)
@@ -156,8 +157,8 @@ class DiscoveryConfigTests(unittest.TestCase):
         with patch("app.routes.api.config.all_items", return_value={**retired, "INDEXER_ENABLED_SITES": "nyaa,1lou"}):
             response = get_config(self.request)
         self.assertFalse(set(retired) & response.keys())
-        # 保留用户已有站点选择原值供读取迁移，不自动替用户开启其它来源。
-        self.assertEqual(response["INDEXER_ENABLED_SITES"], "nyaa,1lou")
+        # 返回有效站点选择；读取时移除已下线站点，不开启其它来源。
+        self.assertEqual(response["INDEXER_ENABLED_SITES"], "nyaa")
         for key, value in retired.items():
             with self.subTest(key=key):
                 result, persist = self._save({key: value})
@@ -333,6 +334,7 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,tpb,sukebei",
             "INDEXER_SUKEBEI_ENABLED": "1",
+            "INDEXER_SITE_CONFIG_VERSION": "2",
         })
 
     def test_indexer_site_selection_rejects_unknown_or_empty_enabled_selection(self):
@@ -359,7 +361,26 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,mikan",
             "INDEXER_SUKEBEI_ENABLED": "0",
+            "INDEXER_SITE_CONFIG_VERSION": "2",
         })
+
+    def test_config_read_migrates_combined_site_and_preserves_legacy_sukebei(self):
+        for version, expected in (("", "btbtla,aipan,dygang,ys5266,sukebei"), ("2", "btbtla,sukebei")):
+            values={"INDEXER_ENABLED_SITES":"btbtla", "INDEXER_SITE_CONFIG_VERSION":version,"INDEXER_SUKEBEI_ENABLED":"1"}
+            with self.subTest(version=version), patch("app.routes.api.config.all_items",return_value=values), patch("app.routes.api.config.get",side_effect=lambda key,default="":values.get(key,default)), patch("app.routes.api.config.get_bool",side_effect=lambda key,default=False: True if key=="INDEXER_SUKEBEI_ENABLED" else default):
+                result=get_config(self.request)
+            self.assertEqual(result["INDEXER_ENABLED_SITES"],expected)
+
+    def test_saved_independent_selection_stays_disabled_after_reload(self):
+        old={"INDEXER_ENABLED_SITES":"btbtla,sukebei", "INDEXER_SUKEBEI_ENABLED":"1"}
+        response,persist=self._save({"INDEXER_ENABLED_SITES":"btbtla"},existing=old)
+        self.assertEqual(response,{"success":True})
+        saved={**old,**persist.call_args.args[0]}
+        self.assertEqual(saved["INDEXER_SITE_CONFIG_VERSION"],"2")
+        self.assertEqual(saved["INDEXER_SUKEBEI_ENABLED"],"0")
+        with patch("app.routes.api.config.all_items",return_value=saved), patch("app.routes.api.config.get",side_effect=lambda key,default="":saved.get(key,default)), patch("app.routes.api.config.get_bool",return_value=False):
+            reloaded=get_config(self.request)
+        self.assertEqual(reloaded["INDEXER_ENABLED_SITES"],"btbtla")
 
     def test_deployment_templates_do_not_embed_discovery_configuration(self):
         env_text = Path(".env.development.example").read_text(encoding="utf-8")

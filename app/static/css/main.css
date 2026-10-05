@@ -6253,10 +6253,10 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 /* Discovery indexer site selector */
 .indexer-site-box { margin: 14px 0; padding: 16px; border: 1px solid var(--border); background: var(--panel-surface); }
 .indexer-site-box[hidden] { display: none; }
-.indexer-site-selector { display: flex; min-height: 104px; align-content: flex-start; align-items: flex-start; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
+.indexer-site-selector { display: flex; align-content: flex-start; align-items: flex-start; flex-wrap: wrap; gap: 10px; margin-top: 12px; }
 .indexer-site-option { position: relative; display: inline-flex; flex: 0 0 auto; cursor: pointer; }
 .indexer-site-option input { position: absolute; width: 1px; height: 1px; margin: 0; opacity: 0; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-.indexer-site-option [data-indexer-site-chip] { display: inline-flex; min-height: 42px; align-items: center; gap: 7px; padding: 0 17px; color: var(--accent); background: transparent; border: 1px solid var(--accent); border-radius: var(--radius-sm); transition: color .18s ease,background-color .18s ease,border-color .18s ease; }
+.indexer-site-option [data-indexer-site-chip] { display: inline-flex; min-height: 44px; align-items: center; gap: 7px; padding: 0 17px; color: var(--accent); background: transparent; border: 1px solid var(--accent); border-radius: var(--radius-sm); transition: color .18s ease,background-color .18s ease,border-color .18s ease; }
 .indexer-site-option strong, .indexer-site-option small { line-height: 1; white-space: nowrap; }
 .indexer-site-option strong { color: inherit; font-size: 12px; font-weight: 600; }
 .indexer-site-option small { color: inherit; font-size: 9px; opacity: .78; }
@@ -6270,8 +6270,8 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 .indexer-site-box.is-disabled .indexer-site-option { cursor: not-allowed; }
 @media (max-width: 560px) {
     .indexer-site-box { padding: 13px; }
-    .indexer-site-selector { min-height: 148px; gap: 8px; }
-    .indexer-site-option [data-indexer-site-chip] { min-height: 40px; padding: 0 13px; }
+    .indexer-site-selector { gap: 8px; }
+    .indexer-site-option [data-indexer-site-chip] { min-height: 44px; padding: 0 13px; }
 }
 
 /* First-run initialization: preserve the login shell while reserving stable form space. */

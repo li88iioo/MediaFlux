@@ -37,6 +37,9 @@ class MemoryConfig:
     def get(self, key, default=""):
         return self.overrides.get(key, self.values.get(key, default))
 
+    def get_bool(self, key, default=False):
+        return str(self.get(key, default)).strip().lower() in {"1", "true", "yes", "on"}
+
     def all_items(self):
         return dict(self.values)
 
@@ -67,7 +70,9 @@ def _load_settings_api(config):
     functions = {"_is_config_mask", "_normalize_discovery_boolean", VALIDATOR, "get_config", "save_config"}
     nodes = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in tree.body:
-        if isinstance(node, ast.Assign) and all(
+        if isinstance(node, ast.ImportFrom) and node.module == "app.indexers.config":
+            nodes.append(node)
+        elif isinstance(node, ast.Assign) and all(
             isinstance(target, ast.Name) and target.id.startswith("_") for target in node.targets
         ):
             nodes.append(node)

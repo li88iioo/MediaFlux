@@ -18,6 +18,10 @@
     const INDEXER_DOWNLOAD_BATCH_PATH = '/api/indexers/download/batch';
     const INDEXER_DOWNLOAD_RESUBMIT_PATH = '/api/indexers/download/resubmit';
     const RESOURCE_SELECTION_LIMIT = 50;
+    const RESOURCE_SITE_NAMES = {
+        nyaa: 'Nyaa', mikan: 'Mikan', btbtla: 'BTBtla', aipan: '爱盼',
+        dygang: '电影港', ys5266: '5266影视', tpb: 'The Pirate Bay', sukebei: 'Sukebei',
+    };
     const MAX_INDEXER_EVENT_CHARS = 1024 * 1024;
     const RESOURCE_TERMINAL_STATUSES = new Set(['expired', 'request_unknown', 'manual_review']);
     const RESOURCE_MANUAL_REVIEW_MESSAGE = '请核对下载列表/目标状态，必要时重新检索后人工处理';
@@ -2052,6 +2056,10 @@
         return details.length ? `，${details.join('，')}` : '';
     }
 
+    function resourceSiteName(siteId, providerName = '') {
+        return String(providerName || RESOURCE_SITE_NAMES[siteId] || siteId || '未知站点');
+    }
+
     function resourceSiteResultCount(siteId) {
         return [...state.resourceResults.values()].filter((result) => resourceSiteKey(result) === siteId).length;
     }
@@ -2088,7 +2096,7 @@
 
     function resourceDiagnosticMessage(diagnostic, fallbackName) {
         const labels = {success: '检索成功', partial: '部分完成', searching: '搜索中', empty: '暂无结果', error: '检索失败'};
-        const name = diagnostic?.site_name || fallbackName || '未知站点';
+        const name = resourceSiteName(diagnostic?.site_id, diagnostic?.site_name || fallbackName);
         const status = labels[diagnostic?.status] || diagnostic?.status || '诊断信息';
         let message = `${name}：${diagnostic?.message || status}`;
         if (diagnostic?.code) message += `（${diagnostic.code}）`;
@@ -2347,25 +2355,25 @@
                 || asArray(site.diagnostics).some((diagnostic) => diagnostic.status === 'error')) ? 'error'
                 : 'empty';
             const message = node('div', `discovery-resource-site-message is-${status}`);
-            const descriptions = entries.flatMap(({site, status}) => {
+            const descriptions = entries.flatMap(({site, siteId, status}) => {
                 const lines = [];
                 if (site.message || ['error', 'empty'].includes(status)) {
                     lines.push(
-                        `${site.site_name || '未知站点'}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`,
+                        `${resourceSiteName(siteId, site.site_name)}：${site.message || (status === 'empty' ? '本次检索没有匹配资源' : '站点检索失败')}${resourceSiteDiagnostic(site)}`,
                     );
                 }
                 lines.push(...asArray(site.diagnostics).map((diagnostic) => {
-                    return resourceDiagnosticMessage(diagnostic, site.site_name);
+                    return resourceDiagnosticMessage(diagnostic, resourceSiteName(siteId, site.site_name));
                 }));
                 return lines;
             });
             message.append(node('span', '', descriptions.join('；')));
             entries.forEach(({site, siteId, status}) => {
                 if (status !== 'error' || site.retryable === false || !siteId) return;
-                const retry = node('button', 'jump-btn discovery-resource-site-retry', `重试 ${site.site_name || siteId}`);
+                const retry = node('button', 'jump-btn discovery-resource-site-retry', `重试 ${resourceSiteName(siteId, site.site_name)}`);
                 retry.type = 'button';
                 retry.setAttribute('data-resource-site-retry', siteId);
-                retry.setAttribute('aria-label', `重新检索 ${site.site_name || siteId}`);
+                retry.setAttribute('aria-label', `重新检索 ${resourceSiteName(siteId, site.site_name)}`);
                 retry.addEventListener('click', (event) => {
                     event.stopPropagation();
                     retry.disabled = true;
@@ -2407,7 +2415,7 @@
         siteStatuses.forEach((site) => {
             const status = normalizedStatus(site);
             const siteId = String(site.site_id || site.id || site.site_name || '');
-            const siteName = siteId === 'btbtla' ? '综合' : site.site_name || siteId || '未知站点';
+            const siteName = resourceSiteName(siteId, site.site_name);
             const statusLabel = labels[status];
             const count = resourceSiteResultCount(siteId);
             const chipStatus = displayStatus(status, count);
@@ -2781,7 +2789,7 @@
         const copy = node('div', 'discovery-resource-copy');
         const badges = node('div', 'discovery-resource-badges');
         badges.append(
-            node('span', 'discovery-resource-site', (result.site_name || result.site_id || '未知站点').toUpperCase()),
+            node('span', 'discovery-resource-site', resourceSiteName(resourceSiteKey(result), result.site_name)),
         );
         const position = resourcePositionLabel(result);
         if (position) {
@@ -2900,12 +2908,11 @@
 
     function activeResourceSiteName() {
         if (!state.activeResourceSiteId) return '全部';
-        if (state.activeResourceSiteId === 'btbtla') return '综合';
         const site = state.resourceSiteStatuses.find((status) => {
             const siteId = String(status.site_id || status.id || status.site_name || '');
             return siteId === state.activeResourceSiteId;
         });
-        return site?.site_name || site?.name || state.activeResourceSiteId;
+        return resourceSiteName(state.activeResourceSiteId, site?.site_name || site?.name);
     }
 
     function syncResourceHeadTitle() {

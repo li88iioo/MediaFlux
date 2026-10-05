@@ -143,12 +143,19 @@ class FakeStatusRegistry:
         self.adapters = {
             "nyaa": FakeStatusAdapter("nyaa", "Nyaa"),
             "mikan": FakeStatusAdapter("mikan", "Mikan"),
-            "btbtla": FakeStatusAdapter("btbtla", "BTBTLA"),
+            "btbtla": FakeStatusAdapter("btbtla", "BTBtla"),
+            "aipan": FakeStatusAdapter("aipan", "爱盼"),
+            "dygang": FakeStatusAdapter("dygang", "电影港"),
+            "ys5266": FakeStatusAdapter("ys5266", "5266影视"),
+            "tpb": FakeStatusAdapter("tpb", "The Pirate Bay"),
             "sukebei": FakeStatusAdapter("sukebei", "Sukebei"),
         }
 
     def ids(self):
         return tuple(self.adapters)
+
+    def enabled_ids(self):
+        return ("nyaa",)
 
     def get(self, site_id):
         return self.adapters[site_id]
@@ -246,9 +253,32 @@ class IndexerAPITests(unittest.TestCase):
         self.assertNotIn("torrent_url", payload["items"][0])
         self.assertNotIn("detail_url", payload["items"][0])
 
-    def test_real_general_provider_recall_through_keyword_and_media_api(self):
+    def test_site_catalog_exposes_independent_sites_in_frontend_contract_order(self):
+        self.authenticate()
+        service = SimpleNamespace(
+            registry=FakeStatusRegistry(),
+            enabled_site_ids=frozenset({"nyaa", "btbtla", "aipan", "ys5266"}),
+        )
+        with patch.object(indexers_api, "get_indexer_service", return_value=service):
+            response = self.client.get("/api/indexers/sites")
+
+        self.assertEqual(response.status_code, 200)
+        sites = response.json()
+        self.assertEqual(
+            [site["site_id"] for site in sites],
+            ["nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb", "sukebei"],
+        )
+        self.assertEqual(
+            [site["site_name"] for site in sites],
+            ["Nyaa", "Mikan", "BTBtla", "爱盼", "电影港", "5266影视", "The Pirate Bay", "Sukebei"],
+        )
+        self.assertEqual(
+            [site["site_id"] for site in sites if site["enabled"]],
+            ["nyaa", "btbtla", "aipan", "ys5266"],
+        )
+
+    def test_real_btbtla_provider_recall_through_keyword_and_media_api(self):
         from app.indexers.providers.btbtla import BTBtlaAdapter
-        from app.indexers.providers.general import GeneralAdapter
         from app.indexers.registry import IndexerRegistry
         from app.indexers.result_store import IndexerResultStore
         from app.indexers.service import IndexerService
@@ -259,7 +289,7 @@ class IndexerAPITests(unittest.TestCase):
         http = FakeHttpClient(_EMPTY)
         http.responses = [_EMPTY, _SEARCH, _DETAIL, _SEARCH, _DETAIL]
         service = IndexerService(
-            registry=IndexerRegistry({'btbtla': GeneralAdapter((BTBtlaAdapter(http=http),))}),
+            registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http)}),
             result_store=IndexerResultStore(),
         )
         try:
@@ -280,10 +310,9 @@ class IndexerAPITests(unittest.TestCase):
         finally:
             asyncio.run(service.aclose())
 
-    def test_general_aipan_source_url_survives_real_media_http_response(self):
+    def test_aipan_source_url_survives_real_media_http_response(self):
         import json
         from app.indexers.providers.aipan import AipanAdapter
-        from app.indexers.providers.general import GeneralAdapter
         from app.indexers.registry import IndexerRegistry
         from app.indexers.result_store import IndexerResultStore
         from app.indexers.service import IndexerService
@@ -295,38 +324,40 @@ class IndexerAPITests(unittest.TestCase):
                 json.dumps({"resources": [{"kind": "magnet", "name": "三体 S01E01", "url": "magnet:?xt=urn:btih:" + HASH_ONE}]})),
         })
         http.allowed_hosts = {"www.aipan.me"}
-        service = IndexerService(registry=IndexerRegistry({"btbtla": GeneralAdapter((AipanAdapter(http=http),))}), result_store=IndexerResultStore())
+        service = IndexerService(registry=IndexerRegistry({"aipan": AipanAdapter(http=http)}), result_store=IndexerResultStore())
         headers = self.authenticate()
         try:
             with patch.object(indexers_api, "get_indexer_service", return_value=service):
                 result = self.client.post("/api/indexers/search", headers=headers,
-                    json={"title": "三体", "media_type": "tv", "sites": ["btbtla"]})
+                    json={"title": "三体", "media_type": "tv", "sites": ["aipan"]})
             self.assertEqual(result.status_code, 200, result.text)
             item = result.json()["items"][0]
-            self.assertEqual(item["site_id"], "btbtla")
+            self.assertEqual(item["site_id"], "aipan")
             self.assertEqual(item["source_url"], "https://www.aipan.me/movie/1")
             self.assertNotIn("magnet", item)
         finally:
             asyncio.run(service.aclose())
 
-    def test_general_source_links_use_each_result_owner_not_a_union_of_clients(self):
+    def test_source_links_require_the_matching_independent_site_owner(self):
         from dataclasses import replace
         from app.indexers.registry import build_default_registry
         registry = build_default_registry()
         service = SimpleNamespace(registry=registry)
         try:
-            for url in (
-                "https://www.btbtlb.com/tdown/1.htm", "https://btbtlb.com/tdown/1.htm",
-                "https://www.aipan.me/movie/1",
-                "https://www.dygang.tv/ys/20230414/1.htm", "https://www.5266ys.net/movie/1.html",
+            for site_id, url in (
+                ("btbtla", "https://www.btbtlb.com/tdown/1.htm"),
+                ("btbtla", "https://btbtlb.com/tdown/1.htm"),
+                ("aipan", "https://www.aipan.me/movie/1"),
+                ("dygang", "https://www.dygang.tv/ys/20230414/1.htm"),
+                ("ys5266", "https://www.5266ys.net/movie/1.html"),
             ):
                 with self.subTest(url=url):
-                    item = IndexerItem(site_id="btbtla", site_name="irrelevant label", title="Demo", detail_url=url)
+                    item = IndexerItem(site_id=site_id, site_name="irrelevant label", title="Demo", detail_url=url)
                     self.assertEqual(indexers_api._public_source_url(service, item), url)
                     self.assertIsNone(indexers_api._public_source_url(service, replace(item, site_id="nyaa")))
-            for url in ("https://evil.example/1", "http://www.aipan.me/movie/1", "https://www.aipan.me:444/movie/1"):
+            for url in ("https://evil.example/1", "http://www.btbtlb.com/tdown/1.htm", "https://www.btbtlb.com:444/tdown/1.htm"):
                 with self.subTest(rejected=url):
-                    item.detail_url = url
+                    item = IndexerItem(site_id="btbtla", site_name="BTBtla", title="Demo", detail_url=url)
                     self.assertIsNone(indexers_api._public_source_url(service, item))
         finally:
             asyncio.run(registry.aclose())

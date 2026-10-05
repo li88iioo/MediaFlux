@@ -17,6 +17,7 @@ from app.indexers.errors import (
     IndexerResultNotFound,
     IndexerValidationError,
 )
+from app.indexers.config import INDEXER_SITE_ORDER
 from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
 from app.indexers.ranking import match_priority
 from app.indexers.release import parse_indexer_release_position
@@ -301,7 +302,12 @@ def _media_request(payload: Any) -> tuple[IndexerMediaSearchRequest, list[str] |
 def sites(request: Request):
     require_api_login(request)
     service = get_indexer_service()
-    return api_response([_site_payload(service, site_id) for site_id in service.registry.ids()])
+    registered = set(service.registry.ids())
+    return api_response([
+        _site_payload(service, site_id)
+        for site_id in INDEXER_SITE_ORDER
+        if site_id in registered
+    ])
 
 
 @router.get("/search")

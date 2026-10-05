@@ -10,6 +10,7 @@ import secrets
 import unicodedata
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 from app import config
 from app.agent.async_bridge import (
@@ -28,7 +29,7 @@ from app.indexers.downloads import (
     download_indexer_result,
     download_indexer_result_public,
 )
-from app.indexers.errors import IndexerError, IndexerValidationError
+from app.indexers.errors import IndexerError, IndexerResultExpired, IndexerValidationError
 from app.indexers.models import IndexerMediaSearchRequest
 from app.indexers.runtime import get_indexer_service, run_indexer_awaitable_sync
 from app.modules.download_dispatcher import public_dispatch_summary
@@ -44,6 +45,13 @@ _SORT_MODES = frozenset(
         "seeders_desc",
         "size_desc",
         "size_asc",
+    }
+)
+_SPLIT_SITE_HOSTS = frozenset(
+    {
+        "aipan.me", "www.aipan.me",
+        "dygang.tv", "www.dygang.tv",
+        "5266ys.net", "www.5266ys.net",
     }
 )
 
@@ -414,6 +422,16 @@ def download_target_readiness(target: str) -> dict[str, bool]:
 def _stored_resource(arguments: dict[str, str], *, service: Any | None = None):
     service = service or get_indexer_service()
     item = service.result_store.get(arguments["result_id"])
+    if item.site_id == "btbtla":
+        try:
+            detail_host = (urlsplit(str(item.detail_url or "")).hostname or "").lower().rstrip(".")
+        except ValueError:
+            detail_host = ""
+        if detail_host in _SPLIT_SITE_HOSTS:
+            raise IndexerResultExpired(
+                "legacy combined-site result cannot be rebound to an independent site",
+                public_message="资源站点已拆分，旧资源确认已过期，请重新搜索后确认。",
+            )
     enabled = set(getattr(service, "enabled_site_ids", ()))
     if item.site_id not in enabled:
         raise IndexerValidationError(

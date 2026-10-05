@@ -35,8 +35,7 @@
             field.addEventListener('change',gate.invalidate);
         });
     }
-    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','tpb','sukebei'];
-    const DEFAULT_INDEXER_SITES=['nyaa','mikan','btbtla','tpb'];
+    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','aipan','dygang','ys5266','tpb','sukebei'];
     const indexerSiteBox=form.querySelector('[data-indexer-site-box]');
     const indexerSiteField=indexerSiteBox?.querySelector('[data-key="INDEXER_ENABLED_SITES"]');
     const indexerSiteInputs=[...(indexerSiteBox?.querySelectorAll('[data-indexer-site]')||[])];
@@ -84,9 +83,7 @@
         indexerSiteInputs.forEach(input=>{input.disabled=!enabled;});
     }
     function loadIndexerSiteSelection(config){
-        const configured=String(config.INDEXER_ENABLED_SITES||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean);
-        const selected=new Set(configured.length?configured:DEFAULT_INDEXER_SITES);
-        if(['1','true','yes','on'].includes(String(config.INDEXER_SUKEBEI_ENABLED||'').toLowerCase()))selected.add('sukebei');
+        const selected=new Set(String(config.INDEXER_ENABLED_SITES||'').split(',').map(value=>value.trim().toLowerCase()).filter(Boolean));
         if(indexerSiteField)indexerSiteField.value=INDEXER_SITE_ORDER.filter(site=>selected.has(site)).join(',');
         indexerSiteInputs.forEach(input=>{
             input.checked=selected.has(input.dataset.indexerSite);
