@@ -172,6 +172,16 @@ def rank_item(
     )
 
 
+def match_priority(item: IndexerItem) -> int:
+    """作品身份先于热度/画质；不删弱匹配，留给用户手动核验。"""
+    reasons = set(item.match_reasons)
+    if reasons & {"year_conflict", "episode_conflict"}:
+        return 3
+    if reasons & {"title_exact", "title_contains"}:
+        return 0 if "year_match" in reasons else 1
+    return 2 if "title_similar" in reasons else 3
+
+
 def _meaningful_bracket(match: re.Match[str]) -> str:
     content = match.group(1)
     normalized = _normalize(content)

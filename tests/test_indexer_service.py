@@ -533,7 +533,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         newer_downloadable = item(
             "nyaa",
-            "Target alternate 2025",
+            "Target alternate 2026",
             magnet=f"magnet:?xt=urn:btih:{HASH}",
             published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         )
@@ -559,6 +559,31 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [entry.title for entry in result.items], [newer_downloadable.title]
         )
+
+    async def test_explicit_episode_keeps_priority_over_series_premiere_year(self):
+        # 剧集首播年不一定等于后续季发布年；不能用年份层级盖过明确季集匹配。
+        releases = [
+            item("btbtla", "Demo.2023.1080p", magnet=f"magnet:?xt=urn:btih:{1:040x}"),
+            item("btbtla", "Demo.2026.S02E12.1080p", magnet=f"magnet:?xt=urn:btih:{2:040x}"),
+        ]
+        service = self.service([FakeAdapter("btbtla", releases)])
+        media = IndexerMediaSearchRequest.create(title="Demo", year=2023, media_type="tv", season=2, episode=12)
+        result = await service.search_media(media, ("btbtla",))
+        self.assertEqual(result.items[0].title, "Demo.2026.S02E12.1080p")
+
+    async def test_title_and_year_match_precedes_popular_unrelated_or_other_year(self):
+        titles = ["环太平洋起义.2018.2160p", "起义.2024.1080p", "二二八起义.2026.1080p", "起义.2026.1080p"]
+        for mode in ("relevance_desc", "published_desc", "seeders_desc", "size_desc"):
+            with self.subTest(mode=mode):
+                releases = [item("btbtla", title, magnet=f"magnet:?xt=urn:btih:{index + 1:040x}",
+                                 seeders=10000 if index < 3 else 0,
+                                 published_at=datetime(2026, 10, 5 if index < 3 else 1, tzinfo=timezone.utc))
+                            for index, title in enumerate(titles)]
+                service = self.service([FakeAdapter("btbtla", releases)], max_results_per_site=10)
+                media = IndexerMediaSearchRequest.create(title="起义", year=2026, sort_mode=mode)
+                result = await service.search_media(media, ("btbtla",))
+                self.assertEqual(result.items[0].title, "起义.2026.1080p")
+                self.assertEqual({entry.title for entry in result.items}, set(titles))
 
     async def test_episode_conflicts_stay_below_matching_ranges_even_when_newer(self):
         conflict = item(

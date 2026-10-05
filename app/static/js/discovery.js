@@ -51,8 +51,8 @@
     };
     const DIALOG_NOTICE_SUCCESS_MS = 4000;
     const RESOURCE_SORT_OPTIONS = [
-        ['published_desc', '发布时间：新到旧'],
         ['relevance_desc', '综合匹配：高到低'],
+        ['published_desc', '发布时间：新到旧'],
         ['episode_desc', '季集号：高到低'],
         ['seeders_desc', '做种数：多到少'],
         ['size_desc', '文件大小：大到小'],
@@ -131,7 +131,7 @@
         selectedResourceIds: new Set(),
         resourceResults: new Map(),
         activeResourceSiteId: '',
-        resourceSort: 'published_desc',
+        resourceSort: 'relevance_desc',
         resourceSourceOrder: new Map(),
         resourcePage: 1,
         resourceHasMore: false,
@@ -1462,7 +1462,7 @@
         state.selectedResourceIds.clear();
         state.resourceResults.clear();
         state.activeResourceSiteId = '';
-        state.resourceSort = 'published_desc';
+        state.resourceSort = 'relevance_desc';
         state.resourceSourceOrder.clear();
         state.resourcePage = 1;
         state.resourceHasMore = false;
@@ -1610,6 +1610,10 @@
     }
 
     function compareResourceResults(left, right) {
+        // 身份匹配优先级来自后端同一评分规则；发布时间/体积等只在同级内排序。
+        const identityOrder = state.resourceSort === 'source_order' ? 0
+            : (left.match_priority ?? 1) - (right.match_priority ?? 1);
+        if (identityOrder) return identityOrder;
         let order = 0;
         if (state.resourceSort === 'relevance_desc') order = compareKnownNumbers(left.relevance_score, right.relevance_score, 'desc');
         else if (state.resourceSort === 'published_desc') order = compareResourcePublished(left.published_at, right.published_at);
@@ -1643,36 +1647,32 @@
         });
     }
 
-    function renderResourceResultsList(forceReorder = false, preserveExistingOrder = false, updatedIds = new Set()) {
+    function renderResourceResultsList(updatedIds = new Set()) {
         const list = elements.dialogBody?.querySelector('[data-discovery-resource-list]');
         if (!list) return;
         const currentRows = [...list.querySelectorAll('[data-resource-result-id]')];
         const existingRows = new Map(currentRows.map((row) => [row.dataset.resourceResultId || '', row]));
+        const focused = list.contains(document.activeElement) ? document.activeElement : null;
+        const anchor = focused?.closest('[data-resource-result-id]');
+        const anchorTop = anchor?.getBoundingClientRect().top;
         const sorted = sortedResourceResults();
         if (state.resourceResults.size) list.querySelector('[data-resource-search-empty]')?.remove();
-        if (preserveExistingOrder) {
-            currentRows.forEach((row) => {
-                const resultId = row.dataset.resourceResultId || '';
-                const result = state.resourceResults.get(resultId);
-                if (result && updatedIds.has(resultId)) updateResourceRowContent(row, result);
-            });
-            const additions = sorted
-                .filter((result) => !existingRows.has(result.result_id))
-                .map(resourceRow);
-            if (additions.length) list.append(...additions);
-            if (additions.length || updatedIds.size) renderIcons(list);
-        } else {
-            let rowsChanged = forceReorder || existingRows.size !== state.resourceResults.size;
-            const orderedRows = sorted.map((result) => {
-                const existing = existingRows.get(result.result_id);
-                if (existing && updatedIds.has(result.result_id)) updateResourceRowContent(existing, result);
-                if (!existing) rowsChanged = true;
-                return existing || resourceRow(result);
-            });
-            if (rowsChanged && orderedRows.length) {
-                list.replaceChildren(...orderedRows);
-                renderIcons(list);
-            }
+        const orderedRows = sorted.map((result) => {
+            const row = existingRows.get(result.result_id);
+            if (row && updatedIds.has(result.result_id)) updateResourceRowContent(row, result);
+            return row || resourceRow(result);
+        });
+        const rowsChanged = currentRows.length !== orderedRows.length
+            || orderedRows.some((row, index) => row !== currentRows[index]);
+        if (rowsChanged && orderedRows.length) {
+            list.replaceChildren(...orderedRows);
+            renderIcons(list);
+        } else if (updatedIds.size) {
+            renderIcons(list);
+        }
+        if (focused?.isConnected && anchor?.isConnected) {
+            focused.focus({preventScroll: true});
+            elements.dialogBody.scrollTop += anchor.getBoundingClientRect().top - anchorTop;
         }
         const rows = [...list.querySelectorAll('[data-resource-result-id]')];
         const visibleIds = new Set(visibleResourceResults().map((result) => result.result_id));
@@ -1694,12 +1694,12 @@
     }
 
     async function setResourceSort(sort) {
-        const next = RESOURCE_SORT_OPTIONS.some(([value]) => value === sort) ? sort : 'published_desc';
+        const next = RESOURCE_SORT_OPTIONS.some(([value]) => value === sort) ? sort : 'relevance_desc';
         if (next === state.resourceSort) return;
         state.resourceSort = next;
         // 先对现有结果即时重排，再重新请求第一页。服务端会按排序模式执行
         // 每站点结果截断；仅做本地排序会永久遗漏截断前未进入当前页的候选。
-        renderResourceResultsList(true);
+        renderResourceResultsList();
         syncResourceControls();
         const context = state.resourceSearchContext;
         if (!context) return;
@@ -2934,6 +2934,7 @@
         sort.className = 'form-select discovery-resource-sort';
         sort.setAttribute('data-resource-sort', '');
         sort.setAttribute('aria-label', '资源排序');
+        sort.title = '优先展示作品与年份匹配的结果；所选排序在同一匹配级别内生效。源站原始顺序除外。';
         RESOURCE_SORT_OPTIONS.forEach(([value, label]) => {
             const option = document.createElement('option');
             option.value = value;
@@ -3122,7 +3123,7 @@
             const currentPagination = panel.querySelector('[data-resource-pagination]');
             if (currentPagination) currentPagination.hidden = !state.resourceHasMore;
             list.querySelector('[data-resource-filter-empty]')?.remove();
-            renderResourceResultsList(firstSnapshot && !terminalNoFreshResults, !firstSnapshot || terminalNoFreshResults, changedIds);
+            renderResourceResultsList(changedIds);
             if (terminalNoFreshResults) {
                 const incomplete = ['partial', 'error'].includes(state.resourceSearchProgress?.phase);
                 renderResourceNotice({
@@ -3156,7 +3157,7 @@
                 };
                 updateResourceSiteStatuses(panel);
                 if (resultCount || initialized) {
-                    renderResourceResultsList(false, true);
+                    renderResourceResultsList();
                     renderResourceNotice({
                         type: 'warning',
                         message: `综合检索已终止：${error.message || '本次搜索未完成'}${error.code ? `（${error.code}）` : ''}；已保留 ${resultCount} 条已显示结果`,
@@ -3204,7 +3205,7 @@
                 return false;
             }
             if (resultCount || initialized) {
-                renderResourceResultsList(false, true);
+                renderResourceResultsList();
                 renderResourceNotice({
                     type: resultCount ? 'warning' : 'error',
                     message: `搜索连接中断，本次搜索未完成；已保留 ${resultCount} 条结果`,

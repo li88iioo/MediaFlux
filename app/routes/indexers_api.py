@@ -17,6 +17,7 @@ from app.indexers.errors import (
     IndexerValidationError,
 )
 from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
+from app.indexers.ranking import match_priority
 from app.indexers.release import parse_indexer_release_position
 from app.indexers.runtime import get_indexer_service
 from app.indexers.downloads import (
@@ -86,6 +87,7 @@ def _public_source_url(service, item) -> str | None:
 def _public_search_item(item, service=None) -> dict[str, Any]:
     payload = item.to_public_dict()
     payload["source_url"] = _public_source_url(service, item)
+    payload["match_priority"] = match_priority(item)
     payload.update(parse_indexer_release_position(item.title))
     return payload
 

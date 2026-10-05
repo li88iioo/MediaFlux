@@ -263,6 +263,34 @@ class IndexerProgressBrowserTests(unittest.TestCase):
         self.assertTrue(page.evaluate("document.activeElement === window.__focusedCheckbox"))
         self.assertTrue(checkbox.is_checked())
 
+    def test_late_correct_match_sorts_before_noise_without_losing_selection_or_focus(self):
+        page = self.open_profile()
+        self.assertEqual(page.locator("[data-resource-sort]").input_value(), "relevance_desc")
+        statuses = [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]
+        noise = [{"result_id": f"noise-{i}", "site_id": "alpha", "title": f"无关作品{i}",
+                  "match_priority": 3, "relevance_score": 95, "published_at": "2026-10-05T00:00:00Z"}
+                 for i in range(10)]
+        self.push_event(page, 0, "progress", self.progress_payload(noise, statuses))
+        selected = page.locator("[data-resource-result-id='noise-0'] .discovery-resource-select")
+        selected.wait_for()
+        selected.check()
+        selected.focus()
+        page.evaluate("window.__selectedRow = document.activeElement.closest('[data-resource-result-id]'); window.__selectedTop = window.__selectedRow.getBoundingClientRect().top")
+        correct = {"result_id": "correct", "site_id": "alpha", "title": "起义.2026.1080p", "match_priority": 0,
+                   "relevance_score": 83, "published_at": "2026-01-01T00:00:00Z"}
+        self.push_event(page, 0, "complete", self.progress_payload([*noise, correct], statuses, complete=True))
+        page.wait_for_function("window.__readerCancelCalls.includes(0)")
+        self.assertEqual(page.locator("[data-resource-result-id]").first.get_attribute("data-resource-result-id"), "correct")
+        self.assertTrue(selected.is_checked())
+        self.assertTrue(page.evaluate("document.activeElement.closest('[data-resource-result-id]') === window.__selectedRow"))
+        self.assertLessEqual(abs(page.evaluate("window.__selectedRow.getBoundingClientRect().top - window.__selectedTop")), 1)
+        page.locator("[data-resource-sort]").select_option("published_desc")
+        page.wait_for_function("window.__resourceSearchRequests.length === 2")
+        self.push_event(page, 1, "complete", self.progress_payload([*noise, correct], statuses, complete=True))
+        page.wait_for_function("window.__readerCancelCalls.includes(1)")
+        self.assertEqual(page.locator("[data-resource-result-id]").first.get_attribute("data-resource-result-id"), "correct")
+        self.assertEqual(page.locator("[data-resource-result-id]").count(), 11)
+
     def test_completion_count_includes_retained_earlier_candidates(self):
         page = self.open_profile()
         statuses = [{"site_id": "alpha", "site_name": "Alpha", "status": "success"}]

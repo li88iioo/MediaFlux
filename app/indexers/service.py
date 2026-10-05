@@ -33,7 +33,7 @@ from .models import (
 from .providers.base import magnet_infohash
 from .providers.base import page_observer
 from .query_plan import build_site_queries
-from .ranking import annotate_clusters, rank_item
+from .ranking import annotate_clusters, match_priority, rank_item
 from .registry import IndexerRegistry
 from .release import parse_indexer_release_position
 from .result_store import IndexerResultStore
@@ -845,10 +845,11 @@ class IndexerService:
             position_priority = 4
         else:
             position_priority = 3
+        identity = () if sort_mode == "source_order" else (match_priority(item),)
         stable = (-relevance, -seeders, -published_value, site_index, provider_index)
         if sort_mode == "published_desc":
             return (
-                position_priority,
+                position_priority, *identity,
                 -published_value,
                 -relevance,
                 -seeders,
@@ -857,7 +858,7 @@ class IndexerService:
             )
         if sort_mode == "episode_desc":
             return (
-                position_priority,
+                position_priority, *identity,
                 -(season if season is not None else -1),
                 -(episode_end if episode_end is not None else -1),
                 -(episode if episode is not None else -1),
@@ -865,7 +866,7 @@ class IndexerService:
             )
         if sort_mode == "seeders_desc":
             return (
-                position_priority,
+                position_priority, *identity,
                 -seeders,
                 -relevance,
                 -published_value,
@@ -874,19 +875,19 @@ class IndexerService:
             )
         if sort_mode == "size_desc":
             return (
-                position_priority,
+                position_priority, *identity,
                 size is None,
                 -(size if size is not None else 0),
                 *stable,
             )
         if sort_mode == "size_asc":
             return (
-                position_priority,
+                position_priority, *identity,
                 size is None,
                 size if size is not None else 0,
                 *stable,
             )
-        return (position_priority, *stable)
+        return (position_priority, *identity, *stable)
 
     async def _search_site_plan(
         self,

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 
 from app.indexers.models import IndexerItem, IndexerMediaSearchRequest
-from app.indexers.ranking import annotate_clusters, rank_item
+from app.indexers.ranking import annotate_clusters, match_priority, rank_item
 
 
 class IndexerRankingTests(unittest.TestCase):
@@ -18,6 +18,21 @@ class IndexerRankingTests(unittest.TestCase):
             download_kinds=("torrent",),
             published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         )
+
+    def test_match_priority_separates_identity_from_popularity_and_year_conflicts(self):
+        media = IndexerMediaSearchRequest.create(title="起义", original_title="The Uprising", year=2026)
+        cases = [
+            ("起义.2026.1080p", 0),
+            ("The.Uprising.2026.1080p", 0),
+            ("起义.1080p", 1),
+            ("起义.2024.1080p", 3),
+            ("二二八起义.2026.1080p", 3),
+            ("Pacific.Rim.Uprising.2018.2160p", 3),
+        ]
+        for title, expected in cases:
+            with self.subTest(title=title):
+                candidate = rank_item(self._item(title), media=media, fallback_query="起义")
+                self.assertEqual(match_priority(candidate), expected)
 
     def test_short_cjk_title_requires_a_title_boundary(self):
         media = IndexerMediaSearchRequest.create(

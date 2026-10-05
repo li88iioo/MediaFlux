@@ -404,7 +404,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "const RESOURCE_SORT_OPTIONS",
             "['published_desc', '发布时间：新到旧']",
             "['relevance_desc', '综合匹配：高到低']",
-            "resourceSort: 'published_desc'",
+            "resourceSort: 'relevance_desc'",
             "['episode_desc', '季集号：高到低']",
             "function compareResourceEpisode",
             "function compareResourceResults",

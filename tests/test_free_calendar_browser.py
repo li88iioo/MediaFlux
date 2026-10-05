@@ -923,7 +923,7 @@ class FreeCalendarBrowserTests(unittest.TestCase):
                             self.assertEqual(call['headers']['x-csrf-token'], 'fixture-csrf-token')
                             self.assertEqual(call['body'], {
                                 'title': title, 'original_title': '', 'english_title': '', 'aliases': [],
-                                'year': '2026', 'media_type': 'tv', 'sort_mode': 'published_desc', 'page': 1,
+                                'year': '2026', 'media_type': 'tv', 'sort_mode': 'relevance_desc', 'page': 1,
                             })
                         else:
                             page.locator('.discovery-detail-layout').wait_for()
