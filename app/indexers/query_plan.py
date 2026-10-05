@@ -119,6 +119,10 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
     original = request.original_title
     english = request.english_title
 
+    if site_id == "kpkuang":
+        # 目录索引按完整作品名称检索；年份/季集交由共享候选排序核对。
+        return _unique((title, original, english, *aliases))
+
     if site_id in {"dygang", "ys5266"}:
         # 搜索的是作品目录，季集在详情资源中排序；不把SxxExx拼进片名。
         supported = []

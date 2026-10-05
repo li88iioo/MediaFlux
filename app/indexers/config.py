@@ -11,12 +11,13 @@ INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("aipan", "爱盼"),
     ("dygang", "电影港"),
     ("ys5266", "5266影视"),
+    ("kpkuang", "看片狂人"),
     ("tpb", "The Pirate Bay"),
     ("sukebei", "Sukebei"),
 )
 INDEXER_SITE_ORDER = tuple(site_id for site_id, _label in INDEXER_SITE_DEFINITIONS)
 INDEXER_SITE_LABELS = dict(INDEXER_SITE_DEFINITIONS)
-AGENT_ONLY_INDEXER_SITE_IDS = frozenset({"aipan", "dygang", "ys5266"})
+AGENT_ONLY_INDEXER_SITE_IDS = frozenset({"aipan", "dygang", "ys5266", "kpkuang"})
 SENSITIVE_INDEXER_SITE_IDS = frozenset({"sukebei"})
 MANUAL_INDEXER_SITE_ORDER = tuple(
     site_id for site_id in INDEXER_SITE_ORDER

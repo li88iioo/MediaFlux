@@ -7,6 +7,7 @@ from .providers.base import IndexerAdapter
 from .providers.btbtla import BTBtlaAdapter
 from .providers.aipan import AipanAdapter
 from .providers.empire import EmpireAdapter
+from .providers.kpkuang import KPkuangAdapter, KPKUANG_HOST_CONFIG, MAX_RESPONSE_BYTES as KPKUANG_MAX_BYTES
 from .providers.mikan import MikanAdapter
 from .providers.nyaa import NyaaAdapter
 from .providers.piratebay import PirateBayAdapter
@@ -88,6 +89,10 @@ def build_default_registry(
     ys5266_http = supplied.get("ys5266") or FixedHostHttpClient(
         allowed_hosts={"www.5266ys.net"}, user_agent=user_agent, pin_resolved_address=True,
     )
+    kpkuang_http = supplied.get("kpkuang") or FixedHostHttpClient(
+        allowed_hosts=KPKUANG_HOST_CONFIG["allowed_hosts"],
+        user_agent=user_agent, pin_resolved_address=True, max_response_bytes=KPKUANG_MAX_BYTES,
+    )
     return IndexerRegistry(
         {
             "nyaa": NyaaAdapter(
@@ -126,6 +131,7 @@ def build_default_registry(
                 base_url="https://www.5266ys.net/",
                 http=ys5266_http,
             ),
+            "kpkuang": KPkuangAdapter(http=kpkuang_http),
             "tpb": PirateBayAdapter(
                 http=tpb_http,
                 min_interval_seconds=tpb_min_interval_seconds,

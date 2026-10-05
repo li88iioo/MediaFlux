@@ -1012,7 +1012,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         }
         registry = build_default_registry(http_clients=clients)
 
-        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb"))
+        self.assertEqual(registry.ids(), ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "kpkuang", "tpb"))
         self.assertTrue(registry.get("nyaa").default_enabled)
         self.assertFalse(registry.get("sukebei").default_enabled)
         self.assertTrue(registry.get("sukebei").capabilities.pagination_supported)

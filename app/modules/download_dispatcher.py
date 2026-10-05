@@ -1436,7 +1436,7 @@ def _public_magnet_title(row) -> str | None:
     if (row["kind"] != "magnet" or namespace not in {"indexer", "agent"}
             or site not in {
                 "nyaa", "sukebei", "mikan", "tpb", "btbtla",
-                "aipan", "dygang", "ys5266",
+                "aipan", "dygang", "ys5266", "kpkuang",
             }
             or row["torrent_data"]):
         return None
