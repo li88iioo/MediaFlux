@@ -23,7 +23,6 @@ from app.indexers.config import (
     INDEXER_SITE_CONFIG_VERSION,
     INDEXER_SITE_CONFIG_VERSION_KEY,
     build_indexer_site_updates,
-    expand_legacy_indexer_site_ids,
     normalize_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
@@ -66,22 +65,13 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
         with self.assertRaises(AgentToolError):
             indexer_sites_arguments({"site_ids": ["1lou"]})
 
-    def test_legacy_bundle_expands_only_without_the_explicit_v2_marker(self):
-        old_sites = normalize_persisted_indexer_site_ids("nyaa,btbtla,tpb")
-        self.assertEqual(
-            expand_legacy_indexer_site_ids(old_sites),
-            ("nyaa", "btbtla", "aipan", "dygang", "ys5266", "tpb"),
-        )
-        self.assertEqual(
-            expand_legacy_indexer_site_ids(old_sites, format_version="2"),
-            ("nyaa", "btbtla", "tpb"),
-        )
-        self.assertEqual(
-            expand_legacy_indexer_site_ids(old_sites, format_version="3"),
-            ("nyaa", "btbtla", "tpb"),
-        )
+    def test_persisted_agent_only_sites_are_not_manual_options(self):
+        self.assertEqual(normalize_persisted_indexer_site_ids("nyaa,btbtla,aipan,dygang,ys5266,tpb"), ("nyaa", "btbtla", "tpb"))
+        for site in ("aipan", "dygang", "ys5266"):
+            with self.subTest(site=site), self.assertRaises(ValueError):
+                normalize_indexer_site_ids([site])
 
-    def test_agent_current_site_projection_obeys_the_format_marker(self):
+    def test_manual_config_projection_does_not_expand_agent_sources(self):
         values = {
             "INDEXER_ENABLED_SITES": "nyaa,btbtla,tpb",
             "INDEXER_SITE_CONFIG_VERSION": "",
@@ -94,14 +84,14 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
         ):
             self.assertEqual(
                 current_indexer_site_ids(),
-                ("nyaa", "btbtla", "aipan", "dygang", "ys5266", "tpb"),
+                ("nyaa", "btbtla", "tpb"),
             )
             values["INDEXER_SITE_CONFIG_VERSION"] = "2"
             self.assertEqual(
                 current_indexer_site_ids(), ("nyaa", "btbtla", "tpb")
             )
 
-    def test_settings_projection_preserves_legacy_enabled_children_until_saved(self):
+    def test_settings_projection_removes_agent_sources_from_old_manual_settings(self):
         persisted = {"INDEXER_ENABLED_SITES": "nyaa,mikan,btbtla,tpb"}
         format_version = [""]
 
@@ -121,7 +111,7 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
 
         self.assertEqual(
             old_settings["INDEXER_ENABLED_SITES"],
-            "nyaa,mikan,btbtla,aipan,dygang,ys5266,tpb",
+            "nyaa,mikan,btbtla,tpb",
         )
         self.assertEqual(
             new_settings["INDEXER_ENABLED_SITES"], "nyaa,mikan,btbtla,tpb"
@@ -301,7 +291,7 @@ class IndexerSiteConfigUnitTests(unittest.TestCase):
                 b"persisted",
                 {
                     "INDEXER_ENABLED_SITES": "nyaa,tpb",
-                    "INDEXER_SITE_CONFIG_VERSION": "2",
+                    "INDEXER_SITE_CONFIG_VERSION": INDEXER_SITE_CONFIG_VERSION,
                     "INDEXER_SUKEBEI_ENABLED": "0",
                     "INDEXER_SEARCH_ENABLED": "1",
                 },

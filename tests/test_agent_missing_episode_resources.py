@@ -95,6 +95,7 @@ def _search_result(*, ok=True, status="success", query="示例剧 S02E03", items
 class MissingEpisodeResourceToolTests(unittest.TestCase):
     def setUp(self):
         enabled_service = Mock(enabled_site_ids=("nyaa",))
+        enabled_service.site_ids_for_scope.return_value = ("nyaa",)
         get_bool_patch = patch(
             "app.agent.indexer_actions.config.get_bool", return_value=True
         )
@@ -144,6 +145,7 @@ class MissingEpisodeResourceToolTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
                 missing_episode_resource_arguments(arguments)
         service = Mock(enabled_site_ids=("nyaa",))
+        service.site_ids_for_scope.return_value = ("nyaa",)
         with (
             patch("app.agent.indexer_actions.config.get_bool", return_value=True),
             patch(
@@ -204,6 +206,7 @@ class MissingEpisodeResourceToolTests(unittest.TestCase):
             with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
                 missing_season_resource_arguments(arguments)
         service = Mock(enabled_site_ids=("nyaa",))
+        service.site_ids_for_scope.return_value = ("nyaa",)
         with (
             patch("app.agent.indexer_actions.config.get_bool", return_value=True),
             patch(
@@ -244,6 +247,7 @@ class MissingEpisodeResourceToolTests(unittest.TestCase):
         )
         searched = _search_result()
         service = Mock(enabled_site_ids=("nyaa",))
+        service.site_ids_for_scope.return_value = ("nyaa",)
         with (
             patch(
                 "app.agent.episode_resource_actions.audit_series_episodes",

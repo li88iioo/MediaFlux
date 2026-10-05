@@ -47,7 +47,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "sukebei"}))
 
-    def test_legacy_sukebei_switch_survives_combined_site_migration(self):
+    def test_explicit_sukebei_authorization_survives_manual_site_normalization(self):
         registry = FakeRegistry()
 
         def get_value(key, default=""):
@@ -72,7 +72,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.enabled_site_ids,
-            frozenset({"btbtla", "aipan", "dygang", "ys5266", "sukebei"}),
+            frozenset({"btbtla", "sukebei"}),
         )
 
     def test_build_service_passes_configured_user_agent_to_registry(self):
@@ -121,10 +121,10 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.enabled_site_ids,
-            frozenset({"nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb"}),
+            frozenset({"nyaa", "mikan", "btbtla", "tpb"}),
         )
 
-    def test_unversioned_combined_selection_expands_only_legacy_btbtla(self):
+    def test_unversioned_combined_selection_does_not_expand_btbtla(self):
         registry = FakeRegistry()
 
         def get_value(key, default=""):
@@ -144,10 +144,10 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             service.enabled_site_ids,
-            frozenset({"nyaa", "btbtla", "aipan", "dygang", "ys5266", "tpb"}),
+            frozenset({"nyaa", "btbtla", "tpb"}),
         )
 
-    def test_versioned_site_selection_keeps_disabled_legacy_children_disabled(self):
+    def test_persisted_agent_only_ids_never_enter_manual_enabled_set(self):
         registry = FakeRegistry()
 
         def get_value(key, default=""):
@@ -165,7 +165,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         ):
             service = runtime.build_indexer_service()
 
-        self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "btbtla", "ys5266"}))
+        self.assertEqual(service.enabled_site_ids, frozenset({"nyaa", "btbtla"}))
 
     def test_default_registry_registers_each_former_combined_source_independently(self):
         from types import SimpleNamespace

@@ -15,9 +15,8 @@ from app.agent.models import Evidence, ToolResult
 from app.defaults import DEFAULT_DISCOVERY_ENABLED, DEFAULT_INDEXER_SEARCH_ENABLED
 from app.indexers.config import (
     DEFAULT_INDEXER_SITE_IDS,
-    INDEXER_SITE_CONFIG_VERSION_KEY,
-    INDEXER_SITE_ORDER,
-    expand_legacy_indexer_site_ids,
+    MANUAL_INDEXER_SITE_ORDER,
+    normalize_persisted_indexer_site_ids,
 )
 from app.logger import get_logger
 
@@ -100,7 +99,7 @@ _FEATURES: dict[str, FeatureDefinition] = {
         effect_note="仅影响后续复核结果通知，不会启动、暂停或删除下载任务",
     ),
 }
-_INDEXER_SITE_IDS = frozenset(INDEXER_SITE_ORDER)
+_INDEXER_SITE_IDS = frozenset(MANUAL_INDEXER_SITE_ORDER)
 _ALLOWED_ARGUMENTS = {"feature", "enabled"}
 
 
@@ -138,18 +137,17 @@ def _enabled_sites() -> tuple[str, ...]:
         "INDEXER_ENABLED_SITES",
         ",".join(DEFAULT_INDEXER_SITE_IDS),
     )
-    known = {
-        part.strip().lower()
-        for part in str(configured or "").split(",")
-        if part.strip().lower() in _INDEXER_SITE_IDS
-    }
-    requested = set(expand_legacy_indexer_site_ids(
-        known,
-        format_version=config.get(INDEXER_SITE_CONFIG_VERSION_KEY),
-    ))
+    try:
+        requested = set(normalize_persisted_indexer_site_ids(configured))
+    except ValueError:
+        requested = {
+            part.strip().lower()
+            for part in str(configured or "").split(",")
+            if part.strip().lower() in _INDEXER_SITE_IDS
+        }
     if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
         requested.add("sukebei")
-    return tuple(sorted(requested & _INDEXER_SITE_IDS))
+    return tuple(site_id for site_id in MANUAL_INDEXER_SITE_ORDER if site_id in requested)
 
 
 def summarize_feature_states(_arguments: dict[str, Any]) -> ToolResult:

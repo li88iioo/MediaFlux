@@ -107,16 +107,16 @@ def normalize_search_sites(raw_sites: Any) -> list[str]:
 
 
 def validate_enabled_search_sites(sites: list[str]) -> None:
-    """在访问上游前确认指定站点属于当前启用集合。"""
+    """在访问上游前确认指定站点属于 Agent 当前允许集合。"""
     if not sites or not config.get_bool("INDEXER_SEARCH_ENABLED"):
         return
     service = get_indexer_service()
-    enabled = set(getattr(service, "enabled_site_ids", ()))
+    enabled = set(service.site_ids_for_scope("agent"))
     invalid = [site_id for site_id in sites if site_id not in enabled]
     if invalid:
         if invalid == ["sukebei"]:
             raise AgentToolError(
-                "Sukebei 尚未启用；只需单独启用 Sukebei，无需启用其他索引站",
+                "Sukebei 尚未显式授权；请单独授权成人来源后重试",
                 code="precondition_failed",
             )
         raise AgentToolError(f"站点未启用或不存在：{', '.join(invalid)}")
@@ -307,7 +307,9 @@ def search_resources(
         sort_mode=arguments.get("sort_mode", "relevance_desc"),
     )
     service = get_indexer_service()
-    search_awaitable = service.search_media(request, arguments["sites"] or None)
+    search_awaitable = service.search_media(
+        request, arguments["sites"] or None, scope="agent"
+    )
     bounded_timeout = None if timeout_seconds is None else float(timeout_seconds)
     try:
         result = run_indexer_awaitable_sync(
@@ -421,7 +423,7 @@ def download_target_readiness(target: str) -> dict[str, bool]:
 
 def _stored_resource(arguments: dict[str, str], *, service: Any | None = None):
     service = service or get_indexer_service()
-    item = service.result_store.get(arguments["result_id"])
+    item = service.get_result(arguments["result_id"], scope="agent")
     if item.site_id == "btbtla":
         try:
             detail_host = (urlsplit(str(item.detail_url or "")).hostname or "").lower().rstrip(".")
@@ -432,12 +434,6 @@ def _stored_resource(arguments: dict[str, str], *, service: Any | None = None):
                 "legacy combined-site result cannot be rebound to an independent site",
                 public_message="资源站点已拆分，旧资源确认已过期，请重新搜索后确认。",
             )
-    enabled = set(getattr(service, "enabled_site_ids", ()))
-    if item.site_id not in enabled:
-        raise IndexerValidationError(
-            "stored result provider is disabled",
-            public_message="资源来源当前未启用",
-        )
     if item.download_state not in {"ready", "resolvable"} or not item.download_kinds:
         raise IndexerValidationError(
             "stored result is not downloadable", public_message="该资源当前不可下载"
@@ -592,6 +588,7 @@ def _submit_resource(
                 arguments["result_id"],
                 arguments["target"],
                 origin_namespace="agent",
+                scope="agent",
             )
         )
     except IndexerError as exc:
@@ -858,6 +855,7 @@ def _submit_resource_batch(
                         result_id,
                         arguments["target"],
                         origin_namespace="agent",
+                        scope="agent",
                     )
                     for result_id in arguments["result_ids"]
                 )

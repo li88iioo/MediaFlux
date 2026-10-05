@@ -48,7 +48,10 @@ class FixtureIndexer:
         self.items = {}
         self.result_store = Mock(get=lambda result_id: self.items[result_id])
 
-    async def search_media(self, request, sites=None):
+    def site_ids_for_scope(self, scope="manual"):
+        return tuple(self.enabled_site_ids)
+
+    async def search_media(self, request, sites=None, *, scope="manual"):
         label = (
             f"S{request.season:02d}E{request.episode:02d}"
             if request.season is not None and request.episode is not None

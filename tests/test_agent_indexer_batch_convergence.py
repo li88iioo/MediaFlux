@@ -46,7 +46,7 @@ class BatchConvergenceTests(unittest.TestCase):
             )
             self.assertTrue(existing["created"])
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             resolved_ids.append(result_id)
             if result_id == ALIAS:
                 self.assertTrue(await asyncio.to_thread(started.wait, 5), "实际后端未并发开始")
@@ -54,6 +54,7 @@ class BatchConvergenceTests(unittest.TestCase):
 
         service = SimpleNamespace(
             result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
+            get_result=lambda _id, **_kwargs: SimpleNamespace(site_id="nyaa", title="索引结果"),
             resolve=resolve,
         )
 
@@ -159,11 +160,12 @@ class BatchConvergenceTests(unittest.TestCase):
         )
         self.assertTrue(db.claim_download_request(existing["id"], "guangya"))
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             return ResolvedDownload("magnet", MAGNET if result_id == ALIAS else MAGNET.replace("a" * 40, "b" * 40))
 
         service = SimpleNamespace(
-            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")), resolve=resolve
+            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
+            get_result=lambda _id, **_kwargs: SimpleNamespace(site_id="nyaa", title="索引结果"), resolve=resolve
         )
         with patch.object(dispatcher, "_submit_guangya", return_value={"ok": True}) as remote:
             result = indexer_actions._submit_resource_batch(
@@ -186,11 +188,12 @@ class BatchConvergenceTests(unittest.TestCase):
         )
         self.assertTrue(db.claim_download_request(existing["id"], "guangya"))
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             return ResolvedDownload("magnet", MAGNET)
 
         service = SimpleNamespace(
             result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
+            get_result=lambda _id, **_kwargs: SimpleNamespace(site_id="nyaa", title="索引结果"),
             resolve=resolve,
         )
 
@@ -221,13 +224,14 @@ class BatchConvergenceTests(unittest.TestCase):
     def test_independent_downloads_still_submit_concurrently(self):
         remote_barrier = threading.Barrier(2)
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             return ResolvedDownload(
                 "magnet", MAGNET if result_id == FIRST else MAGNET.replace("a" * 40, "b" * 40)
             )
 
         service = SimpleNamespace(
             result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
+            get_result=lambda _id, **_kwargs: SimpleNamespace(site_id="nyaa", title="索引结果"),
             resolve=resolve,
         )
 

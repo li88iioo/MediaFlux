@@ -15,10 +15,9 @@ from app.agent.models import Evidence, ToolResult
 from app.indexers.config import (
     DEFAULT_INDEXER_SITE_IDS,
     INDEXER_SITE_LABELS,
-    INDEXER_SITE_ORDER,
+    MANUAL_INDEXER_SITE_ORDER,
     INDEXER_SITE_CONFIG_VERSION_KEY,
     build_indexer_site_updates,
-    expand_legacy_indexer_site_ids,
     normalize_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
@@ -58,7 +57,7 @@ def indexer_sites_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     raw_site_ids = arguments["site_ids"]
     if not isinstance(raw_site_ids, list):
         raise AgentToolError("site_ids 必须是字符串数组")
-    if len(raw_site_ids) > len(INDEXER_SITE_ORDER):
+    if len(raw_site_ids) > len(MANUAL_INDEXER_SITE_ORDER):
         raise AgentToolError("资源站点数量超出允许范围")
     try:
         site_ids = normalize_indexer_site_ids(raw_site_ids)
@@ -90,29 +89,22 @@ def current_indexer_site_ids(*, strict: bool = False) -> tuple[str, ...]:
         ",".join(DEFAULT_INDEXER_SITE_IDS),
     )
     raw = str(configured or "")
-    format_version = config.get(INDEXER_SITE_CONFIG_VERSION_KEY)
     try:
-        requested = set(expand_legacy_indexer_site_ids(
-            normalize_persisted_indexer_site_ids(raw),
-            format_version=format_version,
-        ))
+        requested = set(normalize_persisted_indexer_site_ids(raw))
     except ValueError as exc:
         if strict:
             raise AgentToolError(
                 "当前资源站点配置包含未知或无效项，请先在设置页修复",
                 code="precondition_failed",
             ) from exc
-        requested = set(expand_legacy_indexer_site_ids(
-            (
-                part.strip().lower()
-                for part in raw.split(",")
-                if part.strip().lower() in INDEXER_SITE_ORDER
-            ),
-            format_version=format_version,
-        ))
+        requested = {
+            part.strip().lower()
+            for part in raw.split(",")
+            if part.strip().lower() in MANUAL_INDEXER_SITE_ORDER
+        }
     if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
         requested.add("sukebei")
-    return tuple(site_id for site_id in INDEXER_SITE_ORDER if site_id in requested)
+    return tuple(site_id for site_id in MANUAL_INDEXER_SITE_ORDER if site_id in requested)
 
 
 def _site_projection(site_ids: tuple[str, ...] | list[str]) -> list[dict[str, str]]:

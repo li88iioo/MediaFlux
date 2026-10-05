@@ -10,6 +10,7 @@ from typing import Any
 from app import config
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.indexers.config import INDEXER_SITE_LABELS
 from app.indexers.runtime import get_indexer_service
 from app.logger import get_logger
 
@@ -102,7 +103,7 @@ def diagnose_indexer_readiness(_arguments: dict[str, Any]) -> ToolResult:
         service = get_indexer_service()
         registry = service.registry
         registered_ids = tuple(registry.ids())
-        enabled_ids = set(service.enabled_site_ids)
+        enabled_ids = set(service.site_ids_for_scope("agent"))
     except Exception as exc:
         logger.warning("Agent 索引器就绪诊断读取注册表失败 type=%s", type(exc).__name__)
         return ToolResult(
@@ -146,7 +147,10 @@ def diagnose_indexer_readiness(_arguments: dict[str, Any]) -> ToolResult:
             pagination_supported = bool(
                 getattr(capabilities, "pagination_supported", False)
             )
-            site_name = _safe_label(getattr(adapter, "site_name", ""), fallback=site_id)
+            site_name = _safe_label(
+                INDEXER_SITE_LABELS.get(site_id, getattr(adapter, "site_name", "")),
+                fallback=site_id,
+            )
             search_available = site_enabled
             download_available = site_enabled and bool(kinds)
             if site_enabled:

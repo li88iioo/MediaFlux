@@ -14,8 +14,7 @@ from app.logger import get_logger
 
 from .config import (
     DEFAULT_INDEXER_SITE_IDS,
-    INDEXER_SITE_CONFIG_VERSION_KEY,
-    expand_legacy_indexer_site_ids,
+    normalize_persisted_indexer_site_ids,
 )
 from .registry import build_default_registry
 from .result_store import IndexerResultStore
@@ -427,13 +426,14 @@ def build_indexer_service() -> IndexerService:
         for site_id in raw_sites.split(",")
         if site_id.strip().lower() in registry.ids()
     }
-    configured = list(expand_legacy_indexer_site_ids(
-        known_sites,
-        format_version=config.get(INDEXER_SITE_CONFIG_VERSION_KEY),
-    ))
-    if config.get_bool("INDEXER_SUKEBEI_ENABLED", False) and "sukebei" not in configured:
-        configured.append("sukebei")
+    configured = normalize_persisted_indexer_site_ids(tuple(known_sites))
+    sukebei_authorized = (
+        "sukebei" in configured
+        or config.get_bool("INDEXER_SUKEBEI_ENABLED", False)
+    )
     enabled = [site_id for site_id in configured if site_id in registry.ids()]
+    if sukebei_authorized and "sukebei" in registry.ids():
+        enabled.append("sukebei")
     return IndexerService(
         registry=registry,
         result_store=IndexerResultStore(
@@ -446,6 +446,7 @@ def build_indexer_service() -> IndexerService:
         max_concurrency=_bounded_int("INDEXER_MAX_CONCURRENCY", 5, 1, 10),
         cache_ttl_seconds=cache_ttl_seconds,
         enabled_site_ids=enabled,
+        sukebei_authorized=sukebei_authorized,
     )
 
 

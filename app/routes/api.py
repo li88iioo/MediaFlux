@@ -27,7 +27,6 @@ from app.indexers.config import (
     INDEXER_SITE_CONFIG_VERSION_KEY,
     build_indexer_site_updates,
     encode_indexer_site_ids,
-    expand_legacy_indexer_site_ids,
     normalize_persisted_indexer_site_ids,
 )
 from app.logger import configure_telebot_logging, get_logger
@@ -1040,12 +1039,7 @@ def get_config(request: Request):
         persisted_sites = normalize_persisted_indexer_site_ids(raw_sites)
         if config.get_bool("INDEXER_SUKEBEI_ENABLED", False):
             persisted_sites = (*persisted_sites, "sukebei")
-        items["INDEXER_ENABLED_SITES"] = ",".join(
-            expand_legacy_indexer_site_ids(
-                persisted_sites,
-                format_version=config.get(INDEXER_SITE_CONFIG_VERSION_KEY),
-            )
-        )
+        items["INDEXER_ENABLED_SITES"] = ",".join(persisted_sites)
     except ValueError:
         items["INDEXER_ENABLED_SITES"] = str(raw_sites or "")
     redacted = redact_config(items)

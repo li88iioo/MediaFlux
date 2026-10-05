@@ -35,7 +35,7 @@
             field.addEventListener('change',gate.invalidate);
         });
     }
-    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','aipan','dygang','ys5266','tpb','sukebei'];
+    const INDEXER_SITE_ORDER=['nyaa','mikan','btbtla','tpb','sukebei'];
     const indexerSiteBox=form.querySelector('[data-indexer-site-box]');
     const indexerSiteField=indexerSiteBox?.querySelector('[data-key="INDEXER_ENABLED_SITES"]');
     const indexerSiteInputs=[...(indexerSiteBox?.querySelectorAll('[data-indexer-site]')||[])];

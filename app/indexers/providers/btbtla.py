@@ -52,7 +52,7 @@ class _ResourcePages:
 
 class BTBtlaAdapter(IndexerAdapter):
     site_id = "btbtla"
-    site_name = "BTBtla"
+    site_name = "综合"
     base_url = "https://www.btbtlb.com/"
     mirror_base_urls = ("https://btbtlb.com/",)
     default_enabled = True

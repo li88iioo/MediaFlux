@@ -91,7 +91,7 @@ from app.agent.telegram_test_actions import (
     send_telegram_test_notification_confirmed,
     telegram_test_arguments,
 )
-from app.indexers.config import INDEXER_SITE_ORDER
+from app.indexers.config import MANUAL_INDEXER_SITE_ORDER
 
 from .shared import (
     _no_arguments,
@@ -459,7 +459,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="config.set_indexer_sites",
-            description="预检并在用户确认后更新固定白名单资源站点，不接受配置键、URL、凭据、Cookie 或路径。",
+            description="预检并在用户确认后更新手动搜索站点；普通站点选择不限制Agent来源。enable_search控制全局总开关，Sukebei需明确授权。不接受配置键、URL、凭据、Cookie或路径。",
             risk=RiskLevel.LOW_WRITE,
             parameters={
                 "type": "object",
@@ -468,11 +468,11 @@ def register_specs(
                     "site_ids": {
                         "type": "array",
                         "minItems": 1,
-                        "maxItems": len(INDEXER_SITE_ORDER),
+                        "maxItems": len(MANUAL_INDEXER_SITE_ORDER),
                         "uniqueItems": True,
                         "items": {
                             "type": "string",
-                            "enum": list(INDEXER_SITE_ORDER),
+                            "enum": list(MANUAL_INDEXER_SITE_ORDER),
                         },
                     },
                     "enable_search": {"type": "boolean"},

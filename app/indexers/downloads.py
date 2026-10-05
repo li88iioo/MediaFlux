@@ -77,9 +77,11 @@ def _download_limiter() -> asyncio.Semaphore:
         return limiter
 
 
-async def _resolve(service, result_id: str) -> tuple[Any, ResolvedDownload]:
-    item = service.result_store.get(result_id)
-    resolved = await service.resolve(result_id)
+async def _resolve(
+    service, result_id: str, *, scope: str = "manual"
+) -> tuple[Any, ResolvedDownload]:
+    item = service.get_result(result_id, scope=scope)
+    resolved = await service.resolve(result_id, scope=scope)
     if not isinstance(resolved, ResolvedDownload):
         raise IndexerInvalidResponse("provider returned invalid download")
     return item, resolved
@@ -458,8 +460,9 @@ async def download_indexer_result(
     message_id: str = "",
     admission_id: int | None = None,
     origin_namespace: str = "indexer",
+    scope: str = "manual",
 ) -> dict[str, Any]:
-    """解析一个 opaque 资源站结果并提交到指定目标。"""
+    """按服务端调用入口校验后解析并提交资源结果。"""
     normalized_target = str(target or "").strip().lower()
     if normalized_target not in DOWNLOAD_TARGETS:
         return _failed_download_result(result_id, normalized_target, "下载目标无效")
@@ -468,7 +471,7 @@ async def download_indexer_result(
         raise IndexerValidationError("invalid download origin namespace")
 
     async with _download_limiter():
-        stored, resolved = await _resolve(service, result_id)
+        stored, resolved = await _resolve(service, result_id, scope=scope)
         item = await _resolved_download_input(service, stored, resolved)
         submitted = await asyncio.to_thread(
             submit_download_input,
@@ -519,6 +522,7 @@ async def download_indexer_result_public(
     message_id: str = "",
     admission_id: int | None = None,
     origin_namespace: str = "indexer",
+    scope: str = "manual",
 ) -> dict[str, Any]:
     """返回适合 Web/TG/Agent 展示的稳定错误契约，不泄露上游细节。"""
     try:
@@ -530,6 +534,7 @@ async def download_indexer_result_public(
             user_id=user_id,
             message_id=message_id,
             origin_namespace=origin_namespace,
+            scope=scope,
             **({"admission_id": admission_id} if admission_id is not None else {}),
         )
     except IndexerError as exc:

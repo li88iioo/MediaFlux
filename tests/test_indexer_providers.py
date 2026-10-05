@@ -987,7 +987,7 @@ class IndexerProviderTests(unittest.IsolatedAsyncioTestCase):
         registry = build_default_registry()
 
         btbtla = registry.get("btbtla")
-        self.assertEqual(btbtla.site_name, "BTBtla")
+        self.assertEqual(btbtla.site_name, "综合")
         for site in ("aipan", "dygang", "ys5266"):
             self.assertEqual(registry.get(site).site_id, site)
         self.assertIsInstance(btbtla.http, BrowserImpersonatingHttpClient)

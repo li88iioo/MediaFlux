@@ -6,6 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
 
+from app.indexers.downloads import _resolve
 from app.indexers.errors import (
     IndexerRateLimited,
     IndexerQueryRejected,
@@ -264,7 +265,10 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(has_results=bool(found)):
                 adapter=PartiallyFailingQueryAdapter("dygang", {"Allowed":found}, failing_query="Forbidden", error=IndexerQueryRejected("private fixture detail"))
                 service=self.service([adapter])
-                result=await service.search_media(IndexerMediaSearchRequest.create(title="Forbidden",aliases=["Allowed"]))
+                result=await service.search_media(
+                    IndexerMediaSearchRequest.create(title="Forbidden", aliases=["Allowed"]),
+                    scope="agent",
+                )
                 self.assertEqual(adapter.queries,["Forbidden","Allowed"])
                 self.assertEqual(len(result.items),len(found))
                 self.assertFalse(result.errors)
@@ -276,13 +280,13 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         adapter=FakeAdapter("dygang",error=IndexerQueryRejected("private rejected query"))
         service=self.service([adapter],breaker_failure_threshold=2)
         for query in ("bad-one","bad-two","bad-three"):
-            result=await service.search(query)
+            result=await service.search(query, scope="agent")
             self.assertEqual(result.errors[0].code,"query_rejected")
             self.assertNotIn("private",result.errors[0].message)
         self.assertEqual(adapter.calls,3)
         self.assertNotIn("dygang",service._breaker_states)
         adapter.error=None
-        healthy=await service.search("good")
+        healthy=await service.search("good", scope="agent")
         self.assertFalse(healthy.errors)
         self.assertEqual(adapter.calls,4)
 
@@ -290,8 +294,8 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         blocked=FakeAdapter("dygang",error=IndexerChallengeRequired("raw verification HTML"))
         healthy=FakeAdapter("nyaa",[item("nyaa","Good",magnet=f"magnet:?xt=urn:btih:{HASH}")])
         service=self.service([blocked,healthy])
-        first=await service.search("first")
-        second=await service.search("second")
+        first=await service.search("first", scope="agent")
+        second=await service.search("second", scope="agent")
         self.assertEqual(blocked.calls,1)
         self.assertEqual(healthy.calls,2)
         for result in (first,second):
@@ -310,12 +314,15 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
                         return result
                 adapter=Partial("dygang",{"First":[item("dygang","Unrelated upload",magnet=f"magnet:?xt=urn:btih:{HASH}")]})
                 service=self.service([adapter])
-                result=await service.search_media(IndexerMediaSearchRequest.create(title="First",aliases=["Second"]))
+                result=await service.search_media(
+                    IndexerMediaSearchRequest.create(title="First", aliases=["Second"]),
+                    scope="agent",
+                )
                 self.assertEqual(adapter.queries,["First"])
                 self.assertEqual(len(result.items),1)
                 self.assertTrue(result.partial)
                 self.assertEqual(result.errors[0].site_id,"dygang")
-                second=await service.search("new-query")
+                second=await service.search("new-query", scope="agent")
                 self.assertEqual(second.errors[0].code,code)
                 self.assertEqual(adapter.calls,1)
 
@@ -428,7 +435,10 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
                 adapter = SlowAlias(site, {"Primary": [item(site, "Other name", magnet=f"magnet:?xt=urn:btih:{HASH}")]})
                 service = self.service([adapter], site_timeout_seconds=1, total_timeout_seconds=0.1)
                 with patch.object(service, "_site_plan_quality_satisfied", return_value=False):
-                    result = await service.search_media(IndexerMediaSearchRequest.create(title="Primary", aliases=["Alternate"]))
+                    result = await service.search_media(
+                        IndexerMediaSearchRequest.create(title="Primary", aliases=["Alternate"]),
+                        scope="agent",
+                    )
                 self.assertEqual(len(result.items), 1)
                 self.assertTrue(result.partial)
                 self.assertEqual(result.errors[0].code, "timeout")
@@ -1013,6 +1023,128 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(result.items), 4)
         self.assertEqual(tracker["maximum"], 2)
+
+    async def test_same_sites_and_query_share_cache_across_manual_and_agent_scopes(self):
+        adapter = FakeAdapter(
+            "nyaa", [item("nyaa", "shared", magnet=f"magnet:?xt=urn:btih:{HASH}")]
+        )
+        service = self.service([adapter], enabled_site_ids=("nyaa",))
+
+        manual = await service.search("shared query", 1, ("nyaa",), scope="manual")
+        agent = await service.search("shared query", 1, ("nyaa",), scope="agent")
+
+        self.assertFalse(manual.cached)
+        self.assertTrue(agent.cached)
+        self.assertEqual(adapter.calls, 1)
+        self.assertEqual(manual.items[0].site_id, agent.items[0].site_id)
+
+    async def test_cache_does_not_mix_different_selected_source_ranges(self):
+        nyaa = FakeAdapter("nyaa", [item("nyaa", "manual hit")])
+        aipan = FakeAdapter("aipan", [item("aipan", "agent-only hit")])
+        service = self.service([nyaa, aipan], enabled_site_ids=("nyaa",))
+
+        manual = await service.search("same title")
+        agent = await service.search("same title", scope="agent")
+
+        self.assertEqual(manual.sites_attempted, ("nyaa",))
+        self.assertFalse(agent.cached)
+        self.assertEqual(agent.sites_attempted, ("nyaa", "aipan"))
+        self.assertEqual({row.site_id for row in agent.items}, {"nyaa", "aipan"})
+        self.assertEqual((nyaa.calls, aipan.calls), (2, 1))
+
+    async def test_manual_scope_rejects_agent_only_source_but_agent_scope_can_search_it(self):
+        adapter = FakeAdapter("aipan", [item("aipan", "Agent source")])
+        service = self.service([adapter], enabled_site_ids=("aipan",))
+
+        with self.assertRaises(IndexerValidationError):
+            await service.search("query", 1, ("aipan",), scope="manual")
+        result = await service.search("query", 1, ("aipan",), scope="agent")
+
+        self.assertEqual(result.sites_attempted, ("aipan",))
+        self.assertEqual(adapter.calls, 1)
+
+    async def test_agent_can_use_ordinary_source_when_manual_selection_is_empty(self):
+        adapter = FakeAdapter("nyaa", [item("nyaa", "Ordinary source")])
+        service = self.service([adapter], enabled_site_ids=())
+
+        with self.assertRaises(IndexerValidationError):
+            await service.search("query", 1, ("nyaa",), scope="manual")
+        result = await service.search("query", 1, ("nyaa",), scope="agent")
+
+        self.assertEqual(result.sites_attempted, ("nyaa",))
+        self.assertEqual(adapter.calls, 1)
+
+    async def test_sukebei_requires_explicit_authorization_for_agent_scope(self):
+        adapter = FakeAdapter("sukebei", [item("sukebei", "Adult source")])
+        denied = self.service([adapter], enabled_site_ids=(), sukebei_authorized=False)
+        with self.assertRaises(IndexerValidationError):
+            await denied.search("query", 1, ("sukebei",), scope="agent")
+
+        authorized = self.service(
+            [adapter], enabled_site_ids=(), sukebei_authorized=True
+        )
+        result = await authorized.search("query", 1, ("sukebei",), scope="agent")
+
+        self.assertEqual(result.sites_attempted, ("sukebei",))
+
+    async def test_global_disable_blocks_search_and_existing_result_resolution(self):
+        adapter = FakeAdapter("nyaa")
+        service = self.service([adapter], enabled_site_ids=("nyaa",))
+        stored_id = self.store.put(
+            IndexerItem(
+                site_id="nyaa", site_name="Nyaa", title="Stored",
+                detail_url="https://example.test/resource",
+                download_state="resolvable", download_kinds=("magnet",),
+            )
+        )
+
+        with patch("app.indexers.service.config.get_bool", return_value=False):
+            with self.assertRaises(IndexerValidationError):
+                await service.search("query", scope="agent")
+            with self.assertRaises(IndexerValidationError):
+                service.get_result(stored_id, scope="agent")
+            with self.assertRaises(IndexerValidationError):
+                await service.resolve(stored_id, scope="agent")
+
+        self.assertEqual(adapter.calls, 0)
+        self.assertEqual(adapter.resolve_calls, [])
+
+    async def test_existing_result_resolution_uses_current_scope_not_creation_scope(self):
+        ordinary = FakeAdapter("nyaa")
+        agent_only = FakeAdapter("aipan")
+        service = self.service(
+            [ordinary, agent_only], enabled_site_ids=()
+        )
+        old_manual_result = self.store.put(
+            IndexerItem(
+                site_id="nyaa", site_name="Nyaa", title="Old manual candidate",
+                detail_url="https://example.test/old",
+                download_state="resolvable", download_kinds=("magnet",),
+            )
+        )
+        agent_only_result = self.store.put(
+            IndexerItem(
+                site_id="aipan", site_name="爱盼", title="Agent candidate",
+                detail_url="https://example.test/agent",
+                download_state="resolvable", download_kinds=("magnet",),
+            )
+        )
+
+        stored, resolved = await _resolve(
+            service, old_manual_result, scope="agent"
+        )
+        self.assertEqual(stored.title, "Old manual candidate")
+        self.assertEqual(resolved.kind, "magnet")
+        with self.assertRaises(IndexerSecurityError):
+            await _resolve(service, old_manual_result, scope="manual")
+
+        stored, resolved = await _resolve(
+            service, agent_only_result, scope="agent"
+        )
+        self.assertEqual(stored.site_id, "aipan")
+        self.assertEqual(resolved.kind, "magnet")
+        with self.assertRaises(IndexerSecurityError):
+            await _resolve(service, agent_only_result, scope="manual")
 
     async def test_short_cache_skips_providers_then_expires(self):
         adapter = FakeAdapter("nyaa", [item("nyaa", "one")])

@@ -53,7 +53,7 @@ def register_specs(
         ToolSpec(
             name="indexer.search_resources",
             description=(
-                "在已启用的多站索引中搜索短期资源结果，只返回 opaque result_id 与公开元数据。"
+                "在Agent允许的多站索引中搜索短期资源结果，不受手动页面的普通站点复选框限制；总开关和成人来源授权仍生效。只返回 opaque result_id 与公开元数据。"
                 "sites 可把本次读取严格限制到指定站点且不会修改站点配置；例如 "
                 'sites=["sukebei"] 只查询 Sukebei。需要近期结果时使用 '
                 "sort_mode=published_desc。"

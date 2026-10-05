@@ -17,7 +17,10 @@ from app.indexers.errors import (
     IndexerResultNotFound,
     IndexerValidationError,
 )
-from app.indexers.config import INDEXER_SITE_ORDER
+from app.indexers.config import (
+    INDEXER_SITE_LABELS,
+    MANUAL_INDEXER_SITE_ORDER,
+)
 from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
 from app.indexers.ranking import match_priority
 from app.indexers.release import parse_indexer_release_position
@@ -117,7 +120,7 @@ def _site_payload(service, site_id: str) -> dict[str, Any]:
     adapter = service.registry.get(site_id)
     return {
         "site_id": adapter.site_id,
-        "site_name": adapter.site_name,
+        "site_name": INDEXER_SITE_LABELS.get(site_id, adapter.site_name),
         "enabled": site_id in getattr(service, "enabled_site_ids", frozenset(service.registry.enabled_ids())),
         "pagination_supported": adapter.capabilities.pagination_supported,
         "download_kinds": list(adapter.capabilities.download_kinds),
@@ -140,8 +143,11 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
     enabled_site_ids = getattr(service, "enabled_site_ids", None)
     if enabled_site_ids is None:
         enabled_site_ids = frozenset(service.registry.enabled_ids())
+    registered = set(service.registry.ids())
     payload = []
-    for site_id in service.registry.ids():
+    for site_id in MANUAL_INDEXER_SITE_ORDER:
+        if site_id not in registered:
+            continue
         adapter = service.registry.get(site_id)
         code = None
         retryable = False
@@ -174,7 +180,7 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
         page_state = page_states.get(site_id)
         payload.append({
             "site_id": site_id,
-            "site_name": adapter.site_name,
+            "site_name": INDEXER_SITE_LABELS.get(site_id, adapter.site_name),
             "status": status,
             "count": counts.get(site_id, 0),
             "collected_count": result.site_collected_counts.get(site_id, counts.get(site_id, 0)),
@@ -307,7 +313,7 @@ def sites(request: Request):
     registered = set(service.registry.ids())
     return api_response([
         _site_payload(service, site_id)
-        for site_id in INDEXER_SITE_ORDER
+        for site_id in MANUAL_INDEXER_SITE_ORDER
         if site_id in registered
     ])
 
@@ -329,9 +335,13 @@ async def search(
     site_ids = [value.strip().lower() for value in sites.split(",") if value.strip()] or None
     service = get_indexer_service()
     if "text/event-stream" in request.headers.get("accept", ""):
-        return _stream_response(request, service, lambda observer: service.search(q, page, site_ids, sort_mode=sort, on_progress=observer))
+        return _stream_response(request, service, lambda observer: service.search(
+            q, page, site_ids, scope="manual", sort_mode=sort, on_progress=observer
+        ))
     try:
-        result = await service.search(q, page, site_ids, sort_mode=sort)
+        result = await service.search(
+            q, page, site_ids, scope="manual", sort_mode=sort
+        )
     except IndexerError as exc:
         return _error_response(exc)
     return api_response(_search_payload(service, result))
@@ -344,8 +354,12 @@ async def search_media(request: Request, payload: Any = Body(...)):
         media_request, site_ids = _media_request(payload)
         service = get_indexer_service()
         if "text/event-stream" in request.headers.get("accept", ""):
-            return _stream_response(request, service, lambda observer: service.search_media(media_request, site_ids, on_progress=observer))
-        result = await service.search_media(media_request, site_ids)
+            return _stream_response(request, service, lambda observer: service.search_media(
+                media_request, site_ids, scope="manual", on_progress=observer
+            ))
+        result = await service.search_media(
+            media_request, site_ids, scope="manual"
+        )
     except IndexerError as exc:
         return _error_response(exc)
     return api_response(_search_payload(service, result))
@@ -354,6 +368,9 @@ async def search_media(request: Request, payload: Any = Body(...)):
 def _validate_batch_payload(data: Any) -> tuple[list[str], str]:
     if not isinstance(data, dict):
         raise ValueError("批量下载参数必须是 JSON 对象")
+    unknown = set(data) - {"result_ids", "target"}
+    if unknown:
+        raise ValueError(f"未知批量下载参数: {', '.join(sorted(unknown))}")
     raw_result_ids = data.get("result_ids")
     if not isinstance(raw_result_ids, list) or not raw_result_ids:
         raise ValueError("资源结果 ID 列表无效")
@@ -384,6 +401,9 @@ async def download(request: Request, data: Any = Body(default=None)):
     require_api_login(request)
     if not isinstance(data, dict):
         return api_error("下载参数必须是 JSON 对象", 400)
+    unknown = set(data) - {"result_id", "target"}
+    if unknown:
+        return api_error(f"未知下载参数: {', '.join(sorted(unknown))}", 400)
     result_id = str(data.get("result_id") or "").strip()
     target = str(data.get("target") or "").strip().lower()
     if not result_id or len(result_id) > 128:
@@ -393,7 +413,7 @@ async def download(request: Request, data: Any = Body(default=None)):
 
     service = get_indexer_service()
     try:
-        item = await download_indexer_result(service, result_id, target)
+        item = await download_indexer_result(service, result_id, target, scope="manual")
     except IndexerError as exc:
         return _error_response(exc)
     except _InvalidDownloadData:
@@ -471,7 +491,9 @@ async def batch_download(request: Request, data: Any = Body(default=None)):
     service = get_indexer_service()
 
     async def run(result_id: str) -> dict[str, Any]:
-        return await download_indexer_result_public(service, result_id, target)
+        return await download_indexer_result_public(
+            service, result_id, target, scope="manual"
+        )
 
     items = await asyncio.gather(*(run(result_id) for result_id in result_ids))
     summary = {

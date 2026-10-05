@@ -73,7 +73,16 @@ class FakeIndexerService:
         self.partial = partial
         self.search_calls: list[tuple[object, object]] = []
 
-    async def search_media(self, request, sites=None):
+    def site_ids_for_scope(self, scope="manual"):
+        assert scope == "agent"
+        return tuple(self.enabled_site_ids)
+
+    def get_result(self, result_id, *, scope="manual"):
+        assert scope == "agent"
+        return self.result_store.get(result_id)
+
+    async def search_media(self, request, sites=None, *, scope="manual"):
+        assert scope == "agent"
         self.search_calls.append((request, sites))
         return AggregatedIndexerResult(
             query=request.title,
@@ -96,7 +105,10 @@ class FakeDownloadService:
     def __init__(self, item: IndexerItem):
         self.result_store = FakeResultStore(item)
 
-    async def resolve(self, _result_id: str) -> ResolvedDownload:
+    def get_result(self, result_id, *, scope="manual"):
+        return self.result_store.get(result_id)
+
+    async def resolve(self, _result_id: str, *, scope="manual") -> ResolvedDownload:
         return ResolvedDownload(kind="magnet", value=_SECRET_MAGNET)
 
 
@@ -205,7 +217,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             with self.subTest(payload=payload), self.assertRaises(AgentToolError):
                 search_arguments(payload)
 
-    def test_search_arguments_reject_disabled_site(self):
+    def test_search_arguments_reject_site_absent_from_agent_registry(self):
         service = FakeIndexerService()
         with (
             patch("app.agent.indexer_actions.config.get_bool", return_value=True),
@@ -235,8 +247,8 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             )
 
         self.assertEqual(rejected.exception.code, "precondition_failed")
-        self.assertIn("单独启用 Sukebei", rejected.exception.safe_message)
-        self.assertIn("无需启用其他索引站", rejected.exception.safe_message)
+        self.assertIn("单独授权成人来源", rejected.exception.safe_message)
+        self.assertNotIn("启用所有", rejected.exception.safe_message)
 
     def test_recent_adult_search_is_restricted_to_sukebei_and_sorted_by_date(self):
         item = _resource_item(
@@ -493,7 +505,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
     def test_search_resources_enforces_caller_timeout(self):
         service = FakeIndexerService()
 
-        async def slow_search(_request, _sites=None):
+        async def slow_search(_request, _sites=None, *, scope="agent"):
             await asyncio.sleep(0.05)
             raise AssertionError("timeout should cancel the slow search")
 
@@ -675,7 +687,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertNotIn("private backend error", str(result.to_dict()))
         self.assertNotIn("secret", str(result.to_dict()))
         dispatch.assert_awaited_once_with(
-            service, _RESULT_ID, "both", origin_namespace="agent"
+            service, _RESULT_ID, "both", origin_namespace="agent", scope="agent"
         )
 
     def test_submit_resource_maps_duplicate_failure_and_internal_error(self):

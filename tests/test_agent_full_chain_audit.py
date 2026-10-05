@@ -38,11 +38,11 @@ def isolated_chain():
     ):
         items = {item["result_id"]: SimpleNamespace(**item) for item in _resources().data["items"]}
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             digest = "a" if result_id.endswith("001") else "b"
             return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + digest * 40)
 
-        service = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__), resolve=resolve, enabled_site_ids=("demo",))
+        service = SimpleNamespace(result_store=SimpleNamespace(get=items.__getitem__), get_result=lambda key, **_kw: items[key], resolve=resolve, enabled_site_ids=("demo",))
         with (
             patch.object(indexer_actions.config, "get_bool", return_value=True),
             patch.object(indexer_actions, "get_indexer_service", return_value=service),

@@ -97,11 +97,15 @@ class FakeIndexerService:
         self.search_sort_modes = []
         self.media_search_calls = []
 
-    async def resolve(self, result_id):
+    def get_result(self, result_id, *, scope="manual"):
+        assert scope == "manual"
+        return self.result_store.get(result_id)
+
+    async def resolve(self, result_id, *, scope="manual"):
         item = self.result_store.get(result_id)
         return await self.adapter.resolve(item)
 
-    async def search(self, query, page, site_ids, *, sort_mode="relevance_desc"):
+    async def search(self, query, page, site_ids, *, scope="manual", sort_mode="relevance_desc"):
         self.search_calls.append((query, page, site_ids))
         self.search_sort_modes.append(sort_mode)
         return AggregatedIndexerResult(
@@ -115,7 +119,7 @@ class FakeIndexerService:
             cached=False,
         )
 
-    async def search_media(self, request, site_ids):
+    async def search_media(self, request, site_ids, *, scope="manual"):
         self.media_search_calls.append((request, site_ids))
         return AggregatedIndexerResult(
             query=request.title,
@@ -268,15 +272,15 @@ class IndexerAPITests(unittest.TestCase):
         sites = response.json()
         self.assertEqual(
             [site["site_id"] for site in sites],
-            ["nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb", "sukebei"],
+            ["nyaa", "mikan", "btbtla", "tpb", "sukebei"],
         )
         self.assertEqual(
             [site["site_name"] for site in sites],
-            ["Nyaa", "Mikan", "BTBtla", "爱盼", "电影港", "5266影视", "The Pirate Bay", "Sukebei"],
+            ["Nyaa", "Mikan", "综合", "The Pirate Bay", "Sukebei"],
         )
         self.assertEqual(
             [site["site_id"] for site in sites if site["enabled"]],
-            ["nyaa", "btbtla", "aipan", "ys5266"],
+            ["nyaa", "btbtla"],
         )
 
     def test_real_btbtla_provider_recall_through_keyword_and_media_api(self):
@@ -312,7 +316,7 @@ class IndexerAPITests(unittest.TestCase):
         finally:
             asyncio.run(service.aclose())
 
-    def test_aipan_source_url_survives_real_media_http_response(self):
+    def test_agent_only_source_cannot_be_requested_from_manual_http_api(self):
         import json
         from app.indexers.providers.aipan import AipanAdapter
         from app.indexers.registry import IndexerRegistry
@@ -332,11 +336,8 @@ class IndexerAPITests(unittest.TestCase):
             with patch.object(indexers_api, "get_indexer_service", return_value=service):
                 result = self.client.post("/api/indexers/search", headers=headers,
                     json={"title": "三体", "media_type": "tv", "sites": ["aipan"]})
-            self.assertEqual(result.status_code, 200, result.text)
-            item = result.json()["items"][0]
-            self.assertEqual(item["site_id"], "aipan")
-            self.assertEqual(item["source_url"], "https://www.aipan.me/movie/1")
-            self.assertNotIn("magnet", item)
+            self.assertEqual(result.status_code, 400, result.text)
+            self.assertEqual(http.calls, [])
         finally:
             asyncio.run(service.aclose())
 
@@ -726,19 +727,13 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(payload["items"][0]["title"], "Healthy candidate")
         self.assertTrue(payload["partial"])
         statuses = {row["site_id"]: row for row in payload["site_statuses"]}
-        self.assertEqual(statuses["dygang"]["code"], "query_rejected")
-        rejected_message = statuses["dygang"]["message"]
-        self.assertIn("关键词", rejected_message)
-        self.assertTrue(any(term in rejected_message for term in ("片名", "别名")))
-        self.assertNotIn("缩短", rejected_message)
-        self.assertIs(statuses["dygang"]["retryable"], False)
-        self.assertEqual(statuses["ys5266"]["code"], "challenge_required")
-        self.assertIn("人机验证", statuses["ys5266"]["message"])
-        self.assertIs(statuses["ys5266"]["retryable"], False)
-        self.assertEqual(
-            {row["site_id"] for row in payload["errors"]}, {"dygang", "ys5266"}
-        )
-        self.assertNotIn("btbtla", {row["site_id"] for row in payload["errors"]})
+        self.assertNotIn("dygang", statuses)
+        self.assertNotIn("ys5266", statuses)
+        self.assertEqual(indexers_api._safe_site_error(result.errors[0]), ("query_rejected", rejected.public_message, False))
+        code, message, retryable = indexers_api._safe_site_error(detail_error)
+        self.assertEqual(code, "challenge_required")
+        self.assertIn("人机验证", message)
+        self.assertFalse(retryable)
         self.assertNotIn(private_html, response.text)
 
     def test_search_site_statuses_use_pre_dedupe_item_counts(self):
@@ -1321,7 +1316,7 @@ class IndexerAPITests(unittest.TestCase):
         active = 0
         max_active = 0
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
@@ -1418,7 +1413,7 @@ class IndexerAPITests(unittest.TestCase):
         active = 0
         max_active = 0
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             nonlocal active, max_active
             with state_lock:
                 active += 1

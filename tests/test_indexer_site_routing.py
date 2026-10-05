@@ -63,22 +63,7 @@ class PlanMediaSiteRouteTests(unittest.TestCase):
 
         self.assertEqual(routed, ("btbtla", "tpb"))
 
-    def test_split_legacy_sources_remain_in_automatic_routes_when_enabled(self):
-        sites = (
-            "nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb", "sukebei",
-        )
-        self.assertEqual(
-            plan_media_site_route(sites, is_animation=True, original_language="ja"),
-            ("mikan", "nyaa", "btbtla", "aipan", "dygang", "ys5266"),
-        )
-        self.assertEqual(
-            plan_media_site_route(sites, is_animation=True, original_language="zh"),
-            ("btbtla", "aipan", "dygang", "ys5266", "nyaa"),
-        )
-        self.assertEqual(
-            plan_media_site_route(sites, is_animation=False),
-            ("btbtla", "aipan", "dygang", "ys5266", "tpb"),
-        )
+
 
 
 class TmdbAnimationDetectionTests(unittest.TestCase):
@@ -101,15 +86,18 @@ class TmdbAnimationDetectionTests(unittest.TestCase):
 
 class ServiceMediaSiteRouteTests(unittest.TestCase):
     def test_route_uses_registry_order_and_enabled_subset(self):
-        stub = SimpleNamespace(
-            registry=SimpleNamespace(ids=lambda: ("nyaa", "mikan", "btbtla", "tpb", "sukebei")),
-            enabled_site_ids=frozenset({"nyaa", "tpb", "sukebei"}),
-        )
+        requested_scopes = []
 
+        def allowed_sites(scope):
+            requested_scopes.append(scope)
+            return ("nyaa", "tpb", "sukebei")
+
+        stub = SimpleNamespace(site_ids_for_scope=allowed_sites)
         routed = IndexerService.media_site_route(
             stub, is_animation=False, original_language="zh",
         )
 
+        self.assertEqual(requested_scopes, ["manual"])
         self.assertEqual(routed, ("tpb",))
 
 

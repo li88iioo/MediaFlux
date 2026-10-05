@@ -49,6 +49,10 @@ class _Service:
         self.registry = _Registry(adapters, broken=broken)
         self.enabled_site_ids = frozenset(enabled)
 
+    def site_ids_for_scope(self, scope="manual"):
+        assert scope == "agent"
+        return tuple(self.enabled_site_ids)
+
     async def search(self, *_args, **_kwargs):
         raise AssertionError("readiness diagnosis must not search providers")
 

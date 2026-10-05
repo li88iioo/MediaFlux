@@ -7,7 +7,7 @@ from typing import Any
 INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("nyaa", "Nyaa"),
     ("mikan", "Mikan"),
-    ("btbtla", "BTBtla"),
+    ("btbtla", "综合"),
     ("aipan", "爱盼"),
     ("dygang", "电影港"),
     ("ys5266", "5266影视"),
@@ -16,10 +16,15 @@ INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
 )
 INDEXER_SITE_ORDER = tuple(site_id for site_id, _label in INDEXER_SITE_DEFINITIONS)
 INDEXER_SITE_LABELS = dict(INDEXER_SITE_DEFINITIONS)
-DEFAULT_INDEXER_SITE_IDS = ("nyaa", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb")
+AGENT_ONLY_INDEXER_SITE_IDS = frozenset({"aipan", "dygang", "ys5266"})
+SENSITIVE_INDEXER_SITE_IDS = frozenset({"sukebei"})
+MANUAL_INDEXER_SITE_ORDER = tuple(
+    site_id for site_id in INDEXER_SITE_ORDER
+    if site_id not in AGENT_ONLY_INDEXER_SITE_IDS
+)
+DEFAULT_INDEXER_SITE_IDS = ("nyaa", "mikan", "btbtla", "tpb")
 INDEXER_SITE_CONFIG_VERSION_KEY = "INDEXER_SITE_CONFIG_VERSION"
-INDEXER_SITE_CONFIG_VERSION = "2"
-LEGACY_COMBINED_INDEXER_SITE_IDS = ("aipan", "dygang", "ys5266")
+INDEXER_SITE_CONFIG_VERSION = "3"
 RETIRED_INDEXER_SITE_IDS = frozenset({"animetosho", "1lou"})
 
 
@@ -29,19 +34,11 @@ def normalize_indexer_site_ids(value: Any) -> tuple[str, ...]:
 
 
 def normalize_persisted_indexer_site_ids(value: Any) -> tuple[str, ...]:
-    """读取旧持久化配置时丢弃已下线站点，其他未知项仍严格报错。"""
-    return _normalize_indexer_site_ids(value, ignored=RETIRED_INDEXER_SITE_IDS)
-
-
-def expand_legacy_indexer_site_ids(
-    site_ids: Iterable[str], *, format_version: str = ""
-) -> tuple[str, ...]:
-    """按显式格式标记解释站点列表；仅未迁移的旧 btbtla 才展开子站。"""
-    requested = {str(site_id).strip().lower() for site_id in site_ids if str(site_id).strip()}
-    legacy_format = str(format_version or "").strip() in {"", "1"}
-    if legacy_format and "btbtla" in requested:
-        requested.update(LEGACY_COMBINED_INDEXER_SITE_IDS)
-    return tuple(site_id for site_id in INDEXER_SITE_ORDER if site_id in requested)
+    """读取旧配置时丢弃已下线与已移出手动集合的站点。"""
+    return _normalize_indexer_site_ids(
+        value,
+        ignored=RETIRED_INDEXER_SITE_IDS | AGENT_ONLY_INDEXER_SITE_IDS,
+    )
 
 
 def _normalize_indexer_site_ids(
@@ -55,7 +52,7 @@ def _normalize_indexer_site_ids(
             raise ValueError("INDEXER_ENABLED_SITES 格式无效")
         items: Iterable[Any] = raw.split(",")
     elif isinstance(value, (list, tuple)):
-        if len(value) > (len(INDEXER_SITE_ORDER) + len(ignored)) * 2:
+        if len(value) > (len(MANUAL_INDEXER_SITE_ORDER) + len(ignored)) * 2:
             raise ValueError("资源站点数量超出允许范围")
         items = value
     else:
@@ -72,10 +69,11 @@ def _normalize_indexer_site_ids(
             raise ValueError("资源站点 ID 格式无效")
         requested.add(site_id)
 
-    unknown = sorted(requested - set(INDEXER_SITE_ORDER) - ignored)
+    allowed = set(MANUAL_INDEXER_SITE_ORDER)
+    unknown = sorted(requested - allowed - ignored)
     if unknown:
         raise ValueError(f"未知资源站点: {', '.join(unknown)}")
-    return tuple(site_id for site_id in INDEXER_SITE_ORDER if site_id in requested)
+    return tuple(site_id for site_id in MANUAL_INDEXER_SITE_ORDER if site_id in requested)
 
 
 def encode_indexer_site_ids(value: Any) -> str:
@@ -95,13 +93,13 @@ def build_indexer_site_updates(value: Any) -> dict[str, str]:
 #
 # 对仍可用的站点保留 fail-open 回退；不重新启用已下线或成人站点，
 # 用户在订阅上显式配置的站点列表始终优先于自动路由。
-_ANIME_JA_PREFERRED = ("mikan", "nyaa", "btbtla", "aipan", "dygang", "ys5266")
+_ANIME_JA_PREFERRED = ("mikan", "nyaa", "btbtla")
 _ANIME_JA_DROPPED = frozenset({"tpb"})
 # 国漫主要在中文站；Mikan 只收录日本番组。
-_ANIME_ZH_PREFERRED = ("btbtla", "aipan", "dygang", "ys5266", "nyaa")
+_ANIME_ZH_PREFERRED = ("btbtla", "nyaa")
 _ANIME_ZH_DROPPED = frozenset({"mikan", "tpb"})
 # 真人影视不会出现在动漫专站。
-_LIVE_ACTION_PREFERRED = ("btbtla", "aipan", "dygang", "ys5266", "tpb")
+_LIVE_ACTION_PREFERRED = ("btbtla", "tpb")
 _LIVE_ACTION_DROPPED = frozenset({"mikan", "nyaa"})
 
 

@@ -9,9 +9,14 @@ from datetime import datetime, timedelta, timezone
 from time import perf_counter
 from typing import cast
 
+from app import config
 from app.logger import get_logger
 
-from .config import RETIRED_INDEXER_SITE_IDS
+from .config import (
+    AGENT_ONLY_INDEXER_SITE_IDS,
+    RETIRED_INDEXER_SITE_IDS,
+    SENSITIVE_INDEXER_SITE_IDS,
+)
 from .errors import (
     IndexerError,
     IndexerInvalidResponse,
@@ -88,6 +93,7 @@ class IndexerService:
         breaker_failure_threshold: int = 3,
         breaker_cooldown_seconds: int = 300,
         enabled_site_ids: Iterable[str] | None = None,
+        sukebei_authorized: bool | None = None,
         clock: Callable[[], datetime] | None = None,
     ):
         if site_timeout_seconds <= 0 or total_timeout_seconds <= 0:
@@ -111,12 +117,28 @@ class IndexerService:
         self.max_cache_entries = int(max_cache_entries)
         self.breaker_failure_threshold = int(breaker_failure_threshold)
         self.breaker_cooldown_seconds = int(breaker_cooldown_seconds)
-        enabled = (
+        configured = (
             registry.enabled_ids()
             if enabled_site_ids is None
             else tuple(enabled_site_ids)
         )
-        self.enabled_site_ids = frozenset(enabled)
+        registered = set(registry.ids())
+        configured_ids = {str(site_id).strip().lower() for site_id in configured}
+        self.sukebei_authorized = (
+            "sukebei" in configured_ids
+            if sukebei_authorized is None
+            else bool(sukebei_authorized)
+        )
+        manual = {
+            site_id
+            for site_id in configured_ids & registered
+            if site_id not in AGENT_ONLY_INDEXER_SITE_IDS
+            and site_id not in SENSITIVE_INDEXER_SITE_IDS
+            and site_id not in RETIRED_INDEXER_SITE_IDS
+        }
+        if self.sukebei_authorized and "sukebei" in registered:
+            manual.add("sukebei")
+        self.enabled_site_ids = frozenset(manual)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._cache: OrderedDict[tuple[object, ...], _CacheEntry] = OrderedDict()
         self._cache_lock = threading.RLock()
@@ -142,6 +164,7 @@ class IndexerService:
         page: int = 1,
         site_ids: Iterable[str] | None = None,
         *,
+        scope: str = "manual",
         sort_mode: str = "relevance_desc",
         on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
     ) -> AggregatedIndexerResult:
@@ -150,7 +173,8 @@ class IndexerService:
             page,
             sort_mode=sort_mode,
         )
-        selected = self._select_sites(site_ids)
+        scope = self._normalize_scope(scope)
+        selected = self._select_sites(site_ids, scope=scope)
         plans = {site_id: (request.query,) for site_id in selected}
         cache_key = (
             "query",
@@ -175,11 +199,13 @@ class IndexerService:
         request: IndexerMediaSearchRequest,
         site_ids: Iterable[str] | None = None,
         *,
+        scope: str = "manual",
         on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
     ) -> AggregatedIndexerResult:
         if not isinstance(request, IndexerMediaSearchRequest):
             raise IndexerValidationError("invalid media search request")
-        selected = self._select_sites(site_ids)
+        scope = self._normalize_scope(scope)
+        selected = self._select_sites(site_ids, scope=scope)
         plans = {site_id: build_site_queries(site_id, request) for site_id in selected}
         plan_identity = tuple((site_id, plans[site_id]) for site_id in selected)
         cache_key = (
@@ -375,7 +401,8 @@ class IndexerService:
                     notifier = asyncio.create_task(progress.wait())
                 if pending and self._progress_callbacks.get(key):
                     snapshot = self._aggregate_outcomes(
-                        display_query=display_query, page=page, selected=selected,
+                        display_query=display_query, page=page,
+                        selected=selected,
                         outcome_by_site=outcomes, ranking_context=ranking_context,
                         sort_mode=sort_mode, complete=False, published_items=published_items,
                     )
@@ -393,7 +420,8 @@ class IndexerService:
             if unfinished:
                 await asyncio.gather(*unfinished, return_exceptions=True)
         result = self._aggregate_outcomes(
-            display_query=display_query, page=page, selected=selected,
+            display_query=display_query, page=page,
+            selected=selected,
             outcome_by_site=outcomes, ranking_context=ranking_context,
             sort_mode=sort_mode, complete=True, published_items=published_items,
         )
@@ -420,7 +448,8 @@ class IndexerService:
         return ("hash", infohash) if infohash else (item.site_id, item.detail_url, item.title)
 
     def _aggregate_outcomes(
-        self, *, display_query: str, page: int, selected: tuple[str, ...],
+        self, *, display_query: str, page: int,
+        selected: tuple[str, ...],
         outcome_by_site: dict[str, _ProviderOutcome],
         ranking_context: IndexerMediaSearchRequest | None, sort_mode: str,
         complete: bool, published_items: dict[tuple, IndexerItem],
@@ -580,12 +609,23 @@ class IndexerService:
         )
         return result
 
-    async def resolve(self, result_id: str) -> ResolvedDownload:
+    def get_result(self, result_id: str, *, scope: str = "manual") -> IndexerItem:
+        """读取共享结果，并按当前调用入口允许的来源集合校验。"""
         self._ensure_open()
+        allowed = self.site_ids_for_scope(scope)
         stored_result = self.result_store.get(result_id)
+        if stored_result.site_id not in allowed:
+            raise IndexerSecurityError(
+                "stored result provider is not allowed for this caller"
+            )
+        return stored_result
+
+    async def resolve(
+        self, result_id: str, *, scope: str = "manual"
+    ) -> ResolvedDownload:
+        self._ensure_open()
+        stored_result = self.get_result(result_id, scope=scope)
         site_id = stored_result.site_id
-        if site_id not in self.registry.ids() or site_id not in self.enabled_site_ids:
-            raise IndexerSecurityError("stored result provider is not enabled")
         if stored_result.download_state not in {"ready", "resolvable"}:
             raise IndexerInvalidResponse("stored result is not downloadable")
         adapter = self.registry.get(site_id)
@@ -737,28 +777,52 @@ class IndexerService:
         *,
         is_animation: bool,
         original_language: str = "",
+        scope: str = "manual",
     ) -> tuple[str, ...]:
         """按媒体语义返回启用站点的收敛子集，供未显式配置站点的调用方使用。"""
         from .config import plan_media_site_route
 
-        available = tuple(
-            site_id
-            for site_id in self.registry.ids()
-            if site_id in self.enabled_site_ids
-        )
+        available = self.site_ids_for_scope(scope)
         return plan_media_site_route(
             available,
             is_animation=is_animation,
             original_language=original_language,
         )
 
-    def _select_sites(self, site_ids: Iterable[str] | None) -> tuple[str, ...]:
-        requested = (
-            tuple(
-                site_id
-                for site_id in self.registry.ids()
-                if site_id in self.enabled_site_ids
+    @staticmethod
+    def _normalize_scope(scope: str) -> str:
+        normalized = str(scope or "").strip().lower()
+        if normalized not in {"manual", "agent"}:
+            raise IndexerValidationError("invalid indexer search scope")
+        return normalized
+
+    def site_ids_for_scope(self, scope: str = "manual") -> tuple[str, ...]:
+        """返回该服务端调用入口当前可用的站点白名单。"""
+        normalized_scope = self._normalize_scope(scope)
+        if not config.get_bool("INDEXER_SEARCH_ENABLED"):
+            raise IndexerValidationError(
+                "indexer search is disabled",
+                public_message="资源检索功能已关闭",
             )
+        registered = tuple(self.registry.ids())
+        if normalized_scope == "manual":
+            allowed = self.enabled_site_ids
+        else:
+            allowed = {
+                site_id for site_id in registered
+                if site_id not in RETIRED_INDEXER_SITE_IDS
+                and site_id not in SENSITIVE_INDEXER_SITE_IDS
+            }
+            if self.sukebei_authorized and "sukebei" in registered:
+                allowed.add("sukebei")
+        return tuple(site_id for site_id in registered if site_id in allowed)
+
+    def _select_sites(
+        self, site_ids: Iterable[str] | None, *, scope: str = "manual"
+    ) -> tuple[str, ...]:
+        allowed = set(self.site_ids_for_scope(scope))
+        requested = (
+            tuple(site_id for site_id in self.registry.ids() if site_id in allowed)
             if site_ids is None
             else tuple(site_ids)
         )
@@ -769,7 +833,7 @@ class IndexerService:
                 continue
             if (
                 site_id not in self.registry.ids()
-                or site_id not in self.enabled_site_ids
+                or site_id not in allowed
             ):
                 raise IndexerValidationError(f"unknown or disabled site: {site_id}")
             selected.append(site_id)

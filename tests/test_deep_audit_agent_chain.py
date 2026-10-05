@@ -94,12 +94,13 @@ def offline_chain():
             for item in _resources().data["items"]
         }
 
-        async def resolve(result_id):
+        async def resolve(result_id, *, scope="manual"):
             digest = "a" if result_id.endswith("001") else "b"
             return ResolvedDownload("magnet", "magnet:?xt=urn:btih:" + digest * 40)
 
         service = SimpleNamespace(
             result_store=SimpleNamespace(get=resources.__getitem__),
+            get_result=lambda key, **_kw: resources[key],
             resolve=resolve,
             enabled_site_ids=("demo",),
         )
