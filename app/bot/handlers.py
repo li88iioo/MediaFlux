@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from app.repositories.download_requests import download_display_title
+
 import hmac
 import html
 import logging
@@ -1772,7 +1774,7 @@ def _register_commands(bot, telebot):
         send_target_picker(
             msg,
             int(row["id"]),
-            str(row["title"] or title),
+            download_display_title(row),
             chat_id=chat_id,
             user_id=user_id,
             reissued=True,
@@ -1962,7 +1964,7 @@ def _register_commands(bot, telebot):
         send_target_picker(
             call.message,
             int(row["id"]),
-            str(row["title"] or "未命名任务"),
+            download_display_title(row),
             chat_id=chat_id,
             user_id=user_id,
             reissued=True,
@@ -2286,7 +2288,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                     )
                     picker_text = (
                         "<b>选择下载目标</b>\n"
-                        f"任务: {html.escape(str(row['title'] or '未命名任务'))}\n"
+                        f"任务: {html.escape(download_display_title(row))}\n"
                         f"{notice}"
                     )
                     try:

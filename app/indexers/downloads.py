@@ -6,6 +6,7 @@ Web、Telegram、Agent 与订阅统一复用同一套解析、幂等准入、
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import threading
 import weakref
 from pathlib import PurePosixPath
@@ -22,6 +23,9 @@ from app.indexers.errors import (
 )
 from app.indexers.models import ResolvedDownload
 from app.logger import get_logger
+from app.repositories.download_requests import (
+    download_display_title, enrich_download_display_title, usable_download_title,
+)
 from app.modules.download_dispatcher import (
     DownloadInput,
     create_request,
@@ -94,7 +98,7 @@ def _torrent_filename(resolved: ResolvedDownload) -> str:
 async def _resolved_download_input(service, stored, resolved: ResolvedDownload):
     try:
         if resolved.kind == "magnet":
-            return normalize_download_url(str(resolved.value or ""))
+            return replace(normalize_download_url(str(resolved.value or "")), display_title=str(stored.title or ""))
         client = service.registry.get(stored.site_id).http_client_for_result(stored)
         if isinstance(resolved.value, bytes):
             max_bytes = int(getattr(client, "max_response_bytes", 2 * 1024 * 1024))
@@ -286,6 +290,9 @@ def _persist_and_dispatch(
     if existing is not None:
         existing_id = int(existing["id"] or 0)
         existing_status = str(existing["status"] or "")
+        if (usable_download_title(item.display_title)
+                and not usable_download_title(download_display_title(existing))):
+            enrich_download_display_title(existing_id, item.display_title)
         if existing_status == "manual_review":
             if admission_id is not None:
                 db.bind_media_download_admission_request(admission_id, existing_id)

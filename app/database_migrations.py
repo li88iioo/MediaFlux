@@ -1540,6 +1540,15 @@ def _migrate_recognition_format_rules_v31(conn: sqlite3.Connection) -> None:
         conn.execute(statement)
 
 
+def _migrate_download_display_title_v32(conn: sqlite3.Connection) -> None:
+    """新增纯展示名称及按请求补名索引；旧业务标题/路由不回写。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(download_requests)")}
+    if columns and "display_title" not in columns:
+        conn.execute("ALTER TABLE download_requests ADD COLUMN display_title TEXT NOT NULL DEFAULT ''")
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_log'").fetchone():
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_download_log_request_source_id ON download_log(request_id, source, id DESC)")
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1572,4 +1581,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     28: _migrate_download_resource_and_strm_ownership_v29,
     29: _migrate_episode_research_cache_v30,
     30: _migrate_recognition_format_rules_v31,
+    31: _migrate_download_display_title_v32,
 }

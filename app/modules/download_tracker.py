@@ -29,7 +29,9 @@ from app.logger import get_logger, log_throttled
 from app.modules.naming import sanitize_name
 from app.modules.organize import OrganizeRules
 from app.modules.organize_tasks import get_organize_manager
-from app.repositories.download_requests import apply_download_tracker_update
+from app.repositories.download_requests import (
+    apply_download_tracker_update, download_display_title, usable_download_title,
+)
 
 logger = get_logger(__name__)
 
@@ -297,6 +299,7 @@ class DownloadTracker:
         gy_status = str(row["gy_status"] or "")
 
         matched_qb_task = None
+        matched_gy_tasks = []
         local_import_pending = str(
             self._row_value(row, "local_import_status", "") or ""
         ) in {"", "pending"}
@@ -348,6 +351,8 @@ class DownloadTracker:
                 task_by_id = gy_tasks.by_id
                 matched = [task_by_id[task_id] for task_id in task_ids if task_id in task_by_id]
                 expected_batches = max(len(task_ids), int(self._row_value(row, "gy_batch_count", 0) or 0))
+                if len(matched) == expected_batches:
+                    matched_gy_tasks = matched
                 states = [self._gy_task_state(task) for task in matched]
                 progress_values = [
                     max(0.0, min(float(task.get("progress") or 0), 1.0)) for task in matched
@@ -383,6 +388,8 @@ class DownloadTracker:
             elif not task_ids and gy_available:
                 task = self._match_gy(row, gy_tasks)
                 if task:
+                    if int(self._row_value(row, "gy_batch_count", 0) or 0) <= 1:
+                        matched_gy_tasks = [task]
                     progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
                     updates["gy_status"] = self._gy_task_state(task)
                     updates["gy_task_missing_since"] = None
@@ -416,6 +423,14 @@ class DownloadTracker:
                             "请核对云端文件后人工处理"
                         )
 
+        if not usable_download_title(download_display_title(row)):
+            names = {str(task.get("name") or "").strip() for task in matched_gy_tasks}
+            candidate = str(getattr(matched_qb_task, "name", "") or "").strip()
+            if not usable_download_title(candidate) and len(names) == 1:
+                candidate = names.pop()
+            if usable_download_title(candidate):
+                updates["display_title"] = candidate
+
         effective_qb = updates.get("qb_status", qb_status)
         effective_gy = updates.get("gy_status", gy_status)
         if effective_qb == "completed" and matched_qb_task is None:
@@ -447,7 +462,7 @@ class DownloadTracker:
             and root_status not in {"completed", "failed", "manual_review"}
         ):
             notification_payload = {
-                "title": str(self._row_value(row, "title", "") or "未命名任务"),
+                "title": updates.get("display_title") or download_display_title(row),
                 "event_status": next_root_status,
                 "qb_status": str(effective_qb or ""),
                 "gy_status": str(effective_gy or ""),

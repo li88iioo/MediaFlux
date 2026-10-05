@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import asyncio
+from dataclasses import replace
 
 import unittest
 from datetime import datetime, timezone
@@ -19,6 +20,7 @@ from app.agent.indexer_candidate_actions import (
     present_candidates,
     present_candidates_arguments,
 )
+from app.modules.download_dispatcher import DownloadInput
 from app.indexers.downloads import download_indexer_result
 from app.indexers.errors import IndexerResultExpired
 from app.indexers.models import (
@@ -719,7 +721,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
     def test_shared_download_service_dispatches_only_server_resolved_value(self):
         item = _resource_item(download_kinds=("magnet",))
         service = FakeDownloadService(item)
-        normalized = object()
+        normalized = DownloadInput(kind="magnet", title="磁力任务", source_value=_SECRET_MAGNET)
         with (
             patch(
                 "app.indexers.downloads.normalize_download_url", return_value=normalized
@@ -745,7 +747,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
             result = asyncio.run(download_indexer_result(service, _RESULT_ID, "qb"))
         normalize.assert_called_once_with(_SECRET_MAGNET)
         create.assert_called_once_with(
-            normalized, "", "", origin="indexer:nyaa", user_id=""
+            replace(normalized, display_title=item.title), "", "", origin="indexer:nyaa", user_id=""
         )
         dispatch.assert_called_once_with(7, "qb")
         self.assertTrue(result["ok"])
@@ -754,7 +756,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
     def test_shared_download_service_marks_agent_origin_namespace(self):
         item = _resource_item(download_kinds=("magnet",))
         service = FakeDownloadService(item)
-        normalized = object()
+        normalized = DownloadInput(kind="magnet", title="磁力任务", source_value=_SECRET_MAGNET)
         with (
             patch(
                 "app.indexers.downloads.normalize_download_url", return_value=normalized
@@ -783,6 +785,6 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
                 )
             )
         create.assert_called_once_with(
-            normalized, "", "", origin="agent:nyaa", user_id=""
+            replace(normalized, display_title=item.title), "", "", origin="agent:nyaa", user_id=""
         )
         self.assertTrue(result["ok"])

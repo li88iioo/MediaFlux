@@ -21,6 +21,7 @@ from app.config import get
 from app.indexers.providers.base import magnet_infohash
 from app.logger import get_logger
 from app.modules.offline import analyze_offline_url, detect_protocol, submit_offline
+from app.repositories.download_requests import download_display_title, usable_download_title
 
 logger = get_logger(__name__)
 
@@ -65,6 +66,8 @@ class DownloadInput:
     identity_hint: str = ""
     # RSS enclosure 的类型仅作为读取种子的线索；身份仍必须从真实bytes校验。
     content_type: str = ""
+    # 仅用于日志/通知/列表，不能替代用于路由与整理的title。
+    display_title: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -271,7 +274,11 @@ def prepare_download_input(item: DownloadInput, target: str) -> DownloadInput:
     except Exception as exc:
         # 传输错误可能带认证URL；只对外暴露稳定安全的错误，不回退HTTP。
         raise ValueError("种子读取或校验失败，请核对资源后重试") from exc
-    return replace(item, torrent_data=payload, identity_hint="", content_type="application/x-bittorrent")
+    display_title = item.display_title
+    if not usable_download_title(display_title or item.title):
+        display_title = parse_torrent_metadata(payload)[0]
+    return replace(item, torrent_data=payload, identity_hint="", content_type="application/x-bittorrent",
+                   display_title=display_title)
 
 
 def request_keys(item: DownloadInput) -> tuple[str, ...]:
@@ -348,7 +355,7 @@ def create_request(
 ) -> dict[str, Any]:
     keys = request_keys(item)
     req_id, created = db.create_download_request(
-        keys[0], item.kind, title=item.title,
+        keys[0], item.kind, title=item.title, display_title=item.display_title,
         source_value=item.source_value, torrent_data=item.torrent_data, content_type=item.content_type,
         chat_id=str(chat_id), user_id=str(user_id), message_id=str(message_id), origin=origin,
         supersede_request_id=supersede_request_id,
@@ -846,6 +853,7 @@ def resubmit_download_request(
     item = DownloadInput(
         kind=item_kind,
         title=str(source_row["title"] or ""),
+        display_title=str(source_row["display_title"] or ""),
         source_value=str(source_row["source_value"] or ""),
         torrent_data=item_torrent_data,
         identity_hint=f"btih:{qb_task_id_hint}" if qb_task_id_hint else "",
@@ -1069,7 +1077,7 @@ def _dispatch_claimed_targets(
 ) -> dict[str, Any]:
     """两个认领入口共用唯一提交/结果转换/日志执行链，根状态只由仓储原子归并。"""
     request_id = int(row["id"])
-    title = str(row["title"] or "未命名任务")
+    title = download_display_title(row)
     source_value = str(row["source_value"] or "")
     results: dict[str, dict[str, Any]] = {}
     submissions = {
@@ -1536,6 +1544,7 @@ def _submit_guangya(row, *, target_dir_id: str = "", target_dir_name: str = "") 
             kind="http", title=str(row["title"] or ""),
             source_value=str(row["source_value"] or ""), torrent_data=torrent_data,
             content_type=_request_content_type(row),
+            display_title=str(row["display_title"] or ""),
         ), "guangya")
         torrent_data = item.torrent_data
         if torrent_data is not None:

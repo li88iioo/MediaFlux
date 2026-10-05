@@ -53,7 +53,7 @@ class BatchConvergenceTests(unittest.TestCase):
             return ResolvedDownload("magnet", MAGNET)
 
         service = SimpleNamespace(
-            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa")),
+            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
             resolve=resolve,
         )
 
@@ -163,7 +163,7 @@ class BatchConvergenceTests(unittest.TestCase):
             return ResolvedDownload("magnet", MAGNET if result_id == ALIAS else MAGNET.replace("a" * 40, "b" * 40))
 
         service = SimpleNamespace(
-            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa")), resolve=resolve
+            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")), resolve=resolve
         )
         with patch.object(dispatcher, "_submit_guangya", return_value={"ok": True}) as remote:
             result = indexer_actions._submit_resource_batch(
@@ -190,7 +190,7 @@ class BatchConvergenceTests(unittest.TestCase):
             return ResolvedDownload("magnet", MAGNET)
 
         service = SimpleNamespace(
-            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa")),
+            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
             resolve=resolve,
         )
 
@@ -227,7 +227,7 @@ class BatchConvergenceTests(unittest.TestCase):
             )
 
         service = SimpleNamespace(
-            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa")),
+            result_store=SimpleNamespace(get=lambda _: SimpleNamespace(site_id="nyaa", title="索引结果")),
             resolve=resolve,
         )
 

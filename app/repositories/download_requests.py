@@ -2,10 +2,48 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
+
+
+_PLACEHOLDER_TITLES = ("", "磁力任务", "链接任务", "ED2K 任务", "未命名任务", "未命名下载请求", "离线下载", "torrent", "resource")
+
+
+def usable_download_title(value: object) -> bool:
+    text = str(value or "").strip()
+    return bool(text and text not in _PLACEHOLDER_TITLES
+                and not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", text)
+                and not text.lower().startswith(("magnet:", "http://", "https://")))
+
+
+def download_display_title(row) -> str:
+    """请求的展示投影；业务代码仍读取原始title，不受后端补名影响。"""
+    return str((row["display_title"] if "display_title" in row.keys() else "")
+               or (row["title"] if "title" in row.keys() else "") or "未命名任务")
+
+
+def _enrich_display_title_conn(conn, request_id: int, title: str) -> None:
+    if not usable_download_title(title):
+        return
+    current = conn.execute("SELECT title,display_title,status FROM download_requests WHERE id=?", (request_id,)).fetchone()
+    if (current is None or current["status"] in {"cancelled", "resubmitted"}
+            or usable_download_title(download_display_title(current))):
+        return
+    conn.execute("UPDATE download_requests SET display_title=? WHERE id=?", (title.strip(), request_id))
+    missing_titles = (*_PLACEHOLDER_TITLES, download_display_title(current))
+    placeholders = ",".join("?" for _ in missing_titles)
+    conn.execute(f"UPDATE download_log SET title=? WHERE request_id=? AND TRIM(COALESCE(title,'')) IN ({placeholders})",
+                 (title.strip(), request_id, *missing_titles))
+
+
+def enrich_download_display_title(request_id: int, title: str) -> None:
+    """已按资源身份命中旧请求时只补展示信息，不认领、重试或重新提交。"""
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _enrich_display_title_conn(conn, request_id, title)
 
 
 class DownloadAdmissionBindingError(RuntimeError):
@@ -21,6 +59,10 @@ def add_download_log(source: str, title: str = "", path: str = "",
                      request_id: int | None = None, backend_task_id: str = "",
                      progress: float = 0, error: str = "") -> int:
     with db.get_conn() as conn:
+        if request_id and not usable_download_title(title):
+            row = conn.execute("SELECT title,display_title FROM download_requests WHERE id=?", (request_id,)).fetchone()
+            if row is not None and row["display_title"]:
+                title = download_display_title(row)
         cur = conn.execute(
             "INSERT INTO download_log(source,title,path,status,rss_item_id,request_id,"
             "backend_task_id,progress,error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -301,6 +343,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                             source_alias_key: str = "",
                             admission_id: int | None = None,
                             content_type: str = "",
+                            display_title: str = "",
                             initial_targets: str = "",
                             retry_source_request_id: int | None = None,
                             retry_source_status: str = "") -> tuple[int, bool]:
@@ -310,6 +353,7 @@ def create_download_request(request_key: str, kind: str, title: str = "",
     保留旧请求作为历史尝试，并创建新的 canonical 请求。``manual_review`` 仅允许
     待处理页显式传入 ``supersede_request_id`` 时创建 successor。
     """
+    display_title = str(display_title).strip() if usable_download_title(display_title) else ""
     if initial_targets not in {"", "qb", "guangya", "both"}:
         raise ValueError("未知下载认领目标")
     retryable_kinds = {"magnet", "torrent", "ed2k", "http"}
@@ -348,6 +392,8 @@ def create_download_request(request_key: str, kind: str, title: str = "",
             _bind_media_download_admission_conn(
                 conn, admission_id, int(request_id), timestamp
             )
+            if not created and display_title:
+                _enrich_display_title_conn(conn, int(request_id), display_title)
             return int(request_id), created
 
         # 串行化“检查所有等价 key → 归档历史 → 新建 canonical 请求”。
@@ -369,9 +415,9 @@ def create_download_request(request_key: str, kind: str, title: str = "",
         )
         if not rows:
             created = conn.execute(
-                "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,"
-                "source_value,torrent_data,content_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (primary_key, origin, chat_id, user_id, message_id, kind, title, source_value,
+                "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,display_title,"
+                "source_value,torrent_data,content_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (primary_key, origin, chat_id, user_id, message_id, kind, title, display_title, source_value,
                  torrent_data, str(content_type or ""), "pending", timestamp, timestamp),
             )
             request_id = int(created.lastrowid)
@@ -449,9 +495,9 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                 raise RuntimeError("下载请求重试认领失败")
 
         created = conn.execute(
-            "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,"
-            "source_value,torrent_data,content_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (primary_key, origin, chat_id, user_id, message_id, kind, title, source_value,
+            "INSERT INTO download_requests(request_key,origin,chat_id,user_id,message_id,kind,title,display_title,"
+            "source_value,torrent_data,content_type,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (primary_key, origin, chat_id, user_id, message_id, kind, title, display_title, source_value,
              torrent_data, str(content_type or ""), "pending", timestamp, timestamp),
         )
         request_id = int(created.lastrowid)
@@ -1298,6 +1344,9 @@ def apply_download_tracker_update(
             return None
         if dict(current) != dict(snapshot):
             return None
+        display_title = fields.pop("display_title", "")
+        if display_title:
+            _enrich_display_title_conn(conn, request_id, display_title)
         if str(current["status"] or "") == "resubmitted":
             # 未被接管的后端仍可推进，但历史根状态不可复活。
             fields["status"] = "resubmitted"

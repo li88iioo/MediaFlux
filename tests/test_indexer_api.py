@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
+from app.modules.download_dispatcher import DownloadInput
 from app import config as app_config
 from app.indexers.providers.base import IndexerAdapter
 from app.indexers.models import (
@@ -181,6 +182,8 @@ class IndexerAPITests(unittest.TestCase):
             return_value=None,
         )
         self.request_alias_lookup_patch.start()
+        from app import database as db
+        db.init_db()
         self.client = TestClient(create_app(), raise_server_exceptions=False)
 
     def tearDown(self):
@@ -421,7 +424,7 @@ class IndexerAPITests(unittest.TestCase):
         existing = {
             "id": 7, "status": "completed", "qb_status": "completed", "gy_status": "failed",
         }
-        item = SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:" + "a" * 40, torrent_data=None)
+        item = DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:" + "a" * 40, torrent_data=None)
         with patch("app.indexers.downloads.db.get_download_request_by_request_key", return_value=existing), patch(
             "app.indexers.downloads.create_request", return_value={"id": 8, "created": True}
         ) as create, patch("app.indexers.downloads.dispatch_request", return_value={"ok": True}) as dispatch:
@@ -447,7 +450,7 @@ class IndexerAPITests(unittest.TestCase):
             "qb_status": "manual_review",
             "gy_status": "failed",
         }
-        item = SimpleNamespace(
+        item = DownloadInput(
             kind="magnet",
             title="Demo",
             source_value="magnet:?xt=urn:btih:" + "a" * 40,
@@ -481,7 +484,7 @@ class IndexerAPITests(unittest.TestCase):
             "qb_status": "",
             "gy_status": "completed",
         }
-        item = SimpleNamespace(
+        item = DownloadInput(
             kind="magnet",
             title="Demo",
             source_value="magnet:?xt=urn:btih:" + "a" * 40,
@@ -521,7 +524,7 @@ class IndexerAPITests(unittest.TestCase):
             "qb_status": "completed",
             "gy_status": "failed",
         }
-        item = SimpleNamespace(
+        item = DownloadInput(
             kind="magnet",
             title="Demo",
             source_value="magnet:?xt=urn:btih:" + "b" * 40,
@@ -677,7 +680,7 @@ class IndexerAPITests(unittest.TestCase):
         headers = self.authenticate()
         service = FakeIndexerService()
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
-             patch("app.indexers.downloads.normalize_download_url", return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)) as normalize, \
+             patch("app.indexers.downloads.normalize_download_url", return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)) as normalize, \
              patch("app.indexers.downloads.create_request", return_value={"id": 31, "created": True}) as create, \
              patch("app.indexers.downloads.dispatch_request", return_value={"ok": True, "status": "submitted", "succeeded": ["qb"], "failed": []}) as dispatch:
             response = self.client.post(
@@ -700,7 +703,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -792,7 +795,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -835,7 +838,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -880,7 +883,7 @@ class IndexerAPITests(unittest.TestCase):
                     return_value=service,
                 ), patch(
                     "app.indexers.downloads.normalize_download_url",
-                    return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+                    return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
                 ), patch(
                     "app.indexers.downloads.create_request",
                     return_value={"id": 31, "created": True},
@@ -915,7 +918,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -955,7 +958,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(
+            return_value=DownloadInput(
                 kind="magnet",
                 title="Demo",
                 source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
@@ -1004,7 +1007,7 @@ class IndexerAPITests(unittest.TestCase):
             headers={"content-type": "application/x-bittorrent"},
             body=b"torrent-bytes",
         )
-        item = SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)
+        item = DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
              patch("app.indexers.downloads.torrent_download_input", return_value=item) as torrent_input, \
              patch("app.indexers.downloads.create_request", return_value={"id": 41, "created": True}), \
@@ -1022,7 +1025,7 @@ class IndexerAPITests(unittest.TestCase):
         headers = self.authenticate()
         resolved = ResolvedDownload(kind="torrent", value=b"provider-torrent-bytes", filename="demo.torrent")
         service = FakeIndexerService(resolved)
-        item = SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)
+        item = DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None)
         with patch("app.routes.indexers_api.get_indexer_service", return_value=service), \
              patch("app.indexers.downloads.torrent_download_input", return_value=item) as torrent_input, \
              patch("app.indexers.downloads.create_request", return_value={"id": 42, "created": True}), \
@@ -1084,7 +1087,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -1128,7 +1131,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -1168,7 +1171,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(
+            return_value=DownloadInput(
                 kind="magnet",
                 title="Demo",
                 source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
@@ -1234,7 +1237,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -1289,7 +1292,7 @@ class IndexerAPITests(unittest.TestCase):
             try:
                 with patch(
                     "app.indexers.downloads.normalize_download_url",
-                    return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+                    return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
                 ), patch(
                     "app.indexers.downloads.db.get_download_request_by_request_key",
                     return_value=None,
@@ -1348,7 +1351,7 @@ class IndexerAPITests(unittest.TestCase):
 
             with patch(
                 "app.indexers.downloads.normalize_download_url",
-                return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+                return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
             ), patch(
                 "app.indexers.downloads.create_request",
                 side_effect=lambda *args, **kwargs: {"id": next(request_ids), "created": True},
@@ -1397,7 +1400,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -1431,7 +1434,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},
@@ -1525,7 +1528,7 @@ class IndexerAPITests(unittest.TestCase):
             return_value=service,
         ), patch(
             "app.indexers.downloads.normalize_download_url",
-            return_value=SimpleNamespace(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
+            return_value=DownloadInput(kind="magnet", title="Demo", source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", torrent_data=None),
         ), patch(
             "app.indexers.downloads.create_request",
             return_value={"id": 31, "created": True},

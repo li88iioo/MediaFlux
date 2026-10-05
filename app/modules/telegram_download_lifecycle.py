@@ -20,6 +20,7 @@ from app.modules.telegram_media_projection import (
     build_media_detail_blocks,
 )
 from app.notifier import NotificationEvent, safe_int
+from app.repositories.download_requests import download_display_title, usable_download_title
 
 _STATUS_LABELS = {
     "": "—",
@@ -235,12 +236,11 @@ def build_download_lifecycle_event(
         "cancelled": "⏹️ 下载跟踪已停止",
     }[state]
     archive_name, archive_value = _archive_label(row)
+    media_title = notification_payload.get("title")
+    if not usable_download_title(media_title):
+        media_title = download_display_title(row)
     fields: list[tuple[object, object]] = [
-        ("媒体", str(
-            notification_payload.get("title")
-            or _value(row, "title", "")
-            or "未命名任务"
-        )[:160]),
+        ("媒体", str(media_title)[:160]),
         ("下载", _download_label(row)),
         (archive_name, archive_value),
     ]

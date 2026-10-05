@@ -28,6 +28,7 @@ from app.modules.qb_control import (
     remove_qb_tasks,
 )
 from app.web import api_error, api_response, require_api_login
+from app.repositories.download_requests import download_display_title
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/api/downloads")
@@ -186,7 +187,7 @@ def _attention_stages(row) -> list[dict[str, str]]:
 def _attention_json(row) -> dict:
     return {
         "id": int(row["id"]),
-        "title": str(row["title"] or "未命名下载请求"),
+        "title": download_display_title(row),
         "origin": str(row["origin"] or ""),
         "kind": str(row["kind"] or ""),
         "targets": str(row["targets"] or ""),

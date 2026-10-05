@@ -135,8 +135,8 @@ class ReleaseFormatMigrationTests(unittest.TestCase):
             connection.close()
 
     def test_schema31_ddl_has_exact_columns_defaults_and_constraints(self) -> None:
-        self.assertEqual(db.SCHEMA_VERSION, 31)
-        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 31)))
+        self.assertEqual(db.SCHEMA_VERSION, 32)
+        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 32)))
         migration = database_migrations._SCHEMA_MIGRATIONS[30]
         self.assertFalse(hasattr(db, migration.__name__))
         self.assertEqual(migration.__module__, database_migrations.__name__)
@@ -269,7 +269,7 @@ class ReleaseFormatMigrationTests(unittest.TestCase):
 
         self.assertEqual(visited, [30])
         with db.get_conn() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 31)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
             self.assertIsNotNone(
                 conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
@@ -316,7 +316,7 @@ class ReleaseFormatMigrationTests(unittest.TestCase):
             )
         db.init_db()
         with db.get_conn() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 31)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
             self.assertIsNotNone(
                 conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",

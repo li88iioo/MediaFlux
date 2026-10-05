@@ -305,8 +305,8 @@ class EpisodeResearchCacheTests(unittest.TestCase):
         conn.execute("INSERT INTO settings_kv(key,value) VALUES('cache-migration-sentinel','keep')")
 
     def test_v29_migration_alone_matches_fresh_schema_and_preserves_legacy_database(self):
-        self.assertEqual(db.SCHEMA_VERSION, 31)
-        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 31)))
+        self.assertEqual(db.SCHEMA_VERSION, 32)
+        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 32)))
         migration = database_migrations._SCHEMA_MIGRATIONS[29]
         self.assertFalse(hasattr(db, migration.__name__))
         self.assertEqual(migration.__module__, database_migrations.__name__)
@@ -346,7 +346,7 @@ class EpisodeResearchCacheTests(unittest.TestCase):
         with patch.object(db, "_create_pre_migration_backup", side_effect=backup), db.get_conn() as conn:
             self.assertEqual(db._prepare_schema_migration(conn, database_existed=True), 29)
             self.assertEqual(self.cache_schema(conn), fresh)
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 31)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
         self.assertEqual(visited, [29])
         db.init_db()
         self.put()
@@ -361,7 +361,7 @@ class EpisodeResearchCacheTests(unittest.TestCase):
             db.init_db()
             self.assertEqual(observed.call_count, 1)
         with db.get_conn() as conn:
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 31)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
             self.assertEqual(conn.execute(
                 "SELECT value FROM settings_kv WHERE key='cache-migration-sentinel'"
             ).fetchone()[0], "keep")

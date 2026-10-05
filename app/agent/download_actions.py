@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.repositories.download_requests import download_display_title
+
 import math
 import re
 import unicodedata
@@ -166,7 +168,7 @@ def download_request_public_summary(row: Any) -> dict[str, Any]:
         )
     return {
         "request_number": int(row["id"]),
-        "title": _safe_title(row["title"]),
+        "title": _safe_title(download_display_title(row)),
         "kind": str(row["kind"] or "unknown")[:24],
         "targets": targets,
         "status": root_status,

@@ -236,6 +236,7 @@ CREATE TABLE IF NOT EXISTS download_log (
 );
 CREATE INDEX IF NOT EXISTS idx_download_log_status_id ON download_log(status, id DESC);
 CREATE INDEX IF NOT EXISTS idx_download_log_source_id ON download_log(source, id DESC);
+CREATE INDEX IF NOT EXISTS idx_download_log_request_source_id ON download_log(request_id, source, id DESC);
 
 CREATE TABLE IF NOT EXISTS download_requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,6 +247,7 @@ CREATE TABLE IF NOT EXISTS download_requests (
     message_id TEXT,
     kind TEXT NOT NULL,              -- magnet / ed2k / http / torrent
     title TEXT,
+    display_title TEXT NOT NULL DEFAULT '', -- 仅展示，不参与路由或整理命名
     source_value TEXT,
     torrent_data BLOB,
     content_type TEXT NOT NULL DEFAULT '',
