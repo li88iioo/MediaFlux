@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ..config import AIPAN_URL, AIPAN_SEARCH_URL
 from ..errors import (
     IndexerError,
     IndexerInvalidResponse,
@@ -38,8 +39,8 @@ _MAX_DETAIL_CANDIDATES = 3
 class AipanAdapter(DirectResultAdapter):
     site_id = "aipan"
     site_name = "爱盼"
-    base_url = "https://www.aipan.me/"
-    search_url = "https://www.aipan.me/api/movies/search"
+    base_url = AIPAN_URL
+    search_url = AIPAN_SEARCH_URL
     default_enabled = True
     capabilities = IndexerCapabilities(pagination_supported=False, download_kinds=("magnet",))
 

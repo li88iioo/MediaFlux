@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 from bs4 import BeautifulSoup
 import httpx
 
+from ..config import MIKAN_URL, MIKAN_MIRROR_URL
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerSecurityError, IndexerTimeout, IndexerUnavailable
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
 from .base import DirectResultAdapter, fixed_host_join, magnet_infohash, parse_size_bytes, require_html_response
@@ -23,8 +24,8 @@ _MIKAN_DATE_FORMATS = (
 class MikanAdapter(DirectResultAdapter):
     site_id = "mikan"
     site_name = "Mikan"
-    base_url = "https://mikanani.me/"
-    mirror_base_urls = ("https://mikanime.tv/",)
+    base_url = MIKAN_URL
+    mirror_base_urls = (MIKAN_MIRROR_URL,)
     default_enabled = True
     capabilities = IndexerCapabilities(pagination_supported=False, download_kinds=("magnet", "torrent"))
 

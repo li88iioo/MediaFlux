@@ -1,8 +1,28 @@
 """资源站点配置的共享白名单与规范化逻辑。"""
 from __future__ import annotations
 
+from base64 import b64decode
 from collections.abc import Iterable
 from typing import Any
+
+# 内置地址仅作Base64轻度混淆；运行时白名单和TLS策略不变。
+def _decode(encoded: str) -> str:
+    return b64decode(encoded, validate=True).decode("ascii")
+
+
+NYAA_URL = _decode("aHR0cHM6Ly9ueWFhLnNpLw==")
+NYAA_MIRROR_URL = _decode("aHR0cHM6Ly9ueWFhLm5ldC8=")
+SUKEBEI_URL = _decode("aHR0cHM6Ly9zdWtlYmVpLm55YWEuc2kv")
+MIKAN_URL = _decode("aHR0cHM6Ly9taWthbmFuaS5tZS8=")
+MIKAN_MIRROR_URL = _decode("aHR0cHM6Ly9taWthbmltZS50di8=")
+BTBTLA_URL = _decode("aHR0cHM6Ly93d3cuYnRidGxiLmNvbS8=")
+BTBTLA_MIRROR_URL = _decode("aHR0cHM6Ly9idGJ0bGIuY29tLw==")
+AIPAN_URL = _decode("aHR0cHM6Ly93d3cuYWlwYW4ubWUv")
+AIPAN_SEARCH_URL = _decode("aHR0cHM6Ly93d3cuYWlwYW4ubWUvYXBpL21vdmllcy9zZWFyY2g=")
+DYGANG_URL = _decode("aHR0cHM6Ly93d3cuZHlnYW5nLnR2Lw==")
+YS5266_URL = _decode("aHR0cHM6Ly93d3cuNTI2NnlzLm5ldC8=")
+TPB_URL = _decode("aHR0cHM6Ly90aGVwaXJhdGViYXkub3JnLw==")
+TPB_API_URL = _decode("aHR0cHM6Ly9hcGliYXkub3JnL3EucGhw")
 
 INDEXER_SITE_DEFINITIONS: tuple[tuple[str, str], ...] = (
     ("nyaa", "Nyaa"),

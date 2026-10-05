@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from urllib.parse import urlsplit
 
+from .config import (
+    NYAA_URL, NYAA_MIRROR_URL, SUKEBEI_URL, MIKAN_URL, MIKAN_MIRROR_URL,
+    BTBTLA_URL, BTBTLA_MIRROR_URL, AIPAN_URL, DYGANG_URL, YS5266_URL, TPB_API_URL,
+)
 from .http import BrowserImpersonatingHttpClient, FixedHostHttpClient
 from .providers.base import IndexerAdapter
 from .providers.btbtla import BTBtlaAdapter
@@ -54,40 +59,40 @@ def build_default_registry(
     tpb_min_interval_seconds: float = 1,
 ) -> IndexerRegistry:
     supplied = dict(http_clients or {})
-    # nyaa.si 会按来源 IP 限流；nyaa.net 为同引擎镜像，主站失败时回落。
+    # 主站可能按来源IP限流，同引擎镜像用于主站失败时回落。
     nyaa_http = supplied.get("nyaa") or FixedHostHttpClient(
-        allowed_hosts={"nyaa.si", "nyaa.net"}, user_agent=user_agent,
+        allowed_hosts={urlsplit(NYAA_URL).hostname, urlsplit(NYAA_MIRROR_URL).hostname}, user_agent=user_agent,
         pin_resolved_address=True,
     )
     sukebei_http = supplied.get("sukebei") or FixedHostHttpClient(
-        allowed_hosts={"sukebei.nyaa.si"},
+        allowed_hosts={urlsplit(SUKEBEI_URL).hostname},
         user_agent=user_agent,
         pin_resolved_address=True,
     )
     mikan_http = supplied.get("mikan") or FixedHostHttpClient(
-        allowed_hosts={"mikanani.me", "mikanime.tv"},
+        allowed_hosts={urlsplit(MIKAN_URL).hostname, urlsplit(MIKAN_MIRROR_URL).hostname},
         user_agent=user_agent,
         pin_resolved_address=True,
         # Mikan 搜索页内嵌全部剧集条目，热门作品实测 4MiB+，默认 2MiB 会截断。
         max_response_bytes=8 * 1024 * 1024,
     )
     btbtla_http = supplied.get("btbtla") or BrowserImpersonatingHttpClient(
-        allowed_hosts={"www.btbtlb.com", "btbtlb.com"},
-        sni_host="btbtlb.com",
+        allowed_hosts={urlsplit(BTBTLA_URL).hostname, urlsplit(BTBTLA_MIRROR_URL).hostname},
+        sni_host=urlsplit(BTBTLA_MIRROR_URL).hostname,
     )
     tpb_http = supplied.get("tpb") or FixedHostHttpClient(
-        allowed_hosts={"apibay.org"},
+        allowed_hosts={urlsplit(TPB_API_URL).hostname},
         user_agent=user_agent,
         pin_resolved_address=True,
     )
     aipan_http = supplied.get("aipan") or FixedHostHttpClient(
-        allowed_hosts={"www.aipan.me"}, user_agent=user_agent, pin_resolved_address=True,
+        allowed_hosts={urlsplit(AIPAN_URL).hostname}, user_agent=user_agent, pin_resolved_address=True,
     )
     dygang_http = supplied.get("dygang") or FixedHostHttpClient(
-        allowed_hosts={"www.dygang.tv"}, user_agent=user_agent, pin_resolved_address=True,
+        allowed_hosts={urlsplit(DYGANG_URL).hostname}, user_agent=user_agent, pin_resolved_address=True,
     )
     ys5266_http = supplied.get("ys5266") or FixedHostHttpClient(
-        allowed_hosts={"www.5266ys.net"}, user_agent=user_agent, pin_resolved_address=True,
+        allowed_hosts={urlsplit(YS5266_URL).hostname}, user_agent=user_agent, pin_resolved_address=True,
     )
     kpkuang_http = supplied.get("kpkuang") or FixedHostHttpClient(
         allowed_hosts=KPKUANG_HOST_CONFIG["allowed_hosts"],
@@ -98,16 +103,16 @@ def build_default_registry(
             "nyaa": NyaaAdapter(
                 site_id="nyaa",
                 site_name="Nyaa",
-                base_url="https://nyaa.si/",
+                base_url=NYAA_URL,
                 http=nyaa_http,
                 default_enabled=True,
-                mirror_base_urls=("https://nyaa.net/",),
+                mirror_base_urls=(NYAA_MIRROR_URL,),
                 endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
             ),
             "sukebei": NyaaAdapter(
                 site_id="sukebei",
                 site_name="Sukebei",
-                base_url="https://sukebei.nyaa.si/",
+                base_url=SUKEBEI_URL,
                 http=sukebei_http,
                 default_enabled=False,
             ),
@@ -122,13 +127,13 @@ def build_default_registry(
             "dygang": EmpireAdapter(
                 site_id="dygang",
                 site_name="电影港",
-                base_url="https://www.dygang.tv/",
+                base_url=DYGANG_URL,
                 http=dygang_http,
             ),
             "ys5266": EmpireAdapter(
                 site_id="ys5266",
                 site_name="5266影视",
-                base_url="https://www.5266ys.net/",
+                base_url=YS5266_URL,
                 http=ys5266_http,
             ),
             "kpkuang": KPkuangAdapter(http=kpkuang_http),

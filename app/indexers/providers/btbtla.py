@@ -13,6 +13,7 @@ from urllib.parse import quote, unquote, urlsplit
 from bs4 import BeautifulSoup
 
 from app.concurrency import CrossLoopAsyncLock
+from ..config import BTBTLA_URL, BTBTLA_MIRROR_URL
 from ..errors import (
     IndexerInvalidResponse,
     IndexerRateLimited,
@@ -53,8 +54,8 @@ class _ResourcePages:
 class BTBtlaAdapter(IndexerAdapter):
     site_id = "btbtla"
     site_name = "综合"
-    base_url = "https://www.btbtlb.com/"
-    mirror_base_urls = ("https://btbtlb.com/",)
+    base_url = BTBTLA_URL
+    mirror_base_urls = (BTBTLA_MIRROR_URL,)
     default_enabled = True
     capabilities = IndexerCapabilities(pagination_supported=True, download_kinds=("magnet", "torrent"))
 

@@ -43,7 +43,7 @@ class NyaaAdapter(DirectResultAdapter):
         self.base_url = base_url
         self.http = http
         self.default_enabled = bool(default_enabled)
-        # 主站可能按来源 IP 限流（nyaa.si 常见）；镜像与主站同引擎、
+        # 主站可能按来源 IP 限流；镜像与主站同引擎、
         # 布局仅有类名差异，主站限流/不可用时逐个回落。
         self.mirror_base_urls = tuple(mirror_base_urls)
         self._base_urls = tuple(dict.fromkeys((self.base_url, *self.mirror_base_urls)))
@@ -178,7 +178,7 @@ class NyaaAdapter(DirectResultAdapter):
         rows = soup.select("table.torrent-list tbody tr")
         if rows:
             return rows
-        # 镜像（nyaa.net 等）可能不带 torrent-list 类名，按行内 /view/ 链接识别。
+        # 镜像可能不带 torrent-list 类名，按行内 /view/ 链接识别。
         return [
             row
             for row in soup.select("table tbody tr")

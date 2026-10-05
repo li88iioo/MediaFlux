@@ -5,6 +5,7 @@ import re
 import unicodedata
 from datetime import datetime, timezone
 
+from ..config import TPB_URL, TPB_API_URL
 from ..errors import IndexerInvalidResponse, IndexerRateLimited, IndexerUnavailable
 from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest
 from .base import DirectResultAdapter, SearchRequestPacer, PUBLIC_TRACKERS, augment_public_magnet
@@ -24,8 +25,8 @@ _TOKEN_SEPARATORS = re.compile(r"[^0-9a-z\u3400-\u9fff\u3040-\u30ff]+", re.IGNOR
 class PirateBayAdapter(DirectResultAdapter):
     site_id = "tpb"
     site_name = "The Pirate Bay"
-    base_url = "https://thepiratebay.org/"
-    api_url = "https://apibay.org/q.php"
+    base_url = TPB_URL
+    api_url = TPB_API_URL
     default_enabled = True
     capabilities = IndexerCapabilities(False, ("magnet",))
 

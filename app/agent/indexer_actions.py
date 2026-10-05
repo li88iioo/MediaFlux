@@ -23,6 +23,7 @@ from app.agent.recent_resource_candidates import (
     attach_resource_candidate_reference,
 )
 from app.clients.guangya import GuangYaClient, close_guangya_client
+from app.indexers.config import AIPAN_URL, DYGANG_URL, YS5266_URL
 from app.indexers.downloads import (
     DownloadRequestCreationError,
     InvalidDownloadData,
@@ -48,11 +49,9 @@ _SORT_MODES = frozenset(
     }
 )
 _SPLIT_SITE_HOSTS = frozenset(
-    {
-        "aipan.me", "www.aipan.me",
-        "dygang.tv", "www.dygang.tv",
-        "5266ys.net", "www.5266ys.net",
-    }
+    host
+    for base in (AIPAN_URL, DYGANG_URL, YS5266_URL)
+    for host in (urlsplit(base).hostname, urlsplit(base).hostname.removeprefix("www."))
 )
 
 

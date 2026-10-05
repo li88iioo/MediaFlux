@@ -825,3 +825,25 @@ class FixedHostIdentityEncodingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(stream.read_chunks, 1)  # 不重读已被 transport 消费的流。
                 self.assertTrue(stream.closed)
                 self.assertTrue(response.is_closed)
+
+
+class BuiltinIndexerAddressTests(unittest.TestCase):
+    def test_builtin_hosts_are_encoded_in_runtime_sources(self):
+        from pathlib import Path
+        from urllib.parse import urlsplit
+        from app.indexers import config as endpoints
+        from app.indexers.providers.kpkuang import KPKUANG_HOST_CONFIG
+
+        urls = [value for name, value in vars(endpoints).items() if name.endswith('_URL')]
+        urls.extend(KPKUANG_HOST_CONFIG[key] for key in ('base_url', 'api_search_url'))
+        self.assertGreaterEqual(len(urls), 15)
+        hosts = {urlsplit(url).hostname for url in urls}
+        self.assertTrue(all(url.startswith('https://') for url in urls))
+        self.assertNotIn(None, hosts)
+        root = Path(__file__).resolve().parents[1] / 'app'
+        for path in root.rglob('*'):
+            if path.suffix not in {'.py', '.js', '.html'}:
+                continue
+            source = path.read_text(encoding='utf-8')
+            for host in hosts:
+                self.assertNotIn(host, source, f'{path.relative_to(root)} contains a plaintext indexer host')
