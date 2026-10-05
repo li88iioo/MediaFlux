@@ -186,10 +186,10 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
     def selected(page):
         return [site for site in page.locator('[data-key="INDEXER_ENABLED_SITES"]').input_value().split(',') if site]
 
-    def test_eight_independent_sites_wrap_and_save_in_contract_order(self):
-        default_sites = ['nyaa', 'mikan', 'btbtla', 'aipan', 'dygang', 'ys5266', 'tpb']
-        labels = ['Nyaa', 'Mikan', 'BTBtla', '爱盼', '电影港', '5266影视', 'The Pirate Bay', 'Sukebei']
-        site_order = ['nyaa', 'mikan', 'btbtla', 'aipan', 'dygang', 'ys5266', 'tpb', 'sukebei']
+    def test_manual_sites_wrap_and_save_without_agent_only_sources(self):
+        default_sites = ['nyaa', 'mikan', 'btbtla', 'tpb']
+        labels = ['Nyaa', 'Mikan', '综合', 'The Pirate Bay', 'Sukebei']
+        site_order = ['nyaa', 'mikan', 'btbtla', 'tpb', 'sukebei']
         for width in (320, 1280):
             with self.subTest(width=width):
                 page, errors, site_toggle = self.ready({'INDEXER_ENABLED_SITES': ','.join(default_sites)}, width)
@@ -214,7 +214,7 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
 
                 before = site_toggle.locator('..').bounding_box()
                 site_toggle.locator('..').click()
-                remaining = ['nyaa', 'mikan', 'aipan', 'dygang', 'ys5266', 'tpb']
+                remaining = ['nyaa', 'mikan', 'tpb']
                 self.assertEqual(self.selected(page), remaining)
                 after = site_toggle.locator('..').bounding_box()
                 self.assertEqual((before['width'], before['height']), (after['width'], after['height']))
@@ -228,12 +228,12 @@ class SettingsIndexerSiteBrowserTests(unittest.TestCase):
 
     def test_api_site_list_is_authoritative_and_legacy_sensitive_flag_is_ignored(self):
         page, errors, btbtla = self.ready({
-            'INDEXER_ENABLED_SITES': 'aipan',
+            'INDEXER_ENABLED_SITES': 'mikan',
             'INDEXER_SUKEBEI_ENABLED': '1',
         })
-        self.assertEqual(self.selected(page), ['aipan'])
+        self.assertEqual(self.selected(page), ['mikan'])
         self.assertFalse(btbtla.is_checked())
-        expect(page.locator('[data-indexer-site="aipan"]')).to_be_checked()
+        expect(page.locator('[data-indexer-site="mikan"]')).to_be_checked()
         expect(page.locator('[data-indexer-site="sukebei"]')).not_to_be_checked()
         self.assertNotIn('INDEXER_ENABLED_SITES', page.evaluate("collectConfigFields(document.getElementById('settings-panel-discovery'))"))
         self.assertEqual(errors, [])

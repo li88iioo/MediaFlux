@@ -115,7 +115,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         persist.assert_called_once_with({
             "INDEXER_ENABLED_SITES": "nyaa,mikan",
             "INDEXER_SUKEBEI_ENABLED": "0",
-            "INDEXER_SITE_CONFIG_VERSION": "2",
+            "INDEXER_SITE_CONFIG_VERSION": "3",
         })
         shutdown_web.assert_awaited_once()
         shutdown_telegram.assert_called_once_with(timeout=5.0)
@@ -334,7 +334,7 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,tpb,sukebei",
             "INDEXER_SUKEBEI_ENABLED": "1",
-            "INDEXER_SITE_CONFIG_VERSION": "2",
+            "INDEXER_SITE_CONFIG_VERSION": "3",
         })
 
     def test_indexer_site_selection_rejects_unknown_or_empty_enabled_selection(self):
@@ -361,11 +361,11 @@ class DiscoveryConfigTests(unittest.TestCase):
             "DISCOVERY_RESOURCE_RESULTS_ENABLED": "1",
             "INDEXER_ENABLED_SITES": "nyaa,mikan",
             "INDEXER_SUKEBEI_ENABLED": "0",
-            "INDEXER_SITE_CONFIG_VERSION": "2",
+            "INDEXER_SITE_CONFIG_VERSION": "3",
         })
 
-    def test_config_read_migrates_combined_site_and_preserves_legacy_sukebei(self):
-        for version, expected in (("", "btbtla,aipan,dygang,ys5266,sukebei"), ("2", "btbtla,sukebei")):
+    def test_config_read_filters_agent_sources_and_preserves_legacy_sukebei(self):
+        for version, expected in (("", "btbtla,sukebei"), ("2", "btbtla,sukebei")):
             values={"INDEXER_ENABLED_SITES":"btbtla", "INDEXER_SITE_CONFIG_VERSION":version,"INDEXER_SUKEBEI_ENABLED":"1"}
             with self.subTest(version=version), patch("app.routes.api.config.all_items",return_value=values), patch("app.routes.api.config.get",side_effect=lambda key,default="":values.get(key,default)), patch("app.routes.api.config.get_bool",side_effect=lambda key,default=False: True if key=="INDEXER_SUKEBEI_ENABLED" else default):
                 result=get_config(self.request)
@@ -376,7 +376,7 @@ class DiscoveryConfigTests(unittest.TestCase):
         response,persist=self._save({"INDEXER_ENABLED_SITES":"btbtla"},existing=old)
         self.assertEqual(response,{"success":True})
         saved={**old,**persist.call_args.args[0]}
-        self.assertEqual(saved["INDEXER_SITE_CONFIG_VERSION"],"2")
+        self.assertEqual(saved["INDEXER_SITE_CONFIG_VERSION"],"3")
         self.assertEqual(saved["INDEXER_SUKEBEI_ENABLED"],"0")
         with patch("app.routes.api.config.all_items",return_value=saved), patch("app.routes.api.config.get",side_effect=lambda key,default="":saved.get(key,default)), patch("app.routes.api.config.get_bool",return_value=False):
             reloaded=get_config(self.request)

@@ -173,6 +173,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         from app.indexers.registry import build_default_registry
 
         clients = {site_id: object() for site_id in FakeRegistry().ids()}
+        clients["kpkuang"] = object()
         btbtla_adapter = SimpleNamespace(site_id="btbtla", default_enabled=True)
         with patch(
             "app.indexers.registry.BTBtlaAdapter", return_value=btbtla_adapter
@@ -185,7 +186,7 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             registry.ids(),
-            ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "tpb"),
+            ("nyaa", "sukebei", "mikan", "btbtla", "aipan", "dygang", "ys5266", "kpkuang", "tpb"),
         )
         self.assertEqual(build_btbtla.call_args.kwargs["page_size"], 37)
         self.assertEqual(build_btbtla.call_args.kwargs["cache_ttl_seconds"], 73)
