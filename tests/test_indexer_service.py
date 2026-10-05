@@ -12,6 +12,7 @@ from app.indexers.errors import (
     IndexerUnavailable,
     IndexerValidationError,
 )
+from app.indexers.ranking import candidate_sort_key
 from app.indexers.models import (
     IndexerItem,
     IndexerMediaSearchRequest,
@@ -689,7 +690,7 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         entries = [(0, n, entry) for n, entry in enumerate(candidates)]
         self.assertEqual(candidates[0].relevance_score, candidates[1].relevance_score)
         self.assertIs(IndexerService._deduplicate_candidates(entries)[0][2], candidates[1])
-        self.assertIs(min(entries, key=lambda entry: IndexerService._candidate_sort_key(entry, "relevance_desc"))[2], candidates[1])
+        self.assertIs(min(entries, key=lambda entry: candidate_sort_key(entry, "relevance_desc"))[2], candidates[1])
 
     async def test_explicit_episode_keeps_priority_over_series_premiere_year(self):
         # 剧集首播年不一定等于后续季发布年；不能用年份层级盖过明确季集匹配。

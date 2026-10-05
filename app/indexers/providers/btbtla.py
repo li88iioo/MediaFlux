@@ -5,6 +5,8 @@ import html
 import re
 import time
 import unicodedata
+from collections import OrderedDict
+from dataclasses import dataclass, replace
 from collections.abc import Awaitable, Callable
 from urllib.parse import quote, unquote, urlsplit
 
@@ -18,11 +20,14 @@ from ..errors import (
     IndexerSecurityError,
     IndexerUnavailable,
 )
-from ..models import IndexerCapabilities, IndexerItem, IndexerPage, IndexerSearchRequest, ResolvedDownload
+from ..models import IndexerCapabilities, IndexerItem, IndexerMediaSearchRequest, IndexerPage, IndexerSearchRequest, ResolvedDownload
+from ..ranking import candidate_sort_key, rank_item
 from .base import IndexerAdapter, fixed_host_join, is_likely_challenge_page, magnet_infohash, parse_size_bytes, require_html_response
 
 _MAGNET_CANDIDATE = re.compile(r"magnet:\?[^\"'\s<>]+", re.IGNORECASE)
-_RESOURCE_SIZE_SUFFIX = re.compile(r"\[\s*([0-9]+(?:\.[0-9]+)?\s*[KMGTPE]?i?B)\s*\]\s*$", re.IGNORECASE)
+_RESOURCE_SIZE = re.compile(r"\[\s*([0-9]+(?:\.[0-9]+)?\s*[KMGTPE]?i?B)\s*\]", re.IGNORECASE)
+_EXCLUDED_RESOURCE_TABS = frozenset({"720p", "480p", "other"})
+_MAX_CATALOG_PAGES = 100  # 与公共搜索page上限一致；不缓存无法请求的页面。
 _TRAILING_YEAR = re.compile(r"^(.+?)[ ._\-(（]*((?:18|19|20|21)\d{2}|2200)[)）]?(?:年)?$")
 _SEARCH_TOKEN = re.compile(r"[^0-9a-z\u3400-\u9fff]+", re.IGNORECASE)
 _ACCESS_BLOCK_MARKERS = (
@@ -34,6 +39,15 @@ _ACCESS_BLOCK_MARKERS = (
     "请求过于频繁",
     "人机验证",
 )
+
+
+@dataclass(slots=True)
+class _ResourcePages:
+    expires_at: float
+    pages: list[list[IndexerItem]]
+    next_native_page: int | None = 1
+    truncated_count: int = 0
+
 
 
 class BTBtlaAdapter(IndexerAdapter):
@@ -52,9 +66,15 @@ class BTBtlaAdapter(IndexerAdapter):
         monotonic: Callable[[], float] | None = None,
         sleeper: Callable[[float], Awaitable[None]] | None = None,
         max_detail_candidates: int = 2,
+        page_size: int = 40,
+        cache_ttl_seconds: float = 120,
         mirror_base_urls: tuple[str, ...] | None = None,
     ):
         self.http = http
+        self.page_size = max(1, min(int(page_size), 100))
+        self.cache_ttl_seconds = max(1.0, float(cache_ttl_seconds))
+        self._catalog_lock = CrossLoopAsyncLock()
+        self._catalogs: OrderedDict[IndexerSearchRequest, _ResourcePages] = OrderedDict()
         self.min_interval_seconds = max(0.0, float(min_interval_seconds))
         self._monotonic = monotonic or time.monotonic
         self._sleep = sleeper or asyncio.sleep
@@ -72,6 +92,60 @@ class BTBtlaAdapter(IndexerAdapter):
         return self.min_interval_seconds * paced_gaps
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
+        # 站点一张影片详情含数百个版本。先排序再分页，不能让服务层40条窗口
+        # 截断整部作品；原生影片搜索页只在当前页的所有资源窗口用完后读取。
+        # 排序范围为已取回的影片搜索页；不会为“全站全局排序”后台遍历所有影片。
+        key = replace(request, page=1)
+        async with self._catalog_lock:
+            now = self._monotonic()
+            for old_key in list(self._catalogs):
+                if self._catalogs[old_key].expires_at <= now:
+                    del self._catalogs[old_key]
+            catalog = self._catalogs.get(key)
+            if catalog is None:
+                catalog = _ResourcePages(now + self.cache_ttl_seconds, [])
+            fetches = 0
+            while len(catalog.pages) < request.page and catalog.next_native_page is not None:
+                if fetches == 2:
+                    raise IndexerResultExpired("BTBtla resource page requires earlier pages", public_message="资源分页已过期，请重新搜索后继续加载")
+                native = await self._search_native(replace(request, page=catalog.next_native_page))
+                media = IndexerMediaSearchRequest.create(
+                    title=request.query, year=request.year, media_type=request.media_type,
+                    season=request.season, episode=request.episode,
+                )
+                ranked = [rank_item(item, media=media, fallback_query=request.query) for item in native.items]
+                ranked = [entry[1] for entry in sorted(enumerate(ranked), key=lambda entry: candidate_sort_key((0, entry[0], entry[1]), request.sort_mode))]
+                known = {item.detail_url for page_items in catalog.pages for item in page_items if item.detail_url}
+                ranked = [item for item in ranked if not item.detail_url or item.detail_url not in known]
+                fetches += 1
+                room = (_MAX_CATALOG_PAGES - len(catalog.pages)) * self.page_size
+                catalog.truncated_count += max(0, len(ranked) - room)
+                ranked = ranked[:room]
+                windows = [ranked[offset:offset + self.page_size] for offset in range(0, len(ranked), self.page_size)]
+                # 过滤后空页优先在同一预算内补取下一原生页；连续空页仍受两次读取限制。
+                if not windows and (not native.has_more or fetches == 2):
+                    windows = [[]]
+                catalog.pages.extend(windows)
+                catalog.next_native_page = (
+                    catalog.next_native_page + 1
+                    if native.has_more and len(catalog.pages) < _MAX_CATALOG_PAGES else None
+                )
+                self._catalogs[key] = catalog
+                self._catalogs.move_to_end(key)
+                while len(self._catalogs) > 16:
+                    self._catalogs.popitem(last=False)
+            if request.page > len(catalog.pages):
+                return IndexerPage([], request.page, False, True)
+            return IndexerPage(
+                items=[replace(item) for item in catalog.pages[request.page - 1]],
+                page=request.page,
+                has_more=request.page < len(catalog.pages) or catalog.next_native_page is not None,
+                pagination_supported=True,
+                total_items=(len(catalog.pages[-1]) + catalog.truncated_count)
+                if request.page == len(catalog.pages) and catalog.truncated_count else None,
+            )
+
+    async def _search_native(self, request: IndexerSearchRequest) -> IndexerPage:
         last_error: IndexerRateLimited | IndexerUnavailable | None = None
         for base_url in self._host_bases:
             try:
@@ -276,6 +350,12 @@ class BTBtlaAdapter(IndexerAdapter):
         seen_urls: set[str] = set()
         download_list = soup.select_one("#download-list")
         scope = download_list if download_list is not None else soup
+        tabs = scope.select(".downtab-item [data-dropdown-value]") or soup.select(".downtab-item [data-dropdown-value]")
+        panels = scope.select(".module-downlist")
+        excluded = {
+            id(panel) for tab, panel in zip(tabs, panels)
+            if str(tab.get("data-dropdown-value") or tab.get_text(strip=True)).strip().casefold() in _EXCLUDED_RESOURCE_TABS
+        } if len(tabs) == len(panels) else set()
         modern_rows = scope.select(".module-row-info")
         legacy_rows = scope.select(".module-row-one")
         # 线上页面会同时保留少量旧 Tab 容器和全部现代资源行。旧实现用
@@ -284,6 +364,8 @@ class BTBtlaAdapter(IndexerAdapter):
         # 元数据块、把真正的下载链接放在外层；两类节点都扫描并由 URL 去重。
         rows = [*modern_rows, *legacy_rows]
         for row in rows:
+            if any(id(parent) in excluded for parent in row.parents):
+                continue
             resource_anchor = None
             resource_url = ""
             anchors = row.select("a.module-row-text[href]") or row.find_all("a", href=True)
@@ -308,14 +390,18 @@ class BTBtlaAdapter(IndexerAdapter):
                 heading = row.find("h4")
                 if heading is not None:
                     visible_title = heading.get_text(" ", strip=True)
-            size_match = _RESOURCE_SIZE_SUFFIX.search(visible_title)
+            size_match = _RESOURCE_SIZE.search(visible_title)
             size_text = size_match.group(1).strip() if size_match else None
-            title = _RESOURCE_SIZE_SUFFIX.sub("", visible_title).strip()
+            title = _RESOURCE_SIZE.sub("", visible_title, count=1).strip()
             if not title:
                 title = str(resource_anchor.get("title") or "").strip()
                 title = re.sub(r"\.torrent$", "", title, flags=re.IGNORECASE).strip()
             if not title:
                 continue
+            # 源站title属性给出明确作品名，可补回纯英文发行标题的匹配证据。
+            if canonical := re.match(r"《([^》]+)》", str(resource_anchor.get("title") or "")):
+                if canonical[1] not in title:
+                    title = f"{canonical[1]} / {title}"
 
             downloads = None
             download_counters = list(row.select("a.btn-down[href]"))

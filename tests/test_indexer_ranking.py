@@ -44,6 +44,9 @@ class IndexerRankingTests(unittest.TestCase):
             ("起义.1920.WEB-DL", True, False, 3),
             ("起义.1920.1920x1080.WEB-DL", True, False, 3),
             ("起义.2026.1920x1080.WEB-DL", False, True, 0),
+            ("起义.S01E01.2160p.WEB-DL", False, False, 1),
+            ("起义.S01E01.2160P.WEB-DL", False, False, 1),
+            ("起义.2026.2160p.WEB-DL", False, True, 0),
         ]
 
         for title, has_conflict, has_match, expected_priority in cases:

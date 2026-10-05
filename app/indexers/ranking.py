@@ -20,7 +20,8 @@ _HAN_CHAR = re.compile(r"[\u3400-\u9fff]")
 _YEAR = re.compile(r"(?<!\d)(18\d{2}|19\d{2}|20\d{2}|21\d{2}|2200)(?!\d)")
 _TECHNICAL_YEAR_VALUE = re.compile(
     r"(?<!\d)\d{3,5}\s*[x×]\s*\d{3,5}(?!\d)"
-    r"|(?<!\d)\d+(?:[.,]\d+)?\s*(?:[kmgt]?(?:bps|b/s|bits?/s))(?![a-z])",
+    r"|(?<!\d)\d+(?:[.,]\d+)?\s*(?:[kmgt]?(?:bps|b/s|bits?/s))(?![a-z])"
+    r"|(?<![a-z0-9])(?:480|576|720|1080|1440|1920|2160|4320)\s*[pi](?![a-z0-9])",
     re.IGNORECASE,
 )
 _BRACKET_GROUP = re.compile(r"[\[【(（]([^\]】)）]{1,80})[\]】)）]")
@@ -243,3 +244,83 @@ def annotate_clusters(items: list[IndexerItem]) -> list[IndexerItem]:
         cluster_id = "c_" + hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
         output.append(replace(item, cluster_id=cluster_id, cluster_size=counts[signature]))
     return output
+
+
+def published_timestamp(value: datetime | None) -> float:
+    if value is None:
+        return -1.0
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+def match_order(item: IndexerItem) -> tuple[int, int]:
+    if "episode_exact" in item.match_reasons:
+        position_priority = 0
+    elif "episode_range" in item.match_reasons:
+        position_priority = 1
+    elif "season_match" in item.match_reasons:
+        position_priority = 2
+    elif "episode_conflict" in item.match_reasons:
+        position_priority = 4
+    else:
+        position_priority = 3
+    return position_priority, match_priority(item)
+
+def candidate_sort_key(
+    entry: tuple[int, int, IndexerItem],
+    sort_mode: str,
+) -> tuple[object, ...]:
+    site_index, provider_index, item = entry
+    if sort_mode == "source_order":
+        return site_index, provider_index
+    relevance = int(item.relevance_score or 0)
+    seeders = int(item.seeders if item.seeders is not None else -1)
+    size = item.size_bytes
+    published_value = published_timestamp(item.published_at)
+    position = parse_indexer_release_position(item.title)
+    season = position.get("season")
+    episode = position.get("episode")
+    episode_end = position.get("episode_end") or episode
+    priority = match_order(item)
+    stable = (-relevance, -seeders, -published_value, site_index, provider_index)
+    if sort_mode == "published_desc":
+        return (
+            *priority,
+            -published_value,
+            -relevance,
+            -seeders,
+            site_index,
+            provider_index,
+        )
+    if sort_mode == "episode_desc":
+        return (
+            *priority,
+            -(season if season is not None else -1),
+            -(episode_end if episode_end is not None else -1),
+            -(episode if episode is not None else -1),
+            *stable,
+        )
+    if sort_mode == "seeders_desc":
+        return (
+            *priority,
+            -seeders,
+            -relevance,
+            -published_value,
+            site_index,
+            provider_index,
+        )
+    if sort_mode == "size_desc":
+        return (
+            *priority,
+            size is None,
+            -(size if size is not None else 0),
+            *stable,
+        )
+    if sort_mode == "size_asc":
+        return (
+            *priority,
+            size is None,
+            size if size is not None else 0,
+            *stable,
+        )
+    return (*priority, *stable)

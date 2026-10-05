@@ -33,9 +33,8 @@ from .models import (
 from .providers.base import magnet_infohash
 from .providers.base import page_observer, report_page
 from .query_plan import build_site_queries, needs_bilingual_search
-from .ranking import annotate_clusters, match_priority, rank_item
+from .ranking import annotate_clusters, candidate_sort_key, match_order, published_timestamp, rank_item
 from .registry import IndexerRegistry
-from .release import parse_indexer_release_position
 from .result_store import IndexerResultStore
 
 logger = get_logger(__name__)
@@ -506,7 +505,7 @@ class IndexerService:
             provider_items = [rank_item(item, media=ranking_context, fallback_query=display_query, now=self._clock()) for item in page_result.items]
             provider_items = [entry[1] for entry in sorted(
                 enumerate(provider_items),
-                key=lambda entry: self._candidate_sort_key((site_index, entry[0], entry[1]), sort_mode),
+                key=lambda entry: candidate_sort_key((site_index, entry[0], entry[1]), sort_mode),
             )][: self.max_results_per_site]
             collected = max(len(page_result.items), page_result.total_items or 0)
             site_collected_counts[site_id] = collected
@@ -539,7 +538,7 @@ class IndexerService:
         candidates = self._deduplicate_candidates(candidates)
         for _site_index, _provider_index, candidate in candidates:
             site_visible_counts[candidate.site_id] += 1
-        candidates.sort(key=lambda entry: self._candidate_sort_key(entry, sort_mode))
+        candidates.sort(key=lambda entry: candidate_sort_key(entry, sort_mode))
         ranked_items = annotate_clusters([entry[2] for entry in candidates])
         items: list[IndexerItem] = []
         for candidate in ranked_items:
@@ -781,28 +780,6 @@ class IndexerService:
             )
         return tuple(selected)
 
-    @staticmethod
-    def _published_timestamp(value: datetime | None) -> float:
-        if value is None:
-            return -1.0
-        if value.tzinfo is None:
-            value = value.replace(tzinfo=timezone.utc)
-        return value.timestamp()
-
-    @staticmethod
-    def _match_order(item: IndexerItem) -> tuple[int, int]:
-        if "episode_exact" in item.match_reasons:
-            position_priority = 0
-        elif "episode_range" in item.match_reasons:
-            position_priority = 1
-        elif "season_match" in item.match_reasons:
-            position_priority = 2
-        elif "episode_conflict" in item.match_reasons:
-            position_priority = 4
-        else:
-            position_priority = 3
-        return position_priority, match_priority(item)
-
     @classmethod
     def _candidate_preference(
         cls,
@@ -811,7 +788,7 @@ class IndexerService:
         site_index, provider_index, item = entry
         state_rank = {"ready": 2, "resolvable": 1}.get(item.download_state, 0)
         actionable_rank = int(state_rank > 0)
-        published_value = cls._published_timestamp(item.published_at)
+        published_value = published_timestamp(item.published_at)
         metadata_count = sum(
             value is not None and value != ""
             for value in (
@@ -826,7 +803,7 @@ class IndexerService:
         )
         return (
             actionable_rank,
-            *(-value for value in cls._match_order(item)),
+            *(-value for value in match_order(item)),
             int(item.relevance_score or 0),
             state_rank,
             int(item.seeders if item.seeders is not None else -1),
@@ -860,67 +837,6 @@ class IndexerService:
                 output[existing_position] = entry
         return output
 
-    @classmethod
-    def _candidate_sort_key(
-        cls,
-        entry: tuple[int, int, IndexerItem],
-        sort_mode: str,
-    ) -> tuple[object, ...]:
-        site_index, provider_index, item = entry
-        if sort_mode == "source_order":
-            return site_index, provider_index
-        relevance = int(item.relevance_score or 0)
-        seeders = int(item.seeders if item.seeders is not None else -1)
-        size = item.size_bytes
-        published_value = cls._published_timestamp(item.published_at)
-        position = parse_indexer_release_position(item.title)
-        season = position.get("season")
-        episode = position.get("episode")
-        episode_end = position.get("episode_end") or episode
-        priority = cls._match_order(item)
-        stable = (-relevance, -seeders, -published_value, site_index, provider_index)
-        if sort_mode == "published_desc":
-            return (
-                *priority,
-                -published_value,
-                -relevance,
-                -seeders,
-                site_index,
-                provider_index,
-            )
-        if sort_mode == "episode_desc":
-            return (
-                *priority,
-                -(season if season is not None else -1),
-                -(episode_end if episode_end is not None else -1),
-                -(episode if episode is not None else -1),
-                *stable,
-            )
-        if sort_mode == "seeders_desc":
-            return (
-                *priority,
-                -seeders,
-                -relevance,
-                -published_value,
-                site_index,
-                provider_index,
-            )
-        if sort_mode == "size_desc":
-            return (
-                *priority,
-                size is None,
-                -(size if size is not None else 0),
-                *stable,
-            )
-        if sort_mode == "size_asc":
-            return (
-                *priority,
-                size is None,
-                size if size is not None else 0,
-                *stable,
-            )
-        return (*priority, *stable)
-
     async def _search_site_plan(
         self,
         site_id: str,
@@ -948,6 +864,7 @@ class IndexerService:
         last_outcome: _ProviderOutcome | None = None
         last_error: _ProviderOutcome | None = None
         merged_items: list[IndexerItem] = []
+        reported_omissions = 0
         page_errors: dict[tuple[str, str], IndexerProviderError] = {}
         contributed_query = ""
         has_more = False
@@ -997,6 +914,7 @@ class IndexerService:
             last_outcome = outcome
             if outcome.page is None:
                 continue
+            reported_omissions = max(reported_omissions, (outcome.page.total_items or 0) - len(outcome.page.items))
             page_errors.update(((err.code, err.message), err) for err in outcome.page.errors)
             has_more = has_more or bool(outcome.page.has_more)
             pagination_supported = pagination_supported or bool(
@@ -1039,7 +957,7 @@ class IndexerService:
             ]
             ranked_entries = list(enumerate(ranked_items))
             ranked_entries.sort(
-                key=lambda entry: self._candidate_sort_key(
+                key=lambda entry: candidate_sort_key(
                     (0, entry[0], entry[1]),
                     sort_mode,
                 )
@@ -1049,7 +967,7 @@ class IndexerService:
                 site_id=site_id,
                 page=IndexerPage(
                     items=ranked_items[: self.max_results_per_site],
-                    total_items=len(ranked_items),
+                    total_items=len(ranked_items) + reported_omissions,
                     page=page,
                     has_more=has_more,
                     pagination_supported=pagination_supported,
