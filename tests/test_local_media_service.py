@@ -1722,6 +1722,222 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertIn("Movie (2026) {tmdb-1}", target_path)
             self.assertNotIn("LOCAL-", target_path)
 
+    def _prepare_notification_local_task(
+        self,
+        root: Path,
+        *,
+        name: str,
+        filenames: tuple[str, ...],
+        media_type: str,
+        mode: str = "move",
+        conflict_indexes: tuple[int, ...] = (),
+        execute: bool = True,
+    ):
+        source_root, target_root = root / "downloads", root / "library"
+        source_root.mkdir(parents=True)
+        target_root.mkdir()
+        for filename in filenames:
+            (source_root / filename).write_bytes(b"incoming video")
+        source_id = db.create_local_media_source(
+            name=name, qb_profile="", qb_path_prefix="", local_root=str(source_root),
+            stable_seconds=0, mode=mode, owner="admin",
+        )
+        db.upsert_local_library_target(
+            source_id, media_type, str(target_root), owner="admin",
+        )
+        service = LocalMediaService(scraper=FakeScraper(MatchResult(
+            tmdb_id="1", title="Show" if media_type == "tv" else "Movie",
+            year="2026", media_type=media_type, confidence=1.0,
+        )))
+        inspection = service.inspect_source("admin", source_id, source_root)
+        rules = OrganizeRules(
+            region_split=False, year_split=False, naming_scope="both",
+            conflict_strategy=1, emby_refresh=False, clean_empty=False,
+            media_probe_enabled=False,
+        )
+        with patch("app.modules.local_media_service.OrganizeRules.from_config", return_value=rules):
+            preview = service.preview("admin", inspection["inspection_id"])
+            for index in conflict_indexes:
+                target = Path(preview["plans"][index]["target_path"])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"existing library version is longer")
+            if conflict_indexes:
+                preview = service.preview("admin", inspection["inspection_id"])
+            task_id = service.create_manual_task(
+                "admin", inspection["inspection_id"],
+                preview_digest=preview["preview_digest"],
+            )
+            if execute:
+                self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+                service.execute_task("admin", task_id)
+        return service, task_id
+
+    def test_download_notification_uses_real_local_media_file_outcome(self):
+        from app.modules.local_media_outcomes import local_media_task_outcome
+        from app.modules.telegram_notification_center import (
+            deserialize_notification_event,
+            serialize_notification_event,
+        )
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+        from app.modules import telegram_notification_center as center
+        from app.repositories.local_media import reconcile_local_media_downloads
+        from app.repositories.telegram_notifications import get_notification
+        from app.notifier import render_event
+
+        cases = (
+            ("preview", ("Movie.2026.mkv",), "movie", "preview_only", (), "preview_only"),
+            ("all-skip", ("Movie.2026.mkv",), "movie", "move", (0,), "conflict_skipped"),
+            (
+                "partial", ("Show.S01E01.mkv", "Show.S01E02.mkv"),
+                "tv", "move", (0,), "partial",
+            ),
+            ("archive", ("Movie.2026.mkv",), "movie", "move", (), "archived"),
+        )
+        expected_fields = {
+            "preview_only": "未移动",
+            "conflict_skipped": "冲突跳过",
+            "partial": "已归档",
+            "archived": "已归档",
+        }
+        with (
+            patch("app.modules.telegram_notification_policy.notifications_enabled", return_value=True),
+            patch("app.modules.telegram_notification_policy.notification_level", return_value="standard"),
+            patch("app.modules.telegram_download_lifecycle.config.get_bool", return_value=True),
+            patch.object(center, "wake_telegram_notification_dispatcher"),
+            patch.object(center, "send_event_result", side_effect=AssertionError("Telegram transport is disabled")),
+            patch.object(center, "edit_event_result", side_effect=AssertionError("Telegram transport is disabled")),
+            tempfile.TemporaryDirectory() as temporary_root,
+        ):
+            root = Path(temporary_root)
+            for name, filenames, media_type, mode, conflicts, expected_outcome in cases:
+                with self.subTest(outcome=expected_outcome):
+                    service, task_id = self._prepare_notification_local_task(
+                        root / name, name=f"notification-{name}", filenames=filenames,
+                        media_type=media_type, mode=mode, conflict_indexes=conflicts,
+                    )
+                    try:
+                        task = db.get_local_media_task(task_id, owner="admin")
+                        outcome = local_media_task_outcome(
+                            task, db.list_local_media_task_items(task_id, owner="admin"),
+                        )
+                        self.assertEqual(outcome["file_outcome"], expected_outcome)
+
+                        request_id, _ = db.create_download_request(
+                            f"notification-local-{name}", "magnet", title=name, chat_id="100",
+                        )
+                        db.update_download_request(
+                            request_id, status="completed", qb_status="completed",
+                            local_import_status="pending",
+                            local_import_target=f"local-media-task:{task_id}",
+                        )
+                        with db.get_conn() as conn:
+                            reconcile_local_media_downloads(conn, task_id=task_id)
+
+                        files_before = {str(path): path.read_bytes() for path in (root / name).rglob("*.mkv")}
+                        with patch.object(db, "get_local_media_task", wraps=db.get_local_media_task) as read_task, patch.object(
+                            db, "list_local_media_task_items", wraps=db.list_local_media_task_items,
+                        ) as read_items:
+                            published = publish_download_lifecycle(request_id, deliver_now=False)
+                        self.assertEqual(read_task.call_count, 1)
+                        self.assertEqual(read_items.call_count, 1)
+                        self.assertTrue(published.accepted, published)
+                        row = get_notification(published.event_key)
+                        event = deserialize_notification_event(row["event_json"])
+                        local_value = dict(event.fields)["本地整理"]
+                        self.assertIn(expected_fields[expected_outcome], local_value)
+                        if expected_outcome in {"preview_only", "conflict_skipped"}:
+                            self.assertEqual(event.title, "✅ 下载完成（自动入库已跳过）")
+                            self.assertEqual(event.state, "downloaded")
+                        else:
+                            self.assertEqual(event.title, "✅ 下载与入库完成")
+                            self.assertEqual(event.state, "completed")
+                        self.assertEqual(db.get_download_request(request_id)["local_import_status"], "completed")
+                        self.assertEqual(row["event_json"], serialize_notification_event(event))
+                        self.assertIn(expected_fields[expected_outcome], render_event(event))
+                        self.assertEqual(row["revision"], 1)
+
+                        publish_download_lifecycle(request_id, deliver_now=False)
+                        repeated = get_notification(published.event_key)
+                        self.assertEqual(repeated["revision"], 1)
+                        self.assertEqual(repeated["event_json"], row["event_json"])
+                        self.assertEqual({str(path): path.read_bytes() for path in (root / name).rglob("*.mkv")}, files_before)
+                    finally:
+                        service.close()
+
+            history_id, _ = db.create_download_request(
+                "notification-local-history", "magnet", title="history", chat_id="100",
+            )
+            db.update_download_request(
+                history_id, status="completed", qb_status="completed", local_import_status="completed",
+                local_import_target="/library/history",
+            )
+            history = publish_download_lifecycle(history_id, deliver_now=False)
+            history_row = get_notification(history.event_key)
+            history_event = deserialize_notification_event(history_row["event_json"])
+            self.assertEqual(history_event.title, "✅ 下载与入库完成")
+            self.assertEqual(dict(history_event.fields)["本地整理"], "完成")
+
+    def test_download_notification_revision_tracks_local_task_completion(self):
+        from app.modules.telegram_notification_policy import NotificationTopic
+        from app.modules.telegram_notification_center import (
+            deserialize_notification_event,
+            get_notification_thread_snapshot,
+        )
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+        from app.modules import telegram_notification_center as center
+        from app.repositories.local_media import reconcile_local_media_downloads
+        from app.repositories.telegram_notifications import get_notification
+
+        with (
+            patch("app.modules.telegram_notification_policy.notifications_enabled", return_value=True),
+            patch("app.modules.telegram_notification_policy.notification_level", return_value="standard"),
+            patch("app.modules.telegram_download_lifecycle.config.get_bool", return_value=True),
+            patch.object(center, "wake_telegram_notification_dispatcher"),
+            patch.object(center, "send_event_result", side_effect=AssertionError("Telegram transport is disabled")),
+            patch.object(center, "edit_event_result", side_effect=AssertionError("Telegram transport is disabled")),
+            tempfile.TemporaryDirectory() as temporary_root,
+        ):
+            service, task_id = self._prepare_notification_local_task(
+                Path(temporary_root), name="notification-revision",
+                filenames=("Movie.2026.mkv",), media_type="movie", execute=False,
+            )
+            try:
+                request_id, _ = db.create_download_request(
+                    "notification-local-revision", "magnet", title="revision", chat_id="100",
+                )
+                db.update_download_request(
+                    request_id, status="completed", qb_status="completed",
+                    local_import_status="pending",
+                    local_import_target=f"local-media-task:{task_id}",
+                )
+                first = publish_download_lifecycle(request_id, deliver_now=False)
+                first_row = get_notification(first.event_key)
+                self.assertEqual(first_row["revision"], 1)
+                self.assertNotIn("已归档", first_row["event_json"])
+
+                self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+                service.execute_task("admin", task_id)
+                with db.get_conn() as conn:
+                    reconcile_local_media_downloads(conn, task_id=task_id)
+
+                latest = publish_download_lifecycle(request_id, deliver_now=False)
+                latest_row = get_notification(latest.event_key)
+                self.assertEqual(latest_row["revision"], 2)
+                self.assertNotEqual(latest_row["event_json"], first_row["event_json"])
+                event = deserialize_notification_event(latest_row["event_json"])
+                self.assertIn("已归档", dict(event.fields)["本地整理"])
+                snapshot = get_notification_thread_snapshot(
+                    f"download:{request_id}", topic=NotificationTopic.DOWNLOAD,
+                    chat_id="100",
+                )
+                self.assertEqual(snapshot.revision, 2)
+                self.assertFalse(snapshot.current_revision_delivered)
+
+                publish_download_lifecycle(request_id, deliver_now=False)
+                self.assertEqual(get_notification(latest.event_key)["revision"], 2)
+            finally:
+                service.close()
+
 
 
 @pytest.fixture

@@ -926,6 +926,46 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         self.assertIn(("本地整理", "失败"), event.fields)
         self.assertEqual(event.footer, reason)
 
+    def test_download_without_archive_evidence_never_claims_ingest_completed(self) -> None:
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        cases = (
+            ({"status": "completed", "qb_status": "completed"}, "✅ 下载完成", "downloaded"),
+            ({"status": "completed", "qb_status": "completed", "local_import_status": "planned"}, "⏳ 下载与入库处理中", "processing"),
+            ({"status": "submitting", "qb_status": "completed", "gy_status": "submitting", "local_import_status": "completed"}, "⏳ 下载与入库处理中", "processing"),
+        )
+        for index, (fields, title, state) in enumerate(cases):
+            with self.subTest(fields=fields):
+                request_id, _ = db.create_download_request(f"tg-archive-evidence-{index}", "magnet", title="任务", chat_id="100")
+                db.update_download_request(request_id, **fields)
+                event = build_download_lifecycle_event(db.get_download_request(request_id), probe_progress={})
+                self.assertEqual(event.title, title)
+                self.assertEqual(event.state, state)
+
+    def test_local_archive_reference_uses_exact_integer_identity(self) -> None:
+        from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
+
+        task_id = 2**53 + 1
+        with patch.object(db, "get_local_media_task", return_value=None) as lookup:
+            event = build_download_lifecycle_event({
+                "id": 0, "status": "completed", "local_import_status": "completed",
+                "local_import_target": f"local-media-task:{task_id}",
+            }, probe_progress={})
+        lookup.assert_called_once_with(task_id)
+        self.assertEqual(dict(event.fields)["本地整理"], "完成")
+
+    def test_manual_attention_keeps_action_priority_when_probe_fails(self) -> None:
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        request_id, _ = db.create_download_request("tg-probe-attention", "magnet", title="任务", chat_id="100")
+        db.update_download_request(request_id, status="completed", qb_status="completed", local_import_status="requires_manual")
+        with patch("app.modules.telegram_download_lifecycle._load_probe_progress", return_value={"total": 1, "failed": 1}), patch(
+            "app.modules.telegram_download_lifecycle.publish_notification_thread"
+        ) as publish:
+            publish_download_lifecycle(request_id, deliver_now=False)
+        self.assertEqual(publish.call_args.kwargs["importance"], NotificationImportance.ACTION)
+        self.assertEqual(publish.call_args.args[1].state, "attention")
+
     def test_skipped_local_import_does_not_claim_ingest_completed(self) -> None:
         from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
 

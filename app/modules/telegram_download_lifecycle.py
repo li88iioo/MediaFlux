@@ -6,6 +6,7 @@ from dataclasses import replace
 import json
 
 from app import config, database as db
+from app.modules.local_media_outcomes import local_media_task_outcome
 from app.modules.telegram_notification_center import (
     NotificationPublishResult,
     get_notification_thread_event,
@@ -26,6 +27,7 @@ _STATUS_LABELS = {
     "": "—",
     "pending": "等待中",
     "submitted": "已提交",
+    "submitting": "提交中",
     "downloading": "下载中",
     "outcome_unknown": "结果待核对",
     "completed": "完成",
@@ -46,7 +48,7 @@ _STATUS_LABELS = {
 }
 _ATTENTION_STATES = {"manual_review", "requires_manual"}
 _ERROR_STATES = {"failed", "partial", "stopped", "outcome_unknown"}
-_PROCESSING_STATES = {"pending", "submitted", "downloading", "running", "queued", "settling"}
+_PROCESSING_STATES = {"pending", "submitting", "submitted", "downloading", "running", "queued", "settling", "planned"}
 
 
 def _value(row, key: str, default: object = "") -> object:
@@ -92,44 +94,47 @@ def _download_label(row) -> str:
     return " · ".join(parts) or _label(_value(row, "status"), empty="等待开始")
 
 
-def _archive_label(row) -> tuple[str, str]:
+def _archive_stage(row) -> tuple[str, str, str]:
+    """一次读取本地文件事实，阶段文案、总状态及投递级别共同使用。"""
     local_status = _status(_value(row, "local_import_status"))
     organize_status = _status(_value(row, "organize_status"))
+    reference = str(_value(row, "local_import_target"))
+    prefix = "local-media-task:"
+    suffix = reference.removeprefix(prefix)
+    task_id = int(suffix) if reference.startswith(prefix) and len(suffix) <= 19 and suffix.isascii() and suffix.isdigit() else 0
+    if local_status == "completed" and 0 < task_id < 2**63:
+        task = db.get_local_media_task(task_id)
+        if task is not None:
+            outcome = local_media_task_outcome(task, db.list_local_media_task_items(task_id))
+            kind = outcome["file_outcome"]
+            archived, skipped = outcome["archived_video_count"], outcome["skipped_video_count"]
+            if kind == "preview_only":
+                return "本地整理", "skipped", "仅预览，未移动文件"
+            if kind == "conflict_skipped":
+                return "本地整理", "skipped", f"冲突跳过 {skipped} 项，未新增归档"
+            if kind not in {"archived", "partial"} or outcome["unknown_video_count"]:
+                return "本地整理", "manual_review", "归档结果待核对"
+            detail = f"已归档 {archived} 项" + (f" · 冲突跳过 {skipped} 项" if skipped else "")
+            return "本地整理", "completed", detail
     if local_status:
-        return "本地整理", _label(local_status)
+        return "本地整理", local_status, _label(local_status)
     if organize_status:
-        return "光鸭整理", _label(organize_status)
+        return "光鸭整理", organize_status, _label(organize_status)
     downloads = {_status(_value(row, key)) for key in ("qb_status", "gy_status")} - {""}
     if downloads and downloads.issubset({"failed", "manual_review", "cancelled", "resubmitted"}):
-        return "自动整理", "未启动（需核对下载状态）" if "manual_review" in downloads else "未启动（下载已停止）"
-    return "自动整理", "等待下载完成"
+        return "自动整理", "", "未启动（需核对下载状态）" if "manual_review" in downloads else "未启动（下载已停止）"
+    detail = "尚无入库完成记录" if _status(_value(row, "status")) in {"completed", "success"} else "等待下载完成"
+    return "自动整理", "", detail
 
 
-def _importance(row, *, verification_status: str = "") -> NotificationImportance:
+def _overall_state(row, *, archive_status: str, verification_status: str = "") -> str:
     states = {
         _status(_value(row, key))
         for key in (
-            "status", "qb_status", "gy_status", "local_import_status",
-            "organize_status", "strm_status",
-        )
-    }
-    verification = _status(verification_status)
-    if states.intersection(_ATTENTION_STATES) or verification == "attention":
-        return NotificationImportance.ACTION
-    if states.intersection(_ERROR_STATES):
-        return NotificationImportance.ERROR
-    return NotificationImportance.RESULT
-
-
-def _overall_state(row, *, verification_status: str = "") -> str:
-    states = {
-        _status(_value(row, key))
-        for key in (
-            "status", "qb_status", "gy_status", "local_import_status",
-            "organize_status", "strm_status",
+            "status", "qb_status", "gy_status", "organize_status", "strm_status",
         )
         if _status(_value(row, key))
-    }
+    } | {archive_status}
     verification = _status(verification_status)
     if states.intersection(_ATTENTION_STATES) or verification == "attention":
         return "attention"
@@ -138,8 +143,7 @@ def _overall_state(row, *, verification_status: str = "") -> str:
     if states.intersection(_PROCESSING_STATES):
         return "processing"
     archive_states = {
-        _status(_value(row, "local_import_status")),
-        _status(_value(row, "organize_status")),
+        archive_status, _status(_value(row, "organize_status")),
     } - {""}
     archive_completed = archive_states.intersection({"completed", "success"})
     if "skipped" in archive_states and not archive_completed:
@@ -152,7 +156,7 @@ def _overall_state(row, *, verification_status: str = "") -> str:
     if _status(_value(row, "status")) == "cancelled":
         return "cancelled"
     if _status(_value(row, "status")) in {"completed", "success"}:
-        return "completed"
+        return "downloaded"
     return "processing"
 
 
@@ -187,7 +191,7 @@ def _probe_needs_attention(progress: Mapping[str, int]) -> bool:
 
 
 def _merge_probe_progress(
-    event: NotificationEvent, row, progress: Mapping[str, int], *, verification_status: str,
+    event: NotificationEvent, progress: Mapping[str, int],
 ) -> NotificationEvent:
     if not progress.get("total") and not progress.get("strm_pending"):
         return event
@@ -195,14 +199,15 @@ def _merge_probe_progress(
     pending = bool(progress.get("pending") or progress.get("strm_pending"))
     label = "需要复核" if needs_attention else "进行中" if pending else "完成"
     fields = tuple(event.fields) + (("后台规格补全", label),)
-    base_state = _overall_state(row, verification_status=verification_status)
+    base_state = event.state
     if needs_attention:
         # ACTION 优先级与原业务异常保留；不能把后台失败写回 download_requests
         # 让已成功下载/整理被调度器重新执行。异常细节不跨通知范围外泄。
         title = event.title if base_state in {"attention", "error"} else "⚠️ 下载入库链路部分完成"
         note = "后台规格补全或后续 STRM 同步尚有异常，请在 Web 运行记录中复核。"
         footer = "\n".join(value for value in (event.footer, note) if value)
-        return replace(event, title=title, fields=fields, footer=footer, state="partial")
+        return replace(event, title=title, fields=fields, footer=footer,
+                       state="attention" if base_state == "attention" else "partial")
     if pending and base_state not in {"attention", "error"}:
         return replace(
             event, title="⏳ 下载与入库处理中", fields=fields, state="processing",
@@ -226,16 +231,16 @@ def build_download_lifecycle_event(
     previous = get_notification_thread_event(
         f"download:{request_id}", topic=NotificationTopic.DOWNLOAD, chat_id=chat_id,
     )
-    state = _overall_state(row, verification_status=verification_status)
+    archive_name, archive_status, archive_value = _archive_stage(row)
+    state = _overall_state(row, archive_status=archive_status, verification_status=verification_status)
     title = {
         "attention": "⚠️ 下载入库需要处理",
         "error": "⚠️ 下载入库部分完成",
         "completed": "✅ 下载与入库完成",
-        "downloaded": "✅ 下载完成（自动入库已跳过）",
+        "downloaded": "✅ 下载完成（自动入库已跳过）" if archive_status == "skipped" else "✅ 下载完成",
         "processing": "⏳ 下载与入库处理中",
         "cancelled": "⏹️ 下载跟踪已停止",
     }[state]
-    archive_name, archive_value = _archive_label(row)
     media_title = notification_payload.get("title")
     if not usable_download_title(media_title):
         media_title = download_display_title(row)
@@ -304,7 +309,7 @@ def build_download_lifecycle_event(
     elif state == "error":
         footer = errors[0] if errors else "本次链路存在未完成阶段，请查看 Web 运行记录。"
     elif state == "downloaded":
-        footer = errors[0] if errors else "下载已完成，但本次没有执行自动入库。"
+        footer = errors[0] if errors else "下载已完成，暂无本次新增归档的记录。"
     elif state == "processing":
         footer = "后续阶段会更新本条消息，无需重复提交。"
     event = NotificationEvent(
@@ -312,10 +317,10 @@ def build_download_lifecycle_event(
         fields=tuple(fields),
         footer=footer,
         layout="relaxed",
+        state=state,
     )
     event = _merge_probe_progress(
-        event, row, _load_probe_progress(row) if probe_progress is None else probe_progress,
-        verification_status=verification_status,
+        event, _load_probe_progress(row) if probe_progress is None else probe_progress,
     )
     return attach_bounded_media_details(event, lines)
 
@@ -365,9 +370,11 @@ def publish_download_lifecycle(
         verification_result=verification_result,
         probe_progress=probe_progress,
     )
-    importance = _importance(row, verification_status=verification_status)
-    if importance == NotificationImportance.RESULT and _probe_needs_attention(probe_progress):
-        importance = NotificationImportance.ERROR
+    importance = {
+        "attention": NotificationImportance.ACTION,
+        "error": NotificationImportance.ERROR,
+        "partial": NotificationImportance.ERROR,
+    }.get(event.state, NotificationImportance.RESULT)
     topic_enabled = config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
     # 下载异常和人工处理不应被“整理成功通知”开关吞掉；全局通知总开关仍生效。
     if importance in {NotificationImportance.ACTION, NotificationImportance.ERROR}:
