@@ -22,13 +22,18 @@ from app.agent.indexer_candidate_actions import (
 )
 from app.modules.download_dispatcher import DownloadInput
 from app.indexers.downloads import download_indexer_result
-from app.indexers.errors import IndexerResultExpired
+from app.indexers.errors import (
+    IndexerChallengeRequired,
+    IndexerQueryRejected,
+    IndexerResultExpired,
+)
 from app.indexers.models import (
     AggregatedIndexerResult,
     IndexerItem,
     IndexerProviderError,
     ResolvedDownload,
 )
+from app.indexers.providers.empire import EmpireAdapter
 
 _RESULT_ID = "opaque-result-1234"
 _SECRET_MAGNET = "magnet:?xt=urn:btih:" + "a" * 40
@@ -332,6 +337,69 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
         self.assertNotIn(_SECRET_MAGNET, serialized)
         self.assertNotIn(_SECRET_TORRENT_URL, serialized)
         self.assertNotIn(_SECRET_DETAIL_URL, serialized)
+
+    def test_search_resources_propagates_safe_query_errors_and_keeps_candidates(self):
+        private_html = "<html>private cookie=secret; upstream diagnostic</html>"
+        rejected = IndexerQueryRejected(private_html)
+        challenge = IndexerChallengeRequired(private_html)
+        detail_error = EmpireAdapter(
+            site_id="ys5266",
+            site_name="5266影视",
+            base_url="https://www.5266ys.net/",
+            http=object(),
+        )._detail_error(challenge)
+        self.assertEqual(detail_error.site_id, "ys5266")
+
+        service = FakeIndexerService(partial=False)
+        result = AggregatedIndexerResult(
+            query="Demo",
+            page=1,
+            items=[service.item],
+            sites_attempted=("nyaa", "dygang", "ys5266"),
+            sites_succeeded=("nyaa",),
+            site_item_counts={"nyaa": 1},
+            errors=[
+                IndexerProviderError("dygang", rejected.code, rejected.public_message),
+                detail_error,
+            ],
+            partial=True,
+        )
+        arguments = {
+            "title": "Demo",
+            "original_title": "",
+            "english_title": "",
+            "aliases": [],
+            "year": None,
+            "media_type": "",
+            "page": 1,
+            "sites": ["nyaa", "dygang", "ys5266"],
+            "limit": 20,
+        }
+        with (
+            patch("app.agent.indexer_actions.config.get_bool", return_value=True),
+            patch("app.agent.indexer_actions.get_indexer_service", return_value=service),
+            patch.object(service, "search_media", new=AsyncMock(return_value=result)),
+        ):
+            output = search_resources(arguments)
+
+        self.assertTrue(output.ok)
+        self.assertEqual(output.status, "partial")
+        self.assertEqual(output.data["items"][0]["title"], service.item.title)
+        self.assertEqual(
+            [(error["site_id"], error["code"]) for error in output.data["errors"]],
+            [("dygang", "query_rejected"), ("ys5266", "challenge_required")],
+        )
+        self.assertEqual(output.data["errors"][0]["message"], rejected.public_message)
+        self.assertEqual(output.data["errors"][1]["message"], detail_error.message)
+        self.assertIn("关键词", output.data["errors"][0]["message"])
+        self.assertTrue(
+            any(term in output.data["errors"][0]["message"] for term in ("片名", "别名"))
+        )
+        self.assertNotIn("缩短", output.data["errors"][0]["message"])
+        self.assertIn("人机验证", output.data["errors"][1]["message"])
+        serialized = str(output.to_dict())
+        self.assertNotIn(private_html, serialized)
+        self.assertNotIn("btbtla", serialized)
 
     def test_present_candidates_is_read_only_keeps_original_positions_and_hides_private_data(self):
         snapshot = _candidate_snapshot()

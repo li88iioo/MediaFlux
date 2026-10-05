@@ -46,6 +46,8 @@ _SITE_ERROR_CATALOG: dict[str, tuple[str, bool]] = {
     "unavailable": ("站点暂不可用，请稍后重试", True),
     "rate_limited": ("站点请求过于频繁，请稍后再试", True),
     "invalid_response": ("站点返回异常数据，请稍后重试", True),
+    "query_rejected": ("关键词长度或字符不受该站点支持，请换用完整片名或别名", False),
+    "challenge_required": ("站点要求人机验证，本次未完成检索", False),
     "response_too_large": ("站点响应异常，暂无法处理", False),
     "security_error": ("站点连接未通过安全校验", False),
 }

@@ -18,6 +18,16 @@ class IndexerValidationError(IndexerError, ValueError):
     default_public_message = "搜索参数无效"
 
 
+class IndexerQueryRejected(IndexerError):
+    code = "query_rejected"
+    default_public_message = "关键词长度或字符不受该站点支持，请换用完整片名或别名"
+
+
+class IndexerChallengeRequired(IndexerError):
+    code = "challenge_required"
+    default_public_message = "站点要求人机验证，本次未完成检索"
+
+
 class IndexerSecurityError(IndexerError):
     code = "security_error"
     default_public_message = "上游地址未通过安全校验"

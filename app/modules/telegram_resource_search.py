@@ -22,6 +22,8 @@ _SITE_ERROR_MESSAGES = {
     "unavailable": "暂不可用",
     "rate_limited": "请求过于频繁",
     "invalid_response": "返回数据异常",
+    "query_rejected": "关键词长度或字符不受支持，请换用片名或别名",
+    "challenge_required": "需要人机验证，本次未完成检索",
     "response_too_large": "响应内容异常",
     "security_error": "安全校验失败",
 }

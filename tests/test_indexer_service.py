@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, patch
 
 from app.indexers.errors import (
     IndexerRateLimited,
+    IndexerQueryRejected,
+    IndexerChallengeRequired,
     IndexerSecurityError,
     IndexerUnavailable,
     IndexerValidationError,
@@ -17,6 +19,7 @@ from app.indexers.models import (
     IndexerItem,
     IndexerMediaSearchRequest,
     IndexerPage,
+    IndexerProviderError,
     ResolvedDownload,
 )
 from app.indexers.registry import IndexerRegistry
@@ -256,6 +259,66 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             **kwargs,
         )
 
+    async def test_query_rejection_tries_complete_alias_without_poisoning_site(self):
+        for found in ([], [item("dygang", "Allowed", magnet=f"magnet:?xt=urn:btih:{HASH}")]):
+            with self.subTest(has_results=bool(found)):
+                adapter=PartiallyFailingQueryAdapter("dygang", {"Allowed":found}, failing_query="Forbidden", error=IndexerQueryRejected("private fixture detail"))
+                service=self.service([adapter])
+                result=await service.search_media(IndexerMediaSearchRequest.create(title="Forbidden",aliases=["Allowed"]))
+                self.assertEqual(adapter.queries,["Forbidden","Allowed"])
+                self.assertEqual(len(result.items),len(found))
+                self.assertFalse(result.errors)
+                self.assertFalse(result.partial)
+                self.assertEqual(result.sites_succeeded,("dygang",))
+                self.assertNotIn("dygang",service._breaker_states)
+
+    async def test_repeated_bad_queries_do_not_cool_down_a_healthy_site(self):
+        adapter=FakeAdapter("dygang",error=IndexerQueryRejected("private rejected query"))
+        service=self.service([adapter],breaker_failure_threshold=2)
+        for query in ("bad-one","bad-two","bad-three"):
+            result=await service.search(query)
+            self.assertEqual(result.errors[0].code,"query_rejected")
+            self.assertNotIn("private",result.errors[0].message)
+        self.assertEqual(adapter.calls,3)
+        self.assertNotIn("dygang",service._breaker_states)
+        adapter.error=None
+        healthy=await service.search("good")
+        self.assertFalse(healthy.errors)
+        self.assertEqual(adapter.calls,4)
+
+    async def test_challenge_cools_only_affected_site_and_preserves_healthy_results(self):
+        blocked=FakeAdapter("dygang",error=IndexerChallengeRequired("raw verification HTML"))
+        healthy=FakeAdapter("nyaa",[item("nyaa","Good",magnet=f"magnet:?xt=urn:btih:{HASH}")])
+        service=self.service([blocked,healthy])
+        first=await service.search("first")
+        second=await service.search("second")
+        self.assertEqual(blocked.calls,1)
+        self.assertEqual(healthy.calls,2)
+        for result in (first,second):
+            self.assertEqual(len(result.items),1)
+            self.assertEqual(result.errors[0].site_id,"dygang")
+            self.assertEqual(result.errors[0].code,"challenge_required")
+            self.assertNotIn("raw verification",result.errors[0].message)
+
+    async def test_partial_detail_rejection_preserves_items_and_stops_aliases(self):
+        for code in ("rate_limited","challenge_required"):
+            with self.subTest(code=code):
+                class Partial(QueryAwareAdapter):
+                    async def search(self, request):
+                        result=await super().search(request)
+                        result.errors=(IndexerProviderError("dygang",code,"safe reason"),)
+                        return result
+                adapter=Partial("dygang",{"First":[item("dygang","Unrelated upload",magnet=f"magnet:?xt=urn:btih:{HASH}")]})
+                service=self.service([adapter])
+                result=await service.search_media(IndexerMediaSearchRequest.create(title="First",aliases=["Second"]))
+                self.assertEqual(adapter.queries,["First"])
+                self.assertEqual(len(result.items),1)
+                self.assertTrue(result.partial)
+                self.assertEqual(result.errors[0].site_id,"dygang")
+                second=await service.search("new-query")
+                self.assertEqual(second.errors[0].code,code)
+                self.assertEqual(adapter.calls,1)
+
     async def test_nyaa_bilingual_search_merges_even_after_a_strong_first_hit(self):
         media = IndexerMediaSearchRequest.create(title="凡人修仙传", english_title="Fanren Xiu Xian Chuan", season=1, episode=192)
         shared = f"magnet:?xt=urn:btih:{HASH}"
@@ -348,6 +411,28 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             await service.aclose()
         self.assertTrue(adapter.cancelled)
+
+    async def test_empire_first_candidates_survive_slow_alias_total_timeout(self):
+        class SlowAlias(QueryAwareAdapter):
+            cancelled = False
+            async def search(self, request):
+                if request.query == "Alternate":
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        self.cancelled = True
+                return await super().search(request)
+
+        for site in ("dygang", "ys5266"):
+            with self.subTest(site=site):
+                adapter = SlowAlias(site, {"Primary": [item(site, "Other name", magnet=f"magnet:?xt=urn:btih:{HASH}")]})
+                service = self.service([adapter], site_timeout_seconds=1, total_timeout_seconds=0.1)
+                with patch.object(service, "_site_plan_quality_satisfied", return_value=False):
+                    result = await service.search_media(IndexerMediaSearchRequest.create(title="Primary", aliases=["Alternate"]))
+                self.assertEqual(len(result.items), 1)
+                self.assertTrue(result.partial)
+                self.assertEqual(result.errors[0].code, "timeout")
+                self.assertTrue(adapter.cancelled)
 
     async def test_retired_site_in_old_request_never_executes_or_expands_scope(self):
         active = FakeAdapter("btbtla", [item("btbtla", "valid resource")])

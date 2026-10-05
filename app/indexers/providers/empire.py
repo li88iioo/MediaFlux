@@ -5,12 +5,17 @@ import html
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from time import monotonic
 from urllib.parse import parse_qs, quote_from_bytes, urlsplit
 
 from bs4 import BeautifulSoup
 
+from app.concurrency import CrossLoopAsyncLock
+
 from ..errors import (
     IndexerError,
+    IndexerChallengeRequired,
+    IndexerQueryRejected,
     IndexerInvalidResponse,
     IndexerRateLimited,
     IndexerSecurityError,
@@ -24,6 +29,7 @@ from ..models import (
     IndexerProviderError,
     IndexerSearchRequest,
 )
+from ..query_plan import encode_empire_keyword
 from .base import (
     DirectResultAdapter,
     is_likely_challenge_page,
@@ -31,6 +37,7 @@ from .base import (
     require_html_response,
 )
 
+_SEARCH_INTERVAL_SECONDS = 5.5
 _SEARCH_TIMEOUT_SECONDS = 8.0
 _DETAIL_TIMEOUT_SECONDS = 6.0
 _DETAIL_CONCURRENCY = 3
@@ -69,6 +76,11 @@ class EmpireAdapter(DirectResultAdapter):
         self.site_name = site_name
         self.base_url = base_url.rstrip("/") + "/"
         self.http = http
+        self._search_lock = CrossLoopAsyncLock()
+        self._search_finished: float | None = None
+
+    def search_timeout_overhead_seconds(self) -> float:
+        return _SEARCH_INTERVAL_SECONDS
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         if request.page > 1:
@@ -76,36 +88,37 @@ class EmpireAdapter(DirectResultAdapter):
                 items=[], page=request.page, has_more=False, pagination_supported=False,
             )
 
-        try:
-            keyword = quote_from_bytes(request.query.encode("gbk"), safe="")
-        except UnicodeEncodeError as exc:
-            raise IndexerInvalidResponse("search term cannot be encoded as GBK") from exc
+        keyword = quote_from_bytes(encode_empire_keyword(request.query), safe="")
 
-        response_url = self._join_known_host("/e/search/index.php")
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + _SEARCH_TIMEOUT_SECONDS
-        try:
-            response = await asyncio.wait_for(
-                self.http.post_form(
-                    response_url,
-                    content=self._form_body(keyword),
-                    headers={
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Referer": self.base_url,
-                    },
-                ),
-                timeout=_SEARCH_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as exc:
-            raise IndexerTimeout(f"{self.site_name} search timed out") from exc
+        # 按表单响应完成时间留出间隔，避免首次DNS/TLS耗时吞掉服务器要求的5秒。
+        # 只串行搜索POST；详情页仍沿用有界并发，不阻塞其它站点。
+        async with self._search_lock:
+            if self._search_finished is not None:
+                delay = _SEARCH_INTERVAL_SECONDS - (monotonic() - self._search_finished)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            deadline = loop.time() + _SEARCH_TIMEOUT_SECONDS
+            try:
+                response = await asyncio.wait_for(
+                    self.http.post_form(
+                        self._join_known_host("/e/search/index.php"),
+                        content=self._form_body(keyword),
+                        headers={
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Referer": self.base_url,
+                        },
+                    ),
+                    timeout=_SEARCH_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                raise IndexerTimeout(f"{self.site_name} search timed out") from exc
+            finally:
+                self._search_finished = monotonic()
 
-        self._validate_status(response.status_code)
-        require_html_response(response)
+        _body, soup = self._read_page(response)
         result_url = self._join_known_host(response.url)
-        result_body = response.body.decode("gbk", errors="replace")
-        if is_likely_challenge_page(result_body):
-            raise IndexerInvalidResponse(f"{self.site_name} search returned a challenge page")
-        results = self._parse_results(result_body, result_url)
+        results = self._parse_results(soup, result_url)
         if not results:
             return IndexerPage(items=[], page=1, has_more=False, pagination_supported=False)
 
@@ -170,14 +183,32 @@ class EmpireAdapter(DirectResultAdapter):
         )
 
     def _form_body(self, keyword: str) -> bytes:
-        if self.site_id == "dygang":
-            fields = f"tempid=1&tbname=article&keyboard={keyword}&show=title%2Csmalltext&Submit="
-        else:
-            fields = f"show=title%2Csmalltext&tempid=1&tbname=article&keyboard={keyword}&submit="
-        return fields.encode("ascii")
+        submit = "Submit" if self.site_id == "dygang" else "submit"
+        return f"tempid=1&tbname=article&keyboard={keyword}&show=title%2Csmalltext&{submit}=".encode("ascii")
 
-    def _parse_results(self, body: str, result_url: str) -> list[_SearchResult]:
+    def _read_page(self, response) -> tuple[str, BeautifulSoup]:
+        body = response.body.decode("gbk", errors="replace")
+        if response.status_code != 429 and (
+            is_likely_challenge_page(body)
+            or str(response.headers.get("cf-mitigated") or "").lower() == "challenge"
+        ):
+            raise IndexerChallengeRequired("upstream returned a verification page")
+        self._validate_status(response.status_code)
+        require_html_response(response)
         soup = BeautifulSoup(body, "lxml")
+        if soup.title and soup.title.get_text(strip=True) in {"信息提示", "系统提示"}:
+            message = soup.get_text(" ", strip=True)
+            if any(marker in message for marker in ("验证码", "人机验证", "安全验证")):
+                raise IndexerChallengeRequired("upstream requires verification")
+            if any(marker in message for marker in ("搜索间隔", "搜索时间间隔", "频繁搜索", "搜索太频繁", "操作过于频繁", "两次搜索")):
+                raise IndexerRateLimited("upstream search frequency notice")
+            if any(marker in message for marker in ("搜索关键字只能", "搜索关键词只能", "关键字太长", "关键词太长", "关键字太短", "关键词太短", "关键字长度", "关键词长度")):
+                raise IndexerQueryRejected("upstream rejected the search term")
+            if not any(marker in message.casefold() for marker in _EMPTY_MARKERS):
+                raise IndexerUnavailable("upstream service notice")
+        return body, soup
+
+    def _parse_results(self, soup: BeautifulSoup, result_url: str) -> list[_SearchResult]:
         if self.site_id == "dygang":
             anchors = soup.select("a.classlinkclass[href]")
         else:
@@ -221,14 +252,7 @@ class EmpireAdapter(DirectResultAdapter):
                 result.detail_url,
                 headers={"Referer": referer},
             )
-            self._validate_status(response.status_code)
-            require_html_response(response)
-            body = response.body.decode("gbk", errors="replace")
-            if is_likely_challenge_page(body):
-                return [], self._detail_error(
-                    IndexerInvalidResponse("detail page is a challenge page"),
-                ), True
-            soup = BeautifulSoup(body, "lxml")
+            body, soup = self._read_page(response)
             if not body.strip() or not (
                 soup.get_text(" ", strip=True)
                 or soup.select_one("a[href], script, [data-magnet], [data-clipboard-text]")
@@ -263,7 +287,7 @@ class EmpireAdapter(DirectResultAdapter):
             raise
         except Exception as exc:
             return [], self._detail_error(exc), isinstance(
-                exc, (IndexerRateLimited, IndexerSecurityError),
+                exc, (IndexerRateLimited, IndexerSecurityError, IndexerChallengeRequired),
             )
 
     @staticmethod
@@ -314,9 +338,9 @@ class EmpireAdapter(DirectResultAdapter):
     def _detail_error(self, exc: Exception) -> IndexerProviderError:
         code = exc.code if isinstance(exc, IndexerError) else "unavailable"
         return IndexerProviderError(
-            site_id="btbtla",
+            site_id=self.site_id,
             code=code,
-            message=f"{self.site_name}详情页获取失败",
+            message=f"{self.site_name}：{exc.public_message if isinstance(exc, IndexerError) else '详情页获取失败'}",
         )
 
     def _validate_status(self, status_code: int) -> None:

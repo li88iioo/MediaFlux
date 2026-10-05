@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import re
 
+from .errors import IndexerQueryRejected
 from .models import MAX_SEARCH_TEXT_LENGTH, IndexerMediaSearchRequest
 
 _HAN = re.compile(r"[\u3400-\u9fff]")
@@ -16,6 +17,17 @@ _POSITION_MARKER = re.compile(
     r"|第\s*0*\d{1,4}\s*[集話话]"
     r")"
 )
+
+
+def encode_empire_keyword(value: str) -> bytes:
+    """两站帝国CMS限制的是GBK编码字节，不是Python字符数。"""
+    try:
+        encoded = value.encode("gbk")
+    except UnicodeEncodeError as exc:
+        raise IndexerQueryRejected("search term cannot be encoded as GBK") from exc
+    if not 2 <= len(encoded) <= 20:
+        raise IndexerQueryRejected("search term must contain 2 to 20 GBK bytes")
+    return encoded
 
 
 def _unique(values: Iterable[str], *, limit: int = 3) -> tuple[str, ...]:
@@ -106,6 +118,18 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
     title = request.title
     original = request.original_title
     english = request.english_title
+
+    if site_id in {"dygang", "ys5266"}:
+        # 搜索的是作品目录，季集在详情资源中排序；不把SxxExx拼进片名。
+        supported = []
+        for value in (title, original, english, *aliases):
+            try:
+                encode_empire_keyword(value)
+            except IndexerQueryRejected:
+                continue
+            supported.append(value)
+        # 无合法完整名称时交由provider明确拒绝，不能截断片名或冒称无资源。
+        return _unique(supported) or (title,)
 
     if site_id == "mikan":
         bases = [title, original, *aliases, english]

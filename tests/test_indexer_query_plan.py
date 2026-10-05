@@ -123,6 +123,24 @@ class IndexerQueryPlanTests(unittest.TestCase):
         )
         self.assertEqual(request.cache_identity(), identity)
 
+    def test_empire_queries_use_supported_complete_names_without_episode_suffixes(self):
+        for site in ("dygang", "ys5266"):
+            with self.subTest(site=site):
+                request = IndexerMediaSearchRequest.create(
+                    title="天地玄黄宇宙洪荒日月盈", original_title="An Unsupported Original Name",
+                    english_title="A Second Very Long English Title",
+                    aliases=["仙逆", "Renegade Immortal"], season=1, episode=1,
+                )
+                self.assertEqual(build_site_queries(site,request),("仙逆","Renegade Immortal"))
+                self.assertEqual(request.title,"天地玄黄宇宙洪荒日月盈")
+                self.assertEqual((request.season,request.episode),(1,1))
+
+    def test_empire_without_supported_alias_retains_whole_query_for_explicit_rejection(self):
+        request=IndexerMediaSearchRequest.create(title="天地玄黄宇宙洪荒日月盈")
+        for site in ("dygang","ys5266"):
+            self.assertEqual(build_site_queries(site,request),(request.title,))
+        self.assertEqual(build_site_queries("btbtla",request),(request.title,))
+
     def test_unknown_site_falls_back_to_stable_input_order(self):
         self.assertEqual(
             build_site_queries("custom", self.request),

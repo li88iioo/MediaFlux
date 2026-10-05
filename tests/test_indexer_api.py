@@ -15,7 +15,9 @@ from fastapi.testclient import TestClient
 
 from app.modules.download_dispatcher import DownloadInput
 from app import config as app_config
+from app.indexers.errors import IndexerChallengeRequired, IndexerQueryRejected
 from app.indexers.providers.base import IndexerAdapter
+from app.indexers.providers.empire import EmpireAdapter
 from app.indexers.models import (
     AggregatedIndexerResult,
     IndexerCapabilities,
@@ -673,6 +675,71 @@ class IndexerAPITests(unittest.TestCase):
         self.assertEqual(statuses["btbtla"]["status"], "error")
         self.assertEqual(statuses["mikan"]["status"], "success")
         self.assertTrue(statuses["btbtla"]["retryable"])
+
+    def test_search_maps_query_rejection_and_challenge_without_retry_or_private_detail(self):
+        self.authenticate()
+        private_html = "<html>private cookie=secret; upstream diagnostic</html>"
+        rejected = IndexerQueryRejected(private_html)
+        challenge = IndexerChallengeRequired(private_html)
+        detail_error = EmpireAdapter(
+            site_id="ys5266",
+            site_name="5266影视",
+            base_url="https://www.5266ys.net/",
+            http=object(),
+        )._detail_error(challenge)
+        self.assertEqual(detail_error.site_id, "ys5266")
+
+        healthy_item = IndexerItem(
+            result_id="healthy-result",
+            site_id="mikan",
+            site_name="Mikan",
+            title="Healthy candidate",
+        )
+        result = AggregatedIndexerResult(
+            query="Demo",
+            page=1,
+            items=[healthy_item],
+            sites_attempted=("dygang", "ys5266", "mikan"),
+            sites_succeeded=("mikan",),
+            site_item_counts={"mikan": 1},
+            errors=[
+                IndexerProviderError("dygang", rejected.code, rejected.public_message),
+                detail_error,
+            ],
+            partial=True,
+        )
+        service = SimpleNamespace(
+            registry=FakeStatusRegistry(),
+            enabled_site_ids=frozenset({"dygang", "ys5266", "mikan"}),
+            search=AsyncMock(return_value=result),
+        )
+
+        with (
+            patch("app.routes.indexers_api.get_indexer_service", return_value=service),
+            patch.object(indexers_api, "_public_source_url", return_value=None),
+        ):
+            response = self.client.get("/api/indexers/search?q=Demo")
+
+        self.assertEqual(response.status_code, 200)
+        service.search.assert_awaited_once()
+        payload = response.json()
+        self.assertEqual(payload["items"][0]["title"], "Healthy candidate")
+        self.assertTrue(payload["partial"])
+        statuses = {row["site_id"]: row for row in payload["site_statuses"]}
+        self.assertEqual(statuses["dygang"]["code"], "query_rejected")
+        rejected_message = statuses["dygang"]["message"]
+        self.assertIn("关键词", rejected_message)
+        self.assertTrue(any(term in rejected_message for term in ("片名", "别名")))
+        self.assertNotIn("缩短", rejected_message)
+        self.assertIs(statuses["dygang"]["retryable"], False)
+        self.assertEqual(statuses["ys5266"]["code"], "challenge_required")
+        self.assertIn("人机验证", statuses["ys5266"]["message"])
+        self.assertIs(statuses["ys5266"]["retryable"], False)
+        self.assertEqual(
+            {row["site_id"] for row in payload["errors"]}, {"dygang", "ys5266"}
+        )
+        self.assertNotIn("btbtla", {row["site_id"] for row in payload["errors"]})
+        self.assertNotIn(private_html, response.text)
 
     def test_search_site_statuses_use_pre_dedupe_item_counts(self):
         self.authenticate()

@@ -5,7 +5,9 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import unquote_to_bytes
 
-from app.indexers.errors import IndexerInvalidResponse, IndexerUnavailable
+from bs4 import BeautifulSoup
+
+from app.indexers.errors import IndexerChallengeRequired, IndexerInvalidResponse, IndexerQueryRejected, IndexerRateLimited, IndexerUnavailable
 from app.indexers.http import IndexerHttpResponse
 from app.indexers.models import IndexerSearchRequest
 from app.indexers.providers.empire import EmpireAdapter, _DETAIL_TIMEOUT_SECONDS
@@ -85,8 +87,106 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
         paths = ("/yx/20240322/54243.htm", "/dsj/20230116/st.htm", "/dmq/20221210/50941.htm")
         body = "".join(f'<a class="classlinkclass" href="{path}">三体</a>' for path in paths)
         adapter = _adapter("dygang", None)
-        result = adapter._parse_results(body, "https://www.dygang.tv/e/search/result/?searchid=1")
+        result = adapter._parse_results(BeautifulSoup(body, "lxml"), "https://www.dygang.tv/e/search/result/?searchid=1")
         self.assertEqual([item.detail_url for item in result], [adapter.base_url.rstrip("/") + path for path in paths])
+
+    async def test_search_interval_starts_after_response_and_skips_invalid_queries(self):
+        clock = [100.0]
+        sleeps = []
+        http = _EmpireHttp(_response("https://www.dygang.tv/e/search/", "<title>信息提示</title>没有搜索到相关的内容"))
+        original_post = http.post_form
+        async def delayed_response(*args, **kwargs):
+            clock[0] += 3  # 首次握手/服务器响应不能占用后续安全间隔。
+            return await original_post(*args, **kwargs)
+        async def sleep(delay):
+            sleeps.append(delay)
+            clock[0] += delay
+        adapter = _adapter("dygang", http)
+        with (
+            patch.object(http, "post_form", side_effect=delayed_response),
+            patch("app.indexers.providers.empire.monotonic", side_effect=lambda: clock[0]),
+            patch("app.indexers.providers.empire.asyncio.sleep", side_effect=sleep),
+        ):
+            await adapter.search(IndexerSearchRequest.create("电影"))
+            self.assertEqual(sleeps, [])
+            with self.assertRaises(IndexerQueryRejected):
+                await adapter.search(IndexerSearchRequest.create("x" * 21))
+            await adapter.search(IndexerSearchRequest.create("电影", page=2))
+            self.assertEqual(sleeps, [])
+            await adapter.search(IndexerSearchRequest.create("剧集"))
+        self.assertEqual(sleeps, [5.5])
+        self.assertEqual(adapter._search_finished, 111.5)
+        self.assertEqual(len(http.form_calls), 2)
+
+    async def test_cancelled_search_releases_form_lock_for_next_request(self):
+        started = asyncio.Event()
+        http = _EmpireHttp(_response("https://www.dygang.tv/e/search/", "<title>信息提示</title>没有搜索到相关的内容"))
+        adapter = _adapter("dygang", http)
+        async def blocked(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+        with patch.object(http, "post_form", side_effect=blocked):
+            task = asyncio.create_task(adapter.search(IndexerSearchRequest.create("电影")))
+            await asyncio.wait_for(started.wait(), 1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        with patch("app.indexers.providers.empire._SEARCH_INTERVAL_SECONDS", 0):
+            result = await asyncio.wait_for(adapter.search(IndexerSearchRequest.create("剧集")), 1)
+        self.assertEqual(result.items, [])
+        self.assertIsNotNone(adapter._search_finished)
+
+    async def test_unacceptable_keywords_are_rejected_without_http(self):
+        for site_id in ("dygang", "ys5266"):
+            for query in ("a", "x" * 21, "天地玄黄宇宙洪荒日月盈", "电影😀"):
+                with self.subTest(site=site_id, query=query):
+                    http = _EmpireHttp(None)
+                    with self.assertRaises(IndexerQueryRejected):
+                        await _adapter(site_id, http).search(IndexerSearchRequest.create(query))
+                    self.assertEqual(http.form_calls, [])
+
+    async def test_gbk_byte_boundaries_accept_complete_terms(self):
+        for query in ("ab", "x" * 20, "仙", "天地玄黄宇宙洪荒日月"):
+            with self.subTest(query=query):
+                http = _EmpireHttp(_response("https://www.dygang.tv/e/search/", "<title>信息提示</title>没有搜索到相关的内容"))
+                result = await _adapter("dygang", http).search(IndexerSearchRequest.create(query))
+                self.assertFalse(result.items)
+                self.assertEqual(len(http.form_calls), 1)
+                body = unquote_to_bytes(http.form_calls[0][1].decode("ascii")).decode("gbk")
+                self.assertIn("keyboard=" + query + "&", body)
+
+    async def test_cms_notice_pages_have_distinct_safe_error_types(self):
+        cases = (
+            ("系统限制的搜索关键字只能在 2~20 个字符之间", IndexerQueryRejected),
+            ("两次搜索间隔不能小于10秒，请不要频繁搜索", IndexerRateLimited),
+            ("系统限制的搜索时间间隔为 5 秒,请稍后再搜索", IndexerRateLimited),
+            ("请输入验证码完成安全验证", IndexerChallengeRequired),
+            ("搜索功能暂时关闭", IndexerUnavailable),
+        )
+        for site in ("dygang", "ys5266"):
+            for notice, error in cases:
+                with self.subTest(site=site, notice=notice):
+                    host = "www.dygang.tv" if site == "dygang" else "www.5266ys.net"
+                    http = _EmpireHttp(_response(f"https://{host}/e/search/", f"<title>信息提示</title><p>{notice}</p><script>const secret='private-fixture';</script>"))
+                    with self.assertRaises(error) as caught:
+                        await _adapter(site, http).search(IndexerSearchRequest.create("示例"))
+                    self.assertNotIn("private-fixture", caught.exception.public_message)
+                    self.assertFalse(http.get_calls)
+
+    async def test_challenge_pages_are_classified_for_success_and_block_statuses(self):
+        for status in (200, 403, 503):
+            with self.subTest(status=status):
+                http = _EmpireHttp(_response("https://www.dygang.tv/e/search/", "<html>Just a moment... verify you are human</html>",status=status))
+                with self.assertRaises(IndexerChallengeRequired):
+                    await _adapter("dygang",http).search(IndexerSearchRequest.create("示例"))
+
+    async def test_notice_words_inside_a_real_detail_do_not_become_site_errors(self):
+        url = "https://www.dygang.tv/ys/2025/123.htm"
+        detail = f'<title>电影信息</title><p>片中角色没有搜索到答案，频繁搜索、人机验证只是剧情描述。</p><a href="magnet:?xt=urn:btih:{_VALID_HASH}">片源</a>'
+        http = _EmpireHttp(_response("https://www.dygang.tv/e/search/",_DYGANG_RESULT),{url:_response(url,detail)})
+        result = await _adapter("dygang",http).search(IndexerSearchRequest.create("示例"))
+        self.assertEqual(len(result.items),1)
+        self.assertEqual(result.errors,())
 
     async def test_form_uses_gbk_and_site_specific_empire_fields(self):
         for site_id, host, body in (
@@ -213,7 +313,7 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(page.items, [])
         self.assertEqual(len(page.errors), 1)
-        self.assertEqual(page.errors[0].site_id, "btbtla")
+        self.assertEqual(page.errors[0].site_id, "dygang")
         self.assertIn("电影港", page.errors[0].message)
 
     async def test_partial_detail_failure_keeps_other_items_and_identifies_subsite(self):
@@ -235,7 +335,7 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(page.items), 1)
         self.assertEqual(page.items[0].detail_url, first)
         self.assertEqual(len(page.errors), 1)
-        self.assertEqual(page.errors[0].site_id, "btbtla")
+        self.assertEqual(page.errors[0].site_id, "ys5266")
         self.assertIn("5266影视", page.errors[0].message)
 
     async def test_detail_requests_are_bounded_and_duplicate_infohashes_are_removed(self):
@@ -395,7 +495,7 @@ class EmpireAdapterTests(unittest.IsolatedAsyncioTestCase):
 
         for stop_response, expected_code in (
             (_response("unused", "限流", status=429), "rate_limited"),
-            (_response("unused", "<html><body>Just a moment... verify you are human</body></html>"), "invalid_response"),
+            (_response("unused", "<html><body>Just a moment... verify you are human</body></html>"), "challenge_required"),
         ):
             with self.subTest(expected_code=expected_code):
                 details = {

@@ -907,10 +907,21 @@ class IndexerService:
             outcome.attempts = attempts
             duration_ms += outcome.duration_ms
             if outcome.error is not None:
+                if outcome.error.code == "query_rejected":
+                    if last_outcome is None:
+                        last_error = outcome
+                    continue  # 输入问题不是站点故障，允许尝试下一个完整别名。
                 self._record_circuit_failure(site_id, code=outcome.error.code)
                 last_error = outcome
                 break
-            self._record_circuit_success(site_id)
+            if last_error is not None and last_error.error.code == "query_rejected":
+                last_error = None
+            pause = next((error for error in (outcome.page.errors if outcome.page else ())
+                          if error.code in {"rate_limited", "security_error", "challenge_required"}), None)
+            if pause is not None:
+                self._record_circuit_failure(site_id, code=pause.code)
+            else:
+                self._record_circuit_success(site_id)
             last_outcome = outcome
             if outcome.page is None:
                 continue
@@ -932,13 +943,15 @@ class IndexerService:
                     for item in outcome.page.items
                 ]
                 merged_items = self._merge_plan_items(merged_items, plan_items)
+            if pause is not None:
+                break
             if merged_items and attempts >= minimum_queries and self._site_plan_quality_satisfied(
                 merged_items,
                 media=ranking_context,
                 fallback_query=query,
             ):
                 break
-            if merged_items and site_id == "nyaa" and attempts < len(queries):
+            if merged_items and site_id in {"nyaa", "dygang", "ys5266"} and attempts < len(queries):
                 # 平滑查询间先交付已知结果，下一别名失败/取消不抹掉已返回证据。
                 report_page(site_id, IndexerPage(
                     items=list(merged_items), page=page, has_more=has_more,
@@ -1091,6 +1104,11 @@ class IndexerService:
                         code="rate_limited",
                         message="索引站点请求过于频繁，已暂时冷却",
                     )
+                if state.code == "challenge_required":
+                    return IndexerProviderError(
+                        site_id=site_id, code="challenge_required",
+                        message="站点要求人机验证，已暂缓自动查询",
+                    )
                 if state.code == "security_error":
                     return IndexerProviderError(
                         site_id=site_id,
@@ -1110,7 +1128,7 @@ class IndexerService:
         now = self._clock()
         # 限流与安全校验类失败继续重试只会更糟（触发更严格的封锁），
         # 不必等失败次数达到阈值，立即进入冷却。
-        immediate = code in {"rate_limited", "security_error"}
+        immediate = code in {"rate_limited", "security_error", "challenge_required"}
         with self._breaker_lock:
             previous = self._breaker_states.get(site_id)
             failures = (previous.failures if previous is not None else 0) + 1

@@ -12,10 +12,14 @@ from app.bot.handlers import (
     _resource_search_view,
     _resource_target_view,
 )
+from app.indexers.errors import IndexerChallengeRequired, IndexerQueryRejected
+from app.indexers.models import AggregatedIndexerResult, IndexerItem, IndexerProviderError
+from app.indexers.providers.empire import EmpireAdapter
 from app.modules.telegram_resource_search import (
     TelegramIndexerWorker,
     TelegramResourceSearchError,
     TelegramResourceSearchStore,
+    _search_snapshot,
 )
 
 
@@ -234,6 +238,71 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertTrue(
             all(len(button.callback_data) <= 64 for button in markup.buttons)
         )
+
+    def test_query_rejection_and_challenge_are_safe_and_keep_healthy_candidates(self):
+        private_html = "<html>private cookie=secret; upstream diagnostic</html>"
+        rejected = IndexerQueryRejected(private_html)
+        challenge = IndexerChallengeRequired(private_html)
+        detail_error = EmpireAdapter(
+            site_id="ys5266",
+            site_name="5266影视",
+            base_url="https://www.5266ys.net/",
+            http=object(),
+        )._detail_error(challenge)
+        self.assertEqual(detail_error.site_id, "ys5266")
+
+        healthy_item = IndexerItem(
+            result_id="healthy-result",
+            site_id="mikan",
+            site_name="Mikan",
+            title="Healthy candidate",
+        )
+        result = AggregatedIndexerResult(
+            query="Demo",
+            page=1,
+            items=[healthy_item],
+            sites_attempted=("dygang", "ys5266", "mikan"),
+            sites_succeeded=("mikan",),
+            site_item_counts={"mikan": 1},
+            errors=[
+                IndexerProviderError("dygang", rejected.code, rejected.public_message),
+                detail_error,
+            ],
+            partial=True,
+        )
+        site_names = {"dygang": "电影港", "ys5266": "5266影视", "mikan": "Mikan"}
+        service = SimpleNamespace(
+            registry=SimpleNamespace(
+                ids=lambda: tuple(site_names),
+                get=lambda site_id: SimpleNamespace(site_name=site_names[site_id]),
+            )
+        )
+        snapshot = _search_snapshot(service, result)
+        session_id = self.store.create_session(
+            chat_id="100",
+            user_id="9",
+            query=snapshot["query"],
+            items=snapshot["items"],
+            sites=snapshot["sites"],
+        )
+
+        text, _ = _resource_search_view(
+            _TELEBOT,
+            session_id,
+            chat_id="100",
+            user_id="9",
+            store=self.store,
+        )
+
+        self.assertIn("Healthy candidate", text)
+        self.assertIn("电影港：", text)
+        self.assertIn("关键词", text)
+        self.assertTrue("片名" in text or "别名" in text)
+        self.assertNotIn("缩短", text)
+        self.assertIn("5266影视：", text)
+        self.assertIn("人机验证", text)
+        self.assertNotIn(private_html, text)
+        self.assertNotIn("BTBtla", text)
 
     def test_source_callback_replaces_message_with_filtered_results(self):
         action_id = self.store.create_action(
