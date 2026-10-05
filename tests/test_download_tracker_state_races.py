@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +18,8 @@ from tests.support import isolated_test_database
 class DownloadTrackerStateRaceTests(unittest.TestCase):
     def setUp(self) -> None:
         self.enterContext(isolated_test_database())
+        for owner, name in ((socket.socket, "connect"), (socket.socket, "connect_ex"), (socket, "getaddrinfo")):
+            self.enterContext(patch.object(owner, name, side_effect=AssertionError("禁止外联")))
         self.tracker = DownloadTracker()
         self.notify = self.enterContext(
             patch.object(self.tracker, "_notify_completion")
@@ -151,6 +154,146 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                 )
                 self.organize.assert_not_called()
                 self.staging.assert_not_called()
+
+    @staticmethod
+    def _gy_batch(*states):
+        return [
+            GuangYaClient._to_offline_task({"taskId": f"gy-{index}", "status": state, "progress": 0})
+            for index, state in enumerate(states, 1) if state is not None
+        ]
+
+    def test_guangya_batch_failure_keeps_live_admission_and_blocks_resource_retry(self) -> None:
+        item = download_dispatcher.normalize_download_url("magnet:?xt=urn:btih:" + "d" * 40)
+        request_id = download_dispatcher.create_request(item, "", "batch-repro")["id"]
+        with (
+            patch.object(download_dispatcher, "get", side_effect=lambda key, default="": default),
+            patch.object(download_dispatcher, "analyze_offline_url", return_value=SimpleNamespace(allowed=True)),
+            patch.object(download_dispatcher, "_recover_guangya_magnet_torrent", return_value=None),
+            patch.object(download_dispatcher, "_submit_guangya", return_value={
+                "ok": True, "task_ids": ["gy-1", "gy-2"], "batch_count": 2,
+            }) as submit,
+        ):
+            self.assertTrue(download_dispatcher.dispatch_request(request_id, "guangya")["ok"])
+            subscription_id = self._bind_admission(request_id)
+            self.tracker._update_request(
+                db.get_download_request(request_id), [], self._gy_batch(4, 0), qb_available=False,
+            )
+            row = db.get_download_request(request_id)
+            active = db.list_active_media_download_admissions(subscription_id)
+            retry = download_dispatcher.resubmit_download_request(request_id, "guangya")
+
+        self.assertEqual((row["status"], row["gy_status"]), ("downloading", "downloading"))
+        self.assertIsNone(row["completed_at"])
+        self.assertEqual(len(active), 1)
+        self.assertFalse(retry["ok"])
+        submit.assert_called_once()
+        self.organize.assert_not_called()
+        self.staging.assert_not_called()
+
+    def test_guangya_batch_terminal_state_requires_every_batch_to_be_known(self) -> None:
+        cases = (
+            ((4, 4), "", 2, "failed"),
+            ((4, 0), "", 2, "downloading"),
+            ((4, "unknown"), "", 2, "downloading"),
+            ((4, None), "", 2, "submitted"),
+            ((4, None), "2000-01-01 00:00:00", 2, "manual_review"),
+            ((4, 1), "", 2, "manual_review"),
+            ((1, 0), "", 2, "downloading"),
+            ((1, 1), "", 2, "completed"),
+            ((4, 0), "", 3, "manual_review"),
+        )
+        for states, missing_since, batch_count, expected in cases:
+            with self.subTest(states=states, missing_since=missing_since, batch_count=batch_count), isolated_test_database():
+                self.organize.reset_mock()
+                self.staging.reset_mock()
+                request_id = self._request(
+                    targets="guangya", qb_status="", gy_task_ids='["gy-1","gy-2"]',
+                    gy_batch_count=batch_count, gy_task_missing_since=missing_since or None,
+                )
+                subscription_id = self._bind_admission(request_id)
+                self.tracker._update_request(
+                    db.get_download_request(request_id), [], self._gy_batch(*states), qb_available=False,
+                )
+                row = db.get_download_request(request_id)
+                self.assertEqual((row["status"], row["gy_status"]), (expected, expected))
+                self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), int(expected != "failed"))
+                if expected == "completed":
+                    self.organize.assert_called_once()
+                else:
+                    self.organize.assert_not_called()
+                    self.staging.assert_not_called()
+                if expected in {"submitted", "downloading"}:
+                    self.assertIsNone(row["completed_at"])
+                    self.assertEqual(row["notification_event_status"], "")
+
+    def test_guangya_batch_mixed_terminal_does_not_report_success_with_completed_qb(self) -> None:
+        request_id = self._request(
+            qb_status="completed", local_import_status="completed",
+            gy_task_ids='["gy-1","gy-2"]', gy_batch_count=2,
+        )
+        subscription_id = self._bind_admission(request_id)
+        self.tracker._update_request(
+            db.get_download_request(request_id), [], self._gy_batch(4, 1), qb_available=False,
+        )
+        row = db.get_download_request(request_id)
+        self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
+        self.assertEqual(row["notification_event_status"], "manual_review")
+        self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
+        self.organize.assert_not_called()
+
+    def test_guangya_batch_without_id_list_cannot_collapse_to_one_terminal_task(self) -> None:
+        for state in (4, 1):
+            with self.subTest(state=state), isolated_test_database():
+                request_id = self._request(
+                    targets="guangya", qb_status="", gy_task_ids="[]", gy_batch_count=2, gy_isolated=1,
+                )
+                subscription_id = self._bind_admission(request_id)
+                self.tracker._update_request(
+                    db.get_download_request(request_id), [], self._gy_batch(state), qb_available=False,
+                )
+                row = db.get_download_request(request_id)
+                self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
+                self.assertEqual((row["gy_task_ids"], row["gy_batch_count"]), ("[]", 2))
+                self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
+                self.organize.assert_not_called()
+
+    def test_guangya_batch_still_allows_only_failed_qb_to_retry_in_place(self) -> None:
+        request_id = self._request(qb_status="failed", gy_task_ids='["gy-1","gy-2"]', gy_batch_count=2)
+        self.tracker._update_request(
+            db.get_download_request(request_id), [], self._gy_batch(4, 0), qb_available=False,
+        )
+        with (
+            patch.object(download_dispatcher, "get", side_effect=lambda key, default="": "http://qb.invalid" if key == "QB_URL" else default),
+            patch.object(download_dispatcher, "analyze_offline_url", return_value=SimpleNamespace(allowed=True)),
+            patch.object(download_dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "a" * 40}) as qb,
+            patch.object(download_dispatcher, "_submit_guangya") as gy,
+        ):
+            result = download_dispatcher.resubmit_download_request(request_id, "qb")
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["created"])
+        self.assertEqual(result["request_id"], request_id)
+        row = db.get_download_request(request_id)
+        self.assertEqual((row["gy_status"], row["gy_task_ids"]), ("downloading", '["gy-1","gy-2"]'))
+        qb.assert_called_once()
+        gy.assert_not_called()
+
+    def test_guangya_batch_unavailable_backend_does_not_finalize_stale_snapshot(self) -> None:
+        for task_ids in ('["gy-1","gy-2"]', "[]"):
+            with self.subTest(task_ids=task_ids), isolated_test_database():
+                request_id = self._request(
+                    targets="guangya", qb_status="", gy_task_ids=task_ids, gy_batch_count=2,
+                    gy_task_missing_since="2000-01-01 00:00:00",
+                )
+                subscription_id = self._bind_admission(request_id)
+                self.tracker._update_request(
+                    db.get_download_request(request_id), [], self._gy_batch(4, 4),
+                    qb_available=False, gy_available=False,
+                )
+                row = db.get_download_request(request_id)
+                self.assertEqual((row["status"], row["gy_status"]), ("submitted", "submitted"))
+                self.assertIsNone(row["completed_at"])
+                self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
+                self.organize.assert_not_called()
 
     def test_stale_snapshot_cannot_revive_successfully_resubmitted_request(
         self,

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from app import database as db
 from app.modules.download_tracker import _TRACKER_CURSOR_KEY, DownloadTracker
-from tests.support import IsolatedDatabaseTestCase
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
 
 class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
@@ -76,6 +76,31 @@ class DownloadTrackerBatchIsolationTests(IsolatedDatabaseTestCase):
         self.assertEqual(seen, [first, second])
         self.assertEqual(db.get_download_request(second)["qb_status"], "downloading")
         self.assertEqual(db.kv_get(_TRACKER_CURSOR_KEY), str(second))
+
+    def test_guangya_partial_batch_is_polled_after_restart_until_remaining_task_finishes(self) -> None:
+        for final_state, expected in (("failed", "failed"), ("completed", "manual_review")):
+            with self.subTest(final_state=final_state), isolated_test_database():
+                request_id = self._request("gy-batch")
+                db.update_download_request(
+                    request_id, targets="guangya", qb_status="", gy_status="submitted",
+                    gy_task_id="gy-1", gy_task_ids='["gy-1","gy-2"]', gy_batch_count=2,
+                )
+                failed = {"id": "gy-1", "status": "failed", "progress": 0}
+                live = {"id": "gy-2", "status": "downloading", "progress": 0.4}
+                with (
+                    patch.object(DownloadTracker, "_gy_tasks", side_effect=[
+                        (True, [failed, live]), (True, [failed, {**live, "status": final_state}]),
+                    ]) as tasks,
+                    patch.object(DownloadTracker, "_qb_tasks") as qb,
+                    patch.object(DownloadTracker, "_start_organize") as organize,
+                ):
+                    self.assertEqual(DownloadTracker().run_once(), 1)
+                    self.assertEqual(db.get_download_request(request_id)["gy_status"], "downloading")
+                    self.assertEqual(DownloadTracker().run_once(), 1)
+                self.assertEqual(db.get_download_request(request_id)["gy_status"], expected)
+                self.assertEqual(tasks.call_count, 2)
+                qb.assert_not_called()
+                organize.assert_not_called()
 
     def test_process_interrupt_is_not_swallowed_or_marked_as_finished_batch(self) -> None:
         self._request("interrupted")

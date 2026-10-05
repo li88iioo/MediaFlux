@@ -345,15 +345,12 @@ class DownloadTracker:
                     "请在下载器中核对，勿直接重复提交"
                 )
 
-        if gy_status in {"submitted", "downloading", "outcome_unknown"}:
+        if gy_available and gy_status in {"submitted", "downloading", "outcome_unknown"}:
             task_ids = self._parse_gy_task_ids(row)
-            if task_ids and gy_available:
+            expected_batches = max(len(task_ids), int(self._row_value(row, "gy_batch_count", 0) or 0))
+            if task_ids or expected_batches > 1:
                 task_by_id = gy_tasks.by_id
                 matched = [task_by_id[task_id] for task_id in task_ids if task_id in task_by_id]
-                expected_batches = max(len(task_ids), int(self._row_value(row, "gy_batch_count", 0) or 0))
-                if len(matched) == expected_batches:
-                    matched_gy_tasks = matched
-                states = [self._gy_task_state(task) for task in matched]
                 progress_values = [
                     max(0.0, min(float(task.get("progress") or 0), 1.0)) for task in matched
                 ]
@@ -364,12 +361,6 @@ class DownloadTracker:
                         "光鸭仅返回部分任务 ID，部分提交可能已经生效；"
                         "请核对云端任务，勿直接重复提交"
                     )
-                elif any(state == "failed" for state in states):
-                    updates["gy_status"] = "failed"
-                    updates["error"] = "光鸭分批下载存在失败任务，已停止自动整理，请人工核验"
-                elif len(matched) == expected_batches and states and all(state == "completed" for state in states):
-                    updates["gy_status"] = "completed"
-                    updates["gy_task_missing_since"] = None
                 elif len(matched) < expected_batches:
                     missing_since = self._row_value(row, "gy_task_missing_since", "")
                     if not missing_since:
@@ -380,16 +371,25 @@ class DownloadTracker:
                     else:
                         updates["gy_status"] = "downloading"
                 else:
-                    updates["gy_status"] = "downloading"
+                    matched_gy_tasks = matched
                     updates["gy_task_missing_since"] = None
+                    # 批次齐全才归并；混合终态保留准入，不能把部分成功当成可重投失败。
+                    states = {self._gy_task_state(task) for task in matched}
+                    if "downloading" in states:
+                        updates["gy_status"] = "downloading"
+                    elif states == {"completed"}:
+                        updates["gy_status"] = "completed"
+                    else:
+                        updates["gy_status"] = "failed" if states == {"failed"} else "manual_review"
+                        updates["error"] = "光鸭分批下载存在失败任务，已停止自动整理，请人工核验"
                 backend_logs.append((
-                    "guangya", updates.get("gy_status", gy_status), progress, task_ids[0],
+                    "guangya", updates.get("gy_status", gy_status), progress,
+                    task_ids[0] if task_ids else str(self._row_value(row, "gy_task_id", "") or ""),
                 ))
-            elif not task_ids and gy_available:
+            else:
                 task = self._match_gy(row, gy_tasks)
                 if task:
-                    if int(self._row_value(row, "gy_batch_count", 0) or 0) <= 1:
-                        matched_gy_tasks = [task]
+                    matched_gy_tasks = [task]
                     progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
                     updates["gy_status"] = self._gy_task_state(task)
                     updates["gy_task_missing_since"] = None
