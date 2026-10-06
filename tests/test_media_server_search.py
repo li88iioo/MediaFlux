@@ -255,6 +255,50 @@ class MediaServerSearchTests(unittest.TestCase):
                     self.assertEqual(params["Recursive"], "true")
                     self.assertEqual("SeriesPrimaryImageTag" in params["Fields"], client_type is JellyfinClient)
 
+    def test_recent_media_fills_distinct_results_across_episode_pages(self):
+        rows = [
+            {"Id": f"episode-{i}", "Name": f"第{i}集", "Type": "Episode",
+             "SeriesId": "series-a", "SeriesName": "测试剧甲",
+             "DateCreated": f"2026-10-06T12:00:{59-i:02}Z"}
+            for i in range(30)
+        ] + [{"Id": "series-b", "Name": "测试剧乙", "Type": "Series",
+              "DateCreated": "2026-10-05T12:00:00Z"}]
+        for client_type in (JellyfinClient, EmbyClient):
+            with self.subTest(client=client_type.__name__), client_type("http://media.invalid", "token") as client:
+                client._cached_user_id = "user-1"
+                if isinstance(client, EmbyClient):
+                    client._cached_server_info = {"ProductName": "Emby", "Version": "4.9"}
+                def page(_path, *, params):
+                    offset = params.get("StartIndex", 0)
+                    return {"Items": rows[offset:offset + params["Limit"]]}
+                with patch.object(client, "_request", side_effect=page) as request:
+                    items = client.recent_media(limit=2, parent_id="tv-library", media_type="tv")
+                self.assertEqual([item.name for item in items], ["第0集", "测试剧乙"])
+                self.assertEqual(request.call_count, 2)
+                self.assertEqual([call.kwargs["params"].get("StartIndex", 0) for call in request.call_args_list], [0, 30])
+                for call in request.call_args_list:
+                    self.assertEqual(call.kwargs["params"]["ParentId"], "tv-library")
+                    self.assertEqual(call.kwargs["params"]["IncludeItemTypes"], "Series,Episode")
+
+    def test_recent_media_has_bounded_scan_and_surfaces_next_page_failure(self):
+        for client_type in (JellyfinClient, EmbyClient):
+            with self.subTest(client=client_type.__name__), client_type("http://media.invalid", "token") as client:
+                client._cached_user_id = "user-1"
+                if isinstance(client, EmbyClient):
+                    client._cached_server_info = {"ProductName": "Emby", "Version": "4.9"}
+                def page(_path, *, params):
+                    return {"Items": [
+                        {"Id": str(i), "Name": "同一部剧", "Type": "Episode", "SeriesId": "series-a"}
+                        for i in range(params.get("StartIndex", 0), params.get("StartIndex", 0) + params["Limit"])
+                    ]}
+                with patch.object(client, "_request", side_effect=page) as request:
+                    self.assertEqual(len(client.recent_media(limit=2)), 1)
+                self.assertLessEqual(request.call_count, 11)
+                self.assertEqual(sum(call.kwargs["params"]["Limit"] for call in request.call_args_list), 2000)
+                with patch.object(client, "_request", side_effect=[page("", params={"Limit": 30}), RuntimeError("page failed")]):
+                    with self.assertRaisesRegex(RuntimeError, "page failed"):
+                        client.recent_media(limit=2)
+
     def test_recent_media_keeps_newest_episode_per_series(self):
         payload = {"Items": [
             {

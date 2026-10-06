@@ -1003,28 +1003,26 @@ class MediaServerClient:
         }
         if str(parent_id or "").strip():
             params["ParentId"] = str(parent_id).strip()
-        data = self._request(f"/Users/{uid}/Items", params=params)
-        raw_items, _total = self._items_payload(data)
-        raw_items = sorted(
-            raw_items,
-            key=lambda raw: str(raw.get("DateCreated") or ""),
-            reverse=True,
-        )
-        items: list[MediaItem] = []
-        seen: set[str] = set()
-        for raw in raw_items:
-            item_id = str(raw.get("Id") or "")
-            if str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId"):
-                dedupe_key = f"episode-series:{raw['SeriesId']}"
-            else:
-                dedupe_key = item_id
-            if not dedupe_key or dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            items.append(self._media_item(raw))
-            if len(items) >= normalized_limit:
+        # 单集先去重再补页；普通首屏仍只请求一次，不为最近入库遍历整库。
+        recent: dict[str, dict[str, Any]] = {}
+        offset = 0
+        while offset < 2000 and len(recent) < normalized_limit:
+            page_size = min(int(params["Limit"]), 2000 - offset)
+            data = self._request(f"/Users/{uid}/Items", params={**params, "StartIndex": offset, "Limit": page_size})
+            raw_items, _total = self._items_payload(data)
+            for raw in sorted(raw_items, key=lambda row: str(row.get("DateCreated") or ""), reverse=True):
+                key = (f"episode-series:{raw['SeriesId']}"
+                       if str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId")
+                       else str(raw.get("Id") or ""))
+                if key:
+                    recent.setdefault(key, raw)
+                if len(recent) >= normalized_limit:
+                    break
+            if len(raw_items) < page_size:
                 break
-        return items
+            offset += len(raw_items)
+            params["Limit"] = max(int(params["Limit"]), 200)
+        return [self._media_item(raw) for raw in recent.values()]
 
     def _recent_played(self, limit: int = 12) -> list[MediaItem]:
         return []
