@@ -711,6 +711,10 @@ class AgentSession:
 
             async def finish_answer(answer: str, status: str, reason: str, model_calls: int) -> None:
                 """正常回答与预算收尾共用一次持久化/终态发布，不丢失工具调用协议。"""
+                answer = answer or format_partial_progress(
+                    "本轮预算已用完，已保留已取得的结果；可回复继续。", progress_results,
+                    confirmed_result=confirmed_result, write_attempted=attempted_write,
+                )
                 public_answer = sanitize_confirmed_answer(answer, confirmed_result) if confirmed_result is not None else answer
                 if confirmed_result is not None and public_result_state(confirmed_result) == "submitted" and progress_results:
                     # 续行检查仍执行并交付真实新事实，不让模型把提交回执复述成多份。
@@ -724,11 +728,6 @@ class AgentSession:
                     "status": status, "answer": public_answer, "finish_reason": reason,
                     "usage": total_usage, "model_calls": model_calls, "tool_calls": total_tool_calls,
                 })
-
-            budget_notice = (
-                "部分完成：本轮预算已用完，已保留对话与已完成的检查结果。"
-                "未生成确认卡的写操作均未执行；你可以回复继续，我会基于现有上下文接着处理。"
-            )
 
             tool_context = replace(tool_context, capability_search=discovery.search)
             # 新的自然语言回合会明确取代尚未确认的旧计划。若只提升
@@ -931,11 +930,9 @@ class AgentSession:
                         continue
                 if blocked_calls or tool_budget_blocked or (final_synthesis_round and not assistant_text):
                     tool_limited = tool_budget_blocked or over_tool_budget or total_tool_calls >= self.limits.max_tool_calls
-                    final_text = assistant_text if final_synthesis_round else ""
-                    if blocked_calls and final_text:
-                        final_text += "\n\n" + budget_notice
+                    final_text = assistant_text if final_synthesis_round and not blocked_calls else ""
                     await finish_answer(
-                        final_text or budget_notice, "partial",
+                        final_text, "partial",
                         "tool_budget_exceeded" if tool_limited else "model_round_budget_exceeded",
                         round_index + 1,
                     )
@@ -1147,7 +1144,7 @@ class AgentSession:
                 return
 
             # 单模型轮次等边界没有额外汇总调用机会，仍保留本轮已执行事实。
-            await finish_answer(budget_notice, "partial", "model_round_budget_exceeded", self.limits.max_model_rounds)
+            await finish_answer("", "partial", "model_round_budget_exceeded", self.limits.max_model_rounds)
         except (asyncio.CancelledError, StalePublicationError) as exc:
             await preserve_checkpoint()
             if factory is not None:

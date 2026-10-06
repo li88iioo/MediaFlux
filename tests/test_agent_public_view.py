@@ -5,6 +5,7 @@ import unittest
 
 from app.agent.public_view import (
     format_public_result,
+    format_partial_progress,
     public_conversation_messages,
     public_result_state,
     sanitize_confirmed_answer,
@@ -12,6 +13,19 @@ from app.agent.public_view import (
 
 
 class AgentKernelPublicViewTests(unittest.TestCase):
+    def test_partial_reads_keep_distinct_episode_positions_without_guessing(self):
+        rows = [
+            {"series_name": "测试剧", "name": "首集", "type": "Episode", "season_number": 1, "episode_number": 1},
+            {"series_name": "测试剧", "name": "次集", "type": "Episode", "season_number": 1, "episode_number": 2},
+            {"series_name": "测试剧", "name": "特别篇", "type": "Episode", "season_number": 0, "episode_number": 1},
+            {"series_name": "测试剧", "name": "未知分季", "type": "Episode", "episode_number": 3},
+        ]
+        text = format_partial_progress("后续查询限流", [("最近入库", {"ok": True, "data": {"items": rows + rows[:1]}})])
+        for position in ("S01E01", "S01E02", "S00E01", "E03"):
+            self.assertEqual(text.count(position), 1)
+        self.assertNotIn("S01E03", text)
+        self.assertNotIn("写操作", text)
+
     def test_background_job_receipt_exposes_public_ref_and_actual_change_counts(self):
         operation_ref = "GY-0000-0000-0000-0000-0000-0000-0000-0001"
         text = format_public_result({"ok": True, "status": "completed", "summary": "光鸭后台任务已完成",

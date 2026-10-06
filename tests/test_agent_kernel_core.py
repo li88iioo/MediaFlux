@@ -1074,6 +1074,14 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                 stored = await state.load(owner="owner", session_id="single")
                 results = [item for item in stored.conversation if item["role"] == "tool"]
                 self.assertEqual(len(results), requested)
+                answer = events[-1].payload["answer"]
+                self.assertNotIn("写操作", answer)
+                self.assertNotIn("确认卡", answer)
+                if executed:
+                    self.assertIn("读取事实", answer)
+                else:
+                    self.assertIn("尚未取得可展示的查询结果", answer)
+                self.assertEqual(stored.conversation[-1]["content"], answer)
 
     async def test_context_window_drops_oldest_complete_turns_only(self) -> None:
         catalog = ToolCatalog([read_tool("library.status")])

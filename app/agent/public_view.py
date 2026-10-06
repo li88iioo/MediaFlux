@@ -230,12 +230,16 @@ def format_partial_progress(
                 continue
             year = _safe(item.get("year"), limit=8)
             media_type = {"movie": "电影", "Movie": "电影", "tv": "剧集", "Series": "剧集", "Episode": "单集"}.get(item.get("media_type") or item.get("type"), "")
+            if media_type == "单集":
+                season, episode = _int_value(item.get("season_number")), _int_value(item.get("episode_number"))
+                position = ((f"S{season:02}" if season is not None and season >= 0 else "") + f"E{episode:02}"
+                            if episode is not None and episode >= 0 else _safe(item.get("name"), limit=160))
+                if position and position != title:
+                    title += " · " + position
             key = (title, year, media_type)
-            if key in items:
-                continue
             overview = _safe(item.get("overview"), limit=180)
             suffix = " · ".join(value for value in (year, media_type) if value)
-            items[key] = title + (f"（{suffix}）" if suffix else "") + (f"：{overview}" if overview else "")
+            items.setdefault(key, title + (f"（{suffix}）" if suffix else "") + (f"：{overview}" if overview else ""))
         summary = _safe(result.get("summary"), limit=300)
         if summary and summary not in summaries:
             summaries.append(summary)
@@ -245,7 +249,7 @@ def format_partial_progress(
         if len(items) > 12:
             lines.append(f"本轮共取得 {len(items)} 项去重内容，此处展示前 12 项。")
     else:
-        lines.append("\n已完成的查询：")
+        lines.append("\n已完成的查询：" if summaries else "\n本轮尚未取得可展示的查询结果。")
         lines.extend(f"• {text}" for text in summaries[-8:])
     if errors:
         lines.append("\n未完成的查询：" + "；".join(errors[-3:]))
