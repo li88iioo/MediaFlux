@@ -208,9 +208,12 @@ class STRMMetadataWorker:
                 if item.strip()
             }
             if configured and extension not in configured:
-                db.cancel_strm_metadata_job(
-                    str(job["source_id"]), str(job["file_id"]),
-                    reason="元数据扩展名已从同步配置移除",
+                db.settle_strm_metadata_job(
+                    job_id,
+                    expected_lease_generation=lease_generation,
+                    expected_revision=revision,
+                    expected_owner=self._owner,
+                    cancel_reason="元数据扩展名已从同步配置移除",
                 )
                 return True
             prepared_job = prepare_strm_metadata_job(
@@ -231,11 +234,7 @@ class STRMMetadataWorker:
                     expected_revision=revision,
                     expected_owner=self._owner,
                 ):
-                    prepared = prepared_job.get("prepared")
-                    temp = getattr(prepared, "temp", None)
-                    if isinstance(temp, Path):
-                        temp.unlink(missing_ok=True)
-                    db.complete_strm_metadata_job(
+                    db.settle_strm_metadata_job(
                         job_id,
                         expected_lease_generation=lease_generation,
                         expected_revision=revision,
@@ -247,12 +246,11 @@ class STRMMetadataWorker:
                     should_stop=self._stop_event.is_set,
                 )
                 metadata_committed = True
-                settled = db.complete_strm_metadata_job(
+                settled = db.settle_strm_metadata_job(
                     job_id,
                     expected_lease_generation=lease_generation,
                     expected_revision=revision,
                     expected_owner=self._owner,
-                    refresh_path=str(result.get("path") or ""),
                     refresh_paths=result.get("refresh_paths") or (),
                 )
             finally:
@@ -265,17 +263,9 @@ class STRMMetadataWorker:
                 self._flush_media_refresh(force=False)
             return True
         except _STRMStopped:
-            prepared = prepared_job.get("prepared") if isinstance(prepared_job, dict) else None
-            temp = getattr(prepared, "temp", None)
-            if isinstance(temp, Path):
-                temp.unlink(missing_ok=True)
             db.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
             return False
         except Exception as exc:
-            prepared = prepared_job.get("prepared") if isinstance(prepared_job, dict) else None
-            temp = getattr(prepared, "temp", None)
-            if isinstance(temp, Path):
-                temp.unlink(missing_ok=True)
             error_type = type(exc).__name__
             state = db.fail_or_retry_strm_metadata_job(
                 job_id,
@@ -339,6 +329,10 @@ class STRMMetadataWorker:
             heartbeat.join(timeout=1.0)
             with self._state_lock:
                 self._current_job_id = 0
+            prepared = prepared_job.get("prepared") if isinstance(prepared_job, dict) else None
+            temp = getattr(prepared, "temp", None)
+            if isinstance(temp, Path):
+                temp.unlink(missing_ok=True)
 
     def _flush_media_refresh(self, *, force: bool) -> None:
         entries = db.list_strm_refresh_entries(limit=20000)

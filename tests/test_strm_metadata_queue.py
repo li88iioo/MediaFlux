@@ -43,7 +43,7 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         first = db.enqueue_strm_metadata_jobs([_job()])
         second = db.enqueue_strm_metadata_jobs([_job()])
         claimed = db.claim_due_strm_metadata_jobs(owner="worker")
-        state = db.complete_strm_metadata_job(
+        state = db.settle_strm_metadata_job(
             claimed[0]["id"],
             expected_lease_generation=claimed[0]["lease_generation"],
             expected_revision=claimed[0]["revision"],
@@ -60,7 +60,7 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
     def test_changed_snapshot_reopens_completed_job(self):
         db.enqueue_strm_metadata_jobs([_job()])
         claimed = db.claim_due_strm_metadata_jobs(owner="worker")
-        db.complete_strm_metadata_job(
+        db.settle_strm_metadata_job(
             claimed[0]["id"],
             expected_lease_generation=claimed[0]["lease_generation"],
             expected_revision=claimed[0]["revision"],
@@ -79,7 +79,7 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         claimed = db.claim_due_strm_metadata_jobs(owner="worker")
 
         result = db.enqueue_strm_metadata_jobs([_job(etag="etag-2")])
-        state = db.complete_strm_metadata_job(
+        state = db.settle_strm_metadata_job(
             claimed[0]["id"],
             expected_lease_generation=claimed[0]["lease_generation"],
             expected_revision=claimed[0]["revision"],
@@ -101,12 +101,12 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
             )
         second = db.claim_due_strm_metadata_jobs(owner="worker-b", lease_seconds=60)[0]
 
-        stale = db.complete_strm_metadata_job(
+        stale = db.settle_strm_metadata_job(
             first["id"],
             expected_lease_generation=first["lease_generation"],
             expected_revision=first["revision"],
         )
-        current = db.complete_strm_metadata_job(
+        current = db.settle_strm_metadata_job(
             second["id"],
             expected_lease_generation=second["lease_generation"],
             expected_revision=second["revision"],
@@ -144,13 +144,13 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         db.enqueue_strm_metadata_jobs([_job()])
         claimed = db.claim_due_strm_metadata_jobs(owner="worker-a")[0]
 
-        stale = db.complete_strm_metadata_job(
+        stale = db.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker-b",
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
         )
-        current = db.complete_strm_metadata_job(
+        current = db.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker-a",
             expected_lease_generation=claimed["lease_generation"],
@@ -165,12 +165,12 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
         claimed = db.claim_due_strm_metadata_jobs(owner="worker-a")[0]
         refresh_path = "/strm/电影/Movie/Movie.nfo"
 
-        state = db.complete_strm_metadata_job(
+        state = db.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker-a",
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
-            refresh_path=refresh_path,
+            refresh_paths=(refresh_path,),
         )
 
         self.assertEqual(state, "completed")
@@ -293,7 +293,7 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
     def test_summary_reports_pending_and_terminal_counts(self):
         db.enqueue_strm_metadata_jobs([_job(file_id="a"), _job(file_id="b")])
         claimed = db.claim_due_strm_metadata_jobs(owner="worker", limit=1)[0]
-        db.complete_strm_metadata_job(
+        db.settle_strm_metadata_job(
             claimed["id"],
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
@@ -441,12 +441,12 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         db.enqueue_strm_metadata_jobs([_job()])
         claimed = db.claim_due_strm_metadata_jobs(owner="worker")[0]
         path = "/strm/Movie/Movie.nfo"
-        db.complete_strm_metadata_job(
+        db.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="worker",
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
-            refresh_path=path,
+            refresh_paths=(path,),
         )
         worker = STRMMetadataWorker()
         self.assertFalse(hasattr(worker, "_changed_paths"))
@@ -484,12 +484,12 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         db.enqueue_strm_metadata_jobs([_job()])
         claimed = db.claim_due_strm_metadata_jobs(owner="old-worker")[0]
         path = "/strm/Movie/Movie.nfo"
-        db.complete_strm_metadata_job(
+        db.settle_strm_metadata_job(
             claimed["id"],
             expected_owner="old-worker",
             expected_lease_generation=claimed["lease_generation"],
             expected_revision=claimed["revision"],
-            refresh_path=path,
+            refresh_paths=(path,),
         )
         worker = STRMMetadataWorker()
 

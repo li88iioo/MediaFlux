@@ -58,6 +58,53 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
                 "UPDATE strm_metadata_queue SET next_attempt_at='2000-01-01 00:00:00'"
             )
 
+    def test_extension_rejection_settles_only_its_claimed_snapshot(self):
+        for change in ("unchanged", "revision", "lease"):
+            with self.subTest(change=change):
+                with db.get_conn() as conn:
+                    conn.execute("DELETE FROM strm_metadata_queue")
+                db.enqueue_strm_metadata_jobs([{**self.job, "filename": "Movie.jpg", "target_rel_path": "整理/Movie/Movie.jpg"}])
+                successor = []
+                def settings(key, default=""):
+                    if key == "STRM_METADATA_EXTS":
+                        if change == "revision":
+                            db.enqueue_strm_metadata_jobs([self.job])
+                        elif change == "lease":
+                            db.recover_stale_strm_metadata_jobs(force=True, owner=self.worker._owner)
+                            successor.extend(db.claim_due_strm_metadata_jobs(owner="successor"))
+                        return "nfo"
+                    return str(self.root) if key == "STRM_ROOT" else default
+                with (
+                    patch("app.modules.strm_metadata_worker.get", side_effect=settings),
+                    patch("app.modules.strm_metadata_worker.prepare_strm_metadata_job") as prepare,
+                ):
+                    self.assertTrue(self.worker._process_one())
+                prepare.assert_not_called()
+                row = self.queue_row()
+                self.assertEqual(row["status"], {"unchanged": "cancelled", "revision": "queued", "lease": "running"}[change])
+                self.assertEqual(db.list_strm_refresh_entries(), [])
+                self.assertEqual(db.list_strm_failures(status="open"), [])
+                self.assertEqual(self.worker._completed_session, 0)
+                self.assertEqual(self.worker._failed_session, 0)
+                self.assertFalse(self.target.exists())
+                if change == "unchanged":
+                    self.assertIn("扩展名", row["last_error"])
+                elif change == "revision":
+                    self.assertEqual(row["filename"], "Movie.nfo")
+                    self.assertEqual(row["last_error"], "")
+                    with patch("app.modules.strm.requests.get", return_value=_Response()):
+                        self.assertTrue(self.worker._process_one())
+                    self.assertEqual(self.queue_row()["status"], "completed")
+                    self.assertEqual(self.target.read_bytes(), b"metadata")
+                    self.target.unlink()
+                    self.worker._completed_session = 0
+                    with db.get_conn() as conn:
+                        conn.execute("DELETE FROM strm_index")
+                        conn.execute("DELETE FROM strm_refresh_outbox")
+                else:
+                    self.assertEqual(row["lease_owner"], "successor")
+                    self.assertEqual(row["lease_generation"], successor[0]["lease_generation"])
+
     def test_completed_file_at_attempt_limit_retries_handoff_without_redownloading(
         self,
     ):
@@ -219,7 +266,7 @@ class StrmMetadataCommitRecoveryTests(unittest.TestCase):
 
                 with (
                     patch.object(
-                        db, "complete_strm_metadata_job", side_effect=interrupt
+                        db, "settle_strm_metadata_job", side_effect=interrupt
                     ),
                     patch("app.modules.strm.requests.get", return_value=_Response()),
                 ):
@@ -279,7 +326,7 @@ socket.socket.connect=lambda *_a,**_k: (_ for _ in ()).throw(AssertionError("ext
 db.configure_database(Path(sys.argv[1]),test_mode=True)
 worker=STRMMetadataWorker()
 worker._client=_TreeClient({"source":[GuangYaFile("meta","Movie.nfo",False,8,"m1","source")]})
-with patch("app.modules.strm_metadata_worker.get_bool",return_value=True), patch("app.modules.strm_metadata_worker.get",side_effect=lambda key,default="": {"STRM_ROOT":sys.argv[2],"STRM_METADATA_EXTS":"nfo"}.get(key,default)), patch("app.modules.strm.requests.get",return_value=_Response()), patch.object(db,"complete_strm_metadata_job",side_effect=lambda *_a,**_k: os._exit(79)):
+with patch("app.modules.strm_metadata_worker.get_bool",return_value=True), patch("app.modules.strm_metadata_worker.get",side_effect=lambda key,default="": {"STRM_ROOT":sys.argv[2],"STRM_METADATA_EXTS":"nfo"}.get(key,default)), patch("app.modules.strm.requests.get",return_value=_Response()), patch.object(db,"settle_strm_metadata_job",side_effect=lambda *_a,**_k: os._exit(79)):
  worker._process_one()
 raise AssertionError("crash checkpoint not reached")
 """

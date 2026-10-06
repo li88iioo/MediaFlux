@@ -449,7 +449,7 @@ def test_interrupt_metadata_ack_crash_reuses_verified_installation(tmp_path):
         with cloud_runtime(cloud, root):
             with patch.object(
                 db,
-                "complete_strm_metadata_job",
+                "settle_strm_metadata_job",
                 side_effect=SystemExit("crash before ACK"),
             ):
                 with pytest.raises(SystemExit):

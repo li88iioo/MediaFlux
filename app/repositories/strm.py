@@ -443,16 +443,16 @@ def renew_strm_metadata_job_lease(
         return cur.rowcount == 1
 
 
-def complete_strm_metadata_job(
+def settle_strm_metadata_job(
     job_id: int,
     *,
     expected_lease_generation: int,
     expected_revision: int,
     expected_owner: str = "",
-    refresh_path: str = "",
     refresh_paths: object = (),
+    cancel_reason: str = "",
 ) -> str:
-    """提交成功结果与全部变化路径；快照已变化时重新排队最新版本。"""
+    """按租约交接成功或取消；快照已变化时只重新排队最新版本。"""
     database = db
     stamp = database.now()
     with database.get_conn() as conn:
@@ -471,26 +471,23 @@ def complete_strm_metadata_job(
         ):
             return "stale"
         requeue = bool(row["dirty"]) or int(row["revision"] or 0) != int(expected_revision)
-        status = "queued" if requeue else "completed"
+        status = "queued" if requeue else "cancelled" if cancel_reason else "completed"
+        cancelled = status == "cancelled"
         cur = conn.execute(
             "UPDATE strm_metadata_queue SET status=?,dirty=0,attempts=0,next_attempt_at=?,"
-            "completed_at=?,lease_owner='',lease_until=0,last_error_type='',last_error='',"
+            "completed_at=?,lease_owner='',lease_until=0,last_error_type=?,last_error=?,"
             "updated_at=? WHERE id=? AND status='running' AND lease_generation=?",
             (
-                status, stamp, None if requeue else stamp, stamp, int(job_id),
+                status, stamp, stamp if status == "completed" else None,
+                "Cancelled" if cancelled else "", _sanitize_metadata_error(cancel_reason) if cancelled else "",
+                stamp, int(job_id),
                 int(expected_lease_generation),
             ),
         )
         if cur.rowcount != 1:
             return "stale"
-        # 单路径参数只是旧 API 的薄适配；新旧落盘目录统一进入同一 outbox
-        # 事务，不能只刷新新文件而遗漏已删除的历史元数据目录。
-        normalized_paths = _normalize_refresh_paths((refresh_path, *(refresh_paths or ())))
         if status == "completed":
-            if normalized_paths:
-                _enqueue_strm_refresh_paths(
-                    conn, normalized_paths, stamp=stamp, allow_emby=True
-                )
+            _enqueue_strm_refresh_paths(conn, refresh_paths, stamp=stamp, allow_emby=True)
             database._resolve_strm_failure_for_item_conn(
                 conn, str(row["source_id"]), str(row["file_id"]), "metadata", timestamp=stamp,
             )

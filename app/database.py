@@ -2121,7 +2121,7 @@ from app.repositories.strm import (  # noqa: E402,F401
     claim_due_strm_metadata_jobs,
     claim_strm_change_targets,
     complete_strm_change_target,
-    complete_strm_metadata_job,
+    settle_strm_metadata_job,
     count_due_strm_change_targets,
     count_pending_strm_change_targets,
     count_strm_metadata_jobs,

@@ -17,12 +17,12 @@ class STRMBatchHandoffAuditTests(unittest.TestCase):
 
     @staticmethod
     def complete(job, path=""):
-        return db.complete_strm_metadata_job(
+        return db.settle_strm_metadata_job(
             job["id"],
             expected_owner=job["lease_owner"],
             expected_lease_generation=job["lease_generation"],
             expected_revision=job["revision"],
-            refresh_path=path,
+            refresh_paths=(path,),
         )
 
     def test_owner_recovery_and_new_revisions_fence_every_old_batch_result(self):

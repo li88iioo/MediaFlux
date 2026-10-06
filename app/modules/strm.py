@@ -1295,7 +1295,7 @@ def commit_strm_metadata_job(
             prepared.temp.unlink(missing_ok=True)
         return {
             "status": "skipped", "file_id": file_id,
-            "path": str(expected), "cleaned": 0,
+            "path": str(expected), "cleaned": 0, "refresh_paths": [str(expected)],
         }
     if prepared is None:
         raise RuntimeError("已安装元数据在准备后发生变化，等待重新下载")
@@ -1303,7 +1303,7 @@ def commit_strm_metadata_job(
         remote, rel_dir, expected, strm_root, metadata_source_key,
         existing_rows, "", should_stop=should_stop, prepared=prepared,
     )
-    # 失败台账与任务 ACK/刷新交接由 complete_strm_metadata_job 同事务确认；
+    # 失败台账与任务 ACK/刷新交接由 settle_strm_metadata_job 同事务确认；
     # 安装器只返回已验证的落盘事实，不能提前关闭尚未交接的旧失败项。
     refresh_paths = [str(expected)]
     if cleaned and current:
