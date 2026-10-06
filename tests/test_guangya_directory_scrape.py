@@ -2282,6 +2282,34 @@ class PartialDirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             rules_loader=lambda: self.rules,
         )
 
+    def test_large_directory_preview_keeps_every_video_without_cloud_writes(self):
+        # 仅替代云盘和 TMDB 边界；真实检查、规划、签名及预览存储均执行。
+        for count in (99, 100, 101, 150):
+            with self.subTest(count=count):
+                videos = [
+                    _file(f"large-{index}", f"Example.Show.S01E{index:03d}.mkv", "show-dir")
+                    for index in range(1, count + 1)
+                ]
+                self.client.tree["show-dir"] = videos
+                self.client.infos.update({item.file_id: item for item in videos})
+                with (
+                    patch.object(self.client, "move", wraps=self.client.move) as move,
+                    patch.object(self.client, "rename", wraps=self.client.rename) as rename,
+                    patch.object(self.client, "create_dir", wraps=self.client.create_dir) as create,
+                    patch.object(self.client, "delete", wraps=self.client.delete) as delete,
+                    patch("app.modules.media_probe.probe_media_profiles_batch", return_value={}),
+                ):
+                    inspection = self.service.inspect("owner", "show-dir")
+                    preview = self.service.preview("owner", inspection["inspection_id"], "123", "tv")
+                self.assertEqual(inspection["counts"]["video"], count)
+                self.assertEqual(len(preview["plans"]), count)
+                self.assertEqual({plan["file_id"] for plan in preview["plans"]}, {item.file_id for item in videos})
+                self.assertFalse(preview["cloud_write"])
+                self.assertEqual(self.client.tree["show-dir"], videos)
+                self.assertEqual(len(self.store.get_preview("owner", preview["preview_id"]).plans), count)
+                for operation in (move, rename, create, delete):
+                    operation.assert_not_called()
+
     def test_multiple_files_keep_partial_stats_when_one_real_move_fails(self):
         inspection = self.service.inspect("owner", "show-dir")
         preview = self.service.preview(
