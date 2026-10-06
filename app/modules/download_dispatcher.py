@@ -793,7 +793,9 @@ def resubmit_download_request(
             "request_id": int(source_request_id),
             "created": False,
             "targets": targets,
-            "source_attention_preserved": not bool(result.get("ok")),
+            "source_attention_preserved": not bool(result.get("ok")) or bool(
+                db.count_download_requests_requiring_attention(int(source_request_id))
+            ),
         }
 
     source_kind = str(source_row["kind"] or "")
@@ -952,7 +954,9 @@ def resubmit_download_request(
         "request_id": successor_id,
         "created": True,
         "targets": targets,
-        "source_attention_preserved": not bool(result.get("ok")),
+        "source_attention_preserved": not bool(result.get("ok")) or bool(
+            db.count_download_requests_requiring_attention(int(source_request_id))
+        ),
     }
 
 

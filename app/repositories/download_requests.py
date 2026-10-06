@@ -630,11 +630,13 @@ def get_download_request(request_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def count_download_requests_requiring_attention() -> int:
-    """返回需要用户核验的下载及后处理异常请求数。"""
+def count_download_requests_requiring_attention(request_id: int | None = None) -> int:
+    """看板与重提回执共用待处理口径，可精确核对单条请求。"""
+    scope = " AND id=?" if request_id is not None else ""
+    params = (int(request_id),) if request_id is not None else ()
     with db.get_conn() as conn:
         return int(conn.execute(
-            f"SELECT COUNT(*) FROM download_requests WHERE {_DOWNLOAD_ATTENTION_WHERE}"
+            f"SELECT COUNT(*) FROM download_requests WHERE {_DOWNLOAD_ATTENTION_WHERE}{scope}", params,
         ).fetchone()[0])
 
 
@@ -699,27 +701,37 @@ def mark_download_request_resubmitted(
     successor_request_id: int,
     targets: str,
 ) -> bool:
-    """把旧异常请求标记为已由新的下载请求接管。
+    """只把已重提后端的旧异常标记为由新请求接管。
 
-    保留旧请求及原错误用于审计，但从待处理口径中移除，避免重新提交后
-    旧异常与新请求同时占用两个待处理条目。
+    保留旧请求及原错误用于审计；未重提的后端继续跟踪、整理或保留待处理，
+    不能因另一端重新提交而被提前收尾。
     """
+    if targets not in {"qb", "guangya", "both"}:
+        raise ValueError("未知下载重提目标")
     timestamp = db.now()
-    note = f"已重新提交为请求 #{int(successor_request_id)}（目标：{str(targets or '')}）"
+    note = f"已重新提交为请求 #{int(successor_request_id)}（目标：{targets}）"
+    fields = ["status"]
+    if targets in {"qb", "both"}:
+        fields.extend(("qb_status", "local_import_status"))
+    if targets in {"guangya", "both"}:
+        fields.extend(("gy_status", "organize_status", "strm_status"))
+    # 仅接管明确重提的后端及其后处理，不得替另一端清除失败或认领整理。
+    assignments = []
+    for field in fields:
+        states = "'failed','manual_review'" if field in {"status", "qb_status", "gy_status"} else "'failed'"
+        assignments.append(f"{field}=CASE WHEN {field} IN ({states}) THEN 'resubmitted' ELSE {field} END")
+    if targets in {"guangya", "both"}:
+        assignments.append(
+            "organize_started=CASE WHEN gy_status='completed' AND organize_started<=0 THEN 1 "
+            "WHEN organize_started<0 THEN 0 ELSE organize_started END"
+        )
+    assignments.extend((
+        "error=CASE WHEN COALESCE(error,'')='' THEN ? ELSE substr(error || char(10) || ?,1,1000) END",
+        "updated_at=?",
+    ))
     with db.get_conn() as conn:
         cur = conn.execute(
-            "UPDATE download_requests SET "
-            "status=CASE WHEN status IN ('failed','manual_review') THEN 'resubmitted' ELSE status END,"
-            "qb_status=CASE WHEN qb_status IN ('failed','manual_review') THEN 'resubmitted' ELSE qb_status END,"
-            "gy_status=CASE WHEN gy_status IN ('failed','manual_review') THEN 'resubmitted' ELSE gy_status END,"
-            "local_import_status=CASE WHEN local_import_status='failed' THEN 'resubmitted' ELSE local_import_status END,"
-            "organize_started=CASE "
-            "WHEN gy_status='completed' AND organize_started<=0 THEN 1 "
-            "WHEN organize_started<0 THEN 0 ELSE organize_started END,"
-            "organize_status=CASE WHEN organize_status='failed' THEN 'resubmitted' ELSE organize_status END,"
-            "strm_status=CASE WHEN strm_status='failed' THEN 'resubmitted' ELSE strm_status END,"
-            "error=CASE WHEN COALESCE(error,'')='' THEN ? ELSE substr(error || char(10) || ?,1,1000) END,"
-            "updated_at=? WHERE id=?",
+            f"UPDATE download_requests SET {','.join(assignments)} WHERE id=?",
             (note, note, timestamp, int(request_id)),
         )
         return cur.rowcount == 1
@@ -963,7 +975,8 @@ def claim_download_request(request_id: int, targets: str) -> bool:
 # 轮询补偿、整理认领、未配置整理时的目录收口必须消费同一份后端准入事实。
 _GUANGYA_FOLLOWUP_READY_SQL = (
     "targets IN ('guangya','both') AND gy_status='completed' "
-    "AND status IN ('submitted','downloading','completed','manual_review') "
+    "AND (status IN ('submitted','downloading','completed','manual_review') "
+    "OR (status='resubmitted' AND qb_status='resubmitted')) "
     "AND organize_started=0 "
     "AND COALESCE(organize_status,'') NOT IN ('resubmitted','cleared') "
     "AND COALESCE(attention_cleared_at,'')=''"

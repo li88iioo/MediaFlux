@@ -115,6 +115,38 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
                             1,
                         )
 
+    def test_successor_qb_retry_preserves_pending_cloud_organize(self):
+        for status, qb_status in (("completed", "failed"), ("manual_review", "failed")):
+            with self.subTest(status=status):
+                request_id = self.request(target="qb", peer_status="completed")
+                db.update_download_request(
+                    request_id, status=status, qb_status=qb_status,
+                    organize_started=0, organize_status="settle_wait",
+                )
+                with patch.object(dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "retry-qb"}):
+                    result = dispatcher.resubmit_download_request(request_id, "qb")
+                self.assertTrue(result["ok"], result)
+                self.assertTrue(result["created"])
+                old = db.get_download_request(request_id)
+                self.assertEqual(old["gy_status"], "completed")
+                self.assertEqual(old["organize_started"], 0)
+                self.assertEqual(old["organize_status"], "settle_wait")
+                self.assertIn(request_id, {row["id"] for row in db.list_active_download_requests()})
+                self.assertTrue(db.claim_download_request_organize(request_id))
+                self.assertFalse(db.claim_download_request_organize(request_id))
+
+    def test_cloud_successor_does_not_clear_unselected_local_import_failure(self):
+        request_id = self.request(target="guangya", peer_status="completed")
+        db.update_download_request(request_id, status="completed", local_import_status="failed")
+        with patch.object(dispatcher, "_submit_guangya", return_value={"ok": True, "task_ids": ["retry-gy"]}):
+            result = dispatcher.resubmit_download_request(request_id, "guangya")
+        self.assertTrue(result["ok"], result)
+        old = db.get_download_request(request_id)
+        self.assertTrue(result["source_attention_preserved"])
+        self.assertEqual(old["local_import_status"], "failed")
+        self.assertEqual(old["qb_status"], "completed")
+        self.assertIn(request_id, {row["id"] for row in db.list_download_requests_requiring_attention()})
+
     def test_failed_retry_preserves_attention_and_other_backend(self):
         for backend_result in (
             {"ok": False, "error": "拒绝"},
