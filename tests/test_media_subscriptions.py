@@ -184,6 +184,42 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
             expires_at="2099-01-01 00:00:00",
         )
 
+    def test_candidate_list_filters_history_before_its_limit(self):
+        subscription_id = self._seed_subscription()
+        key = "tmdb:86034:tv:S01E001"
+        historical = self._add_candidates(subscription_id, media_key=key,
+            result_ids=tuple(f"history-{i}" for i in range(500)))
+        current = db.replace_media_subscription_candidates(
+            subscription_id, key, season=1, episode=1,
+            candidates=[{"result_id": value, "site_id": "mikan", "title": value,
+                         "relevance_score": 90, "download_state": "ready"}
+                        for value in ("current-available", "current-submitted", "current-dismissed")],
+            expires_at="2099-01-01 00:00:00",
+        )
+        request_id, _ = db.create_download_request("candidate-list-followup", "magnet")
+        db.update_download_request(request_id, status="downloading", targets="guangya", gy_status="downloading")
+        db.update_media_subscription_candidate(current[1], status="submitted", request_id=request_id)
+        db.update_media_subscription_candidate(current[2], status="dismissed")
+        service = MediaSubscriptionService()
+        with patch("app.repositories.media_subscriptions.get_conn", wraps=db.get_conn) as connect:
+            rows = service.list_candidates(subscription_id)
+        # 一次读取订阅，一次维护到期状态并读取候选；不能恢复为逐条/多连接查找。
+        self.assertEqual(connect.call_count, 2)
+        self.assertEqual({row["id"] for row in rows}, set(current[:2]))
+        submitted = next(row for row in rows if row["status"] == "submitted")
+        self.assertEqual(submitted["delivery"]["request_status"], "downloading")
+        self.assertEqual(db.get_media_subscription_candidate(historical[0])["status"], "expired")
+        self.assertEqual(service.get_subscription(subscription_id)["candidate_count"], len(rows))
+        self.assertEqual([row["id"] for row in db.list_media_subscription_candidates(subscription_id)], current[:1])
+        history = db.list_media_subscription_candidates(subscription_id, statuses=(), limit=500)
+        self.assertEqual(len(history), 500)
+        self.assertTrue(all(row["status"] == "expired" for row in history))
+        limited = db.list_media_subscription_candidates(subscription_id, statuses=("available", "submitted"), limit=1)
+        self.assertEqual(len(limited), 1)
+        db.update_media_subscription_candidate(current[0], expires_at="2000-01-01 00:00:00")
+        self.assertEqual([row["id"] for row in service.list_candidates(subscription_id)], current[1:2])
+        self.assertEqual(db.get_media_subscription_candidate(current[0])["status"], "expired")
+
     def test_create_normalizes_identity_and_atomically_upserts_same_tmdb_media(self) -> None:
         service = MediaSubscriptionService()
         detail = {
@@ -846,7 +882,7 @@ class MediaSubscriptionTests(IsolatedDatabaseTestCase):
         self.assertIn("不会推送", result["delivery"]["summary"])
         self.assertEqual(before, after)
         self.assertEqual(db.list_media_subscription_runs(subscription_id=subscription_id), [])
-        self.assertEqual(db.list_media_subscription_candidates(subscription_id, status="", limit=50), [])
+        self.assertEqual(db.list_media_subscription_candidates(subscription_id, statuses=(), limit=50), [])
         sync_admissions.assert_not_awaited()
         download_candidate.assert_not_awaited()
 
@@ -1067,7 +1103,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
                 return await service._search_movie(row, {}, "tmdb:7:movie")
 
         _candidate_total, auto_submitted = asyncio.run(scenario())
-        rows = db.list_media_subscription_candidates(subscription_id, status="", limit=20)
+        rows = db.list_media_subscription_candidates(subscription_id, statuses=(), limit=20)
         by_result = {str(item["result_id"]): int(item["id"]) for item in rows}
         self.assertEqual(auto_submitted, 1)
         download.assert_awaited_once_with(
@@ -1128,7 +1164,7 @@ class MediaSubscriptionAutoCandidateSelectionTests(IsolatedDatabaseTestCase):
                 )
 
         _candidate_total, auto_submitted, _rotation = asyncio.run(scenario())
-        rows = db.list_media_subscription_candidates(subscription_id, status="", limit=20)
+        rows = db.list_media_subscription_candidates(subscription_id, statuses=(), limit=20)
         by_result = {str(item["result_id"]): int(item["id"]) for item in rows}
         self.assertEqual(auto_submitted, 1)
         download.assert_awaited_once_with(

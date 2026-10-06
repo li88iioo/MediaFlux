@@ -927,16 +927,13 @@ def get_media_subscription_candidate(candidate_id: int) -> sqlite3.Row | None:
 
 
 def list_media_subscription_candidates(
-    subscription_id: int, *, status: str = "available", limit: int = 200
+    subscription_id: int, *, statuses: tuple[str, ...] = ("available",), limit: int = 200
 ) -> list[sqlite3.Row]:
-    expire_media_subscription_candidates(subscription_id)
-    params: list[Any] = [int(subscription_id)]
-    clause = ""
-    if status:
-        clause = " AND status=?"
-        params.append(str(status))
-    params.append(max(1, min(int(limit or 200), 500)))
+    """先按状态筛选再排序限量；空状态集合仅用于显式历史查询。"""
+    clause = f" AND c.status IN ({','.join('?' for _ in statuses)})" if statuses else ""
+    params: list[Any] = [int(subscription_id), *statuses, max(1, min(int(limit or 200), 500))]
     with get_conn() as conn:
+        _expire_media_subscription_candidates_conn(conn, subscription_id=subscription_id)
         return conn.execute(
             "SELECT c.*,a.id AS delivery_admission_id,a.status AS delivery_status,"
             "a.error AS delivery_error,a.request_id AS delivery_request_id,"
@@ -949,7 +946,7 @@ def list_media_subscription_candidates(
             "SELECT a2.id FROM media_download_admissions a2 "
             "WHERE a2.candidate_id=c.id ORDER BY a2.id DESC LIMIT 1) "
             "LEFT JOIN download_requests r ON r.id=COALESCE(a.request_id,c.request_id) "
-            "WHERE c.subscription_id=?" + clause.replace("status", "c.status") +
+            "WHERE c.subscription_id=?" + clause +
             " ORDER BY c.media_key,c.relevance_score DESC,c.seeders DESC,c.id DESC LIMIT ?",
             params,
         ).fetchall()

@@ -489,11 +489,10 @@ class MediaSubscriptionService:
     def list_candidates(self, subscription_id: int) -> list[dict[str, Any]]:
         if db.get_media_subscription(int(subscription_id)) is None:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
-        rows = db.list_media_subscription_candidates(int(subscription_id), status="", limit=500)
-        return [
-            _public_candidate(row) for row in rows
-            if str(row["status"] or "") in {"available", "submitted"}
-        ]
+        rows = db.list_media_subscription_candidates(
+            int(subscription_id), statuses=("available", "submitted"), limit=500,
+        )
+        return [_public_candidate(row) for row in rows]
 
     async def preview_subscription_updates(
         self,
