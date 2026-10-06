@@ -115,6 +115,61 @@ class RecognitionHintTests(unittest.TestCase):
         self.assertEqual(evidence["tmdb"]["id"], "1726")
         self.assertEqual(evidence["tmdb"]["matched_query"], "Iron Man")
 
+    def test_external_hint_cannot_expand_source_into_a_different_work(self):
+        from app.modules.scraper import RecognitionContext, RecognitionResult, TMDBScraper
+
+        for source, hint in (
+            ("Alien", "Alien Nation"),
+            ("Sample", "Corps Samples"),
+            ("The Thing", "The Thing Returns"),
+        ):
+            with self.subTest(source=source, hint=hint):
+                # Provider 是可控输入，TMDB 查询、评分与二次识别走真实实现。
+                candidate = {
+                    "id": 42, "title": hint, "original_title": hint,
+                    "release_date": "2021-01-01", "media_type": "movie",
+                }
+                client = Mock(api_key="test-key", base_url="https://tmdb.test/3", config_error="", session=None)
+                client.search.return_value = [candidate]
+                client.detail.return_value = candidate
+                client.detail_with_alternative_titles.return_value = candidate
+                scraper = TMDBScraper(client=client)
+                context = RecognitionContext(
+                    filename=f"{source}.mkv", normalized_title=source,
+                    filename_title=source, media_type="movie", title_variants=[source],
+                )
+                failed = RecognitionResult(
+                    media_type="movie", status="low_confidence", need_confirm=True,
+                    rejected_constraints=["ambiguous_near_tie"], context=context,
+                )
+                card = MediaCard(
+                    provider="douban", external_id="fixture", media_type="movie",
+                    title=hint, original_title=hint, year="2021",
+                )
+                with patch(
+                    "app.modules.recognition_hints.search_recognition_hints",
+                    return_value=SimpleNamespace(items=(card,)),
+                ):
+                    result = scraper._external_hint_fallback(context.filename, "", failed)
+                self.assertIs(result, failed)
+                self.assertTrue(result.need_confirm)
+                client.search.assert_not_called()
+
+    def test_bidirectional_identity_keeps_alias_and_season_evidence(self):
+        from app.modules.scraper import _verify_source_title_anchor
+
+        for source, candidates, season in (
+            (["Iron Man"], ["钢铁侠", "Iron Man"], None),
+            (["我独自升级"], ["我独自升级 2nd Season"], 2),
+            (["我独自升级 2nd Season"], ["我独自升级"], 2),
+            (["Animatica「北斗之拳 拳王軍雜兵們的輓歌」"], ["北斗之拳 拳王軍雜兵們的輓歌"], 1),
+        ):
+            with self.subTest(source=source, candidates=candidates):
+                self.assertTrue(_verify_source_title_anchor(source, candidates, season=season)[0])
+        for source, candidates in ((["Example"], ["Example II"]), (["Example II"], ["Example"])):
+            with self.subTest(source=source, candidates=candidates):
+                self.assertFalse(_verify_source_title_anchor(source, candidates, season=None)[0])
+
     def test_unrelated_external_hint_cannot_redirect_source_title(self):
         from app.modules.scraper import RecognitionContext, RecognitionResult, TMDBScraper
 

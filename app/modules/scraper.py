@@ -1045,35 +1045,21 @@ def _verify_source_title_anchor(
         return False, score, matched_source, matched_candidate, "source_anchor_missing"
     if score < 0.72:
         return False, score, matched_source, matched_candidate, "source_anchor_unverified"
-    protected_suffix_missing = _has_protected_short_title_suffix(
-        [matched_source], candidate_titles
-    )
-    if protected_suffix_missing:
-        return (
-            False,
-            score,
-            matched_source,
-            matched_candidate,
-            "protected_source_title_suffix_missing",
-        )
-    distinctive_remainder = bool(
-        _has_distinctive_title_remainder([matched_source], matched_candidate)
-        and not _explicit_quoted_title_matches(
-            [matched_source], matched_candidate,
-        )
-        and not _known_season_alias_remainder(
-            [matched_source], matched_candidate, season,
-        )
-        and not _primary_title_parts_covered(source_anchors, candidate_titles)
-    )
-    if distinctive_remainder:
-        return (
-            False,
-            score,
-            matched_source,
-            matched_candidate,
-            "distinctive_source_title_remainder",
-        )
+    # 两个方向都不能吞掉作品身份：短来源不能被外部线索扩写成续作/别作，
+    # 完整来源也不能被候选缩成通用前缀。沿用同一套别名、季名和双语证据。
+    for primary, targets, matched, primary_titles in (
+        (matched_source, candidate_titles, matched_candidate, source_anchors),
+        (matched_candidate, source_anchors, matched_source, candidate_titles),
+    ):
+        if _has_protected_short_title_suffix([primary], targets):
+            return False, score, matched_source, matched_candidate, "protected_source_title_suffix_missing"
+        if (
+            _has_distinctive_title_remainder([primary], matched)
+            and not _explicit_quoted_title_matches([primary], matched)
+            and not _known_season_alias_remainder([primary], matched, season)
+            and not _primary_title_parts_covered(primary_titles, targets)
+        ):
+            return False, score, matched_source, matched_candidate, "distinctive_source_title_remainder"
     return True, score, matched_source, matched_candidate, "verified"
 
 
@@ -6247,14 +6233,9 @@ class TMDBScraper:
             ))
             # 外部卡片已经证明与源标题相关；二次 TMDB 结果还必须独立
             # 证明与该卡片相关，不能让已通过的卡片标题替无关 TMDB 结果背书。
-            source_related = bool(second_titles) and max(
-                (
-                    _title_similarity_score(hint_title, result_title)
-                    for hint_title in titles
-                    for result_title in second_titles
-                ),
-                default=0.0,
-            ) >= 0.72
+            source_related = _verify_source_title_anchor(
+                titles, second_titles, season=context.season,
+            )[0]
             if (
                 second.status == "matched"
                 and not second.need_confirm
