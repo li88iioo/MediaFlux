@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import threading
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import date
 from functools import partial
 from typing import Any
 
@@ -37,6 +39,7 @@ from app.discovery.registry import (
 _DISCOVERY_CLOSED_MESSAGE = "探索服务已关闭，请重试"
 _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 _MAX_REFRESH_COOLDOWNS = 512
+_YEAR_RE = re.compile(r"\d{4}")
 logger = get_logger(__name__)
 
 _ERROR_TYPES = {
@@ -376,15 +379,43 @@ class DiscoveryService:
             return max(300, config.get_int("BANGUMI_CACHE_TTL_SECONDS", 21600))
         return self.cache_ttl_seconds
 
-    @staticmethod
-    def _decorate(page: DiscoveryPage, *, cached: bool, stale: bool) -> DiscoveryPage:
+    def _decorate(self, page: DiscoveryPage, *, cached: bool, stale: bool) -> DiscoveryPage:
         identities = [(item.provider, item.external_id, item.media_type) for item in page.items]
         watched = database.list_media_watchlist_keys(identities)
-        items = [
-            replace(item, state="watchlisted" if item.stable_id in watched else item.state)
+        missing = [
+            (item.provider, item.media_type, item.external_id)
             for item in page.items
+            if not str(item.year or "").strip() or not str(item.release_date or "").strip()
         ]
+        metadata = self.cache.get_detail_metadata(missing)
+        items = []
+        for item in page.items:
+            detail = metadata.get((item.provider, item.media_type, item.external_id), {})
+            year, release_date = item.year, item.release_date
+            if not str(year or "").strip() and self._valid_year(detail.get("year", "")):
+                year = detail["year"]
+            if not str(release_date or "").strip() and self._valid_release_date(detail.get("release_date", "")):
+                release_date = detail["release_date"]
+            items.append(replace(
+                item, year=year, release_date=release_date,
+                state="watchlisted" if item.stable_id in watched else item.state,
+            ))
         return replace(page, items=items, cached=cached, stale=stale)
+
+    @staticmethod
+    def _valid_year(value: str) -> bool:
+        text = str(value or "").strip()
+        return bool(
+            _YEAR_RE.fullmatch(text) and 1800 <= int(text) <= 2200
+        )
+
+    @staticmethod
+    def _valid_release_date(value: str) -> bool:
+        text = str(value or "").strip()
+        try:
+            return date.fromisoformat(text).isoformat() == text
+        except ValueError:
+            return False
 
     def shutdown(
         self, timeout_seconds: float = _DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
@@ -422,7 +453,37 @@ class DiscoveryService:
         if media_type not in {"movie", "tv"}:
             raise ValueError("媒体类型无效")
         with self._network_operation():
-            return self.registry.get(provider).get_detail(str(external_id), media_type)
+            detail = self.registry.get(provider).get_detail(str(external_id), media_type)
+            provider_key = str(provider or "").strip().lower()
+            external_key = str(external_id or "").strip()
+            if (
+                isinstance(detail, MediaCard)
+                and (detail.provider, detail.media_type, detail.external_id)
+                == (provider_key, media_type, external_key)
+            ):
+                year = detail.year.strip()
+                if not self._valid_year(year):
+                    year = ""
+                release_date = detail.release_date.strip()
+                if not self._valid_release_date(release_date):
+                    release_date = ""
+                if not year and release_date:
+                    year = release_date[:4]
+                if year or release_date:
+                    try:
+                        self._write_cache_if_open(lambda: self.cache.set_detail_metadata(
+                            provider_key,
+                            media_type,
+                            external_key,
+                            year=year,
+                            release_date=release_date,
+                            ttl_seconds=self._provider_ttl(provider_key),
+                            stale_seconds=self.stale_ttl_seconds,
+                        ))
+                    except Exception as exc:
+                        # 详情请求成功不应因可选缓存写入失败而失败。
+                        logger.warning("写入探索详情日期缓存失败: %s", exc)
+            return detail
 
     @staticmethod
     def add_watchlist(card: MediaCard) -> None:

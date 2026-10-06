@@ -4298,6 +4298,7 @@ from app.repositories.discovery import (  # noqa: E402,F401
     confirm_media_external_id_if_unchanged,
     delete_media_watchlist,
     get_discovery_cache,
+    get_discovery_cache_many,
     get_media_external_id,
     get_media_watchlist,
     get_media_watchlist_by_id,

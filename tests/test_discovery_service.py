@@ -44,21 +44,25 @@ class FakeProvider:
         self.close_calls = 0
         self.closed = threading.Event()
         self.error = None
+        self.detail_card = None
 
     def list_items(self, category, media_type, page, filters):
         self.calls += 1
         if self.error:
             raise self.error
         return DiscoveryPage(
-            items=[MediaCard(provider="tmdb", external_id=str(page), media_type=media_type, title=f"Page {page}")],
+            items=[MediaCard(provider=self.name, external_id=str(page), media_type=media_type, title=f"Page {page}")],
             page=page,
             has_more=page < 2,
-            provider=ProviderHealth(name="tmdb"),
+            provider=ProviderHealth(name=self.name),
         )
 
     def get_detail(self, external_id, media_type):
         self.detail_calls += 1
-        return MediaCard(provider="tmdb", external_id=external_id, media_type=media_type, title="Detail")
+        return self.detail_card or MediaCard(
+            provider=self.name, external_id=external_id,
+            media_type=media_type, title="Detail",
+        )
 
     def close(self):
         self.close_calls += 1
@@ -256,6 +260,130 @@ class DiscoveryServiceTests(unittest.TestCase):
         self.assertFalse(first.cached)
         self.assertTrue(second.cached)
         self.assertFalse(second.stale)
+
+    def test_detail_year_is_reused_after_cache_and_service_recreation(self):
+        detail = MediaCard(
+            provider="tmdb", external_id="1", media_type="movie", title="Detail",
+            year="2026", release_date="2026-03-04",
+        )
+        self.provider.detail_card = detail
+        self.assertEqual(
+            self.service.get_detail("tmdb", "movie", "1"), detail
+        )
+        self.assertTrue(self.service.shutdown(timeout_seconds=0.5))
+
+        provider = FakeProvider()
+        self.service = DiscoveryService(
+            registry=ProviderRegistry({"tmdb": provider}),
+            cache=DiscoveryCache(clock=lambda: self.now),
+            cache_ttl_seconds=60,
+            stale_ttl_seconds=300,
+            refresh_submit=lambda fn: fn(),
+        )
+        with patch(
+            "app.database.get_discovery_cache_many",
+            wraps=database.get_discovery_cache_many,
+        ) as batch_read:
+            page = self.service.list_items("tmdb", "popular", "movie", 1, {})
+
+        self.assertEqual(page.items[0].year, "2026")
+        self.assertEqual(page.items[0].release_date, "2026-03-04")
+        self.assertEqual(provider.detail_calls, 0)
+        batch_read.assert_called_once()
+
+    def test_douban_detail_year_fills_douban_list_card(self):
+        provider = FakeProvider()
+        provider.name = "douban"
+        provider.detail_card = MediaCard(
+            provider="douban", external_id="1", media_type="movie", title="详情",
+            year="2026", release_date="2026-03-04",
+        )
+        service = DiscoveryService(
+            registry=ProviderRegistry({"douban": provider}),
+            cache=DiscoveryCache(clock=lambda: self.now),
+            cache_ttl_seconds=60,
+            stale_ttl_seconds=300,
+        )
+        self.addCleanup(service.shutdown)
+
+        service.get_detail("douban", "movie", "1")
+        page = service.list_items("douban", "movie_hot", "movie", 1, {})
+
+        self.assertEqual(page.items[0].provider, "douban")
+        self.assertEqual(page.items[0].year, "2026")
+        self.assertEqual(page.items[0].release_date, "2026-03-04")
+        self.assertEqual(provider.detail_calls, 1)
+
+    def test_detail_metadata_preserves_nonempty_fields_and_fills_empty_ones(self):
+        self.provider.detail_card = MediaCard(
+            provider="tmdb", external_id="1", media_type="movie", title="Detail",
+            year="2026", release_date="2026-03-04",
+        )
+        self.service.get_detail("tmdb", "movie", "1")
+        self.cache.set_detail_metadata(
+            "tmdb", "movie", "2", year="2026", release_date="2026-03-04",
+            ttl_seconds=60, stale_seconds=300,
+        )
+        self.provider.list_items = lambda *_args: DiscoveryPage(
+            items=[
+                MediaCard(
+                    provider="tmdb", external_id="1", media_type="movie", title="List",
+                    year="2020",
+                ),
+                MediaCard(
+                    provider="tmdb", external_id="2", media_type="movie", title="Existing",
+                    year="unknown", release_date="TBA",
+                ),
+            ],
+            provider=ProviderHealth(name="tmdb"),
+        )
+
+        page = self.service.list_items("tmdb", "popular", "movie", 1, {})
+
+        self.assertEqual(page.items[0].year, "2020")
+        self.assertEqual(page.items[0].release_date, "2026-03-04")
+        self.assertEqual(page.items[1].year, "unknown")
+        self.assertEqual(page.items[1].release_date, "TBA")
+
+    def test_complete_list_dates_skip_detail_cache_lookup(self):
+        self.cache.set_detail_metadata(
+            "tmdb", "movie", "2", year="2026", release_date="2026-03-04",
+            ttl_seconds=60, stale_seconds=300,
+        )
+        self.provider.list_items = lambda *_args: DiscoveryPage(
+            items=[
+                MediaCard(
+                    provider="tmdb", external_id="1", media_type="movie", title="Complete",
+                    year="2020", release_date="2020-05-06",
+                ),
+                MediaCard(
+                    provider="tmdb", external_id="2", media_type="movie", title="Missing",
+                ),
+            ],
+            provider=ProviderHealth(name="tmdb"),
+        )
+
+        with patch.object(
+            self.cache, "get_detail_metadata", wraps=self.cache.get_detail_metadata,
+        ) as batch_read:
+            page = self.service.list_items("tmdb", "popular", "movie", 1, {})
+
+        batch_read.assert_called_once_with([("tmdb", "movie", "2")])
+        self.assertEqual(page.items[0].year, "2020")
+        self.assertEqual(page.items[0].release_date, "2020-05-06")
+        self.assertEqual(page.items[1].year, "2026")
+
+    def test_detail_result_for_different_identity_is_not_cached(self):
+        self.provider.detail_card = MediaCard(
+            provider="tmdb", external_id="other", media_type="movie", title="Detail",
+            year="2026", release_date="2026-03-04",
+        )
+        self.service.get_detail("tmdb", "movie", "1")
+
+        page = self.service.list_items("tmdb", "popular", "movie", 1, {})
+
+        self.assertEqual(page.items[0].year, "")
+        self.assertEqual(page.items[0].release_date, "")
 
     def test_stale_cache_returns_old_page_and_refreshes_once(self):
         self.service.list_items("tmdb", "popular", "movie", 1, {})

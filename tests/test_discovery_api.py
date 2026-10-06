@@ -311,6 +311,45 @@ class DiscoveryAPITests(_BaseClientTests):
             self.assertNotIn(forbidden, response.text)
         service.get_detail.assert_called_once_with("tmdb", "tv", "75787")
 
+    def test_viewed_douban_detail_dates_survive_list_refresh_and_service_restart(self):
+        database.init_db()
+        self.authenticate()
+        item = {"id": "37560173", "media_type": "tv", "title": "余红旧事", "year": "", "release_date": ""}
+        public = Mock()
+        public.list_items.return_value = DoubanPublicPage(
+            items=(item, {**item, "id": "42"}, {**item, "id": "43"}), source="public-json",
+        )
+        public.get_detail.return_value = {**item, "year": "2026"}
+        self.enterContext(patch("requests.sessions.Session.request", side_effect=AssertionError("禁止真实外联")))
+
+        def service():
+            provider = DoubanProvider(enabled=True, public_client=public)
+            current = DiscoveryService(registry=ProviderRegistry({"douban": provider}), cache=DiscoveryCache())
+            self.addCleanup(current.shutdown)
+            return current
+
+        url = "/api/discovery/items?provider=douban&category=tv_hot&media_type=tv&page=1"
+        first = service()
+        with patch("app.routes.discovery_api.get_discovery_service", return_value=first):
+            before = self.client.get(url)
+            self.assertEqual(before.status_code, 200, before.text)
+            self.assertEqual(before.json()["items"][0]["year"], "")
+            detail = self.client.get("/api/discovery/detail/douban/tv/37560173")
+            self.assertEqual(detail.status_code, 200, detail.text)
+            self.assertEqual(detail.json()["year"], "2026")
+            after = self.client.get(url)
+            self.assertEqual(after.status_code, 200, after.text)
+            self.assertEqual(after.json()["items"][0]["year"], "2026")
+            self.assertEqual(after.json()["items"][0]["release_date"], "")
+        self.assertTrue(first.shutdown())
+        with patch("app.routes.discovery_api.get_discovery_service", return_value=service()):
+            restored = self.client.get(url)
+            self.assertEqual(restored.status_code, 200, restored.text)
+            self.assertEqual(restored.json()["items"][0]["year"], "2026")
+        # 一个列表请求 + 用户主动打开的一次详情，刷新与重启都只复用本地缓存。
+        self.assertEqual(public.list_items.call_count, 1)
+        public.get_detail.assert_called_once_with("37560173", "tv")
+
     def test_sections_items_filters_and_detail_use_safe_contract(self):
         self.authenticate()
         service = FakeDiscoveryService()

@@ -1580,11 +1580,11 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(keyboard["rect"], initial["rect"])
 
 
-    def open_catalogue(self, *, width=1440, theme="light"):
+    def open_catalogue(self, *, width=1440, theme="light", cards=None, details=None, requests=None):
         from jinja2 import Environment, FileSystemLoader
         templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         html = templates.get_template("discovery.html").render(
-            active="discovery", resource_results_enabled=True,
+            active="discovery", resource_results_enabled=details is None,
             csrf_token=lambda: "test",
             url_for=lambda name: "/" + name.split(".")[-1],
             static_url=lambda path: "/static/" + path,
@@ -1595,7 +1595,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page = context.new_page()
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
-        cards = [
+        cards = cards if cards is not None else [
             {"provider": "douban", "media_type": "tv", "external_id": "1", "title": "豆瓣剧集", "year": "2024"},
             {"provider": "bangumi", "media_type": "tv", "external_id": "2", "title": "番组周历", "year": "2025", "release_date": "2025-10-01", "weekday": 1},
             {"provider": "tmdb", "media_type": "movie", "external_id": "3", "title": "TMDB电影", "year": "2023", "release_date": "2023-07-21"},
@@ -1603,7 +1603,16 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         def route_request(route):
             path = route.request.url.split("mediaflux.test", 1)[-1]
             if path.startswith("/api/"):
-                payload = {"sections": [{"key": f"s{index}", "title": f"栏目 {index}", "items": cards} for index in range(6)]}
+                if requests is not None:
+                    requests.append(path)
+                if path.startswith("/api/discovery/detail/"):
+                    payload = details or {}
+                elif path.startswith("/api/discovery/items?"):
+                    payload = {"items": cards, "has_more": False}
+                elif path.startswith("/api/discovery/filters/"):
+                    payload = {"filters": []}
+                else:
+                    payload = {"sections": [{"key": f"s{index}", "title": f"栏目 {index}", "items": cards} for index in range(6)]}
                 route.fulfill(json=payload)
             elif path == "/static/css/main.css":
                 route.fulfill(body=self.styles, content_type="text/css")
@@ -1620,6 +1629,57 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.locator(".discovery-card").first.wait_for()
         self.assertEqual(errors, [])
         return page, errors
+
+    def test_detail_dates_fill_cards_and_saved_views_without_extra_requests(self):
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                cards = [
+                    {"provider": "douban", "media_type": "tv", "external_id": "37560173", "title": "余红旧事", "year": ""},
+                    {"provider": "douban", "media_type": "movie", "external_id": "37560173", "title": "同ID电影", "year": ""},
+                    {"provider": "tmdb", "media_type": "tv", "external_id": "37560173", "title": "不同来源", "year": ""},
+                ]
+                detail = {**cards[0], "year": "2026", "release_date": "2026-10-01", "tmdb_id": "123"}
+                requests = []
+                page, errors = self.open_catalogue(width=width, cards=cards, details=detail, requests=requests)
+                selector = '[data-media-key="douban:tv:37560173"]'
+                page.locator(selector).first.evaluate("node => window.__originalCard = node")
+                self.assertEqual(page.locator(selector).first.locator('.discovery-card-source span').first.inner_text(), "剧集")
+                page.locator(selector).first.locator('.discovery-card-open').click()
+                page.locator('.discovery-detail-fields').wait_for()
+                page.keyboard.press("Escape")
+                page.locator('#discovery-detail-dialog').wait_for(state="hidden")
+                self.assertTrue(page.locator(selector).first.evaluate("node => node === window.__originalCard"))
+                for value in page.locator(selector + ' .discovery-card-source span:first-child').all_text_contents():
+                    self.assertEqual(value, "2026-10-01")
+                self.assertEqual(page.locator('[data-media-key="douban:movie:37560173"] .discovery-card-source span').first.inner_text(), "电影")
+                self.assertEqual(page.locator('[data-media-key="tmdb:tv:37560173"] .discovery-card-source span').first.inner_text(), "剧集")
+                page.locator('#discovery-tab-douban-tv').click()
+                page.locator('#discovery-grid').wait_for(state="visible")
+                page.locator('#discovery-tab-sections').click()
+                page.locator('#discovery-sections').wait_for(state="visible")
+                self.assertEqual(page.locator(selector).first.locator('.discovery-card-source span').first.inner_text(), "2026-10-01")
+                self.assertEqual(sum('/detail/' in path for path in requests), 1)
+                self.assertEqual(errors, [])
+
+    def test_detail_dates_do_not_erase_known_year_or_cross_identity(self):
+        cases = (
+            ({"year": ""}, "2024"),
+            ({"year": "2026"}, "2024"),
+            ({"external_id": "other", "year": "2026"}, "剧集"),
+            ({"year": "2026", "release_date": ""}, "2026"),
+        )
+        for detail_fields, expected in cases:
+            with self.subTest(detail_fields=detail_fields):
+                item = {"provider": "douban", "media_type": "tv", "external_id": "42", "title": "测试", "year": "" if "external_id" in detail_fields or "release_date" in detail_fields else "2024"}
+                detail = {**item, **detail_fields, "tmdb_id": "1"}
+                page, errors = self.open_catalogue(cards=[item], details=detail)
+                card = page.locator('.discovery-card').first
+                card.locator('.discovery-card-open').click()
+                page.locator('.discovery-detail-fields').wait_for()
+                page.keyboard.press("Escape")
+                page.locator('#discovery-detail-dialog').wait_for(state="hidden")
+                self.assertEqual(card.locator('.discovery-card-source span').first.inner_text(), expected)
+                self.assertEqual(errors, [])
 
     def test_catalogue_meta_formats_weekday_and_keeps_year(self):
         page, errors = self.open_catalogue()

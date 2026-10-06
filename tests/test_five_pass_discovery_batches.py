@@ -5,7 +5,9 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 from app import database as db
+from app.discovery.cache import DiscoveryCache
 from app.discovery.models import DiscoveryPage, MediaCard
+from app.discovery.registry import ProviderRegistry
 from app.discovery.service import DiscoveryService
 from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 
@@ -13,6 +15,10 @@ from tests.support import IsolatedDatabaseTestCase, isolated_test_database
 class DiscoveryIdentityBatchTests(IsolatedDatabaseTestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
+        self.service = DiscoveryService(
+            registry=ProviderRegistry({}), cache=DiscoveryCache(),
+        )
+        self.addCleanup(self.service.shutdown)
         with db.get_conn() as conn:
             conn.executemany(
                 "INSERT INTO media_watchlist(provider,external_id,media_type,title,created_at) VALUES(?,?,?,?,?)",
@@ -23,13 +29,13 @@ class DiscoveryIdentityBatchTests(IsolatedDatabaseTestCase):
         page = DiscoveryPage(items=tuple(
             MediaCard("tmdb", str(index), "tv", f"Show {index}") for index in range(1200)
         ))
-        decorated = DiscoveryService._decorate(page, cached=True, stale=False)
+        decorated = self.service._decorate(page, cached=True, stale=False)
         self.assertEqual(len(decorated.items), 1200)
         self.assertEqual(sum(item.state == "watchlisted" for item in decorated.items), 600)
         self.assertEqual([item.external_id for item in decorated.items], [str(i) for i in range(1200)])
         self.assertTrue(all(item.state == "none" for item in page.items))
         db.delete_media_watchlist("tmdb", "1198", "tv")
-        again = DiscoveryService._decorate(page, cached=True, stale=True)
+        again = self.service._decorate(page, cached=True, stale=True)
         self.assertEqual(again.items[1198].state, "none")
         self.assertTrue(again.stale)
 

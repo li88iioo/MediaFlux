@@ -23,6 +23,24 @@ def get_discovery_cache(cache_key: str) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def get_discovery_cache_many(cache_keys: list[str]) -> dict[str, sqlite3.Row]:
+    """一次批量读取列表页需要的探索缓存行。"""
+    keys = list(dict.fromkeys(str(key) for key in cache_keys if str(key)))
+    if not keys:
+        return {}
+    result: dict[str, sqlite3.Row] = {}
+    with _database().get_conn() as conn:
+        for offset in range(0, len(keys), 900):
+            chunk = keys[offset:offset + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT * FROM discovery_cache WHERE cache_key IN ({placeholders})",
+                chunk,
+            ).fetchall()
+            result.update({str(row["cache_key"]): row for row in rows})
+    return result
+
+
 def upsert_discovery_cache(
     cache_key: str,
     provider: str,

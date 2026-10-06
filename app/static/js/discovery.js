@@ -3322,6 +3322,35 @@
     }
 
 
+    function rememberDetailDates(item, detail) {
+        const key = itemKey(item);
+        if (itemKey(detail) !== key) return;
+        const dates = {};
+        const year = String(detail.year || '').trim();
+        const releaseDate = String(detail.release_date || '').trim();
+        if (/^\d{4}$/.test(year)) dates.year = year;
+        if (/^\d{4}(?:[-/.年]|$)/.test(releaseDate)) dates.release_date = releaseDate;
+        if (!Object.keys(dates).length) return;
+        const fill = candidate => {
+            if (itemKey(candidate) !== key) return;
+            for (const [field, value] of Object.entries(dates)) {
+                if (!String(candidate[field] || '').trim()) candidate[field] = value;
+            }
+        };
+        fill(item);
+        // 复用已有的有界视图缓存，不再维护第二套详情 Map 或重建整页卡片。
+        for (const view of [state, ...viewSnapshots.values()]) {
+            asArray(view.itemsData).forEach(fill);
+            asArray(view.sectionsData).forEach(section => sectionItems(section).forEach(fill));
+        }
+        for (const entry of cardNodes.values()) {
+            if (itemKey(entry.item) !== key) continue;
+            fill(entry.item);
+            const meta = entry.node.querySelector('.discovery-card-source > span:first-child');
+            if (meta) meta.textContent = cardMeta(entry.item);
+        }
+    }
+
     async function openDetail(item, card) {
         state.detailExitInProgress = false;
         syncDetailCloseCopy();
@@ -3349,12 +3378,15 @@
             const payload = await api(`/api/discovery/detail/${provider}/${mediaType}/${externalId}`, {}, controller.signal);
             if (detailRequestId !== state.detailRequestId) return;
             const detail = payload.detail || payload.item || payload;
+            rememberDetailDates(item, detail);
             const resolvedItem = {
                 ...item,
                 ...detail,
                 provider: item.provider || detail.provider || '',
                 media_type: item.media_type || detail.media_type || '',
                 external_id: item.external_id || item.id || detail.external_id || detail.id || '',
+                year: detail.year || item.year || '',
+                release_date: detail.release_date || item.release_date || '',
             };
             let mapping = {};
             if (!(detail.tmdb_id || resolvedItem.tmdb_id || resolvedItem.mapped_tmdb_id)) {

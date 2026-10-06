@@ -60,8 +60,21 @@ class DiscoveryCache:
         digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return f"discovery:{digest}"
 
-    def get(self, key: str) -> CacheLookup:
-        row = database.get_discovery_cache(key)
+    @staticmethod
+    def make_detail_key(provider: str, media_type: str, external_id: str) -> str:
+        canonical = json.dumps(
+            [
+                str(provider or "").strip().lower(),
+                str(media_type or "").strip().lower(),
+                str(external_id or "").strip(),
+            ],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return f"discovery:detail:{digest}"
+
+    def _lookup(self, row: Any) -> CacheLookup:
         if not row:
             return CacheLookup("miss")
         try:
@@ -79,11 +92,15 @@ class DiscoveryCache:
             except (TypeError, ValueError, json.JSONDecodeError):
                 metadata = {}
             if expires_at > now:
+                try:
+                    status_code = int(metadata.get("status_code") or 503)
+                    retry_after = max(0, int(metadata.get("retry_after") or 0))
+                except (TypeError, ValueError):
+                    status_code, retry_after = 503, 0
                 return CacheLookup(
                     "error", None, row["last_error"] or "",
                     str(metadata.get("code") or "unavailable"),
-                    int(metadata.get("status_code") or 503),
-                    max(0, int(metadata.get("retry_after") or 0)),
+                    status_code, retry_after,
                 )
             return CacheLookup("expired", None, row["last_error"] or "")
         try:
@@ -97,6 +114,77 @@ class DiscoveryCache:
         if stale_until > now:
             return CacheLookup("stale", payload, row["last_error"] or "")
         return CacheLookup("expired", None, row["last_error"] or "")
+
+    def get(self, key: str) -> CacheLookup:
+        return self._lookup(database.get_discovery_cache(key))
+
+    def get_detail_metadata(
+        self, identities: list[tuple[str, str, str]],
+    ) -> dict[tuple[str, str, str], dict[str, str]]:
+        """按 provider/type/id 批量取可复用的详情日期字段。"""
+        normalized = list(dict.fromkeys(
+            (str(provider or "").strip().lower(),
+             str(media_type or "").strip().lower(),
+             str(external_id or "").strip())
+            for provider, media_type, external_id in identities
+            if str(provider or "").strip()
+            and str(media_type or "").strip()
+            and str(external_id or "").strip()
+        ))
+        if not normalized:
+            return {}
+        keys = {
+            identity: self.make_detail_key(*identity) for identity in normalized
+        }
+        try:
+            rows = database.get_discovery_cache_many(list(keys.values()))
+        except Exception as exc:
+            logger.warning("读取探索详情缓存失败: %s", exc)
+            return {}
+
+        result: dict[tuple[str, str, str], dict[str, str]] = {}
+        for identity, key in keys.items():
+            lookup = self._lookup(rows.get(key))
+            payload = lookup.payload
+            if lookup.status not in {"fresh", "stale"} or not payload:
+                continue
+            if payload.get("identity") != list(identity):
+                continue
+            result[identity] = {
+                field: str(payload.get(field) or "")
+                for field in ("year", "release_date")
+            }
+        return result
+
+    def set_detail_metadata(
+        self,
+        provider: str,
+        media_type: str,
+        external_id: str,
+        *,
+        year: str,
+        release_date: str,
+        ttl_seconds: int,
+        stale_seconds: int,
+    ) -> None:
+        identity = (
+            str(provider or "").strip().lower(),
+            str(media_type or "").strip().lower(),
+            str(external_id or "").strip(),
+        )
+        if not all(identity) or not (year or release_date):
+            return
+        self.set_success(
+            self.make_detail_key(*identity),
+            identity[0],
+            {
+                "identity": list(identity),
+                "year": str(year or ""),
+                "release_date": str(release_date or ""),
+            },
+            ttl_seconds=ttl_seconds,
+            stale_seconds=stale_seconds,
+        )
 
     def _maybe_maintain(self, now: datetime) -> None:
         if self._next_maintenance_at is not None and now < self._next_maintenance_at:

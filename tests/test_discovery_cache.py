@@ -160,6 +160,45 @@ class DiscoveryCacheTests(unittest.TestCase):
         self.assertNotEqual(first, self.cache.make_key("tmdb", "discover", "movie", 2, {"genre": "16", "language": "ja"}))
         self.assertNotEqual(first, self.cache.make_key("tmdb", "discover", "movie", 1, {"genre": "35", "language": "ja"}))
 
+    def test_detail_cache_key_is_scoped_by_provider_type_and_external_id(self):
+        douban = self.cache.make_detail_key("douban", "movie", "42")
+        self.assertEqual(douban, self.cache.make_detail_key("DOUBAN", "movie", "42"))
+        self.assertNotEqual(douban, self.cache.make_detail_key("tmdb", "movie", "42"))
+        self.assertNotEqual(douban, self.cache.make_detail_key("douban", "tv", "42"))
+        self.assertNotEqual(douban, self.cache.make_detail_key("douban", "movie", "43"))
+
+    def test_detail_metadata_batch_uses_identity_and_cache_expiry(self):
+        douban = ("douban", "movie", "42")
+        tmdb = ("tmdb", "movie", "42")
+        self.cache.set_detail_metadata(
+            *douban, year="2026", release_date="2026-03-04",
+            ttl_seconds=60, stale_seconds=120,
+        )
+
+        self.assertEqual(
+            self.cache.get_detail_metadata([douban, tmdb]),
+            {douban: {"year": "2026", "release_date": "2026-03-04"}},
+        )
+        self.now += timedelta(seconds=121)
+        self.assertEqual(self.cache.get_detail_metadata([douban]), {})
+
+    def test_detail_metadata_ignores_malformed_or_mismatched_cache_payload(self):
+        identity = ("douban", "movie", "42")
+        key = self.cache.make_detail_key(*identity)
+        database.upsert_discovery_cache(
+            key, identity[0], "not-json", self.now.strftime("%Y-%m-%d %H:%M:%S"),
+            (self.now + timedelta(seconds=60)).strftime("%Y-%m-%d %H:%M:%S"),
+            (self.now + timedelta(seconds=120)).strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        self.assertEqual(self.cache.get_detail_metadata([identity]), {})
+
+        self.cache.set_success(
+            key, identity[0],
+            {"identity": ["tmdb", "movie", "42"], "year": "2026"},
+            ttl_seconds=60, stale_seconds=120,
+        )
+        self.assertEqual(self.cache.get_detail_metadata([identity]), {})
+
     def test_cache_distinguishes_fresh_stale_and_expired(self):
         key = self.cache.make_key("tmdb", "popular", "movie", 1, {})
         self.cache.set_success(key, "tmdb", {"items": [{"title": "A"}]}, ttl_seconds=60, stale_seconds=180)
