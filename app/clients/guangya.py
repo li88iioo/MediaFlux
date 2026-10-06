@@ -825,47 +825,11 @@ def _offline_is_directory(raw: dict) -> bool:
     item_type = str(
         raw.get("type") or raw.get("fileType") or raw.get("kind") or raw.get("resType") or ""
     ).strip().lower()
-    return item_type in ("folder", "dir", "directory", "2")
-
-
-def _offline_is_file(raw: dict, index: int | None = None) -> bool:
-    if _offline_is_directory(raw):
-        return False
-    if not _offline_file_name(raw):
-        return False
-    return index is not None or _offline_file_index(raw) is not None
-
-
-def _bt_positional_file_indexes(parent: dict, key: str, items: list) -> dict[int, int]:
-    """兼容光鸭 BT 解析响应省略 ``fileIndex: 0``。
-
-    光鸭的 Go 响应会在首个文件索引为零时偶发省略该字段。只有能证明当前
-    ``subfiles`` 是 BT 根清单、其余显式索引与数组位置完全一致，且唯一缺失项
-    正好位于位置 0 时才补回索引；显式非法值由索引校验直接拒绝，不视为缺省。
-    其他树形响应继续要求显式索引，避免猜测。
-    """
-    if str(key).lower() != "subfiles" or not items:
-        return {}
-    is_bt_manifest = any(
-        marker in parent
-        for marker in ("infoHash", "info_hash", "torrentHash", "torrent_hash", "subfilesNum")
+    return (
+        item_type in ("folder", "dir", "directory", "2")
+        or raw.get("isDir") is True
+        or any(isinstance(raw.get(key), list) for key in OFFLINE_FILE_TREE_KEYS)
     )
-    if not is_bt_manifest:
-        return {}
-    explicit: list[tuple[int, int]] = []
-    missing: list[int] = []
-    for position, item in enumerate(items):
-        # 含目录的树不是扁平 BT 根清单，目录索引不能用于推断文件位置。
-        if not isinstance(item, dict) or _offline_is_directory(item):
-            return {}
-        index = _offline_file_index(item)
-        if index is None:
-            missing.append(position)
-        else:
-            explicit.append((position, index))
-    if missing != [0] or any(position != index for position, index in explicit):
-        return {}
-    return {0: 0}
 
 
 def _excluded_indexes(raw: dict) -> set[int]:
@@ -949,10 +913,10 @@ def _collect_offline_files(value, output: list[dict], inherited_excluded: set[in
     if not isinstance(value, dict):
         return
     local_excluded = inherited_excluded | _excluded_indexes(value)
+    start = len(output)
     for key, child in value.items():
         if key in OFFLINE_FILE_TREE_KEYS and isinstance(child, list):
-            positional_indexes = _bt_positional_file_indexes(value, key, child)
-            for position, item in enumerate(child):
+            for item in child:
                 if not isinstance(item, dict):
                     continue
                 if _offline_is_directory(item):
@@ -960,18 +924,32 @@ def _collect_offline_files(value, output: list[dict], inherited_excluded: set[in
                     _collect_offline_files(item, output, local_excluded)
                     continue
                 index = _offline_file_index(item)
-                if index is None:
-                    index = positional_indexes.get(position)
-                if _offline_is_file(item, index):
+                if _offline_file_name(item):
                     output.append({
                         "index": index,
                         "name": _offline_file_name(item),
                         "size": _offline_file_size(item),
-                        "excluded": index in local_excluded or _offline_file_excluded(item),
+                        # 缺省索引只能在完整 BT 清单中恢复为零，否则整单拒绝。
+                        "excluded": (0 if index is None else index) in local_excluded or _offline_file_excluded(item),
                     })
                 _collect_offline_files(item, output, local_excluded)
         elif isinstance(child, dict):
             _collect_offline_files(child, output, local_excluded)
+    if "subfilesNum" in value:
+        files = output[start:]
+        if files and (
+            type(value["subfilesNum"]) is not int or value["subfilesNum"] != len(files)
+        ):
+            raise ValueError("BT 清单文件数量与声明不一致，已阻止提交不完整清单")
+        missing = [item for item in files if item["index"] is None]
+        # 光鸭省略 fileIndex:0；树展示顺序不等于种子索引顺序。只有叶子总数
+        # 与声明一致、其余索引完整覆盖 1..N-1 时，才能唯一确定缺省项为零。
+        if (
+            len(missing) == 1
+            and {item["index"] for item in files if item["index"] is not None}
+            == set(range(1, len(files)))
+        ):
+            missing[0]["index"] = 0
 
 
 def _offline_task_ids(payload: dict) -> list[str]:
@@ -2993,6 +2971,8 @@ class GuangYaClient:
         seen: set[int] = set()
         for item in output:
             index = item["index"]
+            if index is None:
+                raise ValueError("解析结果包含文件索引缺失，已阻止提交不完整清单")
             if index in seen:
                 raise ValueError(f"解析结果包含重复文件索引: {index}")
             seen.add(index)

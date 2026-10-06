@@ -193,11 +193,8 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             },
         }
 
-        files = GuangYaClient.normalize_offline_files(response)
-
-        self.assertEqual(files, [
-            {"index": 7, "name": "indexed.mkv", "size": 800, "excluded": False},
-        ])
+        with self.assertRaisesRegex(ValueError, "文件索引缺失"):
+            GuangYaClient.normalize_offline_files(response)
 
     def test_normalize_offline_files_ignores_unrelated_id_only_metadata_lists(self):
         response = {
@@ -231,11 +228,8 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             },
         }
 
-        files = GuangYaClient.normalize_offline_files(response)
-
-        self.assertEqual(files, [
-            {"index": 5, "name": "real-file.mkv", "size": 100, "excluded": False},
-        ])
+        with self.assertRaisesRegex(ValueError, "文件索引缺失"):
+            GuangYaClient.normalize_offline_files(response)
 
     def test_normalize_offline_files_does_not_synthesize_missing_indexes(self):
         response = {
@@ -248,11 +242,8 @@ class GuangYaOfflineSelectionDomainTests(unittest.TestCase):
             },
         }
 
-        files = GuangYaClient.normalize_offline_files(response)
-
-        self.assertEqual(files, [
-            {"index": 7, "name": "indexed.mkv", "size": 200, "excluded": False},
-        ])
+        with self.assertRaisesRegex(ValueError, "文件索引缺失"):
+            GuangYaClient.normalize_offline_files(response)
 
     def test_normalize_offline_files_rejects_duplicate_real_indexes_in_nested_trees(self):
         response = {
@@ -528,6 +519,59 @@ class GuangYaOfflineSelectionWorkflowTests(unittest.TestCase):
         client.create_dir.assert_called_once()
         self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
         self.assertEqual(client.selection_calls[0]["target_dir_id"], "staging-7")
+        self.assertEqual(client.legacy_calls, [])
+
+    def test_automatic_sample_only_manifest_does_not_create_a_download(self):
+        client = FakeSelectionClient({"data": {"files": [
+            {"fileIndex": 0, "name": "Sample.mkv", "size": 331776368},
+        ]}})
+        client.create_dir = Mock()
+        rules = replace(self.rules, exclude_keywords=(), min_file_mb=50)
+        with patch.object(offline.OfflineRules, "from_config", return_value=rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:sample-only", client=client, isolate_task=True,
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("样片", result["error"])
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
+
+    def test_sample_is_not_default_selected_but_explicit_selection_remains_supported(self):
+        client = FakeSelectionClient({"data": {"files": [
+            {"fileIndex": 0, "name": "Movie.1999.mkv", "size": 28255299040},
+            {"fileIndex": 1, "name": "Sample.mkv", "size": 331776368},
+            {"fileIndex": 2, "name": "Corps Samples (2021).mkv", "size": 331776368},
+        ]}})
+        rules = replace(self.rules, exclude_keywords=(), min_file_mb=50)
+        preview = offline.preview_offline_selection(
+            "magnet:?xt=urn:btih:sample-choice", client=client, rules=rules,
+        )
+        self.assertEqual(preview["default_selected_indexes"], [0, 2])
+        sample = next(item for item in preview["files"] if item["index"] == 1)
+        self.assertFalse(sample["locked"])
+        selected = offline.submit_offline_selection(
+            "magnet:?xt=urn:btih:sample-choice", [1], client=client, rules=rules,
+        )
+        self.assertTrue(selected["ok"])
+        self.assertEqual(client.selection_calls[0]["file_indexes"], [1])
+
+    def test_incomplete_manifest_never_creates_staging_or_partial_download(self):
+        client = FakeSelectionClient({"data": {"btResInfo": {
+            "subfilesNum": 3,
+            "subfiles": [
+                {"fileName": "Feature.mkv", "fileSize": 28000000000},
+                {"fileName": "Sample.mkv", "fileIndex": 4, "fileSize": 331776368},
+            ],
+        }}})
+        client.create_dir = Mock()
+        with patch.object(offline.OfflineRules, "from_config", return_value=self.rules):
+            result = offline.submit_offline(
+                "magnet:?xt=urn:btih:incomplete", client=client, isolate_task=True,
+            )
+        self.assertFalse(result["ok"])
+        self.assertIn("资源解析响应无效", result["error"])
+        client.create_dir.assert_not_called()
+        self.assertEqual(client.selection_calls, [])
         self.assertEqual(client.legacy_calls, [])
 
     def test_isolated_directory_is_persisted_before_provider_submission(self):

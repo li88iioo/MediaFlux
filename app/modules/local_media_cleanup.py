@@ -22,6 +22,7 @@ from app.modules.local_storage import (
     is_ignored_local_media_directory,
     move_entry_no_replace_at,
 )
+from app.modules.special_media import is_sample_media_path
 
 _CLEANUP_QUARANTINE_DIR = ".mediaflux-trash"
 
@@ -46,7 +47,6 @@ _DIRECT_SUFFIXES = {".url", ".website", ".part", ".partial", ".tmp", ".temp", ".
 _AD_TEXT_RE = re.compile(
     r"(?i)(readme|广告|说明|声明|最新网址|下载必看|本站|发布页|公众号|微信|高清影视之家)"
 )
-_SAMPLE_RE = re.compile(r"(?i)(?:^|[._\-\s])(sample|proof)(?:$|[._\-\s])")
 
 
 def is_probable_sample_video(
@@ -58,7 +58,7 @@ def is_probable_sample_video(
     """判断文件是否为需保留、但不应自动拆成独立任务的 sample/proof。"""
     return bool(
         int(size or 0) <= max(1, int(sample_max_bytes))
-        and _SAMPLE_RE.search(Path(path).stem)
+        and is_sample_media_path(path)
     )
 
 
@@ -303,7 +303,7 @@ def probable_sample_video_paths(
     items = list(snapshots)
     primary_count = sum(
         1 for item in items
-        if item.role == "video" and not _SAMPLE_RE.search(item.path.stem)
+        if item.role == "video" and not is_sample_media_path(item.path)
     )
     if primary_count <= 0:
         return set()

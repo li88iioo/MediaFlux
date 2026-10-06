@@ -13,10 +13,35 @@ from app.modules.local_media_candidates import (
     discover_local_media_directory_candidates,
     move_candidate_to_trash,
 )
+from app.modules.local_media_cleanup import is_probable_sample_video
 from app.modules.local_storage import LocalFilesystemAdapter, LocalScanLimitExceeded
+from app.modules.special_media import is_sample_media_path
 
 
 class LocalMediaCandidateTests(unittest.TestCase):
+    def test_shared_sample_path_predicate_is_precise_and_local_limit_stays_bounded(self) -> None:
+        for value in (
+            "Sample.mkv",
+            "downloads/Sample/Blue.Streak.1999.mkv",
+            "Movie.sample.mkv",
+            "Movie.sample.sample.mkv",
+            "Movie.proof.mkv",
+        ):
+            with self.subTest(value=value):
+                self.assertTrue(is_sample_media_path(value))
+
+        for value in (
+            "Corps Samples (2021).mkv",
+            "Corps Samples (2021)/Blue.Streak.1999.mkv",
+            "The.Sample.Movie.2021.mkv",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_sample_media_path(value))
+
+        sample_size = 316_410_000
+        self.assertFalse(is_probable_sample_video(Path("Sample.mkv"), sample_size))
+        self.assertTrue(is_probable_sample_video(Path("Sample.mkv"), 100_000_000))
+
     def test_browser_first_video_does_not_probe_remote_depth_or_item_limit(self) -> None:
         with tempfile.TemporaryDirectory(prefix="a5-boundary-") as raw:
             root = Path(raw)

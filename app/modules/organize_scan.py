@@ -10,6 +10,7 @@ from app.logger import get_logger
 from app.modules.special_media import (
     is_special_media_name,
     is_special_path,
+    is_sample_media_path,
     special_parent_context,
 )
 
@@ -353,6 +354,15 @@ class OrganizerScanner:
                 selected_file_ids
                 and str(getattr(item, "file_id", "") or "") not in selected_file_ids
             ):
+                continue
+            media_path = f"{rel}/{item.name}" if rel else item.name
+            if not selected_file_ids and is_sample_media_path(media_path):
+                stats["skipped"] += 1
+                self.append_reason(
+                    stats,
+                    "skip_reasons",
+                    "疑似 sample/proof 样片，已保留且不自动归档",
+                )
                 continue
             if (
                 rules.small_file_mb

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 from decimal import Decimal, InvalidOperation
+from pathlib import PurePath
 
 _SPECIAL_DIR = re.compile(
     r"(?ix)^(?:"
@@ -27,6 +28,9 @@ _EXPLICIT_TMDB_BARE_RE = re.compile(
     r"(?i)(?:^|(?<=[\s._()\[\]{}【】]))"
     r"(?:tmdb(?:[ +\-]?)[0-9]{1,10}|tdmb(?:[ +\-]+)[0-9]{1,10})"
     r"(?=$|(?=[\s._()\[\]{}【】]))"
+)
+_SAMPLE_MEDIA_MARKER_RE = re.compile(
+    r"(?i)(?:^|[._\-\s])(sample|proof)$"
 )
 _SPECIAL_MEDIA_NAME = re.compile(
     r"(?i)(?:^|[ ._\-\[\(【])(?:omnibus|picture[ ._-]*drama|"
@@ -151,6 +155,21 @@ def _media_stem(value: str) -> str:
     if separator and re.fullmatch(r"(?i)[a-z][a-z0-9]{1,7}", suffix):
         return base
     return name
+
+
+def is_sample_media_path(path: str | PurePath) -> bool:
+    """识别显式 sample/proof 文件尾标记或同名专用目录，不访问文件系统。
+
+    普通标题中的子串不算样片标记；例如 ``Corps Samples (2021)`` 和
+    ``The.Sample.Movie`` 不匹配。调用方负责先确认条目是视频。
+    """
+    parts = split_path(str(path))
+    if not parts:
+        return False
+    if any(_SAMPLE_MEDIA_MARKER_RE.fullmatch(part) for part in parts[:-1]):
+        return True
+    stem = _media_stem(parts[-1])
+    return bool(_SAMPLE_MEDIA_MARKER_RE.search(stem))
 
 
 def special_media_position(value: str) -> int | None:

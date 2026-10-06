@@ -15,6 +15,7 @@ from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.config import get, get_bool, get_int
 from app.logger import get_logger, redact_sensitive_text
 from app.modules.naming import sanitize_name
+from app.modules.special_media import is_sample_media_path
 from app.indexers.providers.base import augment_public_magnet
 
 logger = get_logger(__name__)
@@ -927,7 +928,7 @@ def submit_offline_selection(url: str, selected_indexes: list[int] | None,
         invalid = [index for index in requested if index not in available]
         if invalid:
             return {**base, "error": f"选择中包含不存在的文件索引: {', '.join(map(str, invalid))}"}
-        choices = build_offline_file_choices(files, rules)
+        choices = build_offline_file_choices(files, rules, skip_samples=False)
         allowed = {int(item["index"]) for item in choices if item.get("selected")}
         forbidden = [index for index in requested if index not in allowed]
         if forbidden:
@@ -1006,8 +1007,10 @@ def rules_summary(rules: OfflineRules | None = None) -> dict:
     }
 
 
-def build_offline_file_choices(files: list[dict], rules: OfflineRules) -> list[dict]:
-    """为归一化文件列表补充默认选择、锁定状态和排除原因。"""
+def build_offline_file_choices(
+    files: list[dict], rules: OfflineRules, *, skip_samples: bool = True,
+) -> list[dict]:
+    """默认不选样片；显式手选仍校验用户规则及解析器排除项。"""
     allowed_exts = set(rules.allowed_exts or DEFAULT_VIDEO_EXTS)
     minimum_size = max(0, rules.min_file_mb) * 1024 * 1024
     choices: list[dict] = []
@@ -1033,6 +1036,8 @@ def build_offline_file_choices(files: list[dict], rules: OfflineRules) -> list[d
                 reason = "扩展名不允许"
             if not reason and minimum_size and item["size"] < minimum_size:
                 reason = f"小于 {rules.min_file_mb} MB"
+            if not reason and skip_samples and is_sample_media_path(item["name"]):
+                reason = "样片默认不下载，可在预览中明确选择"
         item.update({
             "selected": not reason,
             "locked": locked,

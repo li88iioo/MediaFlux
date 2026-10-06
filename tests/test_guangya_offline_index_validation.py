@@ -128,19 +128,53 @@ class GuangYaOfflineIndexValidationTests(unittest.TestCase):
                     ], tree_key))
                     self.assertEqual([item["index"] for item in files], list(range(1 + len(remaining))))
 
-    def test_omitted_index_is_not_guessed_when_explicit_positions_are_ambiguous(self):
-        files = GuangYaClient.normalize_offline_files(self.manifest([
-            {"name": "Unknown.mkv", "size": 100},
-            {"fileIndex": 7, "name": "Known.mkv", "size": 200},
-        ]))
-        self.assertEqual([item["index"] for item in files], [7])
+    def test_unverifiable_missing_index_rejects_incomplete_selection(self):
+        for items in (
+            [{"name": "Unknown.mkv", "size": 100}, {"fileIndex": 7, "name": "Known.mkv", "size": 200}],
+            [{"fileIndex": 0, "name": "Known.mkv", "size": 100}, {"name": "Unknown.mkv", "size": 200}],
+        ):
+            with self.subTest(items=items), self.assertRaisesRegex(ValueError, "文件索引缺失"):
+                GuangYaClient.normalize_offline_files(self.manifest(items))
 
-    def test_omitted_nonzero_index_is_not_guessed(self):
-        files = GuangYaClient.normalize_offline_files(self.manifest([
-            {"fileIndex": 0, "name": "Known.mkv", "size": 100},
-            {"name": "Unknown.mkv", "size": 200},
-        ]))
-        self.assertEqual([item["index"] for item in files], [0])
+    def test_nested_bt_tree_recovers_zero_not_tree_position(self):
+        # 事故响应结构：先列目录，正片位于根数组中部且省略零值索引。
+        response = self.manifest([
+            {"fileName": "Sample", "isDir": True, "subfiles": [
+                {"fileName": "Sample.mkv", "fileIndex": 4, "fileSize": 331776368},
+            ]},
+            {"fileName": "Screens", "isDir": True, "subfiles": [
+                {"fileName": f"screen-{i}.jpg", "fileIndex": i, "fileSize": 100}
+                for i in range(5, 10)
+            ]},
+            {"fileName": "Movie.nfo", "fileIndex": 1, "fileSize": 100},
+            {"fileName": "Movie.1999.4k.mkv", "fileSize": 28255299040},
+            {"fileName": "folder.jpg", "fileIndex": 2, "fileSize": 100},
+            {"fileName": "logo.png", "fileIndex": 3, "fileSize": 100},
+        ])
+        info = response["data"]["btResInfo"]
+        info["subfilesNum"] = 10
+        for excluded in ([], [0]):
+            info["excludeIndices"] = excluded
+            with self.subTest(excluded=excluded):
+                files = GuangYaClient.normalize_offline_files(response)
+                self.assertEqual(len(files), 10)
+                main = next(item for item in files if item["index"] == 0)
+                self.assertEqual(main["size"], 28255299040)
+                self.assertEqual(main["name"], "Movie.1999.4k.mkv")
+                self.assertEqual(main["excluded"], bool(excluded))
+        for count in (9, 11, None):
+            info["subfilesNum"] = count
+            with self.subTest(count=count), self.assertRaisesRegex(ValueError, "文件数量.*不一致"):
+                GuangYaClient.normalize_offline_files(response)
+
+    def test_declared_bt_count_cannot_silently_drop_an_entire_leaf(self):
+        response = self.manifest([
+            {"fileIndex": i, "fileName": f"File-{i}.mkv", "fileSize": 100}
+            for i in range(1, 10)
+        ])
+        response["data"]["btResInfo"]["subfilesNum"] = 10
+        with self.assertRaisesRegex(ValueError, "文件数量.*不一致"):
+            GuangYaClient.normalize_offline_files(response)
 
     def test_duplicate_real_indexes_still_fail_closed(self):
         response = self.manifest([
@@ -155,7 +189,6 @@ class GuangYaOfflineIndexValidationTests(unittest.TestCase):
             "data": {
                 "trackers": [{"fileIndex": False, "name": "NotAFile"}],
                 "files": [
-                    {"index": -1, "id": False, "name": "NoKnownIndex.mkv"},
                     {"fileIndex": 0, "name": "Valid.mkv", "size": 100},
                 ],
             },
@@ -190,10 +223,8 @@ class GuangYaOfflineIndexValidationTests(unittest.TestCase):
                 {"fileIndex": 2, "name": "Episode.mkv", "size": 200},
             ]},
         ])
-        files = GuangYaClient.normalize_offline_files(response)
-        self.assertEqual(files, [
-            {"index": 2, "name": "Episode.mkv", "size": 200, "excluded": False},
-        ])
+        with self.assertRaisesRegex(ValueError, "文件索引缺失"):
+            GuangYaClient.normalize_offline_files(response)
 
     def test_invalid_child_file_still_fails_closed_beneath_placeholder_directory(self):
         response = self.manifest([

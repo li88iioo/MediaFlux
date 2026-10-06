@@ -3914,3 +3914,106 @@ class DirectoryScrapeSecretBoundaryTests(IsolatedDatabaseTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrganizeScanSampleTests(unittest.TestCase):
+    def test_sample_names_and_sample_directories_do_not_pass_size_threshold(self):
+        from app.modules.organize_models import OrganizeContext
+        from app.modules.organize_scan import OrganizerScanner
+
+        sample_size = 316_410_000
+        source_items = [
+            _file("sample-file", "Sample.mkv", "source", size=sample_size),
+            _file(
+                "samples-title", "Corps Samples (2021).mkv", "source",
+                size=sample_size,
+            ),
+            _dir("sample-dir", "Sample", "source"),
+            _dir("samples-title-dir", "Corps Samples (2021)", "source"),
+        ]
+        sample_dir_video = _file(
+            "sample-dir-video", "Blue.Streak.1999.mkv", "sample-dir",
+            size=sample_size,
+        )
+        movie_dir_video = _file(
+            "movie-dir-video", "Blue.Streak.1999.mkv", "samples-title-dir",
+            size=sample_size,
+        )
+        tree = {
+            "source": source_items,
+            "sample-dir": [sample_dir_video],
+            "samples-title-dir": [movie_dir_video],
+        }
+        infos = {
+            "source": _dir("source", "Downloads"),
+            "sample-dir": source_items[2],
+            "samples-title-dir": source_items[3],
+        }
+        client = _TreeClient(tree, infos)
+        context = OrganizeContext(
+            source_dir_id="source", source_name="Downloads",
+        )
+        stats = {
+            "scan_file_info_calls": 0,
+            "scan_list_dir_calls": 0,
+            "scan_errors": [],
+            "scan_complete": True,
+            "total": 0,
+            "skipped": 0,
+        }
+        scanner = OrganizerScanner(
+            client,
+            traversal_limits=(64, 100, 1_000),
+            append_reason=lambda values, key, reason: values.setdefault(key, []).append(reason),
+        )
+
+        result = scanner.scan(
+            context,
+            SimpleNamespace(small_file_mb=300),
+            stats,
+            video_exts={"mkv"},
+            metadata_exts=set(),
+        )
+
+        self.assertEqual(
+            {item.file.file_id for item in result.scanned_videos},
+            {"samples-title", "movie-dir-video"},
+        )
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["skipped"], 2)
+
+    def test_explicit_selected_file_id_can_still_scan_a_sample(self):
+        from app.modules.organize_models import OrganizeContext
+        from app.modules.organize_scan import OrganizerScanner, ScanRestriction
+
+        sample = _file("sample-file", "Sample.mkv", "source", size=316_410_000)
+        tree = {"source": [sample]}
+        client = _TreeClient(tree, {"source": _dir("source", "Downloads")})
+        stats = {
+            "scan_file_info_calls": 0,
+            "scan_list_dir_calls": 0,
+            "scan_errors": [],
+            "scan_complete": True,
+            "total": 0,
+            "skipped": 0,
+        }
+        scanner = OrganizerScanner(
+            client,
+            traversal_limits=(64, 100, 1_000),
+            append_reason=lambda values, key, reason: values.setdefault(key, []).append(reason),
+        )
+
+        result = scanner.scan(
+            OrganizeContext(source_dir_id="source", source_name="Downloads"),
+            SimpleNamespace(small_file_mb=300),
+            stats,
+            video_exts={"mkv"},
+            metadata_exts=set(),
+            restriction=ScanRestriction(
+                dir_id="source",
+                files_only=True,
+                file_ids=frozenset({"sample-file"}),
+            ),
+        )
+
+        self.assertEqual([item.file.file_id for item in result.scanned_videos], ["sample-file"])
