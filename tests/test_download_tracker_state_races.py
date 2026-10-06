@@ -677,6 +677,63 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         persisted = self.notify.call_args.args[0]
         self.assertEqual(persisted["status"], "resubmitted")
 
+    def test_other_backend_manual_review_does_not_strand_cloud_settle_retry(self):
+        request_id = self._request(
+            status="manual_review", qb_status="manual_review", gy_status="submitted",
+            gy_isolated=1, gy_target_dir="stage", gy_staging_parent_dir="parent",
+            gy_staging_name="stage", gy_expected_file_count=1,
+            notification_delivery_status="sent",
+        )
+        cloud = SimpleNamespace(logged_in=True,
+            file_info=lambda _: SimpleNamespace(is_dir=True, parent_id="parent", name="stage"),
+            list_dir=lambda _: [SimpleNamespace(file_id="file", size=100, etag="stable", updated_at="", name="media.mkv", is_dir=False)])
+        self.staging.side_effect = lambda row: DownloadTracker._staging_ready_for_organize(self.tracker, row)
+        self.organize.side_effect = lambda row: db.claim_download_request_organize(int(row["id"]))
+        with (
+            patch.object(self.tracker, "_run_staging_reconciliation_if_due", return_value=0),
+            patch.object(self.tracker, "_run_torrent_data_cleanup_if_due", return_value=0),
+            patch.object(self.tracker, "_gy_tasks", return_value=(True, [{"id": "gy-1", "status": "completed", "progress": 1.0}])) as gy_poll,
+            patch.object(self.tracker, "_qb_tasks") as qb_poll,
+            patch("app.modules.download_tracker.GuangYaClient", return_value=cloud),
+            patch("app.modules.download_tracker.close_guangya_client"),
+            patch.object(self.tracker, "_publish_lifecycle", return_value=True),
+        ):
+            self.assertEqual(self.tracker.run_once(), 1)
+            row = db.get_download_request(request_id)
+            self.assertEqual((row["status"], row["gy_status"], row["organize_status"]), ("manual_review", "completed", "settling"))
+            self.organize.assert_not_called()
+            self.assertNotIn(request_id, {r["id"] for r in db.list_active_download_requests()})
+            db.update_download_request(request_id, organize_next_retry_at="2000-01-01 00:00:00")
+            self.assertEqual(self.tracker.run_once(), 1)
+            self.organize.assert_called_once()
+            row = db.get_download_request(request_id)
+            self.assertEqual(row["status"], "manual_review")
+            self.assertEqual(row["gy_settle_stable_count"], 2)
+            self.assertEqual(row["organize_started"], 1)
+            self.assertEqual(self.tracker.run_once(), 0)
+            gy_poll.assert_called_once()
+            qb_poll.assert_not_called()
+
+    def test_cloud_followup_selection_and_claim_share_terminal_guards(self):
+        for fields in (
+            {}, {"status": "manual_review"}, {"targets": "qb"},
+            {"status": "cancelled"}, {"status": "resubmitted"}, {"status": "failed"},
+            {"organize_started": -1}, {"organize_started": 1},
+            {"organize_status": "cleared"}, {"organize_status": "resubmitted"},
+            {"attention_cleared_at": "2026-10-06 00:00:00"}, {"gy_status": "manual_review"},
+        ):
+            with self.subTest(fields=fields):
+                values = dict(status="completed", targets="both", qb_status="manual_review", gy_status="completed",
+                    organize_started=0, organize_status="", attention_cleared_at="", notification_delivery_status="sent")
+                values.update(fields)
+                request_id = self._request(**values)
+                # 告警裁决字段不允许通过普通状态更新器写入；此处种入历史行夹具。
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE download_requests SET attention_cleared_at=? WHERE id=?", (values["attention_cleared_at"], request_id))
+                selected = request_id in {row["id"] for row in db.list_active_download_requests()}
+                self.assertEqual(selected, db.claim_download_request_organize(request_id))
+                self.assertEqual(selected, not fields or fields == {"status": "manual_review"})
+
     def test_cancelled_request_is_not_polled_for_stale_notification_or_import(
         self,
     ) -> None:

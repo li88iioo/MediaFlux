@@ -960,17 +960,23 @@ def claim_download_request(request_id: int, targets: str) -> bool:
         return _claim_download_request_conn(conn, request_id, targets, db.now())
 
 
+# 轮询补偿、整理认领、未配置整理时的目录收口必须消费同一份后端准入事实。
+_GUANGYA_FOLLOWUP_READY_SQL = (
+    "targets IN ('guangya','both') AND gy_status='completed' "
+    "AND status IN ('submitted','downloading','completed','manual_review') "
+    "AND organize_started=0 "
+    "AND COALESCE(organize_status,'') NOT IN ('resubmitted','cleared') "
+    "AND COALESCE(attention_cleared_at,'')=''"
+)
+
+
 def claim_download_request_organize(request_id: int) -> bool:
     """原子认领光鸭下载后的整理阶段，阻止旧记录或并发跟踪重复启动。"""
     with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE download_requests SET organize_started=1,organize_status='starting',"
             "organize_error='',updated_at=? WHERE id=? "
-            "AND targets IN ('guangya','both') AND gy_status='completed' "
-            "AND status IN ('submitted','downloading','completed','manual_review') "
-            "AND organize_started=0 "
-            "AND COALESCE(organize_status,'') NOT IN ('resubmitted','cleared') "
-            "AND COALESCE(attention_cleared_at,'')=''",
+            f"AND {_GUANGYA_FOLLOWUP_READY_SQL}",
             (db.now(), int(request_id)),
         )
         return cur.rowcount == 1
@@ -1005,15 +1011,11 @@ def claim_download_request_staging_finalize(
         cur = conn.execute(
             "UPDATE download_requests SET organize_status='queued',organize_error='',"
             "organize_next_retry_at=?,updated_at=? WHERE id=? "
-            "AND targets IN ('guangya','both') AND gy_status='completed' "
-            "AND status IN ('submitted','downloading','completed','manual_review') "
-            "AND organize_started=0 AND gy_isolated=1 "
+            f"AND {_GUANGYA_FOLLOWUP_READY_SQL} AND gy_isolated=1 "
             "AND gy_target_dir=? AND COALESCE(NULLIF(gy_staging_parent_dir,''),'0')=? "
             "AND gy_staging_name=? "
             "AND (organize_next_retry_at IS NULL OR organize_next_retry_at='' "
-            "OR organize_next_retry_at<=datetime('now','localtime')) "
-            "AND COALESCE(organize_status,'') NOT IN ('resubmitted','cleared') "
-            "AND COALESCE(attention_cleared_at,'')=''",
+            "OR organize_next_retry_at<=datetime('now','localtime'))",
             (
                 retry_at,
                 timestamp,
@@ -1582,10 +1584,9 @@ def list_active_download_requests(
 ) -> list[sqlite3.Row]:
     clauses = [
         "status IN ('submitting','submitted','downloading')",
-        "(status!='cancelled' AND ("
-        "qb_status IN ('submitted','downloading','outcome_unknown') OR "
-        "gy_status IN ('submitted','downloading','outcome_unknown'))) ",
-        "(status='completed' AND gy_status='completed' AND organize_started=0 "
+        "(qb_status IN ('submitted','downloading','outcome_unknown') OR "
+        "gy_status IN ('submitted','downloading','outcome_unknown'))",
+        f"({_GUANGYA_FOLLOWUP_READY_SQL} "
         "AND (organize_next_retry_at IS NULL OR organize_next_retry_at='' OR organize_next_retry_at<=datetime('now','localtime')))",
         "((notification_delivery_status IN ('pending','retry_wait') "
         "AND (notification_next_retry_at IS NULL OR notification_next_retry_at='' "
