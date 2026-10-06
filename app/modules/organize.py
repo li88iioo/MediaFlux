@@ -104,9 +104,9 @@ from app.modules.organize_scan import (
     OrganizerScanner,
     OrganizeScanResult,
     ScanRestriction,
-    _ScannedVideo,
-    _TraversalBudget,
-    _TraversalLimitExceeded,
+    ScannedVideo,
+    TraversalBudget,
+    TraversalLimitExceeded,
 )
 from app.modules.organize_groups import (
     GROUP_ROOT_PATH,
@@ -1368,7 +1368,7 @@ class Organizer:
 
     @staticmethod
     def _episode_evidence_group_key(
-        item: _ScannedVideo,
+        item: ScannedVideo,
         parent_context: str,
     ) -> str:
         """按目录与标题身份隔离连续集证据，避免同目录多作品互相污染。"""
@@ -1583,14 +1583,14 @@ class Organizer:
         # 每个源文件映射和终检。规划阶段根据编号形态先处理安全代表：常规包
         # 保留包尾强消歧，疑似后续季累计编号则先处理范围起点，避免包尾异常
         # 阻止整包建立身份。最终结果仍恢复扫描顺序，不改变执行或日志顺序。
-        episode_groups: dict[str, list[_ScannedVideo]] = {}
+        episode_groups: dict[str, list[ScannedVideo]] = {}
         for item in scanned_videos:
             evidence_key = episode_evidence_keys.get(item.file.file_id, "")
             if item.special or evidence_key not in directory_identity_episode_evidence:
                 continue
             episode_groups.setdefault(evidence_key, []).append(item)
 
-        planning_videos: list[_ScannedVideo] = []
+        planning_videos: list[ScannedVideo] = []
         emitted_episode_groups: set[str] = set()
         for item in scanned_videos:
             evidence_key = episode_evidence_keys.get(item.file.file_id, "")
@@ -1611,8 +1611,8 @@ class Organizer:
             representative_episode = (
                 evidence.range_start if uses_safe_identity_probe else evidence.range_end
             )
-            representative: list[_ScannedVideo] = []
-            remainder: list[_ScannedVideo] = []
+            representative: list[ScannedVideo] = []
+            remainder: list[ScannedVideo] = []
             for candidate in group:
                 candidate_position = source_positions.get(candidate.file.file_id)
                 try:
@@ -4543,7 +4543,7 @@ class Organizer:
         return "候选仅命中部分标题" in error
 
     @staticmethod
-    def _physical_source_root(item: _ScannedVideo) -> str:
+    def _physical_source_root(item: ScannedVideo) -> str:
         """返回 source 下用于隔离作品身份的第一层物理目录。"""
         relative_parts = [
             part.strip()
@@ -4913,7 +4913,7 @@ class Organizer:
 
     def _directory_identity_cache_key(
         self,
-        item: _ScannedVideo,
+        item: ScannedVideo,
         rules: OrganizeRules,
         *,
         parent_path_override: str | None = None,
@@ -5072,9 +5072,9 @@ class Organizer:
         ))
 
     def _special_position_overrides(
-        self, candidates: list[_ScannedVideo]
+        self, candidates: list[ScannedVideo]
     ) -> dict[str, tuple[int, int]]:
-        groups: dict[tuple[str, str], list[_ScannedVideo]] = {}
+        groups: dict[tuple[str, str], list[ScannedVideo]] = {}
         for item in candidates:
             if not item.special:
                 continue
@@ -7388,7 +7388,7 @@ class Organizer:
         protected_seen: set[str] = set()
         protected = {str(item) for item in (protected_source_ids or set()) if str(item)}
         protected.add(str(source_dir_id))
-        traversal = _TraversalBudget(*self._traversal_limits)
+        traversal = TraversalBudget(*self._traversal_limits)
 
         def scan(dir_id: str, depth: int) -> bool:
             nonlocal scan_failures
@@ -7397,7 +7397,7 @@ class Organizer:
             try:
                 files = self.client.list_dir(dir_id)
                 traversal.consume_entries(len(files))
-            except _TraversalLimitExceeded:
+            except TraversalLimitExceeded:
                 raise
             except Exception as exc:
                 scan_failures += 1
@@ -7431,7 +7431,7 @@ class Organizer:
         scan_complete = False
         try:
             scan_complete = scan(source_dir_id, 0)
-        except _TraversalLimitExceeded as exc:
+        except TraversalLimitExceeded as exc:
             logger.warning(
                 "空目录扫描触发安全预算 kind=%s limit=%s dirs=%s entries=%s",
                 exc.kind, exc.limit, traversal.directories, traversal.entries,

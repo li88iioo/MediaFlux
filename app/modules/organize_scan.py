@@ -388,9 +388,3 @@ class OrganizerScanner:
                 )
             )
         return True
-
-
-# 保留 organize.py 历史私有名称，减少现有类型注解与调试工具的迁移成本。
-_ScannedVideo = ScannedVideo
-_TraversalLimitExceeded = TraversalLimitExceeded
-_TraversalBudget = TraversalBudget
