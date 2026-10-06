@@ -115,7 +115,22 @@ def recently_played_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 
 def recently_added_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    return _media_list_arguments(arguments, label="最近入库")
+    if not isinstance(arguments, dict) or set(arguments) - {"server", "limit", "library_name", "library_ref", "media_type"}:
+        raise AgentToolError("最近入库仅接受server、limit、library_name、library_ref、media_type")
+    normalized = _media_list_arguments({key: arguments[key] for key in ("server", "limit") if key in arguments}, label="最近入库")
+    for key, maximum in (("library_name", 120), ("library_ref", 64)):
+        if key in arguments:
+            value = arguments[key]
+            if not isinstance(value, str) or not value.strip() or len(value.strip()) > maximum:
+                raise AgentToolError(f"{key}必须是非空字符串，最多{maximum}字符")
+            normalized[key] = value.strip()
+    if "library_name" in normalized and "library_ref" in normalized:
+        raise AgentToolError("library_name与library_ref只能指定一个")
+    if "media_type" in arguments:
+        if arguments["media_type"] not in ("all", "movie", "tv"):
+            raise AgentToolError("media_type仅支持all、movie或tv")
+        normalized["media_type"] = arguments["media_type"]
+    return normalized
 
 
 def preferences_update_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -219,7 +234,7 @@ def _query_media_profile(
         return get_provider_gateway().query(
             profile_ref=profile.source,
             operation=operation,
-            arguments={"limit": int(arguments["limit"])},
+            arguments={key: value for key, value in arguments.items() if key != "server"},
             context=context,
         )
     except ProviderGatewayError as exc:

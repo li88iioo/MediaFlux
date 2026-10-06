@@ -246,6 +246,7 @@ class MediaServerClient:
     """媒体服务器客户端基类。"""
 
     display_name = "MediaServer"
+    _RECENT_EXTRA_FIELDS = ""
     _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
 
     def __init__(
@@ -444,9 +445,11 @@ class MediaServerClient:
     def _libraries(self) -> list[Library]:
         raise NotImplementedError
 
-    def recent_media(self, limit: int = 60) -> list[MediaItem]:
-        """返回最近入库媒体，供独立媒体中心页面使用。"""
-        return self._recent_added(limit=max(1, min(int(limit or 60), 200)))
+    def recent_media(self, limit: int = 60, *, parent_id: str = "", media_type: str = "all") -> list[MediaItem]:
+        """按实际库范围及内容类型查询最近入库；不指定范围时保持全库行为。"""
+        return self._recent_added(
+            limit=max(1, min(int(limit or 60), 200)), parent_id=parent_id, media_type=media_type,
+        )
 
     def _media_item(self, item: dict) -> MediaItem:
         """由具体服务器适配其资源字段，不能强行合并不同响应投影。"""
@@ -981,8 +984,47 @@ class MediaServerClient:
             ignored_unknown=ignored_unknown,
         )
 
-    def _recent_added(self, limit: int = 8) -> list[MediaItem]:
-        raise NotImplementedError
+    def _recent_added(self, limit: int = 8, *, parent_id: str = "", media_type: str = "all") -> list[MediaItem]:
+        uid = self._user_id()
+        normalized_limit = max(1, min(int(limit or 8), 200))
+        if media_type not in {"all", "movie", "tv"}:
+            raise ValueError("媒体类型仅支持all、movie或tv")
+        params = {
+            "Recursive": "true",
+            "Limit": max(30, normalized_limit * 3),
+            "IncludeItemTypes": {"all": "Movie,Series,Episode", "movie": "Movie", "tv": "Series,Episode"}[media_type],
+            "Fields": (
+                "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
+                "ParentIndexNumber,ImageTags," + self._RECENT_EXTRA_FIELDS + "ProductionYear,Genres,UserData"
+            ),
+            "SortBy": "DateCreated",
+            "SortOrder": "Descending",
+            "EnableTotalRecordCount": "false",
+        }
+        if str(parent_id or "").strip():
+            params["ParentId"] = str(parent_id).strip()
+        data = self._request(f"/Users/{uid}/Items", params=params)
+        raw_items, _total = self._items_payload(data)
+        raw_items = sorted(
+            raw_items,
+            key=lambda raw: str(raw.get("DateCreated") or ""),
+            reverse=True,
+        )
+        items: list[MediaItem] = []
+        seen: set[str] = set()
+        for raw in raw_items:
+            item_id = str(raw.get("Id") or "")
+            if str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId"):
+                dedupe_key = f"episode-series:{raw['SeriesId']}"
+            else:
+                dedupe_key = item_id
+            if not dedupe_key or dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            items.append(self._media_item(raw))
+            if len(items) >= normalized_limit:
+                break
+        return items
 
     def _recent_played(self, limit: int = 12) -> list[MediaItem]:
         return []

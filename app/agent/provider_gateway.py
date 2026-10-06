@@ -158,7 +158,9 @@ class ProviderGateway:
         resolved = dict(normalized)
         snapshots: dict[str, Any] = {}
         for argument, expected_kind in spec.reference_arguments.items():
-            value = normalized.get(argument)
+            if argument not in normalized:
+                continue
+            value = normalized[argument]
             if isinstance(value, list):
                 raw_ids: list[str] = []
                 items: list[dict[str, Any]] = []

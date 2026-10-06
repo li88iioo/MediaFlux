@@ -131,9 +131,9 @@ class EmbyClient(MediaServerClient):
         self._prime_product_identity()
         return super().media_web_url(item_id)
 
-    def recent_media(self, limit: int = 60) -> list[MediaItem]:
+    def recent_media(self, limit: int = 60, *, parent_id: str = "", media_type: str = "all") -> list[MediaItem]:
         self._prime_product_identity()
-        return super().recent_media(limit)
+        return super().recent_media(limit, parent_id=parent_id, media_type=media_type)
 
     def list_virtual_folders(self) -> list[dict]:
         """兼容 Emby QueryResult 与 Jellyfin 10.x 裸数组媒体库接口。"""
@@ -225,46 +225,6 @@ class EmbyClient(MediaServerClient):
             progress=normalize_playback_progress(user_data.get("PlayedPercentage")),
             genres=genres,
         )
-
-    def _recent_added(self, limit: int = 8) -> list[MediaItem]:
-        uid = self._user_id()
-        normalized_limit = max(1, min(int(limit or 8), 200))
-        data = self._request(
-            f"/Users/{uid}/Items",
-            params={
-                "Recursive": "true",
-                "Limit": max(30, normalized_limit * 3),
-                "IncludeItemTypes": "Movie,Series,Episode",
-                "Fields": (
-                    "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,ProductionYear,Genres,UserData"
-                ),
-                "SortBy": "DateCreated",
-                "SortOrder": "Descending",
-                "EnableTotalRecordCount": "false",
-            },
-        )
-        raw_items, _total = self._items_payload(data)
-        raw_items = sorted(
-            raw_items,
-            key=lambda raw: str(raw.get("DateCreated") or ""),
-            reverse=True,
-        )
-        items: list[MediaItem] = []
-        seen: set[str] = set()
-        for raw in raw_items:
-            item_id = str(raw.get("Id") or "")
-            if str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId"):
-                dedupe_key = f"episode-series:{raw['SeriesId']}"
-            else:
-                dedupe_key = item_id
-            if not dedupe_key or dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            items.append(self._media_item(raw))
-            if len(items) >= normalized_limit:
-                break
-        return items
 
     def search_media(self, query: str, limit: int = 12) -> list[MediaItem]:
         self._prime_product_identity()

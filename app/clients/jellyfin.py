@@ -28,6 +28,7 @@ logger = get_logger(__name__)
 
 class JellyfinClient(MediaServerClient):
     display_name = "Jellyfin"
+    _RECENT_EXTRA_FIELDS = "SeriesPrimaryImageTag,"
     _PLAYABLE_ITEM_TYPES = "Movie,Episode,Audio,MusicVideo,Book,Video"
     _LIBRARY_TYPES = {
         "tvshows": "Series",
@@ -296,47 +297,6 @@ class JellyfinClient(MediaServerClient):
             ),
             genres=genres,
         )
-
-    def _recent_added(self, limit: int = 8) -> list[MediaItem]:
-        user_id = self._user_id()
-        normalized_limit = max(1, min(int(limit or 8), 200))
-        data = self._request(
-            f"/Users/{user_id}/Items",
-            params={
-                "Recursive": "true",
-                "Limit": max(30, normalized_limit * 3),
-                "IncludeItemTypes": "Movie,Series,Episode",
-                "Fields": (
-                    "DateCreated,Overview,SeriesId,SeriesName,IndexNumber,"
-                    "ParentIndexNumber,ImageTags,SeriesPrimaryImageTag,"
-                    "ProductionYear,Genres,UserData"
-                ),
-                "SortBy": "DateCreated",
-                "SortOrder": "Descending",
-                "EnableTotalRecordCount": "false",
-            },
-        )
-        raw_items, _total = self._items_payload(data)
-        raw_items = sorted(
-            raw_items,
-            key=lambda raw: str(raw.get("DateCreated") or ""),
-            reverse=True,
-        )
-        items: list[MediaItem] = []
-        seen: set[str] = set()
-        for raw in raw_items:
-            item_id = str(raw.get("Id") or "")
-            if str(raw.get("Type") or "").casefold() == "episode" and raw.get("SeriesId"):
-                dedupe_key = f"episode-series:{raw['SeriesId']}"
-            else:
-                dedupe_key = item_id
-            if not dedupe_key or dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            items.append(self._media_item(raw))
-            if len(items) >= normalized_limit:
-                break
-        return items
 
     def search_media(self, query: str, limit: int = 12) -> list[MediaItem]:
         user_id = self._user_id()

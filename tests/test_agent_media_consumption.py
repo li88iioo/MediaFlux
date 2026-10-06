@@ -11,6 +11,7 @@ from app.agent.media_consumption_actions import (
     notification_rule_update_arguments,
     preferences_update_arguments,
     recently_played_arguments,
+    recently_added_arguments,
 )
 from app.agent.models import ToolResult
 from app.agent.provider_models import ProviderGatewayError
@@ -102,6 +103,28 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
             preferences_update_arguments({"quality_profile": "quality"})
         with self.assertRaises(AgentToolError):
             notification_rule_update_arguments({"subscription_number": 1})
+
+    def test_recently_added_accepts_real_library_scope_without_changing_other_lists(self):
+        self.assertEqual(recently_added_arguments({"library_name": " 电视剧 ", "media_type": "tv"}),
+                         {"server": "auto", "limit": 8, "library_name": "电视剧", "media_type": "tv"})
+        for arguments in ({"library_name": ""}, {"library_name": "电视剧", "library_ref": "PO-12345678"}, {"media_type": "anime"}):
+            with self.subTest(arguments=arguments), self.assertRaises(AgentToolError):
+                recently_added_arguments(arguments)
+        with self.assertRaises(AgentToolError):
+            recently_played_arguments({"library_name": "电视剧"})
+
+    def test_recently_added_tool_forwards_scope_to_provider(self):
+        service = get_agent_service()
+        profile = MediaServerProfile(source="configured:jellyfin", server_type="jellyfin", label="Jellyfin", url="http://media.invalid", credential="test", enabled=True, user_id="viewer")
+        gateway = Mock()
+        gateway.query.return_value = ToolResult(True, "success", "仅查询媒体库：电视剧", data={"items": []})
+        with (
+            patch("app.agent.media_consumption_actions.list_configured_profiles", return_value=[profile]),
+            patch("app.agent.media_consumption_actions.get_provider_gateway", return_value=gateway),
+        ):
+            result = service.invoke("media.recently_added", {"library_name": "电视剧", "media_type": "tv", "limit": 5}, owner="owner")
+        self.assertTrue(result["result"]["ok"])
+        self.assertEqual(gateway.query.call_args.kwargs["arguments"], {"limit": 5, "library_name": "电视剧", "media_type": "tv"})
 
     def test_continue_watching_uses_config_or_default_user_and_redacts_ids(
         self,

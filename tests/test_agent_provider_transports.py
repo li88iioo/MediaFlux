@@ -905,3 +905,47 @@ def test_emby_counts_failure_reaches_agent_instead_of_zero_inventory(monkeypatch
         MediaServerProviderTransport().execute_read("configured:emby", "media.items.counts", {})
     assert error.value.code == "provider_unavailable"
     assert len(paths) == 2
+
+
+def test_recent_added_uses_real_library_scope_and_never_genre_guessing(monkeypatch):
+    from app.agent.models import ToolContext
+    from app.agent.provider_gateway import ProviderGateway
+    from app.agent.provider_operations import build_provider_catalog
+    from app.clients.jellyfin import JellyfinClient
+
+    transport = MediaServerProviderTransport()
+    profile = MediaServerProfile(source="configured:jellyfin", server_type="jellyfin", label="Jellyfin", url="http://media.invalid", credential="test", enabled=True, user_id="viewer")
+    monkeypatch.setattr("app.agent.providers.media_server.list_configured_profiles", lambda: [profile])
+    calls = []
+    folders = [{"ItemId": "tv-library", "Name": "电视剧", "CollectionType": "tvshows"},
+               {"ItemId": "anime-library", "Name": "动漫", "CollectionType": "tvshows"}]
+    def request(_self, path, **kwargs):
+        calls.append((path, kwargs))
+        if path == "/Library/VirtualFolders":
+            return folders
+        assert path == "/Users/viewer/Items"
+        parent = kwargs["params"].get("ParentId")
+        # 动漫条目没有Animation标签；只能由ParentId排除，不能从Genres猜测。
+        return {"Items": [{"Id": "one", "Name": "真人剧" if parent == "tv-library" else "无动画标签的动漫", "Type": "Series", "Genres": []}]}
+    monkeypatch.setattr(JellyfinClient, "_request", request)
+    gateway = ProviderGateway(catalog=build_provider_catalog(), transports=[transport])
+    context = ToolContext(owner="owner", session_id="session")
+    for query in ({"library_name": "电视剧"}, {}):
+        result = gateway.query(profile_ref=profile.source, operation="media.items.recent_added", arguments=query, context=context)
+        assert result.data["scope"]["kind"] == ("library" if query else "all")
+        assert result.data["items"][0]["name"] == ("真人剧" if query else "无动画标签的动漫")
+    listed = gateway.query(profile_ref=profile.source, operation="media.libraries.list", arguments={}, context=context)
+    library_ref = listed.data["libraries"][0]["object_ref"]
+    result = gateway.query(profile_ref=profile.source, operation="media.items.recent_added", arguments={"library_ref": library_ref, "media_type": "tv"}, context=context)
+    assert result.data["scope"]["library"]["name"] == "电视剧"
+    assert "__object_id" not in result.data["scope"]["library"]
+    assert calls[-1][1]["params"]["ParentId"] == "tv-library"
+    assert calls[-1][1]["params"]["IncludeItemTypes"] == "Series,Episode"
+    for library_name in ("不存在", "电视剧"):
+        if library_name == "电视剧":
+            folders.append({"ItemId": "tv-duplicate", "Name": "电视剧"})
+        before = len(calls)
+        with pytest.raises(ProviderGatewayError):
+            gateway.query(profile_ref=profile.source, operation="media.items.recent_added", arguments={"library_name": library_name}, context=context)
+        assert len(calls) == before + 1
+        assert calls[-1][0] == "/Library/VirtualFolders"

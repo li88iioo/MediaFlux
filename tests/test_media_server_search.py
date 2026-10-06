@@ -239,6 +239,22 @@ class MediaServerSearchTests(unittest.TestCase):
             self.assertEqual(params["SortOrder"], "Descending")
             self.assertNotIn("GroupItems", params)
 
+    def test_recent_media_filters_library_and_type_before_fetching(self):
+        for client_type in (JellyfinClient, EmbyClient):
+            for media_type, item_types in (("all", "Movie,Series,Episode"), ("tv", "Series,Episode"), ("movie", "Movie")):
+                with self.subTest(client=client_type.__name__, media_type=media_type):
+                    client = client_type("http://media.invalid", "token")
+                    self.addCleanup(client.close)
+                    client._cached_user_id = "user-1"
+                    with patch.object(client, "_request", return_value={"Items": []}) as request:
+                        self.assertEqual(client.recent_media(limit=5, parent_id="tv-library", media_type=media_type), [])
+                    params = request.call_args.kwargs["params"]
+                    self.assertEqual(params["ParentId"], "tv-library")
+                    self.assertEqual(params["IncludeItemTypes"], item_types)
+                    self.assertEqual(params["SortBy"], "DateCreated")
+                    self.assertEqual(params["Recursive"], "true")
+                    self.assertEqual("SeriesPrimaryImageTag" in params["Fields"], client_type is JellyfinClient)
+
     def test_recent_media_keeps_newest_episode_per_series(self):
         payload = {"Items": [
             {

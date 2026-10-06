@@ -226,11 +226,44 @@ class MediaServerProviderTransport:
                     )
                 if operation == "media.items.recent_added":
                     limit = int(arguments.get("limit", 8))
-                    items = client.recent_media(limit=limit)
+                    library_name = str(arguments.get("library_name") or "").strip()
+                    library_id = str(arguments.get("library_ref") or "").strip()
+                    if library_name and library_id:
+                        raise ProviderGatewayError("媒体库名称与引用只能指定一个", code="invalid_arguments")
+                    selected_library = None
+                    if library_name or library_id:
+                        libraries = client.list_virtual_folders()
+                        matches = [folder for folder in libraries if (
+                            str(folder.get("id") or "") == library_id if library_id
+                            else str(folder.get("name") or "").strip().casefold() == library_name.casefold()
+                        )]
+                        if len(matches) != 1 or not str(matches[0].get("id") or "").strip():
+                            raise ProviderGatewayError(
+                                "指定媒体库不存在或名称不唯一，请先列出媒体库并选择；本次未查询全库",
+                                code="precondition_failed",
+                            )
+                        selected_library = matches[0]
+                        library_id = str(selected_library["id"])
+                    media_type = str(arguments.get("media_type") or "all")
+                    if media_type not in {"all", "movie", "tv"}:
+                        raise ProviderGatewayError("媒体类型无效", code="invalid_arguments")
+                    query = {"limit": limit}
+                    if library_id:
+                        query["parent_id"] = library_id
+                    if media_type != "all":
+                        query["media_type"] = media_type
+                    items = client.recent_media(**query)
+                    scope = {"kind": "all", "media_type": media_type}
+                    if selected_library:
+                        scope.update(kind="library", library={
+                            "__object_id": library_id, "__object_kind": "media_library",
+                            "name": str(selected_library.get("name") or ""),
+                        })
+                    scope_note = f"仅查询媒体库：{selected_library.get('name')}" if selected_library else "查询全部可访问媒体库；未按媒体库排除动漫"
                     return ProviderPayload(
-                        summary=f"{profile.label} 返回 {len(items)} 项最近入库内容",
+                        summary=f"{profile.label} 返回 {len(items)} 项最近入库内容；{scope_note}",
                         data={
-                            "server_label": profile.label,
+                            "server_label": profile.label, "scope": scope, "scope_note": scope_note,
                             "count": len(items),
                             "items": [self._media_item(resolve_link, item) for item in items],
                         },

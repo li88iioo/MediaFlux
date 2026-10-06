@@ -7,6 +7,16 @@ from app.agent.provider_models import ProviderOperationSpec
 
 _EMPTY = {"type": "object", "properties": {}, "additionalProperties": False}
 
+RECENT_MEDIA_PROPERTIES = {
+    "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 8},
+    "library_name": {"type": "string", "minLength": 1, "maxLength": 120,
+                     "description": "服务器实际媒体库名称，精确匹配；例如电视剧。不得用类型或标签代替库范围。"},
+    "library_ref": {"type": "string", "minLength": 8, "maxLength": 64,
+                    "description": "media.libraries.list返回的媒体库引用，与library_name二选一"},
+    "media_type": {"type": "string", "enum": ["all", "movie", "tv"],
+                   "description": "内容类型；tv包含动漫剧集，不表示真人电视剧库"},
+}
+
 
 def build_provider_catalog() -> ProviderCatalog:
     catalog = ProviderCatalog()
@@ -34,20 +44,14 @@ def build_provider_catalog() -> ProviderCatalog:
         ProviderOperationSpec(
             operation_id="media.items.recent_added",
             provider="media",
-            description="读取媒体服务器最近入库的电影、剧集或单集，按作品去除重复单集展示，并返回可用的已校验 open_url。",
+            description="读取最近入库，可按真实媒体库名称或引用限定范围，再按作品去重；未指定库代表全库，不得声称排除了动漫库。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
-                "properties": {
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20,
-                        "default": 8,
-                    },
-                },
+                "properties": RECENT_MEDIA_PROPERTIES,
                 "additionalProperties": False,
             },
+            reference_arguments={"library_ref": "media_library"},
             result_kind="media_items",
             max_items=20,
             domains=("media_library", "discovery"),

@@ -27,6 +27,7 @@ from app.agent.media_consumption_actions import (
 from app.agent.media_consumption_actions import (
     empty_arguments as media_consumption_empty_arguments,
 )
+from app.agent.provider_operations import RECENT_MEDIA_PROPERTIES
 from app.agent.media_preference_policy import PREFERENCE_PROPERTIES
 from app.agent.media_subscription_actions import (
     create_media_subscription_confirmed,
@@ -549,18 +550,19 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="media.recently_added",
-            description="读取 Jellyfin 或 Emby 最近入库的内容；连续单集会按作品去重，并在可用时返回已校验的 open_url。",
+            description="读取最近入库；用户指定电视剧/动漫媒体库时必须传library_name或library_ref按真实库过滤，media_type=tv不能排除动漫。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
                 "properties": {
                     "server": {"type": "string", "enum": ["auto", "jellyfin", "emby"]},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                    **RECENT_MEDIA_PROPERTIES,
                 },
                 "additionalProperties": False,
             },
             context_handler=get_recently_added,
             validator=recently_added_arguments,
+            related_tools=("provider.query",),
             examples=("最近入库了什么", "查看 Jellyfin 最新添加内容"),
         )
     )
