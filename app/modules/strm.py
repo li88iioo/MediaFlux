@@ -2913,14 +2913,13 @@ def plan_strm_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
     for source in sources:
         name = str(source["name"])
         name_counts[name] = name_counts.get(name, 0) + 1
+
     multiple = len(sources) > 1
     planned = []
     for source in sources:
         source_id = str(source["id"])
         name = str(source["name"])
-        prefix = name
-        if name_counts[name] > 1:
-            prefix = f"{name} ({source_id[-6:]})"
+        prefix = f"{name} ({source_id[-6:]})" if name_counts[name] > 1 else name
         planned.append({
             "id": source_id,
             "name": name,
@@ -2928,6 +2927,29 @@ def plan_strm_sources(sources: list[dict[str, str]]) -> list[dict[str, str]]:
             "source_key": f"guangya:{source_id}",
             "metadata_source_key": f"guangya-meta:{source_id}",
         })
+
+    if multiple:
+        # 预留所有旧路径，避免冲突 loser 占用尚未分配来源的原路径。
+        reserved = {safe_path_component(row["rel_prefix"]) for row in planned}
+        seen = set()
+        for row in sorted(
+            planned,
+            key=lambda item: (name_counts[item["name"]] == 1, item["id"]),
+        ):
+            component = safe_path_component(row["rel_prefix"])
+            if component in seen:
+                legacy_prefix = row["rel_prefix"]
+                candidate = f"{legacy_prefix} [source {row['id']}]"
+                suffix = 1
+                component = safe_path_component(candidate)
+                while component in reserved:
+                    suffix += 1
+                    candidate = f"{legacy_prefix} [source {row['id']} #{suffix}]"
+                    component = safe_path_component(candidate)
+                row["rel_prefix"] = candidate
+                reserved.add(component)
+            seen.add(component)
+
     return planned
 
 

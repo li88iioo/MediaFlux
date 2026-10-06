@@ -110,6 +110,264 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
         with db.get_conn() as conn:
             conn.execute("DELETE FROM strm_metadata_queue")
             conn.execute("DELETE FROM strm_refresh_outbox")
+
+    def test_source_prefix_collision_keeps_legacy_owner_and_is_order_stable(self):
+        raw = [
+            {"id": "directory-ABC123", "name": "Series"},
+            {"id": "directory-ZYX999", "name": "Series"},
+            {"id": "directory-QWE777", "name": "Series (ABC123)"},
+        ]
+        sources, error = strm_module.parse_strm_sources(raw)
+        self.assertEqual(error, "")
+
+        planned = strm_module.plan_strm_sources(sources)
+        by_id = {row["id"]: row["rel_prefix"] for row in planned}
+        self.assertEqual(by_id["directory-ABC123"], "Series (ABC123)")
+        self.assertEqual(by_id["directory-ZYX999"], "Series (ZYX999)")
+        self.assertNotEqual(
+            by_id["directory-ABC123"], by_id["directory-QWE777"]
+        )
+        self.assertEqual(
+            len({safe_path_component(prefix) for prefix in by_id.values()}),
+            len(by_id),
+        )
+
+        reversed_sources, error = strm_module.parse_strm_sources(list(reversed(raw)))
+        self.assertEqual(error, "")
+        self.assertEqual(
+            {row["id"]: row["rel_prefix"] for row in
+             strm_module.plan_strm_sources(reversed_sources)},
+            by_id,
+        )
+
+        # 来源没有前缀冲突时继续沿用既有路径；同 ID 重复仍保留解析器的
+        # first-wins 行为，而不是生成第二个映射。
+        self.assertEqual(
+            [row["rel_prefix"] for row in strm_module.plan_strm_sources([
+                {"id": "movies", "name": "Movies"},
+                {"id": "series", "name": "Series"},
+            ])],
+            ["Movies", "Series"],
+        )
+        duplicate_ids, error = strm_module.parse_strm_sources([
+            {"id": "same-source", "name": "Original"},
+            {"id": "same-source", "name": "Renamed duplicate"},
+        ])
+        self.assertEqual(error, "")
+        self.assertEqual(duplicate_ids, [{"id": "same-source", "name": "Original"}])
+        self.assertEqual(
+            strm_module.plan_strm_sources(duplicate_ids)[0]["rel_prefix"], ""
+        )
+
+    def test_same_name_sources_with_equal_id_suffixes_get_stable_unique_prefixes(self):
+        sources = [
+            {"id": "source-a-abc123", "name": "同名"},
+            {"id": "source-b-abc123", "name": "同名"},
+        ]
+        planned = strm_module.plan_strm_sources(sources)
+        by_id = {row["id"]: row["rel_prefix"] for row in planned}
+
+        self.assertEqual(by_id["source-a-abc123"], "同名 (abc123)")
+        self.assertNotEqual(by_id["source-a-abc123"], by_id["source-b-abc123"])
+        self.assertEqual(
+            len({safe_path_component(prefix) for prefix in by_id.values()}), 2
+        )
+        self.assertEqual(
+            {row["id"]: row["rel_prefix"] for row in
+             strm_module.plan_strm_sources(list(reversed(sources)))},
+            by_id,
+        )
+
+    def test_same_suffix_upgrade_defers_legacy_owner_handoff_until_cleanup(self):
+        source_a, source_b = "source-a-abc123", "source-b-abc123"
+        sources = [
+            {"id": source_a, "name": "同名"},
+            {"id": source_b, "name": "同名"},
+        ]
+        plans = strm_module.plan_strm_sources(sources)
+        by_id = {row["id"]: row for row in plans}
+        files = {
+            source_id: GuangYaFile(
+                f"video-{source_id}", "Movie.mkv", False, 100,
+                f"etag-{source_id}", source_id,
+            )
+            for source_id in (source_a, source_b)
+        }
+        client = _TreeClient({source_id: [file] for source_id, file in files.items()})
+        base_url = "http://example"
+
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                # 旧顺序下 B 先占据末六位 prefix；新稳定规划把该 prefix 分给 A。
+                legacy_path = generate_strm(
+                    files[source_b], "同名 (abc123)", base_url, root,
+                )
+                db.upsert_strm_index(
+                    f"guangya:{source_b}", files[source_b].file_id,
+                    files[source_b].etag, files[source_b].size, files[source_b].name,
+                    str(legacy_path),
+                    f"sha256:{hashlib.sha256(legacy_path.read_bytes()).hexdigest()}",
+                )
+
+                first_a = sync_strm(
+                    source_a, base_url, root, client=client,
+                    rel_prefix=by_id[source_a]["rel_prefix"], source_name="同名",
+                    clean_empty_dirs=False,
+                )
+                self.assertEqual(first_a["generated"], 0)
+                self.assertEqual(first_a["failed"], 1)
+                self.assertIn(
+                    f"/playgy/{files[source_b].file_id}/",
+                    legacy_path.read_text(encoding="utf-8"),
+                )
+                self.assertEqual(db.list_strm_index(f"guangya:{source_a}"), [])
+
+                # 旧 owner 先搬到新 prefix 并清理旧路径后，A 下一轮才能安全恢复。
+                moved_b = sync_strm(
+                    source_b, base_url, root, client=client,
+                    rel_prefix=by_id[source_b]["rel_prefix"], source_name="同名",
+                    clean_empty_dirs=False,
+                )
+                moved_path = (
+                    Path(root) / STRM_SUBDIR
+                    / safe_path_component(by_id[source_b]["rel_prefix"])
+                    / "Movie.strm"
+                )
+                self.assertEqual(moved_b["generated"], 1)
+                self.assertEqual(moved_b["cleaned"], 1)
+                self.assertFalse(legacy_path.exists())
+                self.assertTrue(moved_path.is_file())
+                self.assertIn(
+                    f"/playgy/{files[source_b].file_id}/",
+                    moved_path.read_text(encoding="utf-8"),
+                )
+
+                recovered_a = sync_strm(
+                    source_a, base_url, root, client=client,
+                    rel_prefix=by_id[source_a]["rel_prefix"], source_name="同名",
+                    clean_empty_dirs=False,
+                )
+                self.assertEqual(recovered_a["generated"], 1)
+                self.assertTrue(legacy_path.is_file())
+                self.assertIn(
+                    f"/playgy/{files[source_a].file_id}/",
+                    legacy_path.read_text(encoding="utf-8"),
+                )
+                self.assertTrue(moved_path.is_file())
+        finally:
+            _cleanup_source_indexes(source_a)
+            _cleanup_source_indexes(source_b)
+
+    def test_source_prefix_upgrade_sync_is_idempotent_repairs_and_cleans_per_owner(self):
+        raw = [
+            {"id": "directory-ABC123", "name": "Series"},
+            {"id": "directory-ZYX999", "name": "Series"},
+            {"id": "directory-QWE777", "name": "Series (ABC123)"},
+        ]
+        sources, error = strm_module.parse_strm_sources(raw)
+        self.assertEqual(error, "")
+        plans = strm_module.plan_strm_sources(sources)
+        by_id = {row["id"]: row for row in plans}
+        self.assertEqual(by_id["directory-ABC123"]["rel_prefix"], "Series (ABC123)")
+        source_ids = [row["id"] for row in plans]
+        files = {
+            source_id: GuangYaFile(
+                f"video-{source_id}", "Movie.mkv", False, 100,
+                f"etag-{source_id}", source_id,
+            )
+            for source_id in source_ids
+        }
+        client = _TreeClient({source_id: [file] for source_id, file in files.items()})
+        base_url = "http://example"
+        source_a = "directory-ABC123"
+        source_b = "directory-ZYX999"
+        source_c = "directory-QWE777"
+
+        try:
+            with tempfile.TemporaryDirectory() as root:
+                # 模拟升级前已成功落盘的首来源：保留其旧 prefix 和索引所有权。
+                legacy_path = generate_strm(
+                    files[source_a], by_id[source_a]["rel_prefix"], base_url, root,
+                )
+                legacy_payload = legacy_path.read_bytes()
+                db.upsert_strm_index(
+                    f"guangya:{source_a}", files[source_a].file_id,
+                    files[source_a].etag, files[source_a].size, files[source_a].name,
+                    str(legacy_path),
+                    f"sha256:{hashlib.sha256(legacy_payload).hexdigest()}",
+                )
+
+                paths = {
+                    source_id: Path(root) / STRM_SUBDIR
+                    / safe_path_component(by_id[source_id]["rel_prefix"])
+                    / "Movie.strm"
+                    for source_id in source_ids
+                }
+                self.assertEqual(len(set(paths.values())), 3)
+
+                first_pass = {}
+                for plan in plans:
+                    source_id = plan["id"]
+                    first_pass[source_id] = sync_strm(
+                        source_id, base_url, root, client=client,
+                        rel_prefix=plan["rel_prefix"], source_name=plan["name"],
+                        clean_empty_dirs=False,
+                    )
+                self.assertEqual(first_pass[source_a]["skipped"], 1)
+                self.assertEqual(first_pass[source_a]["generated"], 0)
+                self.assertEqual(first_pass[source_b]["generated"], 1)
+                self.assertEqual(first_pass[source_c]["generated"], 1)
+                self.assertEqual(paths[source_a], legacy_path)
+
+                for source_id, path in paths.items():
+                    self.assertTrue(path.is_file(), source_id)
+                    self.assertIn(
+                        f"/playgy/{files[source_id].file_id}/",
+                        path.read_text(encoding="utf-8"),
+                    )
+
+                second_pass = {
+                    plan["id"]: sync_strm(
+                        plan["id"], base_url, root, client=client,
+                        rel_prefix=plan["rel_prefix"], source_name=plan["name"],
+                        clean_empty_dirs=False,
+                    )
+                    for plan in plans
+                }
+                for result in second_pass.values():
+                    self.assertEqual(result["generated"], 0)
+                    self.assertEqual(result["skipped"], 1)
+
+                # 缺失修复只重建该来源；另外两个来源的文件和索引保持不变。
+                paths[source_c].unlink()
+                repaired = sync_strm(
+                    source_c, base_url, root, client=client,
+                    rel_prefix=by_id[source_c]["rel_prefix"],
+                    source_name=by_id[source_c]["name"], clean_empty_dirs=False,
+                )
+                self.assertEqual(repaired["generated"], 1)
+                self.assertTrue(paths[source_c].is_file())
+                self.assertTrue(paths[source_a].is_file())
+                self.assertTrue(paths[source_b].is_file())
+
+                # 删除来源 B 的远端文件，只清理 B 的目标与命名空间。
+                client.tree[source_b] = []
+                removed = sync_strm(
+                    source_b, base_url, root, client=client,
+                    rel_prefix=by_id[source_b]["rel_prefix"],
+                    source_name=by_id[source_b]["name"], clean_empty_dirs=False,
+                )
+                self.assertEqual(removed["cleaned"], 1)
+                self.assertFalse(paths[source_b].exists())
+                self.assertTrue(paths[source_a].is_file())
+                self.assertTrue(paths[source_c].is_file())
+                self.assertEqual(db.list_strm_index(f"guangya:{source_b}"), [])
+                self.assertEqual(len(db.list_strm_index(f"guangya:{source_a}")), 1)
+                self.assertEqual(len(db.list_strm_index(f"guangya:{source_c}")), 1)
+        finally:
+            for source_id in source_ids:
+                _cleanup_source_indexes(source_id)
+
     def test_standard_strm_name_matches_sidecar_basename(self):
         video = GuangYaFile("video", "Show.S01E01.mkv", False, 100, "etag")
         sidecar = GuangYaFile("nfo", "Show.S01E01.nfo", False, 10, "meta")
