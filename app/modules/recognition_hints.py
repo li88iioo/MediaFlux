@@ -16,6 +16,7 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 _CACHE_TTL_SECONDS = 600.0
+_ERROR_CACHE_TTL_SECONDS = 30.0
 _CACHE_LIMIT = 256
 _AUTO_TIMEOUT_SECONDS = 4.0
 
@@ -91,7 +92,8 @@ def search_recognition_hints(
         value = RecognitionHintResult((), providers, ({"code": "unavailable"},))
 
     with _lock:
-        _cache[key] = (now + _CACHE_TTL_SECONDS, value)
+        ttl = _ERROR_CACHE_TTL_SECONDS if value.errors else _CACHE_TTL_SECONDS
+        _cache[key] = (time.monotonic() + ttl, value)
         _cache.move_to_end(key)
         while len(_cache) > _CACHE_LIMIT:
             _cache.popitem(last=False)

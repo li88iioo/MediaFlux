@@ -59,6 +59,37 @@ class RecognitionHintTests(unittest.TestCase):
             "钢铁侠", 1, ["douban"], timeout_seconds=4.0
         )
 
+    def test_transient_hint_errors_expire_before_successful_results(self):
+        from app.modules.recognition_hints import clear_recognition_hint_cache, search_recognition_hints
+
+        card = MediaCard(provider="douban", external_id="1", media_type="movie", title="Iron Man")
+        recovered = SimpleNamespace(items=(card,), providers_attempted=("douban",), errors=())
+        for first_result in (
+            TimeoutError("temporary"),
+            SimpleNamespace(items=(), providers_attempted=("douban",), errors=({"code": "timeout"},)),
+            SimpleNamespace(items=(card,), providers_attempted=("douban",), errors=({"code": "timeout"},)),
+        ):
+            with self.subTest(first_result=type(first_result).__name__):
+                clear_recognition_hint_cache()
+                service = Mock()
+                service.search.side_effect = [first_result, recovered]
+                with patch("app.modules.recognition_hints.enabled_hint_providers", return_value=("douban",)), patch(
+                    "app.modules.recognition_hints.get_discovery_search_service", return_value=service,
+                ), patch("app.modules.recognition_hints.time.monotonic", return_value=100.0) as clock:
+                    first = search_recognition_hints("Iron Man", "movie")
+                    self.assertTrue(first.errors)
+                    clock.return_value = 110.0
+                    self.assertTrue(search_recognition_hints("Iron Man", "movie").cached)
+                    self.assertEqual(service.search.call_count, 1)
+                    clock.return_value = 131.0
+                    second = search_recognition_hints("Iron Man", "movie")
+                    self.assertFalse(second.errors)
+                    self.assertFalse(second.cached)
+                    self.assertEqual(second.items, (card,))
+                    clock.return_value = 500.0
+                    self.assertTrue(search_recognition_hints("Iron Man", "movie").cached)
+                    self.assertEqual(service.search.call_count, 2)
+
     def test_scraper_accepts_only_strict_tmdb_revalidated_hint(self):
         from app.modules.scraper import RecognitionContext, RecognitionResult, TMDBScraper
 
