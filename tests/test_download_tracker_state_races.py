@@ -11,6 +11,7 @@ from app import database as db
 from app.clients.guangya import GuangYaClient
 from app.modules import download_dispatcher
 from app.modules.download_tracker import DownloadTracker
+from app.modules.telegram_download_lifecycle import build_download_lifecycle_event
 from app.repositories.download_requests import apply_download_tracker_update
 from tests.support import isolated_test_database
 
@@ -109,8 +110,74 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         db.bind_media_download_admission_request(admission_id, request_id)
         return subscription_id
 
+    def test_official_cloud_states_override_progress_and_directory_creation(self) -> None:
+        # 官方云添加：0 排队 / 1 进行中 / 2 完成 / 3 失败 / 4 取消 / 5 部分完成。
+        for state, expected in ((0, "downloading"), (1, "downloading"), (2, "completed"),
+                                (3, "failed"), (4, "failed"), (5, "manual_review"),
+                                (99, "downloading")):
+            for progress in (0, 1, 100):
+                with self.subTest(state=state, progress=progress):
+                    task = GuangYaClient._to_offline_task({
+                        "taskId": "gy-1", "status": state, "progress": progress,
+                        "fileId": "already-created-empty-directory", "isDir": True,
+                        "totalSize": 4096,
+                    })
+                    self.assertEqual(self.tracker._gy_task_state(task), expected)
+                    if expected != "completed":
+                        self.assertNotEqual(task["status_kind"], "done")
+                        self.assertEqual(task["downloaded"], 0)
+
+    def test_long_running_cloud_download_waits_until_provider_finishes(self) -> None:
+        for task_ids in ('[]', '["gy-1"]'):
+            with self.subTest(task_ids=task_ids), isolated_test_database():
+                self.organize.reset_mock()
+                self.staging.reset_mock()
+                request_id = self._request(
+                    targets="guangya", qb_status="", gy_task_ids=task_ids,
+                    created_at="2000-01-01 00:00:00", gy_isolated=1,
+                )
+                subscription_id = self._bind_admission(request_id)
+                for state in (0, 1, 1):
+                    task = GuangYaClient._to_offline_task({
+                        "taskId": "gy-1", "status": state, "fileId": "empty-dir", "isDir": True,
+                    })
+                    self.tracker._update_request(
+                        db.get_download_request(request_id), [], [task], qb_available=False,
+                    )
+                    row = db.get_download_request(request_id)
+                    self.assertEqual((row["status"], row["gy_status"]), ("downloading", "downloading"))
+                    self.assertIsNone(row["completed_at"])
+                    self.assertEqual(row["notification_event_status"], "")
+                    event = build_download_lifecycle_event(row, probe_progress={})
+                    self.assertEqual(event.state, "processing")
+                    self.assertNotIn("下载完成", event.title)
+                    self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
+                self.organize.assert_not_called()
+                self.staging.assert_not_called()
+                self.tracker._update_request(
+                    row, [], self._gy_batch(2), qb_available=False,
+                )
+                self.assertEqual(db.get_download_request(request_id)["gy_status"], "completed")
+                self.staging.assert_called_once()
+                self.organize.assert_called_once()
+
+    def test_partial_cloud_result_retains_admission_and_never_organizes(self) -> None:
+        for task_ids in ('[]', '["gy-1"]'):
+            with self.subTest(task_ids=task_ids), isolated_test_database():
+                request_id = self._request(targets="guangya", qb_status="", gy_task_ids=task_ids)
+                subscription_id = self._bind_admission(request_id)
+                self.tracker._update_request(
+                    db.get_download_request(request_id), [], self._gy_batch(5), qb_available=False,
+                )
+                row = db.get_download_request(request_id)
+                self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
+                self.assertTrue(row["error"])
+                self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
+                self.organize.assert_not_called()
+                self.staging.assert_not_called()
+
     def test_guangya_failure_codes_use_same_classification_end_to_end(self) -> None:
-        for state in (4, "4", -1, "-1", "failed", "error", "cancelled", "invalid"):
+        for state in (3, "3", 4, "4", -1, "-1", "failed", "error", "cancelled", "invalid"):
             with self.subTest(state=state):
                 task = GuangYaClient._to_offline_task(
                     {"taskId": "gy-1", "status": state, "progress": 20}
@@ -119,7 +186,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                 self.assertEqual(self.tracker._gy_task_state(task), "failed")
 
     def test_guangya_explicit_failure_wins_over_full_progress(self) -> None:
-        for state in (4, "4", -1, "-1", "failed", "error"):
+        for state in (3, "3", 4, "4", -1, "-1", "failed", "error"):
             with self.subTest(state=state):
                 task = GuangYaClient._to_offline_task(
                     {"taskId": "gy-1", "status": state, "progress": 100}
@@ -197,9 +264,12 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
             ((4, "unknown"), "", 2, "downloading"),
             ((4, None), "", 2, "submitted"),
             ((4, None), "2000-01-01 00:00:00", 2, "manual_review"),
-            ((4, 1), "", 2, "manual_review"),
+            ((4, 2), "", 2, "manual_review"),
             ((1, 0), "", 2, "downloading"),
-            ((1, 1), "", 2, "completed"),
+            ((2, 2), "", 2, "completed"),
+            ((1, 1), "", 2, "downloading"),
+            ((5, 2), "", 2, "manual_review"),
+            ((5, 1), "", 2, "downloading"),
             ((4, 0), "", 3, "manual_review"),
         )
         for states, missing_since, batch_count, expected in cases:
@@ -233,7 +303,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         )
         subscription_id = self._bind_admission(request_id)
         self.tracker._update_request(
-            db.get_download_request(request_id), [], self._gy_batch(4, 1), qb_available=False,
+            db.get_download_request(request_id), [], self._gy_batch(4, 2), qb_available=False,
         )
         row = db.get_download_request(request_id)
         self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
@@ -242,7 +312,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         self.organize.assert_not_called()
 
     def test_guangya_batch_without_id_list_cannot_collapse_to_one_terminal_task(self) -> None:
-        for state in (4, 1):
+        for state in (4, 2):
             with self.subTest(state=state), isolated_test_database():
                 request_id = self._request(
                     targets="guangya", qb_status="", gy_task_ids="[]", gy_batch_count=2, gy_isolated=1,
@@ -362,7 +432,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
             request_id, status="cancelled", qb_status="cancelled", gy_status="cancelled"
         )
         cancelled_snapshot = db.get_download_request(request_id)
-        done = GuangYaClient._to_offline_task({"taskId": "gy-1", "status": 1})
+        done = GuangYaClient._to_offline_task({"taskId": "gy-1", "status": 2})
         with patch.object(self.tracker, "_update_backend_log") as backend_log:
             for snapshot in (old_snapshot, cancelled_snapshot):
                 self.tracker._update_request(snapshot, [self._qb_task()], [done])
@@ -392,14 +462,14 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         )
         self.assertEqual(handed_off["notification_event_status"], "completed")
 
-    def test_success_and_progress_fallback_remain_consistent(self) -> None:
+    def test_provider_status_is_authoritative_without_progress_fallback(self) -> None:
         for state, progress, expected in (
-            (1, 0, "completed"),
+            (1, 0, "downloading"),
             ("2", 0, "completed"),
-            (3, 0, "completed"),
+            (3, 0, "failed"),
             ("done", 0, "completed"),
             (0, 20, "downloading"),
-            ("unknown", 100, "completed"),
+            ("unknown", 100, "downloading"),
             ("unknown", "invalid", "downloading"),
         ):
             with self.subTest(state=state, progress=progress):
@@ -409,7 +479,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                 self.assertEqual(self.tracker._gy_task_state(task), expected)
                 self.assertEqual(
                     task["status_kind"],
-                    "done" if expected == "completed" else "running",
+                    "done" if expected == "completed" else "failed" if expected == "failed" else "running",
                 )
 
     def test_same_second_backend_identity_change_rejects_observation(self) -> None:
@@ -449,7 +519,7 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
             self.tracker._update_request(
                 snapshot,
                 [self._qb_task()],
-                [GuangYaClient._to_offline_task({"taskId": "gy-1", "status": 1})],
+                [GuangYaClient._to_offline_task({"taskId": "gy-1", "status": 2})],
             )
         self.assertEqual(db.get_download_request(request_id)["status"], "cancelled")
         with db.get_conn() as conn:

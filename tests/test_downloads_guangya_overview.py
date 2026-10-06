@@ -48,7 +48,7 @@ class GuangYaDownloadOverviewTests(InitializedWebTestCase):
         task = GuangYaClient._to_offline_task({
             "taskId": "task-1",
             "fileName": "Demo.Show.S01",
-            "status": 1,
+            "status": 2,
             "totalSize": 4096,
         })
 
@@ -56,6 +56,12 @@ class GuangYaDownloadOverviewTests(InitializedWebTestCase):
         self.assertEqual(task["downloaded"], 4096)
         self.assertEqual(task["status_label"], "已完成")
         self.assertEqual(task["status_kind"], "done")
+
+    def test_small_percent_is_not_full_progress(self):
+        task = GuangYaClient._to_offline_task({"status": 1, "percent": 1, "totalSize": 4096})
+        self.assertEqual(task["progress"], 0.01)
+        self.assertEqual(task["downloaded"], 0)
+        self.assertEqual(task["status_kind"], "running")
 
     def test_status_two_is_reported_as_completed(self):
         task = GuangYaClient._to_offline_task({
@@ -90,7 +96,7 @@ class GuangYaDownloadOverviewTests(InitializedWebTestCase):
         self.assertEqual(raw.cloud_task_list.call_count, 2)
         self.assertEqual(
             raw.cloud_task_list.call_args_list[0].kwargs,
-            {"page": 0, "page_size": 50, "status": [0, 1, 2, 3, 4]},
+            {"page": 0, "page_size": 50, "status": [0, 1, 2, 3, 4, 5]},
         )
         self.assertEqual(raw.cloud_task_list.call_args_list[1].kwargs["page"], 1)
 

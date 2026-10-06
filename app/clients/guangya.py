@@ -46,20 +46,20 @@ class IncompleteOfflineTaskListError(RuntimeError):
     """离线任务分页不完整，禁止调用方据此判断任务已消失。"""
 
 
-def guangya_offline_task_state(status: object, progress: object = 0) -> str:
-    """客户端展示与下载跟踪共用的离线任务分类；明确失败优先于进度。"""
+def guangya_offline_task_state(status: object) -> str:
+    """云添加状态是完成依据；进度、目录创建均不能代替服务端终态。
+
+    官方状态：0 排队、1 进行中、2 完成、3 失败、4 取消、5 部分完成。
+    部分完成须人工核验，不自动重投或入库；未知状态继续跟踪。
+    """
     normalized = str(status).strip().lower()
-    if normalized in {"4", "-1", "failed", "error", "cancelled", "canceled", "invalid"}:
+    if normalized in {"3", "4", "-1", "failed", "error", "cancelled", "canceled", "invalid"}:
         return "failed"
-    if normalized in {
-        "1", "2", "3", "completed", "complete", "success", "succeeded", "finished", "done",
-    }:
+    if normalized in {"5", "partial", "partially_completed"}:
+        return "manual_review"
+    if normalized in {"2", "completed", "complete", "success", "succeeded", "finished", "done"}:
         return "completed"
-    try:
-        completed = float(progress or 0) >= 1
-    except (TypeError, ValueError):
-        completed = False
-    return "completed" if completed else "downloading"
+    return "downloading"
 
 
 def verify_guangya_write(
@@ -2858,11 +2858,11 @@ class GuangYaClient:
         """完整读取并归一化光鸭离线任务。
 
         光鸭 SDK 的默认状态集合不含 ``2``，且默认只返回第一页；MediaFlux
-        显式读取 0-4 全状态并分页去重，避免已离线完成任务长期显示“下载中”。
+        显式读取 0-5 全状态并分页去重，避免已离线完成任务长期显示“下载中”。
         """
         page_size = 50
         max_pages = 200
-        status_filter = [0, 1, 2, 3, 4]
+        status_filter = [0, 1, 2, 3, 4, 5]
         tasks: list[dict] = []
         seen_ids: set[str] = set()
         seen_pages: set[tuple[str, ...]] = set()
@@ -2925,18 +2925,18 @@ class GuangYaClient:
                 or raw.get("title") or raw.get("url") or "未命名任务")
         status = raw.get("status") if raw.get("status") is not None else raw.get("state")
         normalized_status = str(status).strip().lower()
+        percent_only = raw.get("progress") is None and raw.get("process") is None
         progress = raw.get("progress")
         if progress is None:
             progress = raw.get("process") if raw.get("process") is not None else raw.get("percent", 0)
         try:
             progress = float(progress or 0)
-            if progress > 1:
+            if percent_only or progress > 1:
                 progress /= 100
         except (TypeError, ValueError):
             progress = 0.0
-        task_state = guangya_offline_task_state(status, progress)
+        task_state = guangya_offline_task_state(status)
         completed = task_state == "completed"
-        failed = task_state == "failed"
         size = raw.get("size") or raw.get("totalSize") or raw.get("fileSize") or 0
         downloaded = raw.get("downloaded") or raw.get("completedSize") or raw.get("doneSize") or 0
         speed = raw.get("speed") or raw.get("downloadSpeed") or raw.get("dlspeed") or 0
@@ -2950,8 +2950,11 @@ class GuangYaClient:
             "id": str(task_id),
             "name": str(name),
             "status": status if status is not None else "unknown",
-            "status_label": "已完成" if completed else "失败" if failed else "等待中" if normalized_status == "0" else "下载中",
-            "status_kind": "done" if completed else "failed" if failed else "running",
+            "status_label": ("等待中" if normalized_status == "0" else {
+                "completed": "已完成", "failed": "失败",
+                "manual_review": "部分完成，需核验", "downloading": "下载中",
+            }[task_state]),
+            "status_kind": "done" if completed else "failed" if task_state in {"failed", "manual_review"} else "running",
             "progress": max(0.0, min(progress, 1.0)),
             "size": size,
             "downloaded": downloaded,

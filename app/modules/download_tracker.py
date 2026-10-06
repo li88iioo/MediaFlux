@@ -381,7 +381,7 @@ class DownloadTracker:
                         updates["gy_status"] = "completed"
                     else:
                         updates["gy_status"] = "failed" if states == {"failed"} else "manual_review"
-                        updates["error"] = "光鸭分批下载存在失败任务，已停止自动整理，请人工核验"
+                        updates["error"] = "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
                 backend_logs.append((
                     "guangya", updates.get("gy_status", gy_status), progress,
                     task_ids[0] if task_ids else str(self._row_value(row, "gy_task_id", "") or ""),
@@ -392,6 +392,8 @@ class DownloadTracker:
                     matched_gy_tasks = [task]
                     progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
                     updates["gy_status"] = self._gy_task_state(task)
+                    if updates["gy_status"] == "manual_review":
+                        updates["error"] = "光鸭下载仅部分完成，已停止自动整理，请人工核验"
                     updates["gy_task_missing_since"] = None
                     if task.get("id"):
                         matched_task_id = str(task["id"])
@@ -1235,7 +1237,7 @@ class DownloadTracker:
 
     @staticmethod
     def _gy_task_state(task: dict) -> str:
-        return guangya_offline_task_state(task.get("status"), task.get("progress"))
+        return guangya_offline_task_state(task.get("status"))
 
     @classmethod
     def _match_qb(cls, row, tasks: list | _QBTaskIndex):

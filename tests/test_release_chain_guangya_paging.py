@@ -37,7 +37,7 @@ class GuangYaPagingCompletenessTests(unittest.TestCase):
                 self.assertEqual(len(tasks), count)
                 self.assertEqual(raw.cloud_task_list.call_count, calls)
                 for index, call in enumerate(raw.cloud_task_list.call_args_list):
-                    self.assertEqual(call.kwargs, {"page": index, "page_size": 50, "status": [0, 1, 2, 3, 4]})
+                    self.assertEqual(call.kwargs, {"page": index, "page_size": 50, "status": [0, 1, 2, 3, 4, 5]})
 
     def test_repeated_full_page_and_no_new_ids_are_explicitly_incomplete(self):
         first = page()
