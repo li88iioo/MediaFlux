@@ -374,6 +374,25 @@ class DoubanPublicClientTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             page.items += ({},)
 
+    def test_public_list_shape_without_year_or_date_keeps_year_unknown(self):
+        client, session = self.make_client(FakeResponse({
+            "subjects": [{
+                "id": "42",
+                "title": "缺少年份的公共列表条目",
+                "url": "https://movie.douban.com/subject/42/",
+                "cover": "https://img2.doubanio.com/view/photo/l/public/p42.webp",
+                "rate": "8.5",
+                "episodes_info": "",
+                "is_new": False,
+            }],
+        }))
+
+        page = client.list_items("movie_hot", "movie", 1, {})
+
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(page.items[0]["year"], "")
+        self.assertEqual(page.items[0]["release_date"], "")
+
     def test_full_json_page_reports_has_more(self):
         client, _ = self.make_client(self.json_response([
             {"id": str(i), "title": f"Item {i}"} for i in range(20)

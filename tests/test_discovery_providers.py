@@ -141,6 +141,14 @@ def bangumi_subject(subject_id=1, **overrides):
     return values
 
 
+def bangumi_calendar_item(subject_id=1, **overrides):
+    air_date = overrides.pop("air_date", None)
+    values = bangumi_subject(subject_id, **overrides)
+    date = values.pop("date")
+    values["air_date"] = date if air_date is None else air_date
+    return values
+
+
 class TMDBProviderTests(unittest.TestCase):
     def make_provider(self, payload):
         session = FakeSession(FakeResponse(payload))
@@ -490,6 +498,25 @@ class DoubanProviderTests(unittest.TestCase):
 
         self.assertEqual(page.provider.message, "public")
         public.list_items.assert_called_once_with("movie_hot", "movie", 1, {})
+
+    def test_public_list_without_year_fields_stays_blank_without_detail_requests(self):
+        public = Mock()
+        public.list_items.return_value = DoubanPublicPage(
+            items=tuple(
+                self.normalized_item(str(index), year="", release_date="")
+                for index in range(1, 4)
+            ),
+            source="public-json",
+        )
+        frodo_factory = Mock(side_effect=AssertionError("metadata absence is not a list failure"))
+        provider = self.make_provider(public, frodo_factory=frodo_factory)
+
+        page = provider.list_items("movie_hot", "movie", 1, {})
+
+        self.assertEqual([item.year for item in page.items], ["", "", ""])
+        self.assertTrue(all(item.release_date == "" for item in page.items))
+        public.get_detail.assert_not_called()
+        frodo_factory.assert_not_called()
 
     def test_public_detail_success_never_accesses_configured_frodo_keys(self):
         public = Mock()
@@ -1035,7 +1062,7 @@ class BangumiProviderTests(unittest.TestCase):
         return [
             {
                 "weekday": {"id": weekday if weekday < 7 else 0, "en": "Day", "cn": f"星期{weekday}", "ja": ""},
-                "items": [bangumi_subject(weekday * 10 + offset) for offset in range(1, 4)],
+                "items": [bangumi_calendar_item(weekday * 10 + offset) for offset in range(1, 4)],
             }
             for weekday in range(1, 8)
         ]
@@ -1075,6 +1102,8 @@ class BangumiProviderTests(unittest.TestCase):
         self.assertEqual([item.external_id for item in page.items], ["23", "31", "32", "33", "41"])
         self.assertTrue(page.has_more)
         self.assertTrue(all(item.poster_key.startswith("lain.bgm.tv/") for item in page.items))
+        self.assertEqual(page.items[0].release_date, "2026-07-01")
+        self.assertEqual(page.items[0].year, "2026")
 
     def test_weekday_filter_happens_before_exact_pagination(self):
         provider, _ = self.make_provider(FakeResponse(self.calendar()), page_size=2)
@@ -1143,7 +1172,7 @@ class BangumiProviderTests(unittest.TestCase):
 
     def test_title_fallback_empty_images_and_today_filter(self):
         calendar = self.calendar()
-        calendar[5]["items"] = [bangumi_subject(61, name_cn="", name="Fallback", images=None)]
+        calendar[5]["items"] = [bangumi_calendar_item(61, name_cn="", name="Fallback", images=None)]
         provider, _ = self.make_provider(FakeResponse(calendar), page_size=20)
 
         page = provider.list_items("today", "tv", 1, {})
@@ -1161,7 +1190,17 @@ class BangumiProviderTests(unittest.TestCase):
         self.assertTrue(session.calls[0][0].endswith("/v0/subjects/42"))
         self.assertEqual(card.title, "Subject 42")
         self.assertEqual(card.bangumi_id, "42")
+        self.assertEqual(card.release_date, "2026-07-01")
+        self.assertEqual(card.year, "2026")
         self.assertNotIn("http", card.poster_key)
+
+    def test_calendar_missing_air_date_keeps_year_unknown(self):
+        raw = bangumi_calendar_item(43, air_date="")
+
+        card = BangumiProvider._card(raw, 1)
+
+        self.assertEqual(card.release_date, "")
+        self.assertEqual(card.year, "")
 
     def test_invalid_calendar_shape_is_structured(self):
         provider, _ = self.make_provider(FakeResponse({"items": []}))

@@ -258,14 +258,16 @@ class BangumiProvider(DiscoveryProvider):
         external_id = str(raw.get("id") or "").strip()
         if not external_id:
             return None
-        release_date = str(raw.get("date") or "").strip()
+        # 周历使用 air_date，v0 详情使用 date；两者统一成卡片日期。
+        release_date = str(raw.get("date") or raw.get("air_date") or "").strip()
+        year = release_date[:4] if len(release_date) >= 4 and release_date[:4].isdigit() else ""
         return MediaCard(
             provider="bangumi",
             external_id=external_id,
             media_type="tv",
             title=str(raw.get("name_cn") or raw.get("name") or "").strip(),
             original_title=str(raw.get("name") or "").strip(),
-            year=release_date[:4] if release_date else "",
+            year=year,
             overview=str(raw.get("summary") or "").strip(),
             poster_key=_image_key(raw.get("images")),
             rating=_score(raw.get("rating")),
