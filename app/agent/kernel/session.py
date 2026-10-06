@@ -15,6 +15,7 @@ from app.agent.model_context_budget import bounded_model_messages
 from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.agent.public_view import (
     format_public_result,
+    format_partial_progress,
     public_result_state,
     sanitize_confirmed_answer,
 )
@@ -116,6 +117,8 @@ DEFAULT_SYSTEM_PROMPT = """你是 MediaFlux Media Agent，一名可操作当前 
 - 若确实缺少必要对象，说明已检查什么以及只缺哪一个信息。
 - 搜索摘要不等于完整详情。未查询、字段未返回、确实返回空表、请求失败是不同情况；没有演职员字段不能说官方未公布/TMDB未录入。先读取相应详情，仍不足时用已接入的web.search/web.read核实。配置关闭/缺Key/超时应按工具真实错误说明，不能统称无能力。
 - 队列计数是瞬时快照；running=0不代表消费者未运行或不会自动执行。只有运行状态明确暂停/关闭时才能如此说明，未读取的状态明确未知。
+- 用户指定“电视剧/动漫等媒体库”时，必须按服务器真实库名称或库引用限定查询；Series/tv类型及Genres不等于媒体库归属。最近入库可传library_name精确解析；同名多库或不存在时先列库让用户选择，不能回退全库后声称已按库过滤。未指定库的结果要明确是全库；“电视剧不含动漫”优先核对真实库划分，不能仅凭标题或缺少Animation标签断言真人剧。
+- “剧集呢”等短追问必须延续前文推荐/搜索范围，仅切换所问类型；已取得推荐后不要为了润色逐个跨站搜索，只有用户要求详情核验时才补查。只读结果受限也要先给已有可用内容，再说明缺失范围；不要用工具调用次数或无关写操作警告替代结果。
 - 媒体条目含 `open_url` 时使用 `[打开媒体库](原样 open_url)`；没有该字段时不要猜测链接。
 - 追漫日历返回精确固定 `calendar_url` 时，Web 可显示 `[打开追漫日历](/discovery/calendar)`；Telegram 提示从 MediaFlux 网页端打开追漫日历，不猜站点地址。没有该安全字段时只用文字引导。"""
 
@@ -337,6 +340,7 @@ class AgentSession:
         context_revision = 0
         last_tool_error: ToolPipelineError | None = None
         has_tool_result = False
+        attempted_write = confirming
 
         def record_result(
             name: str, arguments: Mapping[str, Any], result: Mapping[str, Any],
@@ -352,32 +356,11 @@ class AgentSession:
             attempt = (name, context_revision, json.dumps(dict(arguments), ensure_ascii=False, sort_keys=True, default=str))
             progress_results.append((public_tool_label(name), dict(result)))
             last_tool_error = error
-            has_tool_result = has_tool_result or error is None
+            has_tool_result = has_tool_result or (error is None and result.get("ok") is not False)
             if result.get("status") == "rate_limited":
                 limited_tools.add(attempt)
             elif error is None:
                 limited_tools.discard(attempt)
-
-        def progress_answer(reason: str) -> str:
-            lines = ["部分完成：" + reason]
-            if confirmed_result is not None:
-                lines.extend(("", format_public_result(confirmed_result)))
-            if progress_results:
-                lines.append("\n本轮工具核对结果（不代表后续操作已完成）：")
-                for label, result in progress_results[-8:]:
-                    summary = sanitize_public_text(
-                        result.get("summary") or result.get("error") or result.get("status"),
-                        limit=300,
-                    )
-                    lines.append(f"• {label}：{summary}")
-                if len(progress_results) > 8:
-                    lines.append(f"以上为最近 8 项；本轮共记录 {len(progress_results)} 项工具结果。")
-            lines.append(
-                "\n后续写操作尚未执行；已确认操作以以上回执为准。"
-                if confirmed_result is not None else "\n本轮未执行新的写操作；检查或搜索成功不等于变更已提交。"
-            )
-            lines.append("可稍后继续处理未完成部分；新的写操作仍需确认，不会自动重放。")
-            return "\n".join(lines)
 
         async def persist_conversation(*, close_pending: bool = False) -> None:
             checkpoint_messages = list(messages)
@@ -478,7 +461,9 @@ class AgentSession:
                 request_id=agent_input.request_id,
             )
             if confirmed_result is not None or has_tool_result:
-                answer = progress_answer(message)
+                answer = format_partial_progress(
+                    message, progress_results, confirmed_result=confirmed_result, write_attempted=attempted_write,
+                )
                 messages.append(ModelMessage(role="assistant", content=answer, effect_plan_id=plan_id or ""))
                 await preserve_checkpoint()
                 event = failure_factory.create(AgentEventType.TURN_COMPLETED, {"status": "partial", "answer": answer, "finish_reason": code})
@@ -822,6 +807,12 @@ class AgentSession:
                     "若还有已获准的只读检查未完成，应继续处理，不能把已检查的部分条目当成全部任务结束；"
                     "需要写入授权、真实故障或用户补充信息时才说明阻塞并停下。"
                 )
+                if limited_tools:
+                    request_system_prompt += (
+                        "\n已有工具返回真实频率限制：" + "、".join(sorted({name for name, _, _ in limited_tools}))
+                        + "。不要对受限能力换关键词反复重试；优先基于已有结果回答用户的问题，"
+                        "清楚说明哪些补充查询未完成。只读问答不要输出确认卡/写操作/重放提示。"
+                    )
                 if confirmed_result is not None:
                     request_system_prompt += (
                         "\n当前回合是用户点击确认后的续行，不是原预览请求的重放。"
@@ -835,8 +826,9 @@ class AgentSession:
                 if final_synthesis_round:
                     request_system_prompt += (
                         "\n\n本次是最终汇总轮次：不得调用任何工具。请只基于已经取得的工具事实"
-                        "给出简洁结论；若任务尚未完整完成，明确写‘部分完成’，说明未执行的"
-                        "写操作，并提示用户可继续，不得声称已生成不存在的确认计划。"
+                        "给出简洁结论；若任务尚未完整完成，明确写‘部分完成’并交付已有内容。"
+                        "只有涉及写入任务时才说明未执行的写操作；纯查询不要添加确认/重放提示。"
+                        "不得声称已生成不存在的确认计划。"
                     )
                 if answer_recovery:
                     request_system_prompt += (
@@ -989,6 +981,7 @@ class AgentSession:
                             arguments=call.arguments,
                         )
                         if tool.effect is not ToolEffect.READ:
+                            attempted_write = True
                             await publish(
                                 AgentEventType.EFFECT_PREVIEW_STARTED,
                                 {

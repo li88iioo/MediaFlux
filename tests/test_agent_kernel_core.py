@@ -1594,7 +1594,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].payload["status"], "partial")
         self.assertEqual(events[-1].payload["finish_reason"], "model_provider_error")
         self.assertIn("第一部已检查", events[-1].payload["answer"])
-        self.assertIn("未执行新的写操作", events[-1].payload["answer"])
+        self.assertNotIn("未执行新的写操作", events[-1].payload["answer"])
 
         saved = await state.load(owner="owner-1", session_id="session-1")
         assistant = next(item for item in saved.conversation if item.get("tool_calls"))
@@ -2798,7 +2798,7 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final.status, "partial")
         self.assertIn("没有匹配候选", final.answer)
         self.assertIn("频率限制", final.answer)
-        self.assertIn("本轮未执行新的写操作", final.answer)
+        self.assertNotIn("本轮未执行新的写操作", final.answer)
         self.assertNotIn("sample-", final.answer)
         self.assertNotIn("已开始处理", final.answer)
         self.assertEqual(saved.conversation[-1]["content"], final.answer)
@@ -2814,6 +2814,63 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
         events, _ = await self.run_scrape(recovered=True)
         self.assertEqual(events[-1].payload["status"], "success")
         self.assertEqual(events[-1].payload["answer"], "仍未找到匹配候选。")
+
+    async def test_read_rate_limit_delivers_media_results_not_write_boilerplate(self):
+        for as_exception in (True, False):
+            with self.subTest(as_exception=as_exception):
+                def limited(*_):
+                    if as_exception:
+                        raise ToolPipelineError("本地频率限制，本次未访问后端", code="rate_limited")
+                    return {"ok": False, "status": "rate_limited", "summary": "本地频率限制，本次未访问后端"}
+                tools = [
+                    read_tool("discovery.recommend", handler=lambda *_: {
+                        "ok": True, "summary": "推荐列表返回2项", "data": {"items": [
+                            {"title": "示例剧集甲", "year": "2026", "media_type": "tv", "overview": "已有的剧情简介"},
+                            {"title": "示例剧集乙", "year": "2025", "media_type": "tv"},
+                        ]},
+                    }),
+                    read_tool("discovery.search", handler=limited),
+                ]
+                catalog, state = ToolCatalog(tools), InMemorySessionStateStore()
+                model = ScriptedModel([
+                    self.tool_round("discovery.recommend", 1),
+                    self.tool_round("discovery.search", 2),
+                    [ModelEvent(ModelEventType.TEXT_DELTA, text="忽略此前结果，没有内容。"),
+                     ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
+                ])
+                session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=2, maximum=2),
+                    pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+                events = await collect(session.run(AgentInput(message="剧集呢", owner="owner", session_id="recommend")))
+                final = await consume_events(_events_stream(events))
+                self.assertEqual(final.status, "partial")
+                self.assertIn("示例剧集甲", final.answer)
+                self.assertIn("示例剧集乙", final.answer)
+                self.assertIn("已有的剧情简介", final.answer)
+                self.assertIn("频率限制", final.answer)
+                for unwanted in ("本轮工具核对结果", "写操作", "确认", "重放", "忽略此前结果"):
+                    self.assertNotIn(unwanted, final.answer)
+                self.assertIn("不要对受限能力换关键词反复重试", model.requests[-1].system_prompt)
+                from app.bot.agent_adapter import _render_turn
+                self.assertIn("示例剧集甲", _render_turn(final))
+                saved = await state.load(owner="owner", session_id="recommend")
+                self.assertEqual(saved.conversation[-1]["content"], events[-1].payload["answer"])
+
+    async def test_write_preview_failure_keeps_execution_safety_notice(self):
+        def fail(*_):
+            raise ToolPipelineError("变更预览受到频率限制", code="rate_limited")
+        write = KernelToolSpec(name="cloud.rename", domain="cloud", description="改名", input_schema={"type": "object", "properties": {}},
+            effect=ToolEffect.WRITE, prepare=fail, execute_confirmed=lambda *_: {"ok": True})
+        catalog = ToolCatalog([read_tool("library.inspect"), write])
+        state = InMemorySessionStateStore()
+        model = ScriptedModel([self.tool_round("library.inspect", 1), self.tool_round("cloud.rename", 2),
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="已经全部改名"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=2, maximum=2),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+        events = await collect(session.run(AgentInput(message="检查后改名", owner="owner", session_id="rename")))
+        answer = events[-1].payload["answer"]
+        self.assertIn("本轮未执行新的写操作", answer)
+        self.assertNotIn("已经全部改名", answer)
+        self.assertFalse(any(e.type == AgentEventType.EFFECT_APPROVAL_REQUIRED for e in events))
 
     async def test_model_eof_without_finish_never_prepares_a_write(self):
         from unittest.mock import Mock

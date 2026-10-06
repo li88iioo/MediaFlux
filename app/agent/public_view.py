@@ -191,6 +191,68 @@ def format_public_result(
     return "\n".join(lines)
 
 
+def format_partial_progress(
+    reason: str, results: Sequence[tuple[str, Mapping[str, Any]]], *,
+    confirmed_result: Mapping[str, Any] | None = None, write_attempted: bool = False,
+) -> str:
+    """统一降级投影：查询交付已有内容，实际涉及写入才显示执行警示。"""
+    lines = ["部分完成：" + _safe(reason, limit=300)]
+    if write_attempted or confirmed_result is not None:
+        if confirmed_result is not None:
+            lines.extend(("", format_public_result(confirmed_result)))
+        if results:
+            lines.append("\n本轮工具核对结果（不代表后续操作已完成）：")
+            for label, result in results[-8:]:
+                summary = _safe(result.get("summary") or result.get("error") or result.get("status"), limit=300)
+                lines.append(f"• {label}：{summary}")
+            if len(results) > 8:
+                lines.append(f"以上为最近 8 项；本轮共记录 {len(results)} 项工具结果。")
+        lines.append("\n后续写操作尚未执行；已确认操作以以上回执为准。" if confirmed_result is not None
+                     else "\n本轮未执行新的写操作；检查或搜索成功不等于变更已提交。")
+        lines.append("可稍后继续处理未完成部分；新的写操作仍需确认，不会自动重放。")
+        return "\n".join(lines)
+    items: dict[tuple[str, str, str], str] = {}
+    summaries = []
+    errors = []
+    for _label, result in results:
+        if result.get("ok") is False or result.get("status") in {"rate_limited", "failed", "error"}:
+            error = _safe(result.get("error") or result.get("summary"), limit=200)
+            if error and error not in errors:
+                errors.append(error)
+            continue
+        data = result.get("data")
+        rows = data.get("items", []) if isinstance(data, Mapping) else []
+        for item in rows if isinstance(rows, (list, tuple)) else ():
+            if not isinstance(item, Mapping):
+                continue
+            title = _safe(item.get("title") or item.get("series_name") or item.get("name"), limit=160)
+            if not title:
+                continue
+            year = _safe(item.get("year"), limit=8)
+            media_type = {"movie": "电影", "Movie": "电影", "tv": "剧集", "Series": "剧集", "Episode": "单集"}.get(item.get("media_type") or item.get("type"), "")
+            key = (title, year, media_type)
+            if key in items:
+                continue
+            overview = _safe(item.get("overview"), limit=180)
+            suffix = " · ".join(value for value in (year, media_type) if value)
+            items[key] = title + (f"（{suffix}）" if suffix else "") + (f"：{overview}" if overview else "")
+        summary = _safe(result.get("summary"), limit=300)
+        if summary and summary not in summaries:
+            summaries.append(summary)
+    if items:
+        lines.append("\n已取得的部分内容（尚未完成全部筛选/核对）：")
+        lines.extend(f"{index}. {text}" for index, text in enumerate(list(items.values())[:12], 1))
+        if len(items) > 12:
+            lines.append(f"本轮共取得 {len(items)} 项去重内容，此处展示前 12 项。")
+    else:
+        lines.append("\n已完成的查询：")
+        lines.extend(f"• {text}" for text in summaries[-8:])
+    if errors:
+        lines.append("\n未完成的查询：" + "；".join(errors[-3:]))
+    lines.append("\n以上仅代表已成功取得的结果；未完成的查询不能据此判断没有内容。")
+    return "\n".join(lines)
+
+
 def sanitize_confirmed_answer(content: object, result: Mapping[str, Any] | None = None) -> str:
     """未完成操作只呈现可信状态；完成后的新增说明保留，不重复拼接回执。"""
     text = str(content or "").replace("\x00", "").strip()
