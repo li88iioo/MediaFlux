@@ -15,7 +15,7 @@
     data-discovery-root
     data-resource-results-enabled="{{ 'true' if resource_results_enabled else 'false' }}"
 >
-    <h1 class="sr-only" id="discovery-heading">媒体探索</h1>
+    <h1 class="sr-only" id="discovery-heading" tabindex="-1">媒体探索</h1>
 
     <section class="discovery-control-deck" aria-label="探索控制台">
         <div class="discovery-source-tabs" id="discovery-source-tabs" role="tablist" aria-label="探索来源">
@@ -76,6 +76,11 @@
             </button>
         </div>
     </section>
+
+    <button class="icon-btn discovery-back-to-top" id="discovery-back-to-top" type="button"
+            aria-label="返回顶部" title="返回顶部" hidden>
+        <i data-lucide="arrow-up" aria-hidden="true"></i>
+    </button>
 
     {% include "_media_profile_dialog.html" %}
 </div>

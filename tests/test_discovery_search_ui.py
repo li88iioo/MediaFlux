@@ -1580,6 +1580,109 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(keyboard["rect"], initial["rect"])
 
 
+    def open_catalogue(self, *, width=1440, theme="light"):
+        from jinja2 import Environment, FileSystemLoader
+        templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
+        html = templates.get_template("discovery.html").render(
+            active="discovery", resource_results_enabled=True,
+            csrf_token=lambda: "test",
+            url_for=lambda name: "/" + name.split(".")[-1],
+            static_url=lambda path: "/static/" + path,
+        )
+        html = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", "", html)
+        context = self.browser.new_context(viewport={"width": width, "height": 850}, reduced_motion="reduce")
+        self.addCleanup(context.close)
+        page = context.new_page()
+        errors = []
+        page.on("pageerror", lambda error: errors.append(str(error)))
+        cards = [
+            {"provider": "douban", "media_type": "tv", "external_id": "1", "title": "豆瓣剧集", "year": "2024"},
+            {"provider": "bangumi", "media_type": "tv", "external_id": "2", "title": "番组周历", "year": "2025", "release_date": "2025-10-01", "weekday": 1},
+            {"provider": "tmdb", "media_type": "movie", "external_id": "3", "title": "TMDB电影", "year": "2023", "release_date": "2023-07-21"},
+        ]
+        def route_request(route):
+            path = route.request.url.split("mediaflux.test", 1)[-1]
+            if path.startswith("/api/"):
+                payload = {"sections": [{"key": f"s{index}", "title": f"栏目 {index}", "items": cards} for index in range(6)]}
+                route.fulfill(json=payload)
+            elif path == "/static/css/main.css":
+                route.fulfill(body=self.styles, content_type="text/css")
+            elif path.startswith("/static/"):
+                route.fulfill(status=204)
+            else:
+                route.fulfill(body=html, content_type="text/html")
+        context.route("**/*", route_request)
+        page.goto("http://mediaflux.test/discovery", wait_until="domcontentloaded")
+        page.evaluate("theme => document.documentElement.dataset.theme = theme", theme)
+        page.add_script_tag(path=str(ROOT / "app/static/js/lucide.min.js"))
+        page.evaluate("window.renderLucideIcons = () => lucide.createIcons()")
+        page.add_script_tag(content=self.script)
+        page.locator(".discovery-card").first.wait_for()
+        self.assertEqual(errors, [])
+        return page, errors
+
+    def test_catalogue_meta_formats_weekday_and_keeps_year(self):
+        page, errors = self.open_catalogue()
+        meta = page.locator(".discovery-shelf").first.locator(".discovery-card-source span:first-child").all_text_contents()
+        self.assertEqual(meta, ["2024", "周一 / 2025-10-01", "2023-07-21"])
+        self.assertEqual(errors, [])
+
+    def test_back_to_top_idle_focus_and_mobile_layout(self):
+        for width, theme in ((1440, "light"), (390, "light"), (390, "dark")):
+            with self.subTest(width=width, theme=theme):
+                page, errors = self.open_catalogue(width=width, theme=theme)
+                page.clock.install()
+                button = page.locator("#discovery-back-to-top")
+                self.assertTrue(button.is_hidden())
+                page.evaluate("window.scrollTo(0, 1000)")
+                button.wait_for(state="visible")
+                bounds = button.bounding_box()
+                self.assertGreaterEqual(bounds["width"], 44)
+                self.assertGreaterEqual(bounds["height"], 44)
+                self.assertLessEqual(bounds["x"] + bounds["width"], width)
+                self.assertLessEqual(bounds["y"] + bounds["height"], 850)
+                self.assertEqual(button.evaluate("element => getComputedStyle(element).position"), "fixed")
+                # 同一滚动位置比较显隐，避开栏目 content-visibility 的正常按需布局。
+                dimensions = button.evaluate("""element => {
+                    const shown = document.documentElement.scrollHeight;
+                    element.hidden = true;
+                    const hidden = document.documentElement.scrollHeight;
+                    element.hidden = false;
+                    return [shown, hidden];
+                }""")
+                self.assertEqual(*dimensions)
+                self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
+                page.clock.fast_forward(2100)
+                self.assertTrue(button.is_hidden())
+                page.evaluate("window.scrollBy(0, 100)")
+                button.wait_for(state="visible")
+                button.hover()
+                page.clock.fast_forward(2100)
+                self.assertTrue(button.is_visible(), "悬停准备点击时不得自动消失")
+                page.mouse.move(0, 0)
+                button.focus()
+                page.clock.fast_forward(2100)
+                self.assertTrue(button.is_visible(), "键盘聚焦时不得自动消失")
+                page.keyboard.press("Enter")
+                page.wait_for_function("window.scrollY === 0")
+                self.assertTrue(button.is_hidden())
+                self.assertEqual(page.evaluate("document.activeElement.id"), "discovery-heading")
+                self.assertEqual(errors, [])
+
+    def test_back_to_top_does_not_cover_detail_dialog_or_survive_pagehide(self):
+        page, errors = self.open_catalogue()
+        button = page.locator("#discovery-back-to-top")
+        page.evaluate("window.scrollTo(0, 1000)")
+        button.wait_for(state="visible")
+        page.evaluate("document.body.classList.add('discovery-modal-open')")
+        self.assertTrue(button.is_hidden())
+        page.evaluate("document.body.classList.remove('discovery-modal-open')")
+        page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+        self.assertTrue(button.is_hidden())
+        page.evaluate("window.dispatchEvent(new Event('pageshow')); window.scrollBy(0, 100)")
+        button.wait_for(state="visible")
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

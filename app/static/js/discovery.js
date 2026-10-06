@@ -658,7 +658,10 @@
         const releaseDate = String(item.release_date || '').trim();
         const releaseYear = releaseDate.match(/^(\d{4})(?:[-/.年]|$)/)?.[1] || '';
         if (year && year !== releaseYear) parts.push(year);
-        if (item.weekday) parts.push(String(item.weekday));
+        const weekday = Number(item.weekday);
+        if (Number.isInteger(weekday) && weekday >= 1 && weekday <= 7) {
+            parts.push(`周${'一二三四五六日'[weekday - 1]}`);
+        }
         if (releaseDate) parts.push(releaseDate);
         if (!parts.length) parts.push(mediaLabel(item.media_type));
         return parts.slice(0, 2).join(' / ');
@@ -3620,6 +3623,47 @@
         });
     }
 
+    function setupBackToTop() {
+        const button = root.querySelector('#discovery-back-to-top');
+        if (!button) return;
+        const heading = root.querySelector('#discovery-heading');
+        let idleTimer;
+        const hide = () => {
+            window.clearTimeout(idleTimer);
+            if (document.activeElement === button) heading?.focus({preventScroll: true});
+            button.hidden = true;
+        };
+        const scheduleHide = () => {
+            window.clearTimeout(idleTimer);
+            idleTimer = window.setTimeout(() => {
+                // 不在键盘聚焦或鼠标准备点击时移除操作目标。
+                if (document.activeElement !== button && !button.matches(':hover')) hide();
+            }, 2000);
+        };
+        window.addEventListener('scroll', () => {
+            if (window.scrollY < Math.max(400, window.innerHeight * 0.75) || dialogIsOpen()) {
+                hide();
+                return;
+            }
+            button.hidden = false;
+            scheduleHide();
+        }, {passive: true});
+        button.addEventListener('pointerleave', scheduleHide);
+        button.addEventListener('blur', scheduleHide);
+        button.addEventListener('click', () => {
+            hide();
+            window.scrollTo({
+                top: 0,
+                behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth',
+            });
+        });
+        window.addEventListener('pagehide', hide);
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden) hide();
+        });
+    }
+
+    setupBackToTop();
     const initialDetail = detailIdentityFromLocation();
     if (!profileOnly) loadActive();
     if (initialDetail) openDetail(initialDetail, null);

@@ -4845,6 +4845,26 @@ body:has(.discovery-dialog[open]) { overflow: hidden; }
 /* Discovery / 媒体探索 */
 .discovery-workspace-page::after { display: none; }
 .discovery-mobile-bar { display: none; }
+.discovery-back-to-top {
+    position: fixed;
+    right: max(20px, env(safe-area-inset-right, 0px));
+    bottom: max(20px, env(safe-area-inset-bottom, 0px));
+    z-index: 40;
+    width: 44px;
+    height: 44px;
+    border: 1px solid var(--accent-border);
+    border-radius: 50%;
+    color: var(--accent);
+    background: var(--bg-elevated);
+    box-shadow: var(--shadow-soft);
+}
+.discovery-back-to-top:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+}
+.discovery-back-to-top[hidden],
+.discovery-modal-open .discovery-back-to-top { display: none; }
+
 .discovery-page {
     --discovery-amber: #e8b44d;
     --discovery-amber-soft: rgba(232,180,77,.09);
