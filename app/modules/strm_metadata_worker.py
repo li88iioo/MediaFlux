@@ -99,6 +99,17 @@ class STRMMetadataWorker:
             }
 
     def _runtime_client(self) -> GuangYaClient:
+        # 保留连接复用，但不能跨凭据快照复用；其他模块刷新/重新登录后，
+        # 在新任务开始前释放旧连接，重新加载磁盘上的当前凭据。
+        if self._client is not None and not self._client.credentials_current:
+            if not close_guangya_client(self._client):
+                raise RuntimeError("光鸭旧连接尚未释放，元数据任务稍后重试")
+            self._client = None
+            with self._state_lock:
+                self._breaker_until = 0.0
+                self._consecutive_failures = 0
+                self._last_error_type = ""
+            logger.info("光鸭凭据已更新，元数据后台重新加载当前登录信息")
         if self._client is None:
             self._client = GuangYaClient()
         return self._client
@@ -156,6 +167,16 @@ class STRMMetadataWorker:
             return False
         root_text = get("STRM_ROOT", "").strip()
         if not root_text:
+            return False
+        # 登录不可用是整个消费者的条件，不是每个文件各自下载失败。
+        # 先检查再领租约；重新登录后，即使旧熔断尚未结束也可以自动恢复。
+        client = self._runtime_client()
+        if not client.logged_in:
+            with self._state_lock:
+                announce = self._last_error_type != "GuangYaLoginRequired"
+                self._last_error_type = "GuangYaLoginRequired"
+            if announce:
+                logger.warning("STRM 伴随元数据暂停等待光鸭登录；未领取任务，不消耗文件重试次数")
             return False
         now_mono = time.monotonic()
         with self._state_lock:
@@ -217,7 +238,7 @@ class STRMMetadataWorker:
                 )
                 return True
             prepared_job = prepare_strm_metadata_job(
-                job, root_text, client=self._runtime_client(),
+                job, root_text, client=client,
                 should_stop=self._stop_event.is_set,
             )
             # 下载阶段不持有 STRM 写锁；仅最终原子替换和索引提交需要串行。
@@ -266,15 +287,26 @@ class STRMMetadataWorker:
             db.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
             return False
         except Exception as exc:
-            error_type = type(exc).__name__
+            credentials_unavailable = False
+            if not metadata_committed:
+                try:
+                    credentials_unavailable = not client.credentials_current
+                except (OSError, RuntimeError):
+                    # 凭据文件暂不可读也不能导致租约悬空或扣掉文件重试次数。
+                    credentials_unavailable = True
+            error_type = "GuangYaCredentialsUnavailable" if credentials_unavailable else type(exc).__name__
+            error = "光鸭登录信息已变化或暂不可用，元数据任务等待恢复后重试" if credentials_unavailable else exc
             state = db.fail_or_retry_strm_metadata_job(
                 job_id,
                 expected_lease_generation=lease_generation,
                 expected_revision=revision,
                 expected_owner=self._owner,
                 error_type=error_type,
-                error=exc,
+                error=error,
                 handoff_only=metadata_committed,
+                consume_attempt=not credentials_unavailable,
+                base_backoff_seconds=1 if credentials_unavailable else 30,
+                max_backoff_seconds=1 if credentials_unavailable else 3600,
             )
             if state not in {"retry_wait", "failed"}:
                 # 准备下载时不持有 STRM 写锁，期间可能更新快照、取消来源或
@@ -285,6 +317,11 @@ class STRMMetadataWorker:
                     job_id, state,
                 )
                 return True
+            if credentials_unavailable:
+                # 不把全局凭据轮换记成文件损坏，也不触发下载熔断。
+                # 已领取的任务按原租约安全交回；下次轮询会重建客户端。
+                logger.info("光鸭登录信息已变化或暂不可用，元数据任务已交回等待重试 job=%s", job_id)
+                return False
             if metadata_committed:
                 # 文件/索引已确认；只重试完成记录和刷新交接。不能把 SQL 故障
                 # 记为下载失败、耗尽重试或触发下载熔断；重试会复核并复用文件。

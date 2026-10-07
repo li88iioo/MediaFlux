@@ -308,6 +308,9 @@ class StrmMetadataQueueTests(IsolatedDatabaseTestCase):
 
 
 class _TreeClient(PagedDirectoryTestMixin):
+    credentials_current = True
+    logged_in = True
+
     def __init__(self, tree):
         self.tree = tree
         self.info = {}

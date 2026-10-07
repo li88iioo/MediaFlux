@@ -638,11 +638,13 @@ def fail_or_retry_strm_metadata_job(
     base_backoff_seconds: int = 30,
     max_backoff_seconds: int = 3600,
     handoff_only: bool = False,
+    consume_attempt: bool = True,
 ) -> str:
     """失败后退避；已确认安装后的交接重试不消耗下载次数，也不因上限终止。
 
     handoff_only 仅由安装器明确返回已落盘结果后使用；两类重试共用同一
-    lease/revision 判定，旧快照不能污染新任务。
+    lease/revision 判定，旧快照不能污染新任务。凭据等全局条件变化可用
+    consume_attempt=False 交回租约，不消耗文件下载次数。
     """
     database = db
     stamp = database.now()
@@ -668,8 +670,9 @@ def fail_or_retry_strm_metadata_job(
                 (stamp, stamp, int(job_id), int(expected_lease_generation)),
             )
             return "queued"
-        attempts = int(row["attempts"] or 0) + (0 if handoff_only else 1)
-        exhausted = not handoff_only and attempts >= max(1, int(row["max_attempts"] or 1))
+        count_attempt = consume_attempt and not handoff_only
+        attempts = int(row["attempts"] or 0) + int(count_attempt)
+        exhausted = count_attempt and attempts >= max(1, int(row["max_attempts"] or 1))
         status = "failed" if exhausted else "retry_wait"
         delay = 0 if exhausted else min(
             max(1, int(max_backoff_seconds or 1)),

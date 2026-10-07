@@ -17,6 +17,8 @@ from tests.support import isolated_test_database
 class MetadataTransportFixesTests(unittest.TestCase):
     def test_C04_short_http_objects_keep_old_file_and_retry_then_publish(self):
         class Cloud:
+            credentials_current = True
+            logged_in = True
             calls = 0
             def file_info(self, fid):
                 return GuangYaFile("nfo", "Movie.nfo", False, 100, "new", "parent")

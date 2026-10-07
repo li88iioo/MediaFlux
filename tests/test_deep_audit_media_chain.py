@@ -172,6 +172,9 @@ def drain_refresh(endpoint, *, owner="audit-consumer", now_epoch=None):
 class CloudFiles:
     """离线对象读取器，元数据 body 来自真实临时文件，保留分页批量校验。"""
 
+    credentials_current = True
+    logged_in = True
+
     def __init__(self, root, count=4):
         self.files = {}
         self.paths = {}
