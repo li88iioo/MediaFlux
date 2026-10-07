@@ -162,6 +162,8 @@ def _background_data(
             )
     if isinstance(task.get("stats"), dict):
         data["stats"] = dict(task["stats"])
+    if isinstance(task.get("operation_items"), list):
+        data["operation_items"] = task["operation_items"]
     data["background_job"] = job
     if tracker.kind == "guangya_task":
         data["verified"] = status == "completed"
@@ -180,6 +182,7 @@ def _background_model_data(
         "operation_ref",
         "stats",
         "background_job",
+        "operation_items",
         "verified",
         "verification_pending",
         "scope_note",

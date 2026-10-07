@@ -35,7 +35,7 @@ from app.modules.process_lock import CrossProcessLock
 from app.modules.web_secret import get_web_secret
 from app.modules.strm import cloud_change_sources, trigger_cloud_changes
 from app.private_files import protect_private_file
-from app.repositories.organize_operation_jobs import organize_operation_owner_digest
+from app.repositories.organize_operation_jobs import organize_operation_owner_digest, sanitize_organize_operation_result
 
 _PLAN_VERSION = 1
 _PLAN_TTL_SECONDS = 10 * 60
@@ -771,6 +771,20 @@ def _validate_plan_names(operations: list[dict[str, Any]]) -> None:
         occupied[key] = op
 
 
+def _operation_label(item: dict[str, Any]) -> str:
+    op = str(item["op"])
+    name = str((item.get("source") or {}).get("name") or item.get("name") or "")
+    label = {"rename": "改名", "move": "移动", "relocate": "移动并改名",
+             "copy": "复制", "trash": "移入回收站", "create_directory": "新建目录"}[op]
+    if op == "rename":
+        return f"{label}：{name} → {item['new_name']}"
+    if op in {"move", "relocate", "copy"}:
+        target = Path(str(item["target_path"])).name or "根目录"
+        suffix = f" / {item['new_name']}" if op == "relocate" else ""
+        return f"{label}：{name} → {target}{suffix}"
+    return f"{label}：{name}"
+
+
 def build_fs_change_plan(
     client: GuangYaClient,
     *,
@@ -1011,25 +1025,7 @@ def build_fs_change_plan(
         counts[op] += 1
         if len(samples) >= 6:
             continue
-        if op == "rename":
-            samples.append(f"改名：{item['source']['name']} → {item['new_name']}")
-        elif op == "move":
-            samples.append(
-                f"移动：{item['source']['name']} → {Path(str(item['target_path'])).name or '根目录'}"
-            )
-        elif op == "relocate":
-            samples.append(
-                f"移动并改名：{item['source']['name']} → "
-                f"{Path(str(item['target_path'])).name or '根目录'} / {item['new_name']}"
-            )
-        elif op == "copy":
-            samples.append(
-                f"复制：{item['source']['name']} → {Path(str(item['target_path'])).name or '根目录'}"
-            )
-        elif op == "trash":
-            samples.append(f"移入回收站：{item['source']['name']}")
-        else:
-            samples.append(f"新建目录：{item['name']}")
+        samples.append(_operation_label(item))
 
     stats = {"total": len(frozen), "unchanged": unchanged, **counts}
     if not frozen:
@@ -1325,6 +1321,71 @@ def _operation_stat_key(operation: str) -> str:
         raise GuangYaFSChangeError("光鸭变更计划包含未知操作") from exc
 
 
+def _operation_actions(item: dict[str, Any]) -> tuple[str, ...]:
+    op = str(item["op"])
+    if op != "relocate":
+        return (op,)
+    if item["new_name"] == item["source"]["name"]:
+        return ("move",)
+    return ("move", "rename") if item.get("move_first") else ("rename", "move")
+
+
+def _apply_fs_operation(
+    client: GuangYaClient, item: dict[str, Any], outcome: dict[str, Any],
+    created_targets: dict[str, dict[str, Any]], cancel_check: Callable[[], None] | None,
+) -> str:
+    source = item.get("source") or {}
+    created_id = ""
+    actions = _operation_actions(item)
+    try:
+        for action in actions:
+            if cancel_check is not None:
+                cancel_check()
+            outcome.update(status="unknown", reason="write_outcome_unknown")
+            if action == "rename":
+                client.rename(str(source["file_id"]), str(item["new_name"]))
+            elif action == "move":
+                client.move([str(source["file_id"])], _directory_id(item, created_targets))
+            elif action == "copy":
+                client.copy([str(source["file_id"])], _directory_id(item, created_targets))
+            elif action == "create_directory":
+                created_id = client.create_dir(str(item["name"]), _directory_id(item, created_targets, role="parent"))
+            elif action == "trash":
+                delete_operation = None
+                if item.get("require_empty"):
+                    current = client.file_info(str(source["file_id"]))
+                    if current is None:
+                        raise GuangYaFSChangeStale("待清理目录已变化，请重新核对")
+                    delete_operation = lambda: client.delete_empty_directory(
+                        str(source["file_id"]), expected_etag=str(current.etag or ""),
+                        expected_updated_at=max(0, int(current.updated_at or 0)),
+                    )
+                execute_recycle_bin_delete(
+                    client, trigger="agent_guangya_fs_change", reason="Agent 已确认的光鸭文件变更计划",
+                    candidate=DeleteCandidate(file_id=str(source["file_id"]), name=str(source.get("name") or ""),
+                        parent_id=str(source.get("parent_id") or "0"), size=max(0, int(source.get("size") or 0)),
+                        gcid=str(source.get("etag") or "")),
+                    safe_failure_message="光鸭对象移入回收站失败", delete_operation=delete_operation,
+                )
+            else:
+                raise GuangYaFSChangeError("光鸭变更计划包含未知操作")
+            check = item if action == actions[-1] else {**item, "op": action}
+            if not verify_guangya_write(
+                lambda: _verify_after(client, check, created_id, created_targets=created_targets),
+                cancel_check=cancel_check,
+            ):
+                outcome["reason"] = "verification_pending"
+                raise GuangYaFSChangeError("写入后的云端状态尚未核验，未执行后续操作")
+            outcome["completed_actions"].append(action)
+            outcome["status"] = "completed" if action == actions[-1] else "partial"
+            outcome.pop("reason", None)
+    except Exception as exc:
+        # 保留已经取得的创建身份，避免回读失败后按同名目录误判结果。
+        exc.fs_created_id = created_id
+        raise
+    return created_id
+
+
 def execute_fs_change_plan(
     payload: dict[str, Any],
     *,
@@ -1367,6 +1428,13 @@ def execute_fs_change_plan(
         "precondition_failed": 0,
         "audit_failures": 0,
     }
+    operations = list(plan.get("operations") or [])
+    outcomes = sanitize_organize_operation_result({"operation_items": [
+        {"position": index, "operation": item["op"], "label": _operation_label(item),
+         "status": "not_started", "completed_actions": []}
+        for index, item in enumerate(operations, start=1)
+    ]})["operation_items"]
+    result = {"partial": False, "requires_manual": False, "stats": stats, "operation_items": outcomes}
     started_at = _now_iso()
     persistence_uncertain = False
     try:
@@ -1375,14 +1443,17 @@ def execute_fs_change_plan(
             or int(client.credential_generation) != expected_generation
         ):
             raise GuangYaFSChangeStale("光鸭登录凭据已变化，请重新预览")
-        operations = list(plan.get("operations") or [])
         if not operations:
             raise GuangYaFSChangeError("光鸭变更计划没有可执行对象")
         _validate_plan_names(operations)
-        for item in operations:
+        for item, outcome in zip(operations, outcomes):
             if cancel_check is not None:
                 cancel_check()
-            _preflight_operation(client, item, allow_pending_target=True)
+            try:
+                _preflight_operation(client, item, allow_pending_target=True)
+            except GuangYaFSChangeStale:
+                outcome.update(status="blocked", reason="precondition_failed")
+                raise
         # 来源旧路径必须在目录移动/改名之前捕获。
         strm_scope = cloud_change_sources(client) if plan.get("trigger_strm") else None
         # 预检日志先于 running CAS 写入；若日志介质不可用，此时尚未产生任何
@@ -1403,6 +1474,7 @@ def execute_fs_change_plan(
         for index, item in enumerate(operations, start=1):
             if cancel_check is not None:
                 cancel_check()
+            outcome = outcomes[index - 1]
             op = str(item.get("op") or "")
             source = item.get("source") if isinstance(item.get("source"), dict) else {}
             created_id = ""
@@ -1418,80 +1490,26 @@ def execute_fs_change_plan(
                     completed_objects=completed_objects,
                 )
                 provider_write_started = True
-                if op == "rename":
-                    client.rename(
-                        str(source.get("file_id") or ""), str(item["new_name"])
-                    )
-                elif op in {"move", "relocate"}:
-                    # 将复合变更作为有序阶段执行：受理不等于生效，前置核验后才推进。
-                    stages = (("move",) if op == "move" or item["new_name"] == source.get("name")
-                              else ("move", "rename") if item.get("move_first") else ("rename", "move"))
-                    for stage in stages:
-                        if stage == "rename":
-                            client.rename(str(source["file_id"]), str(item["new_name"]))
-                        else:
-                            client.move([str(source["file_id"])], _directory_id(item, created_targets))
-                        if stage != stages[-1] and not verify_guangya_write(
-                            lambda: _verify_after(client, {**item, "op": stage}, created_targets=created_targets),
-                            cancel_check=cancel_check,
-                        ):
-                            stats["verification_failed"] += 1
-                            raise GuangYaFSChangeError("前置变更的云端状态尚未确认，未执行后续操作")
-                elif op == "copy":
-                    client.copy(
-                        [str(source.get("file_id") or "")],
-                        _directory_id(item, created_targets),
-                    )
-                elif op == "trash":
-                    delete_operation = None
-                    if item.get("require_empty"):
-                        current = client.file_info(str(source["file_id"]))
-                        if current is None:
-                            raise GuangYaFSChangeStale("待清理目录已变化，请重新核对")
-                        delete_operation = lambda: client.delete_empty_directory(
-                            str(source["file_id"]), expected_etag=str(current.etag or ""),
-                            expected_updated_at=max(0, int(current.updated_at or 0)),
-                        )
-                    execute_recycle_bin_delete(
-                        client,
-                        trigger="agent_guangya_fs_change",
-                        reason="Agent 已确认的光鸭文件变更计划",
-                        candidate=DeleteCandidate(
-                            file_id=str(source.get("file_id") or ""),
-                            name=str(source.get("name") or ""),
-                            parent_id=str(source.get("parent_id") or "0"),
-                            size=max(0, int(source.get("size") or 0)),
-                            gcid=str(source.get("etag") or ""),
-                        ),
-                        safe_failure_message="光鸭对象移入回收站失败",
-                        delete_operation=delete_operation,
-                    )
-                elif op == "create_directory":
-                    created_id = client.create_dir(
-                        str(item["name"]), _directory_id(item, created_targets, role="parent")
-                    )
-                else:  # _operation_stat_key 已阻止未知操作
-                    raise GuangYaFSChangeError("光鸭变更计划包含未知操作")
-                verified = verify_guangya_write(
-                    lambda: _verify_after(client, item, created_id, created_targets=created_targets),
-                    cancel_check=cancel_check,
-                )
-                if not verified:
-                    stats["verification_failed"] += 1
-                    raise GuangYaFSChangeError("写入后的云端状态校验失败")
+                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check)
                 stats[stat_key] += 1
                 status = "completed"
             except GuangYaFSChangeStale as exc:
+                unmet = not set(item.get("rename_dependencies") or ()).issubset(completed_objects)
+                outcome.update(status="blocked", reason="dependency_failed" if unmet else "precondition_failed")
                 error_type = type(exc).__name__
                 stats["precondition_failed"] += 1
                 stats["failed"] += 1
                 status = "failed"
             except GuangYaWriteRejected as exc:
+                outcome.update(status="partial" if outcome["completed_actions"] else "failed", reason="write_rejected")
                 error_type = type(exc).__name__
                 provider_code = str(exc.code or "")
                 stats["failed"] += 1
                 status = "failed"
             except Exception as exc:  # noqa: BLE001 - 单项失败需收束为可审计部分完成
+                created_id = str(getattr(exc, "fs_created_id", created_id))
+                if outcome.get("reason") == "verification_pending":
+                    stats["verification_failed"] += 1
                 if cancel_check is not None:
                     cancel_check()
                 error_type = type(exc).__name__
@@ -1509,12 +1527,17 @@ def execute_fs_change_plan(
                     except Exception:  # noqa: BLE001 - 后置核验失败即保持未知
                         applied = False
                 if applied:
+                    outcome.update(status="completed", completed_actions=list(_operation_actions(item)))
+                    outcome.pop("reason", None)
                     stats[stat_key] += 1
                     status = "completed"
                     if op == "trash":
                         stats["audit_failures"] += 1
                         persistence_uncertain = True
+                        outcome["reason"] = "audit_unavailable"
                 else:
+                    outcome.update(status="unknown" if provider_write_started else "failed")
+                    outcome.setdefault("reason", "write_outcome_unknown" if provider_write_started else "execution_error")
                     stats["failed"] += 1
                     if provider_write_started:
                         # 任何写入都可能已被 Provider 接受；传输/回读失败不能
@@ -1540,6 +1563,7 @@ def execute_fs_change_plan(
                     index,
                     type(exc).__name__,
                 )
+                outcome["reason"] = "audit_unavailable"
                 stats["audit_failures"] += 1
                 persistence_uncertain = True
                 # 日志介质失效后停止追加写入，避免扩大无法可靠追溯的副作用面。
@@ -1601,6 +1625,7 @@ def execute_fs_change_plan(
                 execution={
                     "started_at": started_at,
                     "finished_at": finished_at,
+                    "operation_items": outcomes,
                     **stats,
                 },
                 expected_statuses={"running"},
@@ -1615,11 +1640,18 @@ def execute_fs_change_plan(
             stats["audit_failures"] += 1
             persistence_uncertain = True
             partial = True
-        return {
-            "partial": partial or persistence_uncertain,
-            "requires_manual": persistence_uncertain,
-            "stats": stats,
-        }
+        result.update(partial=partial or persistence_uncertain, requires_manual=persistence_uncertain)
+        return result
+    except Exception as exc:
+        # 协作取消/写前拒绝仍沿用异常契约，但不能丢掉本次已完成与待核验事实。
+        result.update(partial=any(row["status"] != "not_started" for row in outcomes),
+                      requires_manual=persistence_uncertain or any(row["status"] == "unknown" for row in outcomes))
+        if getattr(exc, "provider_write_not_started", False):
+            for row in outcomes:
+                if row["status"] in {"partial", "not_started"}:
+                    row["reason"] = "cancelled"
+        exc.operation_result = result
+        raise
     finally:
         try:
             client.close()

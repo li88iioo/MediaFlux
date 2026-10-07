@@ -17,12 +17,13 @@ from app.repositories.organize_operation_jobs import (
     enqueue_organize_operation_job,
     finish_organize_operation_job,
     get_organize_operation_job,
-    sanitize_organize_operation_result,
+    get_organize_operation_job_for_owner,
     is_organize_operation_cancel_requested,
-    organize_operation_owner_digest,
-    verify_organize_operation_payload,
     organize_operation_job_id_from_public_ref,
+    organize_operation_owner_digest,
     organize_operation_public_ref,
+    sanitize_organize_operation_result,
+    verify_organize_operation_payload,
 )
 from tests.support import IsolatedDatabaseTestCase
 
@@ -257,6 +258,193 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
             public_ref, owner="owner-durable-test"
         )
         self.assertEqual(queried["result"], expected)
+        self.assertEqual(set(queried["result"]), {"stats"})
+
+    def test_operation_items_are_sanitized_persisted_and_owner_scoped(self) -> None:
+        raw_result = {
+            "stats": {"total": 2, "relocated": 1, "private_counter": 99},
+            "operation_items": [
+                {
+                    "position": 1,
+                    "operation": "relocate",
+                    "status": "completed",
+                    "label": "第 1 集 password=ultra-private-secret",
+                    "completed_actions": ["move", "rename"],
+                    "provider_id": "provider-secret-id",
+                    "file_id": "file-secret-id",
+                    "raw_path": "/private/library/episode.mkv",
+                    "raw_exception": "RuntimeError token=exception-secret",
+                },
+                {
+                    "position": 2,
+                    "operation": "copy",
+                    "status": "failed",
+                    "label": "复制：第 1 集 → target / clean",
+                    "completed_actions": [],
+                    "reason": "execution_error",
+                    "path": "/private/library/episode.mkv",
+                    "error": "private provider exception",
+                },
+                {"position": True, "operation": "move", "status": "completed"},
+                {"position": 3, "operation": "raw_move", "status": "completed"},
+                {"position": 4, "operation": "move", "status": "invented"},
+                {
+                    "position": 5,
+                    "operation": "move",
+                    "status": "completed",
+                    "completed_actions": ["move", "rename", "trash"],
+                },
+                {
+                    "position": 6,
+                    "operation": "move",
+                    "status": "completed",
+                    "label": "/private/library/episode.mkv",
+                    "completed_actions": [],
+                    "provider_id": "only",
+                },
+                {"position": 7, "op": "move", "status": "completed"},
+                {"position": 401, "operation": "move", "status": "completed"},
+                {
+                    "position": 8,
+                    "operation": "rename",
+                    "status": "not_started",
+                    "label": "发布组-第1集-ABC123.mkv",
+                },
+            ],
+            "provider_id": "top-level-provider-secret",
+            "raw_path": "/private/library",
+        }
+        expected = sanitize_organize_operation_result(raw_result)
+        self.assertEqual(expected["stats"], {"total": 2, "relocated": 1})
+        self.assertEqual(len(expected["operation_items"]), 4)
+        self.assertEqual(
+            expected["operation_items"][0],
+            {
+                "position": 1,
+                "operation": "relocate",
+                "status": "completed",
+                "completed_actions": ["move", "rename"],
+            },
+        )
+        self.assertEqual(
+            expected["operation_items"][1],
+            {
+                "position": 2,
+                "operation": "copy",
+                "status": "failed",
+                "label": "复制:第 1 集 → target / clean",
+                "completed_actions": [],
+                "reason": "execution_error",
+            },
+        )
+        self.assertEqual(
+            expected["operation_items"][2],
+            {
+                "position": 6,
+                "operation": "move",
+                "status": "completed",
+                "completed_actions": [],
+            },
+        )
+        self.assertIn(
+            "发布组-第1集",
+            expected["operation_items"][3]["label"],
+        )
+        self.assertNotIn("provider-secret-id", str(expected))
+        self.assertNotIn("private/library", str(expected))
+        self.assertNotIn("exception-secret", str(expected))
+
+        created, _ = self._enqueue(dedupe="owner:operation-items")
+        claimed = claim_organize_operation_job(str(created["job_id"]))
+        self.assertTrue(
+            finish_organize_operation_job(
+                str(created["job_id"]),
+                expected_lease_generation=int(claimed["lease_generation"]),
+                status="partial",
+                result=raw_result,
+            )
+        )
+        terminal = get_organize_operation_job(str(created["job_id"]))
+        self.assertEqual(json.loads(terminal["result_json"]), expected)
+        owner_row = get_organize_operation_job_for_owner(
+            str(created["job_id"]), "owner-durable-test"
+        )
+        other_owner_row = get_organize_operation_job_for_owner(
+            str(created["job_id"]), "someone-else"
+        )
+        self.assertIsNotNone(owner_row)
+        self.assertIsNone(other_owner_row)
+
+        public_ref = organize_operation_public_ref(str(created["job_id"]))
+        manager = OrganizeTaskManager()
+        queried = manager.task_result(public_ref, owner="owner-durable-test")
+        self.assertEqual(queried["result"], expected)
+        self.assertIsNone(manager.task_result(public_ref, owner="someone-else"))
+
+    def test_operation_labels_preserve_media_filenames_not_tool_identifiers(self) -> None:
+        label = "改名：Blue.Streak.1999.2160p.HDR.mkv → 笨贼妙探.1999.2160p.mkv"
+        item = {"position": 1, "operation": "rename", "status": "not_started", "label": label}
+        safe = sanitize_organize_operation_result({"operation_items": [item]})
+        self.assertIn("Blue.Streak.1999.2160p.HDR.mkv", safe["operation_items"][0]["label"])
+        self.assertIn("笨贼妙探.1999.2160p.mkv", safe["operation_items"][0]["label"])
+        self.assertNotIn("内部检查", safe["operation_items"][0]["label"])
+
+    def test_operation_item_labels_are_utf8_bounded_and_400_items_fit_result_budget(self) -> None:
+        long_label = "开头" + "集" * 100 + "结尾"
+        single = sanitize_organize_operation_result(
+            {
+                "stats": {},
+                "operation_items": [
+                    {
+                        "position": 1,
+                        "operation": "rename",
+                        "status": "completed",
+                        "label": long_label,
+                    }
+                ],
+            }
+        )["operation_items"][0]["label"]
+        self.assertLessEqual(len(single.encode("utf-8")), 128)
+        self.assertTrue(single.startswith("开头"))
+        self.assertTrue(single.endswith("结尾"))
+
+        for kind, maximum_label in (("unicode", "😀" * 32), ("json_escape", '"' * 128)):
+            with self.subTest(kind=kind):
+                worst_case = sanitize_organize_operation_result(
+                    {
+                        "stats": {"total": 400},
+                        "operation_items": [
+                            {
+                                "position": index + 1,
+                                "operation": "create_directory",
+                                "status": "not_started",
+                                "label": maximum_label,
+                                "completed_actions": ["create_directory", "create_directory"],
+                                "reason": "dependency_failed",
+                            }
+                            for index in range(400)
+                        ],
+                    }
+                )
+                self.assertEqual(len(worst_case["operation_items"]), 400)
+                self.assertTrue(
+                    all(
+                        len(item["label"].encode("utf-8")) <= 128
+                        for item in worst_case["operation_items"]
+                    )
+                )
+                serialized = json.dumps(
+                    worst_case, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                ).encode("utf-8")
+                self.assertLess(len(serialized), 131_072)
+                created, _ = self._enqueue(dedupe=f"label-budget:{kind}")
+                claimed = claim_organize_operation_job(str(created["job_id"]))
+                self.assertTrue(finish_organize_operation_job(
+                    str(created["job_id"]), expected_lease_generation=int(claimed["lease_generation"]),
+                    status="partial", result=worst_case,
+                ))
+                persisted = get_organize_operation_job(str(created["job_id"]))
+                self.assertEqual(json.loads(persisted["result_json"]), worst_case)
 
     def test_old_manual_review_history_is_pruned_on_next_enqueue(self) -> None:
         with db.get_conn() as conn:

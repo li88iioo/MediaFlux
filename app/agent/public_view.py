@@ -39,6 +39,34 @@ _SUBMITTED_RESULT_STATUSES = frozenset({"accepted", "submitted"})
 _PENDING_RESULT_STATUSES = frozenset(
     {"queued", "running", "in_progress", "retry_wait"}
 )
+_FS_CHANGE_ACTION_LABELS = {
+    "rename": "改名",
+    "move": "移动",
+    "relocate": "清洗并移动",
+    "copy": "复制",
+    "trash": "移入回收站",
+    "create_directory": "创建目录",
+}
+_FS_CHANGE_STATUS_LABELS = {
+    "completed": "已完成",
+    "partial": "部分完成",
+    "failed": "失败",
+    "blocked": "受阻",
+    "not_started": "未开始",
+    "unknown": "已发起但待核验，不建议盲目重试",
+}
+_FS_CHANGE_REASON_LABELS = {
+    "precondition_failed": "前置条件未满足",
+    "dependency_failed": "依赖项未完成",
+    "write_rejected": "写入被拒绝",
+    "verification_pending": "写后核验未完成",
+    "write_outcome_unknown": "写入结果未知",
+    "execution_error": "执行异常",
+    "audit_unavailable": "审计记录不可用",
+    "cancelled": "已取消",
+}
+_MAX_FS_CHANGE_OPERATION_ITEMS = 400
+_MAX_PUBLIC_FS_CHANGE_ITEMS = 8
 _WARNING_RESULT_STATUSES = frozenset(
     {
         "partial",
@@ -143,6 +171,98 @@ def candidate_result_lines(data: Mapping[str, Any]) -> list[str]:
         lines.append(text)
     return lines
 
+
+def _operation_item_status(item: Mapping[str, Any]) -> str:
+    status = str(item.get("status") or "")
+    raw_actions = item.get("completed_actions")
+    operation = item.get("operation")
+    relocate_partial_actions = (
+        status == "partial"
+        and operation == "relocate"
+        and raw_actions in (["move"], ["rename"])
+    )
+    if relocate_partial_actions and raw_actions == ["move"]:
+        detail = "已移动；改名未完成"
+    elif relocate_partial_actions:
+        detail = "已改名；移动未完成"
+    else:
+        detail = _FS_CHANGE_STATUS_LABELS.get(status, "结果未知")
+    if status != "completed" and not relocate_partial_actions:
+        if isinstance(raw_actions, list):
+            actions = dict.fromkeys(
+                action for action in raw_actions
+                if isinstance(action, str) and action in _FS_CHANGE_ACTION_LABELS
+            )
+            action_text = "、".join(_FS_CHANGE_ACTION_LABELS[action] for action in actions)
+            action_text = action_text or ("无" if not raw_actions else "未知")
+        else:
+            action_text = "未知"
+        detail += f"；已确认动作：{action_text}"
+    reason = _FS_CHANGE_REASON_LABELS.get(str(item.get("reason") or ""))
+    return f"{detail}；原因：{reason}" if reason else detail
+
+
+def _operation_items_lines(
+    data: Mapping[str, Any], *, result_status: str = ""
+) -> list[str] | None:
+    """渲染通用文件变更回执；None 表示旧结果没有该 DTO。"""
+    if "operation_items" not in data:
+        return None
+    raw_items = data.get("operation_items")
+    if not isinstance(raw_items, list):
+        return ["- 计划结果：未知（逐项结果格式无效，不能确认完成情况）"]
+    stats = data.get("stats")
+    total = _int_value(data.get("total"))
+    if total is None and isinstance(stats, Mapping):
+        total = _int_value(stats.get("total"))
+    items = raw_items[:_MAX_FS_CHANGE_OPERATION_ITEMS]
+    completed = sum(
+        isinstance(item, Mapping) and item.get("status") == "completed"
+        for item in items
+    )
+    count = len(raw_items)
+    if total is None:
+        summary = f"- 计划结果：已确认完成 {completed} 项；计划总数未知，整体状态未知。"
+    elif count == total and count <= _MAX_FS_CHANGE_OPERATION_ITEMS:
+        summary = f"- 计划结果：已完成 {completed}/总 {total} 项"
+    elif count < total:
+        summary = (
+            f"- 计划结果：已确认完成 {completed}/总 {total} 项；另有 "
+            f"{total - len(items)} 项结果未核对，状态未知。"
+        )
+    else:
+        summary = (
+            f"- 计划结果：已确认完成 {completed}/总 {total} 项；"
+            "逐项结果数量与计划不一致，汇总未知。"
+        )
+
+    remaining = [
+        item for item in items
+        if not isinstance(item, Mapping) or item.get("status") != "completed"
+    ]
+    all_completed = total is not None and count == total and completed == total
+    completed_items = [
+        item for item in items
+        if isinstance(item, Mapping) and item.get("status") == "completed"
+    ]
+    prioritized = remaining
+    if result_status == "partial" and total is not None and total <= _MAX_PUBLIC_FS_CHANGE_ITEMS and not all_completed:
+        prioritized = [*remaining, *completed_items]
+    shown = prioritized[:_MAX_PUBLIC_FS_CHANGE_ITEMS]
+    lines = [summary]
+    for raw_item in shown:
+        item = raw_item if isinstance(raw_item, Mapping) else {}
+        position = item.get("position")
+        position = f"#{position}" if type(position) is int and position > 0 else "#?"
+        label = sanitize_resource_title(item.get("label"), limit=180) or "文件变更项"
+        lines.append(f"- {position} · {label}：{_operation_item_status(item)}")
+
+    omitted = len(prioritized) - len(shown) + max(0, len(raw_items) - len(items))
+    if omitted:
+        lines.append(f"- 另有 {omitted} 项剩余或未知结果未展示。")
+    return lines
+
+
 def format_public_result(
     value: Mapping[str, Any] | None,
     *,
@@ -161,10 +281,15 @@ def format_public_result(
         lines.append("- 状态：后台任务尚未完成")
     data = result.get("data")
     if isinstance(data, Mapping):
+        operation_item_lines = _operation_items_lines(
+            data, result_status=str(result.get("status") or "")
+        )
         target = _safe(data.get("target"), limit=40).lower()
         if target:
             lines.append(f"- 目标：{_TARGET_LABELS.get(target, target)}")
         for key, label in _COUNT_FIELDS:
+            if key == "total" and operation_item_lines is not None:
+                continue
             count = _int_value(data.get(key))
             if count is not None:
                 lines.append(f"- {label}：{count} 项")
@@ -181,9 +306,12 @@ def format_public_result(
         scope_note = _safe(data.get("scope_note"), limit=300)
         if scope_note:
             lines.append(f"- 执行范围：{scope_note}")
-        lines.extend(f"- {line}" for line in candidate_result_lines(data))
-        for error in _failed_item_errors(data):
-            lines.append(f"- 失败原因：{error}")
+        if operation_item_lines is not None:
+            lines.extend(operation_item_lines)
+        else:
+            lines.extend(f"- {line}" for line in candidate_result_lines(data))
+            for error in _failed_item_errors(data):
+                lines.append(f"- 失败原因：{error}")
 
     error = _safe(result.get("error"), limit=300)
     if error and error != summary and error not in "\n".join(lines):
@@ -196,6 +324,11 @@ def format_partial_progress(
     confirmed_result: Mapping[str, Any] | None = None, write_attempted: bool = False,
 ) -> str:
     """统一降级投影：查询交付已有内容，实际涉及写入才显示执行警示。"""
+    if confirmed_result is not None:
+        data = confirmed_result.get("data")
+        operation_items = data.get("operation_items") if isinstance(data, Mapping) else None
+        if isinstance(operation_items, list) and operation_items:
+            return format_public_result(confirmed_result)
     lines = ["部分完成：" + _safe(reason, limit=300)]
     if write_attempted or confirmed_result is not None:
         if confirmed_result is not None:

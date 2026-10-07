@@ -17,7 +17,7 @@ from app.agent.domain_catalog.cloud_runtime import guangya_organize_status
 from app.agent.effect_completion import wait_for_effect_completion
 from app.agent.models import ToolContext, ToolResult
 from app.modules import guangya_fs_change
-from app.modules.organize_tasks import OrganizeTaskManager
+from app.modules.organize_tasks import OrganizeOperationCancelled, OrganizeTaskManager
 from app.repositories.organize_operation_jobs import (
     claim_organize_operation_job,
     count_pending_organize_operation_jobs,
@@ -212,7 +212,27 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
             terminal="completed",
         )
 
-    def _assert_durable_stats_reach_waiter(self, stats, *, terminal):
+    def test_operation_items_survive_worker_history_and_restart(self):
+        self._assert_durable_stats_reach_waiter(
+            {"total": 3, "created": 0, "renamed": 1, "failed": 2}, terminal="partial",
+            operation_items=[
+                {"position": 1, "operation": "rename", "label": "改名：A → A-done", "status": "completed", "completed_actions": ["rename"]},
+                {"position": 2, "operation": "relocate", "label": "移动并改名：dirty → target / clean", "status": "partial", "completed_actions": ["move"], "reason": "write_rejected"},
+                {"position": 3, "operation": "move", "label": "移动：B → archive", "status": "blocked", "completed_actions": [], "reason": "dependency_failed"},
+            ],
+        )
+
+    def test_cancelled_worker_preserves_verified_and_unstarted_items(self):
+        self._assert_durable_stats_reach_waiter(
+            {"total": 2, "created": 0, "renamed": 1, "failed": 0},
+            terminal="cancelled", error=OrganizeOperationCancelled("cancelled"),
+            operation_items=[
+                {"position": 1, "operation": "rename", "label": "改名：A → A-done", "status": "completed", "completed_actions": ["rename"]},
+                {"position": 2, "operation": "rename", "label": "改名：B → B-done", "status": "not_started", "completed_actions": [], "reason": "cancelled"},
+            ],
+        )
+
+    def _assert_durable_stats_reach_waiter(self, stats, *, terminal, operation_items=None, error=None):
         queued, _ = self._enqueue(self._confirmed_plan())
         job_id = str(queued["job_id"])
         claimed = claim_organize_operation_job(job_id)
@@ -237,17 +257,23 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 self.assertEqual(public.data["task"]["status"], "running")
                 self.assertEqual(public.data["task"]["stats"], {})
 
+        execution_result = {
+            "partial": terminal == "partial", "requires_manual": False,
+            "stats": {**stats, "internal_file_id": "private-item"},
+            **({"operation_items": operation_items} if operation_items is not None else {}),
+        }
+        if error is not None:
+            error.operation_result = execution_result
         with (
-            mock.patch.object(manager, "_execute_durable_operation", return_value={
-                "partial": terminal == "partial", "requires_manual": False,
-                "stats": {**stats, "internal_file_id": "private-item"},
-            }),
+            mock.patch.object(manager, "_execute_durable_operation", return_value=execution_result, side_effect=error),
             mock.patch.object(manager, "_wake_download_tracker"),
         ):
             manager._run_durable_operation(dict(claimed))
         persisted = get_organize_operation_job(job_id)
         self.assertEqual(persisted["status"], terminal)
-        self.assertEqual(json.loads(persisted["result_json"]), {"stats": stats})
+        expected_result = sanitize_organize_operation_result({"stats": stats,
+            **({"operation_items": operation_items} if operation_items is not None else {})})
+        self.assertEqual(json.loads(persisted["result_json"]), expected_result)
 
         accepted = ToolResult(True, "accepted", "已提交", data={
             "operation_ref": public_ref, "total": stats["total"],
@@ -275,7 +301,10 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 self.assertEqual(receipt.data["relocate_count"], stats["total"] - stats["created"])
                 self.assertEqual(receipt.data["operation_ref"], public_ref)
                 self.assertEqual(public.data["task"]["stats"], stats)
-                self.assertEqual(raw["result"], {"stats": stats})
+                self.assertEqual(raw["result"], expected_result)
+                if operation_items is not None:
+                    self.assertEqual(receipt.data["operation_items"], expected_result["operation_items"])
+                    self.assertEqual(public.data["task"]["operation_items"], expected_result["operation_items"])
                 self.assertIsNone(current.task_result(public_ref, owner="other-owner"))
                 for private in ("owner_digest", "internal_file_id", "private-item", job_id):
                     self.assertNotIn(private, json.dumps(receipt.data))

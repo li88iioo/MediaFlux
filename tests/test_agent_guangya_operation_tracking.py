@@ -869,10 +869,58 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
     def test_preflight_and_audit_failure_counts_have_distinct_explanations(self):
         from app.agent.domain_catalog.cloud_runtime import _project_guangya_status
         result = _project_guangya_status({'status': 'manual_review', 'stats': {'precondition_failed': 1, 'audit_failures': 2}}, overview={})
-        self.assertIn('1 项写前条件已变化，未执行', result.error)
+        self.assertIn('1 项写前核对未通过，未执行', result.error)
         self.assertIn('2 项执行审计未完整保存', result.error)
         success = _project_guangya_status({'status': 'completed', 'stats': {}}, overview={})
         self.assertEqual(success.error, '')
+
+    def test_task_projection_passes_sanitized_operation_items_and_keeps_legacy_stats(self):
+        from app.agent.domain_catalog.cloud_runtime import _project_guangya_status
+
+        projected = _project_guangya_status(
+            {
+                "status": "partial",
+                "result": {
+                    "stats": {"total": 2, "relocated": 1.8, "private_counter": 99},
+                    "operation_items": [
+                        {
+                            "position": 1,
+                            "operation": "relocate",
+                            "status": "completed",
+                            "label": "第 1 集 password=must-not-leak",
+                            "completed_actions": ["move", "rename"],
+                            "file_id": "private-file-id",
+                            "path": "/private/library/episode.mkv",
+                        },
+                        {"position": 2, "operation": "unsafe", "status": "completed"},
+                        {"position": 3, "op": "move", "status": "completed"},
+                    ],
+                },
+            },
+            overview={},
+        )
+        task = projected.data["task"]
+        self.assertEqual(task["stats"], {"total": 2, "relocated": 1})
+        self.assertEqual(
+            task["operation_items"],
+            [
+                {
+                    "position": 1,
+                    "operation": "relocate",
+                    "status": "completed",
+                    "completed_actions": ["move", "rename"],
+                }
+            ],
+        )
+        self.assertNotIn("private-file-id", str(projected.to_dict()))
+        self.assertNotIn("must-not-leak", str(projected.to_dict()))
+
+        legacy = _project_guangya_status(
+            {"status": "completed", "result": {"counters": {"moved": "3", "renamed": True, "failed": -1}}},
+            overview={},
+        )
+        self.assertEqual(legacy.data["task"]["stats"], {"moved": 3, "renamed": 1, "failed": 0})
+        self.assertNotIn("operation_items", legacy.data["task"])
 
 
 class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):

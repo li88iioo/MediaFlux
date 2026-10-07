@@ -644,6 +644,10 @@ class AgentSession:
                     "elapsed_ms": result.elapsed_ms if result else 0,
                 })
                 if failed:
+                    data = public_result.get("data")
+                    if isinstance(data, dict) and data.get("operation_items"):
+                        confirmed_result = public_result
+                        checkpoint = persist_conversation
                     await failure(str(public_result.get("status") or "effect_failed"), str(public_result.get("summary") or "执行未完成"))
                     return
                 if not receipt_saved:

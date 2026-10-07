@@ -36,6 +36,271 @@ class AgentKernelPublicViewTests(unittest.TestCase):
         self.assertIn("未触发 STRM 联动", text)
         self.assertNotIn("private", text)
 
+    def test_fs_change_receipt_shows_partial_actions_and_blocked_items(self):
+        text = format_public_result({
+            "ok": False,
+            "status": "partial",
+            "summary": "文件变更部分完成",
+            "data": {
+                "stats": {"total": 3, "moved": 1},
+                "operation_items": [
+                    {
+                        "position": 4,
+                        "operation": "relocate",
+                        "label": "第 4 项：整理并移入目标目录",
+                        "status": "partial",
+                        "completed_actions": ["move"],
+                        "reason": "verification_pending",
+                    },
+                    {
+                        "position": 5,
+                        "operation": "rename",
+                        "label": "第 5 项：重命名文件",
+                        "status": "blocked",
+                        "completed_actions": [],
+                        "reason": "dependency_failed",
+                    },
+                    {
+                        "position": 6,
+                        "operation": "move",
+                        "label": "第 6 项：已完成移动",
+                        "status": "completed",
+                        "completed_actions": ["move"],
+                    },
+                ],
+            },
+        })
+
+        self.assertIn("已完成 1/总 3 项", text)
+        self.assertIn("#4 · 第 4 项:整理并移入目标目录：已移动；改名未完成；原因：写后核验未完成", text)
+        self.assertIn("#5 · 第 5 项:重命名文件：受阻；已确认动作：无；原因：依赖项未完成", text)
+        self.assertIn("#6 · 第 6 项:已完成移动：已完成", text)
+        self.assertLess(text.index("#4"), text.index("#5"))
+        self.assertLess(text.index("#5"), text.index("#6"))
+
+    def test_fs_change_unknown_item_warns_against_blind_retry(self):
+        text = format_public_result({
+            "ok": False,
+            "status": "outcome_unknown",
+            "summary": "结果尚未确认",
+            "data": {
+                "stats": {"total": 1},
+                "operation_items": [{
+                    "position": 12,
+                    "operation": "copy",
+                    "label": "复制文件到备份目录",
+                    "status": "unknown",
+                    "completed_actions": [],
+                    "reason": "write_outcome_unknown",
+                }],
+            },
+        })
+
+        self.assertIn("#12 · 复制文件到备份目录：已发起但待核验，不建议盲目重试；已确认动作：无；原因：写入结果未知", text)
+
+    def test_fs_change_complete_receipt_summarizes_without_listing_all_items(self):
+        items = [
+            {
+                "position": position,
+                "operation": "rename",
+                "label": f"已完成文件 {position}",
+                "status": "completed",
+                "completed_actions": ["rename"],
+            }
+            for position in range(1, 4)
+        ]
+        text = format_public_result({
+            "ok": True,
+            "status": "completed",
+            "summary": "文件变更已完成",
+            "data": {"stats": {"total": 3, "renamed": 3}, "operation_items": items},
+        })
+
+        self.assertIn("计划结果：已完成 3/总 3 项", text)
+        self.assertNotIn("已完成文件", text)
+
+    def test_fs_change_mismatched_item_count_marks_missing_results_unknown(self):
+        text = format_public_result({
+            "ok": True,
+            "status": "partial",
+            "summary": "文件变更结果",
+            "data": {
+                "stats": {"total": 3},
+                "operation_items": [
+                    {
+                        "position": 1,
+                        "operation": "move",
+                        "label": "已移动文件",
+                        "status": "completed",
+                        "completed_actions": ["move"],
+                    },
+                    {
+                        "position": 2,
+                        "operation": "rename",
+                        "label": "未完成改名文件",
+                        "status": "failed",
+                        "completed_actions": [],
+                        "reason": "write_rejected",
+                    },
+                ],
+            },
+        })
+
+        self.assertIn("已确认完成 1/总 3 项；另有 1 项结果未核对，状态未知", text)
+        self.assertIn("#2 · 未完成改名文件：失败；已确认动作：无；原因：写入被拒绝", text)
+        self.assertIn("#1 · 已移动文件：已完成", text)
+        self.assertLess(text.index("#2"), text.index("#1"))
+
+    def test_partial_relocate_reports_rename_before_move_when_confirmed(self):
+        text = format_public_result({
+            "ok": False,
+            "status": "partial",
+            "summary": "文件变更部分完成",
+            "data": {
+                "stats": {"total": 1},
+                "operation_items": [{
+                    "position": 1,
+                    "operation": "relocate",
+                    "label": "整理并移动目录",
+                    "status": "partial",
+                    "completed_actions": ["rename"],
+                    "reason": "verification_pending",
+                }],
+            },
+        })
+
+        self.assertIn("已改名；移动未完成；原因：写后核验未完成", text)
+
+    def test_fs_change_receipt_limits_remaining_details_to_eight(self):
+        items = [
+            {
+                "position": position,
+                "operation": "rename",
+                "label": f"待改名文件 {position}",
+                "status": "failed",
+                "completed_actions": [],
+                "reason": "write_rejected",
+            }
+            for position in range(1, 11)
+        ]
+        items.append({
+            "position": 11,
+            "operation": "move",
+            "label": "已完成移动",
+            "status": "completed",
+            "completed_actions": ["move"],
+        })
+        text = format_public_result({
+            "ok": False,
+            "status": "partial",
+            "summary": "文件变更部分完成",
+            "data": {"stats": {"total": 11}, "operation_items": items},
+        })
+
+        for position in range(1, 9):
+            self.assertIn(f"#{position} ·", text)
+        self.assertNotIn("#9 ·", text)
+        self.assertNotIn("#11 ·", text)
+        self.assertIn("另有 2 项剩余或未知结果未展示", text)
+
+    def test_fs_change_item_label_preserves_dotted_filename(self):
+        text = format_public_result({
+            "ok": False,
+            "status": "partial",
+            "summary": "文件变更部分完成",
+            "data": {
+                "stats": {"total": 1},
+                "operation_items": [{
+                    "position": 1,
+                    "operation": "rename",
+                    "label": "改名：movie.mkv → Blue.Streak.S01E01.mkv",
+                    "status": "failed",
+                    "completed_actions": [],
+                }],
+            },
+        })
+
+        self.assertIn("movie.mkv → Blue.Streak.S01E01.mkv", text)
+        self.assertNotIn("内部检查", text)
+
+    def test_fs_change_item_label_is_sanitized_again_before_display(self):
+        text = format_public_result({
+            "ok": False,
+            "status": "partial",
+            "summary": "文件变更未完成",
+            "data": {
+                "stats": {"total": 1},
+                "operation_items": [{
+                    "position": 1,
+                    "operation": "rename",
+                    "label": "改名 access_token=AbCd1234testCredential9876 /data/private/test.env",
+                    "status": "failed",
+                    "completed_actions": [],
+                    "reason": "execution_error",
+                }],
+            },
+        })
+
+        self.assertNotIn("access_token", text)
+        self.assertNotIn("AbCd1234testCredential9876", text)
+        self.assertNotIn("/data/private/test.env", text)
+
+    def test_partial_progress_uses_confirmed_fs_receipt_as_authoritative(self):
+        confirmed = {
+            "ok": False,
+            "status": "partial",
+            "summary": "文件变更部分完成",
+            "data": {
+                "stats": {"total": 1},
+                "operation_items": [{
+                    "position": 2,
+                    "operation": "relocate",
+                    "label": "剧集目录整理",
+                    "status": "partial",
+                    "completed_actions": ["move"],
+                    "reason": "verification_pending",
+                }],
+            },
+        }
+        result = format_partial_progress(
+            "后续查询未完成",
+            [("只读查询", {"ok": True, "summary": "已找到相关目录"})],
+            confirmed_result=confirmed,
+            write_attempted=True,
+        )
+
+        self.assertEqual(result, format_public_result(confirmed))
+        self.assertNotIn("后续写操作尚未执行", result)
+        self.assertNotIn("只读查询", result)
+
+    def test_fs_change_items_do_not_mix_with_read_only_or_candidate_items(self):
+        read_only = format_partial_progress(
+            "查询部分完成",
+            [(
+                "只读查询",
+                {
+                    "ok": True,
+                    "summary": "已找到目录",
+                    "data": {"operation_items": [{"label": "不应作为写回执展示"}]},
+                },
+            )],
+        )
+        candidates = format_public_result({
+            "ok": True,
+            "status": "completed",
+            "summary": "资源已提交",
+            "data": {
+                "source_type": "resource_candidates",
+                "items": [{"position": 3, "title": "资源候选", "status": "submitted"}],
+            },
+        })
+
+        self.assertIn("已找到目录", read_only)
+        self.assertNotIn("不应作为写回执展示", read_only)
+        self.assertNotIn("后续写操作尚未执行", read_only)
+        self.assertIn("#3 · 资源候选：已提交", candidates)
+        self.assertNotIn("计划结果", candidates)
+
     def test_conversation_hides_empty_tool_turns_and_internal_confirmed_json(self) -> None:
         internal_result = {
             "ok": True,

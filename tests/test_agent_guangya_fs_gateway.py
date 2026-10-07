@@ -1613,6 +1613,13 @@ class GuangYaFSGatewayTests(unittest.TestCase):
                     result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
                     self.assertEqual(result["partial"], mode != "timeout_after_apply")
                     self.assertEqual(result["requires_manual"], mode == "timeout_before_apply")
+                    item_result = result["operation_items"][0]
+                    self.assertEqual(item_result["status"], {
+                        "rejected": "partial", "timeout_before_apply": "unknown", "timeout_after_apply": "completed",
+                    }[mode])
+                    self.assertEqual(item_result["completed_actions"],
+                                     ["move", "rename"] if mode == "timeout_after_apply" else ["move"])
+                    self.assertNotIn("file_id", item_result)
                     self.assertEqual(result["stats"]["relocated"], int(mode == "timeout_after_apply"))
                     item = client.file_info("rename")
                     self.assertEqual(item.parent_id, "target")
@@ -2091,6 +2098,76 @@ class GuangYaFSGatewayTests(unittest.TestCase):
         self.assertEqual(audited.call_args.kwargs["candidate"].file_id, "trash")
         self.assertEqual(audited.call_args.kwargs["trigger"], "agent_guangya_fs_change")
 
+    def test_entire_plan_keeps_unstarted_items_after_audit_failure_or_cancel(self):
+        from app.repositories.organize_operation_jobs import OrganizeOperationCancelled
+        for stop in ("audit", "cancel"):
+            with self.subTest(stop=stop):
+                client = FakeGatewayClient()
+                observed = self._query(client)
+                observation = guangya_workspace.load_directory_observation(observed.data["observation_ref"], owner="owner")
+                refs = {row["object_name"]: row["object_ref"] for row in observed.data["entries"]}
+                plan = guangya_fs_change.build_fs_change_plan(client, owner="owner", observation=observation,
+                    operations=[{"op": "rename", "object_ref": refs["广告-ABC.mp4"], "new_name": "A.mp4"},
+                                {"op": "rename", "object_ref": refs["Move.mp4"], "new_name": "B.mp4"}],
+                    trigger_strm=False)
+                guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
+                payload = self._queued_payload(plan)
+                journal = guangya_fs_change._append_journal
+                cancelled = False
+
+                def append(pid, event):
+                    nonlocal cancelled
+                    if event.get("index") == 1:
+                        if stop == "audit":
+                            raise OSError("audit unavailable")
+                        cancelled = True
+                    return journal(pid, event)
+
+                def check():
+                    if cancelled:
+                        raise OrganizeOperationCancelled("cancelled")
+
+                with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=append):
+                    if stop == "cancel":
+                        with self.assertRaises(OrganizeOperationCancelled) as caught:
+                            guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, cancel_check=check)
+                        result = caught.exception.operation_result
+                    else:
+                        result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                self.assertTrue(result["partial"])
+                self.assertEqual(result["requires_manual"], stop == "audit")
+                self.assertEqual(result["stats"]["renamed"], 1)
+                self.assertEqual([row["status"] for row in result["operation_items"]], ["completed", "not_started"])
+                self.assertEqual(result["operation_items"][0]["completed_actions"], ["rename"])
+                self.assertEqual(client.file_info("rename").name, "A.mp4")
+                self.assertEqual(client.file_info("move").name, "Move.mp4")
+                self.assertEqual([row["position"] for row in result["operation_items"]], [1, 2])
+                with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                    guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+
+    def test_creation_identity_survives_first_readback_error(self):
+        client = FakeGatewayClient()
+        observed = self._query(client)
+        observation = guangya_workspace.load_directory_observation(observed.data["observation_ref"], owner="owner")
+        plan = guangya_fs_change.build_fs_change_plan(client, owner="owner", observation=observation,
+            operations=[{"op": "create_directory", "parent_path": "/target", "name": "new"}], trigger_strm=False)
+        guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
+        verify = guangya_fs_change._verify_after
+        identities = []
+
+        def flaky(client, item, created_id="", **kwargs):
+            identities.append(created_id)
+            if len(identities) == 1:
+                raise TimeoutError("readback timeout")
+            return verify(client, item, created_id, **kwargs)
+
+        with mock.patch.object(guangya_fs_change, "_verify_after", side_effect=flaky):
+            result = guangya_fs_change.execute_fs_change_plan(self._queued_payload(plan), client_factory=lambda: client)
+        self.assertFalse(result["partial"])
+        self.assertEqual(identities, ["created-1", "created-1"])
+        self.assertEqual(result["operation_items"][0]["status"], "completed")
+        self.assertNotIn("created-1", json.dumps(result))
+
     def test_journal_failure_after_remote_write_returns_manual_partial(self):
         client = FakeGatewayClient()
         plan = self._confirmed_plan(
@@ -2382,6 +2459,12 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             result = guangya_fs_change.execute_fs_change_plan(self._queued_payload(plan), client_factory=lambda: client)
         self.assertTrue(result['partial'])
         self.assertEqual(result['stats']['moved'], 1, '独立作品仍可以完成')
+        outcomes = result['operation_items']
+        self.assertEqual(len(outcomes), plan['stats']['total'])
+        self.assertEqual(sum(row['status'] == 'completed' for row in outcomes), 1)
+        self.assertEqual(sum(row['status'] == 'blocked' for row in outcomes), 3)
+        self.assertEqual(sum(row['status'] == 'failed' for row in outcomes), 1)
+        self.assertTrue(all(row.get('reason') == 'dependency_failed' for row in outcomes if row['status'] == 'blocked'))
         self.assertEqual(client.file_info('video').parent_id, 'leaf')
         self.assertEqual(client.file_info('work').parent_id, 'source')
         self.assertTrue(client.file_info('mid'))

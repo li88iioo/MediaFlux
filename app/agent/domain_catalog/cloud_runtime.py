@@ -5,42 +5,10 @@ from __future__ import annotations
 from typing import Any
 
 from app.agent.models import Evidence, ToolContext, ToolResult
+from app.repositories.organize_operation_jobs import sanitize_organize_operation_result
 
 from .shared import _bounded_int, _now, _safe_choice, _safe_timestamp
 
-_ALLOWED_STATS = frozenset(
-    {
-        "total",
-        "matched",
-        "need_confirm",
-        "moved",
-        "renamed",
-        "rename_failed",
-        "metadata_moved",
-        "stopped",
-        "skipped",
-        "conflict",
-        "failed",
-        "subtitle_moved",
-        "subtitle_skipped",
-        "replacement_cleanup_failed",
-        "empty_dir_cleanup_failed",
-        "source_dir_cleanup_failed",
-        "audit_failures",
-        "copied",
-        "relocated",
-        "created",
-        "trashed",
-        "strm_triggered",
-        "strm_trigger_failed",
-        "strm_scope_unknown",
-        "strm_trigger_skipped",
-        "quarantined",
-        "empty_deleted",
-        "verification_failed",
-        "precondition_failed",
-    }
-)
 _TASK_STATUSES = {
     "idle",
     "queued",
@@ -55,20 +23,24 @@ _TASK_STATUSES = {
 }
 
 
-def _safe_stats(raw: dict[str, Any]) -> dict[str, int]:
+def _safe_result(raw: dict[str, Any]) -> dict[str, Any]:
     stats = raw.get("stats")
-    if not stats and isinstance(raw.get("result"), dict):
-        result = raw["result"]
+    nested_result = raw.get("result")
+    if not stats and isinstance(nested_result, dict):
+        result = nested_result
         stats = result.get("stats")
         if not isinstance(stats, dict):
             stats = result.get("counters")
-    if not isinstance(stats, dict):
-        return {}
-    return {
-        key: _bounded_int(value)
-        for key, value in stats.items()
-        if key in _ALLOWED_STATS
-    }
+
+    payload: dict[str, Any] = {}
+    if isinstance(stats, dict):
+        payload["stats"] = {key: _bounded_int(value) for key, value in stats.items()}
+    if "operation_items" in raw:
+        payload["operation_items"] = raw["operation_items"]
+    elif isinstance(nested_result, dict) and "operation_items" in nested_result:
+        payload["operation_items"] = nested_result["operation_items"]
+
+    return sanitize_organize_operation_result(payload)
 
 
 def _project_guangya_status(
@@ -79,7 +51,8 @@ def _project_guangya_status(
 ) -> ToolResult:
     task_status = _safe_choice(raw.get("status"), _TASK_STATUSES, "idle")
     running = task_status in {"running", "stopping"}
-    stats = _safe_stats(raw)
+    safe_result = _safe_result(raw)
+    stats = safe_result.get("stats", {})
     schedule_raw = (
         overview.get("schedule") if isinstance(overview.get("schedule"), dict) else {}
     )
@@ -101,7 +74,7 @@ def _project_guangya_status(
         ok, status, summary = True, "queued", "光鸭整理操作正在排队"
         suggestions = ["任务会在当前整理操作结束后自动执行。"]
     elif task_status == "manual_review":
-        ok, status, summary = False, "attention", "光鸭操作在进程中断后需要人工核验"
+        ok, status, summary = False, "attention", "光鸭操作需要进一步核验"
         suggestions = ["请先核对光鸭目标目录，确认远端结果后再决定是否重新执行。"]
     elif task_status == "failed":
         ok, status, summary = False, "attention", "最近一次光鸭整理任务未成功"
@@ -138,7 +111,7 @@ def _project_guangya_status(
         if raw.get("error_code") == "GuangYaFSChangeStale":
             problems.append("冻结计划、凭据或对象状态已变化，本次变更未执行；请重新读取目录并生成预览")
         for key, description in (
-            ("precondition_failed", "项写前条件已变化，未执行"),
+            ("precondition_failed", "项写前核对未通过，未执行"),
             ("verification_failed", "项写后状态未核验通过，不能据此认定未执行，请勿直接重复提交"),
             ("audit_failures", "项执行审计未完整保存，需要核对实际状态"),
         ):
@@ -156,6 +129,8 @@ def _project_guangya_status(
         "finished_at": _safe_timestamp(raw.get("finished_at")),
         "stats": stats,
     }
+    if "operation_items" in safe_result:
+        task_data["operation_items"] = safe_result["operation_items"]
     if operation_ref:
         task_data["operation_ref"] = operation_ref
     return ToolResult(

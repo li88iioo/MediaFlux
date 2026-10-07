@@ -1234,6 +1234,7 @@ class OrganizeTaskManager:
                 operation, type(exc).__name__,
             )
             cancelled = isinstance(exc, OrganizeOperationCancelled)
+            safe_result = sanitize_organize_operation_result(getattr(exc, "operation_result", {}))
             error = "" if cancelled else (
                 public_error_message(exc)
                 if isinstance(exc, DirectoryScrapePublicError)
@@ -1243,7 +1244,7 @@ class OrganizeTaskManager:
             try:
                 persisted = finish_organize_operation_job(
                     task_id, expected_lease_generation=generation, status=terminal_status,
-                    error_code="" if cancelled else type(exc).__name__, error=error,
+                    error_code="" if cancelled else type(exc).__name__, error=error, result=safe_result,
                 )
             except Exception as persist_exc:
                 logger.warning(
@@ -1266,6 +1267,7 @@ class OrganizeTaskManager:
                         ),
                         "error": memory_error, "current_source": "",
                         "error_code": "" if cancelled else type(exc).__name__,
+                        **({"result": safe_result} if safe_result else {}),
                         "group_progress": {},
                         "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     })

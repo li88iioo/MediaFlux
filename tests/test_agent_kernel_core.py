@@ -274,6 +274,43 @@ class AgentKernelCrossLoopTests(unittest.TestCase):
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_confirmed_partial_file_plan_has_factual_answer_without_more_model_calls(self):
+        outcomes = [
+            {"position": 1, "operation": "rename", "label": "改名：A → A-done", "status": "completed", "completed_actions": ["rename"]},
+            {"position": 2, "operation": "relocate", "label": "移动并改名：dirty → target / clean", "status": "partial", "completed_actions": ["move"], "reason": "write_rejected"},
+            {"position": 3, "operation": "move", "label": "移动：B → archive", "status": "blocked", "completed_actions": [], "reason": "dependency_failed"},
+        ]
+        writes = []
+        tool = KernelToolSpec(name="cloud.change", domain="cloud", description="文件变更",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False}, effect=ToolEffect.WRITE,
+            prepare=lambda a, c: PreparedEffect(preview={"summary": "完整计划"}, snapshot_fingerprint="snapshot"),
+            execute_confirmed=lambda *args: writes.append(1) or ToolResult(False, "partial", "文件变更部分完成",
+                data={"total": 3, "stats": {"total": 3, "renamed": 1, "failed": 2}, "operation_items": outcomes}))
+        model = ScriptedModel([[ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("plan", "cloud.change", {})),
+                                ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]])
+        state, catalog = InMemorySessionStateStore(), ToolCatalog([tool])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+        approval = await consume_events(session.run(AgentInput(message="整理这三个目录", owner="owner", session_id="session")))
+        result = await consume_events(session.confirm(owner="owner", session_id="session", plan_id=approval.approval.plan_id))
+        self.assertEqual(result.status, "partial")
+        self.assertIn("1/总 3", result.answer)
+        self.assertIn("dirty", result.answer)
+        self.assertIn("移动", result.answer)
+        self.assertIn("依赖", result.answer)
+        self.assertNotIn("本轮未执行新的写操作", result.answer)
+        self.assertNotIn("可信系统结果", result.answer)
+        self.assertEqual(writes, [1])
+        self.assertEqual(len(model.requests), 1, "失败确认应交付已有事实，不再让模型猜测或重放写入")
+        history = await state.load(owner="owner", session_id="session")
+        self.assertEqual(history.conversation[-1]["content"], result.answer)
+        self.assertEqual(result.effect_result["data"]["operation_items"], outcomes)
+        from app.bot.agent_adapter import _render_turn
+        rendered = _render_turn(result)
+        self.assertEqual(rendered.count("计划结果"), 1, "TG 不能把事实回执重复追加一遍")
+        self.assertIn("dirty", rendered)
+        self.assertNotIn("可信系统结果", rendered)
+
     async def test_invalid_arguments_returns_registered_schema_only_to_model(self):
         for effect in (ToolEffect.READ, ToolEffect.WRITE):
             with self.subTest(effect=effect):

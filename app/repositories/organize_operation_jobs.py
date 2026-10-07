@@ -12,6 +12,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from app.agent.public_safety import sanitize_resource_title
 from app.modules.web_secret import get_web_secret
 from app.repositories.agent_jobs import agent_job_owner_digest
 
@@ -33,6 +34,8 @@ _MANUAL_REVIEW_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_ACTIVE_PER_OWNER = 4
 _MAX_ACTIVE_GLOBAL = 128
 _DEFAULT_TTL_SECONDS = 3_600
+_MAX_OPERATION_ITEMS = 400
+_MAX_OPERATION_LABEL_BYTES = 128
 _ALLOWED_RESULT_STATS = {
     "total", "matched", "need_confirm", "moved", "relocated", "renamed", "rename_failed",
     "metadata_moved", "stopped", "skipped", "conflict", "failed",
@@ -42,7 +45,17 @@ _ALLOWED_RESULT_STATS = {
     "quarantined", "empty_deleted", "verification_failed",
     "precondition_failed", "trashed", "created", "copied",
 }
-
+_ALLOWED_OPERATION_ITEM_OPS = {
+    "rename", "move", "relocate", "copy", "trash", "create_directory",
+}
+_ALLOWED_OPERATION_ITEM_STATUSES = {
+    "completed", "partial", "failed", "blocked", "not_started", "unknown",
+}
+_ALLOWED_OPERATION_ITEM_REASONS = {
+    "precondition_failed", "dependency_failed", "write_rejected",
+    "verification_pending", "write_outcome_unknown", "execution_error",
+    "audit_unavailable", "cancelled",
+}
 logger = logging.getLogger(__name__)
 
 
@@ -115,19 +128,106 @@ def _safe_json(value: object, *, field: str) -> str:
     return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _truncate_operation_label(value: str, limit: int) -> str:
+    # 计入 JSON 转义成本；128 个双引号不能按 128 字节算，避免 400 项写回超限。
+    if len(json.dumps(value, ensure_ascii=False).encode("utf-8")) - 2 <= limit:
+        return value
+    units = [(char, len(json.dumps(char, ensure_ascii=False).encode("utf-8")) - 2) for char in value]
+    marker = "..."
+    remaining = limit - len(marker.encode("utf-8"))
+    head, tail = [], []
+    head_budget = remaining // 2
+    for char, size in units:
+        if size > head_budget:
+            break
+        head.append(char)
+        head_budget -= size
+    tail_budget = remaining - (remaining // 2 - head_budget)
+    for char, size in reversed(units):
+        if size > tail_budget:
+            break
+        tail.append(char)
+        tail_budget -= size
+    return "".join(head) + marker + "".join(reversed(tail))
+
+
+def _sanitize_operation_item_label(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = sanitize_resource_title(value, limit=600)
+    return _truncate_operation_label(text, _MAX_OPERATION_LABEL_BYTES)
+
+
+def _sanitize_operation_items(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for row in value[:_MAX_OPERATION_ITEMS]:
+        if not isinstance(row, dict):
+            continue
+        position = row.get("position")
+        op = row.get("operation")
+        status = row.get("status")
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or not 1 <= position <= _MAX_OPERATION_ITEMS
+            or not isinstance(op, str)
+            or op not in _ALLOWED_OPERATION_ITEM_OPS
+            or not isinstance(status, str)
+            or status not in _ALLOWED_OPERATION_ITEM_STATUSES
+        ):
+            continue
+
+        completed_actions = row.get("completed_actions")
+        if completed_actions is not None and not isinstance(completed_actions, list):
+            continue
+        if isinstance(completed_actions, list) and len(completed_actions) > 2:
+            continue
+        if isinstance(completed_actions, list) and any(
+            not isinstance(action, str) or action not in _ALLOWED_OPERATION_ITEM_OPS
+            for action in completed_actions
+        ):
+            continue
+
+        item: dict[str, Any] = {
+            "position": position,
+            "operation": op,
+            "status": status,
+        }
+        label = _sanitize_operation_item_label(row.get("label"))
+        if label:
+            item["label"] = label
+        if isinstance(completed_actions, list):
+            item["completed_actions"] = completed_actions
+        reason = row.get("reason")
+        if isinstance(reason, str) and reason in _ALLOWED_OPERATION_ITEM_REASONS:
+            item["reason"] = reason
+        items.append(item)
+    return items
+
+
 def sanitize_organize_operation_result(value: object) -> dict[str, Any]:
-    """持久化/公开状态只保留固定聚合计数，丢弃目录与执行标识。"""
-    if not isinstance(value, dict) or not isinstance(value.get("stats"), dict):
+    """仅保留安全统计与有界、脱敏的逐项执行回执。"""
+    if not isinstance(value, dict):
         return {}
     stats: dict[str, int | float] = {}
-    for key, raw in value["stats"].items():
-        if str(key) not in _ALLOWED_RESULT_STATS or isinstance(raw, bool):
-            continue
-        if isinstance(raw, int):
-            stats[str(key)] = max(0, raw)
-        elif isinstance(raw, float):
-            stats[str(key)] = max(0.0, round(raw, 3))
-    return {"stats": stats}
+    raw_stats = value.get("stats")
+    if isinstance(raw_stats, dict):
+        for key, raw in raw_stats.items():
+            if str(key) not in _ALLOWED_RESULT_STATS or isinstance(raw, bool):
+                continue
+            if isinstance(raw, int):
+                stats[str(key)] = max(0, raw)
+            elif isinstance(raw, float):
+                stats[str(key)] = max(0.0, round(raw, 3))
+
+    result: dict[str, Any] = {}
+    if isinstance(raw_stats, dict):
+        result["stats"] = stats
+    if "operation_items" in value:
+        result["operation_items"] = _sanitize_operation_items(value["operation_items"])
+    return result
 
 
 def organize_operation_public_ref(job_id: str) -> str:
