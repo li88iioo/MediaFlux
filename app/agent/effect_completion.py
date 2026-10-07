@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import time
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from app.agent.models import ToolContext, ToolReference, ToolResult
+from app.agent.models import Evidence, ToolContext, ToolReference, ToolResult
 from app.agent.public_safety import sanitize_public_text
+
+if TYPE_CHECKING:
+    from cryptography.fernet import Fernet
+    from app.agent.kernel.state import PublicationLease, SessionState, SessionStateStore
 
 _GY_OPERATION_REF_RE = re.compile(r"GY-(?:[0-9A-F]{4}-){7}[0-9A-F]{4}")
 _WAITABLE_STATUSES = frozenset(
@@ -18,6 +25,10 @@ _WAITABLE_STATUSES = frozenset(
 )
 _WAIT_TIMEOUT_SECONDS = 30 * 60
 _WAIT_INTERVAL_SECONDS = 1.0
+_EFFECT_POLL_SECONDS = 10.0
+_EFFECT_RETENTION_SECONDS = 24 * 60 * 60
+_EFFECT_WAITS_KEY = "effect_waits"
+_EFFECT_NEXT_POLL_KEY = "effect_next_poll_at"
 _TRACKER_KEY = "completion"
 _TRACKER_KINDS = frozenset(
     {
@@ -85,6 +96,16 @@ _STRM_STAT_FIELDS = frozenset(
         "scan_workers_configured",
     }
 )
+
+
+@dataclass(frozen=True)
+class EffectCompletionScope:
+    """确认管道注入的原会话范围，不来自模型参数。"""
+
+    store: SessionStateStore
+    lease: PublicationLease
+    plan_id: str
+    channel: str = "api"
 
 
 @dataclass(frozen=True)
@@ -588,6 +609,306 @@ def _terminal_result(
     )
 
 
+def _completion_cipher() -> Fernet:
+    from cryptography.fernet import Fernet
+    from app.modules.web_secret import get_web_secret
+
+    secret = str(get_web_secret() or "")
+    if not secret:
+        raise ValueError("Agent 回执持久化密钥不可用")
+    key = hashlib.sha256(b"mediaflux-agent-effect-wait:v1\0" + secret.encode()).digest()
+    return Fernet(base64.urlsafe_b64encode(key))
+
+
+def _next_effect_poll(state: SessionState) -> None:
+    waits = state.metadata.get(_EFFECT_WAITS_KEY) or {}
+    due = [float(row["next_poll_at"]) for row in waits.values() if not row.get("delivered")]
+    if due:
+        state.metadata[_EFFECT_NEXT_POLL_KEY] = min(due)
+    else:
+        state.metadata.pop(_EFFECT_NEXT_POLL_KEY, None)
+
+
+def _effect_seed(result: ToolResult, tracker: _CompletionTracker, tool: str,
+                 scope: EffectCompletionScope) -> dict[str, Any]:
+    from app.agent.kernel.projection import DefaultProjector
+
+    return {
+        "owner": scope.lease.owner, "session_id": scope.lease.session_id,
+        "request_id": scope.lease.request_id, "turn_id": scope.lease.turn_id,
+        "plan_id": scope.plan_id, "channel": scope.channel, "tool": str(tool),
+        "tracker": {"kind": tracker.kind, "value": tracker.value},
+        "result": dict(DefaultProjector().project(result).public_content),
+    }
+
+
+def _seed_result(seed: Mapping[str, Any]) -> ToolResult:
+    value = seed["result"]
+    return ToolResult(
+        bool(value["ok"]), str(value["status"]), str(value["summary"]),
+        data=dict(value.get("data") or {}),
+        evidence=[Evidence(**item) for item in value.get("evidence") or []],
+        suggestions=list(value.get("suggestions") or []), error=str(value.get("error") or ""),
+    )
+
+
+async def _register_effect_wait(result: ToolResult, tracker: _CompletionTracker, tool: str,
+                                scope: EffectCompletionScope) -> None:
+    from app.agent.kernel.state import StalePublicationError, publication_matches
+
+    now = time.time()
+    sealed = _completion_cipher().encrypt(json.dumps(
+        _effect_seed(result, tracker, tool, scope), ensure_ascii=False, allow_nan=False,
+        separators=(",", ":"),
+    ).encode()).decode()
+    def register(state):
+        if not publication_matches(scope.lease, generation=state.generation,
+                                   confirmed=state.metadata.get("confirmed_publication")):
+            raise StalePublicationError("确认回合已变化，未注册新的结果跟踪")
+        waits = state.metadata.setdefault(_EFFECT_WAITS_KEY, {})
+        if scope.plan_id not in waits:
+            waits[scope.plan_id] = {
+                "sealed": sealed, "created_at": now, "expires_at": now + _EFFECT_RETENTION_SECONDS,
+                "next_poll_at": now + _EFFECT_POLL_SECONDS, "delivered": False,
+                "state": "pending", "last_status": "", "read_errors": 0,
+            }
+        _next_effect_poll(state)
+        return True
+    registered = await scope.store.update_effect_state(owner=scope.lease.owner,
+        session_id=scope.lease.session_id, change=register)
+    if registered is not True:
+        raise StalePublicationError("原会话已清理，未重建结果跟踪")
+
+
+async def _record_effect_observation(
+    scope: EffectCompletionScope | None, *, status: str, final: ToolResult | None = None,
+    due_now: bool = False,
+) -> None:
+    if scope is None:
+        return
+    from app.agent.kernel.projection import DefaultProjector
+
+    def update(state):
+        row = (state.metadata.get(_EFFECT_WAITS_KEY) or {}).get(scope.plan_id)
+        if row is None:
+            return False
+        row["last_status"] = str(status or "unknown")
+        row["next_poll_at"] = time.time() + (0 if due_now else _EFFECT_POLL_SECONDS)
+        if final is not None:
+            row.update(state="terminal", final_result=dict(DefaultProjector().project(final).public_content),
+                       foreground_final=True)
+        _next_effect_poll(state)
+        return True
+    updated = await scope.store.update_effect_state(owner=scope.lease.owner,
+        session_id=scope.lease.session_id, change=update)
+    if updated is not True:
+        raise asyncio.CancelledError("原会话结果跟踪已清理")
+
+
+async def remember_effect_receipt(store, *, owner, session_id, plan_id, message):
+    """先保存投影后的完整回执模板，再写会话，崩溃后仍能补回opaque refs等投影。"""
+    def remember(state):
+        row = (state.metadata.get(_EFFECT_WAITS_KEY) or {}).get(plan_id)
+        if row and row.get("state") == "terminal":
+            row["receipt_template"] = dict(message)
+            return True
+        return False
+    return await store.update_effect_state(owner=owner, session_id=session_id, change=remember)
+
+
+async def acknowledge_effect_receipt(store, *, owner, session_id, plan_id):
+    """仅在前台终态会话已落盘后清理等待记录；超时的占位回执不能ACK。"""
+    def acknowledge(state):
+        waits = state.metadata.get(_EFFECT_WAITS_KEY) or {}
+        row = waits.get(plan_id)
+        if row and row.get("state") == "terminal" and row.get("foreground_final"):
+            waits.pop(plan_id)
+            _next_effect_poll(state)
+            return True
+        return False
+    return await store.update_effect_state(owner=owner, session_id=session_id, change=acknowledge)
+
+
+def _effect_reply_key(seed: Mapping[str, Any]) -> str:
+    from app.agent.kernel.persistence import SQLiteKernelStore
+
+    owner, session = SQLiteKernelStore()._scope(seed["owner"], seed["session_id"])
+    plan = hashlib.sha256(seed["plan_id"].encode()).hexdigest()
+    return f"agent-effect:{owner}:{session}:{plan}"
+
+
+def agent_effect_reply_is_current(event_key: str) -> bool:
+    """Outbox 投递前核对签名会话，删除/重置后的迟到通知不再发送。"""
+    from app import database as db
+    from app.agent.kernel.persistence import SQLiteKernelStore
+
+    match = re.fullmatch(
+        r"tg:event:agent:agent-effect:([0-9a-f]{64}):([0-9a-f]{64}):([0-9a-f]{64}):[0-9a-f]{16}",
+        str(event_key),
+    )
+    if match is None:
+        return False
+    owner, session, plan = match.groups()
+    with db.get_conn() as conn:
+        row = conn.execute(
+            "SELECT generation,state_json,state_hmac FROM agent_kernel_sessions "
+            "WHERE owner_digest=? AND session_digest=?", (owner, session),
+        ).fetchone()
+    if row is None:
+        return False
+    try:
+        payload = SQLiteKernelStore()._decode(
+            row["state_json"], row["state_hmac"],
+            domain=f"state:v1:{owner}:{session}:{row['generation']}".encode(), expected_type=dict,
+        )
+    except (ValueError, TypeError):
+        return False
+    return any(
+        hashlib.sha256(str(message.get("completion_receipt_id") or "").encode()).hexdigest() == plan
+        for message in payload.get("conversation") or []
+    )
+
+
+def _late_receipt(seed: Mapping[str, Any], public_result: Mapping[str, Any]) -> dict[str, Any]:
+    from app.agent.kernel.model import ModelMessage
+    from app.agent.public_view import _CONFIRMED_RESULT_MARKER, format_public_result
+
+    message = ModelMessage(
+        role="assistant", tool_name=seed["tool"], effect_plan_id=seed["plan_id"],
+        completion_receipt_id=seed["plan_id"],
+        content=_CONFIRMED_RESULT_MARKER + "\n" + json.dumps(public_result, ensure_ascii=False),
+    ).to_dict()
+    message["public_content"] = format_public_result(public_result)
+    return message
+
+
+def _enqueue_late_receipt(seed: Mapping[str, Any], message: Mapping[str, Any]) -> bool:
+    from app.modules.telegram_notification_center import publish_agent_interaction_reply
+    from app.notifier import NotificationEvent
+
+    if seed["channel"] != "telegram":
+        return True
+    match = re.fullmatch(r"tg:v1:(-?[0-9]+)\x1f[0-9]+", seed["owner"])
+    if match is None:
+        # 只保留会话回执，不把无法确定接收人的交互回复发到默认通知群。
+        return True
+    published = publish_agent_interaction_reply(
+        _effect_reply_key(seed), NotificationEvent(
+            title="已确认任务的后续结果", lines=(message["public_content"],),
+        ), chat_id=match.group(1), deliver_now=False,
+    )
+    # 用户关闭 TG Agent 时不排队补发旧交互，但 Web/历史中的任务事实仍保留。
+    return bool(published) or published.status == "disabled"
+
+
+async def poll_effect_receipts(
+    store: SessionStateStore, *, cancelled: Callable[[], bool] = lambda: False, limit: int = 16,
+) -> int:
+    """复用现有调度器读取已提交任务；不调用 execute、不创建新确认或模型回合。"""
+    from app.agent.kernel.projection import DefaultProjector
+    from app.agent.kernel.state import SessionBusyError, merge_effect_receipts
+    from app.logger import get_logger
+    import secrets
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def follow(record):
+        async with semaphore:
+            if cancelled():
+                return 0
+            try:
+                seed = json.loads(_completion_cipher().decrypt(record["sealed"].encode()))
+                if seed["plan_id"] != record["plan_id"]:
+                    return 0
+                plan_id, claim_id = seed["plan_id"], secrets.token_hex(12)
+                scope = {"owner": seed["owner"], "session_id": seed["session_id"]}
+
+                def claim(state):
+                    row = (state.metadata.get(_EFFECT_WAITS_KEY) or {}).get(plan_id)
+                    if (not row or row.get("sealed") != record["sealed"] or row.get("delivered")
+                            or float(row["next_poll_at"]) > time.time()):
+                        return None
+                    row.update(claim_id=claim_id, next_poll_at=time.time() + 60)
+                    _next_effect_poll(state)
+                    return dict(row)
+
+                current = await store.update_effect_state(**scope, change=claim)
+                if current is None:
+                    return 0
+                final = current.get("final_result")
+                status = current.get("last_status", "unknown")
+                errors = int(current.get("read_errors", 0))
+                if final is None and not cancelled():
+                    tracker = _CompletionTracker(**seed["tracker"])
+                    result = _seed_result(seed)
+                    try:
+                        snapshot, status, task = await asyncio.wait_for(
+                            _poll(tracker, ToolContext(**scope, request_id=seed["request_id"],
+                                                       cancelled=cancelled)), timeout=15,
+                        )
+                        errors = 0
+                        if status in _TERMINAL_STATUSES[tracker.kind]:
+                            final = dict(DefaultProjector().project(
+                                _terminal_result(result, snapshot, status, task, tracker),
+                            ).public_content)
+                    except (LookupError, ValueError):
+                        # 失效/被清理的稳定引用不可改查最近任务，也不可无限重试。
+                        current["expires_at"] = 0
+                    except Exception:  # noqa: BLE001 - 读取失败不改变任务本身状态
+                        errors += 1
+                    if final is None and time.time() >= float(current["expires_at"]):
+                        final = dict(DefaultProjector().project(ToolResult(
+                            False, "outcome_unknown", "后台任务结果仍无法核验，自动跟踪已结束",
+                            data={"original_summary": result.summary},
+                            suggestions=["请核对原任务状态；未确认结果前不要重复提交。"],
+                        )).public_content)
+                if cancelled():
+                    return 0
+
+                def save(state):
+                    waits = state.metadata.get(_EFFECT_WAITS_KEY) or {}
+                    row = waits.get(plan_id)
+                    if not row or row.get("claim_id") != claim_id:
+                        return None
+                    row.update(last_status=status, read_errors=errors,
+                               next_poll_at=time.time() + min(60, _EFFECT_POLL_SECONDS * (errors + 1)))
+                    if final is None:
+                        _next_effect_poll(state)
+                        return None
+                    template = row.get("receipt_template")
+                    if row.get("foreground_final") and template and template in state.conversation:
+                        waits.pop(plan_id)
+                        _next_effect_poll(state)
+                        return None
+                    message = template or _late_receipt(seed, final)
+                    row.update(state="terminal", final_result=final, receipt_message=message)
+                    state.conversation = merge_effect_receipts(state.conversation, state.metadata)[-80:]
+                    _next_effect_poll(state)
+                    return message
+
+                message = await store.update_effect_state(**scope, change=save)
+                if message is None or cancelled():
+                    return 0
+                # 先保存会话回执，再交给同一个 outbox；崩溃重试沿用相同幂等键。
+                if not await asyncio.to_thread(_enqueue_late_receipt, seed, message):
+                    return 0
+
+                def delivered(state):
+                    row = (state.metadata.get(_EFFECT_WAITS_KEY) or {}).get(plan_id)
+                    if row and row.get("claim_id") == claim_id:
+                        row["delivered"] = True  # 已交付会话/outbox，不等同远端已收到。
+                        _next_effect_poll(state)
+                await store.update_effect_state(**scope, change=delivered)
+                return 1
+            except SessionBusyError:
+                return 0  # 活跃确认持锁时让路，不抢占用户操作。
+            except Exception as exc:  # noqa: BLE001 - 单个损坏跟踪记录不阻塞其它会话
+                get_logger(__name__).warning("Agent 后续回执核验暂未完成 type=%s", type(exc).__name__)
+                return 0
+
+    return sum(await asyncio.gather(*(follow(row) for row in await store.due_effect_waits(limit=limit))))
+
+
 async def wait_for_effect_completion(
     result: ToolResult,
     *,
@@ -595,6 +916,7 @@ async def wait_for_effect_completion(
     context: ToolContext,
     report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     timeout_seconds: float = _WAIT_TIMEOUT_SECONDS,
+    scope: EffectCompletionScope | None = None,
 ) -> ToolResult:
     """追踪有稳定句柄的后台写操作；纯提交结果原样交给公开语义层。"""
     status = str(result.status or "").strip().casefold()
@@ -602,6 +924,8 @@ async def wait_for_effect_completion(
     if not result.ok or status not in _WAITABLE_STATUSES or tracker is None:
         return result
 
+    if scope is not None:
+        await _register_effect_wait(result, tracker, tool, scope)
     active_statuses = _ACTIVE_STATUSES[tracker.kind]
     terminal_statuses = _TERMINAL_STATUSES[tracker.kind]
     label = sanitize_public_text(result.summary, limit=120) or "后台任务"
@@ -648,6 +972,13 @@ async def wait_for_effect_completion(
                 ]
             )
         )
+        if scope is not None:
+            data["background_job"]["followup_pending"] = True
+            return replace(result, ok=True, status="running",
+                summary=(f"{label}仍在后台执行，完成后会自动回报" if job_status in active_statuses
+                         else f"{label}状态暂未确认，后台将继续核验并回报"),
+                data=data, model_data=_background_model_data(result, data),
+                suggestions=["无需再次确认或重复提交；系统会继续跟踪这个已提交任务。"], error="")
         return replace(
             result,
             ok=False,
@@ -668,6 +999,8 @@ async def wait_for_effect_completion(
     last_status = ""
     last_snapshot: ToolResult | None = None
     last_task: dict[str, Any] = {}
+    failures = 0
+    last_saved = loop.time()
     while True:
         if context.cancelled():
             raise asyncio.CancelledError
@@ -675,14 +1008,24 @@ async def wait_for_effect_completion(
             snapshot, task_status, task = await _poll(tracker, context)
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - 查询异常只能安全降级为未知
+        except Exception as exc:  # noqa: BLE001 - 仅重读状态，不重放写操作。
+            failures += 1
+            remaining = deadline - loop.time()
+            if not isinstance(exc, (LookupError, ValueError)) and failures < 3 and remaining > 0:
+                await asyncio.sleep(min(_WAIT_INTERVAL_SECONDS, remaining))
+                continue
+            await _record_effect_observation(scope, status=last_status, due_now=True)
             return unknown(last_status, last_snapshot, last_task)
 
+        failures = 0
         last_snapshot, last_task = snapshot, task
         if task_status in terminal_statuses:
             await report(snapshot, task_status)
-            return _terminal_result(result, snapshot, task_status, task, tracker)
+            final = _terminal_result(result, snapshot, task_status, task, tracker)
+            await _record_effect_observation(scope, status=task_status, final=final)
+            return final
         if task_status not in active_statuses:
+            await _record_effect_observation(scope, status=task_status, due_now=True)
             return unknown(
                 last_status
                 or ("unknown" if task_status in {"", "empty", "idle"} else task_status),
@@ -690,9 +1033,13 @@ async def wait_for_effect_completion(
                 task,
             )
 
+        if task_status != last_status or loop.time() - last_saved >= _EFFECT_POLL_SECONDS:
+            await _record_effect_observation(scope, status=task_status)
+            last_saved = loop.time()
         last_status = task_status
         await report(snapshot, task_status)
         remaining = deadline - loop.time()
         if remaining <= 0:
+            await _record_effect_observation(scope, status=last_status, due_now=True)
             return unknown(last_status, snapshot, task, timed_out=True)
         await asyncio.sleep(min(_WAIT_INTERVAL_SECONDS, remaining))

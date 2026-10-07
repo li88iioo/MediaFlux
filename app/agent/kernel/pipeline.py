@@ -72,6 +72,8 @@ class ToolCallContext:
     capability_search: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     selection_arguments: Mapping[str, Any] | None = None
     resource_candidate_ref: str = ""
+    channel: str = "api"
+    completion_scope: Any = None
 
     def policy_context(self) -> dict[str, Any]:
         return {
@@ -655,6 +657,12 @@ class ToolPipeline:
                 protection=context,
             )
             if tool.verify is not None:
+                from app.agent.effect_completion import EffectCompletionScope
+
+                context = replace(context, completion_scope=EffectCompletionScope(
+                    store=self.state_store, lease=context.lease,
+                    plan_id=plan.plan_id, channel=context.channel,
+                ))
                 verified = await _invoke(
                     tool.verify,
                     resolved_arguments,

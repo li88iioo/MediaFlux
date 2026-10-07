@@ -20,20 +20,36 @@ from app.modules.web_secret import get_web_secret
 
 from .events import AgentEvent
 from .references import OpaqueReference, ReferenceError
-from .session_guard import guarded_state_call, session_scope_guard, session_io
+from .session_guard import guarded_state_call, session_io, session_scope_guard
 from .state import (
-    SessionBusyError,
-    SelectionInvalidError,
-    candidate_metadata_only,
-    publication_matches,
-    publication_commit_matches,
     CandidateSelectionGuard,
     PublicationLease,
+    SelectionInvalidError,
+    SessionBusyError,
     SessionState,
     StalePublicationError,
     StateUpdate,
+    _apply_effect_state_change,
+    _consume_delivered_effect_receipts,
+    _effect_time_is_due,
+    candidate_metadata_only,
+    merge_effect_receipts,
+    publication_commit_matches,
+    publication_matches,
 )
 from .ux_display import session_display_patch, session_summary
+
+_EFFECT_NEXT_POLL_AT_SQL = (
+    "CASE WHEN json_valid(state_json) THEN "
+    "json_extract(state_json,'$.metadata.effect_next_poll_at') END"
+)
+_DUE_EFFECT_WAITS_SQL = (
+    "SELECT owner_digest,session_digest,generation,state_json,state_hmac "
+    "FROM agent_kernel_sessions "
+    f"WHERE {_EFFECT_NEXT_POLL_AT_SQL} <= ? "
+    f"ORDER BY {_EFFECT_NEXT_POLL_AT_SQL} LIMIT ?"
+)
+
 
 class SQLiteKernelStore:
     """统一 state/ref/event 持久化接口；表结构由 database.init_db 管理。"""
@@ -98,6 +114,23 @@ class SQLiteKernelStore:
             if candidate_metadata_only(conversation, updates):
                 raise SelectionInvalidError("选择状态正在更新，请稍后使用当前按钮。") from exc
             raise StalePublicationError("session is protected by another operation") from exc
+
+    async def update_effect_state(
+        self, *, owner: str, session_id: str,
+        change: Callable[[SessionState], Any],
+    ) -> Any:
+        return await guarded_state_call(
+            owner,
+            session_id,
+            self._update_effect_state_sync,
+            owner,
+            session_id,
+            change,
+            kind="commit",
+        )
+
+    async def due_effect_waits(self, *, limit: int = 16) -> list[dict[str, Any]]:
+        return await session_io(self._due_effect_waits_sync, limit)
 
     async def load(self, *, owner: str, session_id: str) -> SessionState:
         return await session_io(self._load_sync, owner, session_id)
@@ -439,6 +472,7 @@ class SQLiteKernelStore:
             state = self._load_row(conn, owner, session_id)
             if selection_guard is not None:
                 selection_guard.check(state)
+            _consume_delivered_effect_receipts(state)
             owner_digest, session_digest = self._scope(owner, session_id)
             state.generation = max(
                 state.generation,
@@ -487,12 +521,73 @@ class SQLiteKernelStore:
             if not publication_commit_matches(lease, state, conversation, updates):
                 raise StalePublicationError("turn no longer owns publication authority")
             if conversation is not None:
-                state.conversation = deepcopy([dict(item) for item in conversation])[
-                    -80:
-                ]
+                state.conversation = merge_effect_receipts(
+                    conversation, state.metadata,
+                )[-80:]
             state.apply(updates)
             self._write_state(conn, state)
         return state.clone()
+
+    def _update_effect_state_sync(
+        self, owner: str, session_id: str,
+        change: Callable[[SessionState], Any],
+    ) -> Any:
+        owner_digest, session_digest = self._scope(owner, session_id)
+        with session_scope_guard(owner, session_id, kind="commit"), db.get_conn() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT 1 FROM agent_kernel_sessions "
+                "WHERE owner_digest=? AND session_digest=?",
+                (owner_digest, session_digest),
+            ).fetchone()
+            if row is None:
+                return None
+            current = self._load_row(conn, owner, session_id)
+            updated, result, changed = _apply_effect_state_change(current, change)
+            if changed:
+                self._write_state(conn, updated)
+        return result
+
+    def _due_effect_waits_sync(self, limit: int = 16) -> list[dict[str, Any]]:
+        maximum = max(0, int(limit))
+        if not maximum:
+            return []
+        now = self._clock()
+        due: list[tuple[float, str, dict[str, Any]]] = []
+        with db.get_conn() as conn:
+            rows = conn.execute(_DUE_EFFECT_WAITS_SQL, (now, maximum)).fetchall()
+            for row in rows:
+                owner_digest = str(row["owner_digest"])
+                session_digest = str(row["session_digest"])
+                generation = int(row["generation"])
+                try:
+                    payload = self._decode(
+                        row["state_json"],
+                        row["state_hmac"],
+                        domain=f"state:v1:{owner_digest}:{session_digest}:{generation}".encode(),
+                        expected_type=dict,
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                metadata = payload.get("metadata")
+                if not isinstance(metadata, Mapping) or not _effect_time_is_due(
+                    metadata.get("effect_next_poll_at"), now,
+                ):
+                    continue
+                waits = metadata.get("effect_waits")
+                if not isinstance(waits, Mapping):
+                    continue
+                for plan_id, record in waits.items():
+                    if (
+                        not isinstance(record, Mapping)
+                        or not _effect_time_is_due(record.get("next_poll_at"), now)
+                    ):
+                        continue
+                    item = deepcopy(dict(record))
+                    item["plan_id"] = plan_id
+                    due.append((float(record["next_poll_at"]), str(plan_id), item))
+        due.sort(key=lambda item: (item[0], item[1]))
+        return [item[2] for item in due[:maximum]]
 
     def _load_sync(self, owner: str, session_id: str) -> SessionState:
         with db.get_conn() as conn:

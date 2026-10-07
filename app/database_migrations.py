@@ -1549,6 +1549,17 @@ def _migrate_download_display_title_v32(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_download_log_request_source_id ON download_log(request_id, source, id DESC)")
 
 
+def _migrate_agent_kernel_effect_next_poll_index_v33(
+    conn: sqlite3.Connection,
+) -> None:
+    """为待轮询会话添加与 due 查询一致的 JSON 表达式索引。"""
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_kernel_effect_next_poll_at "
+        "ON agent_kernel_sessions (CASE WHEN json_valid(state_json) THEN "
+        "json_extract(state_json,'$.metadata.effect_next_poll_at') END)"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1582,4 +1593,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     29: _migrate_episode_research_cache_v30,
     30: _migrate_recognition_format_rules_v31,
     31: _migrate_download_display_title_v32,
+    32: _migrate_agent_kernel_effect_next_poll_index_v33,
 }

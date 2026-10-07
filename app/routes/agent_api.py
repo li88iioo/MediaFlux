@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 import hashlib
 import hmac
 import logging
@@ -461,6 +462,12 @@ async def get_session(request: Request, session_id: str):
             state=state, store=runtime.store,
         )
         messages = public_conversation_messages(state.conversation, candidate_view=candidate_view)
+        effect_waits = getattr(state, "metadata", {}).get("effect_waits", {})
+        wait_records = effect_waits.values() if isinstance(effect_waits, Mapping) else ()
+        pending_effect_count = sum(
+            not wait.get("delivered") and not wait.get("receipt_message")
+            for wait in wait_records
+        )
         pending_approval = None
         pending_plan_id = state.pending_effect_plan_id
         if pending_plan_id and not (active_turn and active_turn["protected"]):
@@ -482,6 +489,7 @@ async def get_session(request: Request, session_id: str):
                 "pending_approval": pending_approval,
                 "candidate_view": candidate_view,
                 "active_turn": active_turn,
+                "pending_effect_count": pending_effect_count,
                 "last_turn": _last_turn_view(
                     [event for event in events if not observed_request or event.get("request_id") == observed_request],
                     active_turn,

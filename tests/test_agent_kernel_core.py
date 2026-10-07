@@ -26,17 +26,23 @@ from app.agent.kernel.model import (
 from app.agent.kernel.pipeline import ToolCallContext, ToolPipeline, ToolPipelineError
 from app.agent.kernel.projection import ReferenceValue, ToolOutcome
 from app.agent.kernel.provider_model import ModelProviderError
-from app.agent.kernel.session import AgentSession, SessionLimits, _provider_failure_message
+from app.agent.kernel.session import (
+    AgentSession,
+    SessionLimits,
+    _provider_failure_message,
+)
 from app.agent.kernel.state import (
     AgentInput,
     CancellationToken,
     InMemorySessionStateStore,
-    StalePublicationError,
     PublicationLease,
+    StalePublicationError,
+    StateUpdate,
     TurnCoordinator,
+    merge_effect_receipts,
 )
-from app.agent.models import ToolReference, ToolResult
 from app.agent.model_context_budget import bounded_model_messages, compact_tool_content
+from app.agent.models import ToolReference, ToolResult
 
 
 class ScriptedModel:
@@ -94,6 +100,164 @@ def _run_thread(coroutine_factory, errors: list[BaseException]) -> None:
         asyncio.run(coroutine_factory(), debug=True)
     except BaseException as exc:  # pragma: no cover - 仅用于线程错误回传
         errors.append(exc)
+
+
+class InMemoryEffectStateStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_effect_rmw_uses_latest_generation_and_preserves_pending_plan(self) -> None:
+        store = InMemorySessionStateStore()
+        first, _ = await store.begin_turn(
+            owner="owner", session_id="session", request_id="first",
+        )
+        await store.commit(
+            first,
+            conversation=[{"role": "user", "content": "最新用户消息"}],
+            updates=(StateUpdate("pending_effect_plan_id", "pending-plan"),),
+        )
+        second, _ = await store.begin_turn(
+            owner="owner", session_id="session", request_id="second",
+        )
+        observed = []
+
+        def change(state):
+            observed.append((state.generation, state.pending_effect_plan_id,
+                             state.conversation[-1]["content"]))
+            state.generation += 100
+            state.pending_effect_plan_id = "wrong-plan"
+            state.metadata["effect_marker"] = "claimed"
+            return "updated"
+
+        self.assertEqual(
+            await store.update_effect_state(
+                owner="owner", session_id="session", change=change,
+            ),
+            "updated",
+        )
+        latest = await store.load(owner="owner", session_id="session")
+        self.assertEqual(observed, [(second.generation, "pending-plan", "最新用户消息")])
+        self.assertEqual(latest.generation, second.generation)
+        self.assertEqual(latest.pending_effect_plan_id, "pending-plan")
+        self.assertEqual(latest.metadata["effect_marker"], "claimed")
+        self.assertTrue(await store.is_current(second))
+
+    async def test_effect_rmw_rolls_back_callback_exception(self) -> None:
+        store = InMemorySessionStateStore()
+        await store.begin_turn(owner="owner", session_id="session", request_id="one")
+        before = await store.load(owner="owner", session_id="session")
+
+        def fail(state):
+            state.metadata["partial"] = True
+            raise RuntimeError("rollback")
+
+        with self.assertRaisesRegex(RuntimeError, "rollback"):
+            await store.update_effect_state(
+                owner="owner", session_id="session", change=fail,
+            )
+        self.assertEqual(await store.load(owner="owner", session_id="session"), before)
+
+    async def test_begin_turn_removes_poll_index_when_no_waits_remain(self) -> None:
+        store = InMemorySessionStateStore()
+        await store.begin_turn(owner="owner", session_id="session", request_id="first")
+        await store.update_effect_state(
+            owner="owner", session_id="session",
+            change=lambda state: state.metadata.update({"effect_next_poll_at": 10}),
+        )
+        _, state = await store.begin_turn(
+            owner="owner", session_id="session", request_id="second",
+        )
+        self.assertNotIn("effect_waits", state.metadata)
+        self.assertNotIn("effect_next_poll_at", state.metadata)
+
+    async def test_due_waits_copy_records_without_decoding_sealed_payload(self) -> None:
+        now = [100.0]
+        store = InMemorySessionStateStore(clock=lambda: now[0])
+        await store.begin_turn(owner="owner", session_id="session", request_id="one")
+        sealed = "enc:v1:opaque-ciphertext"
+
+        def change(state):
+            state.metadata["effect_waits"] = {
+                "due-plan": {"next_poll_at": 90, "sealed": sealed},
+                "future-plan": {"next_poll_at": 110, "sealed": "future"},
+            }
+            state.metadata["effect_next_poll_at"] = 90
+
+        await store.update_effect_state(
+            owner="owner", session_id="session", change=change,
+        )
+        due = await store.due_effect_waits()
+        self.assertEqual(due, [{"next_poll_at": 90, "sealed": sealed, "plan_id": "due-plan"}])
+        due[0]["sealed"] = "caller mutation"
+        self.assertEqual(
+            (await store.load(owner="owner", session_id="session")).metadata[
+                "effect_waits"]["due-plan"]["sealed"],
+            sealed,
+        )
+
+    async def test_receipt_merge_is_id_keyed_and_begin_turn_consumes_delivered_once(self) -> None:
+        conversation = [
+            {"role": "assistant", "content": "old placeholder", "completion_receipt_id": "plan-a"},
+            {"role": "assistant", "content": "duplicate", "completion_receipt_id": "plan-a"},
+            {"role": "assistant", "content": "unrelated", "completion_receipt_id": "other"},
+        ]
+        metadata = {"effect_waits": {
+            "plan-a": {"receipt_message": {
+                "role": "assistant", "content": "completed", "completion_receipt_id": "plan-a",
+            }},
+            "plan-b": {"receipt_message": {
+                "role": "assistant", "content": "not this plan", "completion_receipt_id": "wrong-id",
+            }},
+            "plan-c": {"receipt_message": {
+                "role": "assistant", "content": "new completion", "completion_receipt_id": "plan-c",
+            }},
+        }}
+        merged = merge_effect_receipts(conversation, metadata)
+        self.assertEqual(
+            [item.get("completion_receipt_id") for item in merged],
+            ["plan-a", "other", "plan-c"],
+        )
+        self.assertEqual(merged[0]["content"], "completed")
+        self.assertEqual(merged[1]["content"], "unrelated")
+        self.assertEqual(conversation[0]["content"], "old placeholder")
+
+        store = InMemorySessionStateStore()
+        first, _ = await store.begin_turn(owner="owner", session_id="session", request_id="first")
+        await store.commit(
+            first,
+            conversation=[{"role": "user", "content": str(index)} for index in range(80)],
+        )
+
+        def add_waits(state):
+            state.metadata["effect_waits"] = {
+                "delivered": {
+                    "delivered": True,
+                    "next_poll_at": 3,
+                    "receipt_message": {
+                        "role": "assistant", "content": "final", "completion_receipt_id": "delivered",
+                    },
+                },
+                "awaiting-delivery": {"delivered": False, "next_poll_at": 20},
+            }
+            state.metadata["effect_next_poll_at"] = 3
+
+        await store.update_effect_state(
+            owner="owner", session_id="session", change=add_waits,
+        )
+        second, state = await store.begin_turn(
+            owner="owner", session_id="session", request_id="second",
+        )
+        self.assertEqual(len(state.conversation), 80)
+        self.assertEqual(state.conversation[-1]["completion_receipt_id"], "delivered")
+        self.assertEqual(list(state.metadata["effect_waits"]), ["awaiting-delivery"])
+        self.assertEqual(state.metadata["effect_next_poll_at"], 20)
+
+        await store.commit(
+            second,
+            conversation=[{"role": "user", "content": f"new-{index}"} for index in range(80)],
+        )
+        after = await store.load(owner="owner", session_id="session")
+        self.assertFalse(any(
+            item.get("completion_receipt_id") == "delivered" for item in after.conversation
+        ))
+        self.assertEqual(list(after.metadata["effect_waits"]), ["awaiting-delivery"])
 
 
 class CapabilityRetrieverTests(unittest.TestCase):

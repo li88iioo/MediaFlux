@@ -1400,6 +1400,11 @@ CREATE TABLE IF NOT EXISTS agent_kernel_sessions (
     updated_at REAL NOT NULL,
     PRIMARY KEY(owner_digest, session_digest)
 );
+CREATE INDEX IF NOT EXISTS idx_agent_kernel_effect_next_poll_at
+    ON agent_kernel_sessions (
+        CASE WHEN json_valid(state_json)
+             THEN json_extract(state_json,'$.metadata.effect_next_poll_at') END
+    );
 CREATE TABLE IF NOT EXISTS agent_kernel_session_epochs (
     owner_digest TEXT NOT NULL,
     session_digest TEXT NOT NULL,

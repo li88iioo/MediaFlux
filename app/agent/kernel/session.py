@@ -417,6 +417,7 @@ class AgentSession:
                 ),
                 tool_name=tool_name,
                 effect_plan_id=plan_id or "",
+                completion_receipt_id=plan_id or "",
             ).to_dict()
             safe_public_content = str(public_content or "").strip()
             if safe_public_content:
@@ -429,11 +430,17 @@ class AgentSession:
                 )
             conversation.append(item)
             try:
+                from app.agent.effect_completion import remember_effect_receipt, acknowledge_effect_receipt
+
+                await remember_effect_receipt(self.state_store, owner=lease.owner,
+                    session_id=lease.session_id, plan_id=plan_id, message=item)
                 state = await self.state_store.commit(
                     lease,
                     conversation=conversation,
                     updates=updates,
                 )
+                await acknowledge_effect_receipt(self.state_store, owner=lease.owner,
+                    session_id=lease.session_id, plan_id=plan_id)
                 messages = self._restore_messages(state)
                 return True
             except StalePublicationError:
@@ -606,6 +613,7 @@ class AgentSession:
                 cancellation=token,
                 report_progress=progress,
                 wait_for_completion=True,
+                channel=agent_input.channel,
                 selection_arguments=validated_selection.arguments if validated_selection else None,
                 resource_candidate_ref=candidate_context.guard.ref if candidate_context else "",
             )

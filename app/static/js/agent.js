@@ -39,6 +39,10 @@
     const STREAM_MARKDOWN_INTERVAL_MS = 72;
     const SESSION_POLL_INTERVAL_MS = 1750;
     const SESSION_POLL_MAX_INTERVAL_MS = 8000;
+    const RECEIPT_POLL_INTERVAL_MS = 5000;
+    const RECEIPT_POLL_MAX_INTERVAL_MS = 30000;
+    const RECEIPT_POLL_LIMIT = 2880;
+    const RECEIPT_OBSERVATION_MAX_MS = 24 * 60 * 60 * 1000;
     const MAX_MARKDOWN_DEPTH = 4;
     const TERMINAL_TURN_STATUSES = ['success', 'partial', 'approval_required', 'effect_completed'];
     const TERMINAL_LAST_TURN_STATUSES = ['completed', 'failed', 'cancelled', 'interrupted'];
@@ -72,6 +76,10 @@
     const sessionEdits = new Set();
     let latestSessionId = '';
     let activeRequest = null;
+    const receiptObservationWindows = new Map();
+    let receiptResumeNeeded = false;
+    let receiptResumeInFlight = false;
+    let receiptResumeRequested = false;
     let historyController = null;
     let sessionLoadGeneration = 0;
     let busy = false;
@@ -1003,7 +1011,10 @@
         const summary = publicSummary(payload.result)
             || String(payload.message || '').trim()
             || previous.summary || '';
-        const record = {receipt, summary};
+        const record = {
+            receipt, summary,
+            followupPending: payload.result?.data?.background_job?.followup_pending === true,
+        };
         turn.effectReceipts.set(planId, record);
         return record;
     }
@@ -1433,6 +1444,10 @@
         active.controller?.abort();
     }
 
+    function clearReceiptObserverForNewRequest() {
+        if (activeRequest?.receiptOnly) invalidateActiveRequest();
+    }
+
     function sameActiveTurn(turn, active) {
         if (!turn || String(turn.request_id || '') !== active.requestId) return false;
         if (active.turnId && turn.turn_id && String(turn.turn_id) !== active.turnId) return false;
@@ -1502,11 +1517,93 @@
         }, delay);
     }
 
+    function receiptSnapshotKey(payload) {
+        return JSON.stringify([payload.messages, payload.pending_approval, payload.candidate_view]);
+    }
+
+    function finishReceiptObservation(active, {completed = false} = {}) {
+        if (!isCurrentActiveRequest(active)) return;
+        clearActiveObservation(active);
+        activeRequest = null;
+        active.observing = false;
+        active.controller?.abort();
+        if (completed) receiptObservationWindows.delete(active.sessionId);
+    }
+
+    function scheduleReceiptObservation(active) {
+        if (!isCurrentActiveRequest(active)) return;
+        const receiptWindow = receiptObservationWindows.get(active.sessionId);
+        const elapsed = receiptWindow ? Date.now() - receiptWindow.startedAt : RECEIPT_OBSERVATION_MAX_MS;
+        if (!receiptWindow || receiptWindow.polls >= RECEIPT_POLL_LIMIT || elapsed >= RECEIPT_OBSERVATION_MAX_MS) {
+            finishReceiptObservation(active);
+            return;
+        }
+        const delay = Math.min(active.receiptPollDelay, RECEIPT_OBSERVATION_MAX_MS - elapsed);
+        active.receiptPollDelay = Math.min(RECEIPT_POLL_MAX_INTERVAL_MS, delay * 2);
+        scheduleActiveObservation(active, delay);
+    }
+
+    function startReceiptObservation(active, payload = null) {
+        if (!isCurrentActiveRequest(active)) return;
+        // 仅已明确交接的任务继续观察；普通完成/失败/确认卡不能被一次
+        // 额外的会话恢复覆盖。正在跟踪的旧任务在新回合结束后继续核验。
+        const handedOff = [...(active.turn?.effectReceipts?.values() || [])]
+            .some(record => record.followupPending);
+        if (!payload && !handedOff && !receiptObservationWindows.has(active.sessionId)) return;
+        const newForegroundTurn = !active.receiptOnly
+            && (active.kind === 'query' || active.kind === 'confirm');
+        active.receiptOnly = true;
+        active.observing = true;
+        if (newForegroundTurn || !receiptObservationWindows.has(active.sessionId)) {
+            receiptObservationWindows.set(active.sessionId, {startedAt: Date.now(), polls: 0});
+        }
+        active.receiptPollDelay = RECEIPT_POLL_INTERVAL_MS;
+        if (payload) active.receiptSnapshotKey = receiptSnapshotKey(payload);
+        if (active.candidateGroup?.isConnected) active.candidateGroup.dataset.previewing = 'false';
+        setBusy(false);
+        resizePrompt();
+        if (document.hidden) {
+            receiptResumeNeeded = true;
+            invalidateActiveRequest();
+            return;
+        }
+        receiptResumeNeeded = false;
+        if (payload) scheduleReceiptObservation(active);
+        else observeActiveSession(active);
+    }
+
+    function pauseReceiptObservation() {
+        if (!activeRequest?.receiptOnly) return;
+        receiptResumeNeeded = true;
+        invalidateActiveRequest();
+    }
+
+    function resumeReceiptObservation() {
+        if (document.hidden || !receiptResumeNeeded) return;
+        if (receiptResumeInFlight) {
+            receiptResumeRequested = true;
+            return;
+        }
+        receiptResumeNeeded = false;
+        receiptResumeInFlight = true;
+        const targetId = sessionId;
+        loadSession(targetId, {closeHistory: false, preserveScroll: true})
+            .then((loaded) => {
+                if (!loaded && sessionId === targetId) receiptResumeNeeded = true;
+            })
+            .finally(() => {
+                receiptResumeInFlight = false;
+                if (receiptResumeRequested) {
+                    receiptResumeRequested = false;
+                    resumeReceiptObservation();
+                }
+            });
+    }
+
     function finishObservedTurn(active, payload, lastTurn) {
         if (!isCurrentActiveRequest(active) || !sameActiveTurn(lastTurn, active)
             || !TERMINAL_LAST_TURN_STATUSES.includes(String(lastTurn?.status || ''))) return;
         clearActiveObservation(active);
-        activeRequest = null;
         active.controller?.abort();
         renderSessionSnapshot(payload, {active, terminalTurn: lastTurn, preserveScroll: true});
         setBusy(false);
@@ -1515,6 +1612,11 @@
             : lastTurn.status === 'failed' || lastTurn.status === 'interrupted' ? '请求未能完成，状态已同步'
                 : 'Media Agent 已完成');
         refreshSessions({quiet: true});
+        if (Number(payload.pending_effect_count) > 0) {
+            startReceiptObservation(active, payload);
+        } else {
+            activeRequest = null;
+        }
     }
 
     function stopActiveUnconfirmed(active, message) {
@@ -1537,6 +1639,20 @@
 
     async function observeActiveSession(active) {
         if (!isCurrentActiveRequest(active)) return;
+        if (active.receiptOnly && document.hidden) {
+            pauseReceiptObservation();
+            return;
+        }
+        if (active.receiptOnly && active.observerController) return;
+        if (active.receiptOnly) {
+            const receiptWindow = receiptObservationWindows.get(active.sessionId);
+            if (!receiptWindow || receiptWindow.polls >= RECEIPT_POLL_LIMIT
+                || Date.now() - receiptWindow.startedAt >= RECEIPT_OBSERVATION_MAX_MS) {
+                finishReceiptObservation(active);
+                return;
+            }
+            receiptWindow.polls += 1;
+        }
         const controller = new AbortController();
         active.observerController = controller;
         try {
@@ -1544,6 +1660,30 @@
             if (!isCurrentActiveRequest(active)) return;
             if (configureDraftScope(payload.draft_scope) || !isCurrentActiveRequest(active)) return;
             if (payload?.session_id !== active.sessionId || !Array.isArray(payload?.messages)) throw new Error('会话状态响应无效');
+            if (active.receiptOnly) {
+                if (payload.active_turn) {
+                    finishReceiptObservation(active);
+                    return;
+                }
+                const snapshotKey = receiptSnapshotKey(payload);
+                const pendingCount = Math.max(0, Number(payload.pending_effect_count) || 0);
+                const changed = active.receiptSnapshotKey !== snapshotKey;
+                if (changed || pendingCount === 0) {
+                    const lastTurn = payload.last_turn;
+                    const terminalTurn = lastTurn
+                        && TERMINAL_LAST_TURN_STATUSES.includes(String(lastTurn.status || ''))
+                        && lastTurn.status !== 'completed'
+                        ? lastTurn : null;
+                    renderSessionSnapshot(payload, {active, terminalTurn, preserveScroll: true});
+                    active.receiptSnapshotKey = snapshotKey;
+                }
+                if (pendingCount > 0) scheduleReceiptObservation(active);
+                else {
+                    finishReceiptObservation(active, {completed: true});
+                    refreshSessions({quiet: true});
+                }
+                return;
+            }
             active.pollDelay = SESSION_POLL_INTERVAL_MS;
             const lastTurn = payload.last_turn;
             if (sameActiveTurn(lastTurn, active)
@@ -1569,6 +1709,10 @@
             scheduleActiveObservation(active);
         } catch (error) {
             if (!isCurrentActiveRequest(active) || error?.name === 'AbortError') return;
+            if (active.receiptOnly) {
+                scheduleReceiptObservation(active);
+                return;
+            }
             active.pollDelay = Math.min(SESSION_POLL_MAX_INTERVAL_MS, Math.max(SESSION_POLL_INTERVAL_MS, (active.pollDelay || SESSION_POLL_INTERVAL_MS) * 2));
             announce(responseStatus, active.cancelAccepted
                 ? '停止请求已受理，正在核对最终状态'
@@ -1635,6 +1779,7 @@
 
     async function sendQuery(text) {
         if (busy || initialRestore || !text.trim()) return;
+        clearReceiptObserverForNewRequest();
         const message = text.trim();
         ++sessionLoadGeneration;
         expireCandidateCards();
@@ -1676,6 +1821,8 @@
                 return;
             }
             announce(responseStatus, turn.failed ? (turn.cancelled ? '请求已停止' : '请求失败') : 'Media Agent 已完成');
+            startReceiptObservation(active);
+            refreshSessions({quiet: true});
         } catch (error) {
             if (!isCurrentActiveRequest(active)) return;
             if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
@@ -1746,6 +1893,7 @@
         if (!card || !planId) return;
         const turn = approvalTurnForCard(card);
         if (!turn || turn.completedPlanIds?.has(String(planId))) return;
+        clearReceiptObserverForNewRequest();
         card.querySelectorAll('button').forEach(item => { item.disabled = true; });
         turn.activePlanId = planId;
         continueTurnFromApproval(turn, card);
@@ -1784,6 +1932,8 @@
             const status = String(terminalEvent.payload?.status || '').toLowerCase();
             announce(responseStatus, status === 'approval_required' ? '等待下一项确认'
                 : turn.failed ? (turn.cancelled ? '请求已停止' : '请求失败') : 'Media Agent 已完成');
+            startReceiptObservation(active);
+            refreshSessions({quiet: true});
         } catch (error) {
             if (!isCurrentActiveRequest(active)) return;
             if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
@@ -1805,6 +1955,7 @@
         const card = button.closest('.agent-confirmation-card');
         const planId = button.dataset.effectCancel || '';
         if (!card || !planId) return;
+        clearReceiptObserverForNewRequest();
         card.querySelectorAll('button').forEach((item) => { item.disabled = true; });
         try {
             const payload = await fetchJSON('/api/agent/actions/confirm/discard', {
@@ -2123,7 +2274,7 @@
         return {candidateGroup, pendingCard};
     }
 
-    async function loadSession(targetId, {closeHistory = true, startup = false, signal = null} = {}) {
+    async function loadSession(targetId, {closeHistory = true, startup = false, signal = null, preserveScroll = false} = {}) {
         if (!SESSION_RE.test(targetId)) return false;
         if (!startup) stopInitialRestore();
         const switching = targetId !== sessionId;
@@ -2136,6 +2287,8 @@
             rememberSession(targetId);
             restoreDraft();
             setBusy(true, {stoppable: false});
+        } else if (activeRequest?.receiptOnly && activeRequest.sessionId === targetId) {
+            invalidateActiveRequest();
         }
         const active = !switching && activeRequest?.sessionId === targetId ? activeRequest : null;
         const generation = active ? sessionLoadGeneration : ++sessionLoadGeneration;
@@ -2145,6 +2298,7 @@
             if (generation !== sessionLoadGeneration || (active && !isCurrentActiveRequest(active))) return false;
             if (configureDraftScope(payload.draft_scope) || generation !== sessionLoadGeneration
                 || (active && !isCurrentActiveRequest(active))) return false;
+            if (!(Number(payload.pending_effect_count) > 0)) receiptObservationWindows.delete(targetId);
             if (active) {
                 const lastTurn = payload.last_turn;
                 if (sameActiveTurn(lastTurn, active)
@@ -2175,10 +2329,22 @@
                     pollTimer: null,
                     observerController: null,
                     observing: true,
+                } : Number(payload.pending_effect_count) > 0 ? {
+                    controller: new AbortController(),
+                    requestId: String(payload.last_turn?.request_id || ''),
+                    turnId: String(payload.last_turn?.turn_id || ''),
+                    sessionId: targetId,
+                    sessionGeneration: generation,
+                    pollTimer: null,
+                    observerController: null,
+                    observing: true,
+                    receiptOnly: true,
                 } : null;
                 if (recovered) activeRequest = recovered;
-                renderSessionSnapshot(payload, {active: recovered, terminalTurn: recovered ? null : terminalTurn});
-                if (recovered) scheduleActiveObservation(recovered);
+                const recoveredTurn = recovered && !recovered.receiptOnly ? recovered : null;
+                renderSessionSnapshot(payload, {active: recoveredTurn, terminalTurn: recoveredTurn ? null : terminalTurn, preserveScroll});
+                if (recovered?.receiptOnly) startReceiptObservation(recovered, payload);
+                else if (recovered) scheduleActiveObservation(recovered);
                 else setBusy(false);
             }
             if (restoreResumeFocus && resumeButton && !resumeButton.disabled) resumeButton.focus({preventScroll: true});
@@ -2439,6 +2605,7 @@
         if (busy || button.disabled || !state) return;
         syncCandidateButtons();
         if (button.disabled) return;
+        clearReceiptObserverForNewRequest();
         const selection = {ref: state.view.selection_ref, positions: [...state.selected].sort((a, b) => a - b), target: state.target};
         const message = `预览候选 ${selection.positions.map(pos => `#${pos}`).join('、')}，下载目标：${approvalTargetLabel(selection.target)}。`;
         const targetSessionId = sessionId;
@@ -2486,7 +2653,11 @@
             });
             if (!isCurrentActiveRequest(active)) return;
             if (!terminalEvent || active.cancelAccepted) startActiveObservation(active);
-            else announce(responseStatus, terminalEvent.type === 'turn.cancelled' ? '请求已停止' : '预检已完成');
+            else {
+                announce(responseStatus, terminalEvent.type === 'turn.cancelled' ? '请求已停止' : '预检已完成');
+                startReceiptObservation(active);
+                refreshSessions({quiet: true});
+            }
         } catch (error) {
             if (!isCurrentActiveRequest(active)) return;
             if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
@@ -2586,6 +2757,7 @@
     newRepliesButton?.addEventListener('click', () => scrollToBottom(true));
     function handlePageHide() {
         saveDraft();
+        if (activeRequest?.receiptOnly) receiptResumeNeeded = true;
         ++sessionLoadGeneration;
         invalidateActiveRequest();
         startupController?.abort();
@@ -2595,11 +2767,20 @@
     }
 
     function handlePageShow(event) {
-        if (event.persisted) loadSession(sessionId, {closeHistory: false});
+        if (event.persisted) {
+            receiptResumeNeeded = true;
+            resumeReceiptObservation();
+        }
     }
 
     window.addEventListener('pagehide', handlePageHide);
     window.addEventListener('pageshow', handlePageShow);
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) pauseReceiptObservation();
+        else resumeReceiptObservation();
+    });
+    window.addEventListener('blur', pauseReceiptObservation);
+    window.addEventListener('focus', resumeReceiptObservation);
     promptInput?.addEventListener('keydown', (event) => {
         if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
             event.preventDefault();

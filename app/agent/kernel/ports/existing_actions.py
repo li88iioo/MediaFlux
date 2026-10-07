@@ -312,6 +312,7 @@ def adapt_tool_spec(spec: ToolSpec) -> KernelToolSpec:
             tool=spec.name,
             context=_kernel_context(context),
             report_progress=context.report_progress,
+            scope=context.completion_scope,
         )
 
     return KernelToolSpec(

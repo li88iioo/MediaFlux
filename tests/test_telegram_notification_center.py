@@ -1,6 +1,7 @@
 """统一 Telegram 通知中心的幂等、线程更新与按钮保留契约。"""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import threading
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.modules.telegram_notification_center import (
     drain_telegram_notifications,
     get_notification_thread_snapshot,
     notification_thread_event_key,
+    publish_agent_interaction_reply,
     publish_notification_event,
     publish_notification_thread,
     serialize_notification_event,
@@ -54,6 +56,38 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         else:
             notification_center._dispatch_stop.clear()
 
+    @contextmanager
+    def _agent_switches(
+        self,
+        *,
+        agent_enabled: bool = True,
+        telegram_enabled: bool = True,
+        notifications_enabled: bool = True,
+        notification_level: str = "standard",
+    ):
+        def get_bool(key: str, default=None):
+            if key == "TG_AGENT_ENABLED":
+                return telegram_enabled
+            if key == "TG_NOTIFICATION_ENABLED":
+                return notifications_enabled
+            return default
+
+        with patch.object(
+            notification_center, "is_agent_enabled", return_value=agent_enabled,
+        ), patch.object(
+            notification_center.config, "get_bool", side_effect=get_bool,
+        ), patch(
+            "app.modules.telegram_notification_policy.notifications_enabled",
+            return_value=notifications_enabled,
+        ), patch(
+            "app.modules.telegram_notification_policy.notification_level",
+            return_value=notification_level,
+        ), patch(
+            "app.agent.effect_completion.agent_effect_reply_is_current",
+            return_value=True,
+        ):
+            yield
+
     def test_round_trip_keeps_actions_and_rendering_flags(self) -> None:
         event = NotificationEvent(
             "待确认",
@@ -68,6 +102,362 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         restored = deserialize_notification_event(serialize_notification_event(event))
         self.assertEqual(restored, event)
         self.assertEqual(restored.actions[0].callback_data, "orgc:token:0")
+
+    def test_agent_interaction_requires_both_agent_switches(self) -> None:
+        for agent_enabled, telegram_enabled in ((False, True), (True, False)):
+            with self.subTest(
+                agent_enabled=agent_enabled, telegram_enabled=telegram_enabled,
+            ), self._agent_switches(
+                agent_enabled=agent_enabled,
+                telegram_enabled=telegram_enabled,
+            ):
+                outcome = publish_agent_interaction_reply(
+                    "agent-effect:owner:session:plan-1",
+                    NotificationEvent("任务已完成"),
+                    chat_id="-100123",
+                )
+
+            self.assertFalse(outcome.accepted)
+            self.assertFalse(outcome.delivered)
+            self.assertEqual(outcome.status, "disabled")
+            self.assertIsNone(get_notification(outcome.event_key))
+
+    def test_agent_interaction_requires_bounded_agent_effect_namespace(self) -> None:
+        invalid_keys = (
+            "ordinary:task-1",
+            "agent-effect:",
+            "agent-effect:" + ("x" * 240),
+            "agent-effect:" + chr(0xD800),
+        )
+        with self._agent_switches():
+            for logical_key in invalid_keys:
+                with self.subTest(logical_key=logical_key[:32]):
+                    outcome = publish_agent_interaction_reply(
+                        logical_key,
+                        NotificationEvent("无效任务键"),
+                        chat_id="100",
+                    )
+                    self.assertFalse(outcome.accepted)
+                    self.assertFalse(outcome.delivered)
+                    self.assertEqual(outcome.status, "invalid_key")
+        with db.get_conn() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM telegram_notification_outbox"
+                ).fetchone()[0],
+                0,
+            )
+
+    def test_agent_interaction_rejects_missing_or_non_numeric_chat_without_default(self) -> None:
+        with self._agent_switches(), patch.object(
+            notification_center,
+            "notification_target_chat_id",
+            return_value="configured-default-chat",
+        ) as target_chat:
+            for chat_id in (None, "", "  ", "default", "+123", "12.3"):
+                with self.subTest(chat_id=chat_id):
+                    outcome = publish_agent_interaction_reply(
+                        "agent-effect:owner:session:plan-chat",
+                        NotificationEvent("任务已完成"),
+                        chat_id=chat_id,
+                    )
+                    self.assertFalse(outcome.accepted)
+                    self.assertFalse(outcome.delivered)
+                    self.assertEqual(outcome.status, "invalid_chat_id")
+        target_chat.assert_not_called()
+        with db.get_conn() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM telegram_notification_outbox"
+                ).fetchone()[0],
+                0,
+            )
+
+    @patch("app.modules.telegram_notification_center.edit_event_result")
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_agent_interaction_bypasses_notification_policy_after_reload(
+        self, sender, editor,
+    ) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=151)
+        policy_cases = (
+            (False, "standard"),
+            (True, "essential"),
+        )
+        for index, (notifications_enabled, level) in enumerate(policy_cases):
+            with self.subTest(
+                notifications_enabled=notifications_enabled, level=level,
+            ), self._agent_switches(
+                notifications_enabled=notifications_enabled,
+                notification_level=level,
+            ):
+                outcome = publish_agent_interaction_reply(
+                    f"agent-effect:owner:session:plan-reload-{index}",
+                    NotificationEvent("可信终态", lines=("已完成",)),
+                    chat_id="-100151",
+                    deliver_now=False,
+                )
+                self.assertTrue(outcome.accepted)
+                self.assertTrue(outcome.queued)
+                saved = get_notification(outcome.event_key)
+                restored = deserialize_notification_event(saved["event_json"])
+                self.assertEqual(saved["topic"], NotificationTopic.AGENT.value)
+                self.assertTrue(outcome.event_key.startswith(
+                    "tg:event:agent:agent-effect:"
+                ))
+                self.assertEqual(restored.state, "agent_effect_reply")
+                self.assertTrue(any(
+                    line.startswith("任务标识：agent-effect-")
+                    for line in restored.lines
+                ))
+
+                # 从持久 outbox 重新 claim/deserialize/dispatch，不依赖发布进程内状态。
+                self.assertTrue(
+                    notification_center.drain_telegram_notifications(
+                        event_key=outcome.event_key,
+                    )
+                )
+                delivered = get_notification(outcome.event_key)
+                self.assertEqual(delivered["status"], "sent")
+                self.assertFalse(outcome.delivered)
+
+        self.assertEqual(sender.call_count, 2)
+        self.assertEqual(sender.call_args.kwargs["chat_id"], "-100151")
+        editor.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_agent_interaction_is_suppressed_after_session_removal(self, sender) -> None:
+        with self._agent_switches():
+            queued = publish_agent_interaction_reply(
+                "agent-effect:owner:session:plan-session-removed",
+                NotificationEvent("可信终态"),
+                chat_id="100",
+                deliver_now=False,
+            )
+        self.assertTrue(queued.queued)
+
+        with self._agent_switches(), patch(
+            "app.agent.effect_completion.agent_effect_reply_is_current",
+            return_value=False,
+        ) as is_current:
+            notification_center.drain_telegram_notifications(
+                event_key=queued.event_key,
+            )
+
+        is_current.assert_called_once_with(queued.event_key)
+        row = get_notification(queued.event_key)
+        self.assertEqual(row["status"], "suppressed")
+        self.assertEqual(row["last_error"], "AgentInteractionSessionRemoved")
+        sender.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_agent_interaction_current_check_error_retries_without_suppressing(
+        self, sender,
+    ) -> None:
+        with self._agent_switches():
+            queued = publish_agent_interaction_reply(
+                "agent-effect:owner:session:plan-session-check-error",
+                NotificationEvent("可信终态"),
+                chat_id="100",
+                deliver_now=False,
+            )
+        self.assertTrue(queued.queued)
+
+        with self._agent_switches(), patch(
+            "app.agent.effect_completion.agent_effect_reply_is_current",
+            side_effect=RuntimeError("temporary state read failure"),
+        ):
+            self.assertFalse(notification_center.drain_telegram_notifications(
+                event_key=queued.event_key,
+            ))
+
+        row = get_notification(queued.event_key)
+        self.assertEqual(row["status"], "retry_wait")
+        self.assertEqual(
+            row["last_error"],
+            "AgentInteractionStateUnavailable:RuntimeError",
+        )
+        self.assertNotEqual(row["status"], "suppressed")
+        sender.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_interaction_dispatch_stops_if_either_agent_switch_closes(self, sender) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=161)
+        for index, (agent_enabled, telegram_enabled) in enumerate(
+            ((False, True), (True, False))
+        ):
+            key = f"agent-effect:owner:session:plan-disabled-{index}"
+            with self.subTest(
+                agent_enabled=agent_enabled, telegram_enabled=telegram_enabled,
+            ), self._agent_switches():
+                queued = publish_agent_interaction_reply(
+                    key, NotificationEvent("可信终态"),
+                    chat_id="100", deliver_now=False,
+                )
+            self.assertTrue(queued.queued)
+
+            with self._agent_switches(
+                agent_enabled=agent_enabled,
+                telegram_enabled=telegram_enabled,
+                notifications_enabled=False,
+            ):
+                notification_center.drain_telegram_notifications(
+                    event_key=queued.event_key,
+                )
+            row = get_notification(queued.event_key)
+            self.assertEqual(row["status"], "suppressed")
+            self.assertFalse(queued.delivered)
+
+        sender.assert_not_called()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_agent_interaction_duplicate_is_immutable_and_not_claimed_delivered(
+        self, sender,
+    ) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=171)
+        key = "agent-effect:owner:session:plan-idempotent"
+        with self._agent_switches(notifications_enabled=False):
+            first = publish_agent_interaction_reply(
+                key, NotificationEvent("第一次回执"),
+                chat_id="100", deliver_now=True,
+            )
+            first_payload = get_notification(first.event_key)["event_json"]
+            duplicate = publish_agent_interaction_reply(
+                key, NotificationEvent("不能覆盖第一次"),
+                chat_id="100", deliver_now=True,
+            )
+
+        self.assertTrue(first.accepted)
+        self.assertTrue(first.delivered)
+        self.assertTrue(duplicate.accepted)
+        self.assertFalse(duplicate.delivered)
+        self.assertEqual(duplicate.status, "sent")
+        self.assertEqual(get_notification(first.event_key)["event_json"], first_payload)
+        self.assertEqual(sender.call_count, 1)
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_concurrent_agent_interaction_duplicate_has_one_delivery_claim(self, sender) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=181)
+        key = "agent-effect:owner:session:plan-concurrent"
+        real_get = notification_center.get_notification
+        first_reads = 0
+        read_lock = threading.Lock()
+        both_prechecked = threading.Barrier(2)
+
+        def synchronized_get(event_key):
+            nonlocal first_reads
+            row = real_get(event_key)
+            with read_lock:
+                first_reads += 1
+                wait_for_other = first_reads <= 2
+            if wait_for_other:
+                both_prechecked.wait(timeout=2.0)
+            return row
+
+        outcomes = {}
+
+        def publish(name, title):
+            outcomes[name] = publish_agent_interaction_reply(
+                key, NotificationEvent(title),
+                chat_id="100", deliver_now=True,
+            )
+
+        with self._agent_switches(), patch.object(
+            notification_center, "get_notification", side_effect=synchronized_get,
+        ), patch.object(notification_center, "wake_telegram_notification_dispatcher"):
+            workers = [
+                threading.Thread(target=publish, args=("first", "回执 A")),
+                threading.Thread(target=publish, args=("second", "回执 B")),
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=3.0)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(sender.call_count, 1)
+        self.assertEqual(sum(result.delivered for result in outcomes.values()), 1)
+        self.assertTrue(all(result.accepted for result in outcomes.values()))
+        saved = deserialize_notification_event(
+            get_notification(next(iter(outcomes.values())).event_key)["event_json"]
+        )
+        self.assertIn(saved.title, {"回执 A", "回执 B"})
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_agent_interaction_unknown_first_send_is_never_replayed(self, sender) -> None:
+        sender.return_value = TelegramSendResult(
+            ok=False, status_code=408, error="ReadTimeout",
+        )
+        key = "agent-effect:owner:session:plan-unknown"
+        with self._agent_switches(notifications_enabled=False):
+            first = publish_agent_interaction_reply(
+                key, NotificationEvent("可信终态"),
+                chat_id="100", deliver_now=True,
+            )
+            again = publish_agent_interaction_reply(
+                key, NotificationEvent("重复请求"),
+                chat_id="100", deliver_now=True,
+            )
+            notification_center.drain_telegram_notifications(
+                event_key=first.event_key,
+            )
+
+        row = get_notification(first.event_key)
+        self.assertTrue(first.accepted)
+        self.assertFalse(first.delivered)
+        self.assertEqual(first.status, "outcome_unknown")
+        self.assertTrue(again.accepted)
+        self.assertFalse(again.delivered)
+        self.assertEqual(row["status"], "outcome_unknown")
+        self.assertEqual(int(row["message_id"] or 0), 0)
+        sender.assert_called_once()
+
+    @patch("app.modules.telegram_notification_center.send_event_result")
+    def test_interaction_bypass_requires_topic_key_prefix_and_state(self, sender) -> None:
+        sender.return_value = TelegramSendResult(ok=True, message_id=191)
+        marker = NotificationEvent("应按普通策略处理", state="agent_effect_reply")
+        cases = (
+            (
+                "tg:event:agent:agent-effect:wrong-topic:abc",
+                "system",
+                marker,
+            ),
+            (
+                notification_center._event_key("event", "agent", "ordinary:key", "100"),
+                "agent",
+                marker,
+            ),
+            (
+                notification_center._event_key(
+                    "event", "agent", "agent-effect:wrong-state", "100",
+                ),
+                "agent",
+                NotificationEvent("应按普通策略处理", state="ordinary"),
+            ),
+        )
+        with self._agent_switches(notifications_enabled=False):
+            for event_key, topic, event in cases:
+                upsert_notification(
+                    event_key,
+                    topic=topic,
+                    importance="result",
+                    chat_id="100",
+                    event_json=serialize_notification_event(event),
+                )
+                notification_center.drain_telegram_notifications(
+                    event_key=event_key,
+                )
+                self.assertEqual(get_notification(event_key)["status"], "suppressed")
+        sender.assert_not_called()
+
+    def test_ordinary_agent_topic_notification_still_obeys_notification_policy(self) -> None:
+        with self._agent_switches(notifications_enabled=False):
+            outcome = publish_notification_event(
+                "ordinary-agent-notice", NotificationEvent("主动通知"),
+                topic=NotificationTopic.AGENT, chat_id="100",
+            )
+        self.assertFalse(outcome.accepted)
+        self.assertFalse(outcome.delivered)
+        self.assertEqual(outcome.status, "disabled")
 
     def test_serialization_converges_dynamic_objects_to_safe_strings(self) -> None:
         restored = deserialize_notification_event(serialize_notification_event(

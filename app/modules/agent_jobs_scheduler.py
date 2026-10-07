@@ -1,6 +1,7 @@
 """Owner 隔离、可恢复、可取消的 Agent 长任务调度器。"""
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 import json
@@ -438,6 +439,15 @@ class AgentJobsScheduler:
     def _loop(self) -> None:
         while not self._stop_event.is_set():
             try:
+                from app.agent.effect_completion import poll_effect_receipts
+                from app.agent.feature_gate import is_agent_enabled
+                from app.agent.kernel.persistence import SQLiteKernelStore
+
+                if is_agent_enabled():
+                    generation = current_agent_runtime_generation()
+                    asyncio.run(poll_effect_receipts(SQLiteKernelStore(), cancelled=lambda: (
+                        self._stop_event.is_set() or not agent_runtime_generation_is_current(generation)
+                    )))
                 for _index in range(3):
                     if self.run_once() == 0:
                         break

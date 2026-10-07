@@ -98,9 +98,9 @@ class AgentKernelArchitectureTests(unittest.TestCase):
         self.assertTrue(forbidden_names.isdisjoint(source.split()))
         line_count = sum(text.count("\n") + 1 for text in sources)
         self.assertGreaterEqual(line_count, 4_000)
-        # 批选加入确定性预检、批次/写入代次分别校验、统一逐项结果与历史归属，
-        # 相对原 UX 增量约 210 行。完整计入 Kernel，不排除模块或放开总量预算。
-        self.assertLessEqual(line_count, 7_800)
+        # 持久回执新增两种存储的原子 RMW/到期读取和同 ID 消息合并，
+        # 增量预算300行；沿用同一 Kernel/执行器，完整计入而不排除模块。
+        self.assertLessEqual(line_count, 8_100)
 
     def test_web_adapter_only_uses_kernel_event_endpoints(self) -> None:
         source = (ROOT / "app" / "static" / "js" / "agent.js").read_text(

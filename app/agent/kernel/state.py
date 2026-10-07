@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import secrets
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -242,6 +243,121 @@ class SessionState:
                         self.metadata[field_name] = deepcopy(update.value)
 
 
+def merge_effect_receipts(
+    conversation: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """按 plan ID 将已完成回执并入会话，不做文本近似匹配。"""
+    merged = [deepcopy(dict(message)) for message in conversation]
+    waits = metadata.get("effect_waits")
+    if not isinstance(waits, Mapping):
+        return merged
+
+    for plan_id, record in waits.items():
+        if not isinstance(plan_id, str) or not plan_id or not isinstance(record, Mapping):
+            continue
+        receipt = record.get("receipt_message")
+        if (
+            not isinstance(receipt, Mapping)
+            or receipt.get("completion_receipt_id") != plan_id
+        ):
+            continue
+
+        matches = [
+            index for index, message in enumerate(merged)
+            if message.get("completion_receipt_id") == plan_id
+        ]
+        replacement = deepcopy(dict(receipt))
+        if matches:
+            # 确认后的模型答复可能已概述“仍在执行”。晚到终态必须位于它
+            # 之后，否则公开投影会把更新后的系统回执当中间结果折叠掉。
+            has_later_answer = any(
+                message.get("role") == "user" or (
+                    message.get("role") == "assistant"
+                    and message.get("effect_plan_id") == plan_id
+                    and not message.get("tool_name")
+                )
+                for message in merged[matches[0] + 1:]
+            )
+            if has_later_answer:
+                for index in reversed(matches):
+                    del merged[index]
+                merged.append(replacement)
+            else:
+                merged[matches[0]] = replacement
+                for index in reversed(matches[1:]):
+                    del merged[index]
+        else:
+            merged.append(replacement)
+    return merged
+
+
+def _consume_delivered_effect_receipts(state: SessionState) -> None:
+    waits = state.metadata.get("effect_waits")
+    if not isinstance(waits, Mapping):
+        state.metadata.pop("effect_waits", None)
+        state.metadata.pop("effect_next_poll_at", None)
+        return
+
+    delivered = {
+        plan_id: record
+        for plan_id, record in waits.items()
+        if isinstance(plan_id, str)
+        and isinstance(record, Mapping)
+        and record.get("delivered") is True
+    }
+    if delivered:
+        state.conversation = merge_effect_receipts(
+            state.conversation, {"effect_waits": delivered},
+        )[-80:]
+
+    remaining = {
+        plan_id: deepcopy(record)
+        for plan_id, record in waits.items()
+        if plan_id not in delivered
+    }
+    if remaining:
+        state.metadata["effect_waits"] = remaining
+        next_polls = [
+            record.get("next_poll_at")
+            for record in remaining.values()
+            if isinstance(record, Mapping)
+            and isinstance(record.get("next_poll_at"), (int, float))
+            and not isinstance(record.get("next_poll_at"), bool)
+        ]
+        if next_polls:
+            state.metadata["effect_next_poll_at"] = min(next_polls)
+        else:
+            state.metadata.pop("effect_next_poll_at", None)
+    else:
+        state.metadata.pop("effect_waits", None)
+        state.metadata.pop("effect_next_poll_at", None)
+
+
+def _effect_time_is_due(value: Any, now: float) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value <= now
+    )
+
+
+def _apply_effect_state_change(
+    state: SessionState, change: Callable[[SessionState], Any],
+) -> tuple[SessionState, Any, bool]:
+    """在副本上执行纯同步回调，并固定 publication 身份字段。"""
+    updated = state.clone()
+    result = change(updated)
+    if inspect.isawaitable(result):
+        if inspect.iscoroutine(result):
+            result.close()
+        raise TypeError("effect state change must be synchronous")
+    updated.owner = state.owner
+    updated.session_id = state.session_id
+    updated.generation = state.generation
+    updated.pending_effect_plan_id = state.pending_effect_plan_id
+    return updated, result, updated != state
+
+
 class SessionStateStore(Protocol):
     async def begin_turn(
         self, *, owner: str, session_id: str, request_id: str,
@@ -258,15 +374,23 @@ class SessionStateStore(Protocol):
         updates: Sequence[StateUpdate] = (),
     ) -> SessionState: ...
 
+    async def update_effect_state(
+        self, *, owner: str, session_id: str,
+        change: Callable[[SessionState], Any],
+    ) -> Any: ...
+
+    async def due_effect_waits(self, *, limit: int = 16) -> list[dict[str, Any]]: ...
+
     async def load(self, *, owner: str, session_id: str) -> SessionState: ...
 
 
 class InMemorySessionStateStore:
     """测试与单进程运行使用的权威状态实现。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
         self._lock = CrossLoopAsyncLock()
         self._states: dict[tuple[str, str], SessionState] = {}
+        self._clock = clock
 
     async def begin_turn(
         self, *, owner: str, session_id: str, request_id: str,
@@ -283,6 +407,7 @@ class InMemorySessionStateStore:
             )
             if selection_guard is not None:
                 selection_guard.check(state)
+            _consume_delivered_effect_receipts(state)
             state.generation = generation
             self._states[key] = state
             lease = PublicationLease(
@@ -315,11 +440,50 @@ class InMemorySessionStateStore:
             if state is None or not publication_commit_matches(lease, state, conversation, updates):
                 raise StalePublicationError("turn no longer owns publication authority")
             if conversation is not None:
-                state.conversation = deepcopy([dict(item) for item in conversation])[
-                    -80:
-                ]
+                state.conversation = merge_effect_receipts(
+                    conversation, state.metadata,
+                )[-80:]
             state.apply(updates)
             return state.clone()
+
+    async def update_effect_state(
+        self, *, owner: str, session_id: str,
+        change: Callable[[SessionState], Any],
+    ) -> Any:
+        key = (owner, session_id)
+        async with self._lock:
+            current = self._states.get(key)
+            if current is None:
+                return None
+            updated, result, changed = _apply_effect_state_change(current, change)
+            if changed:
+                self._states[key] = updated
+            return result
+
+    async def due_effect_waits(self, *, limit: int = 16) -> list[dict[str, Any]]:
+        maximum = max(0, int(limit))
+        if not maximum:
+            return []
+        now = self._clock()
+        async with self._lock:
+            due: list[tuple[float, str, dict[str, Any]]] = []
+            for state in self._states.values():
+                if not _effect_time_is_due(state.metadata.get("effect_next_poll_at"), now):
+                    continue
+                waits = state.metadata.get("effect_waits")
+                if not isinstance(waits, Mapping):
+                    continue
+                for plan_id, record in waits.items():
+                    if (
+                        not isinstance(record, Mapping)
+                        or not _effect_time_is_due(record.get("next_poll_at"), now)
+                    ):
+                        continue
+                    item = deepcopy(dict(record))
+                    item["plan_id"] = plan_id
+                    due.append((float(record["next_poll_at"]), str(plan_id), item))
+            due.sort(key=lambda item: (item[0], item[1]))
+            return [item[2] for item in due[:maximum]]
 
     async def load(self, *, owner: str, session_id: str) -> SessionState:
         async with self._lock:

@@ -927,8 +927,6 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         wait.assert_not_awaited()
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
@@ -1231,3 +1229,251 @@ class LocalMediaScanCompletionTests(unittest.IsolatedAsyncioTestCase):
         result = await tool.verify({}, accepted, context)
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.data["stats"]["archived_video_count"], 1)
+
+
+class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
+    """真实 SQLite/确认会话状态；仅 Provider 状态读取使用固定夹具。"""
+
+    async def asyncSetUp(self):
+        from app.agent.kernel.persistence import SQLiteKernelStore
+        self.database = isolated_test_database()
+        self.database.__enter__()
+        self.store = SQLiteKernelStore()
+        self.scope_args = {"owner": "tg:v1:123\x1f456", "session_id": "effect-session"}
+        self.plan_id = "plan-effect-receipt"
+        self.lease, _ = await self.store.begin_turn(**self.scope_args, request_id="confirm")
+
+    async def asyncTearDown(self):
+        self.database.__exit__(None, None, None)
+
+    async def pending(self, channel="web"):
+        from app.agent.effect_completion import EffectCompletionScope
+        with patch("app.agent.effect_completion._poll", new=AsyncMock(
+            return_value=(_snapshot("running"), "running", {"status": "running"}),
+        )):
+            result = await wait_for_effect_completion(
+                _provider_accepted("empty_recycle_bin", 2), tool="recycle.empty",
+                context=ToolContext(**self.scope_args), timeout_seconds=0,
+                scope=EffectCompletionScope(self.store, self.lease, self.plan_id, channel),
+            )
+        self.assertEqual(result.status, "running")
+        self.assertTrue(result.data["background_job"]["followup_pending"])
+        await self.make_due()
+        return result
+
+    async def make_due(self):
+        def change(state):
+            for row in state.metadata.get("effect_waits", {}).values():
+                row["next_poll_at"] = 0
+            state.metadata["effect_next_poll_at"] = 0
+        await self.store.update_effect_state(**self.scope_args, change=change)
+
+    async def finish(self, *, store=None):
+        from app.agent.effect_completion import poll_effect_receipts
+        with patch("app.agent.effect_completion._poll", new=AsyncMock(
+            return_value=(ToolResult(True, "completed", "云盘任务已完成"), "completed", {"status": "completed"}),
+        )) as reader:
+            count = await poll_effect_receipts(store or self.store)
+        return count, reader
+
+    async def test_many_already_accepted_tasks_are_not_rejected_after_the_write(self):
+        from app.agent.effect_completion import (
+            EffectCompletionScope, _CompletionTracker, _register_effect_wait,
+        )
+        for index in range(17):
+            await _register_effect_wait(
+                _provider_accepted("empty_recycle_bin", 1),
+                _CompletionTracker("guangya_task", {"task_id": f"private-{index}"}),
+                "recycle.empty", EffectCompletionScope(self.store, self.lease, f"plan-{index}"),
+            )
+        state = await self.store.load(**self.scope_args)
+        self.assertEqual(len(state.metadata["effect_waits"]), 17)
+        await self.make_due()
+        self.assertEqual(len(await self.store.due_effect_waits(limit=16)), 16)
+
+    async def test_restart_completes_once_and_preserves_new_turn_and_plan(self):
+        from app.agent.kernel.persistence import SQLiteKernelStore
+        from app.agent.kernel.state import StateUpdate
+        await self.pending()
+        second, _ = await self.store.begin_turn(**self.scope_args, request_id="new-question")
+        await self.store.commit(second, conversation=[{"role": "user", "content": "另一件事"}],
+            updates=(StateUpdate("pending_effect_plan_id", "new-plan"),))
+        count, reader = await self.finish(store=SQLiteKernelStore())
+        self.assertEqual(count, 1)
+        reader.assert_awaited_once()
+        state = await self.store.load(**self.scope_args)
+        self.assertEqual(state.generation, second.generation)
+        self.assertEqual(state.pending_effect_plan_id, "new-plan")
+        self.assertEqual(state.conversation[0]["content"], "另一件事")
+        receipt = state.conversation[-1]
+        self.assertEqual(receipt["completion_receipt_id"], self.plan_id)
+        self.assertNotIn("private-task", json.dumps(receipt))
+        self.assertNotIn("可信系统结果", receipt["public_content"])
+        self.assertEqual((await self.finish())[0], 0)
+        await self.store.commit(second, conversation=[{"role": "user", "content": "另一件事"}])
+        self.assertEqual((await self.store.load(**self.scope_args)).conversation[-1], receipt)
+
+    async def test_late_receipt_follows_new_user_even_without_model_continuation(self):
+        from app.agent.public_view import public_conversation_messages
+        await self.pending()
+        await self.store.commit(self.lease, conversation=[
+            {"role": "assistant", "content": "accepted", "public_content": "等待完成",
+             "tool_name": "recycle.empty", "effect_plan_id": self.plan_id,
+             "completion_receipt_id": self.plan_id},
+            {"role": "user", "content": "还有别的事"},
+        ])
+        self.assertEqual((await self.finish())[0], 1)
+        public = public_conversation_messages((await self.store.load(**self.scope_args)).conversation)
+        self.assertEqual(public[-2]["content"], "还有别的事")
+        self.assertIn("完成", public[-1]["content"])
+
+    async def test_late_receipt_is_visible_after_foreground_model_answer(self):
+        from app.agent.public_view import public_conversation_messages
+        await self.pending()
+        await self.store.commit(self.lease, conversation=[
+            {"role": "assistant", "content": "accepted", "public_content": "等待完成",
+             "tool_name": "recycle.empty", "effect_plan_id": self.plan_id,
+             "completion_receipt_id": self.plan_id},
+            {"role": "assistant", "content": "已受理，请等待", "effect_plan_id": self.plan_id},
+            {"role": "user", "content": "还有别的事"},
+        ])
+        self.assertEqual((await self.finish())[0], 1)
+        state = await self.store.load(**self.scope_args)
+        public = public_conversation_messages(state.conversation)
+        self.assertIn("完成", public[-1]["content"])
+        self.assertEqual(public[-2]["content"], "还有别的事")
+        self.assertNotIn("等待完成", json.dumps(public, ensure_ascii=False))
+
+    async def test_receipt_fallback_without_public_text_never_exposes_internal_json(self):
+        from app.agent.public_view import public_conversation_messages
+        from app.agent.kernel.model import ModelMessage
+        await self.pending()
+        await self.finish()
+        state = await self.store.load(**self.scope_args)
+        restored = ModelMessage.from_dict(state.conversation[-1]).to_dict()
+        self.assertEqual(restored["completion_receipt_id"], self.plan_id)
+        public = public_conversation_messages([restored])
+        self.assertIn("完成", public[-1]["content"])
+        self.assertNotIn("可信系统结果", public[-1]["content"])
+        self.assertNotIn('"evidence"', public[-1]["content"])
+
+    async def test_foreground_terminal_saved_before_ack_does_not_duplicate(self):
+        from app.agent.effect_completion import (
+            EffectCompletionScope, _record_effect_observation, remember_effect_receipt,
+        )
+        await self.pending()
+        scope = EffectCompletionScope(self.store, self.lease, self.plan_id)
+        final = ToolResult(True, "completed", "完成")
+        await _record_effect_observation(scope, status="completed", final=final)
+        message = {"role": "assistant", "content": "已完成", "completion_receipt_id": self.plan_id}
+        await remember_effect_receipt(self.store, **self.scope_args, plan_id=self.plan_id, message=message)
+        await self.store.commit(self.lease, conversation=[message])
+        await self.make_due()
+        count, reader = await self.finish()
+        self.assertEqual(count, 0)
+        reader.assert_not_awaited()
+        state = await self.store.load(**self.scope_args)
+        self.assertEqual(state.conversation, [message])
+        self.assertNotIn(self.plan_id, state.metadata.get("effect_waits", {}))
+
+    async def test_reset_during_read_cannot_resurrect_receipt_or_send(self):
+        from app.agent.effect_completion import poll_effect_receipts
+        await self.pending(channel="telegram")
+        async def reset(*args):
+            await self.store.reset_session(**self.scope_args)
+            return ToolResult(True, "completed", "完成"), "completed", {}
+        with patch("app.agent.effect_completion._poll", side_effect=reset), patch(
+            "app.agent.effect_completion._enqueue_late_receipt",
+        ) as send:
+            self.assertEqual(await poll_effect_receipts(self.store), 0)
+        send.assert_not_called()
+        state = await self.store.load(**self.scope_args)
+        self.assertEqual(state.conversation, [])
+        self.assertNotIn("effect_waits", state.metadata)
+
+    async def test_transient_read_failure_remains_pending_without_fabricated_success(self):
+        from app.agent.effect_completion import poll_effect_receipts
+        await self.pending()
+        with patch("app.agent.effect_completion._poll", side_effect=OSError("offline")):
+            self.assertEqual(await poll_effect_receipts(self.store), 0)
+        state = await self.store.load(**self.scope_args)
+        self.assertEqual(state.conversation, [])
+        self.assertEqual(state.metadata["effect_waits"][self.plan_id]["read_errors"], 1)
+        await self.make_due()
+        self.assertEqual((await self.finish())[0], 1)
+
+    async def test_missing_reference_ends_tracking_without_replaying_write(self):
+        from app.agent.effect_completion import poll_effect_receipts
+        await self.pending()
+        with patch("app.agent.effect_completion._poll", side_effect=LookupError("removed")) as read:
+            self.assertEqual(await poll_effect_receipts(self.store), 1)
+        read.assert_awaited_once()
+        state = await self.store.load(**self.scope_args)
+        self.assertIn("无法核验", state.conversation[-1]["public_content"])
+        self.assertTrue(state.metadata["effect_waits"][self.plan_id]["delivered"])
+
+    async def test_two_sweepers_claim_only_one_read(self):
+        from app.agent.effect_completion import poll_effect_receipts
+        await self.pending()
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def delayed(*args):
+            entered.set()
+            await release.wait()
+            return ToolResult(True, "completed", "完成"), "completed", {}
+        with patch("app.agent.effect_completion._poll", side_effect=delayed) as read:
+            task = asyncio.create_task(poll_effect_receipts(self.store))
+            await entered.wait()
+            self.assertEqual(await poll_effect_receipts(self.store), 0)
+            release.set()
+            self.assertEqual(await task, 1)
+        read.assert_awaited_once()
+
+    async def test_expired_tracking_does_not_discard_failed_telegram_handoff(self):
+        from app.agent.effect_completion import poll_effect_receipts
+        await self.pending(channel="telegram")
+        with patch("app.agent.effect_completion._poll", side_effect=LookupError("removed")), patch(
+            "app.agent.effect_completion._enqueue_late_receipt", return_value=False,
+        ):
+            self.assertEqual(await poll_effect_receipts(self.store), 0)
+        state = await self.store.load(**self.scope_args)
+        self.assertFalse(state.metadata["effect_waits"][self.plan_id]["delivered"])
+        self.assertIn("无法核验", state.conversation[-1]["public_content"])
+        await self.make_due()
+        with patch("app.agent.effect_completion._poll") as read, patch(
+            "app.agent.effect_completion._enqueue_late_receipt", return_value=True,
+        ):
+            self.assertEqual(await poll_effect_receipts(self.store), 1)
+        read.assert_not_called()
+        self.assertEqual(len((await self.store.load(**self.scope_args)).conversation), 1)
+
+    async def test_disabled_telegram_keeps_receipt_without_endless_handoff(self):
+        await self.pending(channel="telegram")
+        with patch("app.modules.telegram_notification_center._agent_interaction_enabled", return_value=False):
+            self.assertEqual((await self.finish())[0], 1)
+        state = await self.store.load(**self.scope_args)
+        self.assertTrue(state.metadata["effect_waits"][self.plan_id]["delivered"])
+        self.assertNotIn("effect_next_poll_at", state.metadata)
+
+    async def test_telegram_outbox_handoff_is_idempotent_and_deleted_session_invalidates(self):
+        from app.agent.effect_completion import (
+            _effect_reply_key, agent_effect_reply_is_current,
+        )
+        from app.modules.telegram_notification_center import get_notification
+        await self.pending(channel="telegram")
+        with patch("app.modules.telegram_notification_center._agent_interaction_enabled", return_value=True):
+            self.assertEqual((await self.finish())[0], 1)
+        key = _effect_reply_key({**self.scope_args, "plan_id": self.plan_id})
+        # 原会话 chat，绝不落到默认通知接收人。
+        from app.modules.telegram_notification_center import _event_key
+        event_key = _event_key("event", "agent", key, "123")
+        row = get_notification(event_key)
+        self.assertIsNotNone(row)
+        self.assertEqual(row["chat_id"], "123")
+        self.assertTrue(agent_effect_reply_is_current(event_key))
+        self.assertEqual((await self.finish())[0], 0)
+        await self.store.reset_session(**self.scope_args)
+        self.assertFalse(agent_effect_reply_is_current(event_key))
+
+
+if __name__ == "__main__":
+    unittest.main()

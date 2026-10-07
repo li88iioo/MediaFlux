@@ -43,6 +43,7 @@ class ModelMessage:
     tool_call_id: str = ""
     tool_name: str = ""
     effect_plan_id: str = ""
+    completion_receipt_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         result: dict[str, Any] = {"role": self.role, "content": self.content}
@@ -61,6 +62,8 @@ class ModelMessage:
             result["tool_name"] = self.tool_name
         if self.effect_plan_id:
             result["effect_plan_id"] = self.effect_plan_id
+        if self.completion_receipt_id:
+            result["completion_receipt_id"] = self.completion_receipt_id
         return result
 
     @classmethod
@@ -82,6 +85,7 @@ class ModelMessage:
             tool_call_id=str(value.get("tool_call_id") or ""),
             tool_name=str(value.get("tool_name") or ""),
             effect_plan_id=str(value.get("effect_plan_id") or ""),
+            completion_receipt_id=str(value.get("completion_receipt_id") or ""),
         )
 
 

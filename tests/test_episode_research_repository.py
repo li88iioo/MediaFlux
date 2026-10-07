@@ -305,8 +305,8 @@ class EpisodeResearchCacheTests(unittest.TestCase):
         conn.execute("INSERT INTO settings_kv(key,value) VALUES('cache-migration-sentinel','keep')")
 
     def test_v29_migration_alone_matches_fresh_schema_and_preserves_legacy_database(self):
-        self.assertEqual(db.SCHEMA_VERSION, 32)
-        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 32)))
+        self.assertEqual(db.SCHEMA_VERSION, 33)
+        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 33)))
         migration = database_migrations._SCHEMA_MIGRATIONS[29]
         self.assertFalse(hasattr(db, migration.__name__))
         self.assertEqual(migration.__module__, database_migrations.__name__)

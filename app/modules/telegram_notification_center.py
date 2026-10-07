@@ -3,10 +3,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+import secrets
 import threading
 import time
 from dataclasses import dataclass, replace
 
+from app import config
+from app.agent.feature_gate import is_agent_enabled
 from app.logger import get_logger
 from app.modules.telegram_notification_policy import (
     NotificationImportance,
@@ -46,6 +50,10 @@ _dispatch_accepting = False
 _delivery_lock = threading.Lock()
 _THREAD_MESSAGE_LIMIT = 3800
 _MAX_LOGICAL_KEY_BYTES = 240
+_AGENT_INTERACTION_LOGICAL_KEY_PREFIX = "agent-effect:"
+_AGENT_INTERACTION_EVENT_KEY_PREFIX = "tg:event:agent:agent-effect:"
+_AGENT_INTERACTION_STATE = "agent_effect_reply"
+_CHAT_ID_RE = re.compile(r"-?[0-9]+\Z")
 _PURGE_INTERVAL_SECONDS = 6 * 60 * 60
 _PURGE_RETRY_SECONDS = 60
 _maintenance_lock = threading.Lock()
@@ -317,6 +325,21 @@ def _bounded_thread_event(event: NotificationEvent) -> NotificationEvent:
     )
 
 
+def _agent_interaction_enabled() -> bool:
+    """交互回执受 Agent/TG Agent 开关控制，不受主动通知策略控制。"""
+    return is_agent_enabled() and config.get_bool("TG_AGENT_ENABLED", False)
+
+
+def _is_agent_interaction_item(item: dict, event: NotificationEvent) -> bool:
+    return bool(
+        str(item.get("topic") or "") == NotificationTopic.AGENT.value
+        and str(item.get("event_key") or "").startswith(
+            _AGENT_INTERACTION_EVENT_KEY_PREFIX
+        )
+        and str(event.state or "") == _AGENT_INTERACTION_STATE
+    )
+
+
 def _allows_dispatch(item: dict) -> bool:
     importance = str(item.get("importance") or "result")
     if allows_notification(importance):
@@ -336,7 +359,57 @@ def _dispatch_item(item: dict) -> bool:
     notification_id = int(item["id"])
     generation = int(item["lease_generation"])
     claimed_revision = int(item["revision"])
-    if not _allows_dispatch(item):
+    event = None
+    interaction_candidate = (
+        str(item.get("topic") or "") == NotificationTopic.AGENT.value
+        and str(item.get("event_key") or "").startswith(
+            _AGENT_INTERACTION_EVENT_KEY_PREFIX
+        )
+    )
+    if interaction_candidate:
+        try:
+            candidate = deserialize_notification_event(
+                str(item.get("event_json") or "")
+            )
+        except ValueError:
+            pass
+        else:
+            if _is_agent_interaction_item(item, candidate):
+                event = candidate
+                if not _agent_interaction_enabled():
+                    suppress_notification(
+                        notification_id,
+                        lease_generation=generation,
+                        claimed_revision=claimed_revision,
+                        reason="AgentInteractionDisabled",
+                    )
+                    return True
+                try:
+                    from app.agent.effect_completion import (
+                        agent_effect_reply_is_current,
+                    )
+
+                    is_current = agent_effect_reply_is_current(
+                        str(item.get("event_key") or "")
+                    )
+                except Exception as exc:
+                    retry_notification(
+                        notification_id,
+                        lease_generation=generation,
+                        claimed_revision=claimed_revision,
+                        error=f"AgentInteractionStateUnavailable:{type(exc).__name__}",
+                    )
+                    return False
+                if not is_current:
+                    suppress_notification(
+                        notification_id,
+                        lease_generation=generation,
+                        claimed_revision=claimed_revision,
+                        reason="AgentInteractionSessionRemoved",
+                    )
+                    return True
+
+    if event is None and not _allows_dispatch(item):
         suppress_notification(
             notification_id,
             lease_generation=generation,
@@ -344,16 +417,17 @@ def _dispatch_item(item: dict) -> bool:
             reason="NotificationPolicyDisabled",
         )
         return True
-    try:
-        event = deserialize_notification_event(str(item.get("event_json") or ""))
-    except ValueError as exc:
-        fail_notification(
-            notification_id,
-            lease_generation=generation,
-            claimed_revision=claimed_revision,
-            error=f"InvalidEventPayload:{type(exc).__name__}",
-        )
-        return False
+    if event is None:
+        try:
+            event = deserialize_notification_event(str(item.get("event_json") or ""))
+        except ValueError as exc:
+            fail_notification(
+                notification_id,
+                lease_generation=generation,
+                claimed_revision=claimed_revision,
+                error=f"InvalidEventPayload:{type(exc).__name__}",
+            )
+            return False
 
     if str(item.get("topic") or "") == NotificationTopic.DOWNLOAD.value:
         try:
@@ -475,9 +549,24 @@ def _publish(
     topic_enabled: bool,
     preferred_message_id: int = 0,
     deliver_now: bool = True,
+    agent_interaction: bool = False,
+    agent_interaction_attempt_id: str = "",
 ) -> NotificationPublishResult:
     normalized_importance = NotificationImportance(_importance(importance))
     normalized_topic = _topic(topic)
+    if agent_interaction:
+        normalized_logical_key = _bounded_logical_key(logical_key)
+        if (
+            normalized_topic != NotificationTopic.AGENT.value
+            or thread
+            or not normalized_logical_key.startswith(
+                _AGENT_INTERACTION_LOGICAL_KEY_PREFIX
+            )
+            or str(event.state or "") != _AGENT_INTERACTION_STATE
+        ):
+            return NotificationPublishResult(False, status="invalid_interaction")
+        if not _agent_interaction_enabled():
+            return NotificationPublishResult(False, status="disabled")
     target = notification_target_chat_id(chat_id)
     if not target:
         return NotificationPublishResult(False, status="unconfigured")
@@ -502,17 +591,18 @@ def _publish(
         and int(existing.get("message_id") or 0) > 0
         and int(existing.get("delivered_revision") or 0) > 0
     )
-    allowed = allows_notification(
-        normalized_importance, topic_enabled=topic_enabled,
-    )
-    if not allowed:
-        from app.modules.telegram_notification_policy import notifications_enabled
+    if not agent_interaction:
+        allowed = allows_notification(
+            normalized_importance, topic_enabled=topic_enabled,
+        )
+        if not allowed:
+            from app.modules.telegram_notification_policy import notifications_enabled
 
-        # 已经展示给用户的线程需要完成终态更新，避免 essential 等级下
-        # 候选按钮、错误或“等待后处理”永久停留。
-        allowed = bool(thread and continuation and notifications_enabled())
-    if not allowed:
-        return NotificationPublishResult(False, status="disabled")
+            # 已经展示给用户的线程需要完成终态更新，避免 essential 等级下
+            # 候选按钮、错误或“等待后处理”永久停留。
+            allowed = bool(thread and continuation and notifications_enabled())
+        if not allowed:
+            return NotificationPublishResult(False, status="disabled")
     try:
         if event.actions:
             valid_actions = _normalized_actions(event.actions)
@@ -529,6 +619,14 @@ def _publish(
         if thread:
             event = _bounded_thread_event(event)
         event_json = serialize_notification_event(event)
+        if agent_interaction_attempt_id:
+            payload = json.loads(event_json)
+            payload["_agent_interaction_attempt_id"] = str(
+                agent_interaction_attempt_id
+            )
+            event_json = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"),
+            )
     except Exception as exc:
         logger.warning(
             "拒绝无法序列化的 Telegram 通知 topic=%s type=%s",
@@ -586,6 +684,87 @@ def publish_notification_event(
         topic_enabled=topic_enabled,
         deliver_now=deliver_now,
     )
+
+
+def publish_agent_interaction_reply(
+    logical_key: str,
+    event: NotificationEvent,
+    *,
+    chat_id: str,
+    deliver_now: bool = False,
+) -> NotificationPublishResult:
+    """持久化并发送已确认 Agent 任务的交互回执，不走主动通知策略。"""
+    target = str(chat_id if chat_id is not None else "").strip()
+    if not _CHAT_ID_RE.fullmatch(target):
+        return NotificationPublishResult(False, status="invalid_chat_id")
+
+    key = str(logical_key or "").strip()
+    try:
+        encoded_key = key.encode("utf-8")
+    except UnicodeEncodeError:
+        return NotificationPublishResult(False, status="invalid_key")
+    if (
+        not key.startswith(_AGENT_INTERACTION_LOGICAL_KEY_PREFIX)
+        or not key[len(_AGENT_INTERACTION_LOGICAL_KEY_PREFIX):].strip()
+        or len(encoded_key) > _MAX_LOGICAL_KEY_BYTES
+    ):
+        return NotificationPublishResult(False, status="invalid_key")
+    if not isinstance(event, NotificationEvent):
+        return NotificationPublishResult(False, status="invalid_event")
+    if not _agent_interaction_enabled():
+        return NotificationPublishResult(False, status="disabled")
+
+    event_key = _event_key(
+        "event", NotificationTopic.AGENT.value, key, target,
+    )
+    existing = get_notification(event_key)
+    if existing is not None:
+        status = str(existing.get("status") or "")
+        return NotificationPublishResult(
+            True,
+            delivered=False,
+            queued=status in {"pending", "retry_wait", "sending"},
+            status=status or "duplicate",
+            event_key=event_key,
+        )
+
+    task_id = hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
+    fixed_event = replace(
+        event,
+        lines=(*tuple(event.lines or ()), f"任务标识：agent-effect-{task_id}"),
+        state=_AGENT_INTERACTION_STATE,
+    )
+    attempt_id = secrets.token_urlsafe(12)
+    published = _publish(
+        key,
+        fixed_event,
+        topic=NotificationTopic.AGENT,
+        importance=NotificationImportance.RESULT,
+        chat_id=target,
+        thread=False,
+        topic_enabled=True,
+        deliver_now=deliver_now,
+        agent_interaction=True,
+        agent_interaction_attempt_id=attempt_id,
+    )
+    if not published.accepted:
+        return published
+
+    row = get_notification(event_key)
+    try:
+        stored = json.loads(str(row.get("event_json") or "{}")) if row else {}
+    except (TypeError, ValueError):
+        stored = {}
+    if stored.get("_agent_interaction_attempt_id") != attempt_id:
+        status = str(row.get("status") or "") if row else ""
+        return NotificationPublishResult(
+            True,
+            delivered=False,
+            queued=status in {"pending", "retry_wait", "sending"},
+            status=status or "duplicate",
+            event_key=event_key,
+        )
+    return published
 
 
 def publish_notification_thread(

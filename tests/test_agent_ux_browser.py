@@ -60,11 +60,12 @@ def candidate_view_variant(ref: str, selection_ref: str, *, recommended_position
 def session_snapshot(session_id: str, *, messages: list[dict] | None = None,
                      active_turn: dict | None = None, last_turn: dict | None = None,
                      pending_approval: dict | None = None, candidate: dict | None = None,
-                     generation: int = 1) -> dict:
+                     generation: int = 1, pending_effect_count: int = 0) -> dict:
     return {
         'session_id': session_id,
         'generation': generation,
         'messages': list(messages or []),
+        'pending_effect_count': pending_effect_count,
         'pending_approval': pending_approval,
         'candidate_view': candidate,
         'active_turn': active_turn,
@@ -506,6 +507,226 @@ class AgentUXBrowserTests(unittest.TestCase):
         self.assertEqual(page.locator('.agent-message-assistant').count(), 1)
         self.assertEqual(page.locator('#agentPrompt').input_value(), '保留未发送草稿')
         self.assertEqual(page.evaluate("window.__kernelCalls.filter(c => c.method === 'POST').length"), 0)
+
+    def test_pending_receipt_restore_is_read_only_and_preserves_draft_and_scroll(self):
+        messages = []
+        for index in range(28):
+            messages.extend((
+                {'role': 'user', 'content': f'之前的问题 {index}'},
+                {'role': 'assistant', 'content': f'之前的回复 {index}：' + '保留历史内容。' * 8},
+            ))
+        initial = session_snapshot(
+            SESSION_A,
+            messages=messages,
+            last_turn={
+                'request_id': 'receipt-request', 'turn_id': 'receipt-turn',
+                'status': 'completed', 'message': '本轮已完成',
+            },
+            pending_effect_count=1,
+        )
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'sessions': [{'session_id': SESSION_A, 'title': '后台回执'}]},
+            'sessionDetails': {SESSION_A: initial},
+        }, stored_session=SESSION_A)
+        session_path = f'/api/agent/sessions/{SESSION_A}'
+        page.wait_for_function(
+            "(path) => window.__kernelCalls.some(call => call.url === path)",
+            arg=session_path,
+        )
+        self.assertTrue(page.locator('#agentPrompt').is_enabled())
+        self.assertTrue(page.locator('#agentStop').is_hidden())
+
+        page.locator('#agentPrompt').fill('观察期间保留的草稿')
+        before = page.evaluate("""() => {
+            const transcript = document.querySelector('#agentTranscript');
+            transcript.scrollTop = 120;
+            transcript.dispatchEvent(new Event('scroll'));
+            return transcript.scrollTop;
+        }""")
+        self.assertGreater(before, 0)
+        page.evaluate("""({id, path}) => {
+            const current = window.__kernelConfig.sessionDetails[id];
+            window.__kernelConfig.sessionDetails[id] = {
+                ...current,
+                pending_effect_count: 0,
+                messages: [...current.messages, {role: 'assistant', content: '后台晚到回执已保存。'}],
+            };
+        }""", {'id': SESSION_A, 'path': session_path})
+
+        page.get_by_text('后台晚到回执已保存。', exact=True).wait_for(timeout=15000)
+        after = page.evaluate("document.querySelector('#agentTranscript').scrollTop")
+        self.assertAlmostEqual(after, before, delta=1)
+        self.assertEqual(page.locator('#agentPrompt').input_value(), '观察期间保留的草稿')
+        self.assertTrue(page.locator('#agentPrompt').is_enabled())
+        self.assertTrue(page.locator('#agentStop').is_hidden())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query' && call.method === 'POST').length"), 0)
+
+    def test_receipt_observation_pauses_while_hidden_and_reloads_on_focus(self):
+        initial = session_snapshot(
+            SESSION_A,
+            messages=[{'role': 'assistant', 'content': '等待后台回执'}],
+            last_turn={
+                'request_id': 'receipt-hidden-request', 'turn_id': 'receipt-hidden-turn',
+                'status': 'completed', 'message': '本轮已完成',
+            },
+            pending_effect_count=1,
+        )
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'sessions': [{'session_id': SESSION_A, 'title': '后台回执'}]},
+            'sessionDetails': {SESSION_A: initial},
+        }, stored_session=SESSION_A)
+        session_path = f'/api/agent/sessions/{SESSION_A}'
+        page.get_by_text('等待后台回执', exact=True).wait_for()
+        page.evaluate("""() => {
+            Object.defineProperty(document, 'hidden', {configurable: true, value: true});
+            document.dispatchEvent(new Event('visibilitychange'));
+        }""")
+        page.evaluate("""id => {
+            const current = window.__kernelConfig.sessionDetails[id];
+            window.__kernelConfig.sessionDetails[id] = {
+                ...current,
+                pending_effect_count: 0,
+                messages: [...current.messages, {role: 'assistant', content: '隐藏期间完成的回执'}],
+            };
+        }""", SESSION_A)
+        page.wait_for_timeout(5300)
+        detail_reads = page.evaluate("(path) => window.__kernelCalls.filter(call => call.url === path).length", session_path)
+        self.assertEqual(detail_reads, 1)
+
+        page.evaluate("""() => {
+            Object.defineProperty(document, 'hidden', {configurable: true, value: false});
+            document.dispatchEvent(new Event('visibilitychange'));
+            window.dispatchEvent(new Event('focus'));
+        }""")
+        page.get_by_text('隐藏期间完成的回执', exact=True).wait_for(timeout=5000)
+        detail_reads = page.evaluate("(path) => window.__kernelCalls.filter(call => call.url === path).length", session_path)
+        self.assertEqual(detail_reads, 2)
+        self.assertTrue(page.locator('#agentPrompt').is_enabled())
+        self.assertTrue(page.locator('#agentStop').is_hidden())
+
+    def test_switching_sessions_stops_the_previous_receipt_poll(self):
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'sessions': [
+                {'session_id': SESSION_A, 'title': '待回执会话'},
+                {'session_id': SESSION_B, 'title': '另一个会话'},
+            ]},
+            'sessionDetails': {
+                SESSION_A: session_snapshot(SESSION_A, messages=[{'role': 'assistant', 'content': 'A 等待回执'}], pending_effect_count=1),
+                SESSION_B: session_snapshot(SESSION_B, messages=[{'role': 'assistant', 'content': 'B 会话内容'}]),
+            },
+        }, stored_session=SESSION_A)
+        page.get_by_text('A 等待回执', exact=True).wait_for()
+        page.locator('#toggleAgentRail').click()
+        page.locator(f'[data-session-open="{SESSION_B}"]').click()
+        page.get_by_text('B 会话内容', exact=True).wait_for()
+        page.wait_for_timeout(5300)
+
+        self.assertEqual(page.evaluate("id => window.__kernelCalls.filter(call => call.url === `/api/agent/sessions/${id}`).length", SESSION_A), 1)
+        self.assertEqual(page.evaluate("id => window.__kernelCalls.filter(call => call.url === `/api/agent/sessions/${id}`).length", SESSION_B), 1)
+
+    def test_new_foreground_turn_restarts_an_expired_receipt_observation_window(self):
+        initial = session_snapshot(
+            SESSION_A,
+            messages=[{'role': 'assistant', 'content': '旧后台任务等待回执'}],
+            last_turn={
+                'request_id': 'old-receipt-request', 'turn_id': 'old-receipt-turn',
+                'status': 'completed', 'message': '本轮已完成',
+            },
+            pending_effect_count=1,
+        )
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'sessions': [{'session_id': SESSION_A, 'title': '后台回执'}]},
+            'sessionDetails': {SESSION_A: initial},
+            'queryEvents': [
+                harness._event(1, 'turn.started'),
+                harness._event(2, 'turn.completed', {'status': 'success', 'answer': '新任务已完成。'}),
+            ],
+        }, stored_session=SESSION_A)
+        session_path = f'/api/agent/sessions/{SESSION_A}'
+        page.get_by_text('旧后台任务等待回执', exact=True).wait_for()
+        page.evaluate("""({id, elapsed}) => {
+            const current = window.__kernelConfig.sessionDetails[id];
+            window.__kernelConfig.sessionDetails[id] = {
+                ...current,
+                pending_effect_count: 1,
+                messages: [
+                    ...current.messages,
+                    {role: 'user', content: '启动新的后台任务'},
+                    {role: 'assistant', content: '新任务已完成。'},
+                    {role: 'assistant', content: '新后台任务晚到回执'},
+                ],
+            };
+            const originalNow = Date.now;
+            Date.now = () => originalNow() + elapsed;
+        }""", {'id': SESSION_A, 'elapsed': 24 * 60 * 60 * 1000 + 1})
+
+        page.locator('#agentPrompt').fill('启动新的后台任务')
+        page.locator('#agentSend').click()
+        page.get_by_text('新后台任务晚到回执', exact=True).wait_for(timeout=7000)
+        page.get_by_text('新任务已完成。', exact=True).wait_for()
+
+        self.assertEqual(
+            page.evaluate("path => window.__kernelCalls.filter(call => call.url === path).length", session_path),
+            2,
+        )
+
+    def test_late_receipt_cannot_replace_an_in_flight_new_request(self):
+        initial = session_snapshot(
+            SESSION_A,
+            messages=[{'role': 'assistant', 'content': '已有历史回复'}],
+            last_turn={
+                'request_id': 'receipt-request', 'turn_id': 'receipt-turn',
+                'status': 'completed', 'message': '本轮已完成',
+            },
+            pending_effect_count=1,
+        )
+        page = self.page({
+            'sessions': {'draft_scope': SCOPE, 'sessions': [{'session_id': SESSION_A, 'title': '后台回执'}]},
+            'sessionDetails': {SESSION_A: initial},
+            'holdQueryOpen': True,
+        }, stored_session=SESSION_A)
+        page.wait_for_function(
+            "(path) => window.__kernelCalls.some(call => call.url === path)",
+            arg=f'/api/agent/sessions/{SESSION_A}',
+        )
+        page.evaluate("""(path) => {
+            const originalFetch = window.fetch;
+            window.__holdReceiptRead = true;
+            window.fetch = async (url, options = {}) => {
+                if (window.__holdReceiptRead && new URL(String(url), location.href).pathname === path) {
+                    window.__holdReceiptRead = false;
+                    window.__receiptReadStarted = true;
+                    await new Promise(resolve => { window.__releaseReceiptRead = resolve; });
+                }
+                return originalFetch(url, options);
+            };
+        }""", f'/api/agent/sessions/{SESSION_A}')
+        page.wait_for_function('window.__receiptReadStarted === true', timeout=15000)
+        page.evaluate("""id => {
+            const current = window.__kernelConfig.sessionDetails[id];
+            window.__kernelConfig.sessionDetails[id] = {
+                ...current,
+                pending_effect_count: 0,
+                messages: [...current.messages, {role: 'assistant', content: '不应覆盖新请求的晚到回执。'}],
+            };
+            window.__kernelConfig.queryEvents = [{
+                event_id: 'new-turn-started', type: 'turn.started', sequence: 1,
+                session_id: id, turn_id: 'new-turn', request_id: 'new-request', payload: {},
+            }];
+        }""", SESSION_A)
+
+        page.locator('#agentPrompt').fill('发起新请求')
+        page.locator('#agentSend').click()
+        page.locator('#agentStop').wait_for(state='visible')
+        page.locator('#agentPrompt').fill('新请求期间保留的草稿')
+        page.evaluate('window.__releaseReceiptRead()')
+        page.wait_for_timeout(100)
+
+        self.assertIn('发起新请求', page.locator('#agentTranscript').inner_text())
+        self.assertNotIn('不应覆盖新请求的晚到回执。', page.locator('#agentTranscript').inner_text())
+        self.assertEqual(page.locator('#agentPrompt').input_value(), '新请求期间保留的草稿')
+        self.assertTrue(page.locator('#agentStop').is_visible())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/query' && call.method === 'POST').length"), 1)
 
     def test_accepted_cancel_waits_for_verified_terminal_instead_of_aborting_ui(self):
         current = {

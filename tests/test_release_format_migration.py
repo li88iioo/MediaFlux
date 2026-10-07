@@ -135,8 +135,8 @@ class ReleaseFormatMigrationTests(unittest.TestCase):
             connection.close()
 
     def test_schema31_ddl_has_exact_columns_defaults_and_constraints(self) -> None:
-        self.assertEqual(db.SCHEMA_VERSION, 32)
-        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 32)))
+        self.assertEqual(db.SCHEMA_VERSION, 33)
+        self.assertEqual(sorted(database_migrations._SCHEMA_MIGRATIONS), list(range(1, 33)))
         migration = database_migrations._SCHEMA_MIGRATIONS[30]
         self.assertFalse(hasattr(db, migration.__name__))
         self.assertEqual(migration.__module__, database_migrations.__name__)

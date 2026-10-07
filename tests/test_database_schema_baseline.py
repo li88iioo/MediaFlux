@@ -18,6 +18,50 @@ from tests.support import seed_rss_entry_state
 
 
 class DatabaseSchemaBaselineTests(IsolatedDatabaseTestCase):
+    def test_v32_database_migrates_agent_kernel_due_expression_index(self) -> None:
+        previous_path = db.DB_PATH
+        previous_test_mode = bool(getattr(db, "_configured_test_mode", False))
+        with tempfile.TemporaryDirectory(prefix="mediaflux-schema-kernel-due-v33-") as root:
+            path = Path(root) / "v32.db"
+            conn = sqlite3.connect(path)
+            try:
+                conn.executescript(db._SCHEMA)
+                conn.execute(
+                    "DROP INDEX idx_agent_kernel_effect_next_poll_at"
+                )
+                conn.execute(
+                    "INSERT INTO agent_kernel_sessions"
+                    "(owner_digest,session_digest,generation,state_json,state_hmac,updated_at) "
+                    "VALUES('owner-digest','session-digest',4,'{}','legacy-hmac',1)"
+                )
+                conn.execute("PRAGMA user_version=32")
+                conn.commit()
+            finally:
+                conn.close()
+
+            db.configure_database(path, test_mode=True)
+            try:
+                db.init_db()
+                with db.get_conn() as migrated:
+                    version = int(migrated.execute("PRAGMA user_version").fetchone()[0])
+                    index = migrated.execute(
+                        "SELECT sql FROM sqlite_master WHERE type='index' "
+                        "AND name='idx_agent_kernel_effect_next_poll_at'"
+                    ).fetchone()
+                    preserved = migrated.execute(
+                        "SELECT generation,state_json,state_hmac FROM agent_kernel_sessions "
+                        "WHERE owner_digest='owner-digest' AND session_digest='session-digest'"
+                    ).fetchone()
+                self.assertEqual(version, 33)
+                self.assertIsNotNone(index)
+                self.assertIn("json_valid(state_json)", index["sql"])
+                self.assertIn("$.metadata.effect_next_poll_at", index["sql"])
+                self.assertEqual(
+                    tuple(preserved), (4, "{}", "legacy-hmac"),
+                )
+            finally:
+                db.configure_database(previous_path, test_mode=previous_test_mode)
+
     def test_v18_strm_refresh_outbox_is_migrated_without_dual_track(self) -> None:
         conn = sqlite3.connect(":memory:")
         try:

@@ -446,6 +446,19 @@ class AgentKernelApiTests(unittest.TestCase):
         self.assertEqual(current.json()["draft_scope"], history.json()["draft_scope"])
         self.assertEqual(current.headers["cache-control"], "private, no-store")
 
+    def test_session_snapshot_counts_only_unresolved_business_effect_waits(self):
+        self.runtime.store.state.metadata = {"effect_waits": {
+            "plan_pending": {"delivered": False, "receipt_message": ""},
+            # 业务结果已有，只剩 Telegram 投递；Web 不需要继续轮询。
+            "plan_receipt_ready": {"delivered": False, "receipt_message": "任务已完成"},
+            "plan_delivered": {"delivered": True, "receipt_message": ""},
+        }}
+
+        response = self.client.get("/api/agent/sessions/session_1234567890")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["pending_effect_count"], 1)
+
     def test_evicted_turn_start_does_not_hide_an_unconfirmed_terminal_state(self):
         self.runtime.store.add_event(owner="webk:v1:" + "a" * 64, session_id="session_1234567890", event={
             "type": "model.delta", "turn_id": "old-turn", "request_id": "old-request",
