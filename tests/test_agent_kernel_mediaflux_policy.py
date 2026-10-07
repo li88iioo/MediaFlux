@@ -376,3 +376,51 @@ class MediaFluxPolicyTests(unittest.IsolatedAsyncioTestCase):
                     arguments={},
                 )
             self.assertEqual(raised.exception.code, "rate_limited")
+
+    async def test_configuration_reads_do_not_spend_write_preview_budget(self) -> None:
+        families = (
+            ("media.preferences", "media.set_preferences", "media.clear_preferences"),
+            (
+                "media.subscription_notification_rule",
+                "media.set_subscription_notification_rule",
+                "media.reset_subscription_notification_rule",
+            ),
+        )
+        with (
+            isolated_test_database("config-read-write-budgets.db"),
+            patch("app.agent.rate_limit.time.time", return_value=1800000000.0),
+        ):
+            limiters = (MediaFluxToolRateLimiter(), MediaFluxToolRateLimiter())
+            for read, update, clear in families:
+                with self.subTest(read=read):
+                    owner = "webk:v1:" + uuid.uuid4().hex * 2
+                    # Actual shared SQLite budget, not an allow() mock. Queries
+                    # before/after changes must not consume a write's allowance.
+                    for index in range(12):
+                        await limiters[index % 2].acquire(
+                            owner=owner, tool_name=read, cost=1, arguments={}
+                        )
+                    with self.assertRaises(ToolPipelineError) as read_limited:
+                        await limiters[1].acquire(
+                            owner=owner, tool_name=read, cost=1, arguments={}
+                        )
+                    self.assertEqual(read_limited.exception.code, "rate_limited")
+                    for stage in ("", "confirm:"):
+                        for index, tool in enumerate((update, clear, update, clear)):
+                            await limiters[index % 2].acquire(
+                                owner=owner, tool_name=stage + tool,
+                                cost=1, arguments={},
+                            )
+                        # Changing tool/session/worker cannot replenish the
+                        # shared write budget; confirmations have their own.
+                        for tool in (update, clear):
+                            with self.assertRaises(ToolPipelineError) as limited:
+                                await limiters[0].acquire(
+                                    owner=owner, tool_name=stage + tool,
+                                    cost=1, arguments={},
+                                )
+                            self.assertEqual(limited.exception.code, "rate_limited")
+                    await limiters[1].acquire(
+                        owner="webk:v1:" + uuid.uuid4().hex * 2,
+                        tool_name=update, cost=1, arguments={},
+                    )
