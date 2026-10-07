@@ -377,3 +377,11 @@ def test_new_capabilities_have_readable_public_labels_and_write_audit_names():
             )
             assert contract["action"] == label
             assert contract["impact"] != "确认后会执行服务端预检通过的受控操作。", name
+
+@pytest.mark.parametrize("message", [
+    "检查qBittorrent当前队列和传输状态",
+    "只读检查qBittorrent版本、网络连接与传输状态，并汇总各状态任务数量",
+])
+def test_qb_diagnosis_keeps_native_capability_discovery_reachable(catalog, message):
+    names = select(catalog, message)
+    assert {"downloads.diagnose_queue", "provider.capabilities"} <= names

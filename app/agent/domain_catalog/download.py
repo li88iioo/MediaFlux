@@ -25,7 +25,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="downloads.diagnose_queue",
-            description="只读诊断 qBittorrent 当前队列、传输状态与疑似停滞任务，不返回 hash、路径或凭据。",
+            description="只读诊断 qBittorrent 当前队列、传输状态与疑似停滞任务，不返回 hash、路径或凭据。此诊断不含客户端版本；版本与其他原生信息通过provider.capabilities发现后用provider.query读取。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -34,6 +34,7 @@ def register_specs(
             },
             handler=diagnose_download_queue,
             validator=download_diagnosis_arguments,
+            related_tools=("provider.capabilities",),
             examples=(
                 "检查下载队列有没有异常",
                 "qBittorrent 里有没有卡住的任务",
