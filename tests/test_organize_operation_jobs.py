@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import unittest
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 from fastapi import FastAPI, Request
@@ -13,13 +14,17 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import database as db
 from app.modules.organize_tasks import OrganizeTaskManager
 from app.repositories.organize_operation_jobs import (
+    CLOUD_COPY_PENDING_CODE,
+    CLOUD_COPY_POLL_SECONDS,
     _payload_auth,
     claim_organize_operation_job,
+    defer_organize_operation_job,
     enqueue_organize_operation_job,
     finish_organize_operation_job,
     get_organize_operation_job,
     get_organize_operation_job_for_owner,
     is_organize_operation_cancel_requested,
+    list_pending_organize_operation_jobs,
     organize_operation_job_id_from_public_ref,
     organize_operation_owner_digest,
     organize_operation_public_ref,
@@ -524,6 +529,16 @@ class OrganizeDurableOperationManagerTests(IsolatedDatabaseTestCase):
     def _payload() -> dict:
         return {"version": 1, "safe": True}
 
+    def _enqueue(self, *, dedupe: str):
+        return enqueue_organize_operation_job(
+            job_kind="agent_directory_scrape",
+            owner="owner-defer-test",
+            operation="目录刮削",
+            reference="安全引用",
+            payload=self._payload(),
+            dedupe_key=dedupe,
+        )
+
     def _enqueue_fs_change(self, *, dedupe: str, case: str = "eligible"):
         owner = f"owner-fs-resume-{dedupe}"
         owner_digest = organize_operation_owner_digest(owner)
@@ -544,6 +559,252 @@ class OrganizeDurableOperationManagerTests(IsolatedDatabaseTestCase):
                 dedupe_key=f"fs-resume:{dedupe}",
             )
         return created, payload
+
+    def test_provider_copy_defer_waits_then_reclaims_same_job_with_next_generation(
+        self,
+    ) -> None:
+        created, _payload = self._enqueue_fs_change(dedupe="provider-copy-delay")
+        job_id = str(created["job_id"])
+        claimed = claim_organize_operation_job(job_id)
+        generation = int(claimed["lease_generation"])
+        before = get_organize_operation_job(job_id)
+        result = {
+            "stats": {"copied": 2, "failed": 1, "private_path": "/private"},
+            "private_result": "must not persist",
+        }
+
+        with patch(
+            "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+            create=True,
+            return_value=True,
+        ) as can_resume:
+            self.assertTrue(defer_organize_operation_job(
+                job_id,
+                expected_lease_generation=generation,
+                result=result,
+            ))
+
+        can_resume.assert_called_once_with(
+            json.loads(before["payload_json"]),
+            job_id=job_id,
+            owner_digest=str(before["owner_digest"]),
+            lease_generation=generation,
+        )
+        deferred = get_organize_operation_job(job_id)
+        self.assertEqual(deferred["status"], "pending")
+        self.assertEqual(deferred["lease_generation"], generation)
+        self.assertEqual(deferred["error_code"], CLOUD_COPY_PENDING_CODE)
+        self.assertEqual(deferred["error"], "")
+        self.assertIsNone(deferred["finished_at"])
+        deferred_at = deferred["updated_at"]
+        self.assertGreater(deferred_at, before["updated_at"])
+        self.assertEqual(
+            json.loads(deferred["result_json"]),
+            {"stats": {"copied": 2, "failed": 1}},
+        )
+        for field in ("job_id", "payload_json", "payload_auth", "reference", "expires_at"):
+            self.assertEqual(deferred[field], before[field], field)
+
+        self.assertIsNone(claim_organize_operation_job(job_id))
+        visible = list_pending_organize_operation_jobs()
+        self.assertEqual([str(row["job_id"]) for row in visible], [job_id])
+        self.assertEqual(
+            list_pending_organize_operation_jobs(ready_only=True), []
+        )
+        self.assertFalse(defer_organize_operation_job(
+            job_id,
+            expected_lease_generation=generation,
+            result={"stats": {"copied": 99}},
+        ))
+        unchanged = get_organize_operation_job(job_id)
+        self.assertEqual(unchanged["status"], "pending")
+        self.assertEqual(unchanged["result_json"], deferred["result_json"])
+        self.assertEqual(unchanged["updated_at"], deferred_at)
+
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_operation_jobs SET updated_at=? WHERE job_id=?",
+                (
+                    (datetime.now().astimezone() - timedelta(
+                        seconds=CLOUD_COPY_POLL_SECONDS + 2
+                    ))
+                    .strftime("%Y-%m-%d %H:%M:%S.%f"),
+                    job_id,
+                ),
+            )
+        ready = list_pending_organize_operation_jobs(ready_only=True)
+        self.assertEqual([str(row["job_id"]) for row in ready], [job_id])
+        reclaimed = claim_organize_operation_job(job_id)
+        self.assertEqual(reclaimed["job_id"], job_id)
+        self.assertEqual(reclaimed["lease_generation"], generation + 1)
+
+    def test_provider_copy_wait_does_not_block_fifo_ready_jobs_or_ui_visibility(
+        self,
+    ) -> None:
+        waiting, _ = self._enqueue_fs_change(dedupe="provider-copy-head")
+        first, _ = self._enqueue(dedupe="provider-copy-ready-first")
+        second, _ = self._enqueue(dedupe="provider-copy-ready-second")
+        waiting_id = str(waiting["job_id"])
+        first_id = str(first["job_id"])
+        second_id = str(second["job_id"])
+        claimed_waiting = claim_organize_operation_job(waiting_id)
+        with patch(
+            "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+            create=True,
+            return_value=True,
+        ):
+            self.assertTrue(defer_organize_operation_job(
+                waiting_id,
+                expected_lease_generation=int(claimed_waiting["lease_generation"]),
+            ))
+
+        self.assertEqual(
+            [str(row["job_id"]) for row in list_pending_organize_operation_jobs()],
+            [waiting_id, first_id, second_id],
+        )
+        self.assertEqual(
+            [str(row["job_id"]) for row in list_pending_organize_operation_jobs(
+                ready_only=True
+            )],
+            [first_id, second_id],
+        )
+        first_claim = claim_organize_operation_job()
+        self.assertEqual(first_claim["job_id"], first_id)
+        second_claim = claim_organize_operation_job(second_id)
+        self.assertEqual(second_claim["job_id"], second_id)
+        self.assertIsNone(claim_organize_operation_job(waiting_id))
+
+    def test_defer_rejects_wrong_lease_cancelled_purged_expired_tampered_and_legacy_jobs(
+        self,
+    ) -> None:
+        cases = {
+            key: self._enqueue_fs_change(dedupe=f"defer-reject-{key}")[0]
+            for key in ("wrong-lease", "cancelled", "purged", "expired", "tampered", "checkpoint")
+        }
+        claims = {
+            key: claim_organize_operation_job(str(row["job_id"]))
+            for key, row in cases.items()
+        }
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_operation_jobs SET cancel_requested=1 WHERE job_id=?",
+                (str(cases["cancelled"]["job_id"]),),
+            )
+            conn.execute(
+                "UPDATE organize_operation_jobs SET purged_at=? WHERE job_id=?",
+                (db.now(), str(cases["purged"]["job_id"])),
+            )
+            conn.execute(
+                "UPDATE organize_operation_jobs SET expires_at=? WHERE job_id=?",
+                (time.time() - 1, str(cases["expired"]["job_id"])),
+            )
+            conn.execute(
+                "UPDATE organize_operation_jobs SET payload_json=? WHERE job_id=?",
+                ('{"tampered":true}', str(cases["tampered"]["job_id"])),
+            )
+
+        for key in ("wrong-lease", "cancelled", "purged", "expired", "tampered"):
+            with self.subTest(case=key), patch(
+                "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+                create=True,
+                return_value=True,
+            ) as can_resume:
+                row = cases[key]
+                generation = int(claims[key]["lease_generation"])
+                before = get_organize_operation_job(str(row["job_id"]))
+                self.assertFalse(defer_organize_operation_job(
+                    str(row["job_id"]),
+                    expected_lease_generation=(
+                        generation + 1 if key == "wrong-lease" else generation
+                    ),
+                ))
+                after = get_organize_operation_job(str(row["job_id"]))
+                for field in ("status", "lease_generation", "result_json", "updated_at"):
+                    self.assertEqual(after[field], before[field], field)
+                if key in {"wrong-lease", "cancelled", "purged", "expired", "tampered"}:
+                    can_resume.assert_not_called()
+
+        checkpoint = cases["checkpoint"]
+        generation = int(claims["checkpoint"]["lease_generation"])
+        before = get_organize_operation_job(str(checkpoint["job_id"]))
+        with patch(
+            "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+            create=True,
+            return_value=False,
+        ) as can_resume:
+            self.assertFalse(defer_organize_operation_job(
+                str(checkpoint["job_id"]), expected_lease_generation=generation
+            ))
+        can_resume.assert_called_once()
+        after = get_organize_operation_job(str(checkpoint["job_id"]))
+        self.assertEqual(after["status"], "running")
+        self.assertEqual(after["lease_generation"], generation)
+        self.assertEqual(after["updated_at"], before["updated_at"])
+
+        legacy, _ = self._enqueue(dedupe="defer-legacy-pending")
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_operation_jobs SET error_code='WorkerInterruptedResume' "
+                "WHERE job_id=?",
+                (str(legacy["job_id"]),),
+            )
+        legacy_claim = claim_organize_operation_job(str(legacy["job_id"]))
+        self.assertEqual(legacy_claim["status"], "running")
+
+        wrong_kind, _ = self._enqueue(dedupe="defer-wrong-kind")
+        wrong_kind_claim = claim_organize_operation_job(str(wrong_kind["job_id"]))
+        with patch(
+            "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+            create=True,
+            return_value=True,
+        ) as can_resume:
+            self.assertFalse(defer_organize_operation_job(
+                str(wrong_kind["job_id"]),
+                expected_lease_generation=int(wrong_kind_claim["lease_generation"]),
+            ))
+        can_resume.assert_not_called()
+        self.assertEqual(
+            get_organize_operation_job(str(wrong_kind["job_id"]))["status"],
+            "running",
+        )
+
+    def test_expired_provider_copy_becomes_manual_review_not_cancelled(self) -> None:
+        created, _ = self._enqueue_fs_change(dedupe="provider-copy-expired")
+        job_id = str(created["job_id"])
+        claimed = claim_organize_operation_job(job_id)
+        with patch(
+            "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+            create=True,
+            return_value=True,
+        ):
+            self.assertTrue(defer_organize_operation_job(
+                job_id,
+                expected_lease_generation=int(claimed["lease_generation"]),
+                result={"stats": {"copied": 1}},
+            ))
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_operation_jobs SET expires_at=? WHERE job_id=?",
+                (time.time() - 1, job_id),
+            )
+
+        with patch("app.modules.guangya_fs_change.finalize_fs_change_plan_job") as finalize:
+            self.assertIsNone(claim_organize_operation_job())
+        finalize.assert_called_once()
+        self.assertEqual(finalize.call_args.kwargs["queue_status"], "manual_review")
+        expired = get_organize_operation_job(job_id)
+        self.assertEqual(expired["status"], "manual_review")
+        self.assertEqual(expired["error_code"], "ProviderCopyOutcomeUnknown")
+        self.assertIn("云端处理结果未知", expired["error"])
+        self.assertIn("可能仍在执行", expired["error"])
+        self.assertIn("先核对目标目录", expired["error"])
+        self.assertIn("勿直接重试", expired["error"])
+        self.assertNotIn("云端已取消", expired["error"])
+        self.assertEqual(expired["payload_json"], "{}")
+        self.assertEqual(expired["payload_auth"], "")
+        self.assertEqual(
+            json.loads(expired["result_json"]), {"stats": {"copied": 1}}
+        )
 
     def test_orphan_fs_change_requeues_only_when_plan_is_resumable(self) -> None:
         created, _payload = self._enqueue_fs_change(dedupe="eligible")

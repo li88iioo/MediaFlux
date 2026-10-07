@@ -118,6 +118,33 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("secret", result.data["task"]["stats"])
         self.assertIn("未触发 STRM 联动", " ".join(result.suggestions))
 
+    def test_copy_pending_queued_status_projects_safe_resume_summary(self) -> None:
+        from app.repositories.organize_operation_jobs import CLOUD_COPY_PENDING_CODE
+
+        manager = Mock()
+        manager.status.return_value = {
+            "operation_queue": {"total": 1},
+            "schedule": {},
+        }
+        manager.task_result.return_value = {
+            "status": "queued",
+            "error_code": CLOUD_COPY_PENDING_CODE,
+            "task_id": "private-copy-task-id",
+            "running": False,
+        }
+        with patch(
+            "app.modules.organize_tasks.get_organize_manager", return_value=manager
+        ):
+            result = guangya_organize_status(
+                {"operation_ref": _OPERATION_REF},
+                ToolContext(owner="webk:v1:owner-safe"),
+            )
+
+        self.assertEqual(result.status, "queued")
+        self.assertEqual(result.data["task"]["status"], "queued")
+        self.assertNotIn("private-copy-task-id", json.dumps(result.to_dict()))
+        self.assertEqual(result.summary, "光鸭复制仍在处理中，完成后将继续原计划")
+
     async def test_waits_on_persistent_snapshots_and_reports_safe_progress(
         self,
     ) -> None:
@@ -189,6 +216,78 @@ class GuangYaOperationTrackingTests(unittest.IsolatedAsyncioTestCase):
             all(item["tool"] == "guangya.fs.change.execute" for item in progress)
         )
         self.assertNotIn("owner", progress[0])
+
+    async def test_organize_completion_waits_across_worker_yield_and_reclaim(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "operation_ref",
+                ToolResult(
+                    True,
+                    "accepted",
+                    "已提交",
+                    data={"operation_ref": _OPERATION_REF},
+                ),
+                "app.agent.domain_catalog.cloud_runtime.guangya_organize_status",
+            ),
+            (
+                "private_task_id",
+                _tracked_accepted(
+                    "guangya_organize_task",
+                    task_id="private-organize-task",
+                    operation="run",
+                ),
+                "app.agent.domain_catalog.cloud_runtime.guangya_organize_task_status",
+            ),
+        )
+        expected_statuses = ["running", "queued", "running", "completed"]
+
+        for label, accepted, status_target in cases:
+            with self.subTest(tracker=label):
+                snapshots = iter(
+                    _snapshot(status, stats={"copied": 1})
+                    for status in expected_statuses
+                )
+                progress: list[dict] = []
+
+                async def report(payload):
+                    progress.append(dict(payload))
+
+                with (
+                    patch(
+                        status_target,
+                        side_effect=lambda *_args, _snapshots=snapshots, **_kwargs: (
+                            next(_snapshots)
+                        ),
+                    ) as status,
+                    patch(
+                        "app.agent.effect_completion.asyncio.sleep",
+                        new=AsyncMock(),
+                    ) as sleep,
+                ):
+                    result = await wait_for_effect_completion(
+                        accepted,
+                        tool="guangya.fs.change.execute",
+                        context=ToolContext(owner="tg:v1:owner-safe"),
+                        report_progress=report,
+                        timeout_seconds=60,
+                    )
+
+                self.assertTrue(result.ok)
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(result.data["background_job"]["status"], "completed")
+                self.assertEqual(status.call_count, 4)
+                self.assertEqual(sleep.await_count, 3)
+                self.assertEqual(
+                    [event["status"] for event in progress], expected_statuses
+                )
+                self.assertEqual(progress[-1]["status"], "completed")
+                if label == "private_task_id":
+                    self.assertNotIn("private-organize-task", str(result.to_dict()))
+                    self.assertNotIn(
+                        "private-organize-task", json.dumps(progress, ensure_ascii=False)
+                    )
 
     async def test_waits_for_provider_task_until_recycle_clear_completes(self) -> None:
         snapshots = iter(

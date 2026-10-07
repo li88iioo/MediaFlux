@@ -192,10 +192,118 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 "plan_id": plan["plan_id"],
                 "plan_fingerprint": plan["fingerprint"],
                 "owner_digest": plan["owner_digest"],
-                "credential_generation": 9,
+                "credential_generation": plan["credential_generation"],
             },
             dedupe_key=f"fs-change:{plan['plan_id']}",
         )
+
+    def test_waiting_copy_releases_worker_and_resumes_same_plan_without_recopy(self):
+        from app.modules import guangya_workspace as workspace
+        from app.repositories.organize_operation_jobs import CLOUD_COPY_PENDING_CODE
+        from tests.test_agent_guangya_fs_gateway import FakeGatewayClient
+
+        client = FakeGatewayClient()
+        with mock.patch.object(workspace, "_directory", return_value=Path(self.temp.name) / "observations"):
+            observation = workspace.create_directory_observation(client, owner="queue-owner", path="/", recursive=True)
+            refs = {row["file_id"]: row["handle"] for row in observation["entries"]}
+            plan = guangya_fs_change.build_fs_change_plan(client, owner="queue-owner", observation=observation,
+                operations=[{"op": "copy", "object_ref": refs["trash"], "target_path": "/target"},
+                            {"op": "move", "object_ref": refs["source"], "target_path": "/target"}], trigger_strm=False)
+        guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="queue-owner", expected_fingerprint=plan["fingerprint"])
+        queued, _ = self._enqueue(plan)
+        job_id = queued["job_id"]
+        public_ref = organize_operation_public_ref(job_id)
+        payload = json.loads(queued["payload_json"])
+        first_manager = None
+
+        def run(row):
+            manager = OrganizeTaskManager()
+            manager._lock = threading.Lock()
+            manager._lock.acquire()
+            manager._worker = object()
+            manager._task = {"id": job_id, "status": "running", "durable": True, "owner_digest": row["owner_digest"]}
+            with mock.patch.object(manager, "_wake_download_tracker"), \
+                 mock.patch.object(manager, "_execute_durable_operation", side_effect=lambda _row:
+                     guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=row["lease_generation"])):
+                manager._run_durable_operation(dict(row))
+            self.assertIsNone(manager._worker)
+            self.assertTrue(manager._lock.acquire(blocking=False), "waiting must release the organizer write lock")
+            manager._lock.release()
+            return manager
+
+        with mock.patch.object(client, "copy", wraps=client.copy) as copied, \
+             mock.patch.object(client, "task_status", return_value={"data": {"status": 1}}) as task_status, \
+             mock.patch.object(guangya_fs_change, "_COPY_FOREGROUND_ATTEMPTS", 1):
+            first_manager = run(claim_organize_operation_job(job_id))
+            waiting = get_organize_operation_job(job_id)
+            self.assertEqual(waiting["status"], "pending")
+            self.assertEqual(waiting["error_code"], CLOUD_COPY_PENDING_CODE)
+            self.assertIsNone(waiting["finished_at"])
+            self.assertEqual(waiting["expires_at"], queued["expires_at"])
+            self.assertEqual(waiting["payload_json"], queued["payload_json"])
+            self.assertIsNone(claim_organize_operation_job())
+            self.assertEqual(first_manager.task_result(public_ref, owner="queue-owner")["status"], "queued")
+            # 复制在云端运行时，另一个普通任务可以领取，不被等待队首占锁。
+            other, _ = enqueue_organize_operation_job(job_kind="directory_scrape", owner="queue-owner",
+                operation="independent", reference="", payload={}, dedupe_key="independent")
+            claimed_other = claim_organize_operation_job()
+            self.assertEqual(claimed_other["job_id"], other["job_id"])
+            finish_organize_operation_job(other["job_id"], expected_lease_generation=claimed_other["lease_generation"], status="completed")
+            for generation in (2, 3):
+                with database.get_conn() as conn:
+                    conn.execute("UPDATE organize_operation_jobs SET updated_at='2000-01-01 00:00:00' WHERE job_id=?", (job_id,))
+                if generation == 3: task_status.return_value = {"data": {"status": 2}}
+                claimed = claim_organize_operation_job(job_id)
+                self.assertEqual(claimed["lease_generation"], generation)
+                run(claimed)
+            copied.assert_called_once_with(["trash"], "target")
+        finished = get_organize_operation_job(job_id)
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(client.file_info("source").parent_id, "target")
+        self.assertEqual(json.loads(finished["result_json"])["stats"]["copied"], 1)
+        # 原manager的queued缓存不能遮住另一worker已落盘的终态。
+        self.assertEqual(first_manager.task_result(public_ref, owner="queue-owner")["status"], "completed")
+        self.assertNotIn("copy-task-", finished["result_json"])
+
+    def test_owner_purge_cannot_be_undone_by_running_or_finished_worker_cache(self):
+        queued, _ = self._enqueue(self._confirmed_plan())
+        job_id = queued["job_id"]
+        claimed = claim_organize_operation_job(job_id)
+        public_ref = organize_operation_public_ref(job_id)
+        manager = OrganizeTaskManager()
+        manager._lock = threading.Lock()
+        manager._lock.acquire()
+        private_result = {"stats": {"total": 1}, "operation_items": [{
+            "position": 1, "operation": "copy", "status": "unknown",
+            "label": "复制：已清理的文件名", "completed_actions": [],
+        }]}
+        manager._task = {"id": job_id, "status": "running", "durable": True,
+                         "owner_digest": claimed["owner_digest"], "result": private_result}
+        database.purge_agent_subject_data(owner="queue-owner")
+        self.assertIsNone(manager.task_result(public_ref, owner="queue-owner"))
+        cancelled = OrganizeOperationCancelled("cancelled")
+        cancelled.operation_result = private_result
+        with mock.patch.object(manager, "_execute_durable_operation", side_effect=cancelled), mock.patch.object(manager, "_wake_download_tracker"):
+            manager._run_durable_operation(dict(claimed))
+        self.assertIsNone(get_organize_operation_job(job_id))
+        self.assertIsNone(manager.task_result(public_ref, owner="queue-owner"))
+        manager._task = {}
+        self.assertIsNone(manager.task_result(public_ref, owner="queue-owner"), "history cache must not resurrect the erased receipt")
+
+    def test_wait_checkpoint_failure_is_manual_review_not_retryable_failure(self):
+        queued, _ = self._enqueue(self._confirmed_plan())
+        claimed = claim_organize_operation_job(queued["job_id"])
+        manager = OrganizeTaskManager()
+        manager._lock = threading.Lock()
+        manager._lock.acquire()
+        manager._task = {"id": queued["job_id"], "status": "running", "durable": True}
+        error = guangya_fs_change.GuangYaFSCheckpointError("checkpoint unavailable")
+        error.operation_result = {"stats": {"audit_failures": 1}, "requires_manual": True}
+        with mock.patch.object(manager, "_execute_durable_operation", side_effect=error), mock.patch.object(manager, "_wake_download_tracker"):
+            manager._run_durable_operation(dict(claimed))
+        result = get_organize_operation_job(queued["job_id"])
+        self.assertEqual(result["status"], "manual_review")
+        self.assertIn("勿重复提交", result["error"])
 
     def test_durable_fs_partial_stats_reach_waiter_from_live_history_and_restart(self):
         # 实盘结果的数值/结构；所有执行均替换为内存结果，不访问云盘。

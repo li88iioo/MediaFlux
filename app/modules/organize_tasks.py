@@ -33,6 +33,8 @@ from app.repositories.download_staging import (
 from app.modules.process_lock import CrossProcessLock
 from app.repositories.organize_operation_jobs import (
     claim_organize_operation_job,
+    defer_organize_operation_job,
+    CLOUD_COPY_PENDING_CODE,
     count_pending_organize_operation_jobs,
     count_running_organize_operation_jobs,
     enqueue_organize_operation_job,
@@ -746,6 +748,8 @@ class OrganizeTaskManager:
                     continue
                 if owner_digest and str(task.get("owner_digest") or "") != owner_digest:
                     continue
+                if task.get("durable"):
+                    continue  # 持久任务以数据库为唯一事实，不能让旧worker缓存复活已清理的回执。
                 result = dict(task)
                 # 只有普通扫描使用 counters；单次操作与持久作业保留各自的执行回执。
                 if not result.get("durable") and not result.get("operation") and isinstance(result.get("result"), dict):
@@ -758,7 +762,7 @@ class OrganizeTaskManager:
             )
         except ValueError:
             row = None
-        if row is None:
+        if row is None or row["purged_at"] is not None:
             return None
         try:
             persisted_result = json.loads(str(row["result_json"] or "{}"))
@@ -770,6 +774,8 @@ class OrganizeTaskManager:
             "id": str(row["job_id"] or ""),
             "status": public_status,
             "message": (
+                "光鸭复制仍在处理中，完成后将继续原计划"
+                if status == "pending" and row["error_code"] == CLOUD_COPY_PENDING_CODE else
                 f"{str(row['operation'] or '操作')}已排队"
                 if status == "pending" else
                 f"{str(row['operation'] or '操作')}需要人工核验"
@@ -1223,88 +1229,64 @@ class OrganizeTaskManager:
         raise ValueError("不支持的持久化操作类型")
 
     def _run_durable_operation(self, row: dict[str, Any]) -> None:
+        from app.modules.guangya_fs_change import GuangYaFSCopyPending, GuangYaFSCheckpointError
+
         task_id = str(row.get("job_id") or "")
         operation = str(row.get("operation") or "操作")
         generation = int(row.get("lease_generation") or 0)
+        error = error_code = ""
         try:
-            result = self._execute_durable_operation(row)
-        except Exception as exc:
-            logger.error(
-                "持久化整理操作失败 operation=%s type=%s",
-                operation, type(exc).__name__,
-            )
-            cancelled = isinstance(exc, OrganizeOperationCancelled)
-            safe_result = sanitize_organize_operation_result(getattr(exc, "operation_result", {}))
-            error = "" if cancelled else (
-                public_error_message(exc)
-                if isinstance(exc, DirectoryScrapePublicError)
-                else f"{operation}失败，请重新检查后重试"
-            )
-            terminal_status = "cancelled" if cancelled else "failed"
             try:
-                persisted = finish_organize_operation_job(
-                    task_id, expected_lease_generation=generation, status=terminal_status,
-                    error_code="" if cancelled else type(exc).__name__, error=error, result=safe_result,
+                result = self._execute_durable_operation(row)
+                status = _operation_result_status(result)
+            except GuangYaFSCopyPending as exc:
+                result = exc.operation_result
+                status, error_code = "queued", CLOUD_COPY_PENDING_CODE
+            except Exception as exc:
+                logger.error("持久化整理操作失败 operation=%s type=%s", operation, type(exc).__name__)
+                result = getattr(exc, "operation_result", {})
+                cancelled = isinstance(exc, OrganizeOperationCancelled)
+                status = "cancelled" if cancelled else "manual_review" if isinstance(exc, GuangYaFSCheckpointError) else "failed"
+                error_code = "" if cancelled else type(exc).__name__
+                error = "" if cancelled else (
+                    public_error_message(exc) if isinstance(exc, DirectoryScrapePublicError)
+                    else "操作检查点未能保存，请核对云端结果，勿重复提交" if status == "manual_review"
+                    else f"{operation}失败，请重新检查后重试"
                 )
-            except Exception as persist_exc:
-                logger.warning(
-                    "持久化光鸭操作失败终态写入异常 type=%s",
-                    type(persist_exc).__name__,
-                )
-                persisted = False
-            memory_status = terminal_status if persisted else "manual_review"
-            memory_error = error if persisted else (
-                "操作执行结果未能可靠持久化，请核对目标目录后再决定是否重试"
-            )
-            with self._state_lock:
-                if self._task.get("id") == task_id:
-                    self._task.update({
-                        "status": memory_status,
-                        "message": (
-                            f"{operation}已取消" if persisted and cancelled
-                            else f"{operation}失败" if persisted
-                            else f"{operation}需要人工核验"
-                        ),
-                        "error": memory_error, "current_source": "",
-                        "error_code": "" if cancelled else type(exc).__name__,
-                        **({"result": safe_result} if safe_result else {}),
-                        "group_progress": {},
-                        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                    self._remember_task_locked(self._task)
-                    self._remember_operation_locked(self._task)
-        else:
-            terminal_status = _operation_result_status(result)
             safe_result = sanitize_organize_operation_result(result)
             try:
-                persisted = finish_organize_operation_job(
-                    task_id, expected_lease_generation=generation,
-                    status=terminal_status,
-                    result=safe_result,
-                )
-            except Exception as persist_exc:
-                logger.warning(
-                    "持久化光鸭操作成功终态写入异常 type=%s",
-                    type(persist_exc).__name__,
-                )
                 persisted = False
-            memory_status = terminal_status if persisted else "manual_review"
+                if status == "queued":
+                    persisted = defer_organize_operation_job(task_id,
+                        expected_lease_generation=generation, result=safe_result)
+                    if not persisted:
+                        cancelled = is_organize_operation_cancel_requested(task_id, expected_lease_generation=generation)
+                        status = "cancelled" if cancelled else "manual_review"
+                        error_code = "" if cancelled else "CopyFollowupUnavailable"
+                        error = "" if cancelled else "复制已提交但无法继续跟踪，请核对云端结果，勿重复提交"
+                if status != "queued":
+                    persisted = finish_organize_operation_job(task_id,
+                        expected_lease_generation=generation, status=status,
+                        error_code=error_code, error=error, result=safe_result)
+            except Exception as persist_exc:
+                logger.warning("持久化光鸭操作状态写入异常 type=%s", type(persist_exc).__name__)
+                persisted = False
+            memory_status = status if persisted else "manual_review"
+            message = (
+                "光鸭复制仍在处理中，完成后将继续原计划" if memory_status == "queued"
+                else f"{operation}" + {
+                    "completed": "已完成", "partial": "部分完成", "failed": "失败",
+                    "cancelled": "已取消", "manual_review": "需要人工核验",
+                }[memory_status]
+            )
             with self._state_lock:
                 if self._task.get("id") == task_id:
                     self._task.update({
-                        "status": memory_status,
-                        "message": (
-                            f"{operation}部分完成" if persisted and terminal_status == "partial"
-                            else f"{operation}失败" if persisted and terminal_status == "failed"
-                            else f"{operation}已完成" if persisted
-                            else f"{operation}需要人工核验"
-                        ),
-                        "error": "" if persisted else (
-                            "操作结果未能可靠持久化，请核对目标目录"
-                        ),
-                        "current_source": "", "group_progress": {},
-                        "finished_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "result": safe_result if persisted else {},
+                        "status": memory_status, "message": message,
+                        "error": error if persisted else "操作结果未能可靠持久化，请核对目标目录，勿重复提交",
+                        "error_code": error_code, "current_source": "", "group_progress": {},
+                        "finished_at": "" if memory_status == "queued" else datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "result": safe_result,
                     })
                     self._remember_task_locked(self._task)
                     self._remember_operation_locked(self._task)
@@ -1546,7 +1528,7 @@ class OrganizeTaskManager:
                         durable_row = None
                         if durable_pending:
                             try:
-                                pending_rows = list_pending_organize_operation_jobs(limit=1)
+                                pending_rows = list_pending_organize_operation_jobs(limit=1, ready_only=True)
                                 durable_row = pending_rows[0] if pending_rows else None
                             except Exception as exc:
                                 logger.warning(

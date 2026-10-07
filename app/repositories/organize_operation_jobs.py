@@ -34,6 +34,13 @@ _MANUAL_REVIEW_RETENTION_SECONDS = 30 * 24 * 60 * 60
 _MAX_ACTIVE_PER_OWNER = 4
 _MAX_ACTIVE_GLOBAL = 128
 _DEFAULT_TTL_SECONDS = 3_600
+CLOUD_COPY_PENDING_CODE = "ProviderCopyPending"
+CLOUD_COPY_POLL_SECONDS = 10
+_PROVIDER_COPY_EXPIRED_CODE = "ProviderCopyOutcomeUnknown"
+_PROVIDER_COPY_EXPIRED_ERROR = (
+    "复制请求已提交，队列已过期；云端处理结果未知，可能仍在执行。"
+    "请先核对目标目录，勿直接重试或视为已取消。"
+)
 _MAX_OPERATION_ITEMS = 400
 _MAX_OPERATION_LABEL_BYTES = 128
 _ALLOWED_RESULT_STATS = {
@@ -386,24 +393,40 @@ def _expire_pending(conn: sqlite3.Connection, current_epoch: float) -> int:
         "SELECT * FROM organize_operation_jobs WHERE status='pending' AND expires_at<=?",
         (float(current_epoch),),
     ).fetchall()
-    cur = conn.execute(
+    copy_expired = conn.execute(
+        "UPDATE organize_operation_jobs SET status='manual_review',reference='',"
+        "payload_json='{}',payload_auth='',error_code=?,error=?,"
+        "finished_at=COALESCE(finished_at,?),updated_at=? "
+        "WHERE status='pending' AND expires_at<=? AND error_code=?",
+        (
+            _PROVIDER_COPY_EXPIRED_CODE, _PROVIDER_COPY_EXPIRED_ERROR,
+            timestamp, timestamp, float(current_epoch), CLOUD_COPY_PENDING_CODE,
+        ),
+    )
+    expired = conn.execute(
         "UPDATE organize_operation_jobs SET status='cancelled',payload_json='{}',"
         "payload_auth='',error_code='QueueExpired',error='排队确认已过期，请重新预检',"
         "finished_at=COALESCE(finished_at,?),updated_at=? "
-        "WHERE status='pending' AND expires_at<=?",
-        (timestamp, timestamp, float(current_epoch)),
+        "WHERE status='pending' AND expires_at<=? "
+        "AND COALESCE(error_code,'')<>?",
+        (timestamp, timestamp, float(current_epoch), CLOUD_COPY_PENDING_CODE),
     )
     for row in expired_rows:
+        is_copy_pending = str(row["error_code"] or "") == CLOUD_COPY_PENDING_CODE
         _sync_cloud_plan_terminal(
             row,
-            status="cancelled",
-            error_code="QueueExpired",
+            status="manual_review" if is_copy_pending else "cancelled",
+            error_code=(
+                _PROVIDER_COPY_EXPIRED_CODE if is_copy_pending else "QueueExpired"
+            ),
         )
     conn.execute(
         "DELETE FROM organize_operation_jobs WHERE purged_at IS NOT NULL "
         "AND status<>'running'"
     )
-    return max(0, int(cur.rowcount or 0))
+    return max(0, int(copy_expired.rowcount or 0)) + max(
+        0, int(expired.rowcount or 0)
+    )
 
 
 def _delete_job_rows(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> None:
@@ -577,13 +600,17 @@ def claim_organize_operation_job(job_id: str | None = None) -> sqlite3.Row | Non
     safe_id = _safe_job_id(job_id) if job_id else ""
     timestamp = now()
     current_epoch = time.time()
+    ready_cutoff = datetime.fromtimestamp(
+        current_epoch - CLOUD_COPY_POLL_SECONDS
+    ).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
         _expire_pending(conn, current_epoch)
         row = conn.execute(
             "SELECT job_id FROM organize_operation_jobs WHERE status='pending' "
-            "AND expires_at>? ORDER BY created_at,job_id LIMIT 1",
-            (current_epoch,),
+            "AND expires_at>? AND (COALESCE(error_code,'')<>? OR updated_at<=?) "
+            "ORDER BY created_at,job_id LIMIT 1",
+            (current_epoch, CLOUD_COPY_PENDING_CODE, ready_cutoff),
         ).fetchone()
         if row is None:
             return None
@@ -593,14 +620,83 @@ def claim_organize_operation_job(job_id: str | None = None) -> sqlite3.Row | Non
         cur = conn.execute(
             "UPDATE organize_operation_jobs SET status='running',"
             "lease_generation=lease_generation+1,started_at=COALESCE(started_at,?),"
-            "updated_at=? WHERE job_id=? AND status='pending' AND expires_at>?",
-            (timestamp, timestamp, selected, current_epoch),
+            "updated_at=? WHERE job_id=? AND status='pending' AND expires_at>? "
+            "AND (COALESCE(error_code,'')<>? OR updated_at<=?)",
+            (
+                timestamp, timestamp, selected, current_epoch,
+                CLOUD_COPY_PENDING_CODE, ready_cutoff,
+            ),
         )
         if cur.rowcount != 1:
             return None
         return conn.execute(
             "SELECT * FROM organize_operation_jobs WHERE job_id=?", (selected,)
         ).fetchone()
+
+
+def defer_organize_operation_job(
+    job_id: str,
+    *,
+    expected_lease_generation: int,
+    result: dict[str, Any] | None = None,
+) -> bool:
+    """安全地把已提交云端复制、仍需轮询的计划放回延后领取队列。"""
+    safe_id = _safe_job_id(job_id)
+    generation = max(0, int(expected_lease_generation))
+    safe_result = sanitize_organize_operation_result(result or {})
+    safe_result_json = _safe_json(safe_result, field="光鸭操作任务结果")
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM organize_operation_jobs WHERE job_id=? "
+            "AND status='running' AND lease_generation=?",
+            (safe_id, generation),
+        ).fetchone()
+        if (
+            row is None
+            or str(row["job_kind"] or "") != "agent_guangya_fs_change"
+            or bool(row["cancel_requested"])
+            or row["purged_at"] is not None
+            or float(row["expires_at"] or 0) <= time.time()
+        ):
+            return False
+        try:
+            if not verify_organize_operation_payload(row):
+                return False
+            payload = json.loads(str(row["payload_json"] or "{}"))
+            if not isinstance(payload, dict):
+                return False
+            from app.modules.guangya_fs_change import can_resume_fs_change_plan
+
+            can_resume = can_resume_fs_change_plan(
+                payload,
+                job_id=str(row["job_id"]),
+                owner_digest=str(row["owner_digest"]),
+                lease_generation=generation,
+            )
+        except Exception:  # noqa: BLE001 - 不确定的计划不得重新排队
+            return False
+        if can_resume is not True:
+            return False
+
+        current_epoch = time.time()
+        if float(row["expires_at"] or 0) <= current_epoch:
+            return False
+        timestamp = datetime.fromtimestamp(current_epoch).astimezone().strftime(
+            "%Y-%m-%d %H:%M:%S.%f"
+        )
+        cur = conn.execute(
+            "UPDATE organize_operation_jobs SET status='pending',result_json=?,"
+            "error_code=?,error='',finished_at=NULL,updated_at=? "
+            "WHERE job_id=? AND status='running' AND lease_generation=? "
+            "AND job_kind='agent_guangya_fs_change' AND cancel_requested=0 "
+            "AND purged_at IS NULL AND expires_at>?",
+            (
+                safe_result_json, CLOUD_COPY_PENDING_CODE, timestamp, safe_id,
+                generation, current_epoch,
+            ),
+        )
+        return cur.rowcount == 1
 
 
 def is_organize_operation_cancel_requested(
@@ -830,15 +926,33 @@ def count_pending_organize_operation_jobs() -> int:
     return int(row["total"] or 0) if row is not None else 0
 
 
-def list_pending_organize_operation_jobs(*, limit: int = 64) -> list[sqlite3.Row]:
+def list_pending_organize_operation_jobs(
+    *, limit: int = 64, ready_only: bool = False
+) -> list[sqlite3.Row]:
     safe_limit = max(1, min(int(limit), 64))
     try:
         with get_conn() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            _expire_pending(conn, time.time())
+            current_epoch = time.time()
+            _expire_pending(conn, current_epoch)
+            ready_filter = ""
+            params: tuple[object, ...] = (safe_limit,)
+            if ready_only:
+                ready_cutoff = datetime.fromtimestamp(
+                    current_epoch - CLOUD_COPY_POLL_SECONDS
+                ).astimezone().strftime("%Y-%m-%d %H:%M:%S.%f")
+                ready_filter = (
+                    "AND expires_at>? "
+                    "AND (COALESCE(error_code,'')<>? OR updated_at<=?) "
+                )
+                params = (
+                    current_epoch, CLOUD_COPY_PENDING_CODE, ready_cutoff, safe_limit
+                )
             return conn.execute(
                 "SELECT * FROM organize_operation_jobs WHERE status='pending' "
-                "ORDER BY created_at,job_id LIMIT ?", (safe_limit,)
+                + ready_filter
+                + "ORDER BY created_at,job_id LIMIT ?",
+                params,
             ).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).casefold():

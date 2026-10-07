@@ -2221,11 +2221,18 @@ class GuangYaFSGatewayTests(unittest.TestCase):
                      mock.patch.object(client, "list_dir", side_effect=listing), \
                      mock.patch.object(client, "move", wraps=client.move) as moved, \
                      mock.patch("app.clients.guangya.sleep"):
-                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                    if case == "running":
+                        with self.assertRaises(guangya_fs_change.GuangYaFSCopyPending) as waiting:
+                            guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+                        result = waiting.exception.operation_result
+                        self.assertEqual(result["stats"]["failed"], 0)
+                        self.assertFalse(result["requires_manual"])
+                    else:
+                        result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
                 complete = case in {"complete", "delayed_task"}
                 self.assertEqual(result["stats"]["copied"], int(complete))
                 self.assertEqual(result["stats"]["moved"], int(complete))
-                self.assertEqual(result["partial"], not complete)
+                self.assertEqual(result["partial"], not complete and case != "running")
                 self.assertEqual(client.file_info("source").parent_id, "archive" if complete else "0")
                 self.assertEqual(client.file_info("trash").parent_id, "source")
                 self.assertEqual(moved.call_count, int(complete))
@@ -2292,11 +2299,79 @@ class GuangYaFSGatewayTests(unittest.TestCase):
                             guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
                     with mock.patch.object(client, "copy", wraps=original_copy) as copied, \
                          mock.patch.object(client, "task_status", return_value={"data": {"status": 2 if complete else 1}}) as task:
-                        result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                        if checkpointed and not complete:
+                            with self.assertRaises(guangya_fs_change.GuangYaFSCopyPending) as waiting:
+                                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                            result = waiting.exception.operation_result
+                        else:
+                            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
                     copied.assert_not_called()
                     self.assertEqual(result["stats"]["copied"], int(checkpointed and complete))
                     self.assertEqual(client.file_info("source").parent_id, "archive" if checkpointed and complete else "0")
                     self.assertEqual(task.call_count, int(checkpointed))
+
+    def test_pending_copy_can_wait_across_leases_and_only_move_parent_after_completion(self):
+        client = FakeGatewayClient()
+        plan, payload = self._directory_copy_plan(client)
+        with mock.patch.object(client, "copy", wraps=client.copy) as copy, \
+             mock.patch.object(client, "move", wraps=client.move) as move, \
+             mock.patch.object(client, "task_status", return_value={"data": {"status": 1}}) as task, \
+             mock.patch.object(guangya_fs_change, "_COPY_FOREGROUND_ATTEMPTS", 1):
+            for generation in (1, 2, 3):
+                with self.assertRaises(guangya_fs_change.GuangYaFSCopyPending) as waiting:
+                    guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=generation)
+                self.assertEqual(waiting.exception.position, 1)
+                self.assertEqual(waiting.exception.operation_result["stats"]["failed"], 0)
+                self.assertTrue(guangya_fs_change.can_resume_fs_change_plan(payload,
+                    job_id=payload["job_id"], owner_digest=plan["owner_digest"], lease_generation=generation))
+                self.assertEqual(guangya_fs_change._read(plan["plan_id"])["status"], "running")
+                self.assertEqual(client.file_info("source").parent_id, "0")
+            self.assertEqual(copy.call_count, 1)
+            move.assert_not_called()
+            self.assertEqual(task.call_count, 3)
+            task.return_value = {"data": {"status": 2}}
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=4)
+            self.assertFalse(result["partial"])
+            self.assertEqual(copy.call_count, 1)
+            move.assert_called_once_with(["source"], "archive")
+
+    def test_copy_status_read_error_then_known_running_defers_instead_of_failing(self):
+        client = FakeGatewayClient()
+        plan, payload = self._directory_copy_plan(client)
+        with mock.patch.object(client, "task_status", side_effect=[RuntimeError("temporary read"), {"data": {"status": 1}}]), \
+             mock.patch.object(client, "copy", wraps=client.copy) as copy:
+            with self.assertRaises(guangya_fs_change.GuangYaFSCopyPending) as waiting:
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        self.assertEqual(waiting.exception.operation_result["stats"]["failed"], 0)
+        self.assertEqual(waiting.exception.operation_result["stats"]["verification_failed"], 0)
+        self.assertEqual(client.file_info("source").parent_id, "0")
+        copy.assert_called_once()
+        with mock.patch.object(client, "task_status", return_value={"data": {"status": 3}}), mock.patch.object(client, "copy", wraps=client.copy) as copy:
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=2)
+        self.assertEqual(result["operation_items"][0]["status"], "failed")
+        self.assertEqual(result["operation_items"][1]["status"], "blocked")
+        copy.assert_not_called()
+
+    def test_copy_wait_checkpoint_failure_does_not_finish_or_continue_plan(self):
+        client = FakeGatewayClient()
+        plan, payload = self._directory_copy_plan(client)
+        original = guangya_fs_change._append_journal
+        task_saved = 0
+        def fail_wait(plan_id, event):
+            nonlocal task_saved
+            if (event.get("data") or {}).get("copy_task_id"):
+                task_saved += 1
+                if task_saved > 1: raise OSError("disk full")
+            original(plan_id, event)
+        with mock.patch.object(client, "task_status", return_value={"data": {"status": 1}}), \
+             mock.patch.object(client, "move", wraps=client.move) as move, \
+             mock.patch.object(guangya_fs_change, "_COPY_FOREGROUND_ATTEMPTS", 1), \
+             mock.patch.object(guangya_fs_change, "_append_journal", side_effect=fail_wait):
+            with self.assertRaises(guangya_fs_change.GuangYaFSCheckpointError) as failed:
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+            self.assertEqual(failed.exception.operation_result["stats"]["audit_failures"], 1)
+            self.assertTrue(failed.exception.operation_result["requires_manual"])
+            move.assert_not_called()
 
     def test_copy_keeps_source_and_verifies_new_target_object(self):
         client = FakeGatewayClient()

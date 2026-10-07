@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.agent.models import Evidence, ToolContext, ToolResult
-from app.repositories.organize_operation_jobs import sanitize_organize_operation_result
+from app.repositories.organize_operation_jobs import CLOUD_COPY_PENDING_CODE, sanitize_organize_operation_result
 
 from .shared import _bounded_int, _now, _safe_choice, _safe_timestamp
 
@@ -73,6 +73,9 @@ def _project_guangya_status(
     elif task_status == "queued":
         ok, status, summary = True, "queued", "光鸭整理操作正在排队"
         suggestions = ["任务会在当前整理操作结束后自动执行。"]
+        if raw.get("error_code") == CLOUD_COPY_PENDING_CODE:
+            summary = "光鸭复制仍在处理中，完成后将继续原计划"
+            suggestions = ["系统会继续跟踪原任务；无需再次确认或重复提交复制。"]
     elif task_status == "manual_review":
         ok, status, summary = False, "attention", "光鸭操作需要进一步核验"
         suggestions = ["请先核对光鸭目标目录，确认远端结果后再决定是否重新执行。"]

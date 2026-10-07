@@ -47,6 +47,7 @@ MAX_FS_CHANGE_OPERATIONS = (
     MAX_FS_CHANGE_OBJECT_OPERATIONS + MAX_FS_CHANGE_CREATE_OPERATIONS
 )
 _MAX_PLAN_BYTES = 2 * 1024 * 1024
+_COPY_FOREGROUND_ATTEMPTS = 21
 _MAX_COPY_ITEMS = 2_000
 _MAX_COPY_DIRS = 500
 _MAX_PLANS = 32
@@ -68,6 +69,14 @@ class GuangYaFSChangeError(RuntimeError):
 
 class GuangYaFSCheckpointError(GuangYaFSChangeError):
     """阶段事实无法可靠落盘，必须停止追加写入。"""
+
+
+class GuangYaFSCopyPending(GuangYaFSChangeError):
+    """已提交的复制仍在运行：让出 worker，原任务稍后仅读对账再续行。"""
+
+    def __init__(self, position: int = 0):
+        super().__init__("光鸭复制仍在处理中，完成后将继续原计划")
+        self.position = position
 
 
 class GuangYaFSChangeStale(GuangYaFSChangeError):
@@ -1316,6 +1325,8 @@ def _verify_after(
             state = guangya_provider_task_state(client.task_status(copy_task_id))
             if state == "failed":
                 raise GuangYaWriteRejected("copy", code="task_failed")
+            if state == "running":
+                raise GuangYaFSCopyPending()
             if state != "completed":
                 return False
         if not _snapshot_matches(_find_current(client, source), source):
@@ -1404,17 +1415,25 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
     """复用同一次写后读取：返回阶段核验与可用于续行的中间版本，不额外查询。"""
     intermediate = action != _operation_actions(item)[-1]
     observed = None
+    copy_pending = False
 
     def verify():
-        nonlocal observed
+        nonlocal observed, copy_pending
+        copy_pending = False
         if intermediate:
             observed = _written_source(client, {**item, "op": action}, created_targets)
             return observed is not None
-        return _verify_after(client, item, created_id, created_targets=created_targets,
-                             copy_task_id=copy_task_id, cancel_check=cancel_check)
+        try:
+            return _verify_after(client, item, created_id, created_targets=created_targets,
+                                 copy_task_id=copy_task_id, cancel_check=cancel_check)
+        except GuangYaFSCopyPending:
+            copy_pending = True
+            return False
 
-    attempts = 121 if item["op"] == "copy" and item["source"]["is_dir"] else 21
+    attempts = _COPY_FOREGROUND_ATTEMPTS if copy_task_id else 21
     verified = verify_guangya_write(verify, cancel_check=cancel_check, attempts=attempts)
+    if not verified and copy_pending:
+        raise GuangYaFSCopyPending()
     if verified and observed is not None:
         source = item["source"]
         expected = {**source, "name": item["new_name"] if action == "rename" else source["name"],
@@ -1532,7 +1551,7 @@ def _can_continue_relocation(client, item, outcome, source_snapshot, created_tar
 
 def _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check, stage_sources, copy_tasks):
     """仅读核对事实；仅有签名中间快照的已核验半步可继续，未知动作不重放。"""
-    resumable, completed_objects = set(), set()
+    resumable, completed_objects, waiting_copies = set(), set(), set()
     for item, outcome in zip(operations, outcomes):
         if cancel_check is not None:
             cancel_check()
@@ -1552,6 +1571,12 @@ def _reconcile_fs_operations(client, operations, outcomes, created_targets, stat
         try:
             verified = verifiable and _verify_after(client, item, created_id, created_targets=created_targets,
                                                    copy_task_id=copy_task_id, cancel_check=cancel_check)
+        except GuangYaFSCopyPending:
+            waiting_copies.add(outcome["position"])
+            verified = False
+        except GuangYaWriteRejected:
+            outcome.update(status="failed", reason="write_rejected")
+            continue
         except Exception:  # 读失败只能保留未知，不能落为可重试。
             verified = False
         if verified:
@@ -1572,11 +1597,11 @@ def _reconcile_fs_operations(client, operations, outcomes, created_targets, stat
     for item, outcome in zip(operations, outcomes):
         if outcome["status"] == "completed":
             stats[_operation_stat_key(item["op"])] += 1
-        elif outcome["status"] != "not_started" and outcome["position"] not in resumable:
+        elif outcome["status"] != "not_started" and outcome["position"] not in resumable | waiting_copies:
             stats["failed"] += 1
     uncertain = bool(stats.get("audit_failures") or any(
-        row["status"] in {"unknown", "partial"} and row["position"] not in resumable for row in outcomes))
-    return uncertain, resumable
+        row["status"] in {"unknown", "partial"} and row["position"] not in resumable | waiting_copies for row in outcomes))
+    return uncertain, resumable, waiting_copies
 
 
 def _reset_fs_checkpoint_cursor(plan_id, execution):
@@ -1866,11 +1891,13 @@ def execute_fs_change_plan(
             expected_statuses={"running" if recovering else "queued"}, expected_job_id=job_id,
             expected_lease_generation=int(previous["lease_generation"]) if recovering else None)
         if recovering:
-            persistence_uncertain, resumable = _reconcile_fs_operations(
+            persistence_uncertain, resumable, waiting_copies = _reconcile_fs_operations(
                 client, operations, outcomes, created_targets, stats, cancel_check, stage_sources, copy_tasks)
             _reset_fs_checkpoint_cursor(plan_id, execution)
             update_fs_change_plan_execution(plan_id, status="running", execution=execution,
                 expected_statuses={"running"}, expected_job_id=job_id, expected_lease_generation=lease_generation)
+            if waiting_copies and not persistence_uncertain:
+                raise GuangYaFSCopyPending(min(waiting_copies))
         completed_objects = {str((item.get("source") or {}).get("file_id") or
             (created_targets.get(item.get("created_path")) or {}).get("file_id") or "")
             for item, outcome in zip(operations, outcomes) if outcome["status"] == "completed"}
@@ -1905,6 +1932,10 @@ def execute_fs_change_plan(
                 needs_checkpoint = False  # 正常末阶段已持久化；异常核对/拒绝需要补记。
                 stats[stat_key] += 1
                 status = "completed"
+            except GuangYaFSCopyPending as exc:
+                outcome["reason"] = "verification_pending"
+                exc.position = index
+                raise
             except GuangYaFSCheckpointError:
                 stats[stat_key if outcome["status"] == "completed" else "failed"] += 1
                 stats["audit_failures"] += 1
@@ -1945,6 +1976,12 @@ def execute_fs_change_plan(
                             copy_task_id=copy_tasks.get(str(index), ""),
                             cancel_check=cancel_check,
                         )
+                    except GuangYaFSCopyPending as waiting:
+                        if outcome.get("reason") == "verification_pending":
+                            stats["verification_failed"] -= 1
+                        outcome["reason"] = "verification_pending"
+                        waiting.position = index
+                        raise
                     except Exception:  # noqa: BLE001 - 后置核验失败即保持未知
                         applied = False
                 if applied:
@@ -2002,6 +2039,23 @@ def execute_fs_change_plan(
         return _finish_fs_change_execution(plan_id, job_id, plan, result,
             execution=execution, checkpoint=checkpoint,
             successful_operations=successful_operations, persistence_uncertain=persistence_uncertain, cancel_check=cancel_check)
+    except GuangYaFSCopyPending as exc:
+        if cancel_check is not None:
+            try:
+                cancel_check()
+            except Exception as cancelled:
+                cancelled.operation_result = result
+                raise
+        try:
+            _write_fs_checkpoint(plan_id, job_id, execution,
+                item=operations[exc.position - 1], outcome=outcomes[exc.position - 1])
+        except GuangYaFSCheckpointError as failed:
+            stats["audit_failures"] += 1
+            result.update(partial=True, requires_manual=True)
+            failed.operation_result = result
+            raise
+        exc.operation_result = result
+        raise
     except Exception as exc:
         # 协作取消/写前拒绝仍沿用异常契约，但不能丢掉本次已完成与待核验事实。
         result.update(partial=any(row["status"] != "not_started" for row in outcomes),
