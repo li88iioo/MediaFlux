@@ -13,7 +13,12 @@ from app.agent import guangya_share_actions as shares
 from app.agent import guangya_workspace_actions as workspace
 from app.agent.errors import AgentToolError
 from app.agent.models import ToolContext
-from app.clients.guangya import DirectoryEntryLimitError, GuangYaClient, IncompleteOfflineTaskListError
+from app.clients.guangya import (
+    DirectoryEntryLimitError,
+    GuangYaClient,
+    IncompleteOfflineTaskListError,
+    guangya_provider_task_state,
+)
 from tests.test_agent_guangya_sdk_capabilities import _RecycleClient, _ShareClient
 
 
@@ -485,6 +490,21 @@ class GuangYaReadContractTests(unittest.TestCase):
 
 
 class GuangYaAgentReadCompletionTests(unittest.TestCase):
+    def test_generic_provider_task_state_does_not_use_offline_task_codes(self):
+        for payload, expected in (
+            ({"status": 0}, "running"),
+            ({"status": 1}, "running"),
+            ({"status": 2, "detail": {"code": 0}}, "completed"),
+            ({"status": 2, "detail": {"code": 157}}, "failed"),
+            ({"status": 3}, "failed"),
+            ({"status": "pending"}, "running"),
+            ({"status": "unknown"}, "unknown"),
+            ({"status": 4}, "unknown"),
+            ({"status": 5}, "unknown"),
+        ):
+            with self.subTest(payload=payload):
+                self.assertEqual(guangya_provider_task_state({"data": payload}), expected)
+
     def test_unknown_task_and_terminal_error_detail_are_not_success(self):
         client = _RecycleClient()
         for payload, expected, ok in (
@@ -493,6 +513,8 @@ class GuangYaAgentReadCompletionTests(unittest.TestCase):
             ({"status": 2, "detail": {"code": 0}}, "completed", True),
             ({"status": 2, "detail": {"code": 157, "msg": "private-error"}}, "failed", False),
             ({"status": 3}, "failed", False),
+            ({"status": 4}, "unknown", False),
+            ({"status": 5}, "unknown", False),
             ({"status": 99}, "unknown", False),
         ):
             with (

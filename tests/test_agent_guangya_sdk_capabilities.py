@@ -123,12 +123,14 @@ class GuangYaSdkClientTests(unittest.TestCase):
         raw = _RawSdk()
         client = _Client(raw)
 
-        self.assertEqual(client.copy(["file-1", "file-1"], "target"), "copy-task")
+        copy_task_id = client.copy(["file-1", "file-1"], "target")
+        self.assertEqual(copy_task_id, "copy-task")
+        self.assertEqual(client.task_status(copy_task_id)["data"]["status"], "completed")
+        self.assertIn(("task", copy_task_id), raw.calls)
         recycle = client.list_recycle(max_items=10)
         self.assertEqual([(item.file_id, item.name) for item in recycle], [("trash-1", "旧文件.mkv")])
         self.assertEqual(client.restore_from_recycle(["trash-1"]), "restore-task")
         self.assertEqual(client.clear_recycle_bin(), "clear-task")
-        self.assertEqual(client.task_status("restore-task")["data"]["status"], "completed")
         self.assertEqual(client.account_info()["data"]["nickname"], "测试用户")
         self.assertEqual(client.account_storage_info()["data"]["totalSpaceSize"], 1000)
 

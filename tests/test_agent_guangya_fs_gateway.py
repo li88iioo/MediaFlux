@@ -80,16 +80,25 @@ class FakeGatewayClient:
         return True
 
     def copy(self, file_ids, parent_id):
+        def clone(source, parent):
+            self.counter += 1
+            copied = deepcopy(source)
+            copied.file_id = f"copied-{self.counter}"
+            copied.parent_id = str(parent)
+            self.directories.setdefault(str(parent), []).append(copied)
+            if copied.is_dir:
+                self.directories[copied.file_id] = []
+                for child in self.list_dir(source.file_id):
+                    clone(child, copied.file_id)
         for file_id in file_ids:
             source = self.file_info(str(file_id))
             if source is None:
                 raise RuntimeError("missing")
-            self.counter += 1
-            copied = deepcopy(source)
-            copied.file_id = f"copied-{self.counter}"
-            copied.parent_id = str(parent_id)
-            self.directories.setdefault(str(parent_id), []).append(copied)
+            clone(source, parent_id)
         return f"copy-task-{self.counter}"
+
+    def task_status(self, task_id):
+        return {"data": {"status": 2, "detail": {"code": 0}}}
 
     def delete(self, file_ids):
         for file_id in file_ids:
@@ -2153,6 +2162,141 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             )
         self.assertEqual(client.file_info("source").parent_id, "0")
         self.assertEqual(client.list_dir("target"), [])
+
+    def _directory_copy_plan(self, client):
+        client.directories["trash"] = [
+            GuangYaFile("leaf", "leaf.txt", False, parent_id="trash", size=10, etag="hash-leaf"),
+            GuangYaFile("nested", "nested", True, parent_id="trash", etag="dir"),
+            GuangYaFile("empty", "empty", True, parent_id="trash", etag="empty"),
+        ]
+        client.directories["nested"] = [GuangYaFile("deep", "deep.txt", False, parent_id="nested", size=20, etag="hash-deep")]
+        client.directories["empty"] = []
+        client.directories["0"].append(GuangYaFile("archive", "archive", True, parent_id="0", etag="archive"))
+        client.directories["archive"] = []
+        obs = guangya_workspace.create_directory_observation(client, owner="owner", path="/", recursive=True, max_items=500)
+        refs = {row["file_id"]: row["handle"] for row in obs["entries"]}
+        plan = guangya_fs_change.build_fs_change_plan(client, owner="owner", observation=obs, trigger_strm=False,
+            operations=[{"op": "move", "object_ref": refs["source"], "target_path": "/archive"},
+                        {"op": "copy", "object_ref": refs["trash"], "target_path": "/target"}])
+        guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
+        return plan, self._queued_payload(plan)
+
+    def test_directory_copy_requires_task_and_complete_tree_before_moving_parent(self):
+        for case in ("complete", "delayed_task", "running", "unknown", "failed", "terminal_error",
+                     "empty_shell", "missing_leaf", "missing_empty_dir", "wrong_size", "wrong_hash", "missing_hash", "extra", "source_changed", "read_error"):
+            with self.subTest(case=case):
+                client = FakeGatewayClient()
+                plan, payload = self._directory_copy_plan(client)
+                original_copy, original_list = client.copy, client.list_dir
+                copied_root = ""
+                task_calls = 0
+                def copy(ids, parent):
+                    nonlocal copied_root
+                    task_id = original_copy(ids, parent)
+                    copied_root = client.directories[parent][0].file_id
+                    rows = client.directories[copied_root]
+                    if case == "empty_shell": rows.clear()
+                    if case == "missing_leaf": rows.pop(0)
+                    if case == "missing_empty_dir": rows.pop(2)
+                    if case == "wrong_size": rows[0].size = 9
+                    if case == "wrong_hash": rows[0].etag = "different"
+                    if case == "missing_hash": rows[0].etag = ""
+                    if case == "extra": rows.append(GuangYaFile("extra", "extra.txt", False, parent_id=copied_root, size=1))
+                    if case == "source_changed": client.directories["nested"][0].size += 1
+                    return task_id
+                def status(task_id):
+                    nonlocal task_calls
+                    task_calls += 1
+                    if case == "delayed_task" and task_calls < 3 or case == "running":
+                        return {"data": {"status": 1}}
+                    if case == "unknown": return {"data": {"status": 999}}
+                    if case == "failed": return {"data": {"status": 3}}
+                    return {"data": {"status": 2, "detail": {"code": 7 if case == "terminal_error" else 0}}}
+                def listing(parent="0"):
+                    if copied_root and parent == copied_root and case == "read_error":
+                        raise RuntimeError("directory listing unavailable")
+                    return original_list(parent)
+                with mock.patch.object(client, "copy", side_effect=copy) as copied, \
+                     mock.patch.object(client, "task_status", side_effect=status), \
+                     mock.patch.object(client, "list_dir", side_effect=listing), \
+                     mock.patch.object(client, "move", wraps=client.move) as moved, \
+                     mock.patch("app.clients.guangya.sleep"):
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                complete = case in {"complete", "delayed_task"}
+                self.assertEqual(result["stats"]["copied"], int(complete))
+                self.assertEqual(result["stats"]["moved"], int(complete))
+                self.assertEqual(result["partial"], not complete)
+                self.assertEqual(client.file_info("source").parent_id, "archive" if complete else "0")
+                self.assertEqual(client.file_info("trash").parent_id, "source")
+                self.assertEqual(moved.call_count, int(complete))
+                copied.assert_called_once_with(["trash"], "target")
+                self.assertNotIn("copy_tasks", json.dumps(result))
+                self.assertNotIn("copy-task-", json.dumps(result))
+                if case == "delayed_task": self.assertGreaterEqual(task_calls, 3)
+
+    def test_directory_copy_freezes_source_tree_and_rejects_old_plan(self):
+        for change in ("new_child", "deep_content", "missing_snapshot"):
+            with self.subTest(change=change):
+                client = FakeGatewayClient()
+                plan, payload = self._directory_copy_plan(client)
+                if change == "new_child": client.directories["empty"].append(GuangYaFile("new", "new.txt", False, parent_id="empty", size=1))
+                elif change == "deep_content": client.directories["nested"][0].etag = "new-content"
+                else:
+                    stored = guangya_fs_change._read(plan["plan_id"])
+                    stored["operations"][0].pop("copy_snapshot")
+                    stored["fingerprint"] = guangya_fs_change._fingerprint(stored)
+                    payload["plan_fingerprint"] = stored["fingerprint"]
+                    guangya_fs_change._atomic_write(stored)
+                with mock.patch.object(client, "copy", wraps=client.copy) as copied:
+                    with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                        guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                copied.assert_not_called()
+
+    def test_directory_copy_snapshot_is_bounded_and_cancellable(self):
+        client = FakeGatewayClient()
+        plan, _ = self._directory_copy_plan(client)
+        self.assertEqual(plan["operations"][0]["copy_snapshot"]["items"], 4)
+        with mock.patch.object(guangya_fs_change, "_MAX_COPY_ITEMS", 2):
+            with self.assertRaisesRegex(guangya_fs_change.GuangYaFSChangeError, "预算"):
+                guangya_fs_change._copy_tree_snapshot(client, "trash")
+        with mock.patch.object(guangya_fs_change, "_MAX_COPY_DIRS", 1):
+            with self.assertRaisesRegex(guangya_fs_change.GuangYaFSChangeError, "预算"):
+                guangya_fs_change._copy_tree_snapshot(client, "trash")
+        cancel = mock.Mock(side_effect=RuntimeError("cancelled"))
+        with mock.patch.object(client, "list_dir", wraps=client.list_dir) as listing:
+            with self.assertRaisesRegex(RuntimeError, "cancelled"):
+                guangya_fs_change._copy_tree_snapshot(client, "trash", cancel)
+            listing.assert_not_called()
+        client.directories["empty"].append(client.file_info("trash"))
+        with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+            guangya_fs_change._copy_tree_snapshot(client, "trash")
+
+    def test_directory_copy_recovery_queries_recorded_task_without_repeating_copy(self):
+        class WorkerExit(BaseException): pass
+        for checkpointed in (True, False):
+            for complete in (True, False):
+                with self.subTest(checkpointed=checkpointed, complete=complete):
+                    client = FakeGatewayClient()
+                    plan, payload = self._directory_copy_plan(client)
+                    original_checkpoint, original_copy = guangya_fs_change._append_journal, client.copy
+                    def checkpoint(plan_id, event):
+                        original_checkpoint(plan_id, event)
+                        if (event.get("data") or {}).get("copy_task_id"):
+                            raise WorkerExit()
+                    def copy(ids, parent):
+                        tid = original_copy(ids, parent)
+                        if not checkpointed: raise WorkerExit()
+                        return tid
+                    with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=checkpoint), mock.patch.object(client, "copy", side_effect=copy):
+                        with self.assertRaises(WorkerExit):
+                            guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+                    with mock.patch.object(client, "copy", wraps=original_copy) as copied, \
+                         mock.patch.object(client, "task_status", return_value={"data": {"status": 2 if complete else 1}}) as task:
+                        result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                    copied.assert_not_called()
+                    self.assertEqual(result["stats"]["copied"], int(checkpointed and complete))
+                    self.assertEqual(client.file_info("source").parent_id, "archive" if checkpointed and complete else "0")
+                    self.assertEqual(task.call_count, int(checkpointed))
 
     def test_copy_keeps_source_and_verifies_new_target_object(self):
         client = FakeGatewayClient()

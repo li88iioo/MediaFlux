@@ -46,6 +46,29 @@ class IncompleteOfflineTaskListError(RuntimeError):
     """离线任务分页不完整，禁止调用方据此判断任务已消失。"""
 
 
+def guangya_provider_task_state(response: dict) -> str:
+    """归一化 Provider 通用异步任务状态，不套用离线任务状态码。"""
+    payload = response.get("data")
+    if not isinstance(payload, dict):
+        payload = response
+    status = str(next((
+        payload[key] for key in ("status", "taskStatus", "state")
+        if payload.get(key) is not None
+    ), "unknown")).strip().casefold()
+    completed = status in {"2", "done", "completed", "success", "succeeded", "finished"}
+    failed = status in {"3", "failed", "error", "cancelled", "canceled"}
+    detail = payload.get("detail")
+    if (completed or failed) and isinstance(detail, dict) and detail.get("code") is not None:
+        failed = failed or str(detail["code"]).strip() != "0"
+    if failed:
+        return "failed"
+    if completed:
+        return "completed"
+    if status in {"0", "1", "running", "pending", "queued", "processing", "accepted"}:
+        return "running"
+    return "unknown"
+
+
 def guangya_offline_task_state(status: object) -> str:
     """云添加状态是完成依据；进度、目录创建均不能代替服务端终态。
 
@@ -64,14 +87,15 @@ def guangya_offline_task_state(status: object) -> str:
 
 def verify_guangya_write(
     check: Callable[[], bool], *, cancel_check: Callable[[], None] | None = None,
+    attempts: int = 21,
 ) -> bool:
     """有界重读后置条件以容忍云端索引延迟；绝不重发写请求。"""
-    for attempt in range(21):
+    for attempt in range(attempts):
         if cancel_check is not None:
             cancel_check()
         if check():
             return True
-        if attempt < 20:
+        if attempt + 1 < attempts:
             sleep(0.5)
     return False
 

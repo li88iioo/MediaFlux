@@ -260,6 +260,7 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
         execution_result = {
             "partial": terminal == "partial", "requires_manual": False,
             "stats": {**stats, "internal_file_id": "private-item"},
+            "copy_tasks": {"1": "private-copy-task-id"},
             "stage_sources": {
                 "1": {
                     "file_id": "private-stage-file-id",
@@ -283,9 +284,10 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
             **({"operation_items": operation_items} if operation_items is not None else {})})
         self.assertEqual(json.loads(persisted["result_json"]), expected_result)
         self.assertNotIn("stage_sources", persisted["result_json"])
+        self.assertNotIn("copy_tasks", persisted["result_json"])
         private_stage_values = (
             "private-stage-file-id", "private-stage-parent-id",
-            "private-stage-etag", "private-stage-updated-at",
+            "private-stage-etag", "private-stage-updated-at", "private-copy-task-id",
         )
         for private in private_stage_values:
             self.assertNotIn(private, persisted["result_json"])
@@ -317,6 +319,8 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 self.assertEqual(receipt.data["operation_ref"], public_ref)
                 self.assertEqual(public.data["task"]["stats"], stats)
                 self.assertEqual(raw["result"], expected_result)
+                self.assertNotIn("copy_tasks", json.dumps(public.data))
+                self.assertNotIn("copy_tasks", json.dumps(receipt.data))
                 self.assertNotIn("stage_sources", json.dumps(public.data))
                 self.assertNotIn("stage_sources", json.dumps(receipt.data))
                 if operation_items is not None:

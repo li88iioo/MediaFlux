@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaWriteRejected, verify_guangya_write
+from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaWriteRejected, guangya_provider_task_state, verify_guangya_write
 from app.config import PATHS
 from app.modules.guangya_journal import append_guangya_journal
 from app.modules.guangya_workspace import (
@@ -47,6 +47,8 @@ MAX_FS_CHANGE_OPERATIONS = (
     MAX_FS_CHANGE_OBJECT_OPERATIONS + MAX_FS_CHANGE_CREATE_OPERATIONS
 )
 _MAX_PLAN_BYTES = 2 * 1024 * 1024
+_MAX_COPY_ITEMS = 2_000
+_MAX_COPY_DIRS = 500
 _MAX_PLANS = 32
 _MAX_PLANS_PER_OWNER = 4
 _SAFE_PLAN_ID = re.compile(r"^[0-9a-f]{32}$")
@@ -970,6 +972,8 @@ def build_fs_change_plan(
             )
             if pending_target is not None:
                 base["target_create_path"] = target_path
+        if op == "copy" and current.is_dir:
+            base["copy_snapshot"] = _copy_tree_snapshot(client, current.file_id)
         if handle in seen_objects:
             raise GuangYaFSChangeError("计划不能重复操作同一个对象")
         seen_objects.add(handle)
@@ -1091,6 +1095,36 @@ def build_fs_change_plan(
     return plan
 
 
+def _copy_tree_snapshot(client, root_id, cancel_check=None):
+    """完整遍历形成有界摘要：源身份/版本与复制内容分开，不把目录外壳当成功。"""
+    pending = [(str(root_id), ())]
+    seen, paths, rows, directories = {str(root_id)}, set(), [], 0
+    while pending:
+        directory_id, path = pending.pop()
+        directories += 1
+        if directories > _MAX_COPY_DIRS:
+            raise GuangYaFSChangeError("复制目录超过完整核验预算，请拆分子目录处理")
+        if cancel_check is not None:
+            cancel_check()
+        for entry in client.list_dir(directory_id):
+            relative = (*path, entry.name)
+            if entry.file_id in seen or relative in paths or str(entry.parent_id or "0") != directory_id:
+                raise GuangYaFSChangeStale("复制目录清单不一致，请重新读取")
+            seen.add(entry.file_id)
+            paths.add(relative)
+            rows.append((relative, _snapshot(entry)))
+            if len(rows) > _MAX_COPY_ITEMS:
+                raise GuangYaFSChangeError("复制目录超过完整核验预算，请拆分子目录处理")
+            if entry.is_dir:
+                pending.append((entry.file_id, relative))
+    rows.sort(key=lambda row: row[0])
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    content = [(path, row["is_dir"], 0 if row["is_dir"] else row["size"],
+                "" if row["is_dir"] else row["etag"]) for path, row in rows]
+    return {"identity": digest(rows), "content": digest(content), "items": len(rows)}
+
+
 def _find_current(
     client: GuangYaClient, snapshot: dict[str, Any], *, authoritative: bool = False
 ) -> GuangYaFile | None:
@@ -1157,6 +1191,7 @@ def _preflight_operation(
     allow_pending_target: bool = False,
     completed_objects: set[str] | None = None,
     source_snapshot: dict[str, Any] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> None:
     op = str(item.get("op") or "")
     # 新建目录没有预先存在的快照：沿本次已核验创建链检查名称和位置，
@@ -1195,6 +1230,11 @@ def _preflight_operation(
             exact_updated_at=source_snapshot is not None)
     if not source_matches:
         raise GuangYaFSChangeStale("光鸭对象已变化，请重新预览")
+    if op == "copy" and source["is_dir"]:
+        if not isinstance(item.get("copy_snapshot"), dict):
+            raise GuangYaFSChangeStale("复制计划缺少完整目录快照，请重新预览")
+        if _copy_tree_snapshot(client, source["file_id"], cancel_check) != item["copy_snapshot"]:
+            raise GuangYaFSChangeStale("复制源目录内容已变化，请重新预览")
     if item.get("require_empty") and (completed_objects is not None or not dependencies):
         if client.list_dir(str(source["file_id"])):
             raise GuangYaFSChangeStale("目录仍包含内容，未执行空目录清理")
@@ -1247,6 +1287,8 @@ def _verify_after(
     created_id: str = "",
     *,
     created_targets: dict[str, dict[str, Any]] | None = None,
+    copy_task_id: str = "",
+    cancel_check: Callable[[], None] | None = None,
 ) -> bool:
     op = str(item.get("op") or "")
     if op == "create_directory":
@@ -1269,25 +1311,31 @@ def _verify_after(
     if op in {"rename", "move", "relocate"}:
         return _written_source(client, item, created_targets) is not None
     if op == "copy":
-        # 复制必须保留冻结的源对象，不能把源消失、目标同名当作复制成功。
+        # Provider终态与完整目标都需核验；不能以受理、同名目录或部分子树推进依赖。
+        if copy_task_id:
+            state = guangya_provider_task_state(client.task_status(copy_task_id))
+            if state == "failed":
+                raise GuangYaWriteRejected("copy", code="task_failed")
+            if state != "completed":
+                return False
         if not _snapshot_matches(_find_current(client, source), source):
             return False
         target_id = _directory_id(item, created_targets)
-        target_name = str(source.get("name") or "")
-        for row in client.list_dir(target_id):
-            if row.name != target_name or bool(row.is_dir) != bool(source.get("is_dir")):
-                continue
+        matches = [row for row in client.list_dir(target_id)
+                   if row.name == source.get("name") and row.is_dir == bool(source.get("is_dir"))]
+        if len(matches) != 1 or matches[0].file_id == file_id:
+            return False
+        copied = matches[0]
+        if not copied.is_dir:
             expected_size = max(0, int(source.get("size") or 0))
-            if not row.is_dir and expected_size and int(row.size or 0) != expected_size:
-                continue
-            expected_etag = str(source.get("etag") or "")
-            if not row.is_dir and expected_etag and str(row.etag or "") not in {
-                "",
-                expected_etag,
-            }:
-                continue
-            return True
-        return False
+            return ((not expected_size or int(copied.size or 0) == expected_size)
+                    and (not source.get("etag") or str(copied.etag or "") in {"", str(source["etag"])}))
+        expected = item.get("copy_snapshot")
+        if not isinstance(expected, dict):
+            return False
+        if _copy_tree_snapshot(client, copied.file_id, cancel_check)["content"] != expected["content"]:
+            return False
+        return _copy_tree_snapshot(client, file_id, cancel_check) == expected
     return False
 
 
@@ -1352,7 +1400,7 @@ def _operation_actions(item: dict[str, Any]) -> tuple[str, ...]:
     return ("move", "rename") if item.get("move_first") else ("rename", "move")
 
 
-def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check):
+def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check, copy_task_id):
     """复用同一次写后读取：返回阶段核验与可用于续行的中间版本，不额外查询。"""
     intermediate = action != _operation_actions(item)[-1]
     observed = None
@@ -1362,9 +1410,11 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
         if intermediate:
             observed = _written_source(client, {**item, "op": action}, created_targets)
             return observed is not None
-        return _verify_after(client, item, created_id, created_targets=created_targets)
+        return _verify_after(client, item, created_id, created_targets=created_targets,
+                             copy_task_id=copy_task_id, cancel_check=cancel_check)
 
-    verified = verify_guangya_write(verify, cancel_check=cancel_check)
+    attempts = 121 if item["op"] == "copy" and item["source"]["is_dir"] else 21
+    verified = verify_guangya_write(verify, cancel_check=cancel_check, attempts=attempts)
     if verified and observed is not None:
         source = item["source"]
         expected = {**source, "name": item["new_name"] if action == "rename" else source["name"],
@@ -1378,7 +1428,7 @@ def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_c
 def _apply_fs_operation(
     client: GuangYaClient, item: dict[str, Any], outcome: dict[str, Any],
     created_targets: dict[str, dict[str, Any]], cancel_check: Callable[[], None] | None,
-    checkpoint: Callable[[], None], stage_sources: dict[str, dict[str, Any]],
+    checkpoint: Callable[[], None], stage_sources: dict[str, dict[str, Any]], copy_tasks: dict[str, str],
 ) -> str:
     source = item.get("source") or {}
     created_id = ""
@@ -1402,7 +1452,11 @@ def _apply_fs_operation(
             elif action == "move":
                 client.move([str(source["file_id"])], _directory_id(item, created_targets))
             elif action == "copy":
-                client.copy([str(source["file_id"])], _directory_id(item, created_targets))
+                task_id = client.copy([str(source["file_id"])], _directory_id(item, created_targets))
+                if source["is_dir"] and task_id:
+                    copy_tasks[str(outcome["position"])] = task_id
+                    checkpoint()  # 保留已受理任务；中断恢复仅读查询，不再次复制。
+
             elif action == "create_directory":
                 created_id = client.create_dir(str(item["name"]), _directory_id(item, created_targets, role="parent"))
                 created_targets[str(item["created_path"])] = {
@@ -1429,7 +1483,8 @@ def _apply_fs_operation(
                 )
             else:
                 raise GuangYaFSChangeError("光鸭变更计划包含未知操作")
-            verified, stage_source = _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check)
+            verified, stage_source = _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check,
+                                                              copy_tasks.get(str(outcome["position"]), ""))
             if not verified:
                 outcome["reason"] = "verification_pending"
                 raise GuangYaFSChangeError("写入后的云端状态尚未核验，未执行后续操作")
@@ -1452,7 +1507,7 @@ def _preflight_fs_change_plan(client, operations, outcomes, cancel_check):
         if cancel_check is not None:
             cancel_check()
         try:
-            _preflight_operation(client, item, allow_pending_target=True)
+            _preflight_operation(client, item, allow_pending_target=True, cancel_check=cancel_check)
         except GuangYaFSChangeStale:
             outcome.update(status="blocked", reason="precondition_failed")
             raise
@@ -1475,7 +1530,7 @@ def _can_continue_relocation(client, item, outcome, source_snapshot, created_tar
     return False
 
 
-def _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check, stage_sources):
+def _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check, stage_sources, copy_tasks):
     """仅读核对事实；仅有签名中间快照的已核验半步可继续，未知动作不重放。"""
     resumable, completed_objects = set(), set()
     for item, outcome in zip(operations, outcomes):
@@ -1491,9 +1546,12 @@ def _reconcile_fs_operations(client, operations, outcomes, created_targets, stat
         verifiable = status == "completed" or item["op"] in {"rename", "move", "relocate"}
         # 新建/复制的同名对象不是身份凭据；原位置消失也不证明已进回收站。
         verifiable &= item["op"] != "create_directory" or bool(created_id)
-        verifiable &= not (item["op"] == "copy" and (item.get("source") or {}).get("is_dir"))
+        copy_task_id = copy_tasks.get(str(outcome["position"]), "")
+        directory_copy = item["op"] == "copy" and (item.get("source") or {}).get("is_dir")
+        verifiable = bool(copy_task_id) if directory_copy else verifiable
         try:
-            verified = verifiable and _verify_after(client, item, created_id, created_targets=created_targets)
+            verified = verifiable and _verify_after(client, item, created_id, created_targets=created_targets,
+                                                   copy_task_id=copy_task_id, cancel_check=cancel_check)
         except Exception:  # 读失败只能保留未知，不能落为可重试。
             verified = False
         if verified:
@@ -1532,7 +1590,8 @@ def _read_fs_checkpoints(plan):
     base = plan["execution"]
     execution = {**base, "operation_items": [dict(row) for row in base["operation_items"]],
                  "stats": dict(base["stats"]), "created_targets": dict(base.get("created_targets") or {}),
-                 "stage_sources": dict(base.get("stage_sources") or {})}
+                 "stage_sources": dict(base.get("stage_sources") or {}),
+                 "copy_tasks": dict(base.get("copy_tasks") or {})}
     path = _journal_path(plan["plan_id"])
     try:
         offset = int(base["journal_offset"])
@@ -1563,6 +1622,10 @@ def _read_fs_checkpoints(plan):
                 if not 0 <= index < len(plan["operations"]) or row["operation"] != plan["operations"][index]["op"]:
                     raise ValueError("checkpoint operation")
                 execution["operation_items"][index] = row
+                if "copy_task_id" in delta:
+                    if row["operation"] != "copy" or not isinstance(delta["copy_task_id"], str):
+                        raise ValueError("checkpoint copy task")
+                    execution["copy_tasks"][str(row["position"])] = delta["copy_task_id"]
                 if "stage_source" in delta:
                     snapshot = delta["stage_source"]
                     if snapshot.get("file_id") != (plan["operations"][index].get("source") or {}).get("file_id"):
@@ -1583,6 +1646,9 @@ def _write_fs_checkpoint(plan_id, job_id, execution, *, item=None, outcome=None,
     delta = {"stats": execution["stats"], "finalizing": execution["finalizing"]}
     if outcome is not None:
         delta["operation_item"] = outcome
+        task_id = (execution.get("copy_tasks") or {}).get(str(outcome["position"]))
+        if task_id:
+            delta["copy_task_id"] = task_id
         source_snapshot = (execution.get("stage_sources") or {}).get(str(outcome["position"]))
         if source_snapshot is not None:
             delta["stage_source"] = source_snapshot
@@ -1763,10 +1829,11 @@ def execute_fs_change_plan(
     persistence_uncertain = False
     resumable = set()
     stage_sources = dict(previous.get("stage_sources") or {}) if recovering else {}
+    copy_tasks = dict(previous.get("copy_tasks") or {}) if recovering else {}
 
     execution = {"checkpoint_version": 2, "lease_generation": lease_generation,
                  "started_at": started_at, "stats": stats, "operation_items": outcomes,
-                 "created_targets": created_targets, "stage_sources": stage_sources,
+                 "created_targets": created_targets, "stage_sources": stage_sources, "copy_tasks": copy_tasks,
                  "strm_scope": strm_scope, "finalizing": finalizing}
 
     def checkpoint(*, begin_finalization=False):
@@ -1800,7 +1867,7 @@ def execute_fs_change_plan(
             expected_lease_generation=int(previous["lease_generation"]) if recovering else None)
         if recovering:
             persistence_uncertain, resumable = _reconcile_fs_operations(
-                client, operations, outcomes, created_targets, stats, cancel_check, stage_sources)
+                client, operations, outcomes, created_targets, stats, cancel_check, stage_sources, copy_tasks)
             _reset_fs_checkpoint_cursor(plan_id, execution)
             update_fs_change_plan_execution(plan_id, status="running", execution=execution,
                 expected_statuses={"running"}, expected_job_id=job_id, expected_lease_generation=lease_generation)
@@ -1831,9 +1898,10 @@ def execute_fs_change_plan(
                     created_targets=created_targets,
                     completed_objects=completed_objects,
                     source_snapshot=stage_sources.get(str(index)) if index in resumable else None,
+                    cancel_check=cancel_check,
                 )
                 provider_write_started = True
-                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check, checkpoint, stage_sources)
+                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check, checkpoint, stage_sources, copy_tasks)
                 needs_checkpoint = False  # 正常末阶段已持久化；异常核对/拒绝需要补记。
                 stats[stat_key] += 1
                 status = "completed"
@@ -1867,13 +1935,15 @@ def execute_fs_change_plan(
                 # provider 可能在连接中断前已经接受写入。若冻结后置条件成立，
                 # 则不能再把它算成“失败后可重试”；trash 同时标记审计缺口。
                 applied = False
-                if provider_write_started:
+                if provider_write_started and (op != "copy" or not source.get("is_dir") or copy_tasks.get(str(index))):
                     try:
                         applied = _verify_after(
                             client,
                             item,
                             created_id,
                             created_targets=created_targets,
+                            copy_task_id=copy_tasks.get(str(index), ""),
+                            cancel_check=cancel_check,
                         )
                     except Exception:  # noqa: BLE001 - 后置核验失败即保持未知
                         applied = False

@@ -16,6 +16,7 @@ from app.clients.guangya import (
     GuangYaFile,
     GuangYaWriteRejected,
     close_guangya_client,
+    guangya_provider_task_state,
 )
 
 logger = logging.getLogger(__name__)
@@ -500,11 +501,8 @@ def query_guangya_task_status(
         if client is not None:
             close_guangya_client(client)
 
+    task_state = guangya_provider_task_state(raw)
     payload = raw.get("data") if isinstance(raw.get("data"), dict) else raw
-    status = str(next((
-        payload[key] for key in ("status", "taskStatus", "state")
-        if payload.get(key) is not None
-    ), "unknown")).strip().casefold()
     progress = payload.get("progress")
     if progress is None:
         progress = payload.get("percent")
@@ -516,27 +514,19 @@ def query_guangya_task_status(
             progress_value /= 100
     except (TypeError, ValueError, OverflowError):
         progress_value = 0.0
-    completed = status in {"2", "done", "completed", "success", "succeeded", "finished"}
-    failed = status in {"3", "failed", "error", "cancelled", "canceled"}
-    detail = payload.get("detail")
-    # 官网轮询同时检查终态 detail.code；status=2 也可能携带具体失败。
-    if (completed or failed) and isinstance(detail, dict) and detail.get("code") is not None:
-        failed = failed or str(detail["code"]).strip() != "0"
-    running = status in {"0", "1", "running", "pending", "queued", "processing", "accepted"}
-    public_status = "failed" if failed else "completed" if completed else "running" if running else "unknown"
     summary = {
         "completed": "光鸭任务已完成", "failed": "光鸭任务执行失败",
         "running": "光鸭任务仍在处理中", "unknown": "光鸭任务状态暂时无法确认，不能判断为正在运行或已完成",
-    }[public_status]
-    if public_status == "completed":
+    }[task_state]
+    if task_state == "completed":
         progress_value = 1.0
     return ToolResult(
-        public_status in {"completed", "running"},
-        public_status,
+        task_state in {"completed", "running"},
+        task_state,
         summary,
         data={
             "operation": str(task.get("operation") or "operation"),
-            "status": public_status,
+            "status": task_state,
             "progress": max(0.0, min(progress_value, 1.0)),
         },
         evidence=[
