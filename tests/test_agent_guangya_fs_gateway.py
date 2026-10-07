@@ -1453,6 +1453,131 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             {item.name for item in client.directories["target"]}, {"Move.mp4", "新目录"}
         )
 
+    def test_relocate_chooses_a_conflict_free_order_without_touching_siblings(self):
+        for new_target in (False, True):
+            for move_fails in (False, True):
+                with self.subTest(new_target=new_target, move_fails=move_fails):
+                    client = FakeGatewayClient()
+                    observed = self._query(client)
+                    observation = guangya_workspace.load_directory_observation(
+                        observed.data["observation_ref"], owner="owner"
+                    )
+                    refs = {row["object_name"]: row["object_ref"] for row in observed.data["entries"]}
+                    operations = ([{"op": "create_directory", "parent_path": "/target", "name": "new"}]
+                                  if new_target else [])
+                    target = "/target/new" if new_target else "/target"
+                    operations.append({"op": "relocate", "object_ref": refs["广告-ABC.mp4"],
+                                       "target_path": target, "new_name": "Move.mp4"})
+                    plan = guangya_fs_change.build_fs_change_plan(
+                        client, owner="owner", observation=observation,
+                        operations=operations, trigger_strm=False,
+                    )
+                    self.assertTrue(plan["operations"][-1]["move_first"])
+                    guangya_fs_change.confirm_fs_change_plan(
+                        plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
+                    )
+                    calls = []
+                    rename, move = client.rename, client.move
+
+                    def relocate(ids, parent):
+                        calls.append("move")
+                        if move_fails:
+                            raise GuangYaWriteRejected("move", code="rejected")
+                        return move(ids, parent)
+
+                    def rename_after(fid, name):
+                        calls.append("rename")
+                        self.assertNotEqual(client.file_info(fid).parent_id, "source")
+                        return rename(fid, name)
+
+                    with mock.patch.object(client, "move", side_effect=relocate), \
+                            mock.patch.object(client, "rename", side_effect=rename_after):
+                        result = guangya_fs_change.execute_fs_change_plan(
+                            self._queued_payload(plan), client_factory=lambda: client
+                        )
+                    self.assertEqual(calls, ["move"] if move_fails else ["move", "rename"])
+                    self.assertEqual(result["partial"], move_fails)
+                    self.assertEqual(result["stats"]["relocated"], int(not move_fails))
+                    untouched = client.file_info("move")
+                    self.assertEqual((untouched.name, untouched.parent_id), ("Move.mp4", "source"))
+                    selected = client.file_info("rename")
+                    self.assertEqual(selected.name, "广告-ABC.mp4" if move_fails else "Move.mp4")
+                    self.assertEqual(selected.parent_id == "source", move_fails)
+
+    def test_move_first_reconciles_rename_failure_without_replaying_move(self):
+        for mode in ("rejected", "timeout_before_apply", "timeout_after_apply"):
+            with self.subTest(mode=mode):
+                client = FakeGatewayClient()
+                plan = self._confirmed_plan(client, {
+                    "op": "relocate", "source_name": "广告-ABC.mp4",
+                    "target_path": "/target", "new_name": "Move.mp4",
+                })
+                payload = self._queued_payload(plan)
+                original_rename = client.rename
+
+                def rename(fid, name):
+                    if mode == "rejected":
+                        raise GuangYaWriteRejected("rename", code="rejected")
+                    if mode == "timeout_after_apply":
+                        original_rename(fid, name)
+                    raise TimeoutError("response lost")
+
+                with mock.patch.object(client, "rename", side_effect=rename) as renamed, \
+                        mock.patch.object(client, "move", wraps=client.move) as moved:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                    self.assertEqual(result["partial"], mode != "timeout_after_apply")
+                    self.assertEqual(result["requires_manual"], mode == "timeout_before_apply")
+                    self.assertEqual(result["stats"]["relocated"], int(mode == "timeout_after_apply"))
+                    item = client.file_info("rename")
+                    self.assertEqual(item.parent_id, "target")
+                    self.assertEqual(item.name, "Move.mp4" if mode == "timeout_after_apply" else "广告-ABC.mp4")
+                    self.assertEqual(client.file_info("move").parent_id, "source")
+                    with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                        guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                    renamed.assert_called_once()
+                    moved.assert_called_once()
+
+    def test_move_first_rejects_intermediate_destination_collisions(self):
+        for conflict in ("existing", "planned", "after_preview"):
+            with self.subTest(conflict=conflict):
+                client = FakeGatewayClient()
+                if conflict == "existing":
+                    client.directories["target"].append(GuangYaFile(
+                        "occupied", "广告-ABC.mp4", False, parent_id="target", size=1, etag="other"
+                    ))
+                observed = self._query(client)
+                observation = guangya_workspace.load_directory_observation(
+                    observed.data["observation_ref"], owner="owner"
+                )
+                refs = {row["object_name"]: row["object_ref"] for row in observed.data["entries"]}
+                operations = ([{"op": "create_directory", "parent_path": "/target", "name": "广告-ABC.mp4"}]
+                              if conflict == "planned" else [])
+                operations.append({"op": "relocate", "object_ref": refs["广告-ABC.mp4"],
+                                   "target_path": "/target", "new_name": "Move.mp4"})
+                if conflict != "after_preview":
+                    with self.assertRaises(guangya_fs_change.GuangYaFSChangeError):
+                        guangya_fs_change.build_fs_change_plan(
+                            client, owner="owner", observation=observation,
+                            operations=operations, trigger_strm=False,
+                        )
+                else:
+                    plan = guangya_fs_change.build_fs_change_plan(
+                        client, owner="owner", observation=observation,
+                        operations=operations, trigger_strm=False,
+                    )
+                    guangya_fs_change.confirm_fs_change_plan(
+                        plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
+                    )
+                    client.directories["target"].append(GuangYaFile(
+                        "occupied", "广告-ABC.mp4", False, parent_id="target", size=1, etag="other"
+                    ))
+                    with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                        guangya_fs_change.execute_fs_change_plan(
+                            self._queued_payload(plan), client_factory=lambda: client
+                        )
+                self.assertEqual(client.file_info("rename").name, "广告-ABC.mp4")
+                self.assertEqual(client.file_info("rename").parent_id, "source")
+
     def test_child_backup_and_parent_relocation_share_one_confirmed_plan(self):
         for copy_fails in (False, True):
             with self.subTest(copy_fails=copy_fails):

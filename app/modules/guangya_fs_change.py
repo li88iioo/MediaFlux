@@ -757,8 +757,9 @@ def _validate_plan_names(operations: list[dict[str, Any]]) -> None:
                          else ("id", str(item.get(f"{role}_id") or "0")))
         key = (directory, name)
         previous = occupied.get(key)
-        # relocate 先在源目录改名、再搬走；不能撞上前序操作已留下的新名称。
-        transient = (("id", str(source.get("parent_id") or "0")), name)
+        # 同时核对规整操作的中间名称；中间占位完成后释放，不当成最终目标。
+        transient = ((directory, str(source.get("name") or "").casefold()) if item.get("move_first")
+                     else (("id", str(source.get("parent_id") or "0")), name))
         if previous is not None or (
             op == "relocate" and item.get("new_name") != source.get("name")
             and transient in occupied
@@ -881,7 +882,10 @@ def build_fs_change_plan(
                 if old_suffix != new_suffix:
                     raise GuangYaFSChangeError("文件改名不能改变扩展名")
             if _name_conflict(cache[parent_id], new_name, exclude_id=current.file_id):
-                raise GuangYaFSChangeError("改名目标已被同目录对象占用")
+                if op == "rename":
+                    raise GuangYaFSChangeError("改名目标已被同目录对象占用")
+                # 源目录的同名项不必改动；目标原名也空闲时可以先搬走再改名。
+                base["move_first"] = True
             base["new_name"] = new_name
         if op in {"move", "relocate", "copy"}:
             target_path = _normalize_path(raw.get("target_path"))
@@ -910,7 +914,9 @@ def build_fs_change_plan(
             target_name = str(base.get("new_name") or current.name)
             if pending_target is None:
                 target_items = _list_map(client, target_id, cache)
-                if _name_conflict(target_items, target_name):
+                if _name_conflict(target_items, target_name) or (
+                    base.get("move_first") and _name_conflict(target_items, current.name)
+                ):
                     raise GuangYaFSChangeError("目标目录中已有同名对象")
             base.update(
                 target_path=target_path,
@@ -1156,7 +1162,7 @@ def _preflight_operation(
     if item.get("require_empty") and (completed_objects is not None or not dependencies):
         if client.list_dir(str(source["file_id"])):
             raise GuangYaFSChangeStale("目录仍包含内容，未执行空目录清理")
-    if op in {"rename", "relocate"}:
+    if op in {"rename", "relocate"} and not item.get("move_first"):
         siblings = {
             str(row.file_id): row
             for row in client.list_dir(str(source.get("parent_id") or "0"))
@@ -1183,7 +1189,9 @@ def _preflight_operation(
         target_name = str(
             item.get("new_name") if op == "relocate" else source.get("name") or ""
         )
-        if _name_conflict(siblings, target_name):
+        if _name_conflict(siblings, target_name) or (
+            item.get("move_first") and _name_conflict(siblings, str(source.get("name") or ""))
+        ):
             raise GuangYaFSChangeStale("目标目录中已有同名对象，请重新预览")
 
 
@@ -1416,12 +1424,14 @@ def execute_fs_change_plan(
                     )
                 elif op in {"move", "relocate"}:
                     # 已符合命名时只搬目录；光鸭会拒绝改成同名的无效请求。
-                    if op == "relocate" and item["new_name"] != source.get("name"):
+                    if op == "relocate" and item["new_name"] != source.get("name") and not item.get("move_first"):
                         client.rename(str(source.get("file_id") or ""), str(item["new_name"]))
                     client.move(
                         [str(source.get("file_id") or "")],
                         _directory_id(item, created_targets),
                     )
+                    if item.get("move_first"):
+                        client.rename(str(source["file_id"]), str(item["new_name"]))
                 elif op == "copy":
                     client.copy(
                         [str(source.get("file_id") or "")],
