@@ -1014,7 +1014,7 @@ class AgentSession:
                                 # 仅撤销本次失败的发现，不能丢掉同批之前成功的结果。
                                 discovery.restore(discovery_checkpoint)
                             record_result(tool.name, call.arguments, {"ok": False, "status": exc.code, "summary": str(exc)}, error=exc)
-                            messages.append(self._tool_error_message(call, exc))
+                            messages.append(self._tool_error_message(call, exc, input_schema=tool.input_schema))
                             completed_call_ids.add(call.call_id)
                             await publish(
                                 AgentEventType.TOOL_FAILED,
@@ -1311,10 +1311,14 @@ class AgentSession:
 
     @staticmethod
     def _tool_error_message(
-        call: ModelToolCall, error: ToolPipelineError
+        call: ModelToolCall, error: ToolPipelineError, *, input_schema: Mapping[str, Any] | None = None,
     ) -> ModelMessage:
+        # 仅重述本轮已提供给模型的工具契约，不回显调用参数，也不进入用户事件。
+        repair = ({"expected_input_schema": dict(input_schema)}
+                  if error.code == "invalid_arguments" and input_schema is not None else {})
         content = json.dumps(
             {
+                **repair,
                 "ok": False,
                 "status": "error",
                 "code": error.code,

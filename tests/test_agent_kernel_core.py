@@ -274,6 +274,58 @@ class AgentKernelCrossLoopTests(unittest.TestCase):
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_invalid_arguments_returns_registered_schema_only_to_model(self):
+        for effect in (ToolEffect.READ, ToolEffect.WRITE):
+            with self.subTest(effect=effect):
+                writes = []
+                schema = {"type": "object", "required": ["target_path"],
+                          "properties": {"target_path": {"type": "string"}},
+                          "additionalProperties": False}
+                tool = KernelToolSpec(
+                    name="cloud.change", domain="cloud", description="移动目录",
+                    input_schema=schema, effect=effect,
+                    read=(lambda a, c: {"summary": "已检查目标"}) if effect is ToolEffect.READ else None,
+                    prepare=(lambda a, c: PreparedEffect(preview={"summary": "等待确认"}, snapshot_fingerprint="snapshot")) if effect is ToolEffect.WRITE else None,
+                    execute_confirmed=(lambda a, s, c: writes.append(a)) if effect is ToolEffect.WRITE else None,
+                )
+                def call(cid, arguments):
+                    return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
+                                       tool_call=ModelToolCall(cid, tool.name, arguments)),
+                            ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
+                rounds = [call("invalid", {"wrong_field": "do-not-echo-this"}),
+                          call("corrected", {"target_path": "/approved"})]
+                if effect is ToolEffect.READ:
+                    rounds.append([ModelEvent(ModelEventType.TEXT_DELTA, text="核对完成。"),
+                                   ModelEvent(ModelEventType.FINISH, finish_reason="stop")])
+                model, state, catalog = ScriptedModel(rounds), InMemorySessionStateStore(), ToolCatalog([tool])
+                session = AgentSession(model=model, catalog=catalog,
+                    retriever=CapabilityRetriever(minimum=1, maximum=1),
+                    pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+                events = await collect(session.run(AgentInput(message="移动目录", owner="owner", session_id="session")))
+                error = next(m for m in model.requests[1].messages if m.role == "tool" and m.tool_call_id == "invalid")
+                payload = json.loads(error.content)
+                self.assertEqual(payload["code"], "invalid_arguments")
+                self.assertEqual(payload["expected_input_schema"], schema)
+                self.assertNotIn("do-not-echo-this", error.content)
+                public_events = json.dumps([e.to_dict() for e in events], ensure_ascii=False)
+                self.assertNotIn("expected_input_schema", public_events)
+                self.assertNotIn("do-not-echo-this", public_events)
+                self.assertEqual(writes, [], "参数纠正不能绕过写操作确认")
+                if effect is ToolEffect.WRITE:
+                    self.assertTrue(any(e.type is AgentEventType.EFFECT_APPROVAL_REQUIRED for e in events))
+                else:
+                    self.assertEqual(events[-1].payload["status"], "success")
+
+    def test_parameter_contract_is_not_attached_to_other_errors(self):
+        call = ModelToolCall("failed", "cloud.change", {"wrong_field": "do-not-echo-this"})
+        for code in ("tool_not_found", "precondition_failed", "rate_limited"):
+            with self.subTest(code=code):
+                message = AgentSession._tool_error_message(
+                    call, ToolPipelineError("无法执行", code=code), input_schema={"type": "object"}
+                )
+                self.assertNotIn("expected_input_schema", json.loads(message.content))
+                self.assertNotIn("do-not-echo-this", message.content)
+
     async def test_empty_confirmation_never_becomes_a_synthetic_user_query(self):
         model = ScriptedModel([])
         catalog, state = ToolCatalog([]), InMemorySessionStateStore()
