@@ -449,7 +449,7 @@ def register_specs(
             name="guangya.episode_naming.inspect",
             description=(
                 "为混乱发布组剧集目录建立一次完整只读快照，并把全部视频按来源父目录压缩为"
-                "正片源季集区间、数量与样例；extras/unknown 分开统计并各自保留异常样例。"
+                "正片源季集区间、数量与样例；extras/unknown 分开统计，字幕按同目录视频唯一配对并报告未匹配原因。"
                 "这些是本地源位置，不是 TMDB 映射，目录名或已观察集数不能证明目标偏移；"
                 "不要用 guangya.fs.query 分页读取全部文件，也不要用刮削或垃圾清理工具代替本盘点。"
             ),
@@ -488,10 +488,14 @@ def register_specs(
                 "把光鸭共同父目录中的发布组剧集按紧凑篇章映射编译为 TMDB 标准分季文件："
                 "工具会在预检时自行建立完整最新快照，再按精确 source_path 或唯一目录名片段、"
                 "源季集区间和目标季集区间自动选择全部正片，保留扩展名，创建缺失的 Season XX 目录，"
-                "并生成移动加改名的单一冻结计划。普通正片映射默认排除 Movie/广告/特典；明确 S0 映射兼容纳入意图，include_extras=false 始终排除。"
+                "并携带同目录唯一匹配的字幕，生成移动加改名的单一冻结计划。"
+                "字幕语言/forced/default标签按统一规则保留，歧义字幕不可猜配。"
+                "普通正片映射默认排除 E00/Movie/广告/特典；明确 S0 映射继承纳入意图，include_extras=false 始终排除。"
+                "源E00可用起止0单独显式映射，但不能自行猜成正片E01。"
                 "没有可靠映射时应答复待核对，不得按目录名、源季号或本地已观察集数猜偏移。"
                 "模型不得逐文件拼 object_ref，也不需要传分页快照引用；"
-                "最多一次处理 200 个媒体文件并创建 32 个分季目录。调用只产生人工确认卡，不会立即写入云盘。"
+                "最多一次处理200个视频与字幕文件合计，并创建32个分季目录；expected_count仅指视频集数。"
+                "调用只产生人工确认卡，不会立即写入云盘；必须说明未匹配、未纳入的字幕。"
             ),
             risk=RiskLevel.DANGER,
             parameters={
@@ -538,12 +542,12 @@ def register_specs(
                                 },
                                 "source_episode_start": {
                                     "type": "integer",
-                                    "minimum": 1,
+                                    "minimum": 0,
                                     "maximum": 9999,
                                 },
                                 "source_episode_end": {
                                     "type": "integer",
-                                    "minimum": 1,
+                                    "minimum": 0,
                                     "maximum": 9999,
                                 },
                                 "target_season": {
@@ -572,7 +576,7 @@ def register_specs(
                                     "type": "integer",
                                     "minimum": 1,
                                     "maximum": 200,
-                                    "description": "必须填写；实际匹配数不同会拒绝冻结，防止漏集或扩大范围。",
+                                    "description": "必须填写预期视频集数，不含配套字幕；实际视频匹配数不同会拒绝冻结，防止漏集或扩大范围。",
                                 },
                             },
                             "additionalProperties": False,

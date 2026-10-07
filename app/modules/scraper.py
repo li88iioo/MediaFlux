@@ -1403,7 +1403,8 @@ def parse_release_position(
     """从发布标题中提取可安全展示/排序的季集位置，不发起任何网络请求。
 
     ``tv_episode_mapping_context`` 只由显式 TV 批量映射链启用，用于接受
-    ``Title 014`` 这种普通空格末尾集号；默认关闭，不改变自动识别契约。
+    ``Title 014`` 这种普通空格末尾集号，并保留显式源 E00，不能在用户
+    指定映射前先改写成 S00E01；默认关闭，不改变自动识别契约。
     """
     name = _strip_explicit_tmdb_markers(str(value or ""))
     # 资源站发布标题不一定带文件扩展名，发布组本身却可能包含点号，
@@ -1436,7 +1437,7 @@ def parse_release_position(
         start, end = (int(item) for item in special_range.groups())
         if 1 <= start <= end <= 500:
             season, episode, episode_end = 0, start, end
-    elif fractional is None:
+    elif fractional is None and not (tv_episode_mapping_context and episode == 0):
         special_episode = _extract_special_episode(stem)
         if special_episode is not None:
             season, episode = 0, special_episode

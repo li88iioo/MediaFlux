@@ -445,6 +445,216 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
             **changes,
         }
 
+    @staticmethod
+    def _mixed_observation(*files: dict) -> dict:
+        return {"plan_id": "mixed-media", "truncated": False, "entries": list(files)}
+
+    @staticmethod
+    def _media(handle: str, name: str, kind: str, parent: str = "/Series/Release") -> dict:
+        return {
+            "handle": handle,
+            "name": name,
+            "is_dir": False,
+            "media_kind": kind,
+            "parent_path": parent,
+            "size": 1000,
+        }
+
+    def test_inspect_reports_subtitle_inventory_and_unmatched_reason_without_exposing_handles(self):
+        observation = self._mixed_observation(
+            self._media("V1", "Series S01E01.mkv", "video"),
+            self._media("S1", "Series S01E01.zh.srt", "subtitle"),
+            self._media("S2", "Unmatched.en.srt", "subtitle"),
+        )
+
+        data = summarize_episode_naming_observation(observation, target_root="/Series")
+
+        self.assertEqual((data["video_count"], data["subtitle_count"]), (1, 2))
+        self.assertEqual(data["matched_subtitle_count"], 1)
+        self.assertEqual(data["unmatched_subtitle_count"], 1)
+        self.assertEqual(data["subtitle_skips"], [{
+            "name": "Unmatched.en.srt", "reason": "字幕未唯一匹配任何视频",
+        }])
+        self.assertNotIn("file_id", data["subtitle_skips"][0])
+
+    def test_compiler_reports_unmatched_subtitle_as_not_included(self):
+        observation = self._mixed_observation(
+            self._media("V1", "Series S01E01.mkv", "video"),
+            self._media("S1", "Loose.en.srt", "subtitle"),
+        )
+        compiled = compile_episode_naming_operations(
+            observation, title="Series", target_root="/Series",
+            groups=[self._b1_mapping(source_episode_end=1, expected_count=1)],
+        )
+
+        self.assertEqual((compiled["video_count"], compiled["subtitle_count"]), (1, 0))
+        self.assertEqual(compiled["selected_files"], 1)
+        self.assertEqual(compiled["unmatched_subtitle_count"], 1)
+        self.assertEqual(compiled["subtitle_skips"], [{
+            "name": "Loose.en.srt", "reason": "字幕未唯一匹配任何视频",
+        }])
+        self.assertNotIn("file_id", compiled["subtitle_skips"][0])
+
+    def test_compiler_rejects_media_observation_without_real_handle(self):
+        observation = self._mixed_observation(
+            {**self._media("V1", "Series S01E01.mkv", "video"), "handle": ""},
+        )
+        with self.assertRaisesRegex(GuangYaEpisodeNamingError, "缺少真实对象 handle"):
+            compile_episode_naming_operations(
+                observation, title="Series", target_root="/Series",
+                groups=[self._b1_mapping(source_episode_end=1, expected_count=1)],
+            )
+
+    def test_compiler_includes_all_languages_with_shared_normalized_suffixes(self):
+        observation = self._mixed_observation(
+            self._media("V1", "Series S01E01.mkv", "video"),
+            self._media("S1", "Series S01E01.chs.default.forced.srt", "subtitle"),
+            self._media("S2", "Series S01E01.en.forced.default.ass", "subtitle"),
+        )
+        compiled = compile_episode_naming_operations(
+            observation, title="Series", target_root="/Series",
+            groups=[self._b1_mapping(source_episode_end=1, expected_count=1)],
+        )
+
+        self.assertEqual((compiled["video_count"], compiled["subtitle_count"]), (1, 2))
+        self.assertEqual(compiled["selected_files"], 3)
+        self.assertEqual(compiled["unmatched_subtitle_count"], 0)
+        subtitle_ops = [item for item in compiled["operations"] if item.get("object_ref") in {"S1", "S2"}]
+        self.assertEqual(
+            {item["object_ref"]: item["new_name"] for item in subtitle_ops},
+            {
+                "S1": "Series - S01E01.zh-Hans.forced.default.srt",
+                "S2": "Series - S01E01.en.forced.default.ass",
+            },
+        )
+        self.assertTrue(all(item["op"] == "relocate" for item in subtitle_ops))
+
+    def test_subtitle_pairing_never_crosses_parent_directories(self):
+        observation = self._mixed_observation(
+            self._media("VA", "Series S01E01.mkv", "video", "/Series/A"),
+            self._media("VB", "Series S01E01.mkv", "video", "/Series/B"),
+            self._media("SB", "Series S01E01.en.srt", "subtitle", "/Series/B"),
+        )
+        compiled = compile_episode_naming_operations(
+            observation, title="Series", target_root="/Series",
+            groups=[{
+                "source_path": "/Series/A", "source_episode_start": 1,
+                "source_episode_end": 1, "target_season": 1, "expected_count": 1,
+            }],
+        )
+
+        self.assertEqual(compiled["video_count"], 1)
+        self.assertEqual(compiled["subtitle_count"], 0)
+        self.assertNotIn("SB", str(compiled["operations"]))
+
+    def test_compiler_rejects_subtitle_ambiguity_for_selected_duplicate_stems(self):
+        observation = self._mixed_observation(
+            self._media("V1", "Series S01E01.mkv", "video"),
+            self._media("V2", "Series S01E01.mp4", "video"),
+            self._media("S1", "Series S01E01.en.srt", "subtitle"),
+        )
+        with self.assertRaisesRegex(GuangYaEpisodeNamingError, "所选视频存在字幕歧义.*多个视频具有相同 stem"):
+            compile_episode_naming_operations(
+                observation, title="Series", target_root="/Series",
+                groups=[self._b1_mapping(source_episode_end=1, expected_count=2)],
+            )
+
+    def test_compiler_rejects_duplicate_normalized_subtitle_targets(self):
+        observation = self._mixed_observation(
+            self._media("V1", "Series S01E01.mkv", "video"),
+            self._media("S1", "Series S01E01.chs.srt", "subtitle"),
+            self._media("S2", "Series S01E01.zh-Hans.srt", "subtitle"),
+        )
+        with self.assertRaisesRegex(GuangYaEpisodeNamingError, "多个字幕归一化后目标名称重复"):
+            compile_episode_naming_operations(
+                observation, title="Series", target_root="/Series",
+                groups=[self._b1_mapping(source_episode_end=1, expected_count=1)],
+            )
+
+    def test_selected_media_cap_counts_companions_at_two_hundred_and_two_hundred_one(self):
+        def observation(video_total: int, subtitle_total: int) -> dict:
+            return self._mixed_observation(*[
+                *[
+                    self._media(f"V{i}", f"Series S01E{i:03d}.mkv", "video")
+                    for i in range(1, video_total + 1)
+                ],
+                *[
+                    self._media(f"S{i}", f"Series S01E{i:03d}.zh.srt", "subtitle")
+                    for i in range(1, subtitle_total + 1)
+                ],
+            ])
+
+        at_limit = compile_episode_naming_operations(
+            observation(100, 100), title="Series", target_root="/Series",
+            groups=[self._b1_mapping(source_episode_end=100, expected_count=100)],
+        )
+        self.assertEqual((at_limit["video_count"], at_limit["subtitle_count"]), (100, 100))
+        self.assertEqual(at_limit["selected_files"], 200)
+        with self.assertRaisesRegex(GuangYaEpisodeNamingError, "201 个媒体文件"):
+            compile_episode_naming_operations(
+                observation(101, 100), title="Series", target_root="/Series",
+                groups=[self._b1_mapping(source_episode_end=101, expected_count=101)],
+            )
+
+    def test_e00_explicitly_maps_to_season_zero_without_renaming_specials_directory(self):
+        files = []
+        for episode in range(53):
+            stem = (
+                "[LAB] Acceptance.Show.S01E00.1080p"
+                if episode == 0
+                else f"[LAB] Acceptance.Show.S01E{episode:02d}.1080p"
+            )
+            files.append(self._media(f"V{episode}", f"{stem}.mkv", "video"))
+            files.append(self._media(f"S{episode}", f"{stem}.zh.srt", "subtitle"))
+        observation = self._mixed_observation(*files)
+        compiled = compile_episode_naming_operations(
+            observation, title="Acceptance Show", target_root="/Series",
+            groups=[
+                {
+                    "source_path": "/Series/Release", "source_season": 1,
+                    "source_episode_start": 1, "source_episode_end": 52,
+                    "target_season": 1, "target_episode_start": 1,
+                    "expected_count": 52,
+                },
+                {
+                    "source_path": "/Series/Release", "source_season": 1,
+                    "source_episode_start": 0, "source_episode_end": 0,
+                    "target_season": 0, "target_episode_start": 1,
+                    "expected_count": 1,
+                    "include_extras": True,
+                },
+            ],
+        )
+
+        self.assertEqual((compiled["video_count"], compiled["subtitle_count"]), (53, 53))
+        self.assertEqual(compiled["selected_files"], 106)
+        special_video = next(
+            operation for operation in compiled["operations"]
+            if operation.get("op") == "batch_relocate"
+            and any(item["object_ref"] == "V0" for item in operation["items"])
+        )
+        self.assertEqual(special_video["target_path"], "/Series/Season 00")
+        self.assertEqual(special_video["season"], 0)
+        special_subtitle = next(item for item in compiled["operations"] if item.get("object_ref") == "S0")
+        self.assertEqual(special_subtitle["target_path"], "/Series/Season 00")
+        self.assertEqual(special_subtitle["new_name"], "Acceptance Show - S00E01.zh.srt")
+        self.assertEqual(compiled["included_extra_count"], 1)
+
+    def test_target_collision_between_mapping_groups_is_rejected(self):
+        observation = self._mixed_observation(
+            self._media("VA", "Series S01E01.mkv", "video", "/Series/A"),
+            self._media("VB", "Series S01E01.mkv", "video", "/Series/B"),
+        )
+        group = {
+            "source_episode_start": 1, "source_episode_end": 1,
+            "target_season": 1, "expected_count": 1,
+        }
+        with self.assertRaisesRegex(GuangYaEpisodeNamingError, "多个篇章映射会生成同一目标"):
+            compile_episode_naming_operations(
+                observation, title="Series", target_root="/Series",
+                groups=[dict(group, source_path="/Series/A"), dict(group, source_path="/Series/B")],
+            )
+
     def test_mixed_inspect_separates_all_exception_types_after_regular_samples(self):
         regular = [f"Series S01E{i:02d}.mkv" for i in range(1, 7)]
         observation = self._b1_observation(
@@ -617,6 +827,23 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
         self.assertEqual(confirmation.data["episode_naming"]["included_extra_count"], 1)
         self.assertIn("含 1 个非正片", confirmation.summary)
         self.assertEqual(confirmation.status, "confirmation_required")
+
+    def test_unselected_video_companion_is_reported_without_being_moved(self):
+        observation = self._b1_observation("Show.S01E01.mkv", "Show.S01E02.mkv")
+        observation["entries"].append({
+            "handle": "SUB-2", "name": "Show.S01E02.zh.srt", "is_dir": False,
+            "media_kind": "subtitle", "parent_path": observation["entries"][0]["parent_path"],
+        })
+        group = self._b1_mapping(source_episode_end=1, expected_count=1)
+        compiled = compile_episode_naming_operations(
+            observation, title="Series", target_root="/Series", groups=[group],
+        )
+        self.assertEqual(compiled["subtitle_count"], 0)
+        self.assertEqual(compiled["unmatched_subtitle_count"], 0)
+        self.assertEqual(compiled["unselected_subtitle_count"], 1)
+        self.assertEqual(compiled["subtitle_skips"][0]["name"], "Show.S01E02.zh.srt")
+        self.assertIn("未被本次", compiled["subtitle_skips"][0]["reason"])
+        self.assertNotIn("SUB-2", str(compiled["operations"]))
 
     def test_catalog_keeps_mapping_compatibility_and_declares_opt_in_extras(self):
         from types import SimpleNamespace

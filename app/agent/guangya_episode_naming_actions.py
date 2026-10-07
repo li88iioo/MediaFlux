@@ -98,13 +98,14 @@ def inspect_guangya_episode_naming(
         ok=True,
         status="success",
         summary=(
-            f"剧集命名盘点完成：{int(data['video_count'])} 个视频，"
-            f"{int(data['source_group_count'])} 个来源目录"
+            f"剧集命名盘点完成：{int(data['video_count'])} 个视频、"
+            f"{int(data['subtitle_count'])} 个字幕，{int(data['source_group_count'])} 个来源目录；"
+            f"{int(data['unmatched_subtitle_count'])} 个字幕未唯一匹配"
         ),
         data=data,
         model_data=data,
         suggestions=[
-            "先核对 compact 正片位置、extras 与 unknown；源季号/本地数量不能证明 TMDB 目标偏移。",
+            "先核对正片、extras/unknown及字幕配对；未匹配字幕不代表已处理，源季号/本地数量不能证明TMDB偏移。",
             "只在取得可靠 TMDB 映射或用户明确指定映射后建卡；缺依据则说明待核对，不能猜测。",
         ],
     )
@@ -152,10 +153,10 @@ def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str
         if not required.issubset(raw):
             raise AgentToolError(f"第 {index} 个篇章映射缺少必要参数")
         source_start = _integer(
-            raw.get("source_episode_start"), field="source_episode_start", minimum=1, maximum=9999
+            raw.get("source_episode_start"), field="source_episode_start", minimum=0, maximum=9999
         )
         source_end = _integer(
-            raw.get("source_episode_end"), field="source_episode_end", minimum=1, maximum=9999
+            raw.get("source_episode_end"), field="source_episode_end", minimum=0, maximum=9999
         )
         if source_end < source_start:
             raise AgentToolError("source_episode_end 不能小于 source_episode_start")
@@ -259,21 +260,27 @@ def prepare_guangya_episode_naming_confirmation(
     finally:
         discard_observation(str(fs_arguments.get("observation_ref") or ""))
     mapping = {
-        "selected_files": int(compiled["selected_files"]),
-        "included_extra_count": int(compiled["included_extra_count"]),
-        "created_directories": int(compiled["created_directories"]),
-        "skipped_noop": int(compiled["skipped_noop"]),
+        **{key: int(compiled[key]) for key in (
+            "selected_files", "video_count", "subtitle_count", "unmatched_subtitle_count", "unselected_subtitle_count",
+            "included_extra_count", "created_directories", "skipped_noop",
+        )},
+        "subtitle_skips": list(compiled["subtitle_skips"]),
         "groups": list(compiled["groups"]),
     }
     confirmation.summary = (
         f"确认后将按分季方案执行 {int(preview.data.get('total') or 0)} 项光鸭文件变更"
+        f"（{mapping['video_count']} 个视频、{mapping['subtitle_count']} 个配套字幕）"
     )
     if mapping["included_extra_count"]:
         confirmation.summary += f"（含 {mapping['included_extra_count']} 个非正片，需明确授权纳入）"
+    if mapping["unmatched_subtitle_count"]:
+        confirmation.summary += f"；另有 {mapping['unmatched_subtitle_count']} 个字幕未唯一匹配，不在本计划内"
+    if mapping["unselected_subtitle_count"]:
+        confirmation.summary += f"；{mapping['unselected_subtitle_count']} 个字幕对应视频未纳入本次映射，保持不动"
     confirmation.data = {**confirmation.data, "episode_naming": mapping}
     confirmation.model_data = dict(confirmation.data)
     confirmation.suggestions = [
-        "请核对每季匹配数量和非正片纳入范围；确认后由一个持久任务完成整份计划。",
+        "请核对视频/字幕数量、未处理字幕和非正片纳入范围；一个持久任务只执行这张卡内的计划。",
         "源目录/已观察集数不能证明 TMDB 偏移；映射未核实时不要确认。",
     ]
     return confirmation, fingerprint

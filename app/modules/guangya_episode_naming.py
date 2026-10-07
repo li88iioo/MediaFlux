@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from app.modules.scraper import parse_release_position
 from app.modules.special_media import is_special_media_name, is_special_path
+from app.modules.subtitle_identity import (
+    SubtitlePlanResult,
+    plan_subtitle_companions,
+)
 
 _MAX_MEDIA_OPERATIONS = 200
 _MAX_CREATE_DIRECTORY_OPERATIONS = 32
@@ -62,6 +67,8 @@ def _episode_details(entry: dict[str, Any], target_root: str) -> tuple[str, str,
     )
     if marker:
         kind, reason = "extra", str(marker.lastgroup)
+    elif episode == 0:
+        kind, reason = "extra", "episode_zero"
     elif season == 0 or is_special_media_name(name) or is_special_path(relative_parent):
         kind, reason = "extra", "special_media"
     elif episode is None:
@@ -89,6 +96,48 @@ def _compress_episode_numbers(values: list[int]) -> str:
     return ",".join(chunks)
 
 
+def _within_root(entry: dict[str, Any], target_root: str) -> bool:
+    parent = _normalize_path(entry.get("parent_path"), field="parent_path")
+    return parent == target_root or parent.startswith(target_root.rstrip("/") + "/")
+
+
+def _plan_subtitles(
+    videos: list[dict[str, Any]], subtitles: list[dict[str, Any]]
+) -> SubtitlePlanResult:
+    """按父目录调用共享配对器，保持同名文件不会跨目录相互匹配。"""
+
+    if not subtitles:
+        return SubtitlePlanResult(plans=[], skipped=[])
+
+    media_by_parent: dict[str, dict[str, list[Any]]] = {}
+    combined = [(item, "video") for item in videos] + [(item, "subtitle") for item in subtitles]
+    for entry, kind in combined:
+        parent = _normalize_path(entry.get("parent_path"), field="parent_path")
+        handle = str(entry.get("handle") or "").strip().upper()
+        if not handle:
+            raise GuangYaEpisodeNamingError("目录观察中的媒体缺少真实对象 handle，无法计划字幕配对")
+        media = media_by_parent.setdefault(parent, {"video": [], "subtitle": []})
+        media[kind].append(
+            SimpleNamespace(file_id=handle, name=str(entry.get("name") or ""), entry=entry)
+        )
+
+    plans = []
+    skipped = []
+    for parent in sorted(media_by_parent):
+        media = media_by_parent[parent]
+        result = plan_subtitle_companions(media["video"], media["subtitle"])
+        plans.extend(result.plans)
+        skipped.extend(result.skipped)
+    return SubtitlePlanResult(plans=plans, skipped=skipped)
+
+
+def _subtitle_skips(result: SubtitlePlanResult) -> list[dict[str, str]]:
+    return [
+        {"name": str(item.file.name), "reason": item.reason}
+        for item in result.skipped
+    ]
+
+
 def summarize_episode_naming_observation(
     observation: dict[str, Any], *, target_root: str
 ) -> dict[str, Any]:
@@ -99,15 +148,23 @@ def summarize_episode_naming_observation(
     normalized_root = _normalize_path(target_root, field="target_root")
     grouped: dict[str, list[dict[str, Any]]] = {}
     entries = [item for item in observation.get("entries") or () if isinstance(item, dict)]
-    for entry in entries:
-        if bool(entry.get("is_dir")) or str(entry.get("media_kind") or "") != "video":
-            continue
+    videos = [
+        entry for entry in entries
+        if not bool(entry.get("is_dir"))
+        and str(entry.get("media_kind") or "") == "video"
+        and _within_root(entry, normalized_root)
+    ]
+    subtitles = [
+        entry for entry in entries
+        if not bool(entry.get("is_dir"))
+        and str(entry.get("media_kind") or "") == "subtitle"
+        and _within_root(entry, normalized_root)
+    ]
+    for entry in videos:
         parent_path = _normalize_path(entry.get("parent_path"), field="parent_path")
-        if parent_path != normalized_root and not parent_path.startswith(
-            normalized_root.rstrip("/") + "/"
-        ):
-            continue
         grouped.setdefault(parent_path, []).append(entry)
+
+    subtitle_plan = _plan_subtitles(videos, subtitles)
 
     summaries: list[dict[str, Any]] = []
     counts = {"regular": 0, "extra": 0, "unknown": 0}
@@ -149,6 +206,10 @@ def summarize_episode_naming_observation(
     return {
         "target_root": normalized_root,
         "video_count": sum(counts.values()),
+        "subtitle_count": len(subtitles),
+        "matched_subtitle_count": len(subtitle_plan.plans),
+        "unmatched_subtitle_count": len(subtitle_plan.skipped),
+        "subtitle_skips": _subtitle_skips(subtitle_plan),
         "source_group_count": len(summaries),
         "unparsed_count": total_unparsed,
         **{f"{kind}_count": count for kind, count in counts.items()},
@@ -186,11 +247,7 @@ def compile_episode_naming_operations(
     target_root: str,
     groups: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """按目录和集号区间确定性展开 rename/relocate/create_directory。
-
-    输入只描述篇章到 TMDB 季集的映射；对象引用、扩展名、目标名称和目录
-    创建动作均从 owner-bound 观察快照中生成，避免模型逐文件拼装大 JSON。
-    """
+    """按显式篇章映射展开视频与唯一配套字幕的文件变更。"""
 
     if bool(observation.get("truncated")):
         raise GuangYaEpisodeNamingError("光鸭目录观察不完整，请扩大 max_items 后重新读取")
@@ -202,6 +259,21 @@ def compile_episode_naming_operations(
         raise GuangYaEpisodeNamingError("groups 必须包含 1 到 32 个篇章映射")
 
     entries = [item for item in observation.get("entries") or () if isinstance(item, dict)]
+    videos = [
+        item for item in entries
+        if not bool(item.get("is_dir"))
+        and str(item.get("media_kind") or "") == "video"
+        and _within_root(item, normalized_root)
+    ]
+    subtitles = [
+        item for item in entries
+        if not bool(item.get("is_dir"))
+        and str(item.get("media_kind") or "") == "subtitle"
+        and _within_root(item, normalized_root)
+    ]
+    if any(not str(item.get("handle") or "").strip() for item in [*videos, *subtitles]):
+        raise GuangYaEpisodeNamingError("目录观察中的媒体缺少真实对象 handle，拒绝编译")
+
     existing_directories = {
         _normalize_path(item.get("parent_path"), field="parent_path")
         for item in entries
@@ -215,14 +287,10 @@ def compile_episode_naming_operations(
         for item in entries
         if bool(item.get("is_dir")) and str(item.get("name") or "").strip()
     )
-    used_handles: set[str] = set()
-    target_names: set[tuple[str, str]] = set()
-    create_paths: set[str] = set()
-    create_operations: list[dict[str, Any]] = []
-    change_operations: list[dict[str, Any]] = []
-    group_summaries: list[dict[str, Any]] = []
-    skipped_noop = 0
 
+    selected_handles: set[str] = set()
+    selected_videos: list[dict[str, Any]] = []
+    group_states: list[dict[str, Any]] = []
     for index, group in enumerate(groups, start=1):
         if not isinstance(group, dict):
             raise GuangYaEpisodeNamingError(f"第 {index} 个篇章映射格式无效")
@@ -238,27 +306,25 @@ def compile_episode_naming_operations(
             source_path = _normalize_path(raw_source_path, field="source_path")
         else:
             candidates = {
-                _normalize_path(entry.get("parent_path"), field="parent_path")
-                for entry in entries
-                if not bool(entry.get("is_dir"))
-                and str(entry.get("media_kind") or "") == "video"
-                and directory_contains.casefold()
-                in Path(str(entry.get("parent_path") or "")).name.casefold()
-            }
-            candidates = {
-                path
-                for path in candidates
-                if path == normalized_root or path.startswith(normalized_root.rstrip("/") + "/")
+                _normalize_path(item.get("parent_path"), field="parent_path")
+                for item in videos
+                if directory_contains.casefold()
+                in Path(str(item.get("parent_path") or "")).name.casefold()
             }
             if len(candidates) != 1:
                 raise GuangYaEpisodeNamingError(
                     f"第 {index} 个篇章目录特征匹配到 {len(candidates)} 个目录，请提供更精确特征"
                 )
             source_path = next(iter(candidates))
+
         target_season = int(group["target_season"])
         source_start = int(group["source_episode_start"])
         source_end = int(group["source_episode_end"])
         target_start = int(group.get("target_episode_start", 1))
+        if source_start < 0 or source_end < source_start:
+            raise GuangYaEpisodeNamingError("源起始集号不能小于 0，结束值不能小于起始值")
+        if target_season < 0 or target_start < 1:
+            raise GuangYaEpisodeNamingError("目标季号不能小于 0，目标集号必须从 1 开始")
         source_season = group.get("source_season")
         if source_season is not None:
             source_season = int(source_season)
@@ -269,12 +335,8 @@ def compile_episode_naming_operations(
             expected_count = int(expected_count)
 
         selected: list[tuple[int, dict[str, Any]]] = []
-        unparsed = 0
-        included_extras = 0
-        excluded_extras = 0
-        for entry in entries:
-            if bool(entry.get("is_dir")) or str(entry.get("media_kind") or "") != "video":
-                continue
+        unparsed = included_extras = excluded_extras = 0
+        for entry in videos:
             if _normalize_path(entry.get("parent_path"), field="parent_path") != source_path:
                 continue
             if name_contains and name_contains.casefold() not in str(entry.get("name") or "").casefold():
@@ -285,38 +347,110 @@ def compile_episode_naming_operations(
                 continue
             if source_season is not None and parsed_season != source_season:
                 continue
-            if source_start <= parsed_episode <= source_end:
-                if kind == "extra" and not include_extras:
-                    excluded_extras += 1
-                    continue
-                included_extras += kind == "extra"
-                selected.append((parsed_episode, entry))
+            if not source_start <= parsed_episode <= source_end:
+                continue
+            if kind == "extra" and not include_extras:
+                excluded_extras += 1
+                continue
+            included_extras += kind == "extra"
+            selected.append((parsed_episode, entry))
 
         selected.sort(key=lambda pair: (pair[0], str(pair[1].get("name") or "").casefold()))
         if not selected:
             detail = "，且存在无法识别集号的文件" if unparsed else ""
-            raise GuangYaEpisodeNamingError(f"第 {index} 个篇章映射没有匹配到可处理文件（非正片默认排除）{detail}")
+            raise GuangYaEpisodeNamingError(
+                f"第 {index} 个篇章映射没有匹配到可处理文件（非正片默认排除）{detail}"
+            )
         if expected_count is not None and len(selected) != expected_count:
             raise GuangYaEpisodeNamingError(
                 f"第 {index} 个篇章映射预期 {expected_count} 集，实际匹配 {len(selected)} 集"
             )
 
-        episodes: set[int] = set()
-        relocate_items: list[dict[str, Any]] = []
-        rename_items: list[dict[str, Any]] = []
-        season_directory = f"Season {target_season:02d}"
-        target_path = _full_path(normalized_root, season_directory)
+        rows = []
         for source_episode, entry in selected:
             handle = str(entry.get("handle") or "").strip().upper()
-            if not handle or handle in used_handles:
+            if not handle or handle in selected_handles:
                 raise GuangYaEpisodeNamingError("篇章映射包含重复或无效对象")
+            selected_handles.add(handle)
+            row = {"handle": handle, "source_episode": source_episode, "entry": entry}
+            rows.append(row)
+            selected_videos.append(entry)
+        group_states.append({
+            "index": index,
+            "source_path": source_path,
+            "target_season": target_season,
+            "source_start": source_start,
+            "target_start": target_start,
+            "selected": rows,
+            "unparsed": unparsed,
+            "included_extras": included_extras,
+            "excluded_extras": excluded_extras,
+        })
+
+    all_subtitle_plan = _plan_subtitles(videos, subtitles)
+    selected_subtitle_plan = _plan_subtitles(selected_videos, subtitles)
+    selected_candidate_ids = {
+        id(plan.file.entry) for plan in selected_subtitle_plan.plans
+    }
+    selected_candidate_ids.update(
+        id(skip.file.entry)
+        for skip in selected_subtitle_plan.skipped
+        if skip.reason_code in {"ambiguous-video", "duplicate-target"}
+    )
+    for skip in all_subtitle_plan.skipped:
+        if (
+            skip.reason_code in {"ambiguous-video", "duplicate-target"}
+            and id(skip.file.entry) in selected_candidate_ids
+        ):
+            raise GuangYaEpisodeNamingError(
+                f"所选视频存在字幕歧义，拒绝编译：{skip.file.name}（{skip.reason}）"
+            )
+
+    selected_subtitles = [
+        plan for plan in all_subtitle_plan.plans
+        if plan.video_file_id in selected_handles
+    ]
+    unselected_subtitles = [
+        plan for plan in all_subtitle_plan.plans if plan.video_file_id not in selected_handles
+    ]
+    selected_video_handles = set(selected_handles)
+    subtitle_handles = [
+        str(plan.file.entry.get("handle") or "").strip().upper()
+        for plan in selected_subtitles
+    ]
+    if any(not handle for handle in subtitle_handles) or len(set(subtitle_handles)) != len(subtitle_handles):
+        raise GuangYaEpisodeNamingError("字幕计划包含重复或无效对象 handle")
+    if selected_video_handles.intersection(subtitle_handles):
+        raise GuangYaEpisodeNamingError("字幕计划重复引用了已选视频对象 handle")
+
+    target_names: set[tuple[str, str]] = set()
+    video_targets: dict[str, dict[str, Any]] = {}
+    create_paths: set[str] = set()
+    create_operations: list[dict[str, Any]] = []
+    change_operations: list[dict[str, Any]] = []
+    group_summaries: list[dict[str, Any]] = []
+    selected_handles.update(subtitle_handles)
+    skipped_noop = 0
+
+    for state in group_states:
+        index = state["index"]
+        selected = state["selected"]
+        episodes: set[int] = set()
+        target_season = state["target_season"]
+        target_path = _full_path(normalized_root, f"Season {target_season:02d}")
+        rename_items: list[dict[str, Any]] = []
+        relocate_items: list[dict[str, Any]] = []
+        for row in selected:
+            source_episode = row["source_episode"]
             if source_episode in episodes:
                 raise GuangYaEpisodeNamingError(
                     f"第 {index} 个篇章映射存在重复源集号 E{source_episode:02d}"
                 )
-            target_episode = target_start + source_episode - source_start
+            episodes.add(source_episode)
+            target_episode = state["target_start"] + source_episode - state["source_start"]
             if not 1 <= target_episode <= 9999:
                 raise GuangYaEpisodeNamingError("映射后的目标集号超出 1 到 9999")
+            entry = row["entry"]
             desired = _desired_name(normalized_title, target_season, target_episode, entry)
             target_key = (target_path.casefold(), desired.casefold())
             if target_key in target_names:
@@ -324,8 +458,11 @@ def compile_episode_naming_operations(
                     f"多个篇章映射会生成同一目标：S{target_season:02d}E{target_episode:02d}"
                 )
             target_names.add(target_key)
-            used_handles.add(handle)
-            episodes.add(source_episode)
+            video_targets[row["handle"]] = {
+                "target_path": target_path,
+                "target_episode": target_episode,
+                "desired_name": desired,
+            }
             current_parent = _normalize_path(entry.get("parent_path"), field="parent_path")
             current_name = str(entry.get("name") or "")
             if current_parent == target_path:
@@ -333,58 +470,72 @@ def compile_episode_naming_operations(
                     skipped_noop += 1
                 else:
                     rename_items.append(
-                        {"op": "rename", "object_ref": handle, "new_name": desired}
+                        {"op": "rename", "object_ref": row["handle"], "new_name": desired}
                     )
             else:
-                relocate_items.append({"object_ref": handle, "episode": target_episode})
+                relocate_items.append({"object_ref": row["handle"], "episode": target_episode})
 
         if (relocate_items or rename_items) and target_path not in existing_directories and target_path not in create_paths:
             create_paths.add(target_path)
             create_operations.append(
-                {"op": "create_directory", "parent_path": normalized_root, "name": season_directory}
+                {"op": "create_directory", "parent_path": normalized_root, "name": f"Season {target_season:02d}"}
             )
         change_operations.extend(rename_items)
         if relocate_items:
-            change_operations.append(
-                {
-                    "op": "batch_relocate",
-                    "items": relocate_items,
-                    "target_path": target_path,
-                    "title": normalized_title,
-                    "naming": "season_episode",
-                    "season": target_season,
-                    "episode_padding": 2,
-                }
-            )
-        group_summaries.append(
-            {
-                "source_directory": "(共同父目录)"
-                if source_path == normalized_root
-                else Path(source_path).name,
+            change_operations.append({
+                "op": "batch_relocate",
+                "items": relocate_items,
+                "target_path": target_path,
+                "title": normalized_title,
+                "naming": "season_episode",
                 "season": target_season,
-                "matched": len(selected),
-                "included_extra_count": included_extras,
-                "excluded_extra_count": excluded_extras,
-                "unknown_count": unparsed,
-                "renamed_in_place": len(rename_items),
-                "relocated": len(relocate_items),
-                "source_episode_start": selected[0][0],
-                "source_episode_end": selected[-1][0],
-                "target_episode_start": target_start,
-                "target_episode_end": target_start + selected[-1][0] - source_start,
-            }
-        )
+                "episode_padding": 2,
+            })
+        group_summaries.append({
+            "source_directory": "(共同父目录)" if state["source_path"] == normalized_root else Path(state["source_path"]).name,
+            "season": target_season,
+            "matched": len(selected),
+            "included_extra_count": state["included_extras"],
+            "excluded_extra_count": state["excluded_extras"],
+            "unknown_count": state["unparsed"],
+            "renamed_in_place": len(rename_items),
+            "relocated": len(relocate_items),
+            "source_episode_start": selected[0]["source_episode"],
+            "source_episode_end": selected[-1]["source_episode"],
+            "target_episode_start": state["target_start"],
+            "target_episode_end": state["target_start"] + selected[-1]["source_episode"] - state["source_start"],
+        })
+
+    for plan in selected_subtitles:
+        video_handle = plan.video_file_id
+        target = video_targets[video_handle]
+        entry = plan.file.entry
+        handle = str(entry.get("handle") or "").strip().upper()
+        desired = plan.target_name(target["desired_name"])
+        target_key = (target["target_path"].casefold(), desired.casefold())
+        if target_key in target_names:
+            raise GuangYaEpisodeNamingError(f"字幕目标名称冲突：{desired}")
+        target_names.add(target_key)
+        current_parent = _normalize_path(entry.get("parent_path"), field="parent_path")
+        current_name = str(entry.get("name") or "")
+        if current_parent == target["target_path"]:
+            if current_name == desired:
+                skipped_noop += 1
+            else:
+                change_operations.append({"op": "rename", "object_ref": handle, "new_name": desired})
+        else:
+            change_operations.append({
+                "op": "relocate",
+                "object_ref": handle,
+                "target_path": target["target_path"],
+                "new_name": desired,
+            })
 
     operations = [*create_operations, *change_operations]
-    effective_total = len(create_operations) + sum(
-        len(item.get("items") or ()) if item.get("op") == "batch_relocate" else 1
-        for item in change_operations
-    )
-    if effective_total == 0:
-        raise GuangYaEpisodeNamingError("所选文件已经符合目标分季命名，无需变更")
-    if len(used_handles) > _MAX_MEDIA_OPERATIONS:
+    selected_file_count = len(selected_handles)
+    if selected_file_count > _MAX_MEDIA_OPERATIONS:
         raise GuangYaEpisodeNamingError(
-            f"完整方案需要变更 {len(used_handles)} 个媒体文件，单个冻结计划最多 "
+            f"完整方案包含 {selected_file_count} 个媒体文件，单个冻结计划最多 "
             f"{_MAX_MEDIA_OPERATIONS} 个；请按完整季拆分 groups，不能截断同一季"
         )
     if len(create_operations) > _MAX_CREATE_DIRECTORY_OPERATIONS:
@@ -392,11 +543,26 @@ def compile_episode_naming_operations(
             f"完整方案需要创建 {len(create_operations)} 个目录，单个冻结计划最多 "
             f"{_MAX_CREATE_DIRECTORY_OPERATIONS} 个"
         )
+    effective_total = len(create_operations) + sum(
+        len(item.get("items") or ()) if item.get("op") == "batch_relocate" else 1
+        for item in change_operations
+    )
+    if effective_total == 0:
+        raise GuangYaEpisodeNamingError("所选文件已经符合目标分季命名，无需变更")
+
     return {
         "operations": operations,
         "effective_total": effective_total,
-        "selected_files": len(used_handles),
-        "included_extra_count": sum(group["included_extra_count"] for group in group_summaries),
+        "selected_files": selected_file_count,
+        "video_count": sum(len(state["selected"]) for state in group_states),
+        "subtitle_count": len(selected_subtitles),
+        "unmatched_subtitle_count": len(all_subtitle_plan.skipped),
+        "unselected_subtitle_count": len(unselected_subtitles),
+        "subtitle_skips": [*_subtitle_skips(all_subtitle_plan), *(
+            {"name": str(plan.file.name), "reason": "对应视频未被本次篇章映射选中，字幕未处理"}
+            for plan in unselected_subtitles
+        )],
+        "included_extra_count": sum(group["included_extras"] for group in group_states),
         "created_directories": len(create_operations),
         "skipped_noop": skipped_noop,
         "groups": group_summaries,

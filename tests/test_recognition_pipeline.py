@@ -38,6 +38,25 @@ class RecognitionContractMixin:
 
 
 class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
+    def test_tv_mapping_retains_explicit_zero_before_special_normalization(self):
+        scraper = self.recognition_module()
+        cases = (
+            "[LAB] Acceptance.Show.S01E00.1080p.mkv",
+            "Demo.Show.S02E00.2160p.WEB-DL.mkv",
+            "Synthetic Series.S01E00.mkv",
+        )
+        for filename in cases:
+            with self.subTest(filename=filename):
+                position = scraper.parse_release_position(filename, tv_episode_mapping_context=True)
+                self.assertEqual(position["episode"], 0)
+                self.assertEqual(position["season"], 2 if "S02" in filename else 1)
+                self.assertIsNone(position["episode_end"])
+        # 默认识别/索引链路继续保留既有特殊篇归一化，不能因批量命名回归。
+        self.assertEqual(
+            scraper.parse_release_position(cases[0]),
+            {"season": 0, "episode": 1, "episode_end": None},
+        )
+
     def test_release_projection_and_context_keep_their_distinct_public_contracts(self):
         from tests.support import isolated_test_database
 
