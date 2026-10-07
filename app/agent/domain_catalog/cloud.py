@@ -606,7 +606,7 @@ def register_specs(
                 "把当前会话近期光鸭观察中的对象引用编译为确定性冻结计划；observation_ref 只指定主快照，"
                 "同一 owner 与凭据世代的近期安全引用会自动合并，无需为了跨快照对象重复扫描。支持 rename、move、copy、"
                 "relocate（一次计划内移动并改名）、batch_relocate（用 object_ref+集号批量生成规范文件名）、"
-                "trash（Provider 回收站）和 create_directory。子文件改名或搬出、随后空中间目录trash和父目录move可放在同一计划，系统按依赖执行；父目录清理前必须验证实际为空，任一前置失败会阻止后续父目录操作；这是有序执行而非全局回滚事务；"
+                "trash（Provider 回收站）和 create_directory。子项复制备份、改名或搬出，以及后续空中间目录trash和父目录move/relocate可放在同一计划，系统按依赖执行；父目录清理前必须验证实际为空，任一前置失败会阻止后续父目录操作；这是有序执行而非全局回滚事务；"
                 "多层 create_directory 与指向新目录的移动可放在同一计划，父目录先于子目录创建，无需分次确认；"
                 "重新核对 owner、凭据世代、对象快照、目录占用与结构冲突，不执行任何云端写入。"
             ),

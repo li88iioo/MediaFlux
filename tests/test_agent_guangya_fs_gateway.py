@@ -1453,6 +1453,74 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             {item.name for item in client.directories["target"]}, {"Move.mp4", "新目录"}
         )
 
+    def test_child_backup_and_parent_relocation_share_one_confirmed_plan(self):
+        for copy_fails in (False, True):
+            with self.subTest(copy_fails=copy_fails):
+                client = FakeGatewayClient()
+                observed = self._query(client, operation="tree", path="/", page_size=50)
+                observation = guangya_workspace.load_directory_observation(
+                    observed.data["observation_ref"], owner="owner"
+                )
+                refs = {item["object_name"]: item["object_ref"] for item in observed.data["entries"]}
+                plan = guangya_fs_change.build_fs_change_plan(
+                    client, owner="owner", observation=observation, trigger_strm=False,
+                    operations=[
+                        {"op": "relocate", "object_ref": refs["source"],
+                         "target_path": "/target", "new_name": "archived"},
+                        {"op": "copy", "object_ref": refs["Move.mp4"], "target_path": "/target"},
+                    ],
+                )
+                self.assertEqual([item["op"] for item in plan["operations"]], ["copy", "relocate"])
+                self.assertEqual(plan["operations"][1]["rename_dependencies"], ["move"])
+                self.assertEqual(client.file_info("source").parent_id, "0", "预览不得写入")
+                guangya_fs_change.confirm_fs_change_plan(
+                    plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"]
+                )
+                payload = self._queued_payload(plan)
+                with mock.patch.object(client, "copy", wraps=client.copy) as copy, \
+                        mock.patch.object(client, "move", wraps=client.move) as move:
+                    if copy_fails:
+                        copy.side_effect = GuangYaWriteRejected("copy", code="rejected")
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                    copy.assert_called_once_with(["move"], "target")
+                    self.assertEqual(result["partial"], copy_fails)
+                    self.assertEqual(result["stats"]["copied"], int(not copy_fails))
+                    self.assertEqual(result["stats"]["relocated"], int(not copy_fails))
+                    self.assertEqual(client.file_info("move").parent_id, "source", "复制必须保留源文件")
+                    if copy_fails:
+                        move.assert_not_called()
+                        self.assertEqual(client.file_info("source").name, "source")
+                        self.assertEqual(client.file_info("source").parent_id, "0")
+                        self.assertEqual(result["stats"]["precondition_failed"], 1)
+                    else:
+                        move.assert_called_once_with(["source"], "target")
+                        self.assertEqual(client.file_info("source").name, "archived")
+                        self.assertEqual(client.file_info("source").parent_id, "target")
+                        copied = next(row for row in client.list_dir("target") if row.name == "Move.mp4")
+                        self.assertNotEqual(copied.file_id, "move")
+                        self.assertEqual(copied.size, client.file_info("move").size)
+                    with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                        guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client)
+                    copy.assert_called_once()
+
+    def test_child_backup_does_not_authorize_trashing_nonempty_parent(self):
+        client = FakeGatewayClient()
+        observed = self._query(client, operation="tree", path="/", page_size=50)
+        observation = guangya_workspace.load_directory_observation(
+            observed.data["observation_ref"], owner="owner"
+        )
+        refs = {item["object_name"]: item["object_ref"] for item in observed.data["entries"]}
+        with self.assertRaisesRegex(guangya_fs_change.GuangYaFSChangeError, "先移出内容"):
+            guangya_fs_change.build_fs_change_plan(
+                client, owner="owner", observation=observation, trigger_strm=False,
+                operations=[
+                    {"op": "trash", "object_ref": refs["source"]},
+                    {"op": "copy", "object_ref": refs["Move.mp4"], "target_path": "/target"},
+                ],
+            )
+        self.assertEqual(client.file_info("source").parent_id, "0")
+        self.assertEqual(client.list_dir("target"), [])
+
     def test_copy_keeps_source_and_verifies_new_target_object(self):
         client = FakeGatewayClient()
         observed = self._query(client)

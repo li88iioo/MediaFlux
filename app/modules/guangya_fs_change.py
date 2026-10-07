@@ -952,8 +952,6 @@ def build_fs_change_plan(
                     parent["require_empty"] = True
                     if item["op"] == "trash":
                         item["require_empty"] = True
-                elif item["op"] not in {"rename", "move", "relocate", "trash"}:
-                    raise GuangYaFSChangeError("父目录迁移不能与子项复制混合，请分开预览")
                 elif item["op"] == "trash" and item["source"]["is_dir"]:
                     item["require_empty"] = True
                 parent.setdefault("rename_dependencies", []).append(str(item["source"]["file_id"]))
