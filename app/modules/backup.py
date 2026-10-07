@@ -686,6 +686,13 @@ def runtime_lifecycle_guard(paths: RuntimePaths):
                     "同一数据目录已有 MediaFlux 实例在运行，已拒绝重复启动；"
                     "请先停止正在运行的实例后重试"
                 )
+            try:
+                from app.modules.runtime_layout import require_runtime_layout
+
+                require_runtime_layout(paths)
+            except BaseException:
+                lock.release()
+                raise
             entry = {"lock": lock, "references": 0}
             _RUNTIME_LIFECYCLE_REGISTRY[key] = entry
         entry["references"] = int(entry["references"]) + 1

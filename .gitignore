@@ -28,6 +28,7 @@ db/
 *.sqlite3
 /.mediaflux-*.lock
 /mediaflux.pid
+/runtime/
 /guangya_token.json
 /.guangya_token.json.generation
 /agent-guangya-cleanup

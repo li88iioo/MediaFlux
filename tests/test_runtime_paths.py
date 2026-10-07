@@ -26,6 +26,8 @@ class RuntimePathsTests(unittest.TestCase):
 
         self.assertEqual(paths.database_path, Path("/srv/mediaflux/data/db/mediaflux.db"))
         self.assertEqual(paths.env_file, Path("/srv/mediaflux/config/user.env"))
+        self.assertEqual(paths.runtime_dir, Path("/srv/mediaflux/data/runtime"))
+        self.assertEqual(paths.pid_file, Path("/srv/mediaflux/data/runtime/mediaflux.pid"))
         self.assertEqual(paths.log_dir, Path("/srv/mediaflux/logs"))
         self.assertEqual(paths.trash_dir, Path("/srv/mediaflux/data/trash"))
         self.assertEqual(paths.token_dir, Path("/srv/mediaflux/data"))

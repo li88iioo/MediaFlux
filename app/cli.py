@@ -28,6 +28,9 @@ def build_parser() -> argparse.ArgumentParser:
     start.add_argument("--port", type=int, default=None)
     start.add_argument("--data-dir", default=None)
 
+    migrate = sub.add_parser("runtime-migrate", help="停服后收纳旧运行锁和 PID 文件")
+    migrate.add_argument("--data-dir", default=None)
+
     status = sub.add_parser("status")
     status.add_argument("--port", type=int, default=None)
     open_web = sub.add_parser("open")
@@ -135,7 +138,7 @@ def _start(host: str | None, port: int | None, data_dir: str | None) -> int:
         from app.main import app as web_app
 
         effective_port = port if port is not None else config.flask_port()
-        pid_file = paths.data_dir / "mediaflux.pid"
+        pid_file = paths.pid_file
         try:
             pid_file.parent.mkdir(parents=True, exist_ok=True)
             pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -468,8 +471,25 @@ def _update_command(args: argparse.Namespace) -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     """运行 MediaFlux CLI 并返回适合进程退出的状态码。"""
     args = build_parser().parse_args(argv)
-    if args.command == "start":
-        return _start(args.host, args.port, args.data_dir)
+    if args.command in {"start", "runtime-migrate"}:
+        from app.runtime_paths import RuntimeLayoutError
+
+        if args.command == "start":
+            try:
+                return _start(args.host, args.port, args.data_dir)
+            except RuntimeLayoutError as exc:
+                print(f"MediaFlux runtime layout: {exc}", file=sys.stderr)
+                return 2
+        try:
+            _configure_start_paths(args.data_dir)
+            from app.modules.runtime_layout import migrate_runtime_layout
+
+            count = migrate_runtime_layout(get_runtime_paths())
+            print(f"运行目录迁移完成：收纳 {count} 个旧锁；旧 PID 已清理，新实例 PID 将写入 runtime/。")
+            return 0
+        except (OSError, RuntimeLayoutError) as exc:
+            print(f"MediaFlux runtime layout: {exc}", file=sys.stderr)
+            return 2
     if args.command == "status":
         return _status(args.port)
     if args.command == "open":

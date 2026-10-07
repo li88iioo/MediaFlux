@@ -14,6 +14,16 @@ from pathlib import Path
 from typing import BinaryIO
 
 from app import database as db
+from app.runtime_paths import RuntimeLayoutError
+
+LIFECYCLE_LOCK_NAME = ".mediaflux-runtime-lifecycle.lock"
+
+
+def lock_path(directory: Path, filename: str) -> Path:
+    # 跨版本启动/恢复互斥的唯一锚点，永不搬迁，也不另建第二把锁。
+    if filename == LIFECYCLE_LOCK_NAME:
+        return directory / filename
+    return directory / "runtime" / "locks" / filename
 
 
 class CrossProcessLock:
@@ -33,16 +43,23 @@ class CrossProcessLock:
     @property
     def path(self) -> Path:
         directory = self._directory or db.resolve_db_path().parent
-        return directory / f".mediaflux-{self._name}.lock"
+        return lock_path(directory, f".mediaflux-{self._name}.lock")
 
     def acquire(self, blocking: bool = True) -> bool:
         if not self._thread_lock.acquire(blocking=blocking):
             return False
         handle: BinaryIO | None = None
         try:
-            lock_path = self.path
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            handle = lock_path.open("a+b")
+            target = self.path
+            directory = self._directory or db.resolve_db_path().parent
+            legacy = directory / target.name
+            if target != legacy and legacy.exists():
+                raise RuntimeLayoutError(
+                    "检测到旧锁布局，请先停止所有 MediaFlux 进程，再运行 "
+                    "python mediaflux.py runtime-migrate（使用相同数据目录配置）"
+                )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            handle = target.open("a+b")
             self._acquire_file_lock(handle, blocking=blocking)
             with self._state_lock:
                 self._handle = handle

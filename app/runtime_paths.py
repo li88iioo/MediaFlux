@@ -11,6 +11,10 @@ from typing import Mapping
 _configured_paths: RuntimePaths | None = None
 
 
+class RuntimeLayoutError(RuntimeError):
+    """旧锁布局必须在停服后迁移，不能在线切换互斥对象。"""
+
+
 @dataclass(frozen=True)
 class RuntimePaths:
     program_dir: Path
@@ -20,6 +24,14 @@ class RuntimePaths:
     log_dir: Path
     strm_dir: Path
     trash_dir: Path
+
+    @property
+    def runtime_dir(self) -> Path:
+        return self.data_dir / "runtime"
+
+    @property
+    def pid_file(self) -> Path:
+        return self.runtime_dir / "mediaflux.pid"
 
     @property
     def backup_dir(self) -> Path:
