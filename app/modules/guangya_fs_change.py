@@ -636,7 +636,7 @@ def _snapshot(item: GuangYaFile) -> dict[str, Any]:
     }
 
 
-def _snapshot_matches(item: GuangYaFile | None, snapshot: dict[str, Any]) -> bool:
+def _snapshot_matches(item: GuangYaFile | None, snapshot: dict[str, Any], *, exact_updated_at: bool = False) -> bool:
     if item is None:
         return False
     if not (
@@ -649,6 +649,8 @@ def _snapshot_matches(item: GuangYaFile | None, snapshot: dict[str, Any]) -> boo
     ):
         return False
     expected_updated = max(0, int(snapshot.get("updated_at") or 0))
+    if exact_updated_at:
+        return max(0, int(item.updated_at or 0)) == expected_updated
     return (
         bool(item.etag)
         or not expected_updated
@@ -1090,12 +1092,15 @@ def build_fs_change_plan(
 
 
 def _find_current(
-    client: GuangYaClient, snapshot: dict[str, Any]
+    client: GuangYaClient, snapshot: dict[str, Any], *, authoritative: bool = False
 ) -> GuangYaFile | None:
     try:
         current = client.file_info(str(snapshot.get("file_id") or ""))
     except Exception:  # noqa: BLE001 - Provider/SDK 可抛出多种传输异常
         current = None
+    if current is not None and authoritative:
+        # 半步续行不能用可能较旧的目录列表覆盖明确的对象版本变化。
+        return current
     if _snapshot_matches(current, snapshot):
         return current
     try:
@@ -1108,13 +1113,13 @@ def _find_current(
 
 
 def _verify_directory_snapshot(
-    client: GuangYaClient, directory_id: str, snapshot: dict[str, Any] | None
+    client: GuangYaClient, directory_id: str, snapshot: dict[str, Any] | None, *, authoritative: bool = False
 ) -> bool:
     if directory_id == "0":
         return True
     if not isinstance(snapshot, dict):
         return False
-    current = _find_current(client, snapshot)
+    current = _find_current(client, snapshot, authoritative=authoritative)
     # 目录内容变化可能更新 etag/utime；目标目录只冻结身份、名称与位置，
     # 同名占用会在每一项写入前另行完整读取。
     return bool(
@@ -1151,6 +1156,7 @@ def _preflight_operation(
     created_targets: dict[str, dict[str, Any]] | None = None,
     allow_pending_target: bool = False,
     completed_objects: set[str] | None = None,
+    source_snapshot: dict[str, Any] | None = None,
 ) -> None:
     op = str(item.get("op") or "")
     # 新建目录没有预先存在的快照：沿本次已核验创建链检查名称和位置，
@@ -1158,7 +1164,8 @@ def _preflight_operation(
     dependency = str(item.get("parent_create_path" if op == "create_directory" else "target_create_path") or "")
     while dependency and created_targets is not None:
         directory = created_targets.get(dependency) or {}
-        if not _verify_directory_snapshot(client, str(directory.get("file_id") or ""), directory):
+        if not _verify_directory_snapshot(client, str(directory.get("file_id") or ""), directory,
+                                              authoritative=source_snapshot is not None):
             raise GuangYaFSChangeStale("计划中新建目录尚未就绪或位置已变化，请重新预览")
         dependency = str(directory.get("parent_create_path") or "")
     if op == "create_directory":
@@ -1173,15 +1180,19 @@ def _preflight_operation(
         if _name_conflict(siblings, str(item.get("name") or "")):
             raise GuangYaFSChangeStale("新建目录名称已被占用，请重新预览")
         return
-    source = item.get("source")
+    source = source_snapshot if source_snapshot is not None else item.get("source")
+    if source_snapshot is not None and source_snapshot.get("file_id") != (item.get("source") or {}).get("file_id"):
+        raise GuangYaFSChangeStale("中间态对象身份与冻结计划不一致")
     dependencies = set(item.get("rename_dependencies") or ())
-    if dependencies and completed_objects is not None:
-        if not dependencies.issubset(completed_objects):
-            raise GuangYaFSChangeStale("前置子项变更未全部成功，未执行父目录操作")
-        # 本计划的子项变更会更新目录版本；身份/名称/位置必须仍一致。
+    if dependencies and completed_objects is not None and not dependencies.issubset(completed_objects):
+        raise GuangYaFSChangeStale("前置子项变更未全部成功，未执行父目录操作")
+    if dependencies and completed_objects is not None and source_snapshot is None:
+        # 初次执行允许已批准子项更新目录版本；半步恢复必须符合后置快照。
         source_matches = _verify_directory_snapshot(client, str((source or {}).get("file_id") or ""), source)
     else:
-        source_matches = isinstance(source, dict) and _snapshot_matches(_find_current(client, source), source)
+        source_matches = isinstance(source, dict) and _snapshot_matches(
+            _find_current(client, source, authoritative=source_snapshot is not None), source,
+            exact_updated_at=source_snapshot is not None)
     if not source_matches:
         raise GuangYaFSChangeStale("光鸭对象已变化，请重新预览")
     if item.get("require_empty") and (completed_objects is not None or not dependencies):
@@ -1207,17 +1218,27 @@ def _preflight_operation(
         if not target_id:
             return
         if not item.get("target_create_path") and not _verify_directory_snapshot(
-            client, target_id, item.get("target_snapshot")
+            client, target_id, item.get("target_snapshot"), authoritative=source_snapshot is not None
         ):
             raise GuangYaFSChangeStale("目标目录已变化，请重新预览")
         siblings = {str(row.file_id): row for row in client.list_dir(target_id)}
         target_name = str(
             item.get("new_name") if op == "relocate" else source.get("name") or ""
         )
-        if _name_conflict(siblings, target_name) or (
-            item.get("move_first") and _name_conflict(siblings, str(source.get("name") or ""))
+        exclude_id = str(source.get("file_id") or "") if op != "copy" else ""
+        if _name_conflict(siblings, target_name, exclude_id=exclude_id) or (
+            item.get("move_first") and _name_conflict(siblings, str(source.get("name") or ""), exclude_id=exclude_id)
         ):
             raise GuangYaFSChangeStale("目标目录中已有同名对象，请重新预览")
+
+
+def _written_source(client, item, created_targets):
+    source = item.get("source") or {}
+    rename = item["op"] == "rename"
+    parent_id = str(source.get("parent_id") or "0") if rename else _directory_id(item, created_targets)
+    name = str(item["new_name"] if item["op"] in {"rename", "relocate"} else source.get("name") or "")
+    return next((row for row in client.list_dir(parent_id)
+                 if str(row.file_id) == str(source.get("file_id") or "") and row.name == name), None)
 
 
 def _verify_after(
@@ -1245,20 +1266,8 @@ def _verify_after(
             str(row.file_id) != file_id
             for row in client.list_dir(str(source.get("parent_id") or "0"))
         )
-    if op == "rename":
-        return any(
-            str(row.file_id) == file_id and row.name == str(item.get("new_name") or "")
-            for row in client.list_dir(str(source.get("parent_id") or "0"))
-        )
-    if op in {"move", "relocate"}:
-        target_id = _directory_id(item, created_targets)
-        target_name = str(
-            item.get("new_name") if op == "relocate" else source.get("name") or ""
-        )
-        return any(
-            str(row.file_id) == file_id and row.name == target_name
-            for row in client.list_dir(target_id)
-        )
+    if op in {"rename", "move", "relocate"}:
+        return _written_source(client, item, created_targets) is not None
     if op == "copy":
         # 复制必须保留冻结的源对象，不能把源消失、目标同名当作复制成功。
         if not _snapshot_matches(_find_current(client, source), source):
@@ -1343,16 +1352,39 @@ def _operation_actions(item: dict[str, Any]) -> tuple[str, ...]:
     return ("move", "rename") if item.get("move_first") else ("rename", "move")
 
 
+def _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check):
+    """复用同一次写后读取：返回阶段核验与可用于续行的中间版本，不额外查询。"""
+    intermediate = action != _operation_actions(item)[-1]
+    observed = None
+
+    def verify():
+        nonlocal observed
+        if intermediate:
+            observed = _written_source(client, {**item, "op": action}, created_targets)
+            return observed is not None
+        return _verify_after(client, item, created_id, created_targets=created_targets)
+
+    verified = verify_guangya_write(verify, cancel_check=cancel_check)
+    if verified and observed is not None:
+        source = item["source"]
+        expected = {**source, "name": item["new_name"] if action == "rename" else source["name"],
+                    "parent_id": source["parent_id"] if action == "rename" else _directory_id(item, created_targets),
+                    "updated_at": observed.updated_at}
+        if _snapshot_matches(observed, expected):
+            return True, _snapshot(observed)
+    return verified, None
+
+
 def _apply_fs_operation(
     client: GuangYaClient, item: dict[str, Any], outcome: dict[str, Any],
     created_targets: dict[str, dict[str, Any]], cancel_check: Callable[[], None] | None,
-    checkpoint: Callable[[], None],
+    checkpoint: Callable[[], None], stage_sources: dict[str, dict[str, Any]],
 ) -> str:
     source = item.get("source") or {}
     created_id = ""
     actions = _operation_actions(item)
     try:
-        for action in actions:
+        for action in actions[len(outcome["completed_actions"]):]:
             if cancel_check is not None:
                 cancel_check()
             before_write = dict(outcome)
@@ -1397,13 +1429,12 @@ def _apply_fs_operation(
                 )
             else:
                 raise GuangYaFSChangeError("光鸭变更计划包含未知操作")
-            check = item if action == actions[-1] else {**item, "op": action}
-            if not verify_guangya_write(
-                lambda: _verify_after(client, check, created_id, created_targets=created_targets),
-                cancel_check=cancel_check,
-            ):
+            verified, stage_source = _verify_fs_stage(client, item, action, created_id, created_targets, cancel_check)
+            if not verified:
                 outcome["reason"] = "verification_pending"
                 raise GuangYaFSChangeError("写入后的云端状态尚未核验，未执行后续操作")
+            if stage_source is not None:
+                stage_sources[str(outcome["position"])] = stage_source
             outcome["completed_actions"].append(action)
             outcome["status"] = "completed" if action == actions[-1] else "partial"
             outcome.pop("reason", None)
@@ -1427,12 +1458,33 @@ def _preflight_fs_change_plan(client, operations, outcomes, cancel_check):
             raise
 
 
-def _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check) -> bool:
-    """仅读核对历史事实；无法证明整项完成的在途操作不重放。"""
+def _can_continue_relocation(client, item, outcome, source_snapshot, created_targets, completed_objects):
+    actions = _operation_actions(item)
+    if not (item["op"] == "relocate" and len(actions) == 2
+            and outcome["completed_actions"] == [actions[0]] and not outcome.get("reason")
+            and isinstance(source_snapshot, dict)):
+        return False
+    try:
+        _preflight_operation(client, item, source_snapshot=source_snapshot,
+                             created_targets=created_targets, completed_objects=completed_objects)
+        return True
+    except GuangYaFSChangeStale:
+        outcome["reason"] = "precondition_failed"
+    except Exception:
+        outcome["reason"] = "verification_pending"
+    return False
+
+
+def _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check, stage_sources):
+    """仅读核对事实；仅有签名中间快照的已核验半步可继续，未知动作不重放。"""
+    resumable, completed_objects = set(), set()
     for item, outcome in zip(operations, outcomes):
         if cancel_check is not None:
             cancel_check()
         status = outcome["status"]
+        if status == "partial" and _can_continue_relocation(client, item, outcome,
+                stage_sources.get(str(outcome["position"])), created_targets, completed_objects):
+            resumable.add(outcome["position"])
         if status not in {"completed", "unknown"}:
             continue
         created_id = str((created_targets.get(item.get("created_path")) or {}).get("file_id") or "")
@@ -1447,6 +1499,7 @@ def _reconcile_fs_operations(client, operations, outcomes, created_targets, stat
         if verified:
             outcome.update(status="completed", completed_actions=list(_operation_actions(item)))
             outcome.pop("reason", None)
+            completed_objects.add(str((item.get("source") or {}).get("file_id") or created_id))
         else:
             outcome.update(status="unknown", reason="verification_pending")
             actions = _operation_actions(item)
@@ -1461,9 +1514,11 @@ def _reconcile_fs_operations(client, operations, outcomes, created_targets, stat
     for item, outcome in zip(operations, outcomes):
         if outcome["status"] == "completed":
             stats[_operation_stat_key(item["op"])] += 1
-        elif outcome["status"] != "not_started":
+        elif outcome["status"] != "not_started" and outcome["position"] not in resumable:
             stats["failed"] += 1
-    return bool(stats.get("audit_failures") or any(row["status"] in {"unknown", "partial"} for row in outcomes))
+    uncertain = bool(stats.get("audit_failures") or any(
+        row["status"] in {"unknown", "partial"} and row["position"] not in resumable for row in outcomes))
+    return uncertain, resumable
 
 
 def _reset_fs_checkpoint_cursor(plan_id, execution):
@@ -1476,7 +1531,8 @@ def _read_fs_checkpoints(plan):
     """只重放签名的事实增量，不重放操作。历史普通审计行保持原格式。"""
     base = plan["execution"]
     execution = {**base, "operation_items": [dict(row) for row in base["operation_items"]],
-                 "stats": dict(base["stats"]), "created_targets": dict(base.get("created_targets") or {})}
+                 "stats": dict(base["stats"]), "created_targets": dict(base.get("created_targets") or {}),
+                 "stage_sources": dict(base.get("stage_sources") or {})}
     path = _journal_path(plan["plan_id"])
     try:
         offset = int(base["journal_offset"])
@@ -1507,6 +1563,11 @@ def _read_fs_checkpoints(plan):
                 if not 0 <= index < len(plan["operations"]) or row["operation"] != plan["operations"][index]["op"]:
                     raise ValueError("checkpoint operation")
                 execution["operation_items"][index] = row
+                if "stage_source" in delta:
+                    snapshot = delta["stage_source"]
+                    if snapshot.get("file_id") != (plan["operations"][index].get("source") or {}).get("file_id"):
+                        raise ValueError("checkpoint source identity")
+                    execution["stage_sources"][str(row["position"])] = snapshot
             if "created_target" in delta:
                 target = dict(delta["created_target"])
                 execution["created_targets"][target.pop("path")] = target
@@ -1522,6 +1583,9 @@ def _write_fs_checkpoint(plan_id, job_id, execution, *, item=None, outcome=None,
     delta = {"stats": execution["stats"], "finalizing": execution["finalizing"]}
     if outcome is not None:
         delta["operation_item"] = outcome
+        source_snapshot = (execution.get("stage_sources") or {}).get(str(outcome["position"]))
+        if source_snapshot is not None:
+            delta["stage_source"] = source_snapshot
         path = str(item.get("created_path") or "")
         if path in execution["created_targets"]:
             delta["created_target"] = {"path": path, **execution["created_targets"][path]}
@@ -1697,10 +1761,13 @@ def execute_fs_change_plan(
     strm_scope = previous.get("strm_scope") if recovering else None
     finalizing = bool(previous.get("finalizing")) if recovering else False
     persistence_uncertain = False
+    resumable = set()
+    stage_sources = dict(previous.get("stage_sources") or {}) if recovering else {}
 
     execution = {"checkpoint_version": 2, "lease_generation": lease_generation,
                  "started_at": started_at, "stats": stats, "operation_items": outcomes,
-                 "created_targets": created_targets, "strm_scope": strm_scope, "finalizing": finalizing}
+                 "created_targets": created_targets, "stage_sources": stage_sources,
+                 "strm_scope": strm_scope, "finalizing": finalizing}
 
     def checkpoint(*, begin_finalization=False):
         _write_fs_checkpoint(plan_id, job_id, execution,
@@ -1732,7 +1799,8 @@ def execute_fs_change_plan(
             expected_statuses={"running" if recovering else "queued"}, expected_job_id=job_id,
             expected_lease_generation=int(previous["lease_generation"]) if recovering else None)
         if recovering:
-            persistence_uncertain = _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check)
+            persistence_uncertain, resumable = _reconcile_fs_operations(
+                client, operations, outcomes, created_targets, stats, cancel_check, stage_sources)
             _reset_fs_checkpoint_cursor(plan_id, execution)
             update_fs_change_plan_execution(plan_id, status="running", execution=execution,
                 expected_statuses={"running"}, expected_job_id=job_id, expected_lease_generation=lease_generation)
@@ -1743,7 +1811,7 @@ def execute_fs_change_plan(
         for index, item in enumerate(operations, start=1):
             if persistence_uncertain:
                 break
-            if outcomes[index - 1]["status"] != "not_started":
+            if outcomes[index - 1]["status"] != "not_started" and index not in resumable:
                 continue
             if cancel_check is not None:
                 cancel_check()
@@ -1762,9 +1830,10 @@ def execute_fs_change_plan(
                     item,
                     created_targets=created_targets,
                     completed_objects=completed_objects,
+                    source_snapshot=stage_sources.get(str(index)) if index in resumable else None,
                 )
                 provider_write_started = True
-                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check, checkpoint)
+                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check, checkpoint, stage_sources)
                 needs_checkpoint = False  # 正常末阶段已持久化；异常核对/拒绝需要补记。
                 stats[stat_key] += 1
                 status = "completed"
@@ -1776,7 +1845,8 @@ def execute_fs_change_plan(
                 break
             except GuangYaFSChangeStale as exc:
                 unmet = not set(item.get("rename_dependencies") or ()).issubset(completed_objects)
-                outcome.update(status="blocked", reason="dependency_failed" if unmet else "precondition_failed")
+                outcome.update(status="partial" if outcome["completed_actions"] else "blocked",
+                               reason="dependency_failed" if unmet else "precondition_failed")
                 error_type = type(exc).__name__
                 stats["precondition_failed"] += 1
                 stats["failed"] += 1

@@ -260,6 +260,14 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
         execution_result = {
             "partial": terminal == "partial", "requires_manual": False,
             "stats": {**stats, "internal_file_id": "private-item"},
+            "stage_sources": {
+                "1": {
+                    "file_id": "private-stage-file-id",
+                    "parent_id": "private-stage-parent-id",
+                    "etag": "private-stage-etag",
+                    "updated_at": "private-stage-updated-at",
+                },
+            },
             **({"operation_items": operation_items} if operation_items is not None else {}),
         }
         if error is not None:
@@ -274,6 +282,13 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
         expected_result = sanitize_organize_operation_result({"stats": stats,
             **({"operation_items": operation_items} if operation_items is not None else {})})
         self.assertEqual(json.loads(persisted["result_json"]), expected_result)
+        self.assertNotIn("stage_sources", persisted["result_json"])
+        private_stage_values = (
+            "private-stage-file-id", "private-stage-parent-id",
+            "private-stage-etag", "private-stage-updated-at",
+        )
+        for private in private_stage_values:
+            self.assertNotIn(private, persisted["result_json"])
 
         accepted = ToolResult(True, "accepted", "已提交", data={
             "operation_ref": public_ref, "total": stats["total"],
@@ -302,12 +317,18 @@ class GuangYaFSChangeJobBindingTests(IsolatedDatabaseTestCase):
                 self.assertEqual(receipt.data["operation_ref"], public_ref)
                 self.assertEqual(public.data["task"]["stats"], stats)
                 self.assertEqual(raw["result"], expected_result)
+                self.assertNotIn("stage_sources", json.dumps(public.data))
+                self.assertNotIn("stage_sources", json.dumps(receipt.data))
                 if operation_items is not None:
                     self.assertEqual(receipt.data["operation_items"], expected_result["operation_items"])
                     self.assertEqual(public.data["task"]["operation_items"], expected_result["operation_items"])
                 self.assertIsNone(current.task_result(public_ref, owner="other-owner"))
-                for private in ("owner_digest", "internal_file_id", "private-item", job_id):
-                    self.assertNotIn(private, json.dumps(receipt.data))
+                for private in (
+                    "owner_digest", "internal_file_id", "private-item", job_id,
+                    *private_stage_values,
+                ):
+                    for public_payload in (public.data, receipt.data):
+                        self.assertNotIn(private, json.dumps(public_payload))
 
     def test_preflight_stale_reason_survives_live_history_and_restart(self):
         queued, _ = self._enqueue(self._confirmed_plan())

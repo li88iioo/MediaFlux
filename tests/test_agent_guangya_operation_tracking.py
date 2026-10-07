@@ -869,7 +869,7 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
     def test_preflight_and_audit_failure_counts_have_distinct_explanations(self):
         from app.agent.domain_catalog.cloud_runtime import _project_guangya_status
         result = _project_guangya_status({'status': 'manual_review', 'stats': {'precondition_failed': 1, 'audit_failures': 2}}, overview={})
-        self.assertIn('1 项写前核对未通过，未执行', result.error)
+        self.assertIn('1 项写前核对未通过，后续动作未执行', result.error)
         self.assertIn('2 项执行审计未完整保存', result.error)
         success = _project_guangya_status({'status': 'completed', 'stats': {}}, overview={})
         self.assertEqual(success.error, '')

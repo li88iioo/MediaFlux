@@ -455,6 +455,158 @@ class GuangYaFSGatewayTests(unittest.TestCase):
         self.assertTrue(all(item["status"] == "not_started" for item in result["operation_items"]))
         self.assertEqual(result["stats"]["audit_failures"], 1)
 
+    def _interrupted_relocation(self, client, *, move_first, stop_before_second=False):
+        class WorkerExit(BaseException):
+            pass
+        first = {"op": "relocate", "source_id": "rename", "target_path": "/target",
+                 "new_name": "Move.mp4" if move_first else "Done.mp4"}
+        plan, payload = self._recovery_plan(client, first=first)
+        original = guangya_fs_change._append_journal
+        def checkpoint(plan_id, event):
+            original(plan_id, event)
+            row = (event.get("data") or {}).get("operation_item") or {}
+            expected_status = "unknown" if stop_before_second else "partial"
+            if row.get("position") == 1 and row.get("status") == expected_status and len(row.get("completed_actions") or []) == 1:
+                raise WorkerExit()
+        with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=checkpoint):
+            with self.assertRaises(WorkerExit):
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        return plan, payload
+
+    def test_verified_half_relocation_continues_only_remaining_stage(self):
+        for move_first in (False, True):
+            with self.subTest(move_first=move_first):
+                client = FakeGatewayClient()
+                plan, payload = self._interrupted_relocation(client, move_first=move_first)
+                progress = guangya_fs_change._read_fs_checkpoints(guangya_fs_change._read(plan["plan_id"]))
+                self.assertEqual(progress["operation_items"][0]["completed_actions"], ["move" if move_first else "rename"])
+                self.assertEqual(progress["stage_sources"]["1"], guangya_fs_change._snapshot(client.file_info("rename")))
+                with mock.patch.object(client, "move", wraps=client.move) as moved, mock.patch.object(client, "rename", wraps=client.rename) as renamed:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                self.assertFalse(result["partial"])
+                self.assertEqual((result["stats"]["relocated"], result["stats"]["renamed"], result["stats"]["failed"]), (1, 1, 0))
+                self.assertEqual(moved.call_count, int(not move_first))
+                self.assertEqual(renamed.call_count, 1 + int(move_first))  # 第二个独立改名始终执行一次。
+                self.assertEqual(client.file_info("rename").parent_id, "target")
+                self.assertEqual(client.file_info("rename").name, "Move.mp4" if move_first else "Done.mp4")
+                self.assertNotIn("stage_sources", result)
+                self.assertNotIn("parent_id", json.dumps(result))
+                with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                    guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+
+    def test_late_resume_preflight_failure_keeps_already_completed_stage(self):
+        client = FakeGatewayClient()
+        _plan, payload = self._interrupted_relocation(client, move_first=True)
+        preflight = guangya_fs_change._preflight_operation
+        resumed_checks = 0
+        def mutate_before_write(*args, **kwargs):
+            nonlocal resumed_checks
+            if kwargs.get("source_snapshot") is not None:
+                resumed_checks += 1
+                if resumed_checks == 2:
+                    current = client._pop("rename")
+                    current.etag = "changed-after-reconciliation"
+                    client.directories[current.parent_id].append(current)
+            return preflight(*args, **kwargs)
+        with mock.patch.object(guangya_fs_change, "_preflight_operation", side_effect=mutate_before_write), mock.patch.object(client, "rename", wraps=client.rename) as renamed:
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+        self.assertTrue(result["partial"])
+        row = result["operation_items"][0]
+        self.assertEqual((row["status"], row["completed_actions"], row["reason"]), ("partial", ["move"], "precondition_failed"))
+        self.assertEqual(result["stats"]["precondition_failed"], 1)
+        renamed.assert_called_once_with("move", "B-done.mp4")  # 独立项仍按原计划执行，不碰已漂移对象。
+
+    def test_second_stage_intent_is_not_misclassified_as_unstarted(self):
+        for move_first in (False, True):
+            with self.subTest(move_first=move_first):
+                client = FakeGatewayClient()
+                plan, payload = self._interrupted_relocation(client, move_first=move_first, stop_before_second=True)
+                with mock.patch.object(client, "move", wraps=client.move) as moved, mock.patch.object(client, "rename", wraps=client.rename) as renamed:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                self.assertTrue(result["requires_manual"])
+                self.assertEqual(result["operation_items"][0]["reason"], "verification_pending")
+                self.assertEqual(result["operation_items"][1]["status"], "not_started")
+                moved.assert_not_called()
+                renamed.assert_not_called()
+
+    def test_half_relocation_does_not_hide_drift_behind_stale_listing(self):
+        for drift in ("source_version", "target_location"):
+            with self.subTest(drift=drift):
+                client = FakeGatewayClient()
+                _plan, payload = self._interrupted_relocation(client, move_first=True)
+                info = client.file_info
+                def newer_info(file_id):
+                    current = info(file_id)
+                    if current is not None and file_id == "rename" and drift == "source_version":
+                        current.updated_at += 1
+                    if current is not None and file_id == "target" and drift == "target_location":
+                        current.name = "externally-moved-target"
+                    return current
+                with mock.patch.object(client, "file_info", side_effect=newer_info), mock.patch.object(client, "rename", wraps=client.rename) as rename:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                self.assertTrue(result["requires_manual"])
+                self.assertEqual(result["operation_items"][0]["reason"], "precondition_failed")
+                rename.assert_not_called()
+
+    def test_resumed_second_stage_intent_remains_unknown_after_another_crash(self):
+        class WorkerExit(BaseException):
+            pass
+        client = FakeGatewayClient()
+        plan, payload = self._interrupted_relocation(client, move_first=True)
+        append = guangya_fs_change._append_journal
+        def checkpoint(plan_id, event):
+            append(plan_id, event)
+            row = (event.get("data") or {}).get("operation_item") or {}
+            if row.get("position") == 1 and row.get("status") == "unknown":
+                raise WorkerExit()
+        with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=checkpoint), mock.patch.object(client, "rename", wraps=client.rename) as rename:
+            with self.assertRaises(WorkerExit):
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+            rename.assert_not_called()
+        with mock.patch.object(client, "rename", wraps=client.rename) as rename:
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=5)
+        self.assertTrue(result["requires_manual"])
+        self.assertEqual(result["operation_items"][0]["reason"], "verification_pending")
+        rename.assert_not_called()
+
+    def test_half_relocation_rejects_drift_conflict_and_missing_evidence(self):
+        for move_first in (False, True):
+            for changed in ("source_name", "source_content", "source_size", "source_time", "source_identity", "source_parent", "target_name", "target_conflict", "missing_snapshot", "rejected"):
+                with self.subTest(move_first=move_first, changed=changed):
+                    client = FakeGatewayClient()
+                    plan, payload = self._interrupted_relocation(client, move_first=move_first)
+                    if changed.startswith("source"):
+                        item = client._pop("rename")
+                        if changed == "source_name": item.name = "externally-renamed.mkv"
+                        if changed == "source_content": item.etag = "externally-replaced-content"
+                        if changed == "source_size": item.size += 1
+                        if changed == "source_time": item.updated_at += 1
+                        if changed == "source_identity": item.file_id = "replaced-object"
+                        if changed == "source_parent": item.parent_id = "trash"
+                        client.directories[item.parent_id].append(item)
+                    elif changed == "target_name":
+                        client.rename("target", "externally-renamed-folder")
+                    elif changed == "target_conflict":
+                        client.directories["target"].append(GuangYaFile("collision", plan["operations"][0]["new_name"], False, parent_id="target", size=1, etag="collision"))
+                    else:
+                        stored = guangya_fs_change._read(plan["plan_id"])
+                        state = guangya_fs_change._read_fs_checkpoints(stored)
+                        if changed == "missing_snapshot": state.pop("stage_sources", None)
+                        else: state["operation_items"][0]["reason"] = "write_rejected"
+                        guangya_fs_change._reset_fs_checkpoint_cursor(plan["plan_id"], state)
+                        guangya_fs_change.update_fs_change_plan_execution(plan["plan_id"], status="running", execution=state,
+                            expected_statuses={"running"}, expected_job_id=payload["job_id"], expected_lease_generation=1)
+                        # 模拟旧记录/已明确拒绝的有效检查点，不伪造无日志尾部。
+                        guangya_fs_change._write_fs_checkpoint(plan["plan_id"], payload["job_id"], state,
+                            item=plan["operations"][0], outcome=state["operation_items"][0])
+                    with mock.patch.object(client, "move", wraps=client.move) as moved, mock.patch.object(client, "rename", wraps=client.rename) as renamed:
+                        result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                    self.assertTrue(result["requires_manual"])
+                    self.assertEqual(result["operation_items"][0]["status"], "partial")
+                    self.assertEqual(result["operation_items"][1]["status"], "not_started")
+                    moved.assert_not_called()
+                    renamed.assert_not_called()
+
     def test_recovery_reports_half_relocation_without_replaying_or_extending_writes(self):
         class WorkerExit(BaseException):
             pass
