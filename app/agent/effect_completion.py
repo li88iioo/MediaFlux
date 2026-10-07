@@ -806,7 +806,7 @@ async def poll_effect_receipts(
 ) -> int:
     """复用现有调度器读取已提交任务；不调用 execute、不创建新确认或模型回合。"""
     from app.agent.kernel.projection import DefaultProjector
-    from app.agent.kernel.state import SessionBusyError, merge_effect_receipts
+    from app.agent.kernel.state import SessionBusyError, merge_effect_receipts, retain_conversation
     from app.logger import get_logger
     import secrets
 
@@ -882,7 +882,7 @@ async def poll_effect_receipts(
                         return None
                     message = template or _late_receipt(seed, final)
                     row.update(state="terminal", final_result=final, receipt_message=message)
-                    state.conversation = merge_effect_receipts(state.conversation, state.metadata)[-80:]
+                    state.conversation = retain_conversation(merge_effect_receipts(state.conversation, state.metadata))
                     _next_effect_poll(state)
                     return message
 

@@ -34,6 +34,7 @@ from .state import (
     _effect_time_is_due,
     candidate_metadata_only,
     merge_effect_receipts,
+    retain_conversation,
     publication_commit_matches,
     publication_matches,
 )
@@ -339,7 +340,7 @@ class SQLiteKernelStore:
     def _state_payload(state: SessionState) -> dict[str, Any]:
         return {
             "session_id": state.session_id,
-            "conversation": deepcopy(state.conversation[-80:]),
+            "conversation": deepcopy(retain_conversation(state.conversation)),
             "summary": state.summary,
             "recent_refs": list(state.recent_refs[-100:]),
             "ref_kinds": sorted(state.ref_kinds),
@@ -521,9 +522,9 @@ class SQLiteKernelStore:
             if not publication_commit_matches(lease, state, conversation, updates):
                 raise StalePublicationError("turn no longer owns publication authority")
             if conversation is not None:
-                state.conversation = merge_effect_receipts(
+                state.conversation = retain_conversation(merge_effect_receipts(
                     conversation, state.metadata,
-                )[-80:]
+                ))
             state.apply(updates)
             self._write_state(conn, state)
         return state.clone()

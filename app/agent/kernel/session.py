@@ -1269,7 +1269,7 @@ class AgentSession:
     ) -> list[dict[str, Any]]:
         stored: list[dict[str, Any]] = []
         public_history: dict[tuple, list[dict[str, Any]]] = {}
-        for prior in prior_conversation[-60:]:
+        for prior in prior_conversation:
             if not isinstance(prior, Mapping):
                 continue
             restored = dict(prior)
@@ -1306,7 +1306,7 @@ class AgentSession:
     @staticmethod
     def _restore_messages(state: SessionState) -> list[ModelMessage]:
         messages: list[ModelMessage] = []
-        for item in state.conversation[-60:]:
+        for item in state.conversation:
             if not isinstance(item, Mapping):
                 continue
             try:

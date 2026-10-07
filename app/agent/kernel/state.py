@@ -243,6 +243,34 @@ class SessionState:
                         self.metadata[field_name] = deepcopy(update.value)
 
 
+def retain_conversation(conversation: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """最多80条；优先当前请求与执行事实，原生tool问答不得从中间切开。"""
+    if len(conversation) <= 80:
+        return list(conversation)
+    latest_user = next((i for i in range(len(conversation) - 1, -1, -1)
+                        if conversation[i].get("role") == "user"), -1)
+    groups: list[list[int]] = []
+    pending_calls: set[str] = set()
+    for i, row in enumerate(conversation):
+        if row.get("role") == "tool" and row.get("tool_call_id") in pending_calls:
+            groups[-1].append(i)
+            pending_calls.discard(row["tool_call_id"])
+        else:
+            groups.append([i])
+            pending_calls = {call.get("call_id") for call in (row.get("tool_calls") or ())}
+    priority = sorted(groups, key=lambda group: (
+        latest_user in group,
+        any(i > latest_user and (conversation[i].get("effect_plan_id")
+                                 or conversation[i].get("completion_receipt_id")) for i in group),
+        group[-1],
+    ), reverse=True)
+    selected: list[int] = []
+    for group in priority:
+        if len(selected) + len(group) <= 80:
+            selected.extend(group)
+    return [conversation[i] for i in sorted(selected)]
+
+
 def merge_effect_receipts(
     conversation: Sequence[Mapping[str, Any]], metadata: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
@@ -306,9 +334,9 @@ def _consume_delivered_effect_receipts(state: SessionState) -> None:
         and record.get("delivered") is True
     }
     if delivered:
-        state.conversation = merge_effect_receipts(
+        state.conversation = retain_conversation(merge_effect_receipts(
             state.conversation, {"effect_waits": delivered},
-        )[-80:]
+        ))
 
     remaining = {
         plan_id: deepcopy(record)
@@ -440,9 +468,9 @@ class InMemorySessionStateStore:
             if state is None or not publication_commit_matches(lease, state, conversation, updates):
                 raise StalePublicationError("turn no longer owns publication authority")
             if conversation is not None:
-                state.conversation = merge_effect_receipts(
+                state.conversation = retain_conversation(merge_effect_receipts(
                     conversation, state.metadata,
-                )[-80:]
+                ))
             state.apply(updates)
             return state.clone()
 

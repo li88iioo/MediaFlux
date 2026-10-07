@@ -35,11 +35,13 @@ from app.agent.kernel.state import (
     AgentInput,
     CancellationToken,
     InMemorySessionStateStore,
+    SessionState,
     PublicationLease,
     StalePublicationError,
     StateUpdate,
     TurnCoordinator,
     merge_effect_receipts,
+    retain_conversation,
 )
 from app.agent.model_context_budget import bounded_model_messages, compact_tool_content
 from app.agent.models import ToolReference, ToolResult
@@ -548,7 +550,73 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         with isolated_test_database():
             await self._assert_confirmation_continues(SQLiteKernelStore(), ConfirmationEffectPlanStore(SQLiteConfirmationStore()))
 
-    async def _assert_confirmation_continues(self, state, effect_store=None):
+    def test_history_retains_request_and_receipts_without_unbounded_growth(self):
+        request = {"role": "user", "content": "清洗后入库", "reply_context": {"text": "仅这些对象"}}
+        receipts = [{"role": "assistant", "content": f"步骤{i}已完成", "completion_receipt_id": f"plan-{i}"}
+                    for i in range(2)]
+        history = [request, *receipts, *({"role": "assistant", "content": str(i)} for i in range(81))]
+        retained = retain_conversation(history)
+        self.assertEqual(len(retained), 80)
+        self.assertEqual(retained[:3], [request, *receipts])
+        self.assertEqual(retained[-1], history[-1])
+        restored = AgentSession._restore_messages(
+            SessionState(
+                owner="owner", session_id="session", conversation=retained,
+            )
+        )
+        self.assertIn("清洗后入库", restored[0].content)
+        self.assertIn("仅这些对象", restored[0].content)
+        newest = {"role": "user", "content": "换个任务，只查状态"}
+        history += [newest, *({"role": "assistant", "content": str(i)} for i in range(81))]
+        replaced = retain_conversation(history)
+        self.assertEqual(replaced[0], newest)
+        self.assertNotIn(request, replaced)
+        self.assertFalse(any(row.get("completion_receipt_id") for row in replaced))
+        self.assertEqual(retain_conversation([]), [])
+
+    def test_history_retains_whole_tool_batch_and_its_effect_receipt(self):
+        request = {"role": "user", "content": "先核对再清洗入库"}
+        batch = [
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"call_id": "read", "name": "cloud.inspect", "arguments": {}},
+                {"call_id": "write", "name": "cloud.change", "arguments": {}},
+            ]},
+            {"role": "tool", "tool_call_id": "read", "content": "核对完成"},
+            {"role": "tool", "tool_call_id": "write", "content": "清洗完成", "effect_plan_id": "plan-a"},
+            {"role": "assistant", "content": "已确认清洗", "completion_receipt_id": "plan-a"},
+        ]
+        retained = retain_conversation([
+            request, *batch, *({"role": "assistant", "content": str(i)} for i in range(81)),
+        ])
+        self.assertEqual(retained[:5], [request, *batch])
+        self.assertEqual(len(retained), 80)
+        # A read-only batch at the cutoff is kept whole or omitted whole.
+        plain_batch = [{k: v for k, v in row.items() if k != "effect_plan_id"} for row in batch[:3]]
+        boundary = retain_conversation([request, *plain_batch, *(
+            {"role": "assistant", "content": str(i)} for i in range(78)
+        )])
+        self.assertFalse(any(row.get("tool_call_id") or row.get("tool_calls") for row in boundary))
+        self.assertEqual(boundary[0], request)
+
+    async def test_confirmation_keeps_original_goal_beyond_history_window(self):
+        from app.agent.confirmation import SQLiteConfirmationStore
+        from app.agent.kernel.effects import ConfirmationEffectPlanStore
+        from app.agent.kernel.persistence import SQLiteKernelStore
+        from tests.support import isolated_test_database
+        for history_noise in (61, 81):
+            with self.subTest(history_noise=history_noise, store="memory"):
+                await self._assert_confirmation_continues(
+                    InMemorySessionStateStore(), history_noise=history_noise,
+                )
+            with self.subTest(history_noise=history_noise, store="sqlite"):
+                with isolated_test_database():
+                    await self._assert_confirmation_continues(
+                        SQLiteKernelStore(),
+                        ConfirmationEffectPlanStore(SQLiteConfirmationStore()),
+                        history_noise=history_noise,
+                    )
+
+    async def _assert_confirmation_continues(self, state, effect_store=None, *, history_noise=0):
         writes = []
         tool = KernelToolSpec(
             name="cloud.change", domain="cloud", description="执行下一步云盘变更",
@@ -566,6 +634,15 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                                pipeline=ToolPipeline(catalog=catalog, state_store=state, effect_store=effect_store), state_store=state)
         preview = await consume_events(session.run(AgentInput(message="先清洗再移动，完成后告诉我", owner="owner", session_id="session")))
         self.assertEqual(writes, [])
+        if history_noise:
+            current = await state.load(owner="owner", session_id="session")
+            await state.commit(
+                PublicationLease("owner", "session", current.generation, preview.turn_id, preview.request_id),
+                conversation=[*current.conversation, *(
+                    {"role": "assistant", "content": f"已核验第{index}项，不代表原任务全部完成"}
+                    for index in range(history_noise)
+                )],
+            )
         events = await collect(session.confirm(owner="owner", session_id="session", plan_id=preview.approval.plan_id))
         continued = await consume_events(_events_stream(events))
         self.assertEqual(writes, [1], "后续写操作必须再次获得确认，不能自动执行")
@@ -591,9 +668,12 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(marker, request.system_prompt)
             self.assertIn("已消费", request.system_prompt)
             executed = [row for row in request.messages if row.role == "tool" and row.tool_name == tool.name]
-            self.assertTrue(executed)
-            self.assertIn("已完成", executed[-1].content)
-            self.assertNotIn('"status":"approval_required"', executed[-1].content)
+            if executed:
+                self.assertIn("已完成", executed[-1].content)
+                self.assertNotIn('"status":"approval_required"', executed[-1].content)
+            else:
+                self.assertTrue(history_noise)
+                self.assertTrue(any(row.completion_receipt_id for row in request.messages))
             self.assertEqual([row.content for row in request.messages if row.role == "user"],
                              ["先清洗再移动，完成后告诉我"])
         # 授权语义只属于真实confirm回合，不能泄漏到后续普通请求。
