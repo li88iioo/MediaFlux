@@ -729,6 +729,7 @@ def recover_orphaned_organize_operation_jobs() -> int:
     timestamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        current_epoch = time.time()
         cloud_rows = conn.execute(
             "SELECT * FROM organize_operation_jobs "
             "WHERE status='running' AND job_kind IN "
@@ -741,6 +742,44 @@ def recover_orphaned_organize_operation_jobs() -> int:
             "WHERE status='running' AND cancel_requested=1",
             (timestamp, timestamp),
         )
+
+        resumed_job_ids: set[str] = set()
+        for row in cloud_rows:
+            if (
+                str(row["job_kind"] or "") != "agent_guangya_fs_change"
+                or bool(row["cancel_requested"])
+                or row["purged_at"] is not None
+                or float(row["expires_at"] or 0) <= current_epoch
+                or not verify_organize_operation_payload(row)
+            ):
+                continue
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+                if not isinstance(payload, dict):
+                    continue
+                from app.modules.guangya_fs_change import can_resume_fs_change_plan
+
+                can_resume = can_resume_fs_change_plan(
+                    payload,
+                    job_id=str(row["job_id"]),
+                    owner_digest=str(row["owner_digest"]),
+                    lease_generation=int(row["lease_generation"]),
+                )
+            except Exception:  # noqa: BLE001 - 不确定的计划必须沿用人工复核
+                can_resume = False
+            if can_resume is not True:
+                continue
+            resume_checked_at = time.time()
+            cur = conn.execute(
+                "UPDATE organize_operation_jobs SET status='pending',"
+                "lease_generation=lease_generation+1,error_code='WorkerInterruptedResume',"
+                "error='',updated_at=? WHERE job_id=? AND status='running' "
+                "AND cancel_requested=0 AND purged_at IS NULL AND expires_at>?",
+                (timestamp, str(row["job_id"]), resume_checked_at),
+            )
+            if cur.rowcount == 1:
+                resumed_job_ids.add(str(row["job_id"]))
+
         reviewed = conn.execute(
             "UPDATE organize_operation_jobs SET status='manual_review',"
             "lease_generation=lease_generation+1,reference='',payload_json='{}',payload_auth='',"
@@ -752,6 +791,9 @@ def recover_orphaned_organize_operation_jobs() -> int:
             (timestamp, timestamp),
         )
         for row in cloud_rows:
+            job_id = str(row["job_id"])
+            if job_id in resumed_job_ids:
+                continue
             cancelled_by_request = bool(row["cancel_requested"])
             _sync_cloud_plan_terminal(
                 row,
@@ -766,7 +808,11 @@ def recover_orphaned_organize_operation_jobs() -> int:
             "DELETE FROM organize_operation_jobs WHERE purged_at IS NOT NULL "
             "AND status<>'running'"
         )
-        return max(0, int(cancelled.rowcount or 0)) + max(0, int(reviewed.rowcount or 0))
+        return (
+            max(0, int(cancelled.rowcount or 0))
+            + len(resumed_job_ids)
+            + max(0, int(reviewed.rowcount or 0))
+        )
 
 
 def count_pending_organize_operation_jobs() -> int:

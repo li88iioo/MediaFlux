@@ -1218,7 +1218,7 @@ class OrganizeTaskManager:
             )
 
             return execute_durable_guangya_fs_change_job(
-                payload, cancel_check=cancel_check
+                payload, cancel_check=cancel_check, lease_generation=generation
             )
         raise ValueError("不支持的持久化操作类型")
 
@@ -1533,9 +1533,10 @@ class OrganizeTaskManager:
                                 recovered = recover_orphaned_organize_operation_jobs()
                                 if recovered:
                                     logger.warning(
-                                        "已将 %s 个失去执行进程的光鸭操作标记为需要人工核验",
+                                        "已处理 %s 个中断光鸭操作：可核对计划重排，其余保留人工核验",
                                         recovered,
                                     )
+                                    durable_pending = count_pending_organize_operation_jobs() > 0
                             except Exception as exc:
                                 logger.warning(
                                     "收束光鸭孤儿操作失败 type=%s", type(exc).__name__

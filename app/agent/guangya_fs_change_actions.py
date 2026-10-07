@@ -776,7 +776,7 @@ def execute_guangya_fs_change_confirmed(
         evidence=[
             Evidence(
                 "organize_queue",
-                "冻结计划已提交到可恢复的光鸭写入队列；执行结果只公开聚合计数。",
+                "冻结计划已提交到光鸭持久队列；执行结果按逐项云端核验回执返回。",
                 _now(),
             )
         ],
@@ -788,6 +788,6 @@ def execute_guangya_fs_change_confirmed(
 
 
 def execute_durable_guangya_fs_change_job(
-    payload: dict[str, Any], *, cancel_check=None
+    payload: dict[str, Any], *, cancel_check=None, lease_generation: int = 0
 ) -> dict[str, Any]:
-    return execute_fs_change_plan(payload, cancel_check=cancel_check)
+    return execute_fs_change_plan(payload, cancel_check=cancel_check, lease_generation=lease_generation)

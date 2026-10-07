@@ -13,6 +13,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from app import database as db
 from app.modules.organize_tasks import OrganizeTaskManager
 from app.repositories.organize_operation_jobs import (
+    _payload_auth,
     claim_organize_operation_job,
     enqueue_organize_operation_job,
     finish_organize_operation_job,
@@ -22,6 +23,7 @@ from app.repositories.organize_operation_jobs import (
     organize_operation_job_id_from_public_ref,
     organize_operation_owner_digest,
     organize_operation_public_ref,
+    recover_orphaned_organize_operation_jobs,
     sanitize_organize_operation_result,
     verify_organize_operation_payload,
 )
@@ -521,6 +523,182 @@ class OrganizeDurableOperationManagerTests(IsolatedDatabaseTestCase):
     @staticmethod
     def _payload() -> dict:
         return {"version": 1, "safe": True}
+
+    def _enqueue_fs_change(self, *, dedupe: str, case: str = "eligible"):
+        owner = f"owner-fs-resume-{dedupe}"
+        owner_digest = organize_operation_owner_digest(owner)
+        payload = {
+            "version": 1,
+            "owner_digest": owner_digest,
+            "plan_id": "a" * 32,
+            "plan_fingerprint": "b" * 64,
+            "case": case,
+        }
+        with patch("app.modules.guangya_fs_change.bind_fs_change_plan_job"):
+            created, _ = enqueue_organize_operation_job(
+                job_kind="agent_guangya_fs_change",
+                owner=owner,
+                operation="文件变更",
+                reference=f"安全引用-{dedupe}",
+                payload=payload,
+                dedupe_key=f"fs-resume:{dedupe}",
+            )
+        return created, payload
+
+    def test_orphan_fs_change_requeues_only_when_plan_is_resumable(self) -> None:
+        created, _payload = self._enqueue_fs_change(dedupe="eligible")
+        claimed = claim_organize_operation_job(str(created["job_id"]))
+        self.assertEqual(claimed["status"], "running")
+        old_generation = int(claimed["lease_generation"])
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_operation_jobs SET result_json=? WHERE job_id=?",
+                ('{"stats":{"moved":2}}', str(created["job_id"])),
+            )
+        before = get_organize_operation_job(str(created["job_id"]))
+
+        with (
+            patch(
+                "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+                create=True,
+                return_value=True,
+            ) as can_resume,
+            patch(
+                "app.modules.guangya_fs_change.finalize_fs_change_plan_job"
+            ) as finalize,
+        ):
+            self.assertEqual(recover_orphaned_organize_operation_jobs(), 1)
+
+        can_resume.assert_called_once_with(
+            json.loads(before["payload_json"]),
+            job_id=str(created["job_id"]),
+            owner_digest=str(before["owner_digest"]),
+            lease_generation=old_generation,
+        )
+        finalize.assert_not_called()
+        resumed = get_organize_operation_job(str(created["job_id"]))
+        self.assertEqual(resumed["status"], "pending")
+        self.assertEqual(resumed["lease_generation"], old_generation + 1)
+        self.assertEqual(resumed["error_code"], "WorkerInterruptedResume")
+        self.assertEqual(resumed["error"], "")
+        for field in (
+            "payload_json", "payload_auth", "reference", "dedupe_digest",
+            "expires_at", "result_json",
+        ):
+            self.assertEqual(resumed[field], before[field], field)
+
+        next_claim = claim_organize_operation_job(str(created["job_id"]))
+        self.assertEqual(next_claim["status"], "running")
+        self.assertEqual(next_claim["lease_generation"], old_generation + 2)
+        self.assertFalse(
+            finish_organize_operation_job(
+                str(created["job_id"]),
+                expected_lease_generation=old_generation,
+                status="completed",
+            )
+        )
+
+    def test_orphan_fs_change_exclusions_and_legacy_payload_stay_manual_review(
+        self,
+    ) -> None:
+        cases = {
+            case: self._enqueue_fs_change(dedupe=case, case=case)[0]
+            for case in (
+                "false",
+                "raises",
+                "tampered",
+                "legacy",
+                "cancelled",
+                "purged",
+                "expired",
+            )
+        }
+        other_kind, _ = enqueue_organize_operation_job(
+            job_kind="agent_directory_scrape",
+            owner="owner-fs-resume-other-kind",
+            operation="目录刮削",
+            reference="安全引用",
+            payload=self._payload(),
+            dedupe_key="fs-resume:other-kind",
+        )
+        # Make every row running before applying the recovery exclusions.
+        for _ in range(len(cases) + 1):
+            self.assertIsNotNone(claim_organize_operation_job())
+        with db.get_conn() as conn:
+            tampered_id = str(cases["tampered"]["job_id"])
+            conn.execute(
+                "UPDATE organize_operation_jobs SET payload_json=? WHERE job_id=?",
+                ('{"version":1,"tampered":true}', tampered_id),
+            )
+            legacy_id = str(cases["legacy"]["job_id"])
+            legacy_payload = json.dumps(
+                {"version": 1, "case": "legacy"},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            legacy = conn.execute(
+                "SELECT owner_digest FROM organize_operation_jobs WHERE job_id=?",
+                (legacy_id,),
+            ).fetchone()
+            conn.execute(
+                "UPDATE organize_operation_jobs SET payload_json=?,payload_auth=? "
+                "WHERE job_id=?",
+                (
+                    legacy_payload,
+                    _payload_auth(
+                        job_id=legacy_id,
+                        owner_digest=str(legacy["owner_digest"]),
+                        job_kind="agent_guangya_fs_change",
+                        payload_json=legacy_payload,
+                    ),
+                    legacy_id,
+                ),
+            )
+            conn.execute(
+                "UPDATE organize_operation_jobs SET cancel_requested=1 WHERE job_id=?",
+                (str(cases["cancelled"]["job_id"]),),
+            )
+            conn.execute(
+                "UPDATE organize_operation_jobs SET purged_at=? WHERE job_id=?",
+                (db.now(), str(cases["purged"]["job_id"])),
+            )
+            conn.execute(
+                "UPDATE organize_operation_jobs SET expires_at=? WHERE job_id=?",
+                (time.time() - 1, str(cases["expired"]["job_id"])),
+            )
+
+        def cannot_resume(payload, *_args):
+            if payload.get("case") == "raises":
+                raise RuntimeError("plan unavailable")
+            return False
+
+        with (
+            patch(
+                "app.modules.guangya_fs_change.can_resume_fs_change_plan",
+                create=True,
+                side_effect=cannot_resume,
+            ) as can_resume,
+            patch("app.modules.guangya_fs_change.finalize_fs_change_plan_job"),
+        ):
+            self.assertEqual(recover_orphaned_organize_operation_jobs(), len(cases) + 1)
+
+        self.assertEqual(can_resume.call_count, 3)
+        self.assertEqual(
+            {str(call.args[0].get("case")) for call in can_resume.call_args_list},
+            {"false", "raises", "legacy"},
+        )
+        self.assertEqual(
+            get_organize_operation_job(str(cases["cancelled"]["job_id"]))["status"],
+            "cancelled",
+        )
+        self.assertIsNone(get_organize_operation_job(str(cases["purged"]["job_id"])))
+        for case in ("false", "raises", "tampered", "legacy", "expired"):
+            row = get_organize_operation_job(str(cases[case]["job_id"]))
+            self.assertEqual(row["status"], "manual_review", case)
+            self.assertEqual(row["error_code"], "WorkerExitedUnknownOutcome", case)
+        other = get_organize_operation_job(str(other_kind["job_id"]))
+        self.assertEqual(other["status"], "manual_review")
+        self.assertEqual(other["error_code"], "WorkerExitedUnknownOutcome")
 
     def test_pending_operation_survives_shutdown_and_runs_after_resume(self) -> None:
         first = OrganizeTaskManager()

@@ -874,6 +874,16 @@ class GuangYaOperationResultMeaningTests(unittest.IsolatedAsyncioTestCase):
         success = _project_guangya_status({'status': 'completed', 'stats': {}}, overview={})
         self.assertEqual(success.error, '')
 
+    def test_stale_recovered_plan_does_not_deny_prior_writes(self):
+        from app.agent.domain_catalog.cloud_runtime import _project_guangya_status
+        result = _project_guangya_status({"status": "failed", "error_code": "GuangYaFSChangeStale", "result": {
+            "stats": {"total": 2}, "operation_items": [
+                {"position": 1, "operation": "rename", "status": "unknown", "completed_actions": []},
+                {"position": 2, "operation": "rename", "status": "not_started", "completed_actions": []},
+            ]}}, overview={})
+        self.assertIn("已发生的变更以逐项回执为准", result.error)
+        self.assertNotIn("本次变更未执行", result.error)
+
     def test_task_projection_passes_sanitized_operation_items_and_keeps_legacy_stats(self):
         from app.agent.domain_catalog.cloud_runtime import _project_guangya_status
 

@@ -64,6 +64,10 @@ class GuangYaFSChangeError(RuntimeError):
     """可安全映射给 Agent 的通用光鸭变更错误。"""
 
 
+class GuangYaFSCheckpointError(GuangYaFSChangeError):
+    """阶段事实无法可靠落盘，必须停止追加写入。"""
+
+
 class GuangYaFSChangeStale(GuangYaFSChangeError):
     """冻结计划已过期或云端对象已变化。"""
 
@@ -213,6 +217,31 @@ def _read(plan_id: str) -> dict[str, Any]:
     if not actual or not hmac.compare_digest(actual, _auth(payload)):
         raise GuangYaFSChangeError("光鸭变更计划完整性校验失败")
     return payload
+
+
+def can_resume_fs_change_plan(
+    payload: dict[str, Any], *, job_id: str, owner_digest: str, lease_generation: int,
+) -> bool:
+    """整理全局锁内仅读检查点；只有原任务可被重排，不能据此认定云端已完成。"""
+    try:
+        plan = _read(str(payload.get("plan_id") or ""))
+        _validate_plan_identity(plan, expected_fingerprint=str(payload.get("plan_fingerprint") or ""))
+        if (plan.get("job_id") != job_id or plan.get("owner_digest") != owner_digest
+                or payload.get("owner_digest") != owner_digest):
+            return False
+        if plan.get("status") == "queued":
+            return True  # worker 尚未开启写入窗口。
+        execution = plan.get("execution") or {}
+        if plan.get("status") == "running" and execution.get("checkpoint_version") == 2:
+            _read_fs_checkpoints(plan)  # 破损/不完整的日志只能保守收束，不能重排写入。
+        return bool(
+            plan.get("status") in {"running", "completed", "partial"}
+            and execution.get("checkpoint_version") == 2
+            and 0 < int(execution.get("lease_generation") or 0) <= lease_generation
+            and len(execution.get("operation_items") or []) == len(plan.get("operations") or [])
+        )
+    except (GuangYaFSChangeError, TypeError, ValueError, KeyError):
+        return False
 
 
 def _append_journal(plan_id: str, event: dict[str, Any]) -> None:
@@ -1260,8 +1289,9 @@ def update_fs_change_plan_execution(
     execution: dict[str, Any],
     expected_statuses: set[str] | frozenset[str] | None = None,
     expected_job_id: str = "",
+    expected_lease_generation: int | None = None,
 ) -> dict[str, Any]:
-    """在跨进程锁内执行带前置状态/job_id 的文件级 CAS。"""
+    """在跨进程锁内执行带前置状态/job_id/执行代数的文件级 CAS。"""
     safe_status = str(status or "").strip().casefold()
     if safe_status not in {
         "confirmed",
@@ -1281,30 +1311,13 @@ def update_fs_change_plan_execution(
             or not hmac.compare_digest(str(payload.get("job_id") or ""), safe_job_id)
         ):
             raise GuangYaFSChangeStale("光鸭变更计划任务绑定已变化")
+        if expected_lease_generation is not None and (payload.get("execution") or {}).get("lease_generation") != expected_lease_generation:
+            raise GuangYaFSChangeStale("光鸭变更执行代数已变化，请勿重复执行")
         payload["status"] = safe_status
         payload["execution"] = dict(execution)
         payload["updated_at"] = _now_iso()
         _atomic_write(payload)
         return payload
-
-
-def _claim_fs_change_plan_execution(
-    plan_id: str,
-    *,
-    job_id: str,
-    started_at: str,
-    stats: dict[str, int],
-) -> dict[str, Any]:
-    safe_job_id = str(job_id or "").strip().casefold()
-    if not _SAFE_JOB_ID.fullmatch(safe_job_id):
-        raise GuangYaFSChangeError("光鸭变更任务编号无效")
-    return update_fs_change_plan_execution(
-        plan_id,
-        status="running",
-        execution={"started_at": started_at, **stats},
-        expected_statuses={"queued"},
-        expected_job_id=safe_job_id,
-    )
 
 
 def _operation_stat_key(operation: str) -> str:
@@ -1333,6 +1346,7 @@ def _operation_actions(item: dict[str, Any]) -> tuple[str, ...]:
 def _apply_fs_operation(
     client: GuangYaClient, item: dict[str, Any], outcome: dict[str, Any],
     created_targets: dict[str, dict[str, Any]], cancel_check: Callable[[], None] | None,
+    checkpoint: Callable[[], None],
 ) -> str:
     source = item.get("source") or {}
     created_id = ""
@@ -1341,7 +1355,16 @@ def _apply_fs_operation(
         for action in actions:
             if cancel_check is not None:
                 cancel_check()
+            before_write = dict(outcome)
             outcome.update(status="unknown", reason="write_outcome_unknown")
+            try:
+                checkpoint()  # 先落盘意图，崩溃后不得把已发起当作未开始。
+                if cancel_check is not None:
+                    cancel_check()  # fsync期间到达的取消也必须在发请求前生效。
+            except Exception:
+                outcome.clear()
+                outcome.update(before_write)  # 日志未能保存时本阶段尚未发起。
+                raise
             if action == "rename":
                 client.rename(str(source["file_id"]), str(item["new_name"]))
             elif action == "move":
@@ -1350,6 +1373,11 @@ def _apply_fs_operation(
                 client.copy([str(source["file_id"])], _directory_id(item, created_targets))
             elif action == "create_directory":
                 created_id = client.create_dir(str(item["name"]), _directory_id(item, created_targets, role="parent"))
+                created_targets[str(item["created_path"])] = {
+                    "file_id": created_id, "name": str(item["name"]),
+                    "parent_id": _directory_id(item, created_targets, role="parent"),
+                    "parent_create_path": str(item.get("parent_create_path") or ""),
+                }
             elif action == "trash":
                 delete_operation = None
                 if item.get("require_empty"):
@@ -1379,6 +1407,7 @@ def _apply_fs_operation(
             outcome["completed_actions"].append(action)
             outcome["status"] = "completed" if action == actions[-1] else "partial"
             outcome.pop("reason", None)
+            checkpoint()
     except Exception as exc:
         # 保留已经取得的创建身份，避免回读失败后按同名目录误判结果。
         exc.fs_created_id = created_id
@@ -1386,12 +1415,213 @@ def _apply_fs_operation(
     return created_id
 
 
-def execute_fs_change_plan(
-    payload: dict[str, Any],
-    *,
-    cancel_check: Callable[[], None] | None = None,
-    client_factory: Callable[[], GuangYaClient] = GuangYaClient,
-) -> dict[str, Any]:
+def _preflight_fs_change_plan(client, operations, outcomes, cancel_check):
+    """首次执行需整单通过写前核对；中断恢复则按已记录的阶段逐项核对。"""
+    for item, outcome in zip(operations, outcomes):
+        if cancel_check is not None:
+            cancel_check()
+        try:
+            _preflight_operation(client, item, allow_pending_target=True)
+        except GuangYaFSChangeStale:
+            outcome.update(status="blocked", reason="precondition_failed")
+            raise
+
+
+def _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check) -> bool:
+    """仅读核对历史事实；无法证明整项完成的在途操作不重放。"""
+    for item, outcome in zip(operations, outcomes):
+        if cancel_check is not None:
+            cancel_check()
+        status = outcome["status"]
+        if status not in {"completed", "unknown"}:
+            continue
+        created_id = str((created_targets.get(item.get("created_path")) or {}).get("file_id") or "")
+        verifiable = status == "completed" or item["op"] in {"rename", "move", "relocate"}
+        # 新建/复制的同名对象不是身份凭据；原位置消失也不证明已进回收站。
+        verifiable &= item["op"] != "create_directory" or bool(created_id)
+        verifiable &= not (item["op"] == "copy" and (item.get("source") or {}).get("is_dir"))
+        try:
+            verified = verifiable and _verify_after(client, item, created_id, created_targets=created_targets)
+        except Exception:  # 读失败只能保留未知，不能落为可重试。
+            verified = False
+        if verified:
+            outcome.update(status="completed", completed_actions=list(_operation_actions(item)))
+            outcome.pop("reason", None)
+        else:
+            outcome.update(status="unknown", reason="verification_pending")
+            actions = _operation_actions(item)
+            if item["op"] == "relocate" and len(actions) == 2:
+                try:
+                    if _verify_after(client, {**item, "op": actions[0]}, created_targets=created_targets):
+                        outcome.update(status="partial", completed_actions=[actions[0]])
+                except Exception:
+                    pass  # 中间状态也不可读时仍是未知，不补发任一阶段。
+    for key in ("renamed", "moved", "relocated", "copied", "trashed", "created", "failed"):
+        stats[key] = 0
+    for item, outcome in zip(operations, outcomes):
+        if outcome["status"] == "completed":
+            stats[_operation_stat_key(item["op"])] += 1
+        elif outcome["status"] != "not_started":
+            stats["failed"] += 1
+    return bool(stats.get("audit_failures") or any(row["status"] in {"unknown", "partial"} for row in outcomes))
+
+
+def _reset_fs_checkpoint_cursor(plan_id, execution):
+    path = _journal_path(plan_id)
+    execution.update(checkpoint_id=uuid.uuid4().hex, journal_sequence=0,
+                     journal_offset=path.stat().st_size if path.exists() else 0)
+
+
+def _read_fs_checkpoints(plan):
+    """只重放签名的事实增量，不重放操作。历史普通审计行保持原格式。"""
+    base = plan["execution"]
+    execution = {**base, "operation_items": [dict(row) for row in base["operation_items"]],
+                 "stats": dict(base["stats"]), "created_targets": dict(base.get("created_targets") or {})}
+    path = _journal_path(plan["plan_id"])
+    try:
+        offset = int(base["journal_offset"])
+        if path.is_symlink() or not 0 <= offset <= path.stat().st_size:
+            raise ValueError("checkpoint offset")
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            tail = stream.read(16 * _MAX_PLAN_BYTES + 1)
+        if len(tail) > 16 * _MAX_PLAN_BYTES or tail and not tail.endswith(b"\n"):
+            raise ValueError("checkpoint journal incomplete")
+        if not tail:
+            # 没有阶段记录时无法区分尚未发起与日志整段丢失，不能据此追加写入。
+            raise ValueError("checkpoint journal has no durable stages")
+        for line in tail.splitlines():
+            event = json.loads(line)
+            if event.get("action") != "checkpoint":
+                continue
+            if (not hmac.compare_digest(str(event.get("auth") or ""), _auth(event))
+                    or event.get("plan_id") != plan["plan_id"] or event.get("job_id") != plan["job_id"]
+                    or event.get("checkpoint_id") != base["checkpoint_id"]
+                    or event.get("lease_generation") != base["lease_generation"]
+                    or event.get("sequence") != execution["journal_sequence"] + 1):
+                raise ValueError("checkpoint identity")
+            delta = event["data"]
+            if "operation_item" in delta:
+                row = delta["operation_item"]
+                index = int(row["position"]) - 1
+                if not 0 <= index < len(plan["operations"]) or row["operation"] != plan["operations"][index]["op"]:
+                    raise ValueError("checkpoint operation")
+                execution["operation_items"][index] = row
+            if "created_target" in delta:
+                target = dict(delta["created_target"])
+                execution["created_targets"][target.pop("path")] = target
+            execution.update(stats=delta["stats"], finalizing=delta["finalizing"], journal_sequence=event["sequence"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise GuangYaFSChangeError("中断检查点不可核验，请先核对云端结果") from exc
+    return execution
+
+
+def _write_fs_checkpoint(plan_id, job_id, execution, *, item=None, outcome=None, begin_finalization=False):
+    """持有整理全局锁的 worker 追加 O(1) 阶段记录；完整快照仅在准入/终态保存。"""
+    execution["finalizing"] |= begin_finalization
+    delta = {"stats": execution["stats"], "finalizing": execution["finalizing"]}
+    if outcome is not None:
+        delta["operation_item"] = outcome
+        path = str(item.get("created_path") or "")
+        if path in execution["created_targets"]:
+            delta["created_target"] = {"path": path, **execution["created_targets"][path]}
+    event = {"action": "checkpoint", "at": _now_iso(), "plan_id": plan_id, "job_id": job_id,
+             "checkpoint_id": execution["checkpoint_id"], "lease_generation": execution["lease_generation"],
+             "sequence": execution["journal_sequence"] + 1, "data": delta}
+    event["auth"] = _auth(event)
+    try:
+        _append_journal(plan_id, event)
+        execution["journal_sequence"] = event["sequence"]
+    except Exception as exc:
+        raise GuangYaFSCheckpointError("执行检查点未能保存，已停止后续变更") from exc
+
+
+def _finish_fs_change_execution(
+    plan_id, job_id, plan, result, *, execution, checkpoint,
+    successful_operations, persistence_uncertain, cancel_check,
+):
+    """正常执行与中断核对共用同一收尾，不重复未知的 STRM 提交。"""
+    stats = result["stats"]
+    successful = (
+        stats["renamed"]
+        + stats["moved"]
+        + stats["relocated"]
+        + stats["copied"]
+        + stats["trashed"]
+        + stats["created"]
+    )
+    partial = stats["failed"] > 0 or persistence_uncertain
+    if bool(plan.get("trigger_strm")) and successful > 0:
+        if execution.get("finalizing"):
+            stats["strm_scope_unknown"] = 1
+            persistence_uncertain = partial = True
+        else:
+            try:
+                checkpoint(begin_finalization=True)
+                if cancel_check is not None:
+                    cancel_check()
+            except GuangYaFSCheckpointError:
+                stats["audit_failures"] += 1
+                persistence_uncertain = partial = True
+            else:
+                stats.update(trigger_cloud_changes(successful_operations, sources=execution.get("strm_scope")))
+                partial |= bool(stats.get("strm_trigger_failed"))
+    finished_at = _now_iso()
+    final_status = (
+        "manual_review"
+        if persistence_uncertain
+        else "partial"
+        if partial
+        else "completed"
+    )
+    try:
+        _append_journal(
+            plan_id,
+            {
+                "action": "finalize",
+                "status": final_status,
+                "successful": successful,
+                "failed": stats["failed"],
+                "audit_failures": stats["audit_failures"],
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - 队列必须返回 partial/manual review
+        logger.error(
+            "光鸭变更终态日志持久化失败 plan=%s type=%s",
+            plan_id,
+            type(exc).__name__,
+        )
+        stats["audit_failures"] += 1
+        persistence_uncertain = True
+        partial = True
+        final_status = "manual_review"
+    try:
+        update_fs_change_plan_execution(
+            plan_id,
+            status=final_status,
+            execution={
+                **execution,
+                "finished_at": finished_at,
+                **stats,
+            },
+            expected_statuses={"running"},
+            expected_job_id=job_id,
+            expected_lease_generation=execution["lease_generation"],
+        )
+    except Exception as exc:  # noqa: BLE001 - 远端已写，返回 partial 而非可重试 failed
+        logger.error(
+            "光鸭变更终态计划持久化失败 plan=%s type=%s",
+            plan_id,
+            type(exc).__name__,
+        )
+        stats["audit_failures"] += 1
+        persistence_uncertain = True
+        partial = True
+    result.update(partial=partial or persistence_uncertain, requires_manual=persistence_uncertain)
+    return result
+
+
+def _load_fs_execution_plan(payload, lease_generation):
     if not isinstance(payload, dict) or int(payload.get("version") or 0) != 1:
         raise GuangYaFSChangeError("光鸭变更任务参数无效")
     plan_id = str(payload.get("plan_id") or "")
@@ -1402,9 +1632,18 @@ def execute_fs_change_plan(
     plan = load_fs_change_plan(
         plan_id,
         expected_fingerprint=expected_fingerprint,
-        require_confirmed=True,
+        require_confirmed=False,
     )
-    if str(plan.get("status") or "") != "queued" or not hmac.compare_digest(
+    recovering = str(plan.get("status") or "") != "queued"
+    previous = plan.get("execution") or {}
+    if recovering and not (
+        lease_generation > int(previous.get("lease_generation") or 0)
+        and can_resume_fs_change_plan(payload, job_id=job_id,
+            owner_digest=str(payload.get("owner_digest") or ""),
+            lease_generation=int(previous.get("lease_generation") or 0))
+    ):
+        raise GuangYaFSChangeStale("光鸭变更计划没有可核对的中断检查点")
+    if not hmac.compare_digest(
         str(plan.get("job_id") or ""), job_id
     ):
         raise GuangYaFSChangeStale("光鸭变更计划任务绑定已变化")
@@ -1414,6 +1653,21 @@ def execute_fs_change_plan(
         raise GuangYaFSChangeError("光鸭变更任务会话不匹配")
     raw_generation = payload.get("credential_generation")
     expected_generation = int(raw_generation) if raw_generation is not None else -1
+    if recovering and plan["status"] == "running":
+        plan["execution"] = _read_fs_checkpoints(plan)
+    return plan, recovering, expected_generation
+
+
+def execute_fs_change_plan(
+    payload: dict[str, Any],
+    *,
+    cancel_check: Callable[[], None] | None = None,
+    client_factory: Callable[[], GuangYaClient] = GuangYaClient,
+    lease_generation: int = 0,
+) -> dict[str, Any]:
+    plan, recovering, expected_generation = _load_fs_execution_plan(payload, lease_generation)
+    plan_id, job_id = str(plan["plan_id"]), str(payload["job_id"])
+    previous = plan.get("execution") or {}
     client = client_factory()
     stats = {
         "total": len(plan.get("operations") or []),
@@ -1434,10 +1688,33 @@ def execute_fs_change_plan(
          "status": "not_started", "completed_actions": []}
         for index, item in enumerate(operations, start=1)
     ]})["operation_items"]
+    if recovering:
+        outcomes = previous["operation_items"]
+        stats.update(previous.get("stats") or {})
     result = {"partial": False, "requires_manual": False, "stats": stats, "operation_items": outcomes}
-    started_at = _now_iso()
+    started_at = str(previous.get("started_at") or _now_iso())
+    created_targets = dict(previous.get("created_targets") or {}) if recovering else {}
+    strm_scope = previous.get("strm_scope") if recovering else None
+    finalizing = bool(previous.get("finalizing")) if recovering else False
     persistence_uncertain = False
+
+    execution = {"checkpoint_version": 2, "lease_generation": lease_generation,
+                 "started_at": started_at, "stats": stats, "operation_items": outcomes,
+                 "created_targets": created_targets, "strm_scope": strm_scope, "finalizing": finalizing}
+
+    def checkpoint(*, begin_finalization=False):
+        _write_fs_checkpoint(plan_id, job_id, execution,
+            item=None if begin_finalization else item, outcome=None if begin_finalization else outcome,
+            begin_finalization=begin_finalization)
     try:
+        if recovering and plan["status"] in {"completed", "partial"}:
+            # 执行器终态已可靠落盘，只补齐丢失的队列回执，不再写云盘。
+            update_fs_change_plan_execution(plan_id, status=plan["status"],
+                execution={**previous, "lease_generation": lease_generation},
+                expected_statuses={plan["status"]}, expected_job_id=job_id,
+                expected_lease_generation=int(previous["lease_generation"]))
+            result["partial"] = plan["status"] == "partial"
+            return result
         if (
             not client.logged_in
             or int(client.credential_generation) != expected_generation
@@ -1446,32 +1723,28 @@ def execute_fs_change_plan(
         if not operations:
             raise GuangYaFSChangeError("光鸭变更计划没有可执行对象")
         _validate_plan_names(operations)
-        for item, outcome in zip(operations, outcomes):
-            if cancel_check is not None:
-                cancel_check()
-            try:
-                _preflight_operation(client, item, allow_pending_target=True)
-            except GuangYaFSChangeStale:
-                outcome.update(status="blocked", reason="precondition_failed")
-                raise
-        # 来源旧路径必须在目录移动/改名之前捕获。
-        strm_scope = cloud_change_sources(client) if plan.get("trigger_strm") else None
-        # 预检日志先于 running CAS 写入；若日志介质不可用，此时尚未产生任何
-        # provider 副作用，可以安全失败而不会制造“远端已写、本地 failed”。
-        _append_journal(
-            plan_id,
-            {"action": "preflight", "status": "completed", "total": len(operations)},
-        )
-        _claim_fs_change_plan_execution(
-            plan_id,
-            job_id=job_id,
-            started_at=started_at,
-            stats=stats,
-        )
-        created_targets: dict[str, dict[str, Any]] = {}
-        completed_objects: set[str] = set()
-        successful_operations: list[dict[str, Any]] = []
+        if not recovering:
+            _preflight_fs_change_plan(client, operations, outcomes, cancel_check)
+            execution["strm_scope"] = cloud_change_sources(client) if plan.get("trigger_strm") else None
+            _append_journal(plan_id, {"action": "preflight", "status": "completed", "total": len(operations)})
+        _reset_fs_checkpoint_cursor(plan_id, execution)
+        update_fs_change_plan_execution(plan_id, status="running", execution=execution,
+            expected_statuses={"running" if recovering else "queued"}, expected_job_id=job_id,
+            expected_lease_generation=int(previous["lease_generation"]) if recovering else None)
+        if recovering:
+            persistence_uncertain = _reconcile_fs_operations(client, operations, outcomes, created_targets, stats, cancel_check)
+            _reset_fs_checkpoint_cursor(plan_id, execution)
+            update_fs_change_plan_execution(plan_id, status="running", execution=execution,
+                expected_statuses={"running"}, expected_job_id=job_id, expected_lease_generation=lease_generation)
+        completed_objects = {str((item.get("source") or {}).get("file_id") or
+            (created_targets.get(item.get("created_path")) or {}).get("file_id") or "")
+            for item, outcome in zip(operations, outcomes) if outcome["status"] == "completed"}
+        successful_operations = [item for item, outcome in zip(operations, outcomes) if outcome["status"] == "completed"]
         for index, item in enumerate(operations, start=1):
+            if persistence_uncertain:
+                break
+            if outcomes[index - 1]["status"] != "not_started":
+                continue
             if cancel_check is not None:
                 cancel_check()
             outcome = outcomes[index - 1]
@@ -1481,6 +1754,7 @@ def execute_fs_change_plan(
             error_type = ""
             provider_code = ""
             provider_write_started = False
+            needs_checkpoint = True
             stat_key = _operation_stat_key(op)
             try:
                 _preflight_operation(
@@ -1490,9 +1764,16 @@ def execute_fs_change_plan(
                     completed_objects=completed_objects,
                 )
                 provider_write_started = True
-                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check)
+                created_id = _apply_fs_operation(client, item, outcome, created_targets, cancel_check, checkpoint)
+                needs_checkpoint = False  # 正常末阶段已持久化；异常核对/拒绝需要补记。
                 stats[stat_key] += 1
                 status = "completed"
+            except GuangYaFSCheckpointError:
+                stats[stat_key if outcome["status"] == "completed" else "failed"] += 1
+                stats["audit_failures"] += 1
+                outcome["reason"] = "audit_unavailable"
+                persistence_uncertain = True
+                break
             except GuangYaFSChangeStale as exc:
                 unmet = not set(item.get("rename_dependencies") or ()).issubset(completed_objects)
                 outcome.update(status="blocked", reason="dependency_failed" if unmet else "precondition_failed")
@@ -1569,79 +1850,18 @@ def execute_fs_change_plan(
                 # 日志介质失效后停止追加写入，避免扩大无法可靠追溯的副作用面。
                 break
             if status == "completed":
-                if op == "create_directory":
-                    created_targets[str(item["created_path"])] = {
-                        "file_id": str(created_id), "name": str(item["name"]),
-                        "parent_id": _directory_id(item, created_targets, role="parent"),
-                        "parent_create_path": str(item.get("parent_create_path") or ""),
-                    }
                 completed_objects.add(str(source.get("file_id") or created_id))
                 successful_operations.append(item)
-        successful = (
-            stats["renamed"]
-            + stats["moved"]
-            + stats["relocated"]
-            + stats["copied"]
-            + stats["trashed"]
-            + stats["created"]
-        )
-        partial = stats["failed"] > 0 or persistence_uncertain
-        if bool(plan.get("trigger_strm")) and successful > 0:
-            stats.update(trigger_cloud_changes(successful_operations, sources=strm_scope))
-            partial |= bool(stats.get("strm_trigger_failed"))
-        finished_at = _now_iso()
-        final_status = (
-            "manual_review"
-            if persistence_uncertain
-            else "partial"
-            if partial
-            else "completed"
-        )
-        try:
-            _append_journal(
-                plan_id,
-                {
-                    "action": "finalize",
-                    "status": final_status,
-                    "successful": successful,
-                    "failed": stats["failed"],
-                    "audit_failures": stats["audit_failures"],
-                },
-            )
-        except Exception as exc:  # noqa: BLE001 - 队列必须返回 partial/manual review
-            logger.error(
-                "光鸭变更终态日志持久化失败 plan=%s type=%s",
-                plan_id,
-                type(exc).__name__,
-            )
-            stats["audit_failures"] += 1
-            persistence_uncertain = True
-            partial = True
-            final_status = "manual_review"
-        try:
-            update_fs_change_plan_execution(
-                plan_id,
-                status=final_status,
-                execution={
-                    "started_at": started_at,
-                    "finished_at": finished_at,
-                    "operation_items": outcomes,
-                    **stats,
-                },
-                expected_statuses={"running"},
-                expected_job_id=job_id,
-            )
-        except Exception as exc:  # noqa: BLE001 - 远端已写，返回 partial 而非可重试 failed
-            logger.error(
-                "光鸭变更终态计划持久化失败 plan=%s type=%s",
-                plan_id,
-                type(exc).__name__,
-            )
-            stats["audit_failures"] += 1
-            persistence_uncertain = True
-            partial = True
-        result.update(partial=partial or persistence_uncertain, requires_manual=persistence_uncertain)
-        return result
+            if needs_checkpoint:
+                try:
+                    checkpoint()
+                except GuangYaFSCheckpointError:
+                    stats["audit_failures"] += 1
+                    persistence_uncertain = True
+                    break
+        return _finish_fs_change_execution(plan_id, job_id, plan, result,
+            execution=execution, checkpoint=checkpoint,
+            successful_operations=successful_operations, persistence_uncertain=persistence_uncertain, cancel_check=cancel_check)
     except Exception as exc:
         # 协作取消/写前拒绝仍沿用异常契约，但不能丢掉本次已完成与待核验事实。
         result.update(partial=any(row["status"] != "not_started" for row in outcomes),

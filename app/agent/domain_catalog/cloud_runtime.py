@@ -109,7 +109,11 @@ def _project_guangya_status(
     problems = []
     if task_status in {"partial", "failed", "manual_review"}:
         if raw.get("error_code") == "GuangYaFSChangeStale":
-            problems.append("冻结计划、凭据或对象状态已变化，本次变更未执行；请重新读取目录并生成预览")
+            attempted = any(item.get("status") not in {"not_started", "blocked"} for item in safe_result.get("operation_items", []))
+            problems.append(
+                "执行期间凭据或对象状态已变化；已发生的变更以逐项回执为准，剩余操作未继续"
+                if attempted else "冻结计划、凭据或对象状态已变化，本次变更未执行；请重新读取目录并生成预览"
+            )
         for key, description in (
             ("precondition_failed", "项写前核对未通过，未执行"),
             ("verification_failed", "项写后状态未核验通过，不能据此认定未执行，请勿直接重复提交"),

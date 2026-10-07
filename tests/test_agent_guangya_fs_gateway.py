@@ -271,6 +271,269 @@ class GuangYaFSGatewayTests(unittest.TestCase):
             "job_id": job_id,
         }
 
+    def _recovery_plan(self, client, first=None):
+        observation = guangya_workspace.create_directory_observation(
+            client, owner="owner", path="/source", recursive=True, max_items=100)
+        refs = {item["file_id"]: item["handle"] for item in observation["entries"]}
+        changes = [first or {"op": "rename", "object_ref": refs["rename"], "new_name": "A-done.mp4"},
+                   {"op": "rename", "object_ref": refs["move"], "new_name": "B-done.mp4"}]
+        if "source_id" in changes[0]:
+            changes[0]["object_ref"] = refs[changes[0].pop("source_id")]
+        plan = guangya_fs_change.build_fs_change_plan(client, owner="owner", observation=observation,
+                                                     operations=changes, trigger_strm=False)
+        guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
+        return plan, self._queued_payload(plan)
+
+    def test_recovery_reconciles_rename_without_replaying_and_continues_only_unstarted(self):
+        class WorkerExit(BaseException):
+            pass
+        for crash_at in ("before_write", "after_write", "after_checkpoint", "changed_after_checkpoint"):
+            with self.subTest(crash_at=crash_at):
+                client = FakeGatewayClient()
+                plan, payload = self._recovery_plan(client)
+                original_rename, original_save = client.rename, guangya_fs_change._append_journal
+                calls = []
+
+                def rename(file_id, name):
+                    calls.append(file_id)
+                    if crash_at == "before_write":
+                        raise WorkerExit()
+                    original_rename(file_id, name)
+                    if crash_at == "after_write":
+                        raise WorkerExit()
+                    return True
+
+                def save(plan_id, record):
+                    original_save(plan_id, record)
+                    row = (record.get("data") or {}).get("operation_item") or {}
+                    if crash_at.endswith("checkpoint") and row.get("position") == 1 and row.get("status") == "completed":
+                        raise WorkerExit()
+
+                with mock.patch.object(client, "rename", side_effect=rename), mock.patch.object(guangya_fs_change, "_append_journal", side_effect=save):
+                    with self.assertRaises(WorkerExit):
+                        guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+                self.assertEqual(calls, ["rename"])
+                self.assertTrue(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:owner", lease_generation=1))
+                # 新worker领队列后、更新计划代数前再崩溃，也不能遗失同一检查点。
+                self.assertTrue(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:owner", lease_generation=3))
+                if crash_at == "changed_after_checkpoint":
+                    original_rename("rename", "externally-changed.mp4")
+                with mock.patch.object(client, "rename", wraps=original_rename) as resumed:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                safe = crash_at in {"after_write", "after_checkpoint"}
+                self.assertEqual(result["requires_manual"], not safe)
+                self.assertEqual(resumed.call_count, int(safe))
+                self.assertEqual(result["stats"]["renamed"], 2 if safe else 0)
+                self.assertEqual(client.file_info("move").name, "B-done.mp4" if safe else "Move.mp4")
+                self.assertEqual(result["operation_items"][1]["status"], "completed" if safe else "not_started")
+                if safe:
+                    resumed.assert_called_once_with("move", "B-done.mp4")
+                with self.assertRaises(guangya_fs_change.GuangYaFSChangeStale):
+                    guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+
+    def test_recovery_never_guesses_copy_trash_or_create_success_from_name_or_absence(self):
+        class WorkerExit(BaseException):
+            pass
+        for operation, method, first in (
+            ("copy", "copy", {"op": "copy", "source_id": "rename", "target_path": "/target"}),
+            ("trash", "delete", {"op": "trash", "source_id": "trash"}),
+            ("create_directory", "create_dir", {"op": "create_directory", "parent_path": "/target", "name": "new-dir"}),
+        ):
+            with self.subTest(operation=operation):
+                client = FakeGatewayClient()
+                plan, payload = self._recovery_plan(client, first=dict(first))
+                original = getattr(client, method)
+                def crash(*args, **kwargs):
+                    original(*args, **kwargs)
+                    raise WorkerExit()
+                with mock.patch.object(client, method, side_effect=crash):
+                    with self.assertRaises(WorkerExit):
+                        guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+                with mock.patch.object(client, method, wraps=original) as replay, mock.patch.object(client, "rename", wraps=client.rename) as rename:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+                self.assertTrue(result["requires_manual"])
+                self.assertEqual(result["operation_items"][0]["status"], "unknown")
+                self.assertEqual(result["operation_items"][1]["status"], "not_started")
+                replay.assert_not_called()
+                rename.assert_not_called()
+
+    def test_cancel_arriving_during_checkpoint_prevents_write_and_followup_sync(self):
+        from app.modules.organize_tasks import OrganizeOperationCancelled
+        for phase in ("write", "sync"):
+            with self.subTest(phase=phase):
+                client = FakeGatewayClient()
+                plan = self._confirmed_plan(client, {"op": "rename", "source_name": "广告-ABC.mp4", "new_name": "Done.mp4"}, trigger_strm=phase == "sync")
+                payload = self._queued_payload(plan)
+                cancelled = False
+                append = guangya_fs_change._append_journal
+                def checkpoint(plan_id, event):
+                    nonlocal cancelled
+                    append(plan_id, event)
+                    data = event.get("data") or {}
+                    if phase == "write" and (data.get("operation_item") or {}).get("status") == "unknown" or phase == "sync" and data.get("finalizing"):
+                        cancelled = True
+                def check():
+                    if cancelled:
+                        raise OrganizeOperationCancelled("cancelled while persisting")
+                with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=checkpoint), mock.patch.object(guangya_fs_change, "cloud_change_sources", return_value={"source": "/source"}), mock.patch.object(guangya_fs_change, "trigger_cloud_changes") as sync, mock.patch.object(client, "rename", wraps=client.rename) as rename:
+                    with self.assertRaises(OrganizeOperationCancelled) as caught:
+                        guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1, cancel_check=check)
+                self.assertEqual(rename.call_count, int(phase == "sync"))
+                sync.assert_not_called()
+                row = caught.exception.operation_result["operation_items"][0]
+                self.assertEqual(row["status"], "completed" if phase == "sync" else "not_started")
+
+    def test_checkpoint_io_is_linear_not_full_plan_per_item(self):
+        journal_sizes = []
+        for count in (20, 200):
+            with self.subTest(count=count):
+                client = FakeGatewayClient()
+                client.directories["source"] = [GuangYaFile(str(index), f"Old-{index}.mkv", False, parent_id="source", size=1, etag=str(index)) for index in range(count)]
+                obs = guangya_workspace.create_directory_observation(client, owner="owner", path="/source", recursive=True, max_items=500)
+                operations = [{"op": "rename", "object_ref": row["handle"], "new_name": f"Done-{row['file_id']}.mkv"} for row in obs["entries"]]
+                plan = guangya_fs_change.build_fs_change_plan(client, owner="owner", observation=obs, operations=operations, trigger_strm=False)
+                guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
+                payload = self._queued_payload(plan)
+                with mock.patch.object(guangya_fs_change, "_atomic_write", wraps=guangya_fs_change._atomic_write) as snapshot:
+                    result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+                self.assertFalse(result["partial"])
+                self.assertEqual(snapshot.call_count, 2, "完整计划只能启动/终态写入，不能随N重复重写")
+                journal_sizes.append(guangya_fs_change._journal_path(plan["plan_id"]).stat().st_size)
+        self.assertLess(journal_sizes[1], journal_sizes[0] * 12, "10倍条目量不应导致平方级写放大")
+
+    def test_corrupt_or_unbound_checkpoint_journal_is_not_resumable(self):
+        class WorkerExit(BaseException):
+            pass
+        client = FakeGatewayClient()
+        plan, payload = self._recovery_plan(client)
+        original = client.rename
+        def crash(*args):
+            original(*args)
+            raise WorkerExit()
+        with mock.patch.object(client, "rename", side_effect=crash):
+            with self.assertRaises(WorkerExit):
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        path = guangya_fs_change._journal_path(plan["plan_id"])
+        original_bytes = path.read_bytes()
+        for kind in ("truncated", "missing_all_stages", "tampered", "wrong_job", "missing_sequence"):
+            with self.subTest(kind=kind):
+                lines = original_bytes.splitlines(keepends=True)
+                event = json.loads(lines[-1])
+                if kind == "truncated":
+                    changed = original_bytes[:-1]
+                elif kind == "missing_all_stages":
+                    offset = guangya_fs_change._read(plan["plan_id"])["execution"]["journal_offset"]
+                    changed = original_bytes[:offset]
+                else:
+                    if kind == "tampered":
+                        event["data"]["operation_item"]["status"] = "completed"
+                    elif kind == "wrong_job":
+                        event["job_id"] = "f" * 32
+                        event["auth"] = guangya_fs_change._auth(event)
+                    else:
+                        event["sequence"] += 1
+                        event["auth"] = guangya_fs_change._auth(event)
+                    changed = b"".join(lines[:-1]) + (json.dumps(event) + "\n").encode()
+                path.write_bytes(changed)
+                self.assertFalse(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:owner", lease_generation=1))
+        path.write_bytes(original_bytes)
+        self.assertTrue(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:owner", lease_generation=1))
+
+    def test_checkpoint_failure_before_provider_call_halts_without_claiming_a_write(self):
+        client = FakeGatewayClient()
+        plan, payload = self._recovery_plan(client)
+        original_save = guangya_fs_change._append_journal
+        def save(plan_id, record):
+            row = (record.get("data") or {}).get("operation_item") or {}
+            if row.get("position") == 1 and row.get("status") == "unknown":
+                raise OSError("disk unavailable")
+            return original_save(plan_id, record)
+        with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=save), mock.patch.object(client, "rename", wraps=client.rename) as rename:
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        rename.assert_not_called()
+        self.assertTrue(result["requires_manual"])
+        self.assertTrue(all(item["status"] == "not_started" for item in result["operation_items"]))
+        self.assertEqual(result["stats"]["audit_failures"], 1)
+
+    def test_recovery_reports_half_relocation_without_replaying_or_extending_writes(self):
+        class WorkerExit(BaseException):
+            pass
+        client = FakeGatewayClient()
+        plan, payload = self._recovery_plan(client, first={"op": "relocate", "source_id": "rename", "target_path": "/target", "new_name": "Move.mp4"})
+        original_move = client.move
+        def crash(*args):
+            original_move(*args)
+            raise WorkerExit()
+        with mock.patch.object(client, "move", side_effect=crash):
+            with self.assertRaises(WorkerExit):
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        with mock.patch.object(client, "move", wraps=original_move) as moved, mock.patch.object(client, "rename", wraps=client.rename) as renamed:
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+        self.assertTrue(result["requires_manual"])
+        self.assertEqual(result["operation_items"][0]["status"], "partial")
+        self.assertEqual(result["operation_items"][0]["completed_actions"], ["move"])
+        self.assertEqual(result["operation_items"][1]["status"], "not_started")
+        moved.assert_not_called()
+        renamed.assert_not_called()
+
+    def test_recovery_keeps_verified_created_directory_identity_for_remaining_move(self):
+        class WorkerExit(BaseException):
+            pass
+        client = FakeGatewayClient()
+        obs = guangya_workspace.create_directory_observation(client, owner="owner", path="/source", recursive=True, max_items=100)
+        ref = next(item["handle"] for item in obs["entries"] if item["file_id"] == "move")
+        plan = guangya_fs_change.build_fs_change_plan(client, owner="owner", observation=obs, trigger_strm=False,
+            operations=[{"op": "create_directory", "parent_path": "/target", "name": "new"},
+                        {"op": "move", "object_ref": ref, "target_path": "/target/new"}])
+        guangya_fs_change.confirm_fs_change_plan(plan["plan_id"], owner="owner", expected_fingerprint=plan["fingerprint"])
+        payload = self._queued_payload(plan)
+        original_save = guangya_fs_change._append_journal
+        def save(plan_id, record):
+            original_save(plan_id, record)
+            row = (record.get("data") or {}).get("operation_item") or {}
+            if row.get("position") == 1 and row.get("status") == "completed":
+                raise WorkerExit()
+        with mock.patch.object(guangya_fs_change, "_append_journal", side_effect=save):
+            with self.assertRaises(WorkerExit):
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        created_id = client.list_dir("target")[0].file_id
+        with mock.patch.object(client, "create_dir", side_effect=AssertionError("must not recreate")):
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+        self.assertFalse(result["partial"])
+        self.assertEqual((result["stats"]["created"], result["stats"]["moved"]), (1, 1))
+        self.assertEqual(client.file_info("move").parent_id, created_id)
+
+    def test_recovery_does_not_repeat_unknown_strm_submission(self):
+        class WorkerExit(BaseException):
+            pass
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(client, {"op": "rename", "source_name": "广告-ABC.mp4", "new_name": "Done.mp4"}, trigger_strm=True)
+        payload = self._queued_payload(plan)
+        with mock.patch.object(guangya_fs_change, "cloud_change_sources", return_value={"source": "/source"}), mock.patch.object(guangya_fs_change, "trigger_cloud_changes", side_effect=WorkerExit):
+            with self.assertRaises(WorkerExit):
+                guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        with mock.patch.object(guangya_fs_change, "trigger_cloud_changes", side_effect=AssertionError("unknown sync replay")) as sync, mock.patch.object(client, "rename", side_effect=AssertionError("rename replay")):
+            result = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+        self.assertTrue(result["requires_manual"])
+        self.assertEqual(result["stats"]["strm_scope_unknown"], 1)
+        self.assertEqual(result["stats"]["renamed"], 1)
+        sync.assert_not_called()
+
+    def test_verified_terminal_plan_recovers_queue_receipt_without_repeating_writes(self):
+        client = FakeGatewayClient()
+        plan, payload = self._recovery_plan(client)
+        first = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=1)
+        self.assertTrue(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:owner", lease_generation=1))
+        terminal_execution = guangya_fs_change._read(plan["plan_id"])["execution"]
+        client.logged_in = False  # 已核验历史回执不依赖当前是否仍登录。
+        client.credential_generation += 1
+        with mock.patch.object(client, "rename", side_effect=AssertionError("terminal replay")):
+            recovered = guangya_fs_change.execute_fs_change_plan(payload, client_factory=lambda: client, lease_generation=3)
+        self.assertEqual(recovered, first)
+        self.assertEqual(guangya_fs_change._read(plan["plan_id"])["execution"], {**terminal_execution, "lease_generation": 3})
+        self.assertFalse(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:someone-else", lease_generation=3))
+        self.assertFalse(guangya_fs_change.can_resume_fs_change_plan(payload, job_id=payload["job_id"], owner_digest="digest:owner", lease_generation=1))
+
     def test_strm_trigger_skips_successful_unrelated_prefix_sibling_change(self):
         client = FakeGatewayClient()
         client.directories["0"].append(
@@ -2180,7 +2443,7 @@ class GuangYaFSGatewayTests(unittest.TestCase):
         def flaky_append(plan_id, event):
             nonlocal calls
             calls += 1
-            if calls == 2:
+            if event.get("action") == "rename":
                 raise OSError("journal unavailable")
             return original_append(plan_id, event)
 
