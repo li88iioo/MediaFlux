@@ -1423,15 +1423,20 @@ def execute_fs_change_plan(
                         str(source.get("file_id") or ""), str(item["new_name"])
                     )
                 elif op in {"move", "relocate"}:
-                    # 已符合命名时只搬目录；光鸭会拒绝改成同名的无效请求。
-                    if op == "relocate" and item["new_name"] != source.get("name") and not item.get("move_first"):
-                        client.rename(str(source.get("file_id") or ""), str(item["new_name"]))
-                    client.move(
-                        [str(source.get("file_id") or "")],
-                        _directory_id(item, created_targets),
-                    )
-                    if item.get("move_first"):
-                        client.rename(str(source["file_id"]), str(item["new_name"]))
+                    # 将复合变更作为有序阶段执行：受理不等于生效，前置核验后才推进。
+                    stages = (("move",) if op == "move" or item["new_name"] == source.get("name")
+                              else ("move", "rename") if item.get("move_first") else ("rename", "move"))
+                    for stage in stages:
+                        if stage == "rename":
+                            client.rename(str(source["file_id"]), str(item["new_name"]))
+                        else:
+                            client.move([str(source["file_id"])], _directory_id(item, created_targets))
+                        if stage != stages[-1] and not verify_guangya_write(
+                            lambda: _verify_after(client, {**item, "op": stage}, created_targets=created_targets),
+                            cancel_check=cancel_check,
+                        ):
+                            stats["verification_failed"] += 1
+                            raise GuangYaFSChangeError("前置变更的云端状态尚未确认，未执行后续操作")
                 elif op == "copy":
                     client.copy(
                         [str(source.get("file_id") or "")],

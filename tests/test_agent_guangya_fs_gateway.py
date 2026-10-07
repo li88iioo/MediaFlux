@@ -1504,6 +1504,92 @@ class GuangYaFSGatewayTests(unittest.TestCase):
                     self.assertEqual(selected.name, "广告-ABC.mp4" if move_fails else "Move.mp4")
                     self.assertEqual(selected.parent_id == "source", move_fails)
 
+    def test_relocate_waits_for_rename_visibility_before_moving(self):
+        client = FakeGatewayClient()
+        client.directories["target"].append(GuangYaFile(
+            "occupied", "广告-ABC.mp4", False, parent_id="target", size=1, etag="other"
+        ))
+        plan = self._confirmed_plan(client, {
+            "op": "relocate", "source_name": "广告-ABC.mp4",
+            "target_path": "/target", "new_name": "ABC.mp4",
+        })
+        list_dir, move, rename = client.list_dir, client.move, client.rename
+        pending = []
+        reads = 0
+
+        def delayed_rename(fid, name):
+            pending.append((fid, name))
+            return True
+
+        def delayed_list(parent="0"):
+            nonlocal reads
+            if pending and parent == "source":
+                reads += 1
+                if reads == 3:
+                    rename(*pending[0])
+            return list_dir(parent)
+
+        def move_after_rename(ids, parent):
+            if client.file_info(ids[0]).name != "ABC.mp4":
+                raise GuangYaWriteRejected("move", code="name_conflict")
+            return move(ids, parent)
+
+        with mock.patch.object(client, "rename", side_effect=delayed_rename) as renamed, \
+                mock.patch.object(client, "move", side_effect=move_after_rename) as moved, \
+                mock.patch.object(client, "list_dir", side_effect=delayed_list), \
+                mock.patch("app.clients.guangya.sleep"):
+            result = guangya_fs_change.execute_fs_change_plan(
+                self._queued_payload(plan), client_factory=lambda: client
+            )
+        self.assertFalse(result["partial"])
+        self.assertGreaterEqual(reads, 3)
+        moved.assert_called_once()
+        renamed.assert_called_once()
+        self.assertEqual(client.file_info("rename").name, "ABC.mp4")
+        self.assertEqual(client.file_info("occupied").name, "广告-ABC.mp4")
+
+    def test_move_first_waits_for_move_visibility_before_renaming(self):
+        client = FakeGatewayClient()
+        plan = self._confirmed_plan(client, {
+            "op": "relocate", "source_name": "广告-ABC.mp4",
+            "target_path": "/target", "new_name": "Move.mp4",
+        })
+        list_dir, move, rename = client.list_dir, client.move, client.rename
+        pending = []
+        reads = 0
+
+        def delayed_move(ids, parent):
+            pending.append((ids, parent))
+            return True
+
+        def delayed_list(parent="0"):
+            nonlocal reads
+            if pending and parent == "target":
+                reads += 1
+                if reads == 3:
+                    move(*pending[0])
+            return list_dir(parent)
+
+        def rename_at_destination(fid, name):
+            if client.file_info(fid).parent_id != "target":
+                raise GuangYaWriteRejected("rename", code="name_conflict")
+            return rename(fid, name)
+
+        with mock.patch.object(client, "move", side_effect=delayed_move) as moved, \
+                mock.patch.object(client, "rename", side_effect=rename_at_destination) as renamed, \
+                mock.patch.object(client, "list_dir", side_effect=delayed_list), \
+                mock.patch("app.clients.guangya.sleep"):
+            result = guangya_fs_change.execute_fs_change_plan(
+                self._queued_payload(plan), client_factory=lambda: client
+            )
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["stats"]["relocated"], 1)
+        self.assertGreaterEqual(reads, 3)
+        moved.assert_called_once()
+        renamed.assert_called_once()
+        self.assertEqual(client.file_info("rename").name, "Move.mp4")
+        self.assertEqual(client.file_info("move").parent_id, "source")
+
     def test_move_first_reconciles_rename_failure_without_replaying_move(self):
         for mode in ("rejected", "timeout_before_apply", "timeout_after_apply"):
             with self.subTest(mode=mode):
