@@ -113,6 +113,15 @@ class MediaConsumptionAgentTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             recently_played_arguments({"library_name": "电视剧"})
 
+    def test_recent_library_conflict_survives_public_redaction(self):
+        from app.agent.public_safety import sanitize_public_text
+        with self.assertRaises(AgentToolError) as raised:
+            recently_added_arguments({"library_name": "电视剧", "library_ref": "PO-12345678"})
+        message = sanitize_public_text(str(raised.exception))
+        self.assertEqual(message, "媒体库名称与引用只能指定一个")
+        self.assertNotIn("PO-12345678", message)
+        self.assertNotIn("内部状态", message)
+
     def test_recently_added_tool_forwards_scope_to_provider(self):
         service = get_agent_service()
         profile = MediaServerProfile(source="configured:jellyfin", server_type="jellyfin", label="Jellyfin", url="http://media.invalid", credential="test", enabled=True, user_id="viewer")

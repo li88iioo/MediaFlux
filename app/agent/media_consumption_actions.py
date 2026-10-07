@@ -125,7 +125,7 @@ def recently_added_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
                 raise AgentToolError(f"{key}必须是非空字符串，最多{maximum}字符")
             normalized[key] = value.strip()
     if "library_name" in normalized and "library_ref" in normalized:
-        raise AgentToolError("library_name与library_ref只能指定一个")
+        raise AgentToolError("媒体库名称与引用只能指定一个")
     if "media_type" in arguments:
         if arguments["media_type"] not in ("all", "movie", "tv"):
             raise AgentToolError("media_type仅支持all、movie或tv")
