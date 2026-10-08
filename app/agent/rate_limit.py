@@ -254,7 +254,7 @@ _TOOL_RATE_LIMITS = {
 
 
 class AgentRateLimiter:
-    """线程安全的固定窗口滑动限流器，并对身份状态做有界回收。"""
+    """线程安全的滑动窗口限流器，并对身份状态做有界回收。"""
 
     def __init__(
         self,
@@ -356,7 +356,7 @@ class AgentRateLimiter:
     def _allow_shared(
         self, key: str, *, limit: int, window_seconds: int, cost: int
     ) -> bool:
-        """单行固定窗口桶；跨 Worker 原子判定且不写高频事件日志。"""
+        """单行双窗口计数；只衰减上一个窗口原始计数，不重复结转历史权重。"""
         from app import database as db
 
         digest = hashlib.sha256(
@@ -371,7 +371,7 @@ class AgentRateLimiter:
                 (now_epoch,),
             )
             row = conn.execute(
-                "SELECT window_start,count FROM agent_rate_limit_buckets "
+                "SELECT window_start,count,previous_count FROM agent_rate_limit_buckets "
                 "WHERE limiter_key=?",
                 (digest,),
             ).fetchone()
@@ -383,31 +383,32 @@ class AgentRateLimiter:
                     # 共享身份空间已满时同样保守拒绝新 key，避免轮换身份
                     # 挤掉仍在生效的其他调用方预算。
                     return False
-            carried = 0
+            current_count = previous_count = 0
             if row is not None:
                 previous_start = int(row["window_start"])
-                previous_count = int(row["count"])
                 if previous_start == window_start:
-                    carried = previous_count
+                    current_count = int(row["count"])
+                    previous_count = int(row["previous_count"])
                 elif previous_start == window_start - window_seconds:
-                    remaining = max(0, window_seconds - (now_epoch - window_start))
-                    carried = (
-                        previous_count * remaining + window_seconds - 1
-                    ) // window_seconds
-            new_count = carried + cost
-            if new_count > limit:
+                    previous_count = int(row["count"])
+            remaining = max(0, window_seconds - (now_epoch - window_start))
+            carried = (previous_count * remaining + window_seconds - 1) // window_seconds
+            new_count = current_count + cost
+            if new_count + carried > limit:
                 return False
             conn.execute(
                 "INSERT INTO agent_rate_limit_buckets"
-                "(limiter_key,window_start,count,expires_at,updated_at) "
-                "VALUES(?,?,?,?,?) "
+                "(limiter_key,window_start,count,previous_count,expires_at,updated_at) "
+                "VALUES(?,?,?,?,?,?) "
                 "ON CONFLICT(limiter_key) DO UPDATE SET "
                 "window_start=excluded.window_start,count=excluded.count,"
+                "previous_count=excluded.previous_count,"
                 "expires_at=excluded.expires_at,updated_at=excluded.updated_at",
                 (
                     digest,
                     window_start,
                     new_count,
+                    previous_count,
                     window_start + 2 * window_seconds,
                     db.now(),
                 ),

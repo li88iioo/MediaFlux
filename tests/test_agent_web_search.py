@@ -329,6 +329,30 @@ class WebSearchExecutionTests(IsolatedDatabaseTestCase):
         self.assertTrue(first.allow("same-user", limit=3, window_seconds=60))
         self.assertFalse(second.allow("same-user", limit=3, window_seconds=60))
 
+    def test_shared_rate_bucket_sustained_reads_do_not_accumulate_old_windows(self):
+        limiter = AgentRateLimiter(shared=True)
+        limiter.reset()
+        for stamp in range(120, 1320, 20):
+            with self.subTest(stamp=stamp), patch("app.agent.rate_limit.time.time", return_value=float(stamp)):
+                self.assertTrue(limiter.allow("steady-reader", limit=8, window_seconds=60))
+
+    def test_shared_rate_bucket_decays_previous_window_without_recounting_it(self):
+        limiter = AgentRateLimiter(shared=True)
+        limiter.reset()
+        with patch("app.agent.rate_limit.time.time", return_value=179.0):
+            for _ in range(8):
+                self.assertTrue(limiter.allow("burst-reader", limit=8, window_seconds=60))
+        with patch("app.agent.rate_limit.time.time", return_value=180.0):
+            self.assertFalse(limiter.allow("burst-reader", limit=8, window_seconds=60))
+        with patch("app.agent.rate_limit.time.time", return_value=210.0):
+            for _ in range(4):
+                self.assertTrue(limiter.allow("burst-reader", limit=8, window_seconds=60))
+            self.assertFalse(limiter.allow("burst-reader", limit=8, window_seconds=60))
+        with patch("app.agent.rate_limit.time.time", return_value=240.0):
+            for _ in range(4):
+                self.assertTrue(limiter.allow("burst-reader", limit=8, window_seconds=60))
+            self.assertFalse(limiter.allow("burst-reader", limit=8, window_seconds=60))
+
     def test_shared_rate_bucket_reclaims_expired_rows_and_bounds_identities(self):
         limiter = AgentRateLimiter(shared=True, max_keys=2)
         limiter.reset()

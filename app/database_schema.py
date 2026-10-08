@@ -1589,6 +1589,7 @@ CREATE TABLE IF NOT EXISTS agent_rate_limit_buckets (
     limiter_key TEXT PRIMARY KEY,
     window_start INTEGER NOT NULL,
     count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
+    previous_count INTEGER NOT NULL DEFAULT 0 CHECK(previous_count >= 0),
     expires_at INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL
 );
