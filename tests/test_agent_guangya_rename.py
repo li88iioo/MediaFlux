@@ -110,6 +110,30 @@ class GuangYaRenameTests(unittest.TestCase):
         actions.reset_guangya_rename_context_for_tests()
         self.temp.cleanup()
 
+    def test_preview_and_persisted_flow_keep_distinct_real_filenames(self):
+        for before, after in (
+            ("mf-before.mp4", "mf-after.mp4"),
+            ("Blue.Streak.1999.2160p.H265-KC.mkv", "笨贼妙探.1999.2160p.mkv"),
+            ("Episode_01.mp4", "Episode_02.mp4"),
+        ):
+            with self.subTest(before=before):
+                preview = actions._preview_projection({
+                    "mode": "replace_text", "stats": {"rename_count": 1},
+                    "samples": [{"before": before, "after": after}],
+                })
+                self.assertEqual(preview["sample_changes"], [f"{before} → {after}"])
+                self.assertEqual(actions._safe_preview(preview)["sample_changes"], preview["sample_changes"])
+
+    def test_filename_preview_still_rejects_credentials_and_private_paths(self):
+        for unsafe in ("access_token=private-secret", "/data/private/movie.mp4", r"C:\private\movie.mp4"):
+            with self.subTest(unsafe=unsafe):
+                preview = actions._preview_projection({
+                    "mode": "replace_text", "samples": [{"before": unsafe, "after": "safe.mp4"}],
+                })
+                self.assertEqual(preview["sample_changes"], [])
+                preview["sample_changes"] = [unsafe]
+                self.assertEqual(actions._safe_preview(preview)["sample_changes"], [])
+
     def test_exact_mode_is_rejected_in_favor_of_generic_fs_change(self):
         with self.assertRaisesRegex(Exception, "仅支持 remove_bitrate"):
             actions.guangya_rename_preview_arguments(

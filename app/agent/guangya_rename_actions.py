@@ -13,7 +13,7 @@ from typing import Any
 from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolContext, ToolResult
-from app.agent.public_safety import sanitize_public_text
+from app.agent.public_safety import sanitize_resource_title
 from app.agent.session_context import (
     AgentContextWriteGuard,
     AgentSessionContextRepository,
@@ -115,7 +115,7 @@ def _safe_preview(value: Any) -> dict[str, Any] | None:
     if not isinstance(raw_samples, list):
         return None
     for raw in raw_samples[:5]:
-        sample = sanitize_public_text(raw, limit=520)
+        sample = sanitize_resource_title(raw, limit=520)
         if sample:
             samples.append(sample)
     return {
@@ -420,12 +420,9 @@ def _preview_projection(plan: dict[str, Any]) -> dict[str, Any]:
     for item in list(plan.get("samples") or [])[:5]:
         if not isinstance(item, dict):
             continue
-        before = sanitize_public_text(item.get("before"), limit=255)
-        after = sanitize_public_text(item.get("after"), limit=255)
-        sample = sanitize_public_text(
-            f"{before} → {after}" if before and after else "",
-            limit=520,
-        )
+        before = sanitize_resource_title(item.get("before"), limit=255)
+        after = sanitize_resource_title(item.get("after"), limit=255)
+        sample = f"{before} → {after}" if before and after else ""
         if sample:
             sample_changes.append(sample)
     rename_count = max(0, int(stats.get("rename_count") or 0))
