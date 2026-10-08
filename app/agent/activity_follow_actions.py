@@ -168,30 +168,32 @@ def follow_confirmed(
     )
 
 
-def _stop_state(arguments: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+def _stop_context(arguments: dict[str, Any], context: ToolContext) -> tuple[str, dict[str, Any]]:
     args = stop_arguments(arguments)
     row = rules.get_rule(agent_job_owner_digest(context.owner), args["rule_id"])
     if row is None or row["kind"] != "activity_follow":
         raise AgentToolError(
             "活动跟踪不存在或不属于当前用户", code="precondition_failed"
         )
-    return row
+    # 绑定配置而非租约/检查进度；正常后台运行不应撤销用户的停止确认。
+    fingerprint = _digest({key: row[key] for key in ("id", "owner_digest", "kind", "revision", "settings")})
+    return fingerprint, row
 
 
 def prepare_stop(
     arguments: dict[str, Any], context: ToolContext
 ) -> tuple[ToolResult, str]:
-    row = _stop_state(arguments, context)
+    fingerprint, row = _stop_context(arguments, context)
     return ToolResult(
         True, "confirmation_required", "确认后停止跟踪，不取消原任务", data=_public(row)
-    ), _digest(row)
+    ), fingerprint
 
 
 def stop_confirmed(
     arguments: dict[str, Any], expected_context: str, context: ToolContext
 ) -> ToolResult:
-    row = _stop_state(arguments, context)
-    if expected_context != _digest(row):
+    fingerprint, row = _stop_context(arguments, context)
+    if expected_context != fingerprint:
         raise AgentToolError("跟踪状态已变化，请重新预检", code="precondition_failed")
     saved = rules.save_rule(
         row["owner_digest"],

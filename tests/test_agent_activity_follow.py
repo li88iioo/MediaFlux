@@ -21,6 +21,8 @@ from app.modules.media_automation_rules import (
     drain_automation_rules,
     register_rule_handler,
 )
+from app.repositories import media_automation_rules as rules
+from app.repositories.agent_jobs import agent_job_owner_digest
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -99,6 +101,49 @@ class ActivityFollowTests(IsolatedDatabaseTestCase):
             self.assertRaises(AgentToolError),
         ):
             follow_confirmed(self.arguments, token, self.context)
+
+    def test_stop_confirmation_survives_scheduler_state_changes(self):
+        for phase in ("claimed", "checked", "terminal"):
+            with self.subTest(phase=phase):
+                saved = self.save()
+                args = {"rule_id": saved.data["rule_id"]}
+                _, token = prepare_stop(args, self.context)
+                owner = agent_job_owner_digest(self.context.owner)
+                before = rules.get_rule(owner, args["rule_id"])
+                clock = datetime.now().astimezone() + timedelta(seconds=1)
+                claim = rules.claim_due_rules(clock)[0]
+                if phase != "claimed":
+                    self.assertTrue(rules.finish_rule(
+                        claim["id"], claim["lease_token"],
+                        (clock + timedelta(minutes=5)).isoformat(),
+                        disable=phase == "terminal",
+                    ))
+                current = rules.get_rule(owner, args["rule_id"])
+                self.assertEqual(current["settings"], before["settings"])
+                self.assertEqual(current["revision"], before["revision"])
+                self.assertTrue(stop_confirmed(args, token, self.context).ok)
+                after = rules.get_rule(owner, args["rule_id"])
+                self.assertFalse(after["enabled"])
+                self.assertEqual(after["lease_token"], "")
+                self.assertEqual(after["lease_until"], "")
+                self.assertFalse(rules.owns_lease(claim["id"], claim["lease_token"]))
+                self.assertEqual(after["revision"], before["revision"] + 1)
+                with self.assertRaises(AgentToolError):
+                    stop_confirmed(args, token, self.context)
+
+    def test_stop_confirmation_still_rejects_changed_rule_configuration(self):
+        saved = self.save()
+        args = {"rule_id": saved.data["rule_id"]}
+        _, token = prepare_stop(args, self.context)
+        row = rules.get_rule(agent_job_owner_digest(self.context.owner), args["rule_id"])
+        settings = {**row["settings"], "title": "Changed by another confirmation"}
+        updated = rules.save_rule(row["owner_digest"], kind=row["kind"], settings=settings,
+                                  enabled=True, next_run_at=row["next_run_at"],
+                                  rule_id=row["id"], expected_revision=row["revision"])
+        self.assertIsNotNone(updated)
+        with self.assertRaises(AgentToolError):
+            stop_confirmed(args, token, self.context)
+        self.assertTrue(rules.get_rule(row["owner_digest"], row["id"])["enabled"])
 
     def test_read_running_sends_nothing_then_terminal_notifies_once(self):
         saved = self.save()
