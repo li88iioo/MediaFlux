@@ -117,6 +117,20 @@ class GuangYaMediaHygieneTests(unittest.TestCase):
         for patcher in self.patches:
             patcher.start()
 
+    def test_numeric_provider_sequence_in_year_range_is_cleaned(self):
+        client = FakeHygieneClient()
+        video = client.directories["dir"][0]
+        video.name = "4k688.com@259LUXU-1900.mp4"
+        with mock.patch.object(actions, "GuangYaClient", return_value=client):
+            result = actions.preview_guangya_media_hygiene(
+                {"path": "/NSFW", "recursive": True, "limit": 20, "enrich_metadata": False},
+                ToolContext(owner="year-sequence-owner"),
+            )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["video_rename_count"], 1)
+        self.assertEqual(result.data["identified_video_count"], 1)
+        self.assertIn("4k688.com@259LUXU-1900.mp4 → 259LUXU-1900.mp4", result.data["sample_changes"])
+
     def tearDown(self):
         for patcher in reversed(self.patches):
             patcher.stop()

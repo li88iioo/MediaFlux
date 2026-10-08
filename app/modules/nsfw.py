@@ -265,11 +265,8 @@ def extract_nsfw_identifier(value: str, strip_domains: str = "") -> NsfwIdentifi
             number = match.group(2)
             if prefix.lstrip("0123456789") in _CODE_PREFIX_BLOCKLIST:
                 continue
-            # 只排除真正的季/集占位；不能按首字母整段屏蔽，否则 SW、SD、
-            # EB 等合法成人番号前缀会被误判为普通剧集位置。
-            if prefix in {"S", "E"}:
-                continue
-            if len(number) == 4 and 1900 <= int(number) <= 2099:
+            # 纯字母片名后的年份仍保持保守；数字厂牌前缀的序号不能当年份丢弃。
+            if not prefix[0].isdigit() and len(number) == 4 and 1900 <= int(number) <= 2099:
                 continue
             return NsfwIdentifier(f"{prefix}-{number}", match.group(0), source)
     return None

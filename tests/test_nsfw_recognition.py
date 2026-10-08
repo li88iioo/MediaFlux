@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import tempfile
-from contextlib import nullcontext
 import threading
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
@@ -18,7 +18,6 @@ from app.modules.directory_media import DirectoryInspection, MediaSnapshot
 from app.modules.directory_scrape import DirectoryScrapeService, FixedMatchScraper
 from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
 from app.modules.local_media_service import LocalMediaService
-from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.naming import build_context
 from app.modules.nsfw import (
     MetaTubeClient,
@@ -26,9 +25,9 @@ from app.modules.nsfw import (
     MetaTubeMetadata,
     NsfwRecognizer,
     build_clean_title_candidate,
-    clear_nsfw_cache,
     clean_nsfw_archive_title,
     clean_nsfw_release_text,
+    clear_nsfw_cache,
     extract_nsfw_identifier,
     extract_nsfw_multipart,
     extract_nsfw_part_index,
@@ -36,12 +35,13 @@ from app.modules.nsfw import (
 )
 from app.modules.organize import (
     OrganizePlan,
-    OrganizeRules,
     Organizer,
+    OrganizeRules,
     organize_rules_snapshot,
     organize_rules_snapshot_matches,
     restore_organize_rules_snapshot,
 )
+from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.scraper import Candidate, MatchResult, TMDBScraper
 from app.routes.api import _validate_nsfw_organize_updates
 from tests.support import IsolatedDatabaseTestCase
@@ -140,6 +140,11 @@ class NsfwIdentifierTests(unittest.TestCase):
             "300MIUM-1397.mp4": "300MIUM-1397",
             "300MIUM-1327.mp4": "300MIUM-1327",
             "200GANA-3419.mp4": "200GANA-3419",
+            "4k688.com@259LUXU-1900.mp4": "259LUXU-1900",
+            "259LUXU-1900/259LUXU-1900.mp4": "259LUXU-1900",
+            "300MIUM-1999.mp4": "300MIUM-1999",
+            "300MIUM-2026.mp4": "300MIUM-2026",
+            "200GANA-2099.mp4": "200GANA-2099",
         }
         for value, expected in cases.items():
             with self.subTest(value=value):
@@ -1429,7 +1434,9 @@ class NsfwDownloadSourceTests(IsolatedDatabaseTestCase):
         restored = OrganizeRules(**self.rules.__dict__).for_source("task-dir")
         self.assertTrue(restored.nsfw_exclusive)
         self.assertTrue(organize_rules_snapshot_matches(snapshot, restored))
-        from app.modules.organize_confirmations import _clean_confirmation_retry_is_current
+        from app.modules.organize_confirmations import (
+            _clean_confirmation_retry_is_current,
+        )
         with patch.object(OrganizeRules, "from_config", return_value=OrganizeRules(**self.rules.__dict__)):
             self.assertTrue(_clean_confirmation_retry_is_current({
                 "source_dir_id": "task-dir", "rules": snapshot,
