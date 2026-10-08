@@ -408,11 +408,44 @@ def schedule_media_subscription(subscription_id: int, interval_minutes: int) -> 
     )
 
 
-def delete_media_subscription(subscription_id: int) -> bool:
+def media_subscription_mutation_snapshot(conn: Any, subscription_id: int) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT id,enabled,status,revision,updated_at,"
+        "(SELECT COUNT(*) FROM media_subscription_candidates WHERE subscription_id=s.id "
+        "AND status='available') AS available_candidates,"
+        "(SELECT COUNT(*) FROM media_download_admissions WHERE subscription_id=s.id "
+        "AND status='claimed') AS claimed_admissions,"
+        "(SELECT COUNT(*) FROM media_subscription_runs WHERE subscription_id=s.id "
+        "AND status='running') AS running_checks "
+        "FROM media_subscriptions s WHERE id=? AND deleted_at IS NULL",
+        (subscription_id,),
+    ).fetchone()
+    if row is None:
+        return {"exists": False, "subscription_id": subscription_id}
+    return {
+        "exists": True,
+        "subscription_id": subscription_id,
+        "enabled": bool(row["enabled"]),
+        "status": str(row["status"] or ""),
+        "revision": int(row["revision"] or 0),
+        "updated_at": str(row["updated_at"] or ""),
+        "available_candidates": int(row["available_candidates"]),
+        "claimed_admissions": int(row["claimed_admissions"]),
+        "running_checks": int(row["running_checks"]),
+    }
+
+
+def delete_media_subscription(
+    subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None
+) -> bool:
     """软删除订阅，保留已经发生的下载审计和运行记录。"""
     stamp = now()
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        if expected_snapshot is not None and (
+            media_subscription_mutation_snapshot(conn, subscription_id) != expected_snapshot
+        ):
+            return False
         cur = conn.execute(
             "UPDATE media_subscriptions SET enabled=0,status='paused',deleted_at=?,revision=revision+1,"
             "updated_at=? WHERE id=? AND deleted_at IS NULL",

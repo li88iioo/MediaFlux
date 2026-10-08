@@ -551,46 +551,6 @@ def get_media_subscription_summary(arguments: dict[str, int]) -> ToolResult:
     )
 
 
-def _count(conn: Any, table: str, subscription_id: int, status: str) -> int:
-    row = conn.execute(
-        f"SELECT COUNT(*) AS total FROM {table} WHERE subscription_id=? AND status=?",
-        (subscription_id, status),
-    ).fetchone()
-    return max(0, int((row["total"] if row else 0) or 0))
-
-
-def _snapshot(conn: Any, subscription_id: int) -> dict[str, Any]:
-    row = conn.execute(
-        "SELECT id,enabled,status,revision,updated_at FROM media_subscriptions "
-        "WHERE id=? AND deleted_at IS NULL",
-        (subscription_id,),
-    ).fetchone()
-    if row is None:
-        return {"exists": False, "subscription_id": subscription_id}
-    return {
-        "exists": True,
-        "subscription_id": subscription_id,
-        "enabled": bool(row["enabled"]),
-        "status": str(row["status"] or ""),
-        "revision": int(row["revision"] or 0),
-        "updated_at": str(row["updated_at"] or ""),
-        "available_candidates": _count(
-            conn, "media_subscription_candidates", subscription_id, "available"
-        ),
-        "claimed_admissions": _count(
-            conn, "media_download_admissions", subscription_id, "claimed"
-        ),
-        "running_checks": _count(
-            conn, "media_subscription_runs", subscription_id, "running"
-        ),
-    }
-
-
-def _capture(subscription_id: int) -> dict[str, Any]:
-    with db.get_conn() as conn:
-        return _snapshot(conn, subscription_id)
-
-
 def _fingerprint(state: dict[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(
@@ -864,7 +824,8 @@ def prepare_delete_media_subscription(
     arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
     subscription_id = int(arguments["subscription_id"])
-    state = _capture(subscription_id)
+    with db.get_conn() as conn:
+        state = db.media_subscription_mutation_snapshot(conn, subscription_id)
     if not state.get("exists"):
         raise AgentToolError("未找到指定的媒体追更订阅", code="precondition_failed")
     row = db.get_media_subscription(subscription_id)
@@ -901,23 +862,20 @@ def delete_media_subscription_confirmed(
     arguments: dict[str, Any], expected_context: str
 ) -> ToolResult:
     subscription_id = int(arguments["subscription_id"])
-    state = _capture(subscription_id)
-    if not state.get("exists") or not secrets.compare_digest(
-        _fingerprint(state), str(expected_context or "")
+    with db.get_conn() as conn:
+        state = db.media_subscription_mutation_snapshot(conn, subscription_id)
+    if (
+        not state.get("exists")
+        or not secrets.compare_digest(_fingerprint(state), str(expected_context or ""))
+        or not get_media_subscription_service().delete_subscription(
+            subscription_id, expected_snapshot=state
+        )
     ):
         return ToolResult(
             ok=False,
             status="conflict",
             summary="媒体追更订阅状态已变化，请重新预检",
             error="确认快照已失效。",
-        )
-    removed = get_media_subscription_service().delete_subscription(subscription_id)
-    if not removed:
-        return ToolResult(
-            ok=False,
-            status="conflict",
-            summary="媒体追更订阅状态已变化，请重新预检",
-            error="目标订阅已不存在。",
         )
     runtime_refreshed = _reload_scheduler()
     return ToolResult(
@@ -952,7 +910,8 @@ def prepare_set_media_subscription_enabled(
     arguments: dict[str, Any],
 ) -> tuple[ToolResult, str]:
     subscription_id = int(arguments["subscription_id"])
-    state = _capture(subscription_id)
+    with db.get_conn() as conn:
+        state = db.media_subscription_mutation_snapshot(conn, subscription_id)
     if not state.get("exists"):
         raise AgentToolError("未找到指定的媒体追更订阅", code="precondition_failed")
     requested = bool(arguments["enabled"])
@@ -1015,7 +974,7 @@ def set_media_subscription_enabled_confirmed(
     requested = bool(arguments["enabled"])
     with db.get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        state = _snapshot(conn, subscription_id)
+        state = db.media_subscription_mutation_snapshot(conn, subscription_id)
         if not state.get("exists") or not secrets.compare_digest(
             _fingerprint(state), str(expected_context or "")
         ):

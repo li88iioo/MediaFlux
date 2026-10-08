@@ -606,8 +606,12 @@ class MediaSubscriptionService:
             raise MediaSubscriptionError("媒体订阅不存在", status_code=404, code="not_found")
         return self.get_subscription(int(subscription_id))
 
-    def delete_subscription(self, subscription_id: int) -> bool:
-        return db.delete_media_subscription(int(subscription_id))
+    def delete_subscription(
+        self, subscription_id: int, *, expected_snapshot: dict[str, Any] | None = None
+    ) -> bool:
+        return db.delete_media_subscription(
+            int(subscription_id), expected_snapshot=expected_snapshot
+        )
 
     async def check_subscription(
         self,

@@ -150,6 +150,47 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
 
+    def _assert_delete_rechecks_transaction(self, change: str) -> None:
+        from app.agent.media_subscription_actions import (
+            prepare_delete_media_subscription, delete_media_subscription_confirmed,
+        )
+        from app.modules.media_subscriptions import get_media_subscription_service
+
+        service = get_media_subscription_service()
+        original = service.delete_subscription
+        args = {"subscription_id": self.sid}
+        _, context = prepare_delete_media_subscription(args)
+        def concurrent_change(subscription_id, **kwargs):
+            if change == "revision":
+                db.update_media_subscription_config(subscription_id, action="notify")
+            else:
+                self._seed_inflight_state()
+            return original(subscription_id, **kwargs)
+        with patch.object(service, "delete_subscription", side_effect=concurrent_change):
+            result = delete_media_subscription_confirmed(args, context)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "conflict")
+        row = db.get_media_subscription(self.sid)
+        self.assertIsNotNone(row)
+        if change == "revision":
+            self.assertEqual(row["action"], "notify")
+        else:
+            with db.get_conn() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT status FROM media_subscription_candidates WHERE subscription_id=?",
+                    (self.sid,),
+                ).fetchone()[0], "available")
+                self.assertEqual(conn.execute(
+                    "SELECT status FROM media_download_admissions WHERE subscription_id=?",
+                    (self.sid,),
+                ).fetchone()[0], "claimed")
+
+    def test_delete_rechecks_revision_inside_final_write_transaction(self) -> None:
+        self._assert_delete_rechecks_transaction("revision")
+
+    def test_delete_rechecks_related_work_inside_final_write_transaction(self) -> None:
+        self._assert_delete_rechecks_transaction("related_work")
+
     def test_subscription_policy_enforces_effective_tv_season_invariant(self) -> None:
         service = get_agent_service()
         with self.assertRaises(AgentToolError):
