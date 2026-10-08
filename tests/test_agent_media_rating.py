@@ -117,6 +117,27 @@ class MediaRatingArgumentTests(unittest.TestCase):
 
 
 class MediaRatingExecutionTests(unittest.TestCase):
+    def test_failure_evidence_only_describes_attempted_sources(self):
+        for structured in (False, True):
+            for fallback in (False, True):
+                with self.subTest(structured=structured, fallback=fallback), patch(
+                    "app.agent.media_rating_actions.config.get_bool", return_value=structured
+                ), patch("app.agent.media_rating_actions.get_discovery_search_service") as source, patch(
+                    "app.agent.media_rating_actions._web_rating", return_value=None
+                ) as web:
+                    source.return_value.search.return_value = _search_result(
+                        errors=({"provider": "douban", "code": "unavailable"},), succeeded=()
+                    )
+                    result = lookup_media_rating({"query": "九门", "media_type": "tv", "allow_web_fallback": fallback})
+                self.assertFalse(result.ok)
+                self.assertEqual(source.called, structured)
+                self.assertEqual(web.called, fallback)
+                self.assertEqual(result.data["web_fallback_used"], fallback)
+                evidence = " ".join(item.description for item in result.evidence)
+                self.assertIn("网页补查未取得" if fallback else "未进行网页补查", result.summary)
+                self.assertIn("已尝试豆瓣结构化查询" if structured else "结构化查询未启用", evidence)
+                self.assertIn("已尝试网页补查" if fallback else "未进行网页补查", evidence)
+
     @patch("app.agent.media_rating_actions.config.get_bool", return_value=True)
     @patch("app.agent.media_rating_actions.get_discovery_search_service")
     @patch("app.agent.media_rating_actions.get_discovery_service")
@@ -316,4 +337,5 @@ class MediaRatingExecutionTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status, "not_found")
         self.assertIn("电影还是电视剧", result.summary)
+        self.assertNotIn("存在同名作品", result.summary)
         web_search.assert_not_called()

@@ -17,7 +17,7 @@ from app.agent.async_bridge import AsyncBridgeUnavailable, run_awaitable_sync
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
 from app.agent.web_search_actions import search_web
-from app.discovery.models import MediaCard, ProviderError
+from app.discovery.models import MediaCard
 from app.discovery.search import get_discovery_search_service
 from app.discovery.service import get_discovery_service
 from app.indexers.errors import IndexerError
@@ -451,8 +451,9 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
     selected: MediaCard | None = None
     provider_error = False
     web_fallback_attempted = False
+    structured_attempted = config.get_bool("DISCOVERY_ENABLED")
 
-    if config.get_bool("DISCOVERY_ENABLED"):
+    if structured_attempted:
         try:
             search_result = get_discovery_search_service().search(query, 1, ["douban"])
             selected = _select_card(
@@ -464,11 +465,8 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
             provider_error = bool(search_result.errors) and not bool(
                 search_result.providers_succeeded
             )
-        except (ProviderError, ValueError, RuntimeError) as exc:
-            logger.info("Agent 豆瓣评分结构化查询失败 type=%s", type(exc).__name__)
-            provider_error = True
-        except Exception as exc:  # 防止评分辅助能力拖垮整个 Agent 请求。
-            logger.warning("Agent 豆瓣评分查询异常 type=%s", type(exc).__name__)
+        except Exception as exc:  # 辅助评分失败只报告该来源，不中断整个 Agent。
+            logger.warning("Agent 豆瓣评分结构化查询失败 type=%s", type(exc).__name__)
             provider_error = True
 
     if selected is not None:
@@ -484,12 +482,8 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
             detail = get_discovery_service().get_detail(
                 "douban", selected.media_type, selected.external_id
             )
-        except (ProviderError, ValueError, RuntimeError) as exc:
-            logger.info("Agent 豆瓣评分详情查询失败 type=%s", type(exc).__name__)
-            detail = None
-            provider_error = True
-        except Exception as exc:  # 防止评分辅助能力拖垮整个 Agent 请求。
-            logger.warning("Agent 豆瓣评分详情异常 type=%s", type(exc).__name__)
+        except Exception as exc:  # 详情不可用仍可按调用方授权尝试网页补查。
+            logger.warning("Agent 豆瓣评分详情查询失败 type=%s", type(exc).__name__)
             detail = None
             provider_error = True
         if detail is not None:
@@ -531,14 +525,11 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
         )
         identity += f"（{qualifiers}）"
     if not media_type:
-        reason = "存在同名作品，暂时无法确认要查询电影还是电视剧"
+        reason = "尚未明确要查询电影还是电视剧，无法核验评分"
         suggestions = ["请补充“电影”或“电视剧”，我会继续查询同一作品。"]
     else:
-        reason = (
-            "豆瓣数据源暂时不可用，网页补查也没有得到可核验的分数"
-            if provider_error
-            else "暂未找到可核验的豆瓣评分"
-        )
+        reason = "豆瓣数据源暂时不可用" if provider_error else "未取得可核验的豆瓣评分"
+        reason += "；网页补查未取得可核验的评分" if web_fallback_attempted else "；未进行网页补查"
         suggestions = ["稍后直接说“重试”，我会继续查询同一部作品。"]
     return ToolResult(
         ok=False,
@@ -558,7 +549,8 @@ def lookup_media_rating(arguments: dict[str, Any]) -> ToolResult:
         evidence=[
             Evidence(
                 "douban",
-                "已尝试豆瓣结构化数据；启用网页搜索时也会核验豆瓣网页摘要。",
+                ("已尝试豆瓣结构化查询。" if structured_attempted else "结构化查询未启用，本次未调用。")
+                + ("已尝试网页补查，未取得可核验评分。" if web_fallback_attempted else "本次未进行网页补查。"),
                 _now(),
             )
         ],
