@@ -413,7 +413,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="recognition.set_rule_enabled",
-            description="预检并在用户确认后，按明确规则类型和编号启用或停用一条识别规则；不会修改规则内容、映射、别名或优先级。",
+            description="预检并在用户确认后，按明确规则类型和编号启用或停用一条识别规则；发布格式教学使用release_format及保存回执的rule_id，不得当成preprocess_rule。不会修改规则内容、映射、别名或优先级。",
             risk=RiskLevel.LOW_WRITE,
             parameters={
                 "type": "object",
@@ -425,6 +425,7 @@ def register_specs(
                             "preprocess_rule",
                             "tmdb_regex_rule",
                             "knowledge_entry",
+                            "release_format",
                         ],
                     },
                     "rule_id": {"type": "integer", "minimum": 1},

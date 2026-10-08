@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from app import database as db
 from app.agent.rate_limit import agent_rate_limiter
+from app.modules.recognition import formats
 from app.modules import (
     recognition_knowledge,
     recognition_preprocess_rules,
@@ -31,11 +32,14 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM tmdb_regex_rules")
             conn.execute("DELETE FROM recognition_knowledge")
             conn.execute("DELETE FROM agent_action_history")
+            conn.execute("DELETE FROM recognition_format_rules")
+        formats.invalidate_cache()
         recognition_knowledge.invalidate_active_cache()
         reset_agent_service_for_tests()
         agent_rate_limiter.reset()
 
     def tearDown(self) -> None:
+        formats.invalidate_cache()
         recognition_preprocess_rules.invalidate_active_cache()
         recognition_knowledge.reset_runtime_state_for_tests()
         reset_agent_service_for_tests()
@@ -198,3 +202,76 @@ class AgentRecognitionToggleTests(IsolatedDatabaseTestCase):
             ).fetchone()
         self.assertEqual(int(row["disabled"]), 0)
         self.assertNotIn("SECRET changed name", self._serialized(confirmed))
+
+    def test_release_format_toggle_uses_native_change_and_refreshes_parser(self):
+        from tests.test_release_formats import save_teaching, filename, PARENT
+        from app.modules.scraper import extract_recognition_context
+        item, _ = save_teaching()
+        unrelated = self._preprocess_rule()
+        service = get_agent_service()
+        self.assertEqual(extract_recognition_context(filename(15), PARENT).episode, 15)
+        for enabled, expected_episode in ((False, None), (True, 15)):
+            prepared = service.prepare("recognition.set_rule_enabled", {
+                "rule_type": "release_format", "rule_id": item["id"], "enabled": enabled,
+            }, owner="format-owner")
+            revision = formats.list_rules()[0]["revision"]
+            with patch.object(formats, "change", wraps=formats.change) as change:
+                result = service.confirm(prepared["action_plan"]["plan_id"], owner="format-owner")
+            self.assertTrue(result["result"]["ok"])
+            change.assert_called_once_with(item["id"], {"revision": revision, "disabled": not enabled})
+            self.assertEqual(formats.list_rules()[0]["revision"], revision + 1)
+            self.assertEqual(extract_recognition_context(filename(15), PARENT).episode, expected_episode)
+            with db.get_conn() as conn:
+                self.assertEqual(conn.execute("SELECT disabled FROM recognition_preprocess_rules WHERE id=?", (unrelated["id"],)).fetchone()[0], 0)
+
+    def test_release_format_stale_confirmation_does_not_replay(self):
+        from tests.test_release_formats import save_teaching
+        item, _ = save_teaching()
+        service = get_agent_service()
+        prepared = service.prepare("recognition.set_rule_enabled", {
+            "rule_type": "release_format", "rule_id": item["id"], "enabled": False,
+        }, owner="format-owner")
+        formats.change(item["id"], {"revision": item["revision"], "disabled": True})
+        result = service.confirm(prepared["action_plan"]["plan_id"], owner="format-owner")
+        self.assertFalse(result["result"]["ok"])
+        self.assertEqual(result["result"]["status"], "conflict")
+        self.assertTrue(formats.list_rules()[0]["disabled"])
+        self.assertEqual(formats.list_rules()[0]["revision"], item["revision"] + 1)
+
+    def test_release_format_change_after_agent_check_is_rejected_by_native_revision(self):
+        from tests.test_release_formats import save_teaching
+        item, _ = save_teaching()
+        service = get_agent_service()
+        prepared = service.prepare("recognition.set_rule_enabled", {
+            "rule_type": "release_format", "rule_id": item["id"], "enabled": False,
+        }, owner="format-owner")
+        real_change = formats.change
+        def concurrent_change(rule_id, value):
+            real_change(rule_id, {"revision": item["revision"], "disabled": True})
+            return real_change(rule_id, value)
+        with patch.object(formats, "change", side_effect=concurrent_change):
+            result = service.confirm(prepared["action_plan"]["plan_id"], owner="format-owner")
+        self.assertEqual(result["result"]["status"], "conflict")
+        self.assertTrue(formats.list_rules()[0]["disabled"])
+        self.assertEqual(formats.list_rules()[0]["revision"], item["revision"] + 1)
+
+    def test_release_format_reenable_obeys_native_conflict_replay(self):
+        from tests.test_release_formats import save_teaching, teaching
+        item, _ = save_teaching()
+        formats.change(item["id"], {"revision": item["revision"], "disabled": True})
+        alternate = teaching()
+        alternate["draft"]["template"] = alternate["draft"]["template"].replace("track{episode}r{version}", "track0{version}r{episode}")
+        alternate["examples"][0]["episode"] = 2
+        alternate["examples"][1]["filename"] = alternate["examples"][1]["filename"].replace("r2]", "r3]")
+        alternate["examples"][1]["episode"] = 3
+        alternate["filenames"] = []
+        other, _ = save_teaching(alternate)
+        service = get_agent_service()
+        prepared = service.prepare("recognition.set_rule_enabled", {
+            "rule_type": "release_format", "rule_id": item["id"], "enabled": True,
+        }, owner="format-owner")
+        result = service.confirm(prepared["action_plan"]["plan_id"], owner="format-owner")
+        self.assertEqual(result["result"]["status"], "conflict")
+        stored = {r["id"]: r for r in formats.list_rules()}
+        self.assertTrue(stored[item["id"]]["disabled"])
+        self.assertFalse(stored[other["id"]]["disabled"])

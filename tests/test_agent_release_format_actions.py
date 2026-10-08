@@ -197,6 +197,17 @@ class ReleaseFormatAgentActionTests(IsolatedDatabaseTestCase):
         self.assertIsNone(_parse_release_core(filename(15), PARENT).context.episode)
         self.assertEqual(first.data["enabled"], True)
 
+    def test_saved_rule_receipt_exposes_stable_typed_identity(self) -> None:
+        value = teaching()
+        _, token = prepare_release_format(value)
+        first = save_release_format_confirmed(value, token)
+        second = save_release_format_confirmed(value, token)
+        item = formats.list_rules()[0]
+        for result in (first, second):
+            self.assertEqual(result.data["rule_type"], "release_format")
+            self.assertEqual(result.data["rule_id"], item["id"])
+            self.assertEqual(result.model_data["rule_id"], item["id"])
+
     def test_cancel_without_confirmation_has_no_write(self) -> None:
         _, _token = prepare_release_format(teaching())
         self.assertEqual(self.rule_count(), 0)

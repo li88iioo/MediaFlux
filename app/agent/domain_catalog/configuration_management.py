@@ -132,7 +132,8 @@ def register_specs(registry, **_dependencies) -> None:
                 ToolSpec.context_free_confirmed_handler(save_release_format_confirmed) if save else None
             ),
             domains=("recognition", "config"),
-            related_tools=("recognition.preview_release_format" if save else "recognition.save_release_format",),
+            related_tools=(("recognition.preview_release_format", "recognition.set_rule_enabled")
+                           if save else ("recognition.save_release_format",)),
             examples=("教你识别这个发布组的格式", "这些文件集号识别错了，r2是修订版不是第二集",
                       "先批量预览，不要保存" if not save else "记住这个格式，以后自动识别"),
         ))

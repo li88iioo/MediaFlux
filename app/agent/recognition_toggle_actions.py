@@ -17,11 +17,20 @@ from app import database as db
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
 from app.modules import recognition_knowledge, recognition_preprocess_rules
+from app.modules.recognition import formats
 
 _RULE_TYPES = {
     "preprocess_rule": "识别预处理规则",
     "tmdb_regex_rule": "TMDB 正则规则",
     "knowledge_entry": "识别知识条目",
+    "release_format": "发布格式教学规则",
+}
+
+_RULE_TABLES = {
+    "preprocess_rule": "recognition_preprocess_rules",
+    "tmdb_regex_rule": "tmdb_regex_rules",
+    "knowledge_entry": "recognition_knowledge",
+    "release_format": "recognition_format_rules",
 }
 
 
@@ -66,19 +75,10 @@ def _ensure_storage(rule_type: str) -> None:
 
 
 def _fetch_row(conn: Any, rule_type: str, rule_id: int) -> Any | None:
-    if rule_type == "preprocess_rule":
-        return conn.execute(
-            "SELECT * FROM recognition_preprocess_rules WHERE id=?", (rule_id,)
-        ).fetchone()
-    if rule_type == "tmdb_regex_rule":
-        return conn.execute(
-            "SELECT * FROM tmdb_regex_rules WHERE id=?", (rule_id,)
-        ).fetchone()
-    if rule_type == "knowledge_entry":
-        return conn.execute(
-            "SELECT * FROM recognition_knowledge WHERE id=?", (rule_id,)
-        ).fetchone()
-    raise AgentToolError("rule_type 不受支持")
+    table = _RULE_TABLES.get(rule_type)
+    if table is None:
+        raise AgentToolError("rule_type 不受支持")
+    return conn.execute(f"SELECT * FROM {table} WHERE id=?", (rule_id,)).fetchone()
 
 
 def _row_value(row: Mapping[str, Any] | Any, key: str, default: Any = "") -> Any:
@@ -116,6 +116,8 @@ def _snapshot(row: Any, *, rule_type: str, rule_id: int) -> dict[str, Any]:
             "builtin_key",
             "created_at",
         )
+    elif rule_type == "release_format":
+        identity_fields = ("revision", "signature", "name", "template", "scope", "parent_path", "examples_json")
     elif rule_type == "tmdb_regex_rule":
         identity_fields = (
             "name",
@@ -215,26 +217,11 @@ def prepare_set_recognition_rule_enabled(
 
 
 def _update_enabled(conn: Any, *, rule_type: str, rule_id: int, enabled: bool) -> None:
-    disabled = 0 if enabled else 1
-    timestamp = db.now()
-    if rule_type == "preprocess_rule":
-        cursor = conn.execute(
-            "UPDATE recognition_preprocess_rules SET disabled=?,updated_at=? WHERE id=?",
-            (disabled, timestamp, rule_id),
-        )
-    elif rule_type == "tmdb_regex_rule":
-        cursor = conn.execute(
-            "UPDATE tmdb_regex_rules SET disabled=?,updated_at=? WHERE id=?",
-            (disabled, timestamp, rule_id),
-        )
-    elif rule_type == "knowledge_entry":
-        cursor = conn.execute(
-            "UPDATE recognition_knowledge "
-            "SET disabled=?,user_modified=1,updated_at=? WHERE id=?",
-            (disabled, timestamp, rule_id),
-        )
-    else:  # pragma: no cover - validator guarantees the enum
-        raise AgentToolError("rule_type 不受支持")
+    extra = ",user_modified=1" if rule_type == "knowledge_entry" else ""
+    cursor = conn.execute(
+        f"UPDATE {_RULE_TABLES[rule_type]} SET disabled=?,updated_at=?{extra} WHERE id=?",
+        (int(not enabled), db.now(), rule_id),
+    )
     if cursor.rowcount != 1:
         raise AgentToolError("指定的识别规则不存在", code="precondition_failed")
 
@@ -256,7 +243,8 @@ def set_recognition_rule_enabled_confirmed(
     _ensure_storage(rule_type)
 
     with db.get_conn() as conn:
-        conn.execute("BEGIN IMMEDIATE")
+        if rule_type != "release_format":
+            conn.execute("BEGIN IMMEDIATE")
         row = _fetch_row(conn, rule_type, rule_id)
         if row is None:
             return ToolResult(
@@ -282,14 +270,17 @@ def set_recognition_rule_enabled_confirmed(
                 summary="识别规则状态已经变化，请重新预检",
                 error="确认快照已失效。",
             )
-        _update_enabled(
-            conn,
-            rule_type=rule_type,
-            rule_id=rule_id,
-            enabled=requested,
-        )
+        if rule_type != "release_format":
+            _update_enabled(conn, rule_type=rule_type, rule_id=rule_id, enabled=requested)
 
-    _invalidate_runtime(rule_type)
+    if rule_type == "release_format":
+        # 发布格式由唯一领域入口校验修订号、重新启用冲突并刷新解析缓存。
+        try:
+            formats.change(rule_id, {"revision": int(row["revision"]), "disabled": not requested})
+        except formats.FormatConflict:
+            return ToolResult(False, "conflict", "发布格式规则已变化或与当前规则冲突，请重新预检")
+    else:
+        _invalidate_runtime(rule_type)
     label = _RULE_TYPES[rule_type]
     operation = "启用" if requested else "停用"
     return ToolResult(

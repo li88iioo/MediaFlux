@@ -215,9 +215,9 @@ def save_release_format_confirmed(arguments: dict[str, Any], token: str) -> Tool
         text = "相同发布格式规则已存在且已停用，本次未重新启用"
     else:
         text = "相同发布格式规则已存在且保持启用，未重复创建"
-    data = {"resources": [], "effects": ["只保存以后识别使用的字段规则。", "不移动文件、不绑定 TMDB、不偏移季集编号。"],
+    data = {"rule_type": "release_format", "rule_id": int(item["id"]), "resources": [], "effects": ["只保存以后识别使用的字段规则。", "不移动文件、不绑定 TMDB、不偏移季集编号。"],
             "total": 1, "count": 1, "created": bool(created), "duplicate": duplicate,
             "enabled": enabled, "review_required": 0,
             "summary": {"created": bool(created), "duplicate": duplicate, "enabled": enabled}}
-    return ToolResult(True, "success", text, data=data,
+    return ToolResult(True, "success", f"{text}（发布格式规则 #{item["id"]}）", data=data,
                       model_data={"draft": normalized["draft"], "examples": normalized["examples"], **data})
