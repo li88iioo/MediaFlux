@@ -36,6 +36,65 @@ async def collect(stream):
 
 
 class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_responses_empty_completion_fields_do_not_erase_streamed_arguments(self):
+        arguments = '{"profile_ref":"configured:jellyfin","item_ref":"ref_test"}'
+        for final_type in ("response.function_call_arguments.done", "response.output_item.done"):
+            for final_arguments in (None, "", "   "):
+                with self.subTest(final_type=final_type, final_arguments=final_arguments):
+                    final = {"type": final_type, "output_index": 0, "item_id": "item1", "arguments": final_arguments}
+                    if final_type.endswith("output_item.done"):
+                        final["item"] = {"type": "function_call", "id": "item1", "call_id": "call1", "name": "inspect", "arguments": final_arguments}
+                    frames = [
+                        {"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "item1", "call_id": "call1", "name": "inspect", "arguments": ""}},
+                        {"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "item1", "delta": arguments},
+                        final,
+                        {"type": "response.completed", "response": {"status": "completed"}},
+                    ]
+                    events = await collect(iter_protocol_model_events(chunks(frames, split=11), protocol="responses"))
+                    calls = [event.tool_call for event in events if event.type is ModelEventType.TOOL_CALL_COMPLETED]
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(dict(calls[0].arguments), json.loads(arguments))
+
+    async def test_responses_completion_keeps_explicit_empty_object_but_rejects_partial_json(self):
+        for delta, final, expected in (("{invalid", "", None), ('{"old":1}', "{}", {})):
+            frames = [
+                {"type": "response.output_item.added", "output_index": 0, "item": {"type": "function_call", "id": "i", "call_id": "c", "name": "inspect", "arguments": ""}},
+                {"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "i", "delta": delta},
+                {"type": "response.output_item.done", "output_index": 0, "item": {"type": "function_call", "id": "i", "call_id": "c", "name": "inspect", "arguments": final}},
+                {"type": "response.completed", "response": {"status": "completed"}},
+            ]
+            stream = iter_protocol_model_events(chunks(frames), protocol="responses")
+            if expected is None:
+                with self.assertRaises(ModelProviderError):
+                    await collect(stream)
+            else:
+                events = await collect(stream)
+                calls = [e.tool_call for e in events if e.type is ModelEventType.TOOL_CALL_COMPLETED]
+                self.assertEqual(dict(calls[0].arguments), expected)
+
+    async def test_per_request_model_does_not_mutate_shared_provider_settings(self):
+        seen = []
+        class Response:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+            async def aiter_bytes(self):
+                async for chunk in chunks([{"choices": [{"delta": {"content": "ok"}, "finish_reason": "stop"}]}, "[DONE]"]):
+                    yield chunk
+        class Client:
+            @asynccontextmanager
+            async def stream_post_json(self, url, **kwargs):
+                seen.append((url, kwargs["json"]["model"]))
+                yield Response()
+            async def aclose(self):
+                pass
+        settings = ProviderSettings(api_url="https://api.example.com/v1", model="global", protocol="chat_completions")
+        adapter = OpenAICompatibleModelAdapter(settings, client_factory=lambda **_: Client())
+        for model in ("chat-selected", ""):
+            await collect(adapter.stream(ModelRequest(system_prompt="", messages=(), tools=(), model=model), cancellation=CancellationToken()))
+        self.assertEqual([x[1] for x in seen], ["chat-selected", "global"])
+        self.assertEqual(seen[0][0], seen[1][0])
+        self.assertEqual(settings.model, "global")
+
     async def test_responses_failure_before_output_keeps_original_bounded_retry(self):
         class Response:
             status_code = 200
@@ -223,12 +282,37 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_network_idle_timeout_seconds(90), 90)
         self.assertEqual(_network_idle_timeout_seconds(240), 120)
 
+    def test_provider_settings_accepts_2_to_120_second_timeout_range(self) -> None:
+        for timeout_seconds in (2, 12, 30, 120):
+            with self.subTest(timeout_seconds=timeout_seconds):
+                settings = ProviderSettings(
+                    api_url="https://api.example.com/v1",
+                    model="sample",
+                    timeout_seconds=timeout_seconds,
+                )
+                self.assertEqual(settings.timeout_seconds, timeout_seconds)
+        for timeout_seconds in (1, 121):
+            with self.subTest(timeout_seconds=timeout_seconds), self.assertRaises(
+                ValueError
+            ):
+                ProviderSettings(
+                    api_url="https://api.example.com/v1",
+                    model="sample",
+                    timeout_seconds=timeout_seconds,
+                )
+
     def test_stream_deadline_is_wider_than_network_idle_timeout_but_bounded(
         self,
     ) -> None:
         self.assertEqual(_stream_deadline_seconds(2), 60)
         self.assertEqual(_stream_deadline_seconds(30), 120)
         self.assertEqual(_stream_deadline_seconds(120), 300)
+        self.assertEqual(
+            _stream_deadline_seconds(_network_idle_timeout_seconds(2)), 120
+        )
+        self.assertEqual(
+            _stream_deadline_seconds(_network_idle_timeout_seconds(120)), 300
+        )
 
     async def test_chat_stream_rejects_eof_after_stop_without_done(self) -> None:
         truncated = [

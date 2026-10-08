@@ -96,6 +96,7 @@ class ModelRequest:
     tools: Sequence[Mapping[str, Any]]
     max_output_tokens: int = 1_500
     round_index: int = 0
+    model: str = ""  # 由受控会话偏好选择，不改变 Provider URL、凭据或协议。
 
 
 class ModelAdapter(Protocol):

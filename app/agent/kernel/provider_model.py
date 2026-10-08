@@ -51,14 +51,14 @@ _MODEL_RETRY_DELAY_SECONDS = 0.25
 
 
 def _network_idle_timeout_seconds(configured_timeout_seconds: int) -> int:
-    """模型可能在原生工具调用前长时间不输出，给流式读取保留合理下限。"""
+    """将配置值映射为网络空闲预算：保留 30 秒下限，并限制在 120 秒内。"""
     return min(
         120, max(_MODEL_IDLE_TIMEOUT_FLOOR_SECONDS, int(configured_timeout_seconds))
     )
 
 
 def _stream_deadline_seconds(network_timeout_seconds: int) -> int:
-    """流式响应使用网络空闲超时，同时保留独立的总时限保险丝。"""
+    """为整轮流式响应计算独立总时限，最长 300 秒，不等同于网络空闲预算。"""
     return min(300, max(60, int(network_timeout_seconds) * 4))
 
 
@@ -260,32 +260,22 @@ async def iter_protocol_model_events(
                 raw["arguments"] = str(raw.get("arguments") or "") + str(
                     event.get("delta") or ""
                 )
-            elif event_type == "response.function_call_arguments.done":
-                key = call_key(
-                    index=event.get("output_index"), item_id=event.get("item_id")
-                )
-                raw = calls.setdefault(key, {})
-                if event.get("arguments") is not None:
-                    raw["arguments"] = event.get("arguments")
-                async for item in emit_call(key):
-                    yield item
-            elif event_type == "response.output_item.done":
-                item = event.get("item")
-                if isinstance(item, dict) and item.get("type") == "function_call":
+            elif event_type in {"response.function_call_arguments.done", "response.output_item.done"}:
+                arguments_done = event_type == "response.function_call_arguments.done"
+                item = event if arguments_done else event.get("item")
+                if isinstance(item, dict) and (arguments_done or item.get("type") == "function_call"):
                     key = call_key(
-                        index=event.get("output_index"), item_id=item.get("id")
+                        index=event.get("output_index"),
+                        item_id=event.get("item_id") if arguments_done else item.get("id"),
                     )
                     raw = calls.setdefault(key, {})
-                    raw.update(
-                        {
-                            "id": item.get("id"),
-                            "call_id": item.get("call_id"),
-                            "name": item.get("name"),
-                            "arguments": item.get(
-                                "arguments", raw.get("arguments", "")
-                            ),
-                        }
-                    )
+                    if not arguments_done:
+                        raw.update({field: item.get(field) for field in ("id", "call_id", "name")})
+                    arguments = item.get("arguments")
+                    # 兼容渠道的完成帧可能只含空占位，不能抹掉已经收到的参数增量。
+                    # 显式 {} 仍是有效的完整参数；不完整增量仍由 JSON 校验拒绝。
+                    if arguments is not None and (not isinstance(arguments, str) or arguments.strip()):
+                        raw["arguments"] = arguments
                     async for output in emit_call(key):
                         yield output
             elif event_type == "response.completed":
@@ -595,7 +585,7 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                     )
                     body = native_tool_request_body(
                         protocol=protocol,
-                        model=self.settings.model,
+                        model=request.model or self.settings.model,
                         system_prompt=request.system_prompt,
                         history=history,
                         tools=definitions,
