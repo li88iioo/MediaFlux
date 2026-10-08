@@ -42,6 +42,10 @@ class DirectoryEntryLimitError(RuntimeError):
     """目录超过调用方读取预算；不是网络或目录损坏故障。"""
 
 
+class DirectorySnapshotChangedError(RuntimeError):
+    """分页期间目录发生变化；必须丢弃本轮数据并重新证明完整性。"""
+
+
 class IncompleteOfflineTaskListError(RuntimeError):
     """离线任务分页不完整，禁止调用方据此判断任务已消失。"""
 
@@ -1954,7 +1958,7 @@ class GuangYaClient:
                     raise RuntimeError("光鸭全账号目录快照条目缺少file_id")
                 if item.file_id and item.file_id in seen_ids:
                     if strict:
-                        raise RuntimeError("光鸭全账号目录快照包含重复file_id")
+                        raise DirectorySnapshotChangedError("光鸭全账号目录快照包含重复file_id")
                     continue
                 if item.file_id:
                     seen_ids.add(item.file_id)
@@ -1999,7 +2003,7 @@ class GuangYaClient:
                 if directory_total is None:
                     directory_total = page_total
                 elif page_total != directory_total:
-                    raise RuntimeError("光鸭目录分页总数发生变化，读取不完整")
+                    raise DirectorySnapshotChangedError("光鸭目录分页总数发生变化，读取不完整")
 
             items = self._extract_list(response)
             before = yielded
@@ -2066,50 +2070,60 @@ class GuangYaClient:
         max_items: int,
         should_stop: Callable[[], bool] | None = None,
     ) -> dict[str, GuangYaFile] | None:
-        """双轮读取并核对全账号目录；None 仅表示预估读取成本超出预算。"""
-        def check_cancelled() -> None:
-            if should_stop and should_stop():
-                raise RuntimeError("光鸭全账号目录快照已取消")
+        """预算内取得连续两轮一致快照；分页漂移最多重新采集两次，绝不合并残片。"""
+        remaining = max(1, int(request_budget))
+        last_change: DirectorySnapshotChangedError | None = None
+        minimum_budget = 3
 
-        first_pages = self._iter_directory_pages(
-            "*", 1000, should_stop, strict=True,
-        )
-        first_page, total = next(first_pages)
-        assert total is not None
-        check_cancelled()
+        def read_round(parent_id, expected_total=None, *, estimate=False):
+            nonlocal remaining, minimum_budget
+            pages = self._iter_directory_pages(
+                parent_id, 1000, should_stop, strict=True,
+                expected_total=expected_total, max_pages=remaining,
+            )
+            result: dict[str, GuangYaFile] = {}
+            page = 0
+            try:
+                while True:
+                    if remaining <= 0:
+                        raise RuntimeError("光鸭全账号目录快照超过请求预算")
+                    remaining -= 1
+                    files, total = next(pages)
+                    assert total is not None
+                    if should_stop and should_stop():
+                        raise RuntimeError("光鸭全账号目录快照已取消")
+                    required_pages = max(1, math.ceil(total / 1000))
+                    if estimate:
+                        minimum_budget = 2 * required_pages + 1
+                    if estimate and page == 0 and (total > max_items or 2 * required_pages + 1 > remaining + 1):
+                        return None, total
+                    result.update((item.file_id, item) for item in files)
+                    page += 1
+                    if page == required_pages:
+                        return result, total
+            finally:
+                pages.close()
 
-        # 空目录每轮仍需一次请求以证明为空；非空按协议中的ceil(total/1000)计页。
-        pages_per_round = max(1, math.ceil(total / 1000))
-        # 根列表独立核对缺省parentId的真实根条目，至少预留一页。
-        if total > max_items or 2 * pages_per_round + 1 > request_budget:
-            first_pages.close()
-            return None
-
-        first: dict[str, GuangYaFile] = {
-            item.file_id: item for item in first_page
-        }
-        for page_files, _page_total in first_pages:
-            first.update((item.file_id, item) for item in page_files)
-
-        check_cancelled()
-        second: dict[str, GuangYaFile] = {}
-        for page_files, _page_total in self._iter_directory_pages(
-            "*", 1000, should_stop, strict=True, expected_total=total,
-        ):
-            second.update((item.file_id, item) for item in page_files)
-        check_cancelled()
-        if first != second:
-            raise RuntimeError("光鸭全账号目录两轮快照不一致")
-        roots: dict[str, GuangYaFile] = {}
-        for files, _total in self._iter_directory_pages(
-            None, 1000, should_stop, strict=True,
-            max_pages=request_budget - 2 * pages_per_round,
-        ):
-            roots.update((file.file_id, file) for file in files)
-        check_cancelled()
-        if roots != {fid: file for fid, file in first.items() if file.parent_id == "0"}:
-            raise RuntimeError("光鸭全账号快照与根目录列表不一致，无法确认缺省parentId的归属")
-        return first
+        for attempt in range(3):
+            try:
+                first, total = read_round("*", estimate=True)
+                if first is None:
+                    if last_change is not None:
+                        raise last_change
+                    return None
+                second, _ = read_round("*", total)
+                if first != second:
+                    raise DirectorySnapshotChangedError("光鸭全账号目录两轮快照不一致")
+                roots, _ = read_round(None)
+                if roots != {fid: file for fid, file in first.items() if file.parent_id == "0"}:
+                    raise DirectorySnapshotChangedError("光鸭全账号快照与根目录列表不一致，无法确认缺省parentId的归属")
+                return first
+            except DirectorySnapshotChangedError as exc:
+                last_change = exc
+                if attempt == 2 or remaining < minimum_budget:
+                    raise
+                logger.info("光鸭目录快照在分页期间变化，丢弃本轮重新核验 attempt=%s remaining=%s", attempt + 1, remaining)
+        raise RuntimeError("光鸭全账号目录快照无法稳定")  # pragma: no cover
 
     def list_dir(self, parent_id: str = "0") -> list[GuangYaFile]:
         """完整读取目录全部分页，适合需要完整快照的调用方。"""

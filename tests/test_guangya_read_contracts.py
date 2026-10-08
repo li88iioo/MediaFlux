@@ -267,7 +267,7 @@ class GuangYaReadContractTests(unittest.TestCase):
             client.raw.fs_files.return_value = {"msg": "success", "data": data}
             with self.subTest(label=label), self.assertRaisesRegex(RuntimeError, message):
                 client.read_directory_snapshot(request_budget=10, max_items=10)
-            client.raw.fs_files.assert_called_once()
+            self.assertEqual(client.raw.fs_files.call_count, 3 if label == "duplicate id" else 1)
 
     def test_directory_snapshot_rejects_changed_total_and_server_page_shrink(self):
         rows = [
@@ -293,6 +293,26 @@ class GuangYaReadContractTests(unittest.TestCase):
             shrunk.read_directory_snapshot(request_budget=5, max_items=2000)
         # 缩页按协议错误处理，不降级成成本拒绝或继续超预算翻页。
         shrunk.raw.fs_files.assert_called_once()
+
+    def test_unstable_snapshot_is_discarded_not_deduped_and_stable_rounds_are_required(self):
+        a = {"fileId": "a", "fileName": "A", "parentId": "0"}
+        b = {"fileId": "b", "fileName": "B", "parentId": "0"}
+        bad = {"data": {"total": 2, "list": [a, a]}}
+        good = {"data": {"total": 2, "list": [a, b]}}
+        client = ReadClient(None)
+        client.raw.fs_files.side_effect = [bad, good, good, good]
+        result = client.read_directory_snapshot(request_budget=4, max_items=2)
+        self.assertEqual(set(result), {"a", "b"})
+        self.assertEqual(client.raw.fs_files.call_count, 4)
+        self.assertEqual([c.kwargs["parent_id"] for c in client.raw.fs_files.call_args_list], ["*", "*", "*", None])
+
+    def test_snapshot_retry_never_exceeds_original_budget_or_returns_partial_data(self):
+        a = {"fileId": "a", "fileName": "A", "parentId": "0"}
+        client = ReadClient(None)
+        client.raw.fs_files.return_value = {"data": {"total": 2, "list": [a, a]}}
+        with self.assertRaisesRegex(RuntimeError, "重复file_id"):
+            client.read_directory_snapshot(request_budget=2, max_items=2)
+        self.assertEqual(client.raw.fs_files.call_count, 1)
 
     def test_directory_terminal_page_without_total_checks_locked_count(self):
         enough = ReadClient(None)

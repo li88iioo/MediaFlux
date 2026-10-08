@@ -1072,7 +1072,7 @@ class GuangYaSnapshotScanTests(unittest.TestCase):
             self.assertEqual(result["generated"], 3)
             self.assertNotIn("*", [parent for parent, page in client.calls])
 
-    def test_same_total_changes_and_directory_transition_changes_never_write(self):
+    def test_stable_retry_recovers_file_change_but_not_previously_observed_directory_change(self):
         for during in (1, 2):
             with self.subTest(during=during), tempfile.TemporaryDirectory() as root, isolated_test_database():
                 client = _SnapshotTreeClient()
@@ -1089,6 +1089,13 @@ class GuangYaSnapshotScanTests(unittest.TestCase):
                             next(r for r in client.rows if r["fileId"] == target)["fileName"] = "Changed.mkv"
                 client.hook = mutate
                 result = self.run_sync(root, client)
+                if during == 2:
+                    self.assertFalse(result["scan_incomplete"])
+                    self.assertFalse(result["clean_skipped"])
+                    self.assertEqual(rounds, 4, "变化后必须重新取得两轮一致完整快照")
+                    self.assertEqual(result["generated"], 1)
+                    self.assertEqual(len(list(Path(root).rglob("*.strm"))), 64)
+                    continue
                 self.assertTrue(result["scan_incomplete"])
                 self.assertTrue(result["clean_skipped"])
                 self.assertEqual(result["generated"], 0)
