@@ -3832,3 +3832,86 @@ class ConfirmedEffectReplayTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(writes, [{"step": 1}])
         with self.assertRaises(StalePublicationError):
             await pipeline.execute("cloud.change", {"step": 1}, context=continuation)
+
+
+class ArgumentRepairPreservationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_repair_must_keep_optional_fields_but_can_remove_unknown_fields(self):
+        from dataclasses import replace
+        from unittest.mock import AsyncMock
+
+        prepared = []
+        tool = KernelToolSpec(
+            name="rule.create", domain="rule", description="建立测试规则",
+            input_schema={"type": "object", "required": ["id"], "properties": {
+                "id": {"type": "string"}, "period": {"type": "integer", "enum": [4320, 10080]},
+                "enabled": {"type": "boolean"}, "limit": {"type": "integer"},
+                "sites": {"type": "array", "items": {"type": "string"}},
+            }, "additionalProperties": False},
+            effect=ToolEffect.WRITE,
+            validator=lambda args: {"period": 10080, **args},
+            prepare=lambda a, _: prepared.append(dict(a)) or PreparedEffect(preview={"summary": "等待确认"}, snapshot_fingerprint="snapshot"),
+            execute_confirmed=lambda *_: {"ok": True},
+        )
+        store = InMemorySessionStateStore()
+        pipeline = ToolPipeline(catalog=ToolCatalog([tool]), state_store=store)
+        lease, _ = await store.begin_turn(owner="owner", session_id="repair", request_id="initial")
+        context = ToolCallContext(owner="owner", session_id="repair", request_id="initial", turn_id=lease.turn_id,
+                                  lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
+        invalid = {"id": "A", "period": "4320", "enabled": False, "limit": 0, "sites": []}
+        with self.assertRaisesRegex(ToolPipelineError, "period 类型无效"):
+            await pipeline.execute(tool.name, invalid, context=context)
+        for key in ("period", "enabled", "limit", "sites"):
+            repaired = {**invalid, "period": 4320}
+            repaired.pop(key)
+            with self.subTest(omitted=key), self.assertRaisesRegex(ToolPipelineError, "不能省略.*" + key):
+                await pipeline.execute(tool.model_name, repaired, context=context)
+        self.assertEqual(prepared, [])
+        self.assertFalse((await store.load(owner="owner", session_id="repair")).pending_effect_plan_id)
+        # 无效None占位可移除；False、0、[]不能按falsy处理。
+        with self.assertRaises(ToolPipelineError):
+            await pipeline.execute(tool.name, {"id": "NULL", "period": None}, context=context)
+        null_fixed = await pipeline.execute(tool.name, {"id": "NULL"}, context=context)
+        self.assertEqual(null_fixed.effect_plan.arguments["period"], 10080)
+        # 不同对象正常使用默认值，不消费A的修复约束。
+        other = await pipeline.execute(tool.name, {"id": "B"}, context=context)
+        self.assertEqual(other.effect_plan.arguments["period"], 10080)
+        with self.assertRaisesRegex(ToolPipelineError, "不能省略.*period"):
+            await pipeline.execute(tool.name, {"id": "A"}, context=context)
+        fixed = await pipeline.execute(tool.name, {**invalid, "period": 4320}, context=context)
+        self.assertEqual(fixed.effect_plan.arguments, {**invalid, "period": 4320})
+        self.assertFalse(context.argument_repairs)
+        # 成功后不是永久锁定字段；新调用仍遵守原来的可选契约。
+        fresh = await pipeline.execute(tool.name, {"id": "A"}, context=context)
+        self.assertEqual(fresh.effect_plan.arguments["period"], 10080)
+        with self.assertRaisesRegex(ToolPipelineError, "包含未知参数"):
+            await pipeline.execute(tool.name, {"id": "C", "unknown": "never echo"}, context=context)
+        self.assertIsNotNone((await pipeline.execute(tool.name, {"id": "C"}, context=context)).effect_plan)
+        # 另一轮独立上下文不会继承先前的修复要求。
+        with self.assertRaises(ToolPipelineError):
+            await pipeline.execute(tool.name, invalid, context=context)
+        next_lease, _ = await store.begin_turn(owner="owner", session_id="repair", request_id="next")
+        next_context = replace(context, lease=next_lease, turn_id=next_lease.turn_id, argument_repairs={})
+        self.assertIsNotNone((await pipeline.execute(tool.name, {"id": "A"}, context=next_context)).effect_plan)
+
+    async def test_model_repair_cannot_freeze_a_defaulted_plan_before_correcting_the_field(self):
+        prepared, writes = [], []
+        schema = {"type": "object", "required": ["id"], "properties": {
+            "id": {"type": "string"}, "period": {"type": "integer"}}, "additionalProperties": False}
+        tool = KernelToolSpec(name="rule.create", domain="rule", description="规则", input_schema=schema,
+            effect=ToolEffect.WRITE, validator=lambda a: {"period": 10080, **a},
+            prepare=lambda a, _: prepared.append(dict(a)) or PreparedEffect(preview={"summary": "规则预览"}, snapshot_fingerprint="snapshot"),
+            execute_confirmed=lambda a, *_: writes.append(dict(a)) or {"ok": True})
+        call = ConfirmedEffectReplayTests.call
+        model = ScriptedModel([call(tool.name, {"id": "A", "period": "4320"}, "wrong-type"),
+                               call(tool.model_name, {"id": "A"}, "drop-period"),
+                               call(tool.name, {"id": "A", "period": 4320}, "corrected")])
+        state, catalog = InMemorySessionStateStore(), ToolCatalog([tool])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+        events = await collect(session.run(AgentInput(owner="owner", session_id="repair", message="建立A规则，每4320分钟检查")))
+        self.assertEqual(len([e for e in events if e.type == AgentEventType.TOOL_FAILED]), 2)
+        self.assertEqual(len([e for e in events if e.type == AgentEventType.EFFECT_APPROVAL_REQUIRED]), 1)
+        self.assertEqual(prepared, [{"id": "A", "period": 4320}])
+        self.assertEqual(writes, [])
+        repair_message = next(m for m in model.requests[-1].messages if m.role == "tool" and m.tool_call_id == "drop-period")
+        self.assertIn("不要删除字段退回默认值", repair_message.content)

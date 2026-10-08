@@ -8,7 +8,7 @@ import json
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
 from app.agent.public_safety import sanitize_public_text
@@ -75,6 +75,7 @@ class ToolCallContext:
     channel: str = "api"
     completion_scope: Any = None
     confirmed_effect: PipelineResult | None = None
+    argument_repairs: dict[tuple[str, str], set[str]] = field(default_factory=dict)
 
     def policy_context(self) -> dict[str, Any]:
         return {
@@ -242,44 +243,39 @@ _TYPE_CHECKS: dict[str, tuple[type, ...]] = {
 def _validate_json_schema(
     value: Any, schema: Mapping[str, Any], *, path: str = "arguments"
 ) -> None:
+    def invalid(message: str) -> None:
+        raise ToolPipelineError(message, code="invalid_arguments")
+
     schema_type = schema.get("type")
-    if isinstance(schema_type, str):
-        expected = _TYPE_CHECKS.get(schema_type)
-        if expected is not None:
-            if schema_type in {"integer", "number"} and isinstance(value, bool):
-                raise ToolPipelineError(f"{path} 类型无效", code="invalid_arguments")
-            if not isinstance(value, expected):
-                raise ToolPipelineError(f"{path} 类型无效", code="invalid_arguments")
+    expected = _TYPE_CHECKS.get(schema_type) if isinstance(schema_type, str) else None
+    if expected is not None and (not isinstance(value, expected) or (schema_type in {"integer", "number"} and isinstance(value, bool))):
+        invalid(f"{path} 类型无效")
     if "enum" in schema and value not in schema.get("enum", ()):
-        raise ToolPipelineError(f"{path} 不在允许范围内", code="invalid_arguments")
+        invalid(f"{path} 不在允许范围内")
     if isinstance(value, str):
         if len(value) < int(schema.get("minLength", 0) or 0):
-            raise ToolPipelineError(f"{path} 太短", code="invalid_arguments")
+            invalid(f"{path} 太短")
         maximum = schema.get("maxLength")
         if maximum is not None and len(value) > int(maximum):
-            raise ToolPipelineError(f"{path} 太长", code="invalid_arguments")
+            invalid(f"{path} 太长")
         pattern = schema.get("pattern")
         if isinstance(pattern, str) and not re.search(pattern, value):
-            raise ToolPipelineError(f"{path} 格式无效", code="invalid_arguments")
+            invalid(f"{path} 格式无效")
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         if schema.get("minimum") is not None and value < schema["minimum"]:
-            raise ToolPipelineError(f"{path} 小于允许值", code="invalid_arguments")
+            invalid(f"{path} 小于允许值")
         if schema.get("maximum") is not None and value > schema["maximum"]:
-            raise ToolPipelineError(f"{path} 超过允许值", code="invalid_arguments")
+            invalid(f"{path} 超过允许值")
     if isinstance(value, dict):
         required = schema.get("required") or ()
         for key in required:
             if key not in value:
-                raise ToolPipelineError(
-                    f"缺少必需参数：{key}", code="invalid_arguments"
-                )
+                invalid(f"缺少必需参数：{key}")
         properties = schema.get("properties") or {}
         if schema.get("additionalProperties") is False:
             unexpected = set(value).difference(properties)
             if unexpected:
-                raise ToolPipelineError(
-                    f"包含未知参数：{min(unexpected)}", code="invalid_arguments"
-                )
+                invalid(f"包含未知参数：{min(unexpected)}")
         for key, item in value.items():
             child = properties.get(key)
             if isinstance(child, Mapping):
@@ -420,7 +416,18 @@ class ToolPipeline:
                 or any(type(position) is not int for position in positions)
             ):
                 raise ToolPipelineError("只能预览本次已验证的候选选择", code="selection_mismatch")
-        _validate_json_schema(raw_arguments, tool.input_schema)
+        repair_key = (tool.name, json.dumps(
+            [raw_arguments.get(key) for key in tool.input_schema.get("required", ())], sort_keys=True, default=str,
+        ))
+        omitted = context.argument_repairs.get(repair_key, set()) - raw_arguments.keys()
+        if omitted:
+            raise ToolPipelineError("参数修复不能省略此前已提供的字段：" + "、".join(sorted(omitted)) + "；请修正值，不要删除字段退回默认值。", code="invalid_arguments")
+        try:
+            _validate_json_schema(raw_arguments, tool.input_schema)
+        except ToolPipelineError:
+            # None仅为空占位（例如电影误传season=null），不能强迫重试保留无效字段。
+            context.argument_repairs.setdefault(repair_key, set()).update(key for key, value in raw_arguments.items() if value is not None and key in tool.input_schema.get("properties", {}))
+            raise
         try:
             normalized = tool.validator(raw_arguments)
         except ToolPipelineError:
@@ -438,6 +445,7 @@ class ToolPipeline:
             raise ToolPipelineError(
                 "工具参数校验器返回无效结果", code="invalid_arguments"
             )
+        context.argument_repairs.pop(repair_key, None)
         resolved = await self._authorize(tool, normalized, context)
         completed = context.confirmed_effect
         plan = completed.effect_plan if completed else None
