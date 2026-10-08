@@ -64,15 +64,7 @@ def _search_result() -> ToolResult:
 
 
 def _reference_from(request: ModelRequest) -> str:
-    for message in reversed(request.messages):
-        if message.role != "tool":
-            continue
-        for line in message.content.splitlines():
-            if not line.startswith("reference_arguments="):
-                continue
-            payload = json.loads(line.partition("=")[2])
-            return str(payload["resource_candidates_ref"])
-    raise AssertionError("resource_candidates_ref missing from model history")
+    return str(_model_json_field(request, "reference_arguments")["resource_candidates_ref"])
 
 
 class SameTurnSearchSubmitModel:
@@ -308,9 +300,12 @@ def _multi_work_search_result() -> ToolResult:
 def _model_json_field(request: ModelRequest, field: str) -> Any:
     prefix = f"{field}="
     for message in reversed(request.messages):
-        if message.role != "tool":
+        content = message.content
+        if message.role == "assistant" and content.startswith("历史工具观察"):
+            content = json.loads(content.partition("\n")[2])["result"]
+        elif message.role != "tool":
             continue
-        for line in message.content.splitlines():
+        for line in content.splitlines():
             if line.startswith(prefix):
                 return json.loads(line.partition("=")[2])
     raise AssertionError(f"{field} missing from model history")

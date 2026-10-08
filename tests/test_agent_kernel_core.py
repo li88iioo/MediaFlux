@@ -1503,8 +1503,27 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bounded[-1].content, "方案 A")
         self.assertTrue(any("完整读取狐妖小红娘" in item.content for item in bounded))
         self.assertTrue(any("方案 A：按 TMDB" in item.content for item in bounded))
-        historical_call = next(item for item in bounded if item.tool_calls)
-        self.assertEqual(dict(historical_call.tool_calls[0].arguments), {})
+        self.assertFalse(any(item.tool_calls or item.role == "tool" for item in bounded))
+        self.assertTrue(any("历史工具观察" in item.content for item in bounded))
+
+    async def test_only_past_tool_calls_are_observations_current_calls_keep_native_pairs(self):
+        prior_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("old", "media.user.inspect", {}),))
+        prior_result = ModelMessage(role="tool", tool_call_id="old",
+                                    content='{"ok":false,"error":"未核验"}\nopaque_refs=ref_example')
+        current_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("now", "media.user.inspect", {"profile_ref":"configured:jellyfin"}),))
+        current_result = ModelMessage(role="tool", tool_call_id="now", tool_name="media.user.inspect", content='{"ok":true}')
+        messages = [ModelMessage(role="user", content="旧问题"), prior_call, prior_result,
+                    ModelMessage(role="user", content="新问题"), current_call, current_result]
+        bounded = bounded_model_messages(messages, history_end=3, tool_definitions=(),
+                                          system_prompt="", context_window_tokens=16384, output_tokens=1024)
+        self.assertEqual(bounded[-3:], tuple(messages[-3:]))
+        self.assertFalse(any(row.tool_calls or row.role == "tool" for row in bounded[:-3]))
+        observation = next(row.content for row in bounded if "历史工具观察" in row.content)
+        self.assertIn("未核验", observation)
+        self.assertIn("ref_example", observation)
+        self.assertIn("media.user.inspect", observation)
+        self.assertEqual(prior_call.tool_calls[0].arguments, {})
+        self.assertEqual(prior_result.role, "tool")
 
     async def test_compacted_failed_tool_keeps_failure_fact(self) -> None:
         compact = compact_tool_content(
