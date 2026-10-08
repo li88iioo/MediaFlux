@@ -948,7 +948,7 @@ async def wait_for_effect_completion(
         except Exception:  # noqa: BLE001 - 进度通道故障不应改写业务终态
             return
 
-    def unknown(
+    def pending_result(
         last_status: str,
         snapshot: ToolResult | None = None,
         task: dict[str, Any] | None = None,
@@ -1015,7 +1015,7 @@ async def wait_for_effect_completion(
                 await asyncio.sleep(min(_WAIT_INTERVAL_SECONDS, remaining))
                 continue
             await _record_effect_observation(scope, status=last_status, due_now=True)
-            return unknown(last_status, last_snapshot, last_task)
+            return pending_result(last_status, last_snapshot, last_task)
 
         failures = 0
         last_snapshot, last_task = snapshot, task
@@ -1026,7 +1026,7 @@ async def wait_for_effect_completion(
             return final
         if task_status not in active_statuses:
             await _record_effect_observation(scope, status=task_status, due_now=True)
-            return unknown(
+            return pending_result(
                 last_status
                 or ("unknown" if task_status in {"", "empty", "idle"} else task_status),
                 snapshot,
@@ -1038,8 +1038,12 @@ async def wait_for_effect_completion(
             last_saved = loop.time()
         last_status = task_status
         await report(snapshot, task_status)
+        # 持久 Agent 作业交给已登记的终态跟踪；前台只保护提交与回执落盘，
+        # 不占住同一会话直到全库巡检结束。无持久scope的调用仍等待终态。
+        if scope is not None and tracker.kind == "agent_job":
+            return pending_result(last_status, snapshot, task)
         remaining = deadline - loop.time()
         if remaining <= 0:
             await _record_effect_observation(scope, status=last_status, due_now=True)
-            return unknown(last_status, snapshot, task, timed_out=True)
+            return pending_result(last_status, snapshot, task, timed_out=True)
         await asyncio.sleep(min(_WAIT_INTERVAL_SECONDS, remaining))

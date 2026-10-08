@@ -1276,6 +1276,114 @@ class PersistentEffectReceiptTests(unittest.IsolatedAsyncioTestCase):
             count = await poll_effect_receipts(store or self.store)
         return count, reader
 
+    def create_agent_job(self):
+        from app.agent.library_patrol_progress import empty_patrol_projection
+
+        row, created = db.create_agent_job(
+            owner=self.scope_args["owner"], job_type="library_episode_audit",
+            dedupe_key="2026-10-08:1", input_json='{"as_of":"2026-10-08","max_series":1}',
+            checkpoint_json="{}",
+            projection_json=json.dumps(empty_patrol_projection(as_of="2026-10-08")),
+        )
+        self.assertTrue(created)
+        return row
+
+    async def handoff_agent_job(self, job, *, operation="audit"):
+        from app.agent.effect_completion import EffectCompletionScope
+
+        with patch("app.agent.effect_completion.asyncio.sleep", new=AsyncMock(
+            side_effect=AssertionError("持久任务应交回前台，不等待后台终态"),
+        )):
+            return await wait_for_effect_completion(
+                _tracked_accepted("agent_job", job_id=job["job_id"], operation=operation),
+                tool="agent.cancel_job" if operation == "cancel" else "library.start_episode_audit",
+                context=ToolContext(**self.scope_args), timeout_seconds=60,
+                scope=EffectCompletionScope(self.store, self.lease, self.plan_id),
+            )
+
+    async def test_durable_agent_job_handoff_survives_new_turn_and_reopened_store(self):
+        from app.agent.effect_completion import poll_effect_receipts
+        from app.agent.kernel.persistence import SQLiteKernelStore
+
+        job = self.create_agent_job()
+        result = await self.handoff_agent_job(job)
+        self.assertEqual(result.status, "running")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.data["background_job"]["status"], "pending")
+        self.assertTrue(result.data["background_job"]["followup_pending"])
+        self.assertFalse(result.data["background_job"]["timed_out"])
+        state = await self.store.load(**self.scope_args)
+        self.assertEqual(state.metadata["effect_waits"][self.plan_id]["last_status"], "pending")
+        next_lease, _ = await self.store.begin_turn(**self.scope_args, request_id="next-question")
+        await self.store.commit(next_lease, conversation=[{"role": "user", "content": "后续问题"}])
+        _, outcome = db.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        self.assertEqual(outcome, "cancelled")
+        await self.make_due()
+        reopened = SQLiteKernelStore()
+        self.assertEqual(await poll_effect_receipts(reopened), 1)
+        self.assertEqual(await poll_effect_receipts(reopened), 0)
+        state = await reopened.load(**self.scope_args)
+        self.assertEqual(state.generation, next_lease.generation)
+        self.assertEqual(state.conversation[0]["content"], "后续问题")
+        receipts = [m for m in state.conversation if m.get("completion_receipt_id") == self.plan_id]
+        self.assertEqual(len(receipts), 1)
+        self.assertIn("取消", receipts[0]["public_content"])
+
+    async def test_running_job_cancel_request_hands_off_without_claiming_cancelled(self):
+        from app.agent.effect_completion import poll_effect_receipts
+
+        job = self.create_agent_job()
+        claimed = db.claim_due_agent_job(job_type="library_episode_audit")
+        self.assertIsNotNone(claimed)
+        _, outcome = db.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        self.assertEqual(outcome, "requested")
+        result = await self.handoff_agent_job(job, operation="cancel")
+        self.assertEqual(result.status, "running")
+        self.assertEqual(result.data["background_job"]["status"], "running")
+        await self.make_due()
+        self.assertEqual(await poll_effect_receipts(self.store), 0)
+        self.assertTrue(db.finalize_cancelled_agent_job(
+            job["job_id"], expected_lease_generation=claimed["lease_generation"],
+        ))
+        await self.make_due()
+        self.assertEqual(await poll_effect_receipts(self.store), 1)
+        self.assertEqual(await poll_effect_receipts(self.store), 0)
+
+    async def test_already_terminal_agent_job_returns_final_receipt_without_handoff(self):
+        job = self.create_agent_job()
+        _, outcome = db.cancel_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])
+        self.assertEqual(outcome, "cancelled")
+        result = await self.handoff_agent_job(job, operation="cancel")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.data["background_job"]["status"], "cancelled")
+        self.assertNotIn("followup_pending", result.data["background_job"])
+        state = await self.store.load(**self.scope_args)
+        self.assertTrue(state.metadata["effect_waits"][self.plan_id]["foreground_final"])
+
+    async def test_agent_job_handoff_requires_persisted_tracking(self):
+        job = self.create_agent_job()
+        with patch.object(self.store, "update_effect_state", side_effect=OSError("storage unavailable")), patch(
+            "app.agent.effect_completion._poll", new=AsyncMock(),
+        ) as poll:
+            with self.assertRaises(OSError):
+                await self.handoff_agent_job(job)
+        poll.assert_not_awaited()
+        self.assertEqual(db.get_agent_job(owner=self.scope_args["owner"], job_id=job["job_id"])["status"], "pending")
+        self.assertEqual((await self.store.load(**self.scope_args)).metadata.get("effect_waits", {}), {})
+        # 提交后跟踪登记失败不能靠重放制造第二份任务；重新确认复用原队列行。
+        from app.agent.durable_job_actions import (
+            prepare_start_episode_audit, start_episode_audit_confirmed,
+        )
+        arguments = {"as_of": "2026-10-08", "max_series": 1}
+        context = ToolContext(**self.scope_args)
+        _, fingerprint = prepare_start_episode_audit(arguments, context)
+        with patch("app.agent.durable_job_actions.get_agent_jobs_scheduler"):
+            recovered = start_episode_audit_confirmed(arguments, fingerprint, context)
+        self.assertFalse(recovered.data["created"])
+        self.assertEqual(recovered.data["job_id"], job["job_id"])
+        self.assertEqual(len(db.list_agent_jobs(owner=self.scope_args["owner"])), 1)
+
     async def test_many_already_accepted_tasks_are_not_rejected_after_the_write(self):
         from app.agent.effect_completion import (
             EffectCompletionScope, _CompletionTracker, _register_effect_wait,
