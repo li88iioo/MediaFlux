@@ -412,6 +412,7 @@ class MediaSubscriptionService:
         data: dict[str, Any],
         *,
         identity_confirmed: bool = False,
+        expected_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise MediaSubscriptionError("订阅参数必须是 JSON 对象")
@@ -463,7 +464,12 @@ class MediaSubscriptionService:
             download_target=target,
             sites=sites,
             check_interval_minutes=interval,
+            expected_snapshot=expected_snapshot,
         )
+        if not subscription_id:
+            raise MediaSubscriptionError(
+                "媒体追更订阅状态已变化，请重新预检", status_code=409, code="conflict"
+            )
         return {"created": created, "subscription": self.get_subscription(subscription_id)}
 
     def get_subscription(self, subscription_id: int) -> dict[str, Any]:

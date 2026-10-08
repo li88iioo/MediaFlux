@@ -83,6 +83,27 @@ def add_media_subscription(
         return int(cur.lastrowid)
 
 
+def media_subscription_identity_snapshot(conn: Any, tmdb_id: str, media_type: str) -> dict[str, Any]:
+    row = conn.execute(
+        "SELECT id,enabled,status,revision,deleted_at,updated_at "
+        "FROM media_subscriptions WHERE tmdb_id=? AND media_type=?",
+        (tmdb_id, media_type),
+    ).fetchone()
+    if row is None:
+        return {"exists": False, "tmdb_id": tmdb_id, "media_type": media_type}
+    return {
+        "exists": True,
+        "subscription_id": int(row["id"]),
+        "tmdb_id": tmdb_id,
+        "media_type": media_type,
+        "enabled": bool(row["enabled"]),
+        "status": str(row["status"] or ""),
+        "revision": int(row["revision"] or 0),
+        "deleted_at": str(row["deleted_at"] or ""),
+        "updated_at": str(row["updated_at"] or ""),
+    }
+
+
 def upsert_media_subscription(
     *,
     provider: str,
@@ -101,17 +122,25 @@ def upsert_media_subscription(
     download_target: str = "guangya",
     sites: Iterable[str] | None = None,
     check_interval_minutes: int = 4320,
+    expected_snapshot: dict[str, Any] | None = None,
 ) -> tuple[int, bool]:
-    """原子创建或恢复同一 TMDB 身份的订阅。"""
+    """原子创建或恢复；冻结快照冲突返回 (0, False)，不改变关联工作。"""
     stamp = now()
     interval = max(5, min(int(check_interval_minutes or 4320), 10080))
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
-        row = conn.execute(
-            "SELECT id,revision FROM media_subscriptions WHERE tmdb_id=? AND media_type=?",
-            (str(tmdb_id), str(media_type)),
-        ).fetchone()
-        if row is None:
+        snapshot = media_subscription_identity_snapshot(conn, str(tmdb_id), str(media_type))
+        if expected_snapshot is not None and snapshot != expected_snapshot:
+            return 0, False
+        if expected_snapshot is not None and provider != "tmdb":
+            mapping = conn.execute(
+                "SELECT 1 FROM media_external_ids WHERE provider=? AND external_id=? "
+                "AND media_type=? AND tmdb_id=? AND confirmed=1",
+                (provider, external_id, media_type, str(tmdb_id)),
+            ).fetchone()
+            if mapping is None:
+                return 0, False
+        if not snapshot["exists"]:
             cur = conn.execute(
                 "INSERT INTO media_subscriptions("
                 "provider,external_id,tmdb_id,media_type,title,original_title,year,poster_key,"
@@ -127,8 +156,8 @@ def upsert_media_subscription(
             )
             return int(cur.lastrowid), True
 
-        subscription_id = int(row["id"])
-        revision = int(row["revision"] or 1) + 1
+        subscription_id = snapshot["subscription_id"]
+        revision = int(snapshot["revision"] or 1) + 1
         conn.execute(
             "UPDATE media_subscriptions SET provider=?,external_id=?,title=?,original_title=?,year=?,"
             "poster_key=?,enabled=?,monitor_mode=?,seasons_json=?,include_specials=?,action=?,"

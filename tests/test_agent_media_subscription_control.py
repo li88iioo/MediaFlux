@@ -191,6 +191,100 @@ class MediaSubscriptionAgentControlTests(IsolatedDatabaseTestCase):
     def test_delete_rechecks_related_work_inside_final_write_transaction(self) -> None:
         self._assert_delete_rechecks_transaction("related_work")
 
+    def test_both_create_tools_recheck_identity_at_final_upsert(self) -> None:
+        service = get_agent_service()
+        cases = [(name, restored) for name in (
+            "automation.create_media_rule", "media.create_subscription"
+        ) for restored in (False, True)]
+        for index, (tool, restored) in enumerate(cases):
+            with self.subTest(tool=tool, restored=restored):
+                tmdb_id = str(99000 + index)
+                data = dict(provider="tmdb", external_id=tmdb_id, tmdb_id=tmdb_id,
+                            media_type="movie", title="Concurrent fixture", enabled=False,
+                            action="notify", check_interval_minutes=10080)
+                if restored:
+                    sid = db.add_media_subscription(**data)
+                    self.assertTrue(db.delete_media_subscription(sid))
+                args = ({"tmdb_id": tmdb_id, "media_type": "movie", "enabled": False,
+                         "action": "confirm", "check_interval_minutes": 4320}
+                        if tool == "automation.create_media_rule" else
+                        {"provider": "tmdb", "external_id": tmdb_id, "media_type": "movie"})
+                card = MediaCard(provider="tmdb", external_id=tmdb_id,
+                                 media_type="movie", title="Concurrent fixture")
+                with patch("app.agent.media_subscription_actions.get_discovery_service") as discovery:
+                    discovery.return_value.get_detail.return_value = card
+                    prepared = service.prepare(tool, args, owner="owner")
+                def concurrent_create(*_args, **_kwargs):
+                    db.upsert_media_subscription(**data)
+                    return {"title": "Concurrent fixture", "release_date": "1999-01-01"}
+                with patch("app.modules.media_subscriptions._tmdb_detail", side_effect=concurrent_create):
+                    result = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
+                self.assertFalse(result["result"]["ok"])
+                self.assertEqual(result["result"]["status"], "conflict")
+                row = self._subscription_by_identity(tmdb_id, "movie")
+                self.assertEqual(row["action"], "notify")
+                self.assertFalse(row["enabled"])
+                self.assertEqual(row["check_interval_minutes"], 10080)
+
+    def _assert_create_rechecks_source_mapping(self, *, revoke_confirmed: bool) -> None:
+        service = get_agent_service()
+        external_id = "99110" if revoke_confirmed else "99111"
+        tmdb_id = "99120"
+        changed_tmdb_id = tmdb_id if revoke_confirmed else "99121"
+        args = {"provider": "douban", "external_id": external_id, "media_type": "movie"}
+        db.upsert_media_external_id(
+            "douban", external_id, "movie", tmdb_id, confirmed=True
+        )
+        before_count = db.count_media_subscriptions()
+        card = MediaCard(
+            provider="douban", external_id=external_id,
+            media_type="movie", title="Concurrent mapping fixture",
+        )
+        with patch("app.agent.media_subscription_actions.get_discovery_service") as discovery:
+            discovery.return_value.get_detail.return_value = card
+            prepared = service.prepare("media.create_subscription", args, owner="owner")
+
+        def concurrent_mapping_change(requested_id, media_type):
+            self.assertEqual((requested_id, media_type), (tmdb_id, "movie"))
+            # 外层映射/订阅快照复核已通过；只提交另一写方的映射变更。
+            # 撤销 confirmed 使用真实 SQL，避免 upsert 对已确认映射的保护吞掉变更。
+            with db.get_conn() as conn:
+                changed = conn.execute(
+                    "UPDATE media_external_ids SET tmdb_id=?,confirmed=?,"
+                    "version=version+1,updated_at=? "
+                    "WHERE provider=? AND external_id=? AND media_type=?",
+                    (changed_tmdb_id, int(not revoke_confirmed), db.now(),
+                     "douban", external_id, "movie"),
+                )
+                self.assertEqual(changed.rowcount, 1)
+            return {"id": int(tmdb_id), "title": card.title, "release_date": "1999-01-01"}
+
+        scheduler = Mock()
+        with (
+            patch("app.modules.media_subscriptions._tmdb_detail",
+                  side_effect=concurrent_mapping_change) as detail,
+            patch("app.modules.media_subscription_scheduler.get_media_subscription_scheduler",
+                  return_value=scheduler),
+        ):
+            result = service.confirm(prepared["action_plan"]["plan_id"], owner="owner")
+
+        detail.assert_called_once_with(tmdb_id, "movie")
+        mapping = db.get_media_external_id("douban", external_id, "movie")
+        self.assertEqual(mapping["tmdb_id"], changed_tmdb_id)
+        self.assertEqual(bool(mapping["confirmed"]), not revoke_confirmed)
+        self.assertEqual(result["result"]["status"], "conflict")
+        self.assertFalse(result["result"]["ok"])
+        self.assertIsNone(self._subscription_by_identity(tmdb_id, "movie"))
+        self.assertIsNone(self._subscription_by_identity(changed_tmdb_id, "movie"))
+        self.assertEqual(db.count_media_subscriptions(), before_count)
+        scheduler.reload.assert_not_called()
+
+    def test_create_rechecks_mapping_target_inside_final_write_transaction(self) -> None:
+        self._assert_create_rechecks_source_mapping(revoke_confirmed=False)
+
+    def test_create_rechecks_mapping_confirmation_inside_final_write_transaction(self) -> None:
+        self._assert_create_rechecks_source_mapping(revoke_confirmed=True)
+
     def test_subscription_policy_enforces_effective_tv_season_invariant(self) -> None:
         service = get_agent_service()
         with self.assertRaises(AgentToolError):

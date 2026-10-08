@@ -6,9 +6,9 @@ import json
 from datetime import datetime
 from typing import Any
 
+from app import database as db
 from app.agent.errors import AgentToolError
 from app.agent.media_subscription_actions import (
-    _create_snapshot,
     _decode_create_context,
     _reload_scheduler,
     get_media_subscription_service,
@@ -111,11 +111,6 @@ def prepare_create_media_rule(arguments: dict[str, Any]) -> tuple[ToolResult, st
         base["season"] = args["season"]
     preview, token = prepare_create_media_subscription(base)
     frozen = _decode_create_context(token)
-    if frozen["snapshot"].get("exists") and not frozen["snapshot"].get("deleted_at"):
-        raise AgentToolError(
-            "该媒体已存在订阅，请修改现有订阅策略而不是重复创建",
-            code="precondition_failed",
-        )
     preview.summary = "确认后创建持续运行的媒体追更规则"
     preview.data.update(
         {
@@ -145,7 +140,9 @@ def create_media_rule_confirmed(
     if frozen.get("arguments") != args:
         raise AgentToolError("自动化计划参数已变化", code="confirmation_invalid")
     context = frozen.get("subscription_context", {})
-    if _create_snapshot(args["tmdb_id"], args["media_type"]) != context.get("snapshot"):
+    with db.get_conn() as conn:
+        snapshot = db.media_subscription_identity_snapshot(conn, args["tmdb_id"], args["media_type"])
+    if snapshot != context.get("snapshot"):
         raise AgentToolError(
             "订阅状态在确认前已变化，请重新预检", code="precondition_failed"
         )
@@ -173,7 +170,8 @@ def create_media_rule_confirmed(
     try:
         service = get_media_subscription_service()
         result = run_indexer_awaitable_sync(
-            service.create_subscription(payload), timeout_seconds=35.0
+            service.create_subscription(payload, expected_snapshot=context["snapshot"]),
+            timeout_seconds=35.0
         )
     except MediaSubscriptionError as exc:
         raise AgentToolError(str(exc), code=exc.code) from exc

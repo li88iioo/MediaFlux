@@ -584,28 +584,6 @@ def _resolved_tmdb_id(provider: str, external_id: str, media_type: str) -> str:
     return tmdb_id
 
 
-def _create_snapshot(tmdb_id: str, media_type: str) -> dict[str, Any]:
-    with db.get_conn() as conn:
-        row = conn.execute(
-            "SELECT id,enabled,status,revision,deleted_at,updated_at "
-            "FROM media_subscriptions WHERE tmdb_id=? AND media_type=?",
-            (tmdb_id, media_type),
-        ).fetchone()
-    if row is None:
-        return {"exists": False, "tmdb_id": tmdb_id, "media_type": media_type}
-    return {
-        "exists": True,
-        "subscription_id": int(row["id"]),
-        "tmdb_id": tmdb_id,
-        "media_type": media_type,
-        "enabled": bool(row["enabled"]),
-        "status": str(row["status"] or ""),
-        "revision": int(row["revision"] or 0),
-        "deleted_at": str(row["deleted_at"] or ""),
-        "updated_at": str(row["updated_at"] or ""),
-    }
-
-
 def _encode_create_context(value: dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -629,7 +607,8 @@ def prepare_create_media_subscription(
     season = arguments.get("season")
     check_interval_minutes = int(arguments.get("check_interval_minutes") or 4320)
     tmdb_id = _resolved_tmdb_id(provider, external_id, media_type)
-    snapshot = _create_snapshot(tmdb_id, media_type)
+    with db.get_conn() as conn:
+        snapshot = db.media_subscription_identity_snapshot(conn, tmdb_id, media_type)
     if snapshot.get("exists") and not snapshot.get("deleted_at"):
         raise AgentToolError("该媒体已经在追更订阅中", code="precondition_failed")
 
@@ -729,7 +708,8 @@ def create_media_subscription_confirmed(
             summary="媒体身份映射已变化，请重新预检",
             error="确认快照已失效。",
         )
-    snapshot = _create_snapshot(tmdb_id, identity[2])
+    with db.get_conn() as conn:
+        snapshot = db.media_subscription_identity_snapshot(conn, tmdb_id, identity[2])
     if snapshot != context.get("snapshot"):
         return ToolResult(
             ok=False,
@@ -758,6 +738,7 @@ def create_media_subscription_confirmed(
             get_media_subscription_service().create_subscription(
                 payload,
                 identity_confirmed=identity[0] != "tmdb",
+                expected_snapshot=context["snapshot"],
             ),
             timeout_seconds=_CREATE_TIMEOUT_SECONDS,
         )

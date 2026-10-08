@@ -314,7 +314,7 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
                 ),
             ),
             patch(
-                "app.agent.automation_rule_actions._create_snapshot",
+                "app.agent.automation_rule_actions.db.media_subscription_identity_snapshot",
                 return_value=frozen["snapshot"],
             ),
             patch(
@@ -362,7 +362,7 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
             _, token = prepare_create_media_rule(args)
         with (
             patch(
-                "app.agent.automation_rule_actions._create_snapshot",
+                "app.agent.automation_rule_actions.db.media_subscription_identity_snapshot",
                 return_value={"exists": True},
             ),
             patch(

@@ -2058,6 +2058,7 @@ from app.repositories.media_subscriptions import (  # noqa: E402,F401
     list_media_subscriptions,
     media_subscription_check_is_active,
     media_subscription_mutation_snapshot,
+    media_subscription_identity_snapshot,
     reconcile_media_download_admissions,
     reconcile_startup_media_download_admissions,
     recover_stale_media_subscription_checks,
