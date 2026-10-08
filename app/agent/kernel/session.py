@@ -865,7 +865,6 @@ class AgentSession:
                     tools=request_tools,
                     max_output_tokens=self.limits.effective_output_tokens,
                     round_index=round_index,
-                    require_complete_answer=True,
                 )
                 token.interruptible = True
                 try:
@@ -910,7 +909,7 @@ class AgentSession:
                         elif model_event.type is ModelEventType.FINISH:
                             finish_reason = model_event.finish_reason
                 except IncompleteModelAnswer:
-                    # 同一模型循环内最多恢复一次，消耗原轮次预算；不存残稿、不重放工具。
+                    # 原生协议确实未完成时最多重新汇总一次；不存残稿、不重放工具。
                     if answer_recovery or round_index + 1 >= self.limits.max_model_rounds:
                         raise
                     answer_recovery = True

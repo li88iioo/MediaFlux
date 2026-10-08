@@ -5,9 +5,8 @@ from __future__ import annotations
 import asyncio
 import codecs
 import json
-import secrets
 from collections.abc import AsyncIterator, Callable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -21,8 +20,8 @@ from app.clients.openai_compatible import (
     normalize_provider_location,
     parse_native_tool_turn,
     protocol_attempts,
-    provider_headers,
     provider_finish_reason,
+    provider_headers,
     resolve_protocol,
 )
 from app.indexers.http import FixedHostHttpClient
@@ -43,54 +42,7 @@ class ModelProviderError(RuntimeError):
 
 
 class IncompleteModelAnswer(ModelProviderError):
-    """上游正常 stop，但用户可见答复未履行结束契约。"""
-
-
-class _AnswerCompletion:
-    """逐片隐藏请求级结束标记；不通过文件名、标点或正文长短猜测完整性。"""
-
-    def __init__(self) -> None:
-        self.marker = f"<|mf_answer_end_{secrets.token_hex(8)}|>"
-        self.pending = ""
-        self.complete = False
-        self.has_tool_calls = False
-        self.has_text = False
-
-    def feed(self, text: str) -> str:
-        if self.complete:
-            if text.strip():
-                raise IncompleteModelAnswer("模型回复未完整结束：结束标记之后仍有正文")
-            return ""
-        self.pending += text
-        index = self.pending.find(self.marker)
-        if index >= 0:
-            visible, trailing = self.pending[:index], self.pending[index + len(self.marker):]
-            self.pending = ""
-            self.complete = True
-            if trailing.strip():
-                raise IncompleteModelAnswer("模型回复未完整结束：结束标记之后仍有正文")
-            self.has_text = self.has_text or bool(visible.strip())
-            return visible
-        keep = min(len(self.pending), len(self.marker) - 1)
-        while keep and not self.pending.endswith(self.marker[:keep]):
-            keep -= 1
-        visible = self.pending[:-keep] if keep else self.pending
-        self.pending = self.pending[-keep:] if keep else ""
-        self.has_text = self.has_text or bool(visible.strip())
-        return visible
-
-    def accept(self, event: ModelEvent) -> tuple[ModelEvent, ...]:
-        if event.type is ModelEventType.TEXT_DELTA:
-            text = self.feed(event.text)
-            return (replace(event, text=text),) if text else ()
-        if event.type is ModelEventType.TOOL_CALL_COMPLETED:
-            self.has_tool_calls = True
-        if event.type is ModelEventType.FINISH:
-            if not self.has_tool_calls and not (self.complete and self.has_text):
-                raise IncompleteModelAnswer("模型回复未完整结束：缺少正文或结束标记")
-            # 带工具调用的中间轮次不要求最终答复标记，但也不展示半个控制标记。
-            self.pending = ""
-        return (event,)
+    """Provider 原生协议缺少成功终态；可有界重新汇总，不代表业务工具失败。"""
 
 
 _MODEL_IDLE_TIMEOUT_FLOOR_SECONDS = 30
@@ -345,7 +297,9 @@ async def iter_protocol_model_events(
                     finish_reason = str(response.get("status") or "")
                 completed = True
                 break
-            elif event_type in {"response.failed", "response.incomplete", "error"}:
+            elif event_type == "response.incomplete":
+                raise IncompleteModelAnswer("Responses API 未完整结束")
+            elif event_type in {"response.failed", "error"}:
                 raise ModelProviderError("Responses API 未完整结束")
             continue
 
@@ -452,11 +406,11 @@ async def iter_protocol_model_events(
             break
 
     if not completed:
-        raise ModelProviderError("Provider 流在完成事件前中断")
+        raise IncompleteModelAnswer("Provider 流在完成事件前中断")
     try:
         finish_reason = provider_finish_reason(normalized, finish_reason)
     except ProviderStreamError as exc:
-        raise ModelProviderError(str(exc)) from exc
+        raise IncompleteModelAnswer(str(exc)) from exc
     for key in list(calls):
         async for output in emit_call(key):
             yield output
@@ -605,19 +559,6 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
         *,
         cancellation: CancellationToken,
     ) -> AsyncIterator[ModelEvent]:
-        completion = _AnswerCompletion() if request.require_complete_answer else None
-        if completion is not None:
-            request = replace(request, system_prompt=request.system_prompt + (
-                "\n\n用户可见答复结束契约：需要调用工具时正常调用，不加结束标记。"
-                "本轮不再调用工具、完整回答用户或明确说明无法完成/拒绝原因之后，"
-                f"必须在正文末尾另起一行原样输出 {completion.marker}。"
-                "这只是传输校验标记，不代表业务任务已完成；不要解释标记，不要放在代码块内，"
-                "标记之后不要输出任何内容。"
-            ))
-
-        def checked(event: ModelEvent) -> tuple[ModelEvent, ...]:
-            return completion.accept(event) if completion is not None else (event,)
-
         location = normalize_provider_location(
             self.settings.api_url,
             https_only=True,
@@ -701,8 +642,7 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                                     ):
                                         cancellation.raise_if_cancelled()
                                         emitted = True
-                                        for output in checked(event):
-                                            yield output
+                                        yield event
                                     return
                                 raw = bytearray()
                                 async for chunk in response.aiter_bytes():
@@ -711,7 +651,7 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                                     envelope = json.loads(raw.decode("utf-8"))
                                     turn = parse_native_tool_turn(envelope, protocol)
                                 except ProviderStreamError as exc:
-                                    raise ModelProviderError(str(exc)) from exc
+                                    raise IncompleteModelAnswer(str(exc)) from exc
                                 except (
                                     UnicodeDecodeError,
                                     json.JSONDecodeError,
@@ -725,32 +665,27 @@ class OpenAICompatibleModelAdapter(ModelAdapter):
                                     break
                                 if turn.text:
                                     emitted = True
-                                    for output in checked(ModelEvent(
-                                        ModelEventType.TEXT_DELTA, text=turn.text
-                                    )):
-                                        yield output
+                                    yield ModelEvent(ModelEventType.TEXT_DELTA, text=turn.text)
                                 for call in turn.tool_calls:
                                     emitted = True
-                                    for output in checked(ModelEvent(
+                                    yield ModelEvent(
                                         ModelEventType.TOOL_CALL_COMPLETED,
                                         tool_call=ModelToolCall(
                                             call_id=call.call_id,
                                             name=call.name,
                                             arguments=call.arguments,
                                         ),
-                                    )):
-                                        yield output
+                                    )
                                 if turn.usage is not None:
                                     yield ModelEvent(
                                         ModelEventType.USAGE,
                                         usage=turn.usage.to_dict(),
                                     )
-                                for output in checked(ModelEvent(
+                                yield ModelEvent(
                                     ModelEventType.FINISH, finish_reason=turn.finish_reason
-                                )):
-                                    yield output
+                                )
                                 return
-                        except (asyncio.CancelledError, IncompleteModelAnswer):
+                        except asyncio.CancelledError:
                             raise
                         except Exception as exc:
                             last_error = exc

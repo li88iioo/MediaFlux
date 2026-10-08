@@ -96,7 +96,6 @@ class ModelRequest:
     tools: Sequence[Mapping[str, Any]]
     max_output_tokens: int = 1_500
     round_index: int = 0
-    require_complete_answer: bool = False
 
 
 class ModelAdapter(Protocol):

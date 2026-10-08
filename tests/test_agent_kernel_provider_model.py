@@ -36,6 +36,54 @@ async def collect(stream):
 
 
 class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
+    async def test_responses_failure_before_output_keeps_original_bounded_retry(self):
+        class Response:
+            status_code = 200
+            headers = {"content-type": "text/event-stream"}
+
+            def __init__(self, frames):
+                self.frames = frames
+
+            async def aiter_bytes(self):
+                async for chunk in chunks(self.frames):
+                    yield chunk
+
+        class Client:
+            calls = 0
+
+            @asynccontextmanager
+            async def stream_post_json(self, *_args, **_kwargs):
+                self.calls += 1
+                yield Response([{"type": failure_type}] if self.calls == 1 else [
+                    {"type": "response.output_text.delta", "delta": "已恢复"},
+                    {"type": "response.completed", "response": {"status": "completed"}},
+                ])
+
+            async def aclose(self):
+                pass
+
+        for failure_type in ("response.failed", "error"):
+            with self.subTest(failure_type=failure_type), patch(
+                "app.agent.kernel.provider_model._MODEL_RETRY_DELAY_SECONDS", 0
+            ):
+                client = Client()
+                adapter = OpenAICompatibleModelAdapter(
+                    ProviderSettings(api_url="https://api.example.com/v1", model="sample", protocol="responses"),
+                    client_factory=lambda **_: client,
+                )
+                stream = adapter.stream(
+                    ModelRequest(system_prompt="检查状态", messages=(), tools=()), cancellation=CancellationToken()
+                )
+                if failure_type == "error":
+                    with self.assertRaisesRegex(ModelProviderError, "流式错误"):
+                        await collect(stream)
+                    self.assertEqual(client.calls, 1)
+                    continue
+                events = await collect(stream)
+                self.assertEqual(client.calls, 2)
+                self.assertEqual("".join(event.text for event in events), "已恢复")
+                self.assertEqual(events[-1].type, ModelEventType.FINISH)
+
     async def test_chat_length_finish_never_emits_a_success_or_executable_call(self):
         observed = []
         with self.assertRaises(ModelProviderError):
@@ -461,38 +509,38 @@ class CompleteTurnContractTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(seen, [])
 
 
-class AnswerCompletionContractTests(unittest.IsolatedAsyncioTestCase):
-    async def run_adapter(self, protocol, *, streamed=True, complete=True, tool=False, text='核对完成，未执行写操作。', trailing=''):
-        import re
+class NativeAnswerCompletionTests(unittest.IsolatedAsyncioTestCase):
+    async def run_adapter(self, protocol, *, streamed=True, complete=True, tool=False, text='核对完成，未执行写操作。'):
         from app.agent.kernel.model import ModelMessage
 
         class Client:
             calls = 0
+            request_body = None
 
             @asynccontextmanager
             async def stream_post_json(self, _url, *, json, **_kwargs):
                 self.calls += 1
-                encoded = __import__('json').dumps(json, ensure_ascii=False)
-                marker = re.search(r'<\|mf_answer_end_[0-9a-f]+\|>', encoded).group()
-                body = text + ('\n' + marker if complete else '') + trailing
+                self.request_body = json
                 if protocol == 'chat_completions':
-                    content = {'content': body}
+                    content = {'content': text}
                     if tool:
                         content['tool_calls'] = [{'index': 0, 'id': 'c1', 'type': 'function', 'function': {'name': 'read_status', 'arguments': '{}'}}]
-                    envelope = {'choices': [{'message': content, 'finish_reason': 'stop'}]}
-                    frames = [{'choices': [{'delta': content, 'finish_reason': 'stop'}]}, '[DONE]']
+                    reason = ('tool_calls' if tool else 'stop') if complete else 'length'
+                    envelope = {'choices': [{'message': content, 'finish_reason': reason}]}
+                    frames = [{'choices': [{'delta': content, 'finish_reason': reason}]}, '[DONE]']
                 elif protocol == 'responses':
                     item = ({'type': 'function_call', 'id': 'item1', 'call_id': 'c1', 'name': 'read_status', 'arguments': '{}'} if tool else
-                            {'type': 'message', 'content': [{'type': 'output_text', 'text': body}]})
-                    envelope = {'status': 'completed', 'output': [item]}
+                            {'type': 'message', 'content': [{'type': 'output_text', 'text': text}]})
+                    envelope = {'status': 'completed' if complete else 'incomplete', 'output': [item]}
                     frames = ([{'type': 'response.output_item.done', 'item': item}] if tool else
-                              [{'type': 'response.output_text.delta', 'delta': body}])
-                    frames.append({'type': 'response.completed', 'response': envelope})
+                              [{'type': 'response.output_text.delta', 'delta': text}])
+                    frames.append({'type': 'response.completed' if complete else 'response.incomplete', 'response': envelope})
                 else:
-                    block = ({'type': 'tool_use', 'id': 'c1', 'name': 'read_status', 'input': {}} if tool else {'type': 'text', 'text': body})
-                    envelope = {'stop_reason': 'tool_use' if tool else 'end_turn', 'content': [block]}
+                    block = ({'type': 'tool_use', 'id': 'c1', 'name': 'read_status', 'input': {}} if tool else {'type': 'text', 'text': text})
+                    reason = ('tool_use' if tool else 'end_turn') if complete else 'max_tokens'
+                    envelope = {'stop_reason': reason, 'content': [block]}
                     frames = [{'type': 'content_block_start', 'index': 0, 'content_block': block},
-                              {'type': 'message_delta', 'delta': {'stop_reason': envelope['stop_reason']}},
+                              {'type': 'message_delta', 'delta': {'stop_reason': reason}},
                               {'type': 'message_stop'}]
 
                 class Response:
@@ -521,62 +569,49 @@ class AnswerCompletionContractTests(unittest.IsolatedAsyncioTestCase):
         try:
             async for event in adapter.stream(ModelRequest(
                 system_prompt='文件管理', messages=(ModelMessage(role='user', content='检查状态'),), tools=(),
-                require_complete_answer=True,
             ), cancellation=CancellationToken()):
                 events.append(event)
         except ModelProviderError as exc:
             error = exc
-        self.assertEqual(client.calls, 1, '不因缺少正文结束标记自动重发原模型请求')
-        self.assertNotIn('mf_answer_end_', ''.join(event.text for event in events))
+        self.assertEqual(client.calls, 1, '模型输出后不自动重放原请求')
+        self.assertNotIn('mf_answer_end_', json.dumps(client.request_body))
         return events, error
 
-    async def test_all_protocols_require_complete_natural_answer_for_stream_and_json(self):
-        from app.agent.kernel.provider_model import IncompleteModelAnswer
-        for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
-            for streamed in (True, False):
-                for complete in (True, False):
-                    with self.subTest(protocol=protocol, streamed=streamed, complete=complete):
-                        text = '核对完毕。' if complete else '2. **`044'
-                        events, error = await self.run_adapter(protocol, streamed=streamed, complete=complete, text=text)
-                        if complete:
-                            self.assertIsNone(error)
-                            self.assertEqual(events[-1].type, ModelEventType.FINISH)
-                            self.assertEqual(''.join(e.text for e in events).strip(), text)
-                        else:
-                            self.assertIsInstance(error, IncompleteModelAnswer)
-                            self.assertNotIn(ModelEventType.FINISH, [e.type for e in events])
-
-    async def test_complete_native_tool_rounds_do_not_require_final_answer_marker(self):
+    async def test_normal_native_completion_needs_no_extra_model_text_marker(self):
         for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
             for streamed in (True, False):
                 with self.subTest(protocol=protocol, streamed=streamed):
-                    events, error = await self.run_adapter(protocol, streamed=streamed, complete=False, tool=True, text='')
+                    text = '工作区当前没有需要处理的下一步。'
+                    events, error = await self.run_adapter(protocol, streamed=streamed, text=text)
+                    self.assertIsNone(error)
+                    self.assertEqual(events[-1].type, ModelEventType.FINISH)
+                    self.assertEqual(''.join(e.text for e in events), text)
+
+    async def test_native_truncation_is_still_incomplete_even_with_complete_looking_text(self):
+        from app.agent.kernel.provider_model import IncompleteModelAnswer
+        for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
+            for streamed in (True, False):
+                with self.subTest(protocol=protocol, streamed=streamed):
+                    events, error = await self.run_adapter(protocol, streamed=streamed, complete=False)
+                    self.assertIsInstance(error, IncompleteModelAnswer)
+                    self.assertNotIn(ModelEventType.FINISH, [e.type for e in events])
+
+    async def test_complete_native_tool_rounds_preserve_tool_calls(self):
+        for protocol in ('chat_completions', 'responses', 'anthropic_messages'):
+            for streamed in (True, False):
+                with self.subTest(protocol=protocol, streamed=streamed):
+                    events, error = await self.run_adapter(protocol, streamed=streamed, tool=True, text='')
                     self.assertIsNone(error)
                     self.assertEqual(events[-1].type, ModelEventType.FINISH)
                     self.assertEqual(len([e for e in events if e.tool_call]), 1)
 
-    async def test_text_after_marker_is_not_a_valid_completion(self):
+    async def test_missing_native_terminal_is_incomplete(self):
         from app.agent.kernel.provider_model import IncompleteModelAnswer
-        events, error = await self.run_adapter('responses', trailing='还有遗漏')
-        self.assertIsInstance(error, IncompleteModelAnswer)
-        self.assertNotIn(ModelEventType.FINISH, [e.type for e in events])
-
-    def test_marker_is_hidden_at_every_delta_boundary(self):
-        from app.agent.kernel.provider_model import _AnswerCompletion, IncompleteModelAnswer
-        from app.agent.kernel.model import ModelEvent
-        for split in range(1, 60):
-            contract = _AnswerCompletion()
-            body = '已检查；待确认。\n' + contract.marker
-            visible = ''.join(contract.feed(body[i:i + split]) for i in range(0, len(body), split))
-            self.assertEqual(visible.strip(), '已检查；待确认。')
-            contract.accept(ModelEvent(ModelEventType.FINISH, finish_reason='stop'))
-        contract = _AnswerCompletion()
-        self.assertEqual(contract.feed('半截' + contract.marker[:12]), '半截')
-        with self.assertRaises(IncompleteModelAnswer):
-            contract.accept(ModelEvent(ModelEventType.FINISH, finish_reason='stop'))
-
-    async def test_marker_without_body_is_not_a_complete_answer(self):
-        from app.agent.kernel.provider_model import IncompleteModelAnswer
-        events, error = await self.run_adapter('responses', text='')
-        self.assertIsInstance(error, IncompleteModelAnswer)
-        self.assertNotIn(ModelEventType.FINISH, [e.type for e in events])
+        frames = {
+            'chat_completions': [{'choices': [{'delta': {'content': '正文已输出'}, 'finish_reason': 'stop'}]}],
+            'responses': [{'type': 'response.output_text.delta', 'delta': '正文已输出'}],
+            'anthropic_messages': [{'type': 'content_block_start', 'index': 0, 'content_block': {'type': 'text', 'text': '正文已输出'}}],
+        }
+        for protocol, events in frames.items():
+            with self.subTest(protocol=protocol), self.assertRaises(IncompleteModelAnswer):
+                await collect(iter_protocol_model_events(chunks(events, split=3), protocol=protocol))

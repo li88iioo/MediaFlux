@@ -3313,6 +3313,18 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_stop_with_empty_body_is_not_success(self):
+        model = ScriptedModel([[ModelEvent(ModelEventType.TEXT_DELTA, text=' \n'),
+                            ModelEvent(ModelEventType.FINISH, finish_reason='stop')]])
+        state = InMemorySessionStateStore()
+        catalog = ToolCatalog([])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+        result = await consume_events(session.run(AgentInput(owner='owner', session_id='empty-answer', message='检查状态')))
+        self.assertEqual(result.status, 'failed')
+        self.assertEqual(result.error_code, 'empty_model_response')
+        self.assertEqual(len(model.requests), 1)
+
     async def scenario(self, *, recovery='success', max_rounds=5):
         from app.agent.kernel.provider_model import IncompleteModelAnswer
         reads = []
@@ -3332,7 +3344,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
                     yield ModelEvent(ModelEventType.FINISH, finish_reason='tool_calls')
                 elif index == 2 or recovery == 'failure':
                     yield ModelEvent(ModelEventType.TEXT_DELTA, text='2. **`044')
-                    raise IncompleteModelAnswer('模型回复未完整结束：未收到正文结束标记')
+                    raise IncompleteModelAnswer('Provider 流在完成事件前中断')
                 elif recovery == 'tool':
                     yield ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall('forbidden', 'cloud.inspect', {}))
                     yield ModelEvent(ModelEventType.FINISH, finish_reason='tool_calls')
@@ -3350,7 +3362,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
         events = await collect(session.run(AgentInput(owner='owner', session_id='recovery', message='清洗入库')))
         saved = await state.load(owner='owner', session_id='recovery')
         self.assertEqual(reads, ['read'], '回复恢复不得重放任何业务工具')
-        self.assertTrue(all(r.require_complete_answer for r in model.requests))
+        self.assertTrue(all('mf_answer_end_' not in r.system_prompt for r in model.requests))
         self.assertLessEqual(len(model.requests), max_rounds)
         self.assertNotIn('**`044', str(saved.conversation), '未完成草稿不得成为下一轮可信历史')
         if len(model.requests) == 3:
@@ -3359,7 +3371,7 @@ class AgentAnswerRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('**`044', str(model.requests[-1].messages))
         return events, model.requests
 
-    async def test_truncated_stop_is_recovered_once_without_repeating_tools(self):
+    async def test_interrupted_stream_is_recovered_once_without_repeating_tools(self):
         events, requests = await self.scenario()
         self.assertEqual(len(requests), 3)
         self.assertEqual(events[-1].payload['answer'], '已检查4个目录，尚未完成识别或入库。')
