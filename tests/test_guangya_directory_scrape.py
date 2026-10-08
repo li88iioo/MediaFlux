@@ -1237,6 +1237,163 @@ class DirectoryMediaValidationErrorTests(unittest.TestCase):
             ).inspect("source", self.rules)
 
 
+class DirectoryEpisodeTitleIdentityTests(IsolatedDatabaseTestCase):
+    def inspect_names(self, names, directory="作品目录"):
+        from app.modules.directory_media import DirectoryMediaInspector
+
+        videos = [_file(f"video-{i}", name, "source") for i, name in enumerate(names)]
+        client = _TreeClient(
+            {"source": videos, "archive": []},
+            {
+                "source": _dir("source", directory),
+                "archive": _dir("archive", "媒体库"),
+                **{item.file_id: item for item in videos},
+            },
+        )
+        scraper = TMDBScraper()
+        try:
+            return DirectoryMediaInspector(client, scraper).inspect(
+                "source",
+                OrganizeRules(target_dir_id="archive", small_file_mb=0),
+            )
+        finally:
+            scraper.close()
+
+    def test_real_release_names_with_episode_titles_keep_one_media_identity(self):
+        # 真实云盘发布名样本；使用正式解析器，不用返回预设标题的替身。
+        cases = [
+            (
+                "[Erai-raws] Evil or Live - 01~12 [1080p][Multiple Subtitle]",
+                [
+                    "[Erai-raws] Evil or Live - 01 [1080p][Multiple Subtitle].mkv",
+                    "[Erai-raws] Evil or Live - 09.5 [1080p][Multiple Subtitle].mkv",
+                    "[Erai-raws] Evil or Live - 12 END [1080p][Multiple Subtitle].mkv",
+                ],
+            ),
+            (
+                "[GM-Team][国漫][秦时明月之天行九歌][The Legend of Qin：Nine Songs of the Sky][AVC][GB][1080P]",
+                [
+                    "[GM-Team][国漫][秦时明月之天行九歌][The Legend of Qin：Nine Songs of the Sky][01][序章(上)][AVC][GB][1080P].mp4",
+                    "[GM-Team][国漫][秦时明月之天行九歌][The Legend of Qin：Nine Songs of the Sky][02][序章(下)][AVC][GB][1080P].mp4",
+                    "[GM-Team][国漫][秦时明月之天行九歌][The Legend of Qin：Nine Songs of the Sky][04][心之逆鳞(下)[AVC][GB][1080P].mp4",
+                ],
+            ),
+            (
+                "[GM-Team][国漫][万古仙穹 第1~3季][Wangu Xian Qiong Ⅰ~Ⅲ][01-12 Fin&01-12 Fin&01-13 Fin][AVC][GB][1080P]",
+                [
+                    "[GM-Team][国漫][万古仙穹 第1季][Wangu Xian Qiong Ⅰ][01][AVC][GB][1080P].mp4",
+                    "[GM-Team][国漫][万古仙穹 第2季][Wangu Xian Qiong Ⅱ][01][AVC][GB][1080P].mp4",
+                    "[GM-Team][国漫][万古仙穹 第3季][Wangu Xian Qiong Ⅲ][01][AVC][GB][1080P].mp4",
+                ],
+            ),
+            (
+                "[YMDR][国漫][神契幻奇谭][L.DART][2017][01-24][合集][1080P][HEVC][Chi][GB][MP4][ViPHD]",
+                [
+                    "[YMDR][L.DART][01]「赤瞳的偶像」.mp4",
+                    "[YMDR][L.DART][02]「涌动的暗流」.mp4",
+                    "[YMDR][L.DART][04]「魔女」.mp4",
+                ],
+            ),
+            (
+                "【zero搬运】【国产动漫】《画江湖之杯莫停》 【全40集】【1080P】【Painting lake of the cup stop】",
+                [
+                    "【HD 1080P】【画江湖之杯莫停】第01集 突变【Painting lake of the cup stop】.flv",
+                    "【HD 1080P】【画江湖之杯莫停】第02集 暗潮【Painting lake of the cup stop】.flv",
+                    "【HD 1080P】【画江湖之杯莫停】第04集 何以自处【Painting lake of the cup stop】.flv",
+                ],
+            ),
+            (
+                "疯味英雄",
+                [
+                    "疯味英雄 01 序章 诞生[3c45f3d4].mp4",
+                    "疯味英雄 02 初见[12b8caae].mp4",
+                    "疯味英雄 04 濩落[770c1e07].mp4",
+                ],
+            ),
+            (
+                "天谕",
+                [
+                    "【国漫】天谕 第二季 苍古之绊 第1话 波澜如潮 1080P.mp4",
+                    "【国漫】天谕 第二季 苍古之绊 第2话 旧友新朋 1080P.mp4",
+                    "【国漫】天谕 第二季 苍古之绊 第4话 故园旧事 1080P.mp4",
+                ],
+            ),
+            (
+                "我的天劫女友",
+                [
+                    "我的天劫女友 第1话 和我双修成仙吧.mp4",
+                    "我的天劫女友 第2话 怀中抱妹杀！.mp4",
+                    "我的天劫女友 第4话 两位S级美少女竟为我争风吃醋？.mp4",
+                ],
+            ),
+            (
+                "Three Swordsman - Half Face",
+                [
+                    "半面人：第1话 刑天初现.mp4",
+                    "半面人：第2话 泪别应龙.mp4",
+                    "半面人：第4话 慧娴雅叙.mp4",
+                ],
+            ),
+        ]
+        for directory, names in cases:
+            with self.subTest(directory=directory):
+                inspection = self.inspect_names(names, directory)
+                self.assertEqual(len(inspection.videos), len(names))
+                self.assertFalse(inspection.pending_videos)
+
+    def test_unmarked_numeric_movie_titles_are_not_cropped(self):
+        scraper = TMDBScraper()
+        try:
+            for name, title in (
+                ("杀手 47 再起.mp4", "杀手 47 再起"),
+                ("古惑仔 3 之只手遮天 1996.mp4", "古惑仔 3 之只手遮天"),
+                ("Room.237.2012.1080p.mkv", "Room 237"),
+                ("第1话题 2026.mp4", "第1话题"),
+            ):
+                with self.subTest(name=name):
+                    self.assertEqual(scraper.parse_media(name).title, title)
+        finally:
+            scraper.close()
+
+    def test_episode_titles_do_not_hide_a_second_series(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
+
+        with self.assertRaisesRegex(DirectoryScrapeRequestError, "多个不同媒体"):
+            self.inspect_names(
+                [
+                    "我的天劫女友 第1话 和我双修成仙吧.mp4",
+                    "我的天劫女友 第2话 怀中抱妹杀.mp4",
+                    "疯味英雄 01 序章 诞生[3c45f3d4].mp4",
+                    "疯味英雄 02 初见[12b8caae].mp4",
+                ],
+                "动漫",
+            )
+
+    def test_season_aliases_and_fractional_episode_keep_positions(self):
+        inspection = self.inspect_names(
+            [
+                f"[GM-Team][国漫][万古仙穹 第{season}季][Wangu Xian Qiong {roman}]"
+                "[01][AVC][GB][1080P].mp4"
+                for season, roman in ((1, "Ⅰ"), (2, "Ⅱ"), (3, "Ⅲ"))
+            ]
+        )
+        self.assertEqual(
+            sorted((v.season, v.episode) for v in inspection.videos),
+            [(1, 1), (2, 1), (3, 1)],
+        )
+        inspection = self.inspect_names(
+            [
+                "[Erai-raws] Evil or Live - 09 [1080p][Multiple Subtitle].mkv",
+                "[Erai-raws] Evil or Live - 09.5 [1080p][Multiple Subtitle].mkv",
+            ]
+        )
+        self.assertEqual(
+            [(v.season, v.episode) for v in inspection.videos if v.season == 0],
+            [(0, 1)],
+        )
+        self.assertEqual([v.episode for v in inspection.videos if v.season != 0], [9])
+
+
 class SingleFileInspectionTests(IsolatedDatabaseTestCase):
     def setUp(self):
         from app.modules.directory_media import DirectoryMediaInspector

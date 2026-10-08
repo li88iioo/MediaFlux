@@ -571,7 +571,13 @@ _BRACKET_EPISODE_RANGE = re.compile(
     r"(?:[ ._-]*\d{1,3}(?:\s*[-~～–—]\s*\d{1,3})?)?)*)?|"
     r"第\s*\d{1,3}\s*[-~～–—]\s*\d{1,3}\s*(?:集|[话話]))\s*$"
 )
-_BRACKETED_SEGMENT = re.compile(r"[\[【(（]([^\]】)）]{1,160})[\]】)）]")
+# 方括号内允许圆括号（例如 [序章(上)]），只能由同类右括号结束。
+_BRACKETED_SEGMENT = re.compile(
+    r"[\[【(（]((?<=\[)[^\]\r\n]{1,160}(?=\])"
+    r"|(?<=【)[^】\r\n]{1,160}(?=】)"
+    r"|(?<=\()[^)\r\n]{1,160}(?=\))"
+    r"|(?<=（)[^）\r\n]{1,160}(?=）))[\]】)）]"
+)
 _RELEASE_EPISODE_RANGE = re.compile(
     r"(?i)\bs\d{1,2}e(\d{1,3})\s*[-~～–—]\s*(?:e)?(\d{1,3})\b"
     r"|(?:^|[ ._\-\[\(【])e(?:p(?:isode)?)?[ ._-]*(\d{1,3})"
@@ -1318,13 +1324,29 @@ _GUESSIT_CJK_EPISODE_WORD_COLLISION = re.compile(
     r"第\s*(?:\d{1,4}|[零〇一二两三四五六七八九十]{1,3})\s*"
     r"(?:集|[话話])(?=[\u3040-\u30ff\u3400-\u9fff])"
 )
-# 动画发布常在明确集号后附带本集标题，例如 ``第25話「ただそれだけ」``。
-# 只有数字与已解析 episode 一致、且副标题使用成对引号时才移除，避免把
-# 作品正式名称中的“第X话题”等普通文本误当作集标题。
-_CJK_EPISODE_TITLE_SUFFIX = re.compile(
-    r"第\s*(\d{1,4})\s*(?:集|[话話])\s*"
-    r"(?:「[^」\r\n]{1,180}」|『[^』\r\n]{1,180}』|“[^”\r\n]{1,180}”)"
+# 已解析的集号把作品名与单集标题分开；数字必须与位置解析一致。
+# 裸数字只接受“中文作品名 01 中文集标题”，不能泛化到电影续作数字。
+_EPISODE_TITLE_BOUNDARY = re.compile(
+    r"第\s*(\d{1,4})\s*(?:集|[话話])(?=$|[\s:：「『“])"
+    r"|[\[【]\s*(\d{1,3})(?:v\d+)?\s*[\]】]"
+    r"|(?<=[\u3400-\u9fff])\s+(\d{1,3})\s+(?=[\u3400-\u9fff])"
 )
+
+
+def _episode_title_prefix(value: str, episode: int | None) -> str | None:
+    if episode is None:
+        return None
+    for match in _EPISODE_TITLE_BOUNDARY.finditer(value):
+        if int(next(group for group in match.groups() if group)) != episode:
+            continue
+        # 没有显式集标的中文裸数字必须另有发布校验码证据，不能裁短数字片名。
+        if match.group(3) and not _CHECKSUM_SUFFIX.search(value):
+            continue
+        prefix = value[:match.start()].strip(" ._-:：")
+        title, _ = _clean_release_stem(prefix)
+        if title and not _low_information_query(title):
+            return prefix
+    return None
 
 
 def _strip_known_episode_suffix(
@@ -1344,13 +1366,6 @@ def _strip_known_episode_suffix(
 
     cleaned = str(value or "")
 
-    def strip_episode_title(match: re.Match[str]) -> str:
-        try:
-            return " " if int(match.group(1)) == int(episode) else match.group(0)
-        except (TypeError, ValueError):
-            return match.group(0)
-
-    cleaned = _CJK_EPISODE_TITLE_SUFFIX.sub(strip_episode_title, cleaned)
     cleaned = _ANGLE_EPISODE_TOKEN.sub(" ", cleaned)
 
     def strip_ordinal_total(match: re.Match[str]) -> str:
@@ -1648,8 +1663,9 @@ def _probable_unknown_release_prefix(content: str, remainder: str) -> bool:
     return suffix_size >= max(8, prefix_size + 4)
 
 
+# title_end 只限定作品名投影，完整原文仍用于发布组与技术标签识别。
 def _non_destructive_release_title_candidates(
-    value: str,
+    value: str, *, title_end: int | None = None,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """从发布名生成保守的额外标题候选，并保留原始清洗结果。
 
@@ -1675,7 +1691,7 @@ def _non_destructive_release_title_candidates(
                 components["release_versions"].append(revision.group(0))
         elif _RELEASE_LANGUAGE_BRACKET.fullmatch(content):
             components["language_tags"].append(content)
-    # 发布组 + 分类 + 中文作品/篇章 + 英文别名 + 年份 + 规格构成明确字段链。
+    # 发布组 + 分类 + 中文作品/篇章 + 英文别名 + 年份或集号 + 规格构成明确字段链。
     # 只在该结构成立时分离分类与别名；不把“国漫”等词加入全局删词表，
     # 也不裁掉中文标题中的篇章或续作数字。原始季集仍由位置解析器决定。
     parts = [match.group(1).strip() for match in bracket_segments]
@@ -1685,7 +1701,7 @@ def _non_destructive_release_title_candidates(
             and parts[1] in _CLASSIFIED_ANIMATION_KINDS
             and re.search(r"[\u3040-\u30ff\u3400-\u9fff]", parts[2])
             and re.search(r"[A-Za-z]", parts[3]) and not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", parts[3])
-            and re.fullmatch(r"(?:19|20)\d{2}", parts[4])
+            and re.fullmatch(r"(?:(?:19|20)\d{2}|\d{1,3}(?:v\d+)?)", parts[4])
             and any(_IMPLICIT_SEASON_TECHNICAL_EVIDENCE.search(part) for part in parts[5:])):
         primary = re.sub(r"\s+", " ", _strip_season_tokens(parts[2])).strip(" ._-")
         if primary and not _low_information_query(primary):
@@ -1737,6 +1753,7 @@ def _non_destructive_release_title_candidates(
             _EPISODE_TOKEN.search(following)
             or _CHINESE_EPISODE_TOKEN.search(following)
             or _BRACKET_EPISODE_RANGE.fullmatch(following)
+            or re.fullmatch(r"\d{1,3}(?:v\d+)?", following)
         )
         remainder = source[current.end():].lstrip()
         if (
@@ -1800,7 +1817,7 @@ def _non_destructive_release_title_candidates(
             not _is_release_prefix(content, remainder)
             and _probable_unknown_release_prefix(content, remainder)
         ):
-            projected, _ = _clean_release_stem(remainder)
+            projected, _ = _clean_release_stem(source[first.end():title_end])
             projected = re.sub(
                 r"\s+", " ", _strip_season_tokens(projected)
             ).strip(" ._-")
@@ -2162,7 +2179,7 @@ def _parse_release_surface(
     guessed_year = _position_number(guessed.get("year"))
     year_tokens = [match.group(1) for match in _YEAR_TOKEN.finditer(identity_stem)]
     filename_year = str(guessed_year or (year_tokens[-1] if year_tokens else ""))
-    fractional_position = fractional_episode_position(source) if context_mode else None
+    fractional_position = fractional_episode_position(source)
     explicit_episode = _extract_episode(source)
     guessed_episode = _position_number(guessed.get("episode"))
     guessed_season = _season_number(guessed.get("season"))
@@ -2205,15 +2222,31 @@ def _parse_release_surface(
     elif fractional_position is not None:
         season, episode = 0, None
 
+    episode_title_prefix = _episode_title_prefix(source, episode)
     title_source = _strip_known_episode_suffix(source, episode, season)
+    candidate_source = source if episode_title_prefix else title_source
     if explicit_season is None and implicit_season is not None:
         title_source = _remove_text_span(title_source, implicit_season_span)
+        candidate_source = _remove_text_span(candidate_source, implicit_season_span)
+        if episode_title_prefix:
+            episode_title_prefix = _remove_text_span(episode_title_prefix, implicit_season_span)
     if fractional_position is not None:
         title_source = strip_special_media_markers(title_source)
     release_title_candidates, semantic_components = (
-        _non_destructive_release_title_candidates(title_source)
+        _non_destructive_release_title_candidates(
+            candidate_source if episode_title_prefix else title_source,
+            title_end=len(episode_title_prefix) if episode_title_prefix else None,
+        )
     )
     filename_title, cleaned = _clean_release_stem(title_source)
+    if episode_title_prefix is not None:
+        filename_title, _ = _clean_release_stem(episode_title_prefix)
+        # 标题候选只能来自已确认集号之前；不能被后面的单集名重新覆盖。
+        prefix_key = _comparison_key(filename_title).replace(" ", "")
+        release_title_candidates = [
+            title for title in release_title_candidates
+            if _comparison_key(title).replace(" ", "") in prefix_key
+        ]
     if special_episode is not None:
         filename_title = strip_special_media_markers(
             _SPECIAL_EPISODE_TOKEN.sub(" ", filename_title)
@@ -2253,6 +2286,7 @@ def _parse_release_surface(
         if canonical_title and (
             not release_title
             or implicit_season is not None
+            or episode_title_prefix is not None
             or _low_information_query(release_title)
             or (
                 len(_comparison_key(canonical_title).replace(" ", ""))
