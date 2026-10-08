@@ -740,19 +740,27 @@ Season 1 / S01E01
         page.locator("#agentPrompt").fill("暂停测试任务并继续核验")
         page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
         page.locator(".agent-confirmation-card").wait_for()
+        # 流状态只存在于相邻事件之间；在浏览器内记录，避免跨进程轮询漏掉短暂状态。
+        page.evaluate("""() => {
+          window.__followupStates = [];
+          window.__followupObserver = new MutationObserver(() => {
+            window.__followupStates.push({
+              text: document.querySelector('.agent-stream-text')?.textContent || '',
+              head: document.querySelector('.agent-stream-head')?.textContent || '',
+              messages: document.querySelectorAll('.agent-message-assistant').length,
+            });
+          });
+          window.__followupObserver.observe(document.querySelector('#agentTranscript'), {
+            childList: true, subtree: true, characterData: true,
+          });
+        }""")
         page.locator("[data-effect-confirm]").click()
-
-        page.wait_for_function(
-            "() => document.querySelector('.agent-stream-text')?.textContent.includes('已完成写入，继续核验。')"
-        )
-        self.assertEqual(page.locator(".agent-message-assistant").count(), 1)
-        page.wait_for_function(
-            "() => document.querySelector('.agent-stream-head')?.textContent.includes('正在安全等待核验回执')"
-        )
-        self.assertIn("正在安全等待核验回执", page.locator(".agent-stream-head").inner_text())
-
         narrative = page.locator(".agent-narrative")
         narrative.wait_for()
+        states = page.evaluate("() => { window.__followupObserver.disconnect(); return window.__followupStates; }")
+        self.assertTrue(any("已完成写入，继续核验。" in state["text"] for state in states))
+        self.assertTrue(any("正在安全等待核验回执" in state["head"] for state in states))
+        self.assertTrue(all(state["messages"] == 1 for state in states))
         text = narrative.inner_text()
         self.assertIn("后续核验暂时不可用", text)
         self.assertIn("下载任务已暂停", text)
