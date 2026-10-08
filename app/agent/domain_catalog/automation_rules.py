@@ -86,7 +86,7 @@ def register_specs(registry, **_dependencies) -> None:
     registry.register(
         ToolSpec(
             name="automation.set_digest",
-            description="确认后新增或修改每日摘要规则；按本机时区每天指定时刻汇总媒体动态，或只汇总失败和需关注项。复用既有Telegram通知总开关/队列，不调用LLM、不另建通知链路。enabled=false停用；修改必须提供读取到的rule_id。",
+            description="确认后新增或修改每日摘要规则；按本机时区每天指定时刻汇总媒体动态，或只汇总失败和需关注项。复用既有Telegram通知总开关/队列，不调用LLM、不另建通知链路。enabled=false停用既有规则时不依赖通知目标；修改必须提供读取到的rule_id，未提供的可选设置保持原值。",
             risk=RiskLevel.WRITE,
             requires_confirmation=True,
             parameters={

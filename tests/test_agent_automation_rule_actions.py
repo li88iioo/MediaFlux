@@ -73,6 +73,89 @@ class AutomationRuleTests(IsolatedDatabaseTestCase):
         with self.assertRaises(AgentToolError):
             set_digest_confirmed(change, old_token, self.context)
 
+    def test_digest_partial_edit_preserves_unspecified_options(self):
+        args = {"enabled": True, "hour": 21, "minute": 17, "errors_only": True, "send_empty": True}
+        _, token = prepare_set_digest(args, self.context)
+        original = set_digest_confirmed(args, token, self.context).data
+        change = {"rule_id": original["rule_id"], "enabled": True, "hour": 22}
+        preview, token = prepare_set_digest(change, self.context)
+        for key, value in (("minute", 17), ("errors_only", True), ("send_empty", True)):
+            self.assertEqual(preview.data[key], value)
+        updated = set_digest_confirmed(change, token, self.context)
+        self.assertEqual(updated.data["settings"], {
+            "hour": 22, "minute": 17, "errors_only": True, "send_empty": True,
+        })
+        explicit = {**change, "minute": 0, "errors_only": False, "send_empty": False}
+        _, token = prepare_set_digest(explicit, self.context)
+        reset = set_digest_confirmed(explicit, token, self.context)
+        self.assertEqual(reset.data["settings"], {
+            "hour": 22, "minute": 0, "errors_only": False, "send_empty": False,
+        })
+        self.assertEqual(len(list_digest_rules({}, self.context).data["items"]), 1)
+
+    def test_existing_digest_can_stop_without_a_notification_destination(self):
+        args = {"enabled": True, "hour": 21, "minute": 17, "errors_only": True}
+        _, token = prepare_set_digest(args, self.context)
+        original = set_digest_confirmed(args, token, self.context).data
+        stop = {"rule_id": original["rule_id"], "enabled": False, "hour": 21}
+        original_get = config.get
+        with patch("app.modules.media_automation_rules.config.get", side_effect=lambda key, *a, **kw: (
+            "" if key == "TG_CHAT_ID" else original_get(key, *a, **kw)
+        )):
+            preview, token = prepare_set_digest(stop, self.context)
+            self.assertFalse(preview.data["enabled"])
+            stopped = set_digest_confirmed(stop, token, self.context)
+            self.assertTrue(stopped.ok)
+            self.assertFalse(stopped.data["enabled"])
+            self.assertEqual(stopped.data["settings"]["minute"], 17)
+            self.assertTrue(stopped.data["settings"]["errors_only"])
+            with self.assertRaises(AgentToolError):
+                prepare_set_digest({**stop, "enabled": True}, self.context)
+            with self.assertRaises(AgentToolError):
+                prepare_set_digest({**stop, "rule_id": "missing-rule"}, self.context)
+        self.assertEqual(len(list_digest_rules({}, self.context).data["items"]), 1)
+
+    def test_digest_destination_change_still_invalidates_enable_confirmation(self):
+        args = {"enabled": True, "hour": 21}
+        _, token = prepare_set_digest(args, self.context)
+        original_get = config.get
+        with patch("app.modules.media_automation_rules.config.get", side_effect=lambda key, *a, **kw: (
+            "999" if key == "TG_CHAT_ID" else original_get(key, *a, **kw)
+        )):
+            with self.assertRaises(AgentToolError):
+                set_digest_confirmed(args, token, self.context)
+        self.assertEqual(list_digest_rules({}, self.context).data["items"], [])
+
+    def test_new_disabled_digest_is_not_reported_as_stopping_an_existing_rule(self):
+        active = {"enabled": True, "hour": 21}
+        _, token = prepare_set_digest(active, self.context)
+        existing = set_digest_confirmed(active, token, self.context).data
+        disabled = {"enabled": False, "hour": 22}
+        preview, token = prepare_set_digest(disabled, self.context)
+        self.assertIn("新增", preview.summary)
+        created = set_digest_confirmed(disabled, token, self.context)
+        self.assertIn("新增", created.summary)
+        self.assertIn("当前停用", created.summary)
+        rows = list_digest_rules({}, self.context).data["items"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(next(row for row in rows if row["rule_id"] == existing["rule_id"])["enabled"])
+
+    def test_previous_complete_confirmation_payload_remains_executable(self):
+        import json
+        from app.repositories.agent_jobs import agent_job_owner_digest
+        from app.modules.media_automation_rules import notification_route_settings
+        # Existing signed plans already persisted all optional fields explicitly.
+        args = {"rule_id": "", "enabled": True, "hour": 21, "minute": 0,
+                "errors_only": False, "send_empty": False}
+        old_payload = json.dumps({"owner": agent_job_owner_digest(self.context.owner),
+                                  "arguments": args, "revision": 0,
+                                  "route": notification_route_settings(self.context.owner)})
+        saved = set_digest_confirmed(args, old_payload, self.context)
+        self.assertTrue(saved.ok)
+        self.assertEqual(saved.data["settings"], {
+            "hour": 21, "minute": 0, "errors_only": False, "send_empty": False,
+        })
+
     def test_rule_claim_is_exclusive_recovers_expired_and_cancel_invalidates(self):
         row = rules.save_rule(
             "owner",
