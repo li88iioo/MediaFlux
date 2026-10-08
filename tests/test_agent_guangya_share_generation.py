@@ -27,7 +27,7 @@ class _ShareClient:
             "file-1", "测试目录", True, parent_id="0", etag="test-etag"
         )
         self.shares = [
-            {"shareId": "existing-share", "title": "测试分享", "status": "active"}
+            {"id": "20001", "shareId": "existing-share", "title": "测试分享", "status": "active"}
         ]
         self.writes: list[tuple[str, tuple[str, ...]]] = []
         self.closed = False
@@ -50,7 +50,7 @@ class _ShareClient:
 
     def delete_user_shares(self, share_ids):
         self.writes.append(("revoke", tuple(share_ids)))
-        self.shares = [item for item in self.shares if item["shareId"] not in share_ids]
+        self.shares = [item for item in self.shares if item["id"] not in share_ids]
         return True
 
     def close(self):
@@ -143,7 +143,7 @@ class GuangYaShareGenerationTests(unittest.TestCase):
                 self.assertFalse(result.data["verification_pending"])
                 self.assertNotIn("credential_generation", str(preview.to_dict()))
                 self.assertNotIn("credential_generation", str(result.to_dict()))
-                expected_id = "file-1" if operation == "create" else "existing-share"
+                expected_id = "file-1" if operation == "create" else "20001"
                 self.assertEqual(clients[-1].writes, [(operation, (expected_id,))])
                 self.assertTrue(all(not client.writes for client in clients[:-1]))
                 self.assertTrue(all(client.closed for client in clients))

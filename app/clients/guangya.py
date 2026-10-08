@@ -2636,7 +2636,11 @@ class GuangYaClient:
             max_restore_count=max(0, int(max_restore_count or 0)),
             download_type=1 if allow_download else 0,
         )
-        _validate_write_response(response, operation="share_create")
+        # 分享 data.code 是提取码，不属于响应错误码命名空间。
+        envelope = dict(response) if isinstance(response, dict) else {}
+        if isinstance(envelope.get("data"), dict):
+            envelope["data"] = {key: value for key, value in envelope["data"].items() if key != "code"}
+        _validate_write_response(envelope, operation="share_create")
         return response if isinstance(response, dict) else {}
 
     def delete_user_shares(self, share_ids: list[str]) -> bool:

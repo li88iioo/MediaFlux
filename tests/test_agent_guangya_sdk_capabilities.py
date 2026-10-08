@@ -14,6 +14,7 @@ from app.agent import guangya_account_actions as account_actions
 from app.agent import guangya_recycle_actions as recycle_actions
 from app.agent import guangya_share_actions as share_actions
 from app.agent import guangya_workspace_actions as workspace_actions
+from app.agent.errors import AgentToolError
 from app.agent.models import ToolContext
 from app.clients.guangya import GuangYaClient, GuangYaFile, GuangYaWriteRejected
 
@@ -76,6 +77,7 @@ class _RawSdk:
             "data": {
                 "list": [
                     {
+                        "id": "10001",
                         "shareId": "share-1",
                         "title": "动画",
                         "status": "active",
@@ -145,7 +147,7 @@ class GuangYaSdkClientTests(unittest.TestCase):
             auto_fill_code=True,
         )
         self.assertEqual(created["data"]["shareId"], "created-share")
-        self.assertTrue(client.delete_user_shares(["share-1"]))
+        self.assertTrue(client.delete_user_shares(["10001"]))
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "sample.mkv"
             path.write_bytes(b"sample")
@@ -153,6 +155,21 @@ class GuangYaSdkClientTests(unittest.TestCase):
         self.assertEqual(response["data"]["taskId"], "upload-task")
         share_call = next(item for item in raw.calls if item[0] == "share_create")
         self.assertFalse(share_call[2]["auto_fill_code"])
+
+    def test_create_share_access_code_is_not_a_provider_error_code(self) -> None:
+        response = {"code": 0, "msg": "success", "data": {"shareId": "public-share", "code": "AB12"}}
+        raw = _RawSdk()
+        with mock.patch.object(raw, "share_create", return_value=response):
+            created = _Client(raw).create_user_share(["file-1"], title="Probe")
+        self.assertEqual(created, response)
+        self.assertEqual(share_actions._extract_created_share(created)["access_code"], "AB12")
+        for failure in (
+            {**response, "code": 10},
+            {**response, "data": {**response["data"], "success": False}},
+        ):
+            with self.subTest(failure=failure), mock.patch.object(raw, "share_create", return_value=failure):
+                with self.assertRaises(GuangYaWriteRejected):
+                    _Client(raw).create_user_share(["file-1"], title="Probe")
 
     def test_agent_capability_summary_keeps_local_upload_disabled(self) -> None:
         result = workspace_actions.summarize_guangya_capabilities({})
@@ -566,6 +583,7 @@ class _ShareClient:
         self.credential_generation = 9
         self.shares = [
             {
+                "id": "10001",
                 "shareId": "share-1",
                 "title": "动画",
                 "status": "active",
@@ -586,7 +604,7 @@ class _ShareClient:
     def delete_user_shares(self, share_ids):
         selected = {str(item) for item in share_ids}
         self.shares = [
-            item for item in self.shares if str(item.get("shareId")) not in selected
+            item for item in self.shares if str(item.get("id")) not in selected
         ]
         return True
 
@@ -603,6 +621,15 @@ class _ShareClient:
 
 
 class GuangYaShareActionTests(unittest.TestCase):
+    def test_share_snapshot_requires_management_record_id_not_public_link_id(self) -> None:
+        client = _ShareClient()
+        snapshot = share_actions._load_share_snapshots(client)[0]
+        self.assertEqual(snapshot["share_id"], "10001")
+        self.assertEqual(share_actions._public_share({**snapshot, "title": "Test_Share.01"}, index=1)["title"], "Test_Share.01")
+        del client.shares[0]["id"]
+        with self.assertRaises(AgentToolError):
+            share_actions._load_share_snapshots(client)
+
     def test_create_returns_link_only_to_public_result_and_revoke_revalidates(self) -> None:
         client = _ShareClient()
         context = ToolContext(owner="owner", session_id="session")

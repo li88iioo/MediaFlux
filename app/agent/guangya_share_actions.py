@@ -13,7 +13,11 @@ from app.agent.confirmation import confirmation_context_fingerprint
 from app.agent.errors import AgentToolError
 from app.agent.guangya_workspace_actions import latest_guangya_observation_ref
 from app.agent.models import Evidence, ToolContext, ToolReference, ToolResult
-from app.agent.public_safety import sanitize_public_text, sanitize_untrusted_filename
+from app.agent.public_safety import (
+    sanitize_public_text,
+    sanitize_resource_title,
+    sanitize_untrusted_filename,
+)
 from app.clients.guangya import (
     GuangYaClient,
     GuangYaFile,
@@ -87,7 +91,8 @@ def _first(raw: dict[str, Any], *keys: str) -> object:
 
 
 def _share_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
-    share_id = str(_first(raw, "shareId", "shareID", "share_id", "id") or "").strip()
+    # 列表 id 是撤销接口的管理记录 ID；shareId 只用于公开分享链接。
+    share_id = str(_first(raw, "id") or "").strip()
     return {
         "share_id": share_id,
         "title": str(_first(raw, "title", "shareName", "name") or "").strip(),
@@ -109,7 +114,7 @@ def _share_snapshot(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _public_share(item: dict[str, Any], *, index: int) -> dict[str, Any]:
-    title = sanitize_public_text(item.get("title"), limit=160)
+    title = sanitize_resource_title(item.get("title"), limit=160)
     return {
         "index": index,
         "title": title or "未命名分享",
@@ -429,8 +434,9 @@ def _extract_created_share(raw: dict[str, Any]) -> dict[str, str]:
         _first(raw, "shareUrl", "shareURL", "share_url", "url", "link") or ""
     ).strip()
     # 顶层 ``code`` 常是 HTTP 业务成功码（0/200），不能误当成分享访问码。
+    data = raw.get("data")
     candidate_code = str(
-        _first(
+        (data.get("code") if isinstance(data, dict) else "") or _first(
             raw,
             "shareCode",
             "share_code",
@@ -626,7 +632,7 @@ def _revoke_snapshot(
         "credential_generation": _bounded_int(collection.get("credential_generation")),
         "count": len(selected),
         "samples": [
-            sanitize_public_text(item.get("title"), limit=160) or "未命名分享"
+            sanitize_resource_title(item.get("title"), limit=160) or "未命名分享"
             for item in selected[:6]
         ],
     }
