@@ -232,3 +232,72 @@ class ConfigComponentExplainUnitTests(unittest.TestCase):
         self.assertTrue(result.data["managed_by_environment"])
         self.assertIsNone(result.data["agent_action"])
         self.assertIn("运行环境", "".join(result.suggestions))
+
+
+class ConfigDiagnosisConsistencyTests(unittest.TestCase):
+    def test_strm_summary_and_explanation_share_native_source_validation(self):
+        from app.agent.config_diagnosis_actions import diagnose_config
+
+        cases = [
+            ("", "0", "not_configured"), ("[]", "0", "not_configured"),
+            ("[]", "1", "incomplete"), ("not-json", "0", "incomplete"),
+            ('["0"]', "0", "incomplete"), ('{"id":"source"}', "0", "incomplete"),
+            ('["valid","0"]', "0", "incomplete"),
+            ('["valid"]', "0", "ready"),
+            ('[{"id":"valid","name":"PRIVATE_SOURCE"}]', "1", "ready"),
+        ]
+        for sources, scheduled, expected in cases:
+            values = {"GY_STRM_SOURCE_DIRS": sources, "STRM_SCHEDULE_ENABLED": scheduled,
+                      "GY_STRM_BASE_URL": "http://private.invalid", "STRM_ROOT": "/private/strm"}
+            with self.subTest(sources=sources, scheduled=scheduled), patch(
+                "app.agent.config_explain_actions.config.get", side_effect=_config_get(values)
+            ), patch("app.agent.config_explain_actions.config.has_external_override", return_value=False):
+                summary = diagnose_config({})
+                explanation = explain_config_component({"component": "strm"})
+            entry = next(x for x in summary.data["components"] if x["name"] == "strm")
+            self.assertEqual(entry["status"], expected)
+            self.assertEqual(explanation.status, expected)
+            self.assertEqual(entry["enabled"], explanation.data["enabled"])
+            self.assertEqual("光鸭源目录" in explanation.data["missing_field_labels"], expected != "ready")
+            self.assertFalse(summary.data["network_accessed"])
+            self.assertFalse(explanation.data["network_accessed"])
+            self.assertNotIn("STRM 失败诊断", explanation.data["blocked_capabilities"])
+            self.assertEqual(summary.data["probe_mode"], "configuration_only")
+            if expected == "incomplete":
+                self.assertFalse(summary.ok)
+                self.assertTrue(any(i["severity"] == "error" and i["code"].startswith("strm_") for i in summary.data["issues"]))
+            rendered = json.dumps([summary.to_dict(), explanation.to_dict()], ensure_ascii=False)
+            for secret in ("private.invalid", "/private/strm", "PRIVATE_SOURCE", "GY_STRM_SOURCE_DIRS"):
+                self.assertNotIn(secret, rendered)
+
+    def test_summary_reads_one_configuration_snapshot_and_preserves_disabled_servers(self):
+        from app import config
+        from app.agent.config_diagnosis_actions import diagnose_config
+        from app.modules.strm import parse_strm_sources
+
+        self.assertEqual(parse_strm_sources("[]", require_nonempty=False), ([], ""))
+        values = {"JELLYFIN_ENABLED": "0", "JELLYFIN_URL": "http://secret.invalid",
+                  "JELLYFIN_API_KEY": "secret-api", "EMBY_ENABLED": "0", "TMDB_API_KEY": "secret-tmdb",
+                  "QB_URL": "http://secret.invalid", "QB_API_KEY": "secret-qb", "AI_RECOGNITION_ENABLED": "0"}
+        with patch.object(config, "get", side_effect=_config_get(values)), patch.object(
+            config, "get_many", wraps=config.get_many
+        ) as reads, patch.object(config, "has_external_override", return_value=False):
+            summary = diagnose_config({})
+        self.assertEqual(reads.call_count, 1)
+        states = {x["name"]: x["status"] for x in summary.data["components"]}
+        self.assertEqual(states["jellyfin"], "disabled")
+        self.assertEqual(states["tmdb"], "ready")
+        self.assertEqual(states["qbittorrent"], "ready")
+        self.assertFalse(summary.data["network_accessed"])
+        self.assertNotIn("secret", json.dumps(summary.to_dict()))
+
+    def test_manual_strm_incomplete_is_an_error_even_without_timer(self):
+        from app.agent.config_diagnosis_actions import diagnose_config
+
+        values = {"GY_STRM_SOURCE_DIRS": '["source"]', "STRM_SCHEDULE_ENABLED": "0", "STRM_ROOT": "/private/strm"}
+        with patch("app.agent.config_explain_actions.config.get", side_effect=_config_get(values)), patch(
+            "app.agent.config_explain_actions.config.has_external_override", return_value=False
+        ):
+            result = diagnose_config({})
+        self.assertEqual(result.status, "attention")
+        self.assertTrue(any(i["code"] == "strm_incomplete" for i in result.data["issues"]))

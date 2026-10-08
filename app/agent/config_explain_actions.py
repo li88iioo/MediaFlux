@@ -41,12 +41,19 @@ def _qb_auth(value: Callable[[str], str]) -> bool:
     )
 
 
+def _strm_sources(value: Callable[[str], str]) -> tuple[list[dict[str, str]], str]:
+    from app.modules.strm import parse_strm_sources
+
+    return parse_strm_sources(value("GY_STRM_SOURCE_DIRS"), require_nonempty=False)
+
+
 def _strm_enabled(value: Callable[[str], str]) -> bool:
-    return _state(value("STRM_SCHEDULE_ENABLED")) or bool(value("GY_STRM_SOURCE_DIRS"))
+    sources, error = _strm_sources(value)
+    return _state(value("STRM_SCHEDULE_ENABLED")) or bool(sources or error)
 
 
 def _strm_ready(value: Callable[[str], str]) -> bool:
-    return bool(value("GY_STRM_SOURCE_DIRS")) and all(
+    return _field_present(value, "__strm_source__") and all(
         (
             _has(value, "GY_STRM_BASE_URL"),
             _has(value, "STRM_ROOT"),
@@ -108,7 +115,7 @@ _COMPONENTS: dict[str, ComponentDefinition] = {
             ("GY_STRM_BASE_URL", "播放服务地址"),
             ("STRM_ROOT", "本地 STRM 输出目录"),
         ),
-        blocked_capabilities=("STRM 手动同步", "STRM 定时调度", "STRM 失败诊断"),
+        blocked_capabilities=("STRM 手动同步", "STRM 定时调度", "STRM 失败项重试"),
         enabled=_strm_enabled,
         ready=_strm_ready,
     ),
@@ -145,7 +152,7 @@ _FEATURE_DETAILS: dict[str, dict[str, Any]] = {
     },
 }
 
-CONFIG_COMPONENTS = tuple((*_COMPONENTS.keys(), *_FEATURE_DETAILS.keys()))
+CONFIG_COMPONENTS = (*_COMPONENTS, *_FEATURE_DETAILS)
 _ALLOWED_ARGUMENTS = {"component"}
 _COMPONENT_CONTROL_FIELDS: dict[str, tuple[str, ...]] = {
     "jellyfin": ("JELLYFIN_ENABLED",),
@@ -171,19 +178,21 @@ def config_component_arguments(arguments: dict[str, Any]) -> dict[str, str]:
 
 
 def _effective_value() -> Callable[[str], str]:
-    items = config.all_items()
-
-    def value(key: str) -> str:
-        return str(config.get(key, items.get(key, "")) or "").strip()
-
-    return value
+    keys = {
+        key for definition in _COMPONENTS.values()
+        for field, _label in definition.required_fields
+        for key in _field_override_keys(field)
+    }
+    keys.update(key for fields in _COMPONENT_CONTROL_FIELDS.values() for key in fields)
+    values = config.get_many(tuple(keys))
+    return lambda key: str(values.get(key) or "").strip()
 
 
 def _field_present(value: Callable[[str], str], field: str) -> bool:
     if field == "__qb_auth__":
         return _qb_auth(value)
     if field == "__strm_source__":
-        return bool(value("GY_STRM_SOURCE_DIRS"))
+        return bool(_strm_sources(value)[0])
     if field == "__shared_ai_provider__":
         return _ai_provider_ready(value)
     return _has(value, field)
@@ -216,9 +225,12 @@ def _component_managed_by_environment(
     return any(config.has_external_override(key) for key in keys)
 
 
-def _base_component_payload(component: str) -> dict[str, Any]:
+def component_configuration(
+    component: str, *, value: Callable[[str], str] | None = None,
+) -> dict[str, Any]:
+    """总检与组件解释共用状态判断；只检查配置，不声明远端在线。"""
     definition = _COMPONENTS[component]
-    value = _effective_value()
+    value = value or _effective_value()
     enabled = definition.enabled(value)
     ready = definition.ready(value)
     managed = _component_managed_by_environment(component, definition)
@@ -257,6 +269,8 @@ def _base_component_payload(component: str) -> dict[str, Any]:
 
     return {
         "component": component,
+        "network_accessed": False,
+        "probe_mode": "configuration_only",
         "label": definition.label,
         "status": status,
         "enabled": enabled,
@@ -335,7 +349,7 @@ def explain_config_component(arguments: dict[str, Any]) -> ToolResult:
     payload = (
         _feature_payload(component)
         if component in _FEATURE_DETAILS
-        else _base_component_payload(component)
+        else component_configuration(component)
     )
     label = payload["label"]
     status = payload["status"]
