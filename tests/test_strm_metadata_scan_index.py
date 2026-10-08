@@ -126,3 +126,97 @@ class StrmMetadataScanIndexTests(unittest.TestCase):
         self.assertEqual(stats["metadata_failed"], 0)
         self.assertEqual(target.read_bytes(), b"metadata")
         self.assertEqual(len(db.list_strm_index("guangya-meta:source")), 2)
+
+    def test_unindexed_subtitle_is_queued_then_adopted_only_after_cloud_bytes_match(self):
+        target = self.root / strm.STRM_SUBDIR / "Movie.ass"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"subtitle")
+        stamp = target.stat().st_mtime_ns
+        remote = GuangYaFile("legacy", target.name, False, 8, "cloud", "source")
+        client = _TreeClient({"source": [remote]})
+        stats = strm.sync_strm("source", "http://media.invalid", str(self.root), client=client,
+                               metadata_exts={"ass"}, clean_invalid=False)
+        self.assertEqual(stats["metadata_queued"], 1)
+        self.assertEqual(stats["metadata_failed"], 0)
+        self.assertEqual(db.list_strm_index("guangya-meta:source"), [])
+        job = dict(db.list_strm_metadata_queue()[0])
+        temp = strm._temporary_path(target)
+        temp.write_bytes(b"subtitle")
+        prepared = {"file": remote, "prepared": strm.PreparedMetadataDownload(
+            target, temp, strm._content_fingerprint(temp)), "rel_dir": ""}
+        with patch.object(Path, "replace", side_effect=AssertionError("相同文件不得覆盖")):
+            result = strm.commit_strm_metadata_job(job, prepared, str(self.root))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(target.stat().st_mtime_ns, stamp)
+        self.assertFalse(temp.exists())
+        row = db.list_strm_index("guangya-meta:source")[0]
+        self.assertTrue(strm._metadata_state_matches(row, remote, target))
+        again = strm.sync_strm("source", "http://media.invalid", str(self.root), client=client,
+                               metadata_exts={"ass"}, clean_invalid=False)
+        self.assertEqual(again["metadata_queued"], 0)
+        self.assertEqual(again["metadata_skipped"], 1)
+
+    def test_adoption_preserves_different_local_bytes_and_cleans_prepared_file(self):
+        target = self.root / strm.STRM_SUBDIR / "Movie.ass"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"my edits")
+        remote = GuangYaFile("legacy", target.name, False, 8, "cloud", "source")
+        temp = strm._temporary_path(target)
+        temp.write_bytes(b"subtitle")
+        with self.assertRaises(strm._STRMOwnershipError):
+            strm._install_metadata_candidate(remote, "", target, str(self.root), "guangya-meta:source", [], "",
+                prepared=strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp)))
+        self.assertEqual(target.read_bytes(), b"my edits")
+        self.assertFalse(temp.exists())
+        self.assertEqual(db.list_strm_index("guangya-meta:source"), [])
+
+    def test_adoption_index_failure_never_deletes_existing_subtitle(self):
+        target = self.root / strm.STRM_SUBDIR / "Movie.ass"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(b"subtitle")
+        remote = GuangYaFile("legacy", target.name, False, 8, "cloud", "source")
+        temp = strm._temporary_path(target)
+        temp.write_bytes(b"subtitle")
+        with patch.object(db, "upsert_strm_index", side_effect=RuntimeError("disk busy")), self.assertRaisesRegex(RuntimeError, "disk busy"):
+            strm._install_metadata_candidate(remote, "", target, str(self.root), "guangya-meta:source", [], "",
+                prepared=strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp)))
+        self.assertEqual(target.read_bytes(), b"subtitle")
+        self.assertFalse(temp.exists())
+        self.assertEqual(db.list_strm_index("guangya-meta:source"), [])
+
+    def test_real_http_truncated_body_is_retried_without_publishing_partial_content(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        payload = b"subtitle from HTTP"
+        attempts = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                attempts.append(1)
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(payload[:3] if len(attempts) == 1 else payload)
+                self.wfile.flush()
+                self.close_connection = True
+
+            def log_message(self, *_):
+                pass
+
+        with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            remote = GuangYaFile("m", "Movie.ass", False, len(payload), "v1", "source")
+            try:
+                prepared = strm.prepare_metadata_download(remote, "", str(self.root),
+                    download_url=f"http://127.0.0.1:{server.server_port}/subtitle")
+                self.assertEqual(prepared.temp.read_bytes(), payload)
+                self.assertFalse(prepared.target.exists())
+                self.assertEqual(len(attempts), 2)
+                prepared.temp.unlink()
+            finally:
+                server.shutdown()
+                thread.join(timeout=3)
+        self.assertEqual(list(self.root.rglob("*.tmp")), [])

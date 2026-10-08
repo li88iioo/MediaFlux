@@ -597,7 +597,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                     patch("app.modules.strm._metadata_file_limit", return_value=4), \
                     patch("app.modules.strm.requests.get", return_value=response):
                 with self.assertRaises(ValueError):
-                    strm_module.download_metadata(
+                    strm_module.prepare_metadata_download(
                         file,
                         "",
                         root,
@@ -611,7 +611,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 patch("app.modules.strm._metadata_file_limit", return_value=4), \
                 patch("app.modules.strm.requests.get") as request:
             with self.assertRaises(ValueError):
-                strm_module.download_metadata(
+                strm_module.prepare_metadata_download(
                     file,
                     "",
                     root,
@@ -628,7 +628,7 @@ class StrmHardeningTests(IsolatedDatabaseTestCase):
                 patch("app.modules.strm.time.monotonic", side_effect=[0.0, 0.0, 0.5, 1.5]), \
                 patch("app.modules.strm.requests.get", return_value=response):
             with self.assertRaises(TimeoutError):
-                strm_module.download_metadata(
+                strm_module.prepare_metadata_download(
                     file,
                     "",
                     root,

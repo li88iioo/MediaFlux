@@ -865,35 +865,6 @@ def prepare_metadata_download(
     raise RuntimeError("元数据下载未产生结果")
 
 
-def download_metadata(
-    file: GuangYaFile,
-    rel_dir: str,
-    strm_root: str,
-    client: Optional[GuangYaClient] = None,
-    *,
-    download_url: str = "",
-    should_stop: Callable[[], bool] | None = None,
-    before_replace: Callable[[Path], None] | None = None,
-    on_replaced: Callable[[Path, str], None] | None = None,
-) -> Path:
-    """下载并原子替换单个元数据文件。"""
-    prepared = prepare_metadata_download(
-        file, rel_dir, strm_root, client,
-        download_url=download_url,
-        should_stop=should_stop,
-    )
-    try:
-        if before_replace:
-            before_replace(prepared.target)
-        prepared.temp.replace(prepared.target)
-        if on_replaced:
-            on_replaced(prepared.target, prepared.fingerprint)
-        return prepared.target
-    finally:
-        if prepared.temp.exists():
-            prepared.temp.unlink(missing_ok=True)
-
-
 def _candidate_sort_key(candidate: tuple[GuangYaFile, str]) -> tuple:
     file, _rel_dir = candidate
     return (-int(file.size or 0), str(file.file_id), str(file.etag), str(file.name))
@@ -1136,38 +1107,34 @@ def _install_metadata_candidate(
         row for row in existing_rows
         if str(_row_field(row, "strm_path", "") or "") == str(expected)
     ]
-    _require_owned_file(expected, target_owners, "覆盖元数据")
-    if previous_path and previous_path != expected:
-        _require_owned_file(previous_path, [current], "删除旧元数据")
-    target_backup = _copy_backup(expected)
-    previous_backup = (
-        _copy_backup(previous_path)
-        if previous_path and previous_path != expected else None
+    prepared = prepared or prepare_metadata_download(
+        file, rel_dir, strm_root, client,
+        download_url=download_url, should_stop=should_stop,
     )
-
+    target_backup = previous_backup = None
     index_changed = False
     state = {"installed_fingerprint": "", "previous_deleted": False}
     try:
-        if prepared is not None:
-            if prepared.target != expected:
-                raise RuntimeError("元数据临时文件目标与任务不一致")
+        if prepared.target != expected:
+            raise RuntimeError("元数据临时文件目标与任务不一致")
+        # 历史伴随文件没有索引时，只能用本次云端完整下载逐字节证明同一内容。
+        # 不覆盖、不改变原文件mtime；不同内容仍视为外部文件，不能自动认领。
+        adopt = not target_owners and _fingerprint_matches(expected, prepared.fingerprint)
+        if not adopt:
+            _require_owned_file(expected, target_owners, "覆盖元数据")
+            target_backup = _copy_backup(expected)
+        if previous_path and previous_path != expected:
+            _require_owned_file(previous_path, [current], "删除旧元数据")
+            previous_backup = _copy_backup(previous_path)
+        if adopt:
+            _require_file_snapshot(expected, prepared.fingerprint, "认领同内容元数据")
+        else:
             _require_owned_file(expected, target_owners, "覆盖元数据")
             prepared.temp.replace(expected)
             state["installed_fingerprint"] = prepared.fingerprint
-        else:
-            download_metadata(
-                file, rel_dir, strm_root, client, download_url=download_url,
-                should_stop=should_stop,
-                before_replace=lambda target: _require_owned_file(
-                    target, target_owners, "覆盖元数据"
-                ),
-                on_replaced=lambda _target, fingerprint: state.__setitem__(
-                    "installed_fingerprint", fingerprint
-                ),
-            )
         db.upsert_strm_index(
             source_key, file.file_id, file.etag, file.size, file.name, str(expected),
-            state["installed_fingerprint"],
+            prepared.fingerprint,
             conflicting_file_ids=tuple(row["file_id"] for row in conflicts),
         )
         index_changed = True
@@ -1181,8 +1148,6 @@ def _install_metadata_candidate(
         _discard_backup(previous_backup)
         return cleaned
     except Exception:
-        if prepared is not None and prepared.temp.exists():
-            prepared.temp.unlink(missing_ok=True)
         try:
             _restore_installed_file(
                 expected, target_backup, state["installed_fingerprint"], "元数据"
@@ -1196,6 +1161,8 @@ def _install_metadata_candidate(
                 source_key, str(file.file_id), current, conflicts, index_changed
             )
         raise
+    finally:
+        prepared.temp.unlink(missing_ok=True)
 
 
 def _prepare_strm_metadata_job_with_client(
@@ -2612,7 +2579,8 @@ def _sync_strm_impl(
                 else:
                     try:
                         target_owners = metadata_rows_by_path.get(str(expected), [])
-                        _require_owned_file(expected, target_owners, "排队元数据覆盖")
+                        if target_owners:
+                            _require_owned_file(expected, target_owners, "排队元数据覆盖")
                         if previous_path and previous_path != expected:
                             _require_owned_file(
                                 previous_path,

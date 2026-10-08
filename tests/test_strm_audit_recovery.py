@@ -99,15 +99,15 @@ def test_metadata_retry_only_visits_related_index_rows(tmp_path, count):
         def download(file, rel_dir, root, client=None, **kwargs):
             target = strm._metadata_target(file, rel_dir, root)
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(b"<movie/>")
-            kwargs["on_replaced"](target, strm._content_fingerprint(target))
-            return target
+            temp = strm._temporary_path(target)
+            temp.write_bytes(b"<movie/>")
+            return strm.PreparedMetadataDownload(target, temp, strm._content_fingerprint(temp))
 
         def install(*args, **kwargs):
             visits.append(len(args[5]))
             return original(*args, **kwargs)
 
-        with patch.object(strm, "download_metadata", side_effect=download), patch.object(strm, "_install_metadata_candidate", side_effect=install), patch.object(db, "list_strm_index", wraps=db.list_strm_index) as reads:
+        with patch.object(strm, "prepare_metadata_download", side_effect=download), patch.object(strm, "_install_metadata_candidate", side_effect=install), patch.object(db, "list_strm_index", wraps=db.list_strm_index) as reads:
             result = strm.retry_all_strm_failures("s", "metadata", "test", client=client, runtime_config=runtime)
         assert result["resolved"] == count, result
         assert reads.call_count == 1
@@ -190,7 +190,7 @@ def test_metadata_retry_download_stop_releases_instead_of_failing(tmp_path):
             stop.set()
             raise strm._STRMStopped("cancelled during download")
 
-        with patch.object(strm, "download_metadata", side_effect=download):
+        with patch.object(strm, "prepare_metadata_download", side_effect=download):
             result = strm.retry_all_strm_failures("s", "metadata", "test", client=_TreeClient({"s": [file]}), runtime_config=runtime, should_stop=stop.is_set)
         assert result["stopped"] and result["deferred"] == 1
         assert result["failed"] == 0
