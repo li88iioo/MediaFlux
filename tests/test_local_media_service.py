@@ -1668,6 +1668,47 @@ class LocalMediaServiceTests(IsolatedDatabaseTestCase):
             self.assertTrue(preview["snapshot_digest"])
             self.assertEqual(list(target_root.rglob("*")), [])
 
+    def test_position_blocked_task_preserves_only_explicit_single_file_identity(self):
+        class SeasonScraper(FakeScraper):
+            supports_tmdb_position_validation = True
+            validate_position = staticmethod(TMDBScraper.validate_position)
+            position_validation_error = staticmethod(TMDBScraper.position_validation_error)
+
+            def get_detail(self, tmdb_id, media_type, *, force_refresh=False):
+                return {"id": 1, "name": "Show", "first_air_date": "2026-01-01",
+                        "seasons": [{"season_number": 2, "episode_count": 10}]}
+
+        for locked, directory in ((True, False), (False, False), (True, True)):
+            with self.subTest(locked=locked, directory=directory), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                source_root, target_root = root / f"source-{locked}-{directory}", root / "target"
+                source_root.mkdir(); target_root.mkdir()
+                episode = source_root / "Show.S02E999.mkv"
+                episode.write_bytes(b"video")
+                source_id = self._source(source_root, target_root, "tv")
+                task_id = db.create_local_media_task(
+                    source_id, "", str(source_root if directory else episode),
+                    owner="admin", trigger="scan",
+                )
+                self.assertTrue(db.claim_local_media_task(task_id, owner="admin"))
+                service = LocalMediaService(scraper=SeasonScraper(MatchResult(
+                    tmdb_id="1", title="Show", year="2026", media_type="tv",
+                    confidence=1.0, status="matched", provider="tmdb", external_id="1",
+                    matched_by="tmdb_id" if locked else "search", locked=locked,
+                )))
+                self.addCleanup(service.close)
+                result = service.execute_task("admin", task_id)
+                task = db.get_local_media_task(task_id, owner="admin")
+                self.assertEqual(result["status"], "requires_manual")
+                self.assertIn("文件集号超出", task.error)
+                self.assertEqual(task.status, "requires_manual")
+                self.assertEqual((task.tmdb_id, task.title, task.year, task.media_type),
+                                 ("1", "Show", "2026", "tv") if locked and not directory
+                                 else ("", "", "", ""))
+                self.assertEqual(episode.read_bytes(), b"video")
+                self.assertEqual(list(target_root.rglob("*")), [])
+                self.assertEqual(db.list_local_media_task_items(task_id, owner="admin"), [])
+
     def test_requires_manual_task_review_targets_episode_file(self):
         with tempfile.TemporaryDirectory() as root_raw:
             root = Path(root_raw); source_root = root / "review-downloads"; target_root = root / "tv"

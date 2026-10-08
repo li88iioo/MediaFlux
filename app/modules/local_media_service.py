@@ -1330,11 +1330,22 @@ class LocalMediaService:
             manual_pending_confirmations
         )
         seen_targets: set[Path] = set()
+        task_identity: dict[str, str] = {}
 
         for plan in planning_result.plans:
             match = plan.match or MatchResult()
             snapshot = snapshots_by_id.get(str(plan.file_id))
             if match.need_confirm or plan.action == "conflict":
+                # 单文件明确绑定的作品身份与季集位置是两回事。位置越界仍需
+                # 人工确认，但不能丢失已锁定身份，让后续季集纠偏无从继续。
+                validation = (match.metadata or {}).get("final_position_validation", {})
+                if (
+                    inspection.selected_path.is_file() and match.locked
+                    and match.provider == "tmdb" and match.tmdb_id and match.media_type == "tv"
+                    and validation.get("reason") in {"season_not_found", "episode_out_of_range"}
+                ):
+                    task_identity = {key: str(getattr(match, key) or "")
+                                     for key in ("tmdb_id", "title", "year", "media_type")}
                 candidates = self._confirmation_candidates(match)
                 pending_confirmations.append({
                     "source_name": plan.original_name,
@@ -1490,6 +1501,7 @@ class LocalMediaService:
                 "cloud_write": False,
                 "rules_snapshot": effective_rules_snapshot,
                 "numbering_mode": normalized_numbering_mode,
+                "_task_identity": task_identity,
             }
 
         # Web 写票据覆盖整个计划，扫描/通知的源 digest 保持原契约。
@@ -1812,33 +1824,24 @@ class LocalMediaService:
                 task.snapshot_digest if web_preview or task.confirmation_actor
                 else str(preview.get("digest") or inspection.get("digest") or "")
             )
-            if preview.get("status") != "planned":
-                db.update_local_media_task(
-                    task_id, owner=owner, status="requires_manual",
-                    snapshot_digest=execution_digest,
-                    error=str(preview.get("reason") or "TMDB 结果需要人工确认"),
-                )
-                return {"status": "requires_manual", "task_id": task_id, "preview": preview,
-                        "repreview_required": bool(preview.get("repreview_required"))}
             pending_confirmations = list(preview.get("pending_confirmations") or [])
-            if pending_confirmations:
+            unplanned = preview.get("status") != "planned"
+            if unplanned or pending_confirmations:
                 reason = (
+                    str(preview.get("reason") or "TMDB 结果需要人工确认") if unplanned else
                     f"仍有 {len(pending_confirmations)} 组媒体需要人工确认；"
                     "为保证本地文件事务完整，本次尚未移动任何文件"
                 )
                 db.update_local_media_task(
-                    task_id,
-                    owner=owner,
-                    status="requires_manual",
-                    snapshot_digest=execution_digest,
-                    error=reason,
-                    completed_at=None,
+                    task_id, owner=owner, status="requires_manual",
+                    snapshot_digest=execution_digest, error=reason,
+                    **(preview.get("_task_identity") or {}),
+                    **({} if unplanned else {"completed_at": None}),
                 )
                 return {
-                    "status": "requires_manual",
-                    "task_id": task_id,
-                    "preview": preview,
-                    "reason": reason,
+                    "status": "requires_manual", "task_id": task_id, "preview": preview,
+                    **({"repreview_required": bool(preview.get("repreview_required"))}
+                       if unplanned else {"reason": reason}),
                 }
             for plan in preview["_move_plans"]:
                 db.add_local_media_task_item(
