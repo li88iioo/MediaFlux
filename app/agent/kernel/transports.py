@@ -87,14 +87,25 @@ class EffectEnvelope:
         )
 
 
-class WebKernelTransport:
-    """Web 只取得真实 NDJSON 事件并转发控制命令。"""
+class _KernelTransport:
+    """共享会话依赖与确认取消；具体通道仅适配各自的事件协议。"""
 
     def __init__(
         self, session: AgentSession, *, metrics: KernelMetrics | None = None
     ) -> None:
         self.session = session
         self.metrics = metrics or KernelMetrics()
+
+    async def cancel_effect(self, request: EffectEnvelope) -> bool:
+        normalized = request.normalized()
+        return await self.session.cancel_effect(
+            owner=normalized.owner, session_id=normalized.session_id,
+            plan_id=normalized.plan_id, request_id=normalized.request_id,
+        )
+
+
+class WebKernelTransport(_KernelTransport):
+    """Web 只取得真实 NDJSON 事件并转发控制命令。"""
 
     async def query(self, request: QueryEnvelope) -> AsyncIterator[bytes]:
         async with aclosing(self.session.run(replace(request, channel="web").to_agent_input())) as events:
@@ -128,22 +139,9 @@ class WebKernelTransport:
             request_id=_scope(request_id, "request_id"),
         )
 
-    async def cancel_effect(self, request: EffectEnvelope) -> bool:
-        normalized = request.normalized()
-        return await self.session.cancel_effect(
-            owner=normalized.owner, session_id=normalized.session_id,
-            plan_id=normalized.plan_id, request_id=normalized.request_id,
-        )
 
-
-class TelegramKernelTransport:
+class TelegramKernelTransport(_KernelTransport):
     """Telegram 消费与 Web 相同的事件，不自行实现 Agent 状态机。"""
-
-    def __init__(
-        self, session: AgentSession, *, metrics: KernelMetrics | None = None
-    ) -> None:
-        self.session = session
-        self.metrics = metrics or KernelMetrics()
 
     async def query(
         self,
@@ -196,13 +194,6 @@ class TelegramKernelTransport:
         return await self.session.cancel(
             owner=_owner(owner),
             session_id=_scope(session_id, "session_id"),
-        )
-
-    async def cancel_effect(self, request: EffectEnvelope) -> bool:
-        normalized = request.normalized()
-        return await self.session.cancel_effect(
-            owner=normalized.owner, session_id=normalized.session_id,
-            plan_id=normalized.plan_id, request_id=normalized.request_id,
         )
 
 
