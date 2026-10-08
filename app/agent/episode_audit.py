@@ -547,6 +547,7 @@ def _audit_uncached(arguments: dict[str, Any]) -> ToolResult:
     statuses = {str(source.get("status") or "unavailable") for source in sources}
     incomplete = (
         seasons_truncated
+        or bool(missing and data["ignored_unknown_local"])
         or remote_truncated
         or any(source.get("truncated") for source in ready)
         or "unavailable" in statuses
@@ -559,7 +560,7 @@ def _audit_uncached(arguments: dict[str, Any]) -> ToolResult:
                 status="inconclusive",
                 summary="审计数据不完整，当前结果仅供参考",
                 data=data,
-                suggestions=["存在不可用、未映射或被截断的数据源，请修复后重新审计。"],
+                suggestions=["存在不可用、未映射、截断或无法编号的本地记录，请修复后重新审计。"],
             ),
             mapping_context,
         )

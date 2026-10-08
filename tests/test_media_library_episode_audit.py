@@ -530,6 +530,23 @@ class MediaLibraryEpisodeAuditTests(unittest.TestCase):
         self.assertEqual(result.data["comparison_eligible_count"], 0)
         self.assertIn("没有读取到剧集条目", result.summary)
 
+    def test_unknown_local_position_cannot_be_reported_as_confirmed_missing(self):
+        from app.agent.library_episode_audit import audit_library_episodes
+
+        sources = self._sources()
+        sources[0]["series"][0]["ignored_unknown"] = 1
+        with patch("app.agent.library_episode_audit.inspect_library_series_sources", return_value=sources), patch(
+            "app.agent.library_episode_audit.TMDBClient", return_value=self._tmdb_client()
+        ):
+            result = audit_library_episodes({"as_of": "2026-08-03", "max_series": 50})
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "inconclusive")
+        self.assertEqual(result.data["updates_available_count"], 0)
+        self.assertEqual(result.data["up_to_date_count"], 1)
+        self.assertEqual(result.data["inconclusive_count"], 1)
+        self.assertEqual(result.data["findings"][0]["ignored_unknown_local"], 1)
+        self.assertEqual(result.data["findings"][0]["status"], "inconclusive")
+
     def test_unknown_air_dates_make_the_series_inconclusive(self):
         from app.agent.library_episode_audit import audit_library_episodes
 

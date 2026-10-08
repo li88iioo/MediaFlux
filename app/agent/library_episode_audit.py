@@ -1,9 +1,9 @@
 """全库剧集巡检：以媒体服务器本地集号为库存，和 TMDB 已播清单比较。"""
 from __future__ import annotations
 
-from datetime import date, datetime
 import time
 import unicodedata
+from datetime import date, datetime
 from typing import Any
 
 from app.agent.models import Evidence, ToolResult
@@ -691,6 +691,7 @@ def _audit_library_episodes_with_client(
         data["unknown_air_date_count"] += remote["unknown_air_date_count"]
         group_incomplete = bool(
             group["local_truncated"]
+            or bool(missing and group["ignored_unknown"])
             or remote["truncated"]
             or remote["unknown_air_date_count"]
         )
@@ -714,6 +715,7 @@ def _audit_library_episodes_with_client(
                 "source_count": len(group["sources"]),
                 "expected_aired": len(remote["expected"]),
                 "local_episode_count": len(local),
+                "ignored_unknown_local": group["ignored_unknown"],
                 "missing_count": len(missing),
                 "missing_sample": [
                     {"season": season, "episode": episode}
@@ -775,7 +777,7 @@ def _audit_library_episodes_with_client(
                 f"确认 {data['updates_available_count']} 部存在缺集"
             ),
             data=data,
-            suggestions=["请修复未映射、截断或不可用的数据源后重新巡检。"],
+            suggestions=["请补齐本地季集编号，或修复未映射、截断和不可用的数据源后重新巡检。"],
         )
     if data["updates_available_count"]:
         return _result(

@@ -9,8 +9,8 @@ from app.agent.episode_audit import (
     invalidate_episode_audit_cache,
     reset_episode_audit_cache_for_tests,
 )
-from app.agent.update_actions import check_library_updates
 from app.agent.models import ToolResult
+from app.agent.update_actions import check_library_updates
 from app.clients.base import SeriesCandidate, SeriesEpisodeInventory, SeriesSearchResult
 from app.discovery.models import ProviderNotConfigured, ProviderUnavailable
 from app.services import _series_source_payload
@@ -236,6 +236,27 @@ class EpisodeAuditTests(unittest.TestCase):
             },
         ])
         self.assertFalse(result.data["resource_followups_truncated"])
+
+    def test_unpositioned_local_media_blocks_confirmed_missing_followups(self):
+        source = {**_ready([(1, 1)]), "ignored_unknown": 1, "local_total": 2}
+        with patch("app.agent.episode_audit.inspect_series_episode_sources", return_value=[source]), patch(
+            "app.agent.episode_audit.TMDBClient", return_value=_FakeTMDB()
+        ):
+            result = audit_series_episodes(dict(self.arguments))
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "inconclusive")
+        self.assertEqual(result.data["ignored_unknown_local"], 1)
+        self.assertNotIn("resource_followups", result.data)
+
+    def test_unpositioned_extra_does_not_hide_known_complete_inventory(self):
+        source = {**_ready([(1, 1), (1, 2), (2, 1)]), "ignored_unknown": 1}
+        with patch("app.agent.episode_audit.inspect_series_episode_sources", return_value=[source]), patch(
+            "app.agent.episode_audit.TMDBClient", return_value=_FakeTMDB()
+        ):
+            result = audit_series_episodes(dict(self.arguments))
+        self.assertTrue(result.ok)
+        self.assertEqual(result.status, "up_to_date")
+        self.assertEqual(result.data["missing_count"], 0)
 
     def test_latest_episode_numbers_are_not_local_episode_count(self):
         fake = _FakeTMDB()
@@ -633,6 +654,7 @@ class EpisodeAuditTests(unittest.TestCase):
     def test_refresh_replaces_inflight_query_without_stale_cache_publish_or_unlock(self):
         import threading
         from concurrent.futures import ThreadPoolExecutor
+
         from app.agent import episode_audit as module
         old_started, new_started, old_release, new_release = (threading.Event() for _ in range(4))
         calls = []
