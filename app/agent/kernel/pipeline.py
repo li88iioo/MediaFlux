@@ -74,6 +74,7 @@ class ToolCallContext:
     resource_candidate_ref: str = ""
     channel: str = "api"
     completion_scope: Any = None
+    confirmed_effect: PipelineResult | None = None
 
     def policy_context(self) -> dict[str, Any]:
         return {
@@ -355,11 +356,6 @@ class ToolPipeline:
             return prepared
         return value if isinstance(value, PreparedEffect) else prepared
 
-    def _effect_prepare_failed(
-        self, *, prepared: PreparedEffect, context: ToolCallContext
-    ) -> None:
-        self._notify_effect("prepare_failed", prepared=prepared, context=context)
-
     def _notify_effect(self, method: str, **payload: Any) -> None:
         """终态钩子共享容错边界；辅助审计/清理故障不覆写执行事实。"""
         try:
@@ -389,7 +385,7 @@ class ToolPipeline:
         if cancelled is not None:
             self._notify_effect("cancelled", plan=cancelled)
         else:
-            self._effect_prepare_failed(prepared=prepared, context=context)
+            self._notify_effect("prepare_failed", prepared=prepared, context=context)
 
     async def execute(
         self,
@@ -442,21 +438,21 @@ class ToolPipeline:
             raise ToolPipelineError(
                 "工具参数校验器返回无效结果", code="invalid_arguments"
             )
-        try:
-            resolved = await self._resolve_references(normalized, context=context)
-        except ReferenceError as exc:
-            raise ToolPipelineError(
-                "工具引用无效、已过期或不属于当前会话",
-                code="reference_invalid",
-            ) from exc
-        await self.authorization.authorize(tool, resolved, context)
-        await self.rate_limiter.acquire(
-            owner=context.owner,
-            tool_name=tool.name,
-            cost=tool.cost,
-            arguments=resolved,
-        )
-        context.cancellation.raise_if_cancelled()
+        resolved = await self._authorize(tool, normalized, context)
+        completed = context.confirmed_effect
+        plan = completed.effect_plan if completed else None
+        if (
+            completed and plan and tool.effect is not ToolEffect.READ
+            and (plan.owner, plan.session_id, plan.generation) == (context.owner, context.session_id, context.lease.generation)
+            and tool.name == completed.tool.name and normalized == completed.arguments
+            and completed.outcome.public_content.get("ok") is not False
+        ):
+            if not await self.state_store.is_current(context.lease):
+                raise StalePublicationError("turn lost publication authority")
+            # 只回读本次确认的事实，不重放写操作、票据、引用或状态更新。
+            outcome = replace(completed.outcome, refs=(), state_updates=(), effect_plan=None,
+                              model_content="本轮该操作已确认执行；以下为原回执，不是再次执行。\n" + completed.outcome.model_message())
+            return PipelineResult(tool=tool, arguments=normalized, outcome=outcome)
 
         if tool.effect is ToolEffect.READ:
             if tool.read is None:  # pragma: no cover - ToolSpec 已校验
@@ -511,7 +507,7 @@ class ToolPipeline:
         try:
             with session_scope_guard(context.owner, context.session_id):
                 if not await self.state_store.is_current(context.lease):
-                    self._effect_prepare_failed(prepared=prepared_value, context=context)
+                    self._notify_effect("prepare_failed", prepared=prepared_value, context=context)
                     raise StalePublicationError("turn lost publication authority")
                 try:
                     preview_outcome = await self._materialize_refs(
@@ -529,7 +525,7 @@ class ToolPipeline:
                         public_result=preview_outcome.public_content,
                     )
                 except BaseException:
-                    self._effect_prepare_failed(prepared=prepared_value, context=context)
+                    self._notify_effect("prepare_failed", prepared=prepared_value, context=context)
                     raise
                 try:
                     updates = tuple(preview_outcome.state_updates) + (
@@ -556,7 +552,7 @@ class ToolPipeline:
                     elapsed_ms=max(0, int((time.monotonic() - started) * 1000)),
                 )
         except SessionBusyError:
-            self._effect_prepare_failed(prepared=prepared_value, context=context)
+            self._notify_effect("prepare_failed", prepared=prepared_value, context=context)
             raise
 
     async def execute_confirmed(
@@ -628,23 +624,7 @@ class ToolPipeline:
                 raise ToolPipelineError(
                     "确认计划风险类型不匹配", code="confirmation_invalid"
                 )
-            try:
-                resolved_arguments = await self._resolve_references(
-                    dict(plan.arguments), context=context
-                )
-            except ReferenceError as exc:
-                raise ToolPipelineError(
-                    "确认计划引用无效、已过期或不属于当前会话",
-                    code="confirmation_stale",
-                ) from exc
-            await self.authorization.authorize(tool, resolved_arguments, context)
-            await self.rate_limiter.acquire(
-                owner=context.owner,
-                tool_name=f"confirm:{tool.name}",
-                cost=max(1.0, tool.cost),
-                arguments=resolved_arguments,
-            )
-            context.cancellation.raise_if_cancelled()
+            resolved_arguments = await self._authorize(tool, dict(plan.arguments), context, confirmation=True)
             if tool.execute_confirmed is None:  # pragma: no cover - ToolSpec 已校验
                 raise ToolPipelineError(
                     "工具不支持确认执行", code="confirmation_not_supported"
@@ -725,12 +705,29 @@ class ToolPipeline:
             )
             return cancelled_plan is not None
 
+    async def _authorize(
+        self, tool: KernelToolSpec, arguments: dict[str, Any], context: ToolCallContext, *, confirmation: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            resolved = await self._resolve_references(arguments, context=context)
+        except ReferenceError as exc:
+            raise ToolPipelineError(
+                "确认计划引用无效、已过期或不属于当前会话" if confirmation else "工具引用无效、已过期或不属于当前会话",
+                code="confirmation_stale" if confirmation else "reference_invalid",
+            ) from exc
+        await self.authorization.authorize(tool, resolved, context)
+        await self.rate_limiter.acquire(
+            owner=context.owner, tool_name=f"confirm:{tool.name}" if confirmation else tool.name,
+            cost=max(1.0, tool.cost) if confirmation else tool.cost, arguments=resolved,
+        )
+        context.cancellation.raise_if_cancelled()
+        return resolved
+
     async def _resolve_references(
         self,
         value: Any,
         *,
         context: ToolCallContext,
-        key: str = "",
     ) -> Any:
         if isinstance(value, dict):
             result: dict[str, Any] = {}
@@ -750,13 +747,11 @@ class ToolPipeline:
                         expected_kind=expected_kind,
                     )
                 else:
-                    result[child_key] = await self._resolve_references(
-                        child_value, context=context, key=child_key
-                    )
+                    result[child_key] = await self._resolve_references(child_value, context=context)
             return result
         if isinstance(value, list):
             return [
-                await self._resolve_references(item, context=context, key=key)
+                await self._resolve_references(item, context=context)
                 for item in value
             ]
         return value

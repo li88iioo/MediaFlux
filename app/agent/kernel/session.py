@@ -14,8 +14,8 @@ from typing import Any, Protocol
 from app.agent.model_context_budget import bounded_model_messages
 from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.agent.public_view import (
-    format_public_result,
     format_partial_progress,
+    format_public_result,
     public_result_state,
     sanitize_confirmed_answer,
 )
@@ -430,7 +430,10 @@ class AgentSession:
                 )
             conversation.append(item)
             try:
-                from app.agent.effect_completion import remember_effect_receipt, acknowledge_effect_receipt
+                from app.agent.effect_completion import (
+                    acknowledge_effect_receipt,
+                    remember_effect_receipt,
+                )
 
                 await remember_effect_receipt(self.state_store, owner=lease.owner,
                     session_id=lease.session_id, plan_id=plan_id, message=item)
@@ -627,7 +630,7 @@ class AgentSession:
                 except ConfirmationClaimError as exc:
                     await failure(exc.code, str(exc))
                     return
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - 写后未知状态必须落盘，禁止伪装成未执行
                     public_result = {"ok": False, "status": exc.code if isinstance(exc, ToolPipelineError) else "internal_error",
                                      "summary": str(exc) if isinstance(exc, ToolPipelineError) else "确认执行状态未知，请先查询真实业务状态再决定是否重试。"}
                 candidate_data = public_result.get("data")
@@ -674,6 +677,7 @@ class AgentSession:
                     })
                     return
                 confirmed_result = public_result
+                tool_context = replace(tool_context, confirmed_effect=result)
                 scope.close()
                 await self.coordinator.unprotect(lease, token)
                 confirming = False

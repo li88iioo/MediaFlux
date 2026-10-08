@@ -3696,3 +3696,139 @@ class ConfirmationPendingOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 view = await consume_events(_events_stream(events))
                 self.assertEqual(view.status, "approval_required")
                 self.assertEqual(writes, [1])
+
+
+class ConfirmedEffectReplayTests(unittest.IsolatedAsyncioTestCase):
+    """已确认的同轮重复调用读回原回执，而非产生第二张确认卡。"""
+
+    @staticmethod
+    def call(name, arguments, call_id):
+        return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED,
+                           tool_call=ModelToolCall(call_id, name, arguments)),
+                ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
+
+    def runtime(self, tail, *, failed=False):
+        prepares, writes, reads = [], [], []
+        tool = KernelToolSpec(
+            name="cloud.change", domain="cloud", description="变更",
+            input_schema={"type": "object", "properties": {"step": {"type": "integer"}},
+                          "required": ["step"], "additionalProperties": False},
+            effect=ToolEffect.WRITE,
+            prepare=lambda a, _: prepares.append(dict(a)) or PreparedEffect(
+                preview={"summary": "变更预览"}, snapshot_fingerprint="snapshot"),
+            execute_confirmed=lambda a, *_: writes.append(dict(a)) or ToolOutcome(
+                model_content='{"ok":true,"summary":"变更已完成"}',
+                public_content={"ok": not failed, "status": "failed" if failed else "success",
+                                "summary": "变更失败" if failed else "变更已完成"},
+                state_updates=(StateUpdate("metadata.marker", "original"),)),
+        )
+        read = read_tool("cloud.inspect", domain="cloud", handler=lambda *_: reads.append(1) or ToolOutcome(
+            model_content="已查询", public_content={"ok": True, "summary": "已查询"},
+            state_updates=(StateUpdate("metadata.marker", "read"),)))
+        model = ScriptedModel([self.call(tool.name, {"step": 1}, "initial")] + tail)
+        catalog = ToolCatalog([tool, read])
+        state = InMemorySessionStateStore()
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+        return session, model, prepares, writes, reads
+
+    async def confirm(self, session):
+        preview = await consume_events(session.run(AgentInput(owner="owner", session_id="replay", message="变更")))
+        self.assertIsNotNone(preview.approval)
+        return await collect(session.confirm(owner="owner", session_id="replay", plan_id=preview.approval.plan_id))
+
+    async def test_same_write_after_live_read_reuses_receipt_without_replaying_updates(self):
+        for repair in (False, True):
+            with self.subTest(repair=repair):
+                tail = [self.call("cloud.inspect", {}, "read")]
+                if repair:
+                    tail.append(self.call("cloud.change", {}, "invalid"))
+                tail += [self.call("cloud.change", {"step": 1}, "repeat"),
+                         [ModelEvent(ModelEventType.TEXT_DELTA, text="变更已完成。"),
+                          ModelEvent(ModelEventType.FINISH, finish_reason="stop")]]
+                session, model, prepares, writes, reads = self.runtime(tail)
+                events = await self.confirm(session)
+                final = await consume_events(_events_stream(events))
+                self.assertEqual(final.status, "success")
+                self.assertIsNone(final.approval)
+                self.assertEqual(prepares, [{"step": 1}])
+                self.assertEqual(writes, [{"step": 1}])
+                self.assertEqual(reads, [1])
+                self.assertFalse(any(e.type == AgentEventType.EFFECT_APPROVAL_REQUIRED for e in events))
+                current = await session.state_store.load(owner="owner", session_id="replay")
+                self.assertEqual(current.metadata["marker"], "read")
+                repeated = [m for m in model.requests[-1].messages if m.tool_call_id == "repeat"]
+                self.assertEqual(len(repeated), 1)
+                self.assertIn("不是再次执行", repeated[0].content)
+                if repair:
+                    self.assertTrue(any(e.type == AgentEventType.TOOL_FAILED and e.payload["code"] == "invalid_arguments" for e in events))
+
+    async def test_changed_arguments_still_require_a_new_confirmation(self):
+        session, _, prepares, writes, _ = self.runtime([self.call("cloud.change", {"step": 2}, "next")])
+        final = await consume_events(_events_stream(await self.confirm(session)))
+        self.assertEqual(final.status, "approval_required")
+        self.assertIsNotNone(final.approval)
+        self.assertEqual(prepares, [{"step": 1}, {"step": 2}])
+        self.assertEqual(writes, [{"step": 1}])
+
+    async def test_new_user_turn_does_not_reuse_previous_confirmation(self):
+        session, model, prepares, writes, _ = self.runtime([
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="已完成。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        await self.confirm(session)
+        model.rounds.append(self.call("cloud.change", {"step": 1}, "new-user"))
+        final = await consume_events(session.run(AgentInput(owner="owner", session_id="replay", message="重新执行一次变更")))
+        self.assertEqual(final.status, "approval_required")
+        self.assertEqual(prepares, [{"step": 1}, {"step": 1}])
+        self.assertEqual(writes, [{"step": 1}])
+
+    async def test_failed_effect_cannot_enter_successful_replay_continuation(self):
+        session, model, prepares, writes, _ = self.runtime([], failed=True)
+        final = await consume_events(_events_stream(await self.confirm(session)))
+        self.assertFalse(final.effect_result["ok"])
+        self.assertEqual(len(model.requests), 1)
+        self.assertEqual(prepares, [{"step": 1}])
+        self.assertEqual(writes, [{"step": 1}])
+
+    async def test_receipt_reuse_still_checks_authorization_schema_cancellation_and_scope(self):
+        from dataclasses import replace
+        from unittest.mock import AsyncMock, patch
+
+        session, _, prepares, writes, _ = self.runtime([])
+        pipeline, store = session.pipeline, session.state_store
+        lease, _ = await store.begin_turn(owner="owner", session_id="replay", request_id="initial")
+        context = ToolCallContext(owner="owner", session_id="replay", request_id="initial",
+                                  turn_id=lease.turn_id, lease=lease, cancellation=CancellationToken(),
+                                  report_progress=AsyncMock())
+        preview = await pipeline.execute("cloud.change", {"step": 1}, context=context)
+        completed = await pipeline.execute_confirmed(preview.effect_plan.plan_id, context=context)
+        continuation = replace(context, confirmed_effect=completed)
+        replay = await pipeline.execute("cloud.change", {"step": 1}, context=continuation)
+        self.assertIsNone(replay.effect_plan)
+        self.assertIsNone(replay.outcome.effect_plan)
+        self.assertEqual(replay.outcome.refs, ())
+        self.assertEqual(replay.outcome.state_updates, ())
+        self.assertEqual(replay.elapsed_ms, 0)
+        self.assertEqual(replay.outcome.public_content, completed.outcome.public_content)
+        for arguments in ({}, {"step": True}, {"step": 1, "unexpected": True}):
+            with self.assertRaises(ToolPipelineError) as invalid:
+                await pipeline.execute("cloud.change", arguments, context=continuation)
+            self.assertEqual(invalid.exception.code, "invalid_arguments")
+        with patch.object(pipeline.authorization, "authorize", new=AsyncMock(
+            side_effect=ToolPipelineError("已撤销授权", code="authorization_denied"))):
+            with self.assertRaises(ToolPipelineError) as denied:
+                await pipeline.execute("cloud.change", {"step": 1}, context=continuation)
+            self.assertEqual(denied.exception.code, "authorization_denied")
+        cancelled = CancellationToken()
+        cancelled.cancel("测试取消")
+        with self.assertRaises(asyncio.CancelledError):
+            await pipeline.execute("cloud.change", {"step": 1}, context=replace(continuation, cancellation=cancelled))
+        self.assertEqual(len(prepares), 1)
+        self.assertEqual(writes, [{"step": 1}])
+        for owner, sid in (("other-owner", "replay"), ("owner", "other-session"), ("owner", "replay")):
+            fresh, _ = await store.begin_turn(owner=owner, session_id=sid, request_id="fresh")
+            foreign = replace(continuation, owner=owner, session_id=sid, lease=fresh, turn_id=fresh.turn_id)
+            next_preview = await pipeline.execute("cloud.change", {"step": 1}, context=foreign)
+            self.assertIsNotNone(next_preview.effect_plan, "旧回执不能跨身份、会话或代次复用")
+            self.assertEqual(writes, [{"step": 1}])
+        with self.assertRaises(StalePublicationError):
+            await pipeline.execute("cloud.change", {"step": 1}, context=continuation)
