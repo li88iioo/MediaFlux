@@ -7,7 +7,11 @@ from typing import Any
 
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
-from app.agent.workspace_todo_actions import summarize_workspace_todo
+from app.agent.workspace_todo_actions import (
+    WORKSPACE_BACKLOG_SCOPE,
+    _count,
+    summarize_workspace_todo,
+)
 
 _ACTION_SPECS: dict[str, dict[str, str]] = {
     "downloads": {
@@ -119,13 +123,6 @@ def _now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _count(value: Any) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError, OverflowError):
-        return 0
-
-
 def workspace_next_actions_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if arguments:
         raise AgentToolError("workspace.next_actions 不接受参数")
@@ -178,8 +175,7 @@ def resolve_workspace_action_handoff(arguments: dict[str, Any]) -> dict[str, Any
 def _safe_sources(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
-    allowed = set(_ACTION_SPECS)
-    return [source for source in _ACTION_SPECS if source in value and source in allowed]
+    return [source for source in _ACTION_SPECS if source in value]
 
 
 def _project_action(area: Any) -> dict[str, Any] | None:
@@ -242,6 +238,7 @@ def summarize_workspace_next_actions(_arguments: dict[str, Any]) -> ToolResult:
     unavailable_areas = _safe_sources(todo_data.get("unavailable_areas"))
     data = {
         "probe_mode": "derived_local_snapshot",
+        "scope": WORKSPACE_BACKLOG_SCOPE,
         "network_accessed": False,
         "filesystem_accessed": False,
         "source_tool": "workspace.todo",
@@ -287,13 +284,13 @@ def summarize_workspace_next_actions(_arguments: dict[str, Any]) -> ToolResult:
         summary = f"已生成 {len(actions)} 个安全下一步"
     elif snapshot_status == "active":
         status = "active"
-        summary = "工作区任务正在处理，当前无需额外操作"
+        summary = "本地任务正在处理，当前未生成额外行动卡"
     elif snapshot_status == "waiting":
         status = "waiting"
-        summary = "工作区存在等待项，当前没有需要立即执行的下一步"
+        summary = "本地任务记录中存在等待项，当前未生成需立即执行的行动卡"
     else:
         status = "empty"
-        summary = "工作区当前没有需要处理的下一步"
+        summary = "本地任务记录中没有需要处理的下一步；不代表系统健康检查通过"
 
     return ToolResult(
         ok=True,

@@ -59,6 +59,41 @@ def _area(source: str, reason: str, count: object = 1, **extra):
 
 
 class WorkspaceNextActionsUnitTests(IsolatedDatabaseTestCase):
+    def test_empty_local_snapshot_keeps_health_scope_in_model_dto_without_probing(self):
+        from app.agent.kernel.projection import DefaultProjector
+        from app.agent.workspace_todo_actions import (
+            WORKSPACE_BACKLOG_SCOPE,
+            summarize_workspace_todo,
+        )
+
+        with patch("app.agent.media_health_actions.diagnose_media_servers") as probe:
+            results = (summarize_workspace_todo({}), summarize_workspace_next_actions({}))
+        probe.assert_not_called()
+        for result in results:
+            with self.subTest(tool=result.data.get("source_tool", "workspace.todo")):
+                self.assertEqual(result.status, "empty")
+                self.assertEqual(result.data["scope"], WORKSPACE_BACKLOG_SCOPE)
+                self.assertFalse(result.data["network_accessed"])
+                self.assertEqual(result.data["attention_total"], 0)
+                self.assertIn("本地任务记录", result.summary)
+                projected = DefaultProjector().project(result)
+                self.assertEqual(json.loads(projected.model_content)["data"]["scope"], WORKSPACE_BACKLOG_SCOPE)
+        self.assertEqual(results[1].data["actions"], [])
+        self.assertEqual(results[1].suggestions, [])
+
+    def test_scope_is_fixed_even_when_child_contains_a_broader_claim(self):
+        from app.agent.workspace_todo_actions import WORKSPACE_BACKLOG_SCOPE
+
+        for status in ("attention", "active", "waiting", "empty", "partial", "unavailable"):
+            with self.subTest(status=status), patch(
+                "app.agent.workspace_next_actions.summarize_workspace_todo",
+                return_value=_todo(status=status, ok=status != "unavailable", scope="PRIVATE: 所有模块正常"),
+            ):
+                result = summarize_workspace_next_actions({})
+            self.assertEqual(result.status, "empty" if status == "attention" else status)
+            self.assertEqual(result.data["scope"], WORKSPACE_BACKLOG_SCOPE)
+            self.assertNotIn("PRIVATE", json.dumps(result.to_dict(), ensure_ascii=False))
+
     def test_handoff_arguments_and_fresh_resolution_are_strict(self):
         self.assertEqual(
             workspace_action_handoff_arguments({"action_key": " review_rss "}),

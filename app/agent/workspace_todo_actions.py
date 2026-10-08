@@ -13,6 +13,8 @@ from app.logger import get_logger
 
 logger = get_logger(__name__)
 
+WORKSPACE_BACKLOG_SCOPE = "仅核对本地任务记录，不检查外部服务连通性或全系统健康；空待办不能证明服务正常，也不能覆盖此前尚未复测的超时或故障结论。"
+
 _AREA_SPECS = (
     ("downloads", "downloads.diagnose_queue"),
     ("rss", "rss.diagnose"),
@@ -36,10 +38,9 @@ def workspace_todo_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 
 def _count(value: Any) -> int:
     try:
-        number = int(value or 0)
+        return max(0, int(value or 0))
     except (TypeError, ValueError, OverflowError):
         return 0
-    return max(0, number)
 
 
 def _area(
@@ -320,6 +321,7 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
     waiting_total = sum(item["waiting_count"] for item in areas)
     data = {
         "probe_mode": "local",
+        "scope": WORKSPACE_BACKLOG_SCOPE,
         "network_accessed": False,
         "filesystem_accessed": False,
         "attention_total": attention_total,
@@ -393,7 +395,7 @@ def summarize_workspace_todo(_arguments: dict[str, Any]) -> ToolResult:
         summary = f"工作区有 {waiting_total} 项等待处理"
     else:
         status = "empty"
-        summary = "工作区当前没有待处理事项"
+        summary = "本地任务记录中没有待处理事项；未检查外部服务状态"
 
     return ToolResult(
         ok=True,

@@ -70,7 +70,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="workspace.todo",
-            description="只读汇总下载、RSS、整理、STRM、本地媒体、下载后核验与媒体库巡检的工作区待办计数；不返回标题、路径、URL、凭据、哈希、业务标识或错误正文。",
+            description="只读汇总下载、RSS、整理、STRM、本地媒体、下载后核验与媒体库巡检的本地待办计数，不检查外部服务健康；空待办不能证明所有模块正常。不返回标题、路径、URL、凭据、哈希、业务标识或错误正文。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
@@ -84,7 +84,7 @@ def register_specs(
     registry.register(
         ToolSpec(
             name="workspace.next_actions",
-            description="从本地安全待办快照生成按固定优先级排列的只读下一步行动卡；不执行诊断、预检或写操作，不返回标题、路径、URL、凭据、哈希、业务标识或错误正文。",
+            description="从本地待办快照生成固定优先级的只读行动卡；空列表不代表服务正常或此前故障已恢复。不执行诊断、预检或写操作，不返回标题、路径、URL、凭据、哈希、业务标识或错误正文。",
             risk=RiskLevel.READ,
             parameters={
                 "type": "object",
