@@ -58,7 +58,10 @@ _STREAM_PREVIEW_MAX_CHARS = 720
 _STREAM_PREVIEW_MAX_LINES = 16
 _QUERY_LIMIT_PER_MINUTE = 12
 _CALLBACK_LIMIT_PER_MINUTE = 40
-_CALLBACK_RE = re.compile(r"^agk:(?P<action>[cx]):(?P<plan>[A-Za-z0-9_-]{16,96})$")
+_CALLBACK_RE = re.compile(
+    r"^agk:(?P<action>[cx]):(?:(?P<route>[A-Za-z0-9_-]{8,16}):)?"
+    r"(?P<plan>[A-Za-z0-9_-]{16,96})$"
+)
 _PATROL_PROMPTS = {
     "agp:summary": "查看最近一次全库缺集巡检的完整结果。",
     "agp:resources": "根据最近一次全库缺集巡检结果，为发现的缺集搜索可用资源。",
@@ -119,8 +122,18 @@ def telegram_agent_owner(chat_id: object, user_id: object) -> str:
     return f"tg:v1:{chat}\x1f{user}"
 
 
-def telegram_agent_session_id(chat_id: object, user_id: object) -> str:
+def telegram_agent_session_id(
+    chat_id: object, user_id: object, message_thread_id: object = None
+) -> str:
     owner = telegram_agent_owner(chat_id, user_id)
+    try:
+        thread_id = int(message_thread_id or 0)
+    except (TypeError, ValueError):
+        thread_id = 0
+    if thread_id > 0:
+        from app.modules.telegram_topic_routing import telegram_session_scope
+
+        owner = telegram_session_scope(owner, thread_id)
     digest = hashlib.sha256(
         b"mediaflux-agent-tg-session:v1\0" + owner.encode()
     ).hexdigest()
@@ -206,6 +219,13 @@ AGENT_EXECUTOR = TelegramAgentExecutor()
 def _thread_kwargs(source: Any) -> dict[str, Any]:
     thread_id = getattr(source, "message_thread_id", None)
     return {"message_thread_id": thread_id} if thread_id is not None else {}
+
+
+def _session_for_source(chat_id: object, user_id: object, source: Any) -> tuple[str, str, object]:
+    owner = telegram_agent_owner(chat_id, user_id)
+    thread_id = getattr(source, "message_thread_id", None)
+    session_id = telegram_agent_session_id(chat_id, user_id, thread_id)
+    return owner, session_id, thread_id
 
 
 def _safe_text(value: object, *, limit: int = _MAX_MESSAGE) -> str:
@@ -529,14 +549,28 @@ def _edit_final(
     ).finish_many(chunks, reply_markup=reply_markup, clear_reply_markup=True)
 
 
-def _approval_markup(telebot_module: Any, approval: ApprovalView) -> Any:
+def _approval_markup(
+    telebot_module: Any,
+    approval: ApprovalView,
+    *,
+    owner: str,
+    session_id: str,
+    message_thread_id: object = None,
+) -> Any:
+    if message_thread_id is None:
+        callback_prefix = "agk:{action}:"
+    else:
+        from app.modules.telegram_topic_routing import create_session_callback_route
+
+        route = create_session_callback_route(owner, session_id, message_thread_id)
+        callback_prefix = f"agk:{{action}}:{route}:"
     markup = telebot_module.types.InlineKeyboardMarkup(row_width=2)
     markup.add(
         telebot_module.types.InlineKeyboardButton(
-            "确认执行", callback_data=f"agk:c:{approval.plan_id}"
+            "确认执行", callback_data=callback_prefix.format(action="c") + approval.plan_id
         ),
         telebot_module.types.InlineKeyboardButton(
-            "取消", callback_data=f"agk:x:{approval.plan_id}"
+            "取消", callback_data=callback_prefix.format(action="x") + approval.plan_id
         ),
     )
     return markup
@@ -564,8 +598,7 @@ def _execute_query(
     user_id: str,
     text: str,
 ) -> TurnView:
-    owner = telegram_agent_owner(chat_id, user_id)
-    session_id = telegram_agent_session_id(chat_id, user_id)
+    owner, session_id, thread_id = _session_for_source(chat_id, user_id, source)
     if not agent_rate_limiter.allow(
         f"{owner}:telegram-kernel-query",
         limit=_QUERY_LIMIT_PER_MINUTE,
@@ -618,7 +651,13 @@ def _execute_query(
             )
             progress.finish(
                 body,
-                reply_markup=_approval_markup(telebot_module, view.approval),
+                reply_markup=_approval_markup(
+                    telebot_module,
+                    view.approval,
+                    owner=owner,
+                    session_id=session_id,
+                    message_thread_id=thread_id,
+                ),
             )
         else:
             chunks = split_telegram_html(_render_turn(view), limit=_MAX_MESSAGE) or ["Agent 未返回可显示的回答，请重试。"]
@@ -630,7 +669,14 @@ def _execute_query(
                 from app.bot.agent_candidates import render, start_draft
 
                 draft = asyncio.run(start_draft(runtime, owner=owner, session_id=session_id, view=candidates))
-                body, markup = render(telebot_module, candidates, draft)
+                body, markup = render(
+                    telebot_module,
+                    candidates,
+                    draft,
+                    owner=owner,
+                    session_id=session_id,
+                    message_thread_id=thread_id,
+                )
                 chunks = [*chunks, body]
             progress.finish_many(chunks, reply_markup=markup)
         return view
@@ -646,7 +692,7 @@ def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
     if access == "disabled":
         return False
     if access != "allowed":
-        bot.reply_to(message, "当前身份未获准使用 Media Agent。")
+        bot.reply_to(message, "当前身份未获准使用 Media Agent。", **_thread_kwargs(message))
         return True
     text = str(getattr(message, "text", "") or "").strip()
     if not text:
@@ -664,7 +710,7 @@ def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
         if isinstance(exc, SelectionInvalidError) or (
             isinstance(exc, RuntimeError) and ("频繁" in str(exc) or "重复" in str(exc))
         ):
-            bot.reply_to(message, str(exc))
+            bot.reply_to(message, str(exc), **_thread_kwargs(message))
         else:
             logger.warning("Telegram Agent 请求失败 type=%s", type(exc).__name__)
     return True
@@ -690,6 +736,7 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         )
         return
     owner = telegram_agent_owner(chat_id, user_id)
+    message_thread_id = getattr(getattr(call, "message", None), "message_thread_id", None)
     if not agent_rate_limiter.allow(
         f"{owner}:telegram-kernel-callback",
         limit=_CALLBACK_LIMIT_PER_MINUTE,
@@ -699,8 +746,38 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         return
     if str(getattr(call, "data", "") or "").startswith("agk:s:"):
         from app.bot.agent_candidates import handle_callback
+        from app.modules.telegram_topic_routing import resolve_session_callback_route
 
-        handle_callback(bot, call, telebot_module, owner=owner, session_id=telegram_agent_session_id(chat_id, user_id))
+        from app.bot.agent_candidates import CALLBACK_RE as _CANDIDATE_CALLBACK_RE
+
+        candidate_match = _CANDIDATE_CALLBACK_RE.fullmatch(
+            str(getattr(call, "data", "") or "")
+        )
+        if candidate_match is None:
+            bot.answer_callback_query(call.id, "候选按钮已失效，请重新搜索。", show_alert=True)
+            return
+        route_token = candidate_match.group("route")
+        session_id = (
+            resolve_session_callback_route(
+                owner, route_token, message_thread_id
+            )
+            if route_token
+            else telegram_agent_session_id(chat_id, user_id)
+        )
+        if not session_id:
+            bot.answer_callback_query(
+                call.id, "该候选不属于当前话题或已过期，请重新搜索。", show_alert=True
+            )
+            return
+
+        handle_callback(
+            bot,
+            call,
+            telebot_module,
+            owner=owner,
+            session_id=session_id,
+            message_thread_id=message_thread_id,
+        )
         return
     match = _CALLBACK_RE.fullmatch(str(getattr(call, "data", "") or ""))
     if match is None:
@@ -712,7 +789,21 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 reply_markup=None,
             )
         return
-    session_id = telegram_agent_session_id(chat_id, user_id)
+    route_token = match.group("route")
+    if route_token:
+        from app.modules.telegram_topic_routing import resolve_session_callback_route
+
+        session_id = resolve_session_callback_route(
+            owner, route_token, message_thread_id
+        )
+        if not session_id:
+            bot.answer_callback_query(
+                call.id, "该确认按钮已过期或不属于当前话题。", show_alert=True
+            )
+            return
+    else:
+        # 兼容上线前签发、仅绑定 owner 的确认按钮。
+        session_id = telegram_agent_session_id(chat_id, user_id)
     envelope = EffectEnvelope(
         owner=owner,
         session_id=session_id,
@@ -726,13 +817,6 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         try:
             state = asyncio.run(runtime.store.load(owner=owner, session_id=session_id))
             if state.pending_effect_plan_id != envelope.plan_id:
-                if getattr(call.message, "reply_markup", None) is not None:
-                    with suppress(Exception):
-                        bot.edit_message_reply_markup(
-                            call.message.chat.id,
-                            call.message.message_id,
-                            reply_markup=None,
-                        )
                 bot.answer_callback_query(call.id, "该计划已处理或被替代，请使用当前消息中的按钮。", show_alert=True)
                 return
             plan_verified = True
@@ -770,7 +854,14 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
                 observe=observer,
             )
         )
-        if not view.effect_result and view.error_code in {"effect_in_progress", "confirmation_invalid", "confirmation_stale", "stale_generation"}:
+        if (
+            not view.effect_result
+            and view.approval is None
+            and view.error_code in {
+                "effect_in_progress", "confirmation_invalid",
+                "confirmation_stale", "stale_generation",
+            }
+        ):
             notice = "⚠️ 这次确认未被接受\n" + _render_turn(view)
             notice += "\n\n请先查询任务状态；若尚未执行，请重新生成预览后确认。"
             _settle_candidate_draft(owner, session_id, envelope.plan_id, notice)
@@ -778,8 +869,23 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
             return
         if view.approval is not None:
             receipt = render_telegram_markdown(format_public_result(view.effect_result)) if view.effect_result else ""
-            body = (receipt + "\n\n" if receipt else "") + "\n".join(_preview_lines(view.approval, tool_calls=view.tool_calls))
-            markup = _approval_markup(telebot_module, view.approval)
+            refresh_notice = (
+                "⚠️ 原确认因状态变化失效；本次没有自动执行。以下为重新预检后的新计划，请再次明确确认。\n\n"
+                if view.error_code == "confirmation_stale"
+                else ""
+            )
+            body = (
+                refresh_notice
+                + (receipt + "\n\n" if receipt else "")
+                + "\n".join(_preview_lines(view.approval, tool_calls=view.tool_calls))
+            )
+            markup = _approval_markup(
+                telebot_module,
+                view.approval,
+                owner=owner,
+                session_id=session_id,
+                message_thread_id=message_thread_id,
+            )
         else:
             body = _render_turn(view)
             markup = None
@@ -820,7 +926,10 @@ def handle_agent_patrol_callback(
         logger.warning("Telegram Agent 巡检续接失败 type=%s", type(exc).__name__)
 
 
-def _control_markup(bot_module: Any, *, chat_id: str, user_id: str) -> Any:
+def _control_markup(
+    bot_module: Any, *, chat_id: str, user_id: str,
+    message_thread_id: object = None,
+) -> Any:
     globally_enabled = is_agent_enabled()
     telegram_enabled = _enabled(config.get("TG_AGENT_ENABLED", "0"))
     actions: list[tuple[str, str, dict[str, Any]]] = []
@@ -844,6 +953,7 @@ def _control_markup(bot_module: Any, *, chat_id: str, user_id: str) -> Any:
         user_id=user_id,
         operation="agent_control",
         actions=[(decision, value) for _label, decision, value in actions],
+        message_thread_id=message_thread_id,
     )
     markup = bot_module.types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -864,7 +974,7 @@ def handle_agent_guide(
 ) -> None:
     chat_id, user_id = _identity(message)
     if telegram_agent_control_access(chat_id, user_id) != "allowed":
-        bot.reply_to(message, "当前身份未获准管理 Media Agent。")
+        bot.reply_to(message, "当前身份未获准管理 Media Agent。", **_thread_kwargs(message))
         return
     global_status = "已开启" if is_agent_enabled() else "已关闭"
     telegram_status = (
@@ -880,33 +990,281 @@ def handle_agent_guide(
             telebot_module,
             chat_id=chat_id,
             user_id=user_id,
+            message_thread_id=getattr(message, "message_thread_id", None),
         )
         if telebot_module is not None
         else None
     )
-    bot.reply_to(message, text, parse_mode="HTML", reply_markup=markup)
+    bot.reply_to(
+        message, text, parse_mode="HTML", reply_markup=markup,
+        **_thread_kwargs(message),
+    )
 
 
 def handle_agent_reset(bot: Any, message: Any) -> None:
     chat_id, user_id = _identity(message)
     access = telegram_agent_access(chat_id, user_id)
     if access == "disabled":
-        bot.reply_to(message, "Media Agent 当前未启用，无法重置会话。")
+        bot.reply_to(message, "Media Agent 当前未启用，无法重置会话。", **_thread_kwargs(message))
         return
     if access != "allowed":
-        bot.reply_to(message, "当前身份未获准使用 Media Agent。")
+        bot.reply_to(message, "当前身份未获准使用 Media Agent。", **_thread_kwargs(message))
         return
-    owner = telegram_agent_owner(chat_id, user_id)
-    session_id = telegram_agent_session_id(chat_id, user_id)
+    owner, session_id, _thread_id = _session_for_source(chat_id, user_id, message)
     try:
         runtime = get_agent_kernel_runtime()
         asyncio.run(runtime.lifecycle.reset(owner=owner, session_id=session_id))
-        bot.reply_to(message, "Media Agent 会话已重置。")
+        bot.reply_to(message, "Media Agent 会话已重置。", **_thread_kwargs(message))
     except SessionBusyError:
-        bot.reply_to(message, "已确认写操作正在执行，当前会话暂不能重置。")
+        bot.reply_to(message, "已确认写操作正在执行，当前会话暂不能重置。", **_thread_kwargs(message))
     except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
         logger.warning("Telegram Agent 会话重置失败 type=%s", type(exc).__name__)
-        bot.reply_to(message, "Agent 会话暂时无法重置，请稍后重试。")
+        bot.reply_to(message, "Agent 会话暂时无法重置，请稍后重试。", **_thread_kwargs(message))
+
+
+_TELEGRAM_MODEL_PAGE_SIZE = 8
+_TELEGRAM_MODEL_LIST_TIMEOUT_SECONDS = 12
+
+
+def _telegram_model_page(
+    bot: Any,
+    telebot_module: Any,
+    source: Any,
+    *,
+    owner: str,
+    session_id: str,
+    message_thread_id: object,
+    page: int = 0,
+    edit: bool = False,
+) -> None:
+    from app.agent.kernel.provider_model import ProviderSettings
+    from app.agent.model_catalog import fetch_ai_models
+    from app.modules.telegram_model_preferences import (
+        create_model_callback,
+        get_telegram_model_preference,
+    )
+
+    settings = ProviderSettings.from_config()
+    models = asyncio.run(
+        fetch_ai_models(
+            base_url=settings.api_url,
+            api_key=settings.api_key,
+            protocol=settings.protocol,
+            timeout_seconds=_TELEGRAM_MODEL_LIST_TIMEOUT_SECONDS,
+        )
+    )
+    current_model = get_telegram_model_preference(owner, session_id) or settings.model
+    page_count = max(1, (len(models) + _TELEGRAM_MODEL_PAGE_SIZE - 1) // _TELEGRAM_MODEL_PAGE_SIZE)
+    page = max(0, min(int(page), page_count - 1))
+    start = page * _TELEGRAM_MODEL_PAGE_SIZE
+    visible = models[start : start + _TELEGRAM_MODEL_PAGE_SIZE]
+    lines = [
+        "<b>Media Agent · 当前会话模型</b>",
+        f"当前会话模型：<code>{html.escape(current_model)}</code>",
+        f"全局默认模型：<code>{html.escape(settings.model)}</code>",
+        "选择只对这个会话的后续回合生效；正在执行或已确认的任务不会被切换中断。",
+        f"可选模型（{page + 1}/{page_count}）：",
+    ]
+    markup = telebot_module.types.InlineKeyboardMarkup(row_width=1)
+    for index, model_id in enumerate(visible):
+        marker = "✓ " if model_id == current_model else ""
+        label = f"{marker}{model_id}"
+        if len(label) > 60:
+            label = label[:59] + "…"
+        token = create_model_callback(
+            owner,
+            session_id,
+            message_thread_id,
+            action="select",
+            model_id=model_id,
+            page=page,
+        )
+        markup.add(
+            telebot_module.types.InlineKeyboardButton(
+                label, callback_data=f"tgm:{token}"
+            )
+        )
+    if page_count > 1:
+        navigation = []
+        for label, target_page in (
+            ("‹ 上一页", page - 1),
+            ("下一页 ›", page + 1),
+        ):
+            if 0 <= target_page < page_count:
+                token = create_model_callback(
+                    owner,
+                    session_id,
+                    message_thread_id,
+                    action="page",
+                    page=target_page,
+                )
+                navigation.append(
+                    telebot_module.types.InlineKeyboardButton(
+                        label, callback_data=f"tgm:{token}"
+                    )
+                )
+        markup.add(*navigation)
+    body = "\n".join(lines)
+    if edit:
+        bot.edit_message_text(
+            body,
+            source.chat.id,
+            source.message_id,
+            parse_mode="HTML",
+            reply_markup=markup if visible else None,
+        )
+    else:
+        bot.reply_to(
+            source,
+            body if visible else body + "\n当前渠道没有返回可选模型。",
+            parse_mode="HTML",
+            reply_markup=markup if visible else None,
+            **_thread_kwargs(source),
+        )
+
+
+def handle_agent_model_command(
+    bot: Any, message: Any, telebot_module: Any = None
+) -> None:
+    chat_id, user_id = _identity(message)
+    if telegram_agent_access(chat_id, user_id) != "allowed":
+        bot.reply_to(
+            message, "当前身份未获准使用 Media Agent。", **_thread_kwargs(message)
+        )
+        return
+    if telebot_module is None:
+        bot.reply_to(message, "模型选择界面暂不可用。", **_thread_kwargs(message))
+        return
+    owner, session_id, thread_id = _session_for_source(chat_id, user_id, message)
+    try:
+        _telegram_model_page(
+            bot,
+            telebot_module,
+            message,
+            owner=owner,
+            session_id=session_id,
+            message_thread_id=thread_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - channel config/catalog is external
+        logger.warning("Telegram 模型列表读取失败 type=%s", type(exc).__name__)
+        bot.reply_to(
+            message,
+            "无法读取当前 Provider 的模型列表；请检查渠道配置后重新发送 /model。",
+            **_thread_kwargs(message),
+        )
+
+
+def handle_agent_model_callback(
+    bot: Any, call: Any, telebot_module: Any = None
+) -> None:
+    chat_id, user_id = _identity(call)
+    if telegram_agent_access(chat_id, user_id) != "allowed":
+        bot.answer_callback_query(call.id, "当前身份无权使用 Media Agent", show_alert=True)
+        return
+    if telebot_module is None:
+        bot.answer_callback_query(call.id, "模型选择界面暂不可用", show_alert=True)
+        return
+    owner = telegram_agent_owner(chat_id, user_id)
+    source = call.message
+    thread_id = getattr(source, "message_thread_id", None)
+    token = str(getattr(call, "data", "")).partition(":")[2]
+    from app.modules.telegram_model_preferences import (
+        resolve_model_callback,
+        set_telegram_model_preference,
+    )
+
+    route = resolve_model_callback(owner, token, thread_id)
+    if route is None:
+        bot.answer_callback_query(
+            call.id,
+            "该模型菜单已过期、渠道已变化或不属于当前话题，请重新发送 /model。",
+            show_alert=True,
+        )
+        return
+    session_id = str(route["session_id"])
+    action = route["action"]
+    if action == "page":
+        bot.answer_callback_query(call.id, "正在刷新当前渠道模型列表")
+        try:
+            _telegram_model_page(
+                bot,
+                telebot_module,
+                source,
+                owner=owner,
+                session_id=session_id,
+                message_thread_id=thread_id,
+                page=int(route.get("page") or 0),
+                edit=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - channel config/catalog is external
+            logger.warning("Telegram 模型列表分页失败 type=%s", type(exc).__name__)
+            bot.edit_message_text(
+                "无法刷新当前渠道模型列表，请重新发送 /model。",
+                source.chat.id,
+                source.message_id,
+                reply_markup=None,
+            )
+        return
+    model_id = str(route.get("model_id") or "")
+    set_telegram_model_preference(owner, session_id, model_id)
+    bot.answer_callback_query(call.id, "已保存，下一轮生效")
+    bot.edit_message_text(
+        "<b>当前会话模型已更新</b>\n"
+        f"模型：<code>{html.escape(model_id)}</code>\n"
+        "从下一轮开始生效；正在执行或已确认的任务不会被中断。",
+        source.chat.id,
+        source.message_id,
+        parse_mode="HTML",
+        reply_markup=None,
+    )
+
+
+def _stop_agent_summary(result: dict[str, Any]) -> str:
+    status = str(result.get("status") or "")
+    messages = {
+        "stopping": "已发出停止请求；尚未确认任务终止。",
+        "critical_pending": "当前原子写不可中断；完成安全步骤后会停止续行。",
+        "partially_stopping": "部分任务已请求停止，另有不可取消任务仍在运行。",
+        "partial": "停止流程已处理；仍有不可取消任务。",
+        "stopped": "当前会话活动已终结。",
+        "already_stopped": "当前会话没有活动工作。",
+        "superseded": "停止请求已被后续会话状态取代；无法确认当前任务已停止。请先查询任务状态。",
+        "stop_unconfirmed": "已发送停止请求，但未收到终止确认；不能确认任务已经停止。请先查询任务状态，勿重复提交写操作。",
+    }
+    background = result.get("background_tasks")
+    background = background if isinstance(background, list) else []
+    uncancellable = result.get("uncancellable")
+    uncancellable = uncancellable if isinstance(uncancellable, list) else []
+    suffix = f"后台任务：{len(background)} 项"
+    if uncancellable:
+        suffix += f"；不可取消：{len(uncancellable)} 项"
+    message = messages.get(
+        status,
+        f"收到未识别的停止状态（{status or '空'}）；无法确认任务已停止，请先查询任务状态。",
+    )
+    return f"<b>Media Agent /stop</b>\n{html.escape(message)}\n{suffix}"
+
+
+def handle_agent_stop(bot: Any, message: Any) -> None:
+    chat_id, user_id = _identity(message)
+    if telegram_agent_control_access(chat_id, user_id) != "allowed":
+        bot.reply_to(message, "当前身份未获准停止 Media Agent 会话。", **_thread_kwargs(message))
+        return
+    owner, session_id, _thread_id = _session_for_source(chat_id, user_id, message)
+    try:
+        from app.agent.task_stop import stop_agent_session
+
+        result = asyncio.run(
+            stop_agent_session(get_agent_kernel_runtime(), owner, session_id)
+        )
+        bot.reply_to(message, _stop_agent_summary(result), parse_mode="HTML", **_thread_kwargs(message))
+    except Exception as exc:  # noqa: BLE001 - session-specific stop boundary
+        logger.warning("Telegram Agent 会话停止失败 type=%s", type(exc).__name__)
+        bot.reply_to(
+            message,
+            "无法核实当前会话的停止状态，请先查询任务状态，勿重复提交写操作。",
+            **_thread_kwargs(message),
+        )
 
 
 def _apply_agent_control_action(action_name: str) -> str:

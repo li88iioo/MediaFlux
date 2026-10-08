@@ -621,6 +621,11 @@ class AgentSession:
                 resource_candidate_ref=candidate_context.guard.ref if candidate_context else "",
             )
             if plan_id is not None:
+                original_plan = await asyncio.to_thread(
+                    self.pipeline.effect_store.get_active_plan,
+                    owner=lease.owner, session_id=lease.session_id,
+                    generation=lease.generation, plan_id=plan_id,
+                )
                 result = None
                 try:
                     result = await self.pipeline.execute_confirmed(plan_id, context=tool_context)
@@ -654,7 +659,45 @@ class AgentSession:
                     "message": str(public_result.get("error") or public_result.get("summary") or "执行未完成") if failed else "",
                     "elapsed_ms": result.elapsed_ms if result else 0,
                 })
+                # 写入及回执已完成：先解除保护，再读停止标记，关闭两者之间的竞态窗口。
+                scope.close()
+                await self.coordinator.unprotect(lease, token)
+                stop_state = await self.state_store.load(owner=lease.owner, session_id=lease.session_id)
+                if stop_state.metadata.get("stop_requested_generation") == lease.generation:
+                    await publish(AgentEventType.TURN_CANCELLED, {
+                        "reason": "已停止后续会话；已提交操作以执行回执和后台任务状态为准。",
+                    })
+                    return
                 if failed:
+                    # 旧快照失效时仅重新预检，不重放 execute，也不沿用旧授权。
+                    if receipt_saved and original_plan and public_result.get("status") == "confirmation_stale":
+                        confirming = False
+                        admission_token = await self.turn_admission.begin(agent_input)
+                        refreshed = None
+                        try:
+                            refreshed = await self.pipeline.execute(
+                                original_plan.tool_name, original_plan.arguments, context=tool_context,
+                            )
+                        except (asyncio.CancelledError, StalePublicationError):
+                            raise
+                        except Exception as exc:  # 预检不可用仍保留原始失败事实
+                            logger.info("Agent 更新确认预检失败 type=%s", type(exc).__name__)
+                        refreshed_plan = refreshed.effect_plan if refreshed else None
+                        if refreshed_plan and refreshed_plan.snapshot_fingerprint != original_plan.snapshot_fingerprint:
+                            answer = "原确认条件已变化。已重新预检，请核对更新后的计划并确认；没有自动执行新计划。"
+                            messages.append(ModelMessage(role="assistant", content=answer, effect_plan_id=refreshed_plan.plan_id))
+                            await persist_conversation()
+                            await publish(AgentEventType.EFFECT_APPROVAL_REQUIRED, {
+                                "tool": refreshed.tool.name, "label": public_tool_label(refreshed.tool.name),
+                                "plan": refreshed_plan.public_dict(), "result": dict(refreshed.outcome.public_content),
+                            })
+                            await publish(AgentEventType.TURN_COMPLETED, {
+                                "status": "approval_required", "answer": answer, "plan_id": refreshed_plan.plan_id,
+                                "usage": {}, "model_calls": 0, "tool_calls": 1,
+                            })
+                            return
+                        if refreshed_plan:
+                            await self.pipeline.cancel_effect(refreshed_plan.plan_id, lease=lease)
                     data = public_result.get("data")
                     if isinstance(data, dict) and data.get("operation_items"):
                         confirmed_result = public_result
@@ -678,8 +721,6 @@ class AgentSession:
                     return
                 confirmed_result = public_result
                 tool_context = replace(tool_context, confirmed_effect=result)
-                scope.close()
-                await self.coordinator.unprotect(lease, token)
                 confirming = False
                 admission_token = await self.turn_admission.begin(agent_input)
                 checkpoint = persist_conversation
@@ -793,6 +834,11 @@ class AgentSession:
 
             history_end = current_user_index if current_user_index is not None else next(
                 (i for i in range(len(messages) - 1, -1, -1) if messages[i].role == "user"), len(messages))
+            selected_model = ""
+            if agent_input.channel == "telegram":
+                from app.modules.telegram_model_preferences import get_telegram_model_preference
+
+                selected_model = get_telegram_model_preference(lease.owner, lease.session_id)
             answer_recovery = False
             for round_index in range(self.limits.max_model_rounds):
                 token.raise_if_cancelled()
@@ -865,6 +911,7 @@ class AgentSession:
                     tools=request_tools,
                     max_output_tokens=self.limits.effective_output_tokens,
                     round_index=round_index,
+                    model=selected_model,
                 )
                 token.interruptible = True
                 try:

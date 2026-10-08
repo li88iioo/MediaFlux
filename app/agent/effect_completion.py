@@ -9,6 +9,7 @@ import time
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -683,12 +684,15 @@ async def _register_effect_wait(result: ToolResult, tracker: _CompletionTracker,
 async def _record_effect_observation(
     scope: EffectCompletionScope | None, *, status: str, final: ToolResult | None = None,
     due_now: bool = False,
-) -> None:
+) -> bool:
     if scope is None:
-        return
+        return False
     from app.agent.kernel.projection import DefaultProjector
 
+    stop_requested = False
+
     def update(state):
+        nonlocal stop_requested
         row = (state.metadata.get(_EFFECT_WAITS_KEY) or {}).get(scope.plan_id)
         if row is None:
             return False
@@ -698,11 +702,18 @@ async def _record_effect_observation(
             row.update(state="terminal", final_result=dict(DefaultProjector().project(final).public_content),
                        foreground_final=True)
         _next_effect_poll(state)
+        stop_requested = (
+            state.generation == scope.lease.generation
+            and state.metadata.get("stop_requested_generation") == scope.lease.generation
+        )
         return True
-    updated = await scope.store.update_effect_state(owner=scope.lease.owner,
-        session_id=scope.lease.session_id, change=update)
+
+    updated = await scope.store.update_effect_state(
+        owner=scope.lease.owner, session_id=scope.lease.session_id, change=update
+    )
     if updated is not True:
         raise asyncio.CancelledError("原会话结果跟踪已清理")
+    return stop_requested
 
 
 async def remember_effect_receipt(store, *, owner, session_id, plan_id, message):
@@ -909,6 +920,62 @@ async def poll_effect_receipts(
     return sum(await asyncio.gather(*(follow(row) for row in await store.due_effect_waits(limit=limit))))
 
 
+async def current_session_effect_trackers(
+    store: SessionStateStore, *, owner: str, session_id: str,
+) -> list[dict[str, Any]]:
+    """解密并校验一个 owner/session 的 effect_wait tracker；不 claim 或修改回执。"""
+    owner_key = str(owner or "").strip()
+    session_key = str(session_id or "").strip()
+    if not owner_key or not session_key:
+        return []
+    state = await store.load(owner=owner_key, session_id=session_key)
+    waits = state.metadata.get(_EFFECT_WAITS_KEY)
+    if not isinstance(waits, Mapping):
+        return []
+
+    from cryptography.fernet import InvalidToken
+
+    cipher = _completion_cipher()
+    current: list[dict[str, Any]] = []
+    for plan_id, record in waits.items():
+        if not isinstance(plan_id, str) or not isinstance(record, Mapping):
+            continue
+        sealed = record.get("sealed")
+        if not isinstance(sealed, str) or not sealed:
+            continue
+        try:
+            seed = json.loads(cipher.decrypt(sealed.encode("ascii")).decode("utf-8"))
+        except (InvalidToken, UnicodeError, ValueError, TypeError):
+            # 损坏/旧密文不能扩大到其它任务。
+            continue
+        if (
+            not isinstance(seed, Mapping)
+            or seed.get("owner") != owner_key
+            or seed.get("session_id") != session_key
+            or seed.get("plan_id") != plan_id
+        ):
+            continue
+        raw_tracker = seed.get("tracker")
+        if not isinstance(raw_tracker, Mapping):
+            continue
+        kind = str(raw_tracker.get("kind") or "").strip()
+        value = raw_tracker.get("value")
+        if kind not in _ACTIVE_STATUSES or not isinstance(value, Mapping):
+            continue
+        current.append(
+            {
+                "owner": owner_key,
+                "session_id": session_key,
+                "plan_id": plan_id,
+                "tracker": {"kind": kind, "value": deepcopy(dict(value))},
+                "state": str(record.get("state") or ""),
+                "last_status": str(record.get("last_status") or "").strip().casefold(),
+                "delivered": record.get("delivered") is True,
+            }
+        )
+    return current
+
+
 async def wait_for_effect_completion(
     result: ToolResult,
     *,
@@ -1034,8 +1101,12 @@ async def wait_for_effect_completion(
             )
 
         if task_status != last_status or loop.time() - last_saved >= _EFFECT_POLL_SECONDS:
-            await _record_effect_observation(scope, status=task_status)
+            stop_requested = await _record_effect_observation(scope, status=task_status)
             last_saved = loop.time()
+            if stop_requested:
+                # Stop only the foreground wait. The durable tracker stays pending so
+                # the already-accepted remote operation can still reach a real receipt.
+                return pending_result(task_status, snapshot, task)
         last_status = task_status
         await report(snapshot, task_status)
         # 持久 Agent 作业交给已登记的终态跟踪；前台只保护提交与回执落盘，

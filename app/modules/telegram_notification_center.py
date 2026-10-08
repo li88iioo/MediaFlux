@@ -455,6 +455,18 @@ def _dispatch_item(item: dict) -> bool:
 
     chat_id = str(item.get("chat_id") or "")
     message_id = int(item.get("message_id") or 0)
+    message_thread_id = None
+    if str(item.get("topic") or "") == NotificationTopic.DOWNLOAD.value:
+        thread_key = str(item.get("thread_key") or "")
+        if thread_key.startswith("download:"):
+            from app.modules.telegram_topic_routing import download_request_thread
+
+            message_thread_id = download_request_thread(
+                thread_key[len("download:"):]
+            )
+    send_kwargs = {"chat_id": chat_id or None}
+    if message_thread_id is not None:
+        send_kwargs["message_thread_id"] = message_thread_id
     outcome: TelegramSendResult
     fallback_to_new_message = False
     try:
@@ -466,9 +478,9 @@ def _dispatch_item(item: dict) -> bool:
                 # 旧消息身份已被 Telegram 明确拒绝；后续新发送若结果未知，
                 # 绝不能继续沿用旧 message_id 或自动重放。
                 fallback_to_new_message = True
-                outcome = send_event_result(event, chat_id=chat_id or None)
+                outcome = send_event_result(event, **send_kwargs)
         else:
-            outcome = send_event_result(event, chat_id=chat_id or None)
+            outcome = send_event_result(event, **send_kwargs)
     except Exception as exc:
         logger.warning(
             "Telegram 通知投递异常 topic=%s type=%s",

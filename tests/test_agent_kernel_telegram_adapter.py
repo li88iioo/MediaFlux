@@ -175,6 +175,12 @@ class FakeLifecycle:
 
 class AgentKernelTelegramAdapterTests(unittest.TestCase):
     def setUp(self):
+        model_preference = patch(
+            "app.modules.telegram_model_preferences.get_telegram_model_preference",
+            return_value="",
+        )
+        model_preference.start()
+        self.addCleanup(model_preference.stop)
         self.config_values = {
             "TG_AGENT_ALLOWED_USER_IDS": "7",
             "TG_CHAT_ID": "-100",
@@ -515,7 +521,7 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("qBittorrent", bot.edits[-1][0])
         self.assertIn("确认后会保存订阅规则", bot.edits[-1][0])
 
-    def test_confirm_callback_clears_buttons_for_replaced_plan(self):
+    def test_confirm_callback_preserves_keyboard_for_replaced_plan(self):
         transport = FakeTelegramTransport(None)
         store = types.SimpleNamespace(load=AsyncMock(return_value=types.SimpleNamespace(
             pending_effect_plan_id="plan_replaced_123456",
@@ -535,9 +541,8 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
             adapter.handle_agent_callback(bot, call, TELEBOT)
 
         self.assertEqual(transport.confirmations, [])
-        self.assertEqual(len(bot.edits), 1)
-        self.assertEqual(bot.edits[0][0], "")
-        self.assertIsNone(bot.edits[0][3]["reply_markup"])
+        self.assertEqual(bot.edits, [])
+        self.assertIsNotNone(message.reply_markup)
         self.assertIn("已处理或被替代", bot.answers[-1][1])
         self.assertTrue(bot.answers[-1][2]["show_alert"])
 
@@ -813,6 +818,240 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIsNone(bot.edits[-1][3]["reply_markup"])
         self.assertEqual(len(model.requests), 3)
 
+    def test_stop_command_calls_session_scoped_stop_and_replies_in_topic(self):
+        message = Message("/stop", user_id=7, message_id=51)
+        message.message_thread_id = 41
+        runtime = types.SimpleNamespace()
+        owner, session_id = "tg-owner", "tg-topic-session"
+        result = {
+            "status": "critical_pending",
+            "model_turn": "stopping",
+            "confirmation": "uncancellable",
+            "background_tasks": [],
+            "uncancellable": ["atomic-write"],
+            "stopped": False,
+        }
+        bot = FakeBot()
+        access = self._patch_access()
+        with (
+            access[0],
+            access[1],
+            access[2],
+            patch.object(adapter, "_session_for_source", return_value=(owner, session_id, 41)),
+            patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime),
+            patch(
+                "app.agent.task_stop.stop_agent_session",
+                new=AsyncMock(return_value=result),
+            ) as stop,
+        ):
+            adapter.handle_agent_stop(bot, message)
+
+        stop.assert_awaited_once_with(runtime, owner, session_id)
+        self.assertIn("原子写不可中断", bot.replies[-1][0])
+        self.assertIn("后台任务：0 项", bot.replies[-1][0])
+        self.assertEqual(bot.replies[-1][1]["message_thread_id"], 41)
+
+    def test_model_page_callback_edits_the_source_message_for_next_page(self):
+        source = Message("/model", user_id=7, message_id=44)
+        source.message_thread_id = 41
+        call = Call("tgm:page-token", source)
+        bot = FakeBot()
+        settings = types.SimpleNamespace(
+            api_url="https://provider.example/v1",
+            api_key="provider-key",
+            protocol="auto",
+            model="default-model",
+            timeout_seconds=2,
+        )
+        models = [f"model-{index}" for index in range(10)]
+        access = self._patch_access()
+        with (
+            access[0],
+            access[1],
+            access[2],
+            patch(
+                "app.modules.telegram_model_preferences.resolve_model_callback",
+                return_value={
+                    "session_id": "tg-topic-session",
+                    "action": "page",
+                    "page": 1,
+                },
+            ),
+            patch(
+                "app.agent.kernel.provider_model.ProviderSettings.from_config",
+                return_value=settings,
+            ),
+            patch(
+                "app.agent.model_catalog.fetch_ai_models",
+                new_callable=AsyncMock,
+                return_value=models,
+            ),
+            patch(
+                "app.modules.telegram_model_preferences.get_telegram_model_preference",
+                return_value="",
+            ),
+            patch(
+                "app.modules.telegram_model_preferences.create_model_callback",
+                return_value="abcdefgh",
+            ),
+        ):
+            adapter.handle_agent_model_callback(bot, call, TELEBOT)
+
+        self.assertEqual(len(bot.edits), 1)
+        text, chat_id, message_id, kwargs = bot.edits[0]
+        self.assertEqual((chat_id, message_id), (source.chat.id, source.message_id))
+        self.assertIn("可选模型（2/2）", text)
+        self.assertEqual(
+            [button.text for button in kwargs["reply_markup"].buttons[:2]],
+            ["model-8", "model-9"],
+        )
+        self.assertEqual(bot.answers[-1][0], call.id)
+
+    def test_stop_summary_explicitly_reports_unconfirmed_stop_states(self):
+        for status in ("superseded", "stop_unconfirmed"):
+            with self.subTest(status=status):
+                summary = adapter._stop_agent_summary({"status": status})
+                self.assertRegex(summary, r"(?:无法|不能)确认")
+                self.assertIn("停止", summary)
+                self.assertNotIn("停止状态已返回", summary)
+
+        unknown_summary = adapter._stop_agent_summary({"status": "future_status"})
+        self.assertIn("无法确认任务已停止", unknown_summary)
+        self.assertNotIn("停止状态已返回", unknown_summary)
+
+    def test_model_page_uses_fixed_12_second_list_timeout(self):
+        message = Message("/model", user_id=7, message_id=44)
+        message.message_thread_id = 41
+        settings = types.SimpleNamespace(
+            api_url="https://provider.example/v1",
+            api_key="provider-key",
+            protocol="auto",
+            model="default-model",
+            timeout_seconds=2,
+        )
+        with (
+            patch(
+                "app.agent.kernel.provider_model.ProviderSettings.from_config",
+                return_value=settings,
+            ),
+            patch(
+                "app.agent.model_catalog.fetch_ai_models",
+                new_callable=AsyncMock,
+                return_value=["selected-model"],
+            ) as fetch_models,
+            patch(
+                "app.modules.telegram_model_preferences.get_telegram_model_preference",
+                return_value="",
+            ),
+            patch(
+                "app.modules.telegram_model_preferences.create_model_callback",
+                return_value="abcdefgh",
+            ),
+        ):
+            adapter._telegram_model_page(
+                FakeBot(),
+                TELEBOT,
+                message,
+                owner="tg-owner",
+                session_id="tg-session",
+                message_thread_id=41,
+            )
+
+        fetch_models.assert_awaited_once_with(
+            base_url=settings.api_url,
+            api_key=settings.api_key,
+            protocol="auto",
+            timeout_seconds=12,
+        )
+
+    def test_stale_confirmation_failure_can_finish_with_new_approval(self):
+        failed_result = {
+            "ok": False,
+            "status": "confirmation_stale",
+            "summary": "原确认快照已失效",
+        }
+        next_plan = ApprovalView(
+            plan_id="fresh_plan_1234567890abcdef",
+            tool_name="cloud.move",
+            effect="WRITE",
+            preview={"summary": "重新预检后的移动计划"},
+            result={},
+            expires_at="",
+        )
+        factory = EventFactory(
+            session_id="tg_session",
+            turn_id="stale-refresh",
+            request_id="tgcb_callback-1",
+        )
+        events = (
+            factory.create(
+                AgentEventType.EFFECT_FAILED,
+                {
+                    "code": "confirmation_stale",
+                    "message": "原确认快照已失效",
+                    "result": failed_result,
+                },
+            ),
+            factory.create(
+                AgentEventType.EFFECT_APPROVAL_REQUIRED,
+                {"plan": {"plan_id": next_plan.plan_id}},
+            ),
+            factory.create(
+                AgentEventType.TURN_COMPLETED,
+                {"status": "approval_required"},
+            ),
+        )
+        transport = FakeTelegramTransport(
+            None,
+            confirm_events=events,
+            confirm_view=TurnView(
+                session_id="tg_session",
+                turn_id="stale-refresh",
+                request_id="tgcb_callback-1",
+                status="approval_required",
+                approval=next_plan,
+                effect_result=failed_result,
+                error_code="confirmation_stale",
+                error_message="原确认快照已失效",
+            ),
+        )
+        runtime = types.SimpleNamespace(telegram=transport, store=FakeStore())
+        bot = FakeBot()
+        call = Call(
+            "agk:c:plan_1234567890abcdef",
+            Message("preview", user_id=0, message_id=33),
+        )
+        patches = self._patch_access()
+        with (
+            patches[0],
+            patches[1],
+            patches[2],
+            patch.object(adapter, "get_agent_kernel_runtime", return_value=runtime),
+            patch.object(adapter, "_settle_candidate_draft") as settle,
+        ):
+            adapter.handle_agent_callback(bot, call, TELEBOT)
+
+        self.assertEqual(len(transport.confirmations), 1)
+        self.assertEqual(
+            [event.type for event in events],
+            [
+                AgentEventType.EFFECT_FAILED,
+                AgentEventType.EFFECT_APPROVAL_REQUIRED,
+                AgentEventType.TURN_COMPLETED,
+            ],
+        )
+        final_text, _chat_id, _message_id, final_kwargs = bot.edits[-1]
+        self.assertIn("没有自动执行", final_text)
+        self.assertIn("重新预检后的移动计划", final_text)
+        self.assertTrue(
+            any(
+                button.callback_data == f"agk:c:{next_plan.plan_id}"
+                for button in final_kwargs["reply_markup"].buttons
+            )
+        )
+        settle.assert_called_once()
+        self.assertEqual(settle.call_args.kwargs["next_plan_id"], next_plan.plan_id)
+
     def test_confirm_continues_progress_and_returns_next_approval(self):
         next_plan = ApprovalView(plan_id="next_plan_1234567890abcdef", tool_name="cloud.move", effect="WRITE",
             preview={"summary": "下一步移动目录"}, result={}, expires_at="")
@@ -853,6 +1092,14 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
 
 
 class TelegramAgentExecutorTests(unittest.TestCase):
+    def setUp(self):
+        model_preference = patch(
+            "app.modules.telegram_model_preferences.get_telegram_model_preference",
+            return_value="",
+        )
+        model_preference.start()
+        self.addCleanup(model_preference.stop)
+
     def test_cancelled_job_does_not_kill_the_only_worker(self):
         import asyncio
         import threading

@@ -189,6 +189,10 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn('data-capability="tool_calling"', agent_panel)
         self.assertIn('class="agent-field agent-field-wide agent-model-field"', agent_panel)
         self.assertIn('class="agent-field agent-timeout-field"', agent_panel)
+        self.assertIn('min="2" max="120"', agent_panel)
+        self.assertIn("请求超时（2–120 秒）", agent_panel)
+        self.assertIn("网络空闲等待至少 30 秒", agent_panel)
+        self.assertIn("独立 deadline，最长 300 秒", agent_panel)
         fetch_model_button = re.search(
             r'<button[^>]+id="fetchAgentModelsBtn"[^>]*>.*?</button>',
             agent_panel,
@@ -351,6 +355,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         values = {
             "AGENT_ENABLED": "1",
             "AGENT_LLM_MODEL": "old-model",
+            "AGENT_LLM_TIMEOUT_SECONDS": "30",
         }
         with patch(
             "app.routes.api.config.get",
@@ -369,12 +374,21 @@ class AgentSettingsUiTests(unittest.TestCase):
             unchanged = save_config(self._request(), {"AGENT_ENABLED": "1"})
             changed = save_config(
                 self._request(),
-                {"AGENT_ENABLED": "1", "AGENT_LLM_MODEL": "new-model"},
+                {
+                    "AGENT_ENABLED": "1",
+                    "AGENT_LLM_MODEL": "new-model",
+                    "AGENT_LLM_TIMEOUT_SECONDS": "120",
+                },
             )
 
         self.assertEqual(unchanged, {"success": True})
         self.assertEqual(changed, {"success": True})
-        persist.assert_called_once_with({"AGENT_LLM_MODEL": "new-model"})
+        persist.assert_called_once_with(
+            {
+                "AGENT_LLM_MODEL": "new-model",
+                "AGENT_LLM_TIMEOUT_SECONDS": "120",
+            }
+        )
         restart.assert_not_called()
         reconcile.assert_not_called()
         refresh_menu.assert_not_called()
@@ -393,6 +407,17 @@ class AgentSettingsUiTests(unittest.TestCase):
                 _validate_agent_llm_updates(
                     {"AGENT_LLM_CONTEXT_WINDOW_TOKENS": value}
                 )
+
+    def test_agent_llm_timeout_validation_preserves_legacy_values_and_allows_120(self):
+        for value in ("2", "12", "30", "120"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _validate_agent_llm_updates({"AGENT_LLM_TIMEOUT_SECONDS": value}),
+                    {"AGENT_LLM_TIMEOUT_SECONDS": value},
+                )
+        for value in ("1", "121", "not-a-number"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _validate_agent_llm_updates({"AGENT_LLM_TIMEOUT_SECONDS": value})
 
     def test_agent_feature_gate_hot_toggle_queues_runtime_without_bot_restart(self):
         request = self._request()
@@ -616,12 +641,12 @@ class AgentSettingsUiTests(unittest.TestCase):
             return ["model-a", "model-b"]
 
         with patch.object(tools_api, "require_api_login", return_value=None), patch.object(
-            tools_api, "_fetch_ai_models"
+            tools_api, "fetch_ai_models"
         ) as fetch_models, patch.object(
             tools_api, "run_awaitable_sync", side_effect=resolve_models
         ) as runner, patch.object(
-            tools_api.config, "get_int", return_value=12
-        ):
+            tools_api.config, "get_int", return_value=120
+        ) as configured_timeout:
             response = tools_api.ai_models(
                 self._request(),
                 {
@@ -639,6 +664,7 @@ class AgentSettingsUiTests(unittest.TestCase):
             protocol="responses",
             timeout_seconds=12,
         )
+        configured_timeout.assert_not_called()
         self.assertEqual(runner.call_count, 1)
 
     def test_model_test_uses_current_draft_without_saving_it(self):
@@ -669,7 +695,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                     "api_key": "draft-secret",
                     "protocol": "auto",
                     "model": "claude-test",
-                    "timeout_seconds": 14,
+                    "timeout_seconds": 120,
                 },
             )
 
@@ -688,9 +714,33 @@ class AgentSettingsUiTests(unittest.TestCase):
             api_key="draft-secret",
             protocol="anthropic_messages",
             model="claude-test",
-            timeout_seconds=14,
+            timeout_seconds=120,
         )
         self.assertEqual(runner.call_count, 1)
+
+    def test_model_test_timeout_rejects_values_outside_shared_range(self):
+        from app.routes import tools_api
+
+        for timeout_seconds in (1, 121, "2.5"):
+            with self.subTest(timeout_seconds=timeout_seconds), patch.object(
+                tools_api, "require_api_login", return_value=None
+            ), patch.object(
+                tools_api.agent_rate_limiter, "allow", return_value=True
+            ), patch.object(tools_api, "run_awaitable_sync") as runner:
+                response = tools_api.ai_model_test(
+                    self._request(),
+                    {
+                        "base_url": "https://api.example.test/v1",
+                        "api_key": "draft-secret",
+                        "protocol": "responses",
+                        "model": "model-test",
+                        "timeout_seconds": timeout_seconds,
+                    },
+                )
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("2–120 秒", self._payload(response)["error"])
+            runner.assert_not_called()
 
     def test_model_test_has_rate_limit_and_actionable_safe_errors(self):
         from app.routes import tools_api

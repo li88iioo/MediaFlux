@@ -821,6 +821,35 @@ Season 1 / S01E01
             1,
         )
 
+    def test_changed_snapshot_keeps_new_confirmation_actionable_without_resubmission(self):
+        first = {"plan_id": "plan-stale-original-0001", "tool_name": "guangya.recycle.clear",
+                 "effect": "WRITE", "preview": {"summary": "确认清空2项"}}
+        second = {**first, "plan_id": "plan-stale-refreshed-0002", "preview": {"summary": "确认清空3项"}}
+        page = self.make_page({
+            "sessions": {"sessions": []},
+            "queryEvents": [
+                _event(1, "turn.started"),
+                _event(2, "effect.approval_required", {"plan": first}),
+                _event(3, "turn.completed", {"status": "approval_required"}),
+            ],
+            "confirmEvents": [
+                _event(4, "effect.failed", {"plan_id": first["plan_id"], "code": "confirmation_stale",
+                                           "message": "回收站内容已变化", "result": {"ok": False, "summary": "回收站内容已变化"}}),
+                _event(5, "effect.approval_required", {"plan": second}),
+                _event(6, "turn.completed", {"status": "approval_required", "answer": "已重新预检，尚未执行新计划"}),
+            ],
+        })
+        page.locator("#agentPrompt").fill("清空回收站")
+        page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        page.locator("[data-effect-confirm]").click()
+        next_card = page.locator('[data-plan-id="plan-stale-refreshed-0002"]')
+        next_card.wait_for()
+        self.assertEqual(page.locator(".agent-confirmation-card").count(), 1)
+        self.assertTrue(next_card.locator("[data-effect-confirm]").is_enabled())
+        self.assertIn("确认清空3项", next_card.inner_text())
+        self.assertEqual(page.locator('[data-effect-confirm="plan-stale-original-0001"]').count(), 0)
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
+
     def test_confirm_stream_keeps_trusted_receipt_when_followup_turn_fails(self):
         approval = {
             "plan_id": "plan-browser-partial-0001",

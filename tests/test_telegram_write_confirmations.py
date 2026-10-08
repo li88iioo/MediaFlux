@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from app import database as db
 from app.modules.telegram_write_confirmations import (
@@ -30,6 +30,24 @@ class TelegramWriteConfirmationStoreTests(unittest.TestCase):
             "operation": "rss_refresh",
             "value": {"subscription_id": 7},
         })
+
+    def test_confirmation_is_bound_to_source_topic(self):
+        store = TelegramWriteConfirmationStore()
+        confirm_id, _cancel_id = store.create_pair(
+            chat_id="100",
+            user_id="9",
+            operation="download_request",
+            value={"request_id": 17, "target": "qb"},
+            message_thread_id=41,
+        )
+        with self.assertRaisesRegex(TelegramWriteConfirmationError, "不属于"):
+            store.claim(
+                confirm_id, chat_id="100", user_id="9", message_thread_id=42
+            )
+        action = store.claim(
+            confirm_id, chat_id="100", user_id="9", message_thread_id=41
+        )
+        self.assertEqual(action["value"]["request_id"], 17)
 
     def test_claim_is_single_use_and_invalidates_paired_decision(self):
         store = TelegramWriteConfirmationStore()

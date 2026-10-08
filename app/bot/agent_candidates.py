@@ -12,7 +12,11 @@ from app.agent.kernel.references import ReferenceError
 from app.agent.kernel.state import PublicationLease, SelectionInvalidError, StateUpdate
 from app.agent.kernel.ux_selection import current_candidate_view
 
-CALLBACK_RE = re.compile(r"^agk:s:(ref_[A-Za-z0-9_-]{24}):(?P<action>i(?:[1-9]|1[0-2])|t(?:qb|guangya|both)|[epr])$")
+CALLBACK_RE = re.compile(
+    r"^agk:s:(?:(?P<route>[A-Za-z0-9_-]{8,16}):)?"
+    r"(?P<handle>ref_[A-Za-z0-9_-]{24}):"
+    r"(?P<action>i(?:[1-9]|1[0-2])|t(?:qb|guangya|both)|[epr])$"
+)
 _DRAFT_KIND = "ux_telegram_candidate"
 
 
@@ -66,14 +70,29 @@ async def load_draft(runtime: Any, *, owner: str, session_id: str, handle: str, 
     return view, deepcopy(draft)
 
 
-def render(telebot: Any, view: dict, draft: dict) -> tuple[str, Any]:
+def render(
+    telebot: Any,
+    view: dict,
+    draft: dict,
+    *,
+    owner: str = "",
+    session_id: str = "",
+    message_thread_id: object = None,
+) -> tuple[str, Any]:
     if draft.get("phase") == "result":
         return str(draft.get("result_html") or "本次处理已结束，请核对实际下载状态。"), None
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     handle = draft["handle"]
+    if owner and session_id and message_thread_id is not None:
+        from app.modules.telegram_topic_routing import create_session_callback_route
+
+        route = create_session_callback_route(owner, session_id, message_thread_id)
+        callback_prefix = f"agk:s:{route}:{handle}"
+    else:
+        callback_prefix = f"agk:s:{handle}"
 
     def button(label: str, action: str):
-        return telebot.types.InlineKeyboardButton(label, callback_data=f"agk:s:{handle}:{action}")
+        return telebot.types.InlineKeyboardButton(label, callback_data=f"{callback_prefix}:{action}")
 
     selected = set(draft["positions"])
     recommended = view.get("recommended_positions") or []
@@ -115,7 +134,7 @@ async def reply_selection_ref(runtime: Any, *, owner: str, session_id: str, mess
             if not match:
                 continue
             try:
-                bound = await runtime.store.resolve(match.group(1), owner=owner, session_id=session_id, expected_kind=_DRAFT_KIND)
+                bound = await runtime.store.resolve(match.group("handle"), owner=owner, session_id=session_id, expected_kind=_DRAFT_KIND)
             except ReferenceError as exc:
                 raise SelectionInvalidError("回复的候选已过期，请重新搜索后选择。") from exc
             state = await runtime.store.load(owner=owner, session_id=session_id)
@@ -126,7 +145,15 @@ async def reply_selection_ref(runtime: Any, *, owner: str, session_id: str, mess
     return ""
 
 
-def handle_callback(bot: Any, call: Any, telebot: Any, *, owner: str, session_id: str) -> None:
+def handle_callback(
+    bot: Any,
+    call: Any,
+    telebot: Any,
+    *,
+    owner: str,
+    session_id: str,
+    message_thread_id: object = None,
+) -> None:
     from app.agent.kernel.bootstrap import get_agent_kernel_runtime
     from app.agent.kernel.transports import QueryEnvelope
     from app.bot.agent_adapter import (
@@ -143,7 +170,7 @@ def handle_callback(bot: Any, call: Any, telebot: Any, *, owner: str, session_id
         return
     runtime = get_agent_kernel_runtime()
     try:
-        view, draft = asyncio.run(load_draft(runtime, owner=owner, session_id=session_id, handle=match.group(1), message_id=call.message.message_id))
+        view, draft = asyncio.run(load_draft(runtime, owner=owner, session_id=session_id, handle=match.group("handle"), message_id=call.message.message_id))
         action = match.group("action")
         if draft["phase"] != "select":
             raise SelectionInvalidError("正在处理预检或确认，请使用当前按钮。")
@@ -172,14 +199,18 @@ def handle_callback(bot: Any, call: Any, telebot: Any, *, owner: str, session_id
                 raise SelectionInvalidError("当前目标尚未就绪，请先切换目标。")
             draft["phase"] = "previewing"
         draft["positions"] = sorted(selected)
-        draft = asyncio.run(save_draft(runtime, owner=owner, session_id=session_id, view=view, draft=draft, expected=match.group(1)))
+        draft = asyncio.run(save_draft(runtime, owner=owner, session_id=session_id, view=view, draft=draft, expected=match.group("handle")))
     except Exception as exc:  # noqa: BLE001 - 安全失败，不删除另一并发点击刚更新的键盘
         text = str(exc) if isinstance(exc, SelectionInvalidError) else "候选已失效，请重新搜索后选择。"
         bot.answer_callback_query(call.id, text, show_alert=True)
         return
     bot.answer_callback_query(call.id, "正在预检，尚未下载" if action == "p" else "选择已更新")
     if action != "p":
-        body, markup = render(telebot, view, draft)
+        body, markup = render(
+            telebot, view, draft,
+            owner=owner, session_id=session_id,
+            message_thread_id=message_thread_id,
+        )
         _edit_final(bot, call.message, body, reply_markup=markup, rendered_html=True)
         return
     try:
@@ -192,11 +223,27 @@ def handle_callback(bot: Any, call: Any, telebot: Any, *, owner: str, session_id
         if result.approval:
             draft.update(phase="approval", plan_id=result.approval.plan_id)
             asyncio.run(save_draft(runtime, owner=owner, session_id=session_id, view=view, draft=draft, expected=draft["handle"]))
-            _edit_final(bot, call.message, "\n".join(_preview_lines(result.approval)), reply_markup=_approval_markup(telebot, result.approval), rendered_html=True)
+            _edit_final(
+                bot,
+                call.message,
+                "\n".join(_preview_lines(result.approval)),
+                reply_markup=_approval_markup(
+                    telebot,
+                    result.approval,
+                    owner=owner,
+                    session_id=session_id,
+                    message_thread_id=message_thread_id,
+                ),
+                rendered_html=True,
+            )
         else:
             draft.update(phase="result", result_html=_render_turn(result))
             draft = asyncio.run(save_draft(runtime, owner=owner, session_id=session_id, view=view, draft=draft, expected=draft["handle"]))
-            body, markup = render(telebot, view, draft)
+            body, markup = render(
+                telebot, view, draft,
+                owner=owner, session_id=session_id,
+                message_thread_id=message_thread_id,
+            )
             _edit_final(bot, call.message, body, reply_markup=markup, rendered_html=True)
     except Exception:  # noqa: BLE001 - 预检或投递中断，不把未知状态伪造成执行成功
         _edit_final(bot, call.message, "预检响应中断；尚未确认下载。请查询当前计划或重新发起选择。")

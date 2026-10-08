@@ -155,7 +155,17 @@ class AgentReleaseFormatKernelTests(IsolatedDatabaseTestCase):
                 result = await consume_events(restored.session.confirm(
                     owner=self.owner, session_id="reload-session", plan_id=view.approval.plan_id,
                 ))
-            self.assertEqual(result.status, "failed", result.to_dict())
+            self.assertEqual(result.status, "approval_required", result.to_dict())
+            self.assertIsNotNone(result.approval)
+            self.assertNotEqual(result.approval.plan_id, view.approval.plan_id)
+            self.assertEqual(result.effect_result["status"], "confirmation_stale")
+            self.assertEqual(formats.list_rules(), [])
+            replay = await consume_events(restored.session.confirm(
+                owner=self.owner, session_id="reload-session", plan_id=view.approval.plan_id,
+            ))
+            self.assertEqual(replay.status, "failed")
+            state = await restored.store.load(owner=self.owner, session_id="reload-session")
+            self.assertEqual(state.pending_effect_plan_id, result.approval.plan_id)
             self.assertEqual(formats.list_rules(), [])
         asyncio.run(scenario())
 

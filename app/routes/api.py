@@ -536,7 +536,7 @@ def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
         normalized["AGENT_LLM_MODEL"] = model
 
     limits = {
-        "AGENT_LLM_TIMEOUT_SECONDS": (2, 30),
+        "AGENT_LLM_TIMEOUT_SECONDS": (2, 120),
         "AGENT_LLM_CONTEXT_WINDOW_TOKENS": (16_384, 2_000_000),
     }
     for key, (minimum, maximum) in limits.items():

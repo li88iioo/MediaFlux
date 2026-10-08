@@ -819,7 +819,10 @@ def _partial_delivery(
     )
 
 
-def _send_text_result(bot, target: str, text: str, *, reply_markup=None) -> TelegramSendResult:
+def _send_text_result(
+    bot, target: str, text: str, *, reply_markup=None,
+    message_thread_id: int | None = None,
+) -> TelegramSendResult:
     chunks = split_message(text)
     sent = 0
     last_message_id = 0
@@ -828,6 +831,8 @@ def _send_text_result(bot, target: str, text: str, *, reply_markup=None) -> Tele
             kwargs = {
                 "reply_markup": reply_markup
             } if reply_markup is not None and index == len(chunks) - 1 else {}
+            if message_thread_id is not None:
+                kwargs["message_thread_id"] = message_thread_id
             message = bot.send_message(target, chunk, **kwargs)
             try:
                 last_message_id = int(getattr(message, "message_id", 0) or 0)
@@ -1078,7 +1083,8 @@ def edit_event_result(
 
 
 def send_event_result(
-    event: NotificationEvent, chat_id: Optional[str] = None,
+    event: NotificationEvent, chat_id: Optional[str] = None, *,
+    message_thread_id: int | None = None,
 ) -> TelegramSendResult:
     """发送结构化事件，并保留可重试/结果未知语义。"""
     bot = get_bot()
@@ -1096,6 +1102,7 @@ def send_event_result(
     if not image_url:
         result = _send_text_result(
             bot, target, text, reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
         if not result.ok:
             logger.error(
@@ -1110,6 +1117,8 @@ def send_event_result(
         photo_kwargs = {
             "reply_markup": reply_markup
         } if reply_markup is not None and len(caption_chunks) == 1 else {}
+        if message_thread_id is not None:
+            photo_kwargs["message_thread_id"] = message_thread_id
         photo_message = bot.send_photo(
             target, image_url, caption=caption_chunks[0], **photo_kwargs
         )
@@ -1131,6 +1140,7 @@ def send_event_result(
         )
         result = _send_text_result(
             bot, target, text, reply_markup=reply_markup,
+            message_thread_id=message_thread_id,
         )
         if not result.ok:
             logger.error(
@@ -1143,6 +1153,8 @@ def send_event_result(
             kwargs = {
                 "reply_markup": reply_markup
             } if reply_markup is not None and index == len(caption_chunks) - 2 else {}
+            if message_thread_id is not None:
+                kwargs["message_thread_id"] = message_thread_id
             message = bot.send_message(target, chunk, **kwargs)
             try:
                 last_message_id = int(getattr(message, "message_id", 0) or 0)

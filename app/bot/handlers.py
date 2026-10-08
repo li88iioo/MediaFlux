@@ -125,7 +125,7 @@ def _reject_unauthorized(bot, msg_or_call) -> bool:
         if getattr(msg_or_call, "id", None):
             bot.answer_callback_query(msg_or_call.id, "未授权会话", show_alert=True)
         else:
-            bot.reply_to(msg_or_call, "未授权会话")
+            _reply_to_source(bot,msg_or_call, "未授权会话")
     except Exception:
         pass
     return True
@@ -155,7 +155,7 @@ def _reject_unauthorized_group_write(bot, msg_or_call) -> bool:
                 show_alert=True,
             )
         else:
-            bot.reply_to(msg_or_call, "你无权在此群组执行该操作")
+            _reply_to_source(bot,msg_or_call, "你无权在此群组执行该操作")
     except Exception:
         pass
     return True
@@ -181,7 +181,7 @@ def _reject_unauthorized_resource_search(bot, msg_or_call) -> bool:
                 msg_or_call.id, "你无权在此群组使用资源搜索", show_alert=True
             )
         else:
-            bot.reply_to(msg_or_call, "你无权在此群组使用资源搜索")
+            _reply_to_source(bot,msg_or_call, "你无权在此群组使用资源搜索")
     except Exception:
         pass
     return True
@@ -220,6 +220,7 @@ def _download_target_picker_markup(
     chat_id: str,
     user_id: str,
     allow_guangya: bool = True,
+    message_thread_id: object = None,
 ):
     from app.modules.telegram_write_confirmations import (
         get_telegram_write_confirmation_store,
@@ -280,6 +281,7 @@ def _download_target_picker_markup(
         user_id=user_id,
         operation="download_request",
         actions=[(decision, value) for _label, decision, value in choices],
+        message_thread_id=message_thread_id,
     )
     keyboard = telebot.types.InlineKeyboardMarkup(row_width=2)
     keyboard.add(
@@ -307,7 +309,8 @@ def _configured_local_organize_sources() -> list[object]:
 
 
 def _organize_scope_markup(
-    telebot, *, chat_id: str, user_id: str, cloud: bool, local: bool
+    telebot, *, chat_id: str, user_id: str, cloud: bool, local: bool,
+    message_thread_id: object = None,
 ):
     """生成会话绑定的一次性整理范围选择按钮。"""
     from app.modules.telegram_write_confirmations import (
@@ -327,6 +330,7 @@ def _organize_scope_markup(
         user_id=user_id,
         operation="organize",
         actions=[(decision, value) for _label, decision, value in choices],
+        message_thread_id=message_thread_id,
     )
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -351,6 +355,24 @@ def _telegram_identity(message_or_call) -> tuple[str, str]:
     return str(getattr(chat, "id", "")), str(getattr(user, "id", ""))
 
 
+def _telegram_thread_id(source) -> int | None:
+    message = getattr(source, "message", None) or source
+    try:
+        thread_id = int(getattr(message, "message_thread_id", None) or 0)
+    except (TypeError, ValueError):
+        return None
+    return thread_id if thread_id > 0 else None
+
+
+def _reply_to_source(bot, source, text: str, **kwargs):
+    """回复命令、链接及异步入口消息时显式保留原 Telegram topic。"""
+    message = getattr(source, "message", None) or source
+    thread_id = _telegram_thread_id(message)
+    if thread_id is not None:
+        kwargs.setdefault("message_thread_id", thread_id)
+    return bot.reply_to(message, text, **kwargs)
+
+
 _RESOURCE_PAGE_SIZE = 5
 _RESOURCE_TITLE_LIMIT = 72
 _RESOURCE_BUTTON_TITLE_LIMIT = 34
@@ -372,7 +394,8 @@ def _resource_action_button(
 
 
 def _write_confirmation_markup(
-    telebot, *, chat_id: str, user_id: str, operation: str, value: dict
+    telebot, *, chat_id: str, user_id: str, operation: str, value: dict,
+    message_thread_id: object = None,
 ):
     from app.modules.telegram_write_confirmations import (
         get_telegram_write_confirmation_store,
@@ -383,6 +406,7 @@ def _write_confirmation_markup(
         user_id=user_id,
         operation=operation,
         value=value,
+        message_thread_id=message_thread_id,
     )
     markup = telebot.types.InlineKeyboardMarkup(row_width=2)
     markup.add(
@@ -1074,10 +1098,10 @@ def _start_sync_gy(bot, telebot, source_message) -> bool:
     """在确认回调后启动 STRM 同步，并保证启动失败不会泄漏互斥锁。"""
     global _sync_running
     if _maintenance_task_busy():
-        bot.reply_to(source_message, "已有整理或同步任务在执行，请稍后再试")
+        _reply_to_source(bot,source_message, "已有整理或同步任务在执行，请稍后再试")
         return False
     if not _task_lock.acquire(blocking=False):
-        bot.reply_to(source_message, "任务队列占用中，请稍后")
+        _reply_to_source(bot,source_message, "任务队列占用中，请稍后")
         return False
     _sync_running = True
     progress = None
@@ -1103,7 +1127,7 @@ def _start_sync_gy(bot, telebot, source_message) -> bool:
         if progress is not None:
             progress.finish(f"<b>{sync_label}启动失败</b>\n任务未启动，请稍后重试。")
         else:
-            bot.reply_to(source_message, f"{sync_label}未能启动，请稍后重试")
+            _reply_to_source(bot,source_message, f"{sync_label}未能启动，请稍后重试")
         _sync_running = False
         _task_lock.release()
         return False
@@ -1115,17 +1139,17 @@ def _start_guangya_organize(bot, telebot, source_message) -> bool:
     sources = _configured_organize_sources()
     dst = get("GY_ORGANIZE_TARGET_DIR", "").strip()
     if not sources or not dst or dst == "0":
-        bot.reply_to(
+        _reply_to_source(bot,
             source_message,
             "未配置整理源目录或目标目录\n"
             "请在控制台「网盘整理」页选择至少一个源目录和归档目标目录。",
         )
         return False
     if _maintenance_task_busy():
-        bot.reply_to(source_message, "已有整理或同步任务在执行，请稍后再试")
+        _reply_to_source(bot,source_message, "已有整理或同步任务在执行，请稍后再试")
         return False
     if not _task_lock.acquire(blocking=False):
-        bot.reply_to(source_message, "任务队列占用中，请稍后")
+        _reply_to_source(bot,source_message, "任务队列占用中，请稍后")
         return False
     _organize_running = True
     progress = None
@@ -1155,7 +1179,7 @@ def _start_guangya_organize(bot, telebot, source_message) -> bool:
         if progress is not None:
             progress.finish("<b>光鸭整理启动失败</b>\n任务未启动，请稍后重试。")
         else:
-            bot.reply_to(source_message, "光鸭整理未能启动，请稍后重试")
+            _reply_to_source(bot,source_message, "光鸭整理未能启动，请稍后重试")
         _organize_running = False
         _task_lock.release()
         return False
@@ -1165,16 +1189,16 @@ def _start_organize_local(bot, telebot, source_message) -> bool:
     """启动一次性本地来源扫描，并等待本批任务形成合并结果。"""
     global _local_organize_running
     if not _configured_local_organize_sources():
-        bot.reply_to(
+        _reply_to_source(bot,
             source_message,
             "没有可整理的本地来源\n请先配置本地下载路径和至少一个媒体库归档目标。",
         )
         return False
     if _maintenance_task_busy():
-        bot.reply_to(source_message, "已有整理或同步任务在执行，请稍后再试")
+        _reply_to_source(bot,source_message, "已有整理或同步任务在执行，请稍后再试")
         return False
     if not _task_lock.acquire(blocking=False):
-        bot.reply_to(source_message, "任务队列占用中，请稍后")
+        _reply_to_source(bot,source_message, "任务队列占用中，请稍后")
         return False
     _local_organize_running = True
     progress = None
@@ -1202,7 +1226,7 @@ def _start_organize_local(bot, telebot, source_message) -> bool:
         if progress is not None:
             progress.finish("<b>本地下载整理启动失败</b>\n任务未启动，请稍后重试。")
         else:
-            bot.reply_to(source_message, "本地下载整理未能启动，请稍后重试")
+            _reply_to_source(bot,source_message, "本地下载整理未能启动，请稍后重试")
         _local_organize_running = False
         if _task_lock.locked():
             _task_lock.release()
@@ -1215,17 +1239,17 @@ def _start_organize_all(bot, telebot, source_message) -> bool:
     sources = _configured_organize_sources()
     dst = get("GY_ORGANIZE_TARGET_DIR", "").strip()
     if not sources or not dst or dst == "0" or not _configured_local_organize_sources():
-        bot.reply_to(
+        _reply_to_source(bot,
             source_message,
             "全部整理配置不完整\n"
             "请同时配置光鸭整理来源/目标，以及本地下载来源/媒体库目标。",
         )
         return False
     if _maintenance_task_busy():
-        bot.reply_to(source_message, "已有整理或同步任务在执行，请稍后再试")
+        _reply_to_source(bot,source_message, "已有整理或同步任务在执行，请稍后再试")
         return False
     if not _task_lock.acquire(blocking=False):
-        bot.reply_to(source_message, "任务队列占用中，请稍后")
+        _reply_to_source(bot,source_message, "任务队列占用中，请稍后")
         return False
     _organize_running = True
     _local_organize_running = True
@@ -1254,7 +1278,7 @@ def _start_organize_all(bot, telebot, source_message) -> bool:
         if progress is not None:
             progress.finish("<b>全部整理启动失败</b>\n任务未启动，请稍后重试。")
         else:
-            bot.reply_to(source_message, "全部整理未能启动，请稍后重试")
+            _reply_to_source(bot,source_message, "全部整理未能启动，请稍后重试")
         _organize_running = False
         _local_organize_running = False
         if _task_lock.locked():
@@ -1277,9 +1301,16 @@ def _command_menu_specs() -> list[tuple[str, str]]:
     ]
     commands.append(("agent", "管理 Media Agent"))
     if _telegram_agent_available():
-        commands.append(("agent_reset", "重置 Agent 会话"))
+        commands.extend(
+            [
+                ("agent_reset", "重置 Agent 会话"),
+                ("model", "选择当前会话模型"),
+                ("stop", "停止当前会话任务"),
+            ]
+        )
     commands.extend(
         [
+            ("topic", "设置私聊话题会话隔离"),
             ("status", "查看运行状态"),
             ("help", "查看使用帮助"),
             ("start", "开始"),
@@ -1382,7 +1413,7 @@ def _register_commands(bot, telebot):
         if getattr(source, "message", None) is not None:
             bot.answer_callback_query(source.id, notice, show_alert=True)
         else:
-            bot.reply_to(source, notice)
+            _reply_to_source(bot,source, notice)
 
     def require_auth(handler):
         def wrapped(msg, *args, **kwargs):
@@ -1399,6 +1430,164 @@ def _register_commands(bot, telebot):
             return handler(msg, *args, **kwargs)
 
         return wrapped
+
+    def topic_platform_capabilities():
+        try:
+            me = bot.get_me()
+        except Exception as exc:
+            logger.info("读取 Telegram 私聊话题能力失败 type=%s", type(exc).__name__)
+            return None, None
+        if isinstance(me, dict):
+            return me.get("has_topics_enabled"), me.get("allows_users_to_create_topics")
+        return (
+            getattr(me, "has_topics_enabled", None),
+            getattr(me, "allows_users_to_create_topics", None),
+        )
+
+    def topic_menu_text(enabled: bool, has_topics: object, allows_users: object) -> str:
+        app_state = "开启" if enabled else "关闭"
+        if has_topics is True:
+            platform_state = "已满足 BotFather 私聊话题前置条件"
+        elif has_topics is False:
+            platform_state = "未开启：需先在 BotFather 中启用私聊话题"
+        else:
+            platform_state = "无法确认：请检查 BotFather 私聊话题设置"
+        user_state = (
+            "允许用户创建/删除话题"
+            if allows_users is True
+            else "用户创建/删除话题权限未开启"
+            if allows_users is False
+            else "用户创建/删除话题权限未知"
+        )
+        return (
+            "<b>私聊话题模式</b>\n"
+            f"应用会话隔离：{app_state}\n"
+            f"Telegram 平台：{platform_state}\n"
+            f"平台话题权限：{user_state}\n\n"
+            "此开关只控制 MediaFlux 按 Telegram topic 隔离会话与路由回复；"
+            "不会替 BotFather 开关平台能力，也不会自动创建话题。"
+        )
+
+    def topic_menu_markup():
+        markup = telebot.types.InlineKeyboardMarkup(row_width=2)
+        markup.add(
+            telebot.types.InlineKeyboardButton("开启应用隔离", callback_data="tgt:on"),
+            telebot.types.InlineKeyboardButton("关闭应用隔离", callback_data="tgt:off"),
+        )
+        return markup
+
+    @bot.message_handler(commands=["topic"])
+    @require_auth
+    def cmd_topic(msg):
+        chat = getattr(msg, "chat", None)
+        if getattr(chat, "type", "") != "private":
+            _reply_to_source(bot, msg, "/topic 仅支持 Bot 私聊，不支持群组。")
+            return
+        from app.bot.agent_adapter import telegram_agent_owner
+        from app.modules.telegram_topic_routing import set_topic_mode, topic_mode_enabled
+
+        chat_id, user_id = _telegram_identity(msg)
+        owner = telegram_agent_owner(chat_id, user_id)
+        parts = str(getattr(msg, "text", "") or "").split()
+        action = parts[1].casefold() if len(parts) > 1 else ""
+        if action not in {"", "on", "off"} or len(parts) > 2:
+            _reply_to_source(bot, msg, "用法：/topic、/topic on 或 /topic off")
+            return
+        has_topics, allows_users = topic_platform_capabilities()
+        if action == "on":
+            if has_topics is not True:
+                _reply_to_source(
+                    bot,
+                    msg,
+                    "尚未开启应用话题隔离。请先在 BotFather 为此 Bot 启用私聊话题；"
+                    "MediaFlux 不能代替 BotFather 切换平台能力。",
+                )
+                return
+            set_topic_mode(owner, True)
+        elif action == "off":
+            set_topic_mode(owner, False)
+        _reply_to_source(
+            bot,
+            msg,
+            topic_menu_text(topic_mode_enabled(owner), has_topics, allows_users),
+            parse_mode="HTML",
+            reply_markup=topic_menu_markup(),
+        )
+
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("tgt:")
+    )
+    def choose_topic_mode(call):
+        if _reject_unauthorized(bot, call):
+            return
+        message = getattr(call, "message", None)
+        if getattr(getattr(message, "chat", None), "type", "") != "private":
+            bot.answer_callback_query(call.id, "仅支持 Bot 私聊话题", show_alert=True)
+            return
+        from app.bot.agent_adapter import telegram_agent_owner
+        from app.modules.telegram_topic_routing import set_topic_mode, topic_mode_enabled
+
+        chat_id, user_id = _telegram_identity(call)
+        owner = telegram_agent_owner(chat_id, user_id)
+        action = str(getattr(call, "data", "")).partition(":")[2]
+        has_topics, allows_users = topic_platform_capabilities()
+        if action == "on" and has_topics is not True:
+            bot.answer_callback_query(
+                call.id,
+                "请先在 BotFather 启用私聊话题；应用不能切换平台能力",
+                show_alert=True,
+            )
+            return
+        if action not in {"on", "off"}:
+            bot.answer_callback_query(call.id, "按钮已失效", show_alert=True)
+            return
+        set_topic_mode(owner, action == "on")
+        bot.answer_callback_query(call.id, "应用话题隔离已开启" if action == "on" else "应用话题隔离已关闭")
+        bot.edit_message_text(
+            topic_menu_text(topic_mode_enabled(owner), has_topics, allows_users),
+            message.chat.id,
+            message.message_id,
+            parse_mode="HTML",
+            reply_markup=topic_menu_markup(),
+        )
+
+    @bot.message_handler(commands=["model"])
+    @require_auth
+    def cmd_model(msg):
+        from app.bot.agent_adapter import handle_agent_model_command
+
+        submit_agent(
+            handle_agent_model_command,
+            bot,
+            msg,
+            telebot,
+            source=msg,
+            control=True,
+        )
+
+    @bot.message_handler(commands=["stop"])
+    @require_auth
+    def cmd_stop(msg):
+        from app.bot.agent_adapter import handle_agent_stop
+
+        submit_agent(handle_agent_stop, bot, msg, source=msg, control=True)
+
+    @bot.callback_query_handler(
+        func=lambda call: str(getattr(call, "data", "")).startswith("tgm:")
+    )
+    def choose_model(call):
+        if _reject_unauthorized(bot, call):
+            return
+        from app.bot.agent_adapter import handle_agent_model_callback
+
+        submit_agent(
+            handle_agent_model_callback,
+            bot,
+            call,
+            telebot,
+            source=call,
+            control=True,
+        )
 
     @bot.message_handler(commands=["help"])
     @bot.message_handler(commands=["start"])
@@ -1425,9 +1614,15 @@ def _register_commands(bot, telebot):
         ]
         if _telegram_agent_available():
             agent_lines.append("/agent_reset — 重置 Agent 会话")
+            agent_lines.append("/model — 查看并选择当前会话模型")
+            agent_lines.append("/stop — 请求停止当前会话任务")
         sections.append("\n".join(agent_lines))
+        sections.append(
+            "<b>私聊话题</b>\n/topic — 查看或切换应用话题会话隔离；"
+            "平台能力需先在 BotFather 启用。"
+        )
         sections.append("<b>运行状态</b>\n/status — 查看整理、同步与待处理状态")
-        bot.reply_to(msg, "\n\n".join(sections))
+        _reply_to_source(bot,msg, "\n\n".join(sections))
 
     @bot.message_handler(commands=["status"])
     @require_auth
@@ -1460,10 +1655,10 @@ def _register_commands(bot, telebot):
             group_line = _organize_group_progress_line(organize)
             if group_line:
                 lines.insert(3 if current else 2, group_line)
-            bot.reply_to(msg, "\n".join(lines))
+            _reply_to_source(bot,msg, "\n".join(lines))
         except Exception as exc:
             logger.warning("Telegram 状态查询失败 type=%s", type(exc).__name__)
-            bot.reply_to(msg, "状态读取失败，请稍后重试")
+            _reply_to_source(bot,msg, "状态读取失败，请稍后重试")
 
     @bot.message_handler(commands=["agent"])
     @require_auth
@@ -1492,7 +1687,7 @@ def _register_commands(bot, telebot):
             text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
         )
         if not query:
-            bot.reply_to(
+            _reply_to_source(bot,
                 msg,
                 "<b>请输入要搜索的媒体名称</b>\n"
                 "例如：/media_search 光阴之外\n"
@@ -1501,7 +1696,7 @@ def _register_commands(bot, telebot):
             )
             return
         if not get_bool("INDEXER_SEARCH_ENABLED"):
-            bot.reply_to(msg, "资源站搜索当前已关闭，请先在设置中启用")
+            _reply_to_source(bot,msg, "资源站搜索当前已关闭，请先在设置中启用")
             return
         progress = TelegramProgress(
             bot,
@@ -1543,7 +1738,7 @@ def _register_commands(bot, telebot):
     @require_write_auth
     def cmd_sync(msg):
         if _maintenance_task_busy():
-            bot.reply_to(msg, "已有整理或同步任务在执行，请稍后再试")
+            _reply_to_source(bot,msg, "已有整理或同步任务在执行，请稍后再试")
             return
         chat_id, user_id = _telegram_identity(msg)
         markup = _write_confirmation_markup(
@@ -1552,8 +1747,9 @@ def _register_commands(bot, telebot):
             user_id=user_id,
             operation="sync_gy",
             value={},
+            message_thread_id=_telegram_thread_id(msg),
         )
-        bot.reply_to(
+        _reply_to_source(bot,
             msg,
             "<b>确认同步光鸭 STRM</b>\n"
             "将按当前并发设置（默认 15 个扫描线程）遍历全部已配置目录、校准 STRM、执行安全清理并按需刷新媒体库。",
@@ -1565,7 +1761,7 @@ def _register_commands(bot, telebot):
     @require_write_auth
     def cmd_organize_scope(msg):
         if _maintenance_task_busy():
-            bot.reply_to(msg, "已有整理或同步任务在执行，请稍后再试")
+            _reply_to_source(bot,msg, "已有整理或同步任务在执行，请稍后再试")
             return
         cloud_sources = _configured_organize_sources()
         cloud_target = get("GY_ORGANIZE_TARGET_DIR", "").strip()
@@ -1573,7 +1769,7 @@ def _register_commands(bot, telebot):
         local_sources = _configured_local_organize_sources()
         local_available = bool(local_sources)
         if not cloud_available and not local_available:
-            bot.reply_to(
+            _reply_to_source(bot,
                 msg,
                 "尚未配置可执行的整理来源\n"
                 "请先配置光鸭整理目录，或本地下载来源和媒体库目标。",
@@ -1586,13 +1782,14 @@ def _register_commands(bot, telebot):
             user_id=user_id,
             cloud=cloud_available,
             local=local_available,
+            message_thread_id=_telegram_thread_id(msg),
         )
         available = []
         if cloud_available:
             available.append(f"光鸭 {len(cloud_sources)} 个来源")
         if local_available:
             available.append(f"本地 {len(local_sources)} 个来源")
-        bot.reply_to(
+        _reply_to_source(bot,
             msg,
             "<b>选择整理范围</b>\n"
             f"当前可用：{html.escape(' · '.join(available))}\n"
@@ -1608,7 +1805,7 @@ def _register_commands(bot, telebot):
 
         rows = db.list_rss_subscriptions()
         if not rows:
-            bot.reply_to(msg, "暂无 RSS 订阅项\n\n请在控制台「RSS 订阅」页添加订阅源")
+            _reply_to_source(bot,msg, "暂无 RSS 订阅项\n\n请在控制台「RSS 订阅」页添加订阅源")
             return
         lines = ["<b>RSS 订阅列表</b>\n"]
         for r in rows:
@@ -1618,7 +1815,7 @@ def _register_commands(bot, telebot):
                 f"[{enabled}] <b>#{r['id']} {html.escape(str(r['name']))}</b> [{action}]"
             )
         lines.append("\n/rss_refresh ID - 刷新订阅\n/rss_dl ID - 下载条目")
-        bot.reply_to(msg, "\n".join(lines))
+        _reply_to_source(bot,msg, "\n".join(lines))
 
     @bot.message_handler(commands=["rss_refresh"])
     @bot.message_handler(
@@ -1632,7 +1829,7 @@ def _register_commands(bot, telebot):
         if len(parts) < 2:
             rows = db.list_rss_subscriptions()
             if not rows:
-                bot.reply_to(msg, "暂无 RSS 订阅\n请先在控制台「RSS 订阅」页添加订阅源")
+                _reply_to_source(bot,msg, "暂无 RSS 订阅\n请先在控制台「RSS 订阅」页添加订阅源")
                 return
             lines = ["<b>请选择要刷新的订阅</b>"]
             for row in rows[:8]:
@@ -1643,16 +1840,16 @@ def _register_commands(bot, telebot):
                 )
             if len(rows) > 8:
                 lines.append(f"\n另有 {len(rows) - 8} 个订阅，可发送 /rss 查看完整列表")
-            bot.reply_to(msg, "\n".join(lines))
+            _reply_to_source(bot,msg, "\n".join(lines))
             return
         try:
             sid = int(parts[1])
         except ValueError:
-            bot.reply_to(msg, "订阅ID 必须是数字")
+            _reply_to_source(bot,msg, "订阅ID 必须是数字")
             return
         row = db.get_rss_subscription(sid)
         if row is None:
-            bot.reply_to(msg, "未找到该 RSS 订阅，请发送 /rss 查看有效 ID")
+            _reply_to_source(bot,msg, "未找到该 RSS 订阅，请发送 /rss 查看有效 ID")
             return
         from app.modules.rss import rss_subscription_refresh_revision
 
@@ -1666,8 +1863,9 @@ def _register_commands(bot, telebot):
                 "subscription_id": sid,
                 "expected_revision": rss_subscription_refresh_revision(row),
             },
+            message_thread_id=_telegram_thread_id(msg),
         )
-        bot.reply_to(
+        _reply_to_source(bot,
             msg,
             "<b>确认刷新 RSS 订阅</b>\n"
             f"订阅：#{sid} {html.escape(str(row['name'] or '未命名订阅'))}\n"
@@ -1687,7 +1885,7 @@ def _register_commands(bot, telebot):
         if len(parts) < 2:
             rows = db.list_rss_entries(status="pending", limit=6)
             if not rows:
-                bot.reply_to(
+                _reply_to_source(bot,
                     msg,
                     "暂无待下载的 RSS 条目\n可先发送 /rss 查看订阅，再刷新对应订阅。",
                 )
@@ -1699,16 +1897,16 @@ def _register_commands(bot, telebot):
                     title = title[:41].rstrip() + "…"
                 lines.append(f"/rss_dl {int(row['id'])} — {html.escape(title)}")
             lines.append("\n发送上面的命令即可提交下载。")
-            bot.reply_to(msg, "\n".join(lines))
+            _reply_to_source(bot,msg, "\n".join(lines))
             return
         try:
             eid = int(parts[1])
         except ValueError:
-            bot.reply_to(msg, "条目ID 必须是数字")
+            _reply_to_source(bot,msg, "条目ID 必须是数字")
             return
         row = db.get_rss_entry(eid)
         if row is None:
-            bot.reply_to(msg, "未找到该 RSS 条目，请发送 /rss_dl 查看待下载 ID")
+            _reply_to_source(bot,msg, "未找到该 RSS 条目，请发送 /rss_dl 查看待下载 ID")
             return
         title = " ".join(str(row["title"] or "未命名条目").split())
         if len(title) > 80:
@@ -1720,8 +1918,9 @@ def _register_commands(bot, telebot):
             user_id=user_id,
             operation="rss_download",
             value={"entry_id": eid},
+            message_thread_id=_telegram_thread_id(msg),
         )
-        bot.reply_to(
+        _reply_to_source(bot,
             msg,
             "<b>确认提交 RSS 下载</b>\n"
             f"条目：#{eid} {html.escape(title)}\n"
@@ -1747,8 +1946,10 @@ def _register_commands(bot, telebot):
             chat_id=chat_id,
             user_id=user_id,
             allow_guangya=allow_guangya,
+            message_thread_id=_telegram_thread_id(msg),
         )
-        bot.reply_to(
+        _reply_to_source(
+            bot,
             msg,
             "<b>选择下载目标</b>\n"
             f"任务: {html.escape(title or '未命名任务')}\n"
@@ -1788,7 +1989,7 @@ def _register_commands(bot, telebot):
         filename = str(document.file_name or "")
         mime = str(document.mime_type or "").lower()
         if not filename.lower().endswith(".torrent") and "bittorrent" not in mime:
-            bot.reply_to(msg, "暂不支持该文件，仅可发送 .torrent 种子文件")
+            _reply_to_source(bot, msg, "暂不支持该文件，仅可发送 .torrent 种子文件")
             return
         try:
             from app.modules.download_dispatcher import (
@@ -1811,10 +2012,16 @@ def _register_commands(bot, telebot):
                 str(msg.message_id),
                 user_id=user_id,
             )
+            from app.modules.telegram_topic_routing import bind_download_request_thread
+
+            bind_download_request_thread(
+                request["id"], _telegram_thread_id(msg), only_if_unbound=True
+            )
             if not request["created"]:
                 if reissue_pending_picker(msg, request, item.title):
                     return
-                bot.reply_to(
+                _reply_to_source(
+                    bot,
                     msg,
                     f"该种子已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）",
                 )
@@ -1822,10 +2029,10 @@ def _register_commands(bot, telebot):
             send_target_picker(msg, request["id"], item.title)
         except ValueError as exc:
             logger.info("Telegram 种子校验失败 type=%s", type(exc).__name__)
-            bot.reply_to(msg, f"种子文件无效：{html.escape(str(exc))}")
+            _reply_to_source(bot, msg, f"种子文件无效：{html.escape(str(exc))}")
         except Exception as exc:
             logger.error("Telegram 种子解析失败 type=%s", type(exc).__name__)
-            bot.reply_to(msg, "种子文件处理失败，请确认文件完整后重试")
+            _reply_to_source(bot, msg, "种子文件处理失败，请确认文件完整后重试")
 
     @bot.message_handler(
         func=lambda msg: (
@@ -1873,10 +2080,16 @@ def _register_commands(bot, telebot):
                 str(msg.message_id),
                 user_id=user_id,
             )
+            from app.modules.telegram_topic_routing import bind_download_request_thread
+
+            bind_download_request_thread(
+                request["id"], _telegram_thread_id(msg), only_if_unbound=True
+            )
             if not request["created"]:
                 if reissue_pending_picker(msg, request, item.title):
                     return
-                bot.reply_to(
+                _reply_to_source(
+                    bot,
                     msg,
                     f"该任务已存在，请勿重复提交（请求 #{request['id']}，状态 {request['status']}）",
                 )
@@ -1884,10 +2097,10 @@ def _register_commands(bot, telebot):
             send_target_picker(msg, request["id"], item.title)
         except ValueError as exc:
             logger.info("Telegram 下载链接校验失败 type=%s", type(exc).__name__)
-            bot.reply_to(msg, f"下载链接无效：{html.escape(str(exc))}")
+            _reply_to_source(bot, msg, f"下载链接无效：{html.escape(str(exc))}")
         except Exception as exc:
             logger.warning("Telegram 链接处理失败 (%s)", type(exc).__name__)
-            bot.reply_to(msg, "链接处理失败，请检查链接后重试")
+            _reply_to_source(bot, msg, "链接处理失败，请检查链接后重试")
 
     @bot.callback_query_handler(
         func=lambda call: str(getattr(call, "data", "")).startswith("tgc:")
@@ -2011,7 +2224,7 @@ def _run_rss_refresh(
     if progress is not None:
         progress.finish(text)
     else:
-        bot.reply_to(msg, text)
+        _reply_to_source(bot,msg, text)
 
 
 def _run_rss_download(bot, msg, eid: int, progress: TelegramProgress | None) -> None:
@@ -2040,7 +2253,7 @@ def _run_rss_download(bot, msg, eid: int, progress: TelegramProgress | None) -> 
     if progress is not None:
         progress.finish(text)
     else:
-        bot.reply_to(msg, text)
+        _reply_to_source(bot,msg, text)
 
 
 def _run_telegram_resource_search(
@@ -2072,7 +2285,7 @@ def _run_telegram_resource_search(
         if progress is not None:
             progress.finish(text, reply_markup=markup)
         else:
-            bot.reply_to(msg, text, reply_markup=markup)
+            _reply_to_source(bot,msg, text, reply_markup=markup)
     except Exception as exc:
         logger.warning("Telegram 媒体资源搜索失败 type=%s", type(exc).__name__)
         text = "媒体资源搜索失败，请稍后重试"
@@ -2080,7 +2293,7 @@ def _run_telegram_resource_search(
             if progress is not None:
                 progress.finish(text)
             else:
-                bot.reply_to(msg, text)
+                _reply_to_source(bot,msg, text)
         except Exception:
             pass
 
@@ -2166,6 +2379,7 @@ def _handle_resource_search_callback(bot, call, telebot) -> None:
                 user_id=user_id,
                 operation="resource_download",
                 value={"result_id": result_id, "target": target},
+                message_thread_id=_telegram_thread_id(call),
             )
             bot.answer_callback_query(call.id, "请确认下载操作")
             bot.edit_message_text(
@@ -2201,6 +2415,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
             action_id,
             chat_id=chat_id,
             user_id=user_id,
+            message_thread_id=_telegram_thread_id(call),
         )
         claimed = True
         operation = str(action["operation"])
@@ -2285,6 +2500,7 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                         request_id=request_id,
                         chat_id=chat_id,
                         user_id=user_id,
+                        message_thread_id=_telegram_thread_id(call),
                     )
                     picker_text = (
                         "<b>选择下载目标</b>\n"
@@ -2304,13 +2520,18 @@ def _handle_write_confirmation_callback(bot, call, telebot) -> None:
                             "Telegram NSFW 重新选择卡更新失败 type=%s",
                             type(exc).__name__,
                         )
-                        bot.reply_to(
+                        _reply_to_source(bot,
                             call.message,
                             picker_text,
                             reply_markup=keyboard,
                         )
                     bot.answer_callback_query(call.id, notice, show_alert=True)
                     return
+            from app.modules.telegram_topic_routing import bind_download_request_thread
+
+            bind_download_request_thread(
+                request_id, _telegram_thread_id(call), only_if_unbound=False
+            )
             _edit_write_confirmation_message(
                 bot, call.message, "下载请求已确认", "正在提交到所选下载目标…"
             )
@@ -2684,12 +2905,12 @@ def _inspect_telegram_share(bot, msg, share_url: str, telebot) -> None:
             user_id=user_id,
             store=get_share_transfer_store(),
         )
-        bot.reply_to(msg, text, reply_markup=markup)
+        _reply_to_source(bot,msg, text, reply_markup=markup)
     except ValueError:
-        bot.reply_to(msg, "光鸭分享链接无效，请检查链接或提取码")
+        _reply_to_source(bot,msg, "光鸭分享链接无效，请检查链接或提取码")
     except Exception as exc:
         logger.warning("Telegram 光鸭分享解析失败 (%s)", type(exc).__name__)
-        bot.reply_to(msg, "光鸭分享解析失败，请检查链接或提取码")
+        _reply_to_source(bot,msg, "光鸭分享解析失败，请检查链接或提取码")
 
 
 def _edit_share_message(bot, call, text: str, markup=None) -> None:

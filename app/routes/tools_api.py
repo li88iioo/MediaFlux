@@ -18,6 +18,7 @@ from fastapi.responses import Response
 from app import config
 from app import database as db
 from app.agent.async_bridge import run_awaitable_sync
+from app.agent.model_catalog import fetch_ai_models
 from app.agent.rate_limit import agent_rate_limiter
 from app.clients.openai_compatible import (
     PROTOCOLS,
@@ -932,35 +933,8 @@ def _test_fixed_target(target: dict[str, str], proxies) -> dict:
                 pass
 
 
-async def _fetch_ai_models(
-    *, base_url: str, api_key: str, protocol: str, timeout_seconds: int
-) -> list[str]:
-    location = normalize_provider_location(base_url, https_only=True, public_only=True)
-    headers = provider_headers(protocol, api_key, include_content_type=False)
-    client = FixedHostHttpClient(
-        allowed_hosts={location.host}, timeout_seconds=timeout_seconds,
-        max_response_bytes=512 * 1024, max_redirects=0,
-        user_agent="MediaFlux-AI-Models/1.0", pin_resolved_address=True,
-    )
-    try:
-        response = await client.get(location.models_url, headers=headers, max_redirects=0)
-        if response.status_code != 200:
-            raise ValueError(f"Provider /models 返回 HTTP {response.status_code}")
-        envelope = json.loads(response.text)
-        raw_models = envelope.get("data") if isinstance(envelope, dict) else None
-        if not isinstance(raw_models, list):
-            raise ValueError("Provider /models 响应格式无效")
-        models: list[str] = []
-        for item in raw_models[:1000]:
-            model_id = str(item.get("id") or "").strip() if isinstance(item, dict) else ""
-            if model_id and len(model_id) <= 200 and model_id not in models:
-                models.append(model_id)
-        return sorted(models, key=str.casefold)
-    finally:
-        await client.aclose()
-
-
 _AI_MODEL_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+_AI_MODEL_LIST_TIMEOUT_SECONDS = 12
 _AI_MODEL_TEST_SCHEMA = {
     "type": "object",
     "properties": {"ok": {"type": "boolean"}},
@@ -1022,17 +996,17 @@ def _normalize_tmdb_api_url(raw_value: object) -> str:
 
 def _ai_model_test_timeout(raw_value: object) -> int:
     if isinstance(raw_value, bool):
-        raise ValueError("请求超时必须是 2–30 秒的整数")
+        raise ValueError("请求超时必须是 2–120 秒的整数")
     if isinstance(raw_value, float) and not raw_value.is_integer():
-        raise ValueError("请求超时必须是 2–30 秒的整数")
+        raise ValueError("请求超时必须是 2–120 秒的整数")
     if isinstance(raw_value, str) and not re.fullmatch(r"\d+", raw_value.strip()):
-        raise ValueError("请求超时必须是 2–30 秒的整数")
+        raise ValueError("请求超时必须是 2–120 秒的整数")
     try:
         timeout_seconds = int(raw_value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("请求超时必须是 2–30 秒的整数") from exc
-    if not 2 <= timeout_seconds <= 30:
-        raise ValueError("请求超时必须在 2–30 秒之间")
+        raise ValueError("请求超时必须是 2–120 秒的整数") from exc
+    if not 2 <= timeout_seconds <= 120:
+        raise ValueError("请求超时必须在 2–120 秒之间")
     return timeout_seconds
 
 
@@ -1296,11 +1270,10 @@ def ai_models(request: Request, data: dict | None = Body(default=None)):
     if raw_protocol not in PROTOCOLS:
         return api_error(f"接口协议仅支持 {SUPPORTED_PROTOCOLS_TEXT}", 400)
     protocol = resolve_protocol(raw_protocol, base_url)
-    timeout_seconds = max(2, min(config.get_int("AGENT_LLM_TIMEOUT_SECONDS", 12), 30))
     try:
-        models = run_awaitable_sync(_fetch_ai_models(
+        models = run_awaitable_sync(fetch_ai_models(
             base_url=base_url, api_key=api_key, protocol=protocol,
-            timeout_seconds=timeout_seconds
+            timeout_seconds=_AI_MODEL_LIST_TIMEOUT_SECONDS
         ))
     except (ValueError, IndexerError) as exc:
         return api_error(str(exc), 400)

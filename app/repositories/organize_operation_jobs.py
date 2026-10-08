@@ -699,6 +699,71 @@ def defer_organize_operation_job(
         return cur.rowcount == 1
 
 
+def request_cancel_organize_operation_job(
+    job_id: str,
+    *,
+    owner: str,
+    expected_lease_generation: int,
+) -> tuple[sqlite3.Row | None, str]:
+    """Owner 与 lease CAS 保护的协作取消；不终止已受理的云端复制。"""
+    safe_id = _safe_job_id(job_id)
+    owner_digest = organize_operation_owner_digest(owner)
+    generation = max(0, int(expected_lease_generation))
+    timestamp = now()
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM organize_operation_jobs WHERE job_id=? AND owner_digest=?",
+            (safe_id, owner_digest),
+        ).fetchone()
+        if row is None or row["purged_at"] is not None:
+            return None, "not_found"
+        if int(row["lease_generation"] or 0) != generation:
+            return row, "stale"
+
+        status = str(row["status"] or "").strip().casefold()
+        if status in _TERMINAL_STATUSES:
+            return row, "terminal"
+        if status not in {"pending", "running"}:
+            return row, "stale"
+        # 复制请求已由 Provider 接受；停止本地轮询会丢失可信终态回执。
+        if str(row["error_code"] or "") == CLOUD_COPY_PENDING_CODE:
+            return row, "uncancellable"
+
+        if status == "pending":
+            cur = conn.execute(
+                "UPDATE organize_operation_jobs SET status='cancelled',cancel_requested=1,"
+                "reference='',payload_json='{}',payload_auth='',error_code='UserCancelled',"
+                "error='任务已取消',finished_at=?,updated_at=? "
+                "WHERE job_id=? AND owner_digest=? AND status='pending' "
+                "AND lease_generation=? AND purged_at IS NULL",
+                (timestamp, timestamp, safe_id, owner_digest, generation),
+            )
+            if cur.rowcount != 1:
+                return None, "stale"
+            _sync_cloud_plan_terminal(row, status="cancelled", error_code="UserCancelled")
+            _trim_terminal_history(conn, owner_digest)
+            outcome = "cancelled"
+        elif bool(row["cancel_requested"]):
+            outcome = "requested"
+        else:
+            cur = conn.execute(
+                "UPDATE organize_operation_jobs SET cancel_requested=1,updated_at=? "
+                "WHERE job_id=? AND owner_digest=? AND status='running' "
+                "AND lease_generation=? AND cancel_requested=0 AND purged_at IS NULL",
+                (timestamp, safe_id, owner_digest, generation),
+            )
+            if cur.rowcount != 1:
+                return None, "stale"
+            outcome = "requested"
+
+        updated = conn.execute(
+            "SELECT * FROM organize_operation_jobs WHERE job_id=? AND owner_digest=?",
+            (safe_id, owner_digest),
+        ).fetchone()
+        return updated, outcome
+
+
 def is_organize_operation_cancel_requested(
     job_id: str, *, expected_lease_generation: int
 ) -> bool:

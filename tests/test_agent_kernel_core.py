@@ -1841,6 +1841,123 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(AgentEventType.TOOL_STARTED, [event.type for event in replay])
         self.assertEqual(replay[-1].type, AgentEventType.TURN_FAILED)
 
+    async def test_telegram_model_preference_is_scoped_and_web_metadata_cannot_override(self):
+        model = ScriptedModel([
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="hello"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="hello"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")],
+        ])
+        catalog = ToolCatalog([read_tool("library.status")]); store = InMemorySessionStateStore()
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
+        with unittest.mock.patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value="chosen-model") as preference:
+            await consume_events(session.run(AgentInput(message="你好", owner="o", session_id="web", channel="web", metadata={"model":"not-trusted"})))
+            preference.assert_not_called()
+            await consume_events(session.run(AgentInput(message="你好", owner="o", session_id="tg", channel="telegram")))
+            preference.assert_called_once_with("o", "tg")
+        self.assertEqual([request.model for request in model.requests], ["", "chosen-model"])
+
+    async def test_stop_during_protected_write_keeps_receipt_and_does_not_resume_model(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def execute(_args, _snapshot, _context):
+            started.set()
+            await release.wait()
+            return {"ok": True, "status": "success", "summary": "文件已移动"}
+        tool = KernelToolSpec(name="cloud.move", domain="cloud", description="移动",
+                              input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+                              prepare=lambda _a, _c: PreparedEffect(preview={"summary": "预览"}, snapshot_fingerprint="v1"),
+                              execute_confirmed=execute)
+        catalog = ToolCatalog([tool]); store = InMemorySessionStateStore()
+        model = ScriptedModel([[
+            ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("move", tool.name, {})),
+            ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
+        ]])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
+        preview = await consume_events(session.run(AgentInput(message="移动后继续处理其他文件", owner="o", session_id="s")))
+        task = asyncio.create_task(consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id)))
+        await asyncio.wait_for(started.wait(), 2)
+        def request_stop(state):
+            state.metadata["stop_requested_generation"] = state.generation
+        await store.update_effect_state(owner="o", session_id="s", change=request_stop)
+        release.set()
+        result = await asyncio.wait_for(task, 2)
+        self.assertEqual(result.status, "cancelled", result.to_dict())
+        self.assertEqual(result.effect_result["summary"], "文件已移动")
+        self.assertEqual(len(model.requests), 1)
+        saved = await store.load(owner="o", session_id="s")
+        self.assertTrue(any("文件已移动" in str(row) for row in saved.conversation))
+
+    async def test_stop_arriving_at_unprotect_keeps_receipt_and_prevents_planning(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        async def execute(_args, _snapshot, _context):
+            started.set()
+            await release.wait()
+            return {"ok": True, "status": "success", "summary": "文件已移动"}
+        tool = KernelToolSpec(name="cloud.move", domain="cloud", description="移动",
+                              input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+                              prepare=lambda _a, _c: PreparedEffect(preview={"summary": "预览"}, snapshot_fingerprint="v1"),
+                              execute_confirmed=execute)
+        catalog = ToolCatalog([tool]); store = InMemorySessionStateStore()
+        model = ScriptedModel([[
+            ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("move", tool.name, {})),
+            ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
+        ]])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
+        preview = await consume_events(session.run(AgentInput(message="移动后继续处理其他文件", owner="o", session_id="s")))
+        original_unprotect = session.coordinator.unprotect
+        async def stop_before_unprotect(lease, token):
+            def mark(state):
+                state.metadata["stop_requested_generation"] = state.generation
+            await store.update_effect_state(owner="o", session_id="s", change=mark)
+            await original_unprotect(lease, token)
+        session.coordinator.unprotect = stop_before_unprotect
+        task = asyncio.create_task(consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id)))
+        await asyncio.wait_for(started.wait(), 2)
+        release.set()
+        result = await asyncio.wait_for(task, 2)
+        self.assertEqual(result.status, "cancelled", result.to_dict())
+        self.assertEqual(result.effect_result["summary"], "文件已移动")
+        self.assertEqual(len(model.requests), 1)
+        saved = await store.load(owner="o", session_id="s")
+        self.assertTrue(any("文件已移动" in str(row) for row in saved.conversation))
+
+    async def test_changed_snapshot_refreshes_confirmation_without_replaying_write(self):
+        version = [1]
+        writes = []
+        def execute(_args, expected, _context):
+            if expected != str(version[0]):
+                raise ToolPipelineError("回收站内容已变化", code="confirmation_stale")
+            writes.append(version[0])
+            return {"ok": True, "status": "success", "summary": "已完成"}
+        tool = KernelToolSpec(
+            name="cloud.clear", domain="cloud", description="清空回收站",
+            input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            effect=ToolEffect.WRITE,
+            prepare=lambda _a, _c: PreparedEffect(preview={"summary": f"确认删除{version[0]}项"}, snapshot_fingerprint=str(version[0])),
+            execute_confirmed=execute,
+        )
+        catalog = ToolCatalog([tool]); store = InMemorySessionStateStore()
+        model = ScriptedModel([[
+            ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("clear", tool.name, {})),
+            ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
+        ], [ModelEvent(ModelEventType.TEXT_DELTA, text="已核验完成。"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
+        preview = await consume_events(session.run(AgentInput(message="清空回收站", owner="o", session_id="s")))
+        version[0] = 2
+        refreshed = await consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id))
+        self.assertEqual(refreshed.status, "approval_required", refreshed.to_dict())
+        self.assertNotEqual(refreshed.approval.plan_id, preview.approval.plan_id)
+        self.assertEqual(writes, [])
+        self.assertEqual(len(model.requests), 1)
+        old = await consume_events(session.confirm(owner="o", session_id="s", plan_id=preview.approval.plan_id))
+        self.assertEqual(old.status, "failed")
+        self.assertEqual((await store.load(owner="o", session_id="s")).pending_effect_plan_id, refreshed.approval.plan_id)
+        final = await consume_events(session.confirm(owner="o", session_id="s", plan_id=refreshed.approval.plan_id))
+        self.assertEqual(final.status, "success", final.to_dict())
+        self.assertEqual(writes, [2])
+
     async def test_claimed_execution_failure_keeps_cause_and_clears_pending_plan(self) -> None:
         # 同一个 confirmation_* 错误码既可能来自领票，也可能来自真实执行；
         # 已领票的领域失败必须作为终态交付，而不是被 TG 当成重复点击吞掉。

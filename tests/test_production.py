@@ -3325,6 +3325,9 @@ class TelegramBotTests(unittest.TestCase):
                 "rss_dl",
                 "agent",
                 "agent_reset",
+                "topic",
+                "model",
+                "stop",
             },
         )
 

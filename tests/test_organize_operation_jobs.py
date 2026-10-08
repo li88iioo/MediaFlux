@@ -29,6 +29,7 @@ from app.repositories.organize_operation_jobs import (
     organize_operation_owner_digest,
     organize_operation_public_ref,
     recover_orphaned_organize_operation_jobs,
+    request_cancel_organize_operation_job,
     sanitize_organize_operation_result,
     verify_organize_operation_payload,
 )
@@ -158,6 +159,75 @@ class OrganizeOperationJobRepositoryTests(IsolatedDatabaseTestCase):
         terminal = get_organize_operation_job(str(created["job_id"]))
         self.assertEqual(terminal["status"], "partial")
         self.assertFalse(manager._lock.locked())
+
+    def test_owner_scoped_cancel_terminalizes_pending_and_scrubs_payload(self) -> None:
+        created, _ = self._enqueue(dedupe="owner:pending-cancel")
+        job_id = str(created["job_id"])
+
+        with patch("app.repositories.organize_operation_jobs._sync_cloud_plan_terminal") as sync:
+            cancelled, outcome = request_cancel_organize_operation_job(
+                job_id, owner="owner-durable-test", expected_lease_generation=0
+            )
+        self.assertEqual(outcome, "cancelled")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["payload_json"], "{}")
+        self.assertEqual(cancelled["reference"], "")
+        self.assertEqual(cancelled["error_code"], "UserCancelled")
+        sync.assert_called_once()
+        self.assertEqual(sync.call_args.kwargs["status"], "cancelled")
+
+        self.assertIsNone(
+            get_organize_operation_job_for_owner(job_id, "different-owner")
+        )
+        wrong_owner, wrong_owner_outcome = request_cancel_organize_operation_job(
+            job_id, owner="different-owner", expected_lease_generation=0
+        )
+        self.assertIsNone(wrong_owner)
+        self.assertEqual(wrong_owner_outcome, "not_found")
+
+    def test_owner_scoped_cancel_running_sets_only_cooperative_flag(self) -> None:
+        created, _ = self._enqueue(dedupe="owner:running-cancel")
+        job_id = str(created["job_id"])
+        claimed = claim_organize_operation_job(job_id)
+        generation = int(claimed["lease_generation"])
+
+        requested, outcome = request_cancel_organize_operation_job(
+            job_id, owner="owner-durable-test", expected_lease_generation=generation
+        )
+        self.assertEqual(outcome, "requested")
+        self.assertEqual(requested["status"], "running")
+        self.assertEqual(requested["cancel_requested"], 1)
+        self.assertTrue(is_organize_operation_cancel_requested(
+            job_id, expected_lease_generation=generation
+        ))
+        repeated, repeated_outcome = request_cancel_organize_operation_job(
+            job_id, owner="owner-durable-test", expected_lease_generation=generation
+        )
+        self.assertEqual(repeated_outcome, "requested")
+        self.assertEqual(repeated["status"], "running")
+
+    def test_cancel_rejects_stale_generation_and_preserves_accepted_cloud_copy(self) -> None:
+        created, _ = self._enqueue(dedupe="owner:stale-cancel")
+        job_id = str(created["job_id"])
+        claimed = claim_organize_operation_job(job_id)
+        generation = int(claimed["lease_generation"])
+        stale, outcome = request_cancel_organize_operation_job(
+            job_id, owner="owner-durable-test", expected_lease_generation=generation + 1
+        )
+        self.assertEqual(outcome, "stale")
+        self.assertEqual(stale["cancel_requested"], 0)
+
+        with db.get_conn() as conn:
+            conn.execute(
+                "UPDATE organize_operation_jobs SET error_code=? WHERE job_id=?",
+                (CLOUD_COPY_PENDING_CODE, job_id),
+            )
+        uncancellable, outcome = request_cancel_organize_operation_job(
+            job_id, owner="owner-durable-test", expected_lease_generation=generation
+        )
+        self.assertEqual(outcome, "uncancellable")
+        self.assertEqual(uncancellable["status"], "running")
+        self.assertEqual(uncancellable["cancel_requested"], 0)
 
     def test_claim_and_finish_are_generation_fenced(self) -> None:
         created, _ = self._enqueue()

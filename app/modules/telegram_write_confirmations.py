@@ -23,14 +23,25 @@ class TelegramWriteConfirmationError(ValueError):
     """确认票据无效、过期或 owner 不匹配。"""
 
 
-def _telegram_owner(chat_id: str, user_id: str) -> str:
+def _telegram_owner(
+    chat_id: str, user_id: str, message_thread_id: object = None
+) -> str:
     # 延迟导入避免 Telegram handler/adapter 初始化时形成模块环。
     from app.bot.agent_adapter import telegram_agent_owner
 
     try:
-        return telegram_agent_owner(chat_id, user_id)
+        owner = telegram_agent_owner(chat_id, user_id)
     except ValueError as exc:
         raise TelegramWriteConfirmationError("当前 Telegram 会话身份无效") from exc
+    if message_thread_id is None:
+        return owner
+    try:
+        thread_id = int(message_thread_id)
+    except (TypeError, ValueError) as exc:
+        raise TelegramWriteConfirmationError("当前 Telegram 话题无效") from exc
+    if thread_id <= 0:
+        raise TelegramWriteConfirmationError("当前 Telegram 话题无效")
+    return f"{owner}\x1fthread:{thread_id}"
 
 
 def _bounded_ticket_factory(factory: Callable[[], str]) -> Callable[[], str]:
@@ -119,6 +130,7 @@ class TelegramWriteConfirmationStore:
         user_id: str,
         operation: str,
         actions: list[tuple[str, dict[str, Any]]],
+        message_thread_id: object = None,
     ) -> tuple[str, ...]:
         operation_name, normalized = self._normalize_actions(
             operation,
@@ -126,7 +138,7 @@ class TelegramWriteConfirmationStore:
             max_actions=self.max_actions,
         )
         ticket = self._store.issue(
-            owner=_telegram_owner(str(chat_id), str(user_id)),
+            owner=_telegram_owner(str(chat_id), str(user_id), message_thread_id),
             tool_name=_TELEGRAM_WRITE_TOOL,
             arguments={"operation": operation_name, "actions": normalized},
             replace_active_ticket=True,
@@ -142,12 +154,14 @@ class TelegramWriteConfirmationStore:
         user_id: str,
         operation: str,
         value: dict[str, Any],
+        message_thread_id: object = None,
     ) -> tuple[str, str]:
         confirm_id, cancel_id = self.create_group(
             chat_id=chat_id,
             user_id=user_id,
             operation=operation,
             actions=[("confirm", value), ("cancel", value)],
+            message_thread_id=message_thread_id,
         )
         return confirm_id, cancel_id
 
@@ -157,13 +171,14 @@ class TelegramWriteConfirmationStore:
         *,
         chat_id: str,
         user_id: str,
+        message_thread_id: object = None,
     ) -> dict[str, Any]:
         match = _CALLBACK_ID_RE.fullmatch(str(action_id or "").strip())
         if match is None:
             raise TelegramWriteConfirmationError("确认已过期或已处理，请重新发起")
         ticket_id = match.group("ticket")
         choice_index = int(match.group("index"))
-        owner = _telegram_owner(str(chat_id), str(user_id))
+        owner = _telegram_owner(str(chat_id), str(user_id), message_thread_id)
         owner_match = self._store.ticket_owner_match(
             owner=owner,
             confirmation_id=ticket_id,
