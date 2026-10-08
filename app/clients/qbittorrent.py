@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError
 
 from app.logger import get_logger
 
@@ -210,7 +211,11 @@ class QBittorrentClient:
         except requests.ConnectTimeout:
             logger.warning("qB 添加任务失败: 建立连接超时")
             return TorrentAddResult(False, "qb_unavailable", True)
-        except requests.ConnectionError:
+        except requests.ConnectionError as exc:
+            reason = exc.args[0] if exc.args else None
+            if isinstance(reason, MaxRetryError) and isinstance(reason.reason, NewConnectionError):
+                logger.warning("qB 添加任务失败: 连接尚未建立")
+                return TorrentAddResult(False, "qb_unavailable", True)
             logger.warning("qB 添加任务结果未知: 连接中断")
             return TorrentAddResult(False, "qb_outcome_unknown", False)
         except (requests.ReadTimeout, requests.Timeout):

@@ -6,6 +6,7 @@ import json
 from unittest.mock import MagicMock, patch
 
 import requests
+from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
 
 from app import database as db
 from app.agent.rss_retry_actions import (
@@ -100,6 +101,8 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
             (_Response(429), "qb_rate_limited", True),
             (_Response(503), "qb_outcome_unknown", False),
             (requests.ConnectionError("private host"), "qb_outcome_unknown", False),
+            (requests.ConnectionError(MaxRetryError(None, "/add", NewConnectionError(None, "refused"))), "qb_unavailable", True),
+            (requests.ConnectionError(MaxRetryError(None, "/add", ProtocolError("connection lost"))), "qb_outcome_unknown", False),
             (requests.ConnectTimeout("private host"), "qb_unavailable", True),
             (requests.ReadTimeout("outcome unknown"), "qb_outcome_unknown", False),
             (requests.Timeout("outcome unknown"), "qb_outcome_unknown", False),
@@ -427,6 +430,7 @@ class RssFailureRetryUnitTests(IsolatedDatabaseTestCase):
 
     def test_cloud_directory_or_rules_change_invalidates_confirmation(self):
         from dataclasses import replace
+
         from app.agent.errors import AgentToolError
         from app.modules import download_dispatcher as dispatcher
         from app.modules.offline import OfflineRules
