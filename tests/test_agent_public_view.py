@@ -584,3 +584,8 @@ class PublicToolArgumentErrorTests(unittest.TestCase):
         self.assertNotIn('session_snapshot', text)
         self.assertEqual(sanitize_public_text('new_name access_token=AbCd1234testCredential9876'), '')
         self.assertEqual(sanitize_public_text('new_name /data/private/test.env'), '')
+
+    def test_known_no_missing_episode_status_is_not_private_state(self):
+        from app.agent.public_safety import sanitize_public_text
+        self.assertEqual(sanitize_public_text("not_missing"), "not_missing")
+        self.assertEqual(sanitize_public_text("private_snapshot"), "内部状态")

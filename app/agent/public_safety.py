@@ -288,6 +288,7 @@ _PUBLIC_STATUS_KEYS = frozenset(
         "no_changes",
         "not_configured",
         "not_found",
+        "not_missing",
         "not_run",
         "outcome_unknown",
         "partial",
