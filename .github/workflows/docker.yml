@@ -43,12 +43,16 @@ jobs:
           python -m pip install --require-hashes -r requirements-release-runtime.lock
           python -m pip install "pytest==9.1.1"
           python -m pip install "ruff==0.16.5"
+          python -m pip install "pyrefly==1.2.0"
           python -c 'from importlib.metadata import version; assert version("pytest") == "9.1.1"'
           python -c 'from importlib.metadata import version; assert version("ruff") == "0.16.5"'
+          python -c 'from importlib.metadata import version; assert version("pyrefly") == "1.2.0"'
           python -m pip check
 
       - name: Run Python static quality gate
-        run: ruff check app packaging tests --select F,E9
+        run: |
+          ruff check app packaging tests --select F,E9
+          pyrefly check --python-interpreter-path "$(command -v python)"
 
       - name: Validate Python and JavaScript syntax
         run: |

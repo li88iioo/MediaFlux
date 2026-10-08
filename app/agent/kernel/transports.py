@@ -129,9 +129,11 @@ class WebKernelTransport:
         )
 
     async def cancel_effect(self, request: EffectEnvelope) -> bool:
-        arguments = asdict(request.normalized())
-        arguments.pop("channel")
-        return await self.session.cancel_effect(**arguments)
+        normalized = request.normalized()
+        return await self.session.cancel_effect(
+            owner=normalized.owner, session_id=normalized.session_id,
+            plan_id=normalized.plan_id, request_id=normalized.request_id,
+        )
 
 
 class TelegramKernelTransport:
@@ -197,9 +199,11 @@ class TelegramKernelTransport:
         )
 
     async def cancel_effect(self, request: EffectEnvelope) -> bool:
-        arguments = asdict(request.normalized())
-        arguments.pop("channel")
-        return await self.session.cancel_effect(**arguments)
+        normalized = request.normalized()
+        return await self.session.cancel_effect(
+            owner=normalized.owner, session_id=normalized.session_id,
+            plan_id=normalized.plan_id, request_id=normalized.request_id,
+        )
 
 
 def _owner(value: Any) -> str:

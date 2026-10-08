@@ -1801,7 +1801,7 @@ class LocalMediaService:
             web_preview = task.snapshot_digest.startswith("preview:")
             try:
                 inspection = self.inspect_source(owner, task.source_id, task.content_path)
-                preview = self.preview(
+                preview: dict[str, Any] = self.preview(
                     owner, inspection["inspection_id"], task.tmdb_id, task.media_type,
                     rules_snapshot=task.rules_snapshot,
                     automatic=not web_preview and task.trigger in {"scan", "qb_completed"},

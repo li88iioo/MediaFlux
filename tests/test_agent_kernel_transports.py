@@ -4,6 +4,7 @@ import asyncio
 import json
 import unittest
 from collections.abc import AsyncIterator
+from unittest.mock import patch
 
 from app.agent.kernel.capabilities import (
     CapabilityRetriever,
@@ -22,6 +23,7 @@ from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
 from app.agent.kernel.transports import (
+    EffectEnvelope,
     QueryEnvelope,
     TelegramKernelTransport,
     TransportInputError,
@@ -75,6 +77,19 @@ def make_session() -> AgentSession:
 
 
 class AgentKernelTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cancel_effect_passes_only_normalized_cancellation_arguments(self):
+        for transport_type in (WebKernelTransport, TelegramKernelTransport):
+            with self.subTest(transport=transport_type.__name__):
+                session = make_session()
+                with patch.object(session, "cancel_effect", autospec=True, return_value=True) as cancel:
+                    self.assertTrue(await transport_type(session).cancel_effect(EffectEnvelope(
+                        owner=" owner-1 ", session_id=" session-1 ",
+                        plan_id=" plan-cancel-test-0001 ", request_id=" request-1 ", channel="telegram",
+                    )))
+                cancel.assert_awaited_once_with(
+                    owner="owner-1", session_id="session-1", plan_id="plan-cancel-test-0001", request_id="request-1",
+                )
+
     async def test_web_and_telegram_use_the_same_kernel_event_contract(self) -> None:
         web = WebKernelTransport(make_session())
         web_request = QueryEnvelope(

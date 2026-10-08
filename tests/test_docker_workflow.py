@@ -125,6 +125,18 @@ class DockerWorkflowTests(unittest.TestCase):
             test_job.index("python -m pytest tests"),
         )
 
+    def test_type_check_gate_uses_ci_python_and_blocks_before_tests(self) -> None:
+        test_job = self.text.split("  test:", 1)[1].split("  smoke:", 1)[0]
+        self.assertIn('python -m pip install "pyrefly==1.2.0"', test_job)
+        self.assertIn('version("pyrefly") == "1.2.0"', test_job)
+        gate = 'pyrefly check --python-interpreter-path "$(command -v python)"'
+        self.assertIn(gate, test_job)
+        self.assertLess(test_job.index(gate), test_job.index("python -m pytest tests"))
+        steps = yaml.safe_load(self.text)["jobs"]["test"]["steps"]
+        static_gate = next(step for step in steps if step.get("name") == "Run Python static quality gate")
+        self.assertFalse(static_gate.get("continue-on-error", False))
+        self.assertNotIn("|| true", static_gate["run"])
+
     def test_regression_browser_cases_are_in_required_browser_job(self) -> None:
         browser_job = self.text.split("  browser:", 1)[1].split("  smoke:", 1)[0]
         self.assertIn('python -m pip install "playwright==1.62.0"', browser_job)
