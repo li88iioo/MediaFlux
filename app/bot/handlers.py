@@ -1525,12 +1525,12 @@ def _register_commands(bot, telebot):
             bot.answer_callback_query(call.id, "仅支持 Bot 私聊话题", show_alert=True)
             return
         from app.bot.agent_adapter import telegram_agent_owner
-        from app.modules.telegram_topic_routing import set_topic_mode, topic_mode_enabled
+        from app.modules.telegram_topic_routing import set_topic_mode
 
         chat_id, user_id = _telegram_identity(call)
         owner = telegram_agent_owner(chat_id, user_id)
         action = str(getattr(call, "data", "")).partition(":")[2]
-        has_topics, allows_users = topic_platform_capabilities()
+        has_topics, _ = topic_platform_capabilities()
         if action == "on" and has_topics is not True:
             bot.answer_callback_query(
                 call.id,
@@ -1541,15 +1541,40 @@ def _register_commands(bot, telebot):
         if action not in {"on", "off"}:
             bot.answer_callback_query(call.id, "按钮已失效", show_alert=True)
             return
-        set_topic_mode(owner, action == "on")
-        bot.answer_callback_query(call.id, "应用话题隔离已开启" if action == "on" else "应用话题隔离已关闭")
-        bot.edit_message_text(
-            topic_menu_text(topic_mode_enabled(owner), has_topics, allows_users),
-            message.chat.id,
-            message.message_id,
-            parse_mode="HTML",
-            reply_markup=topic_menu_markup(),
-        )
+
+        result = "私聊话题隔离已开启" if action == "on" else "私聊话题隔离已关闭"
+        try:
+            set_topic_mode(owner, action == "on")
+        except Exception as exc:  # noqa: BLE001 - report persistence failures truthfully
+            logger.warning(
+                "切换 Telegram 私聊话题隔离失败 type=%s", type(exc).__name__
+            )
+            bot.answer_callback_query(
+                call.id, "切换失败，请稍后重试", show_alert=True
+            )
+            return
+
+        try:
+            edited = bot.edit_message_text(
+                result,
+                message.chat.id,
+                message.message_id,
+                reply_markup=telebot.types.InlineKeyboardMarkup(),
+            )
+            if edited is False:
+                raise RuntimeError("Telegram 未确认编辑私聊话题消息")
+        except Exception as exc:  # noqa: BLE001 - SDK/network failures vary
+            logger.warning(
+                "更新 Telegram 私聊话题结果消息失败 type=%s", type(exc).__name__
+            )
+            bot.answer_callback_query(
+                call.id,
+                "设置已保存，但按钮消息更新失败；请发送 /topic 核对当前状态",
+                show_alert=True,
+            )
+            return
+
+        bot.answer_callback_query(call.id, result)
 
     @bot.message_handler(commands=["model"])
     @require_auth
