@@ -80,6 +80,25 @@ class AgentKernelAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(view.approval.preview["summary"], "暂停 1 个下载任务")
         self.assertEqual(view.tool_calls, ("download.pause",))
 
+    async def test_terminal_view_only_exposes_approval_when_awaiting_confirmation(self) -> None:
+        for event_type, payload in (
+            (AgentEventType.TURN_CANCELLED, {"reason": "user_cancelled"}),
+            (AgentEventType.TURN_FAILED, {"message": "检查点失败"}),
+            (AgentEventType.TURN_COMPLETED, {"status": "partial", "answer": "未完成"}),
+            (AgentEventType.TURN_COMPLETED, {"status": "success", "answer": "已完成"}),
+        ):
+            with self.subTest(terminal=event_type, payload=payload):
+                factory = EventFactory(session_id="s", turn_id="t", request_id="r")
+                receipt = {"ok": True, "summary": "前一步已完成"}
+                view = await consume_events(event_stream([
+                    factory.create(AgentEventType.TURN_STARTED),
+                    factory.create(AgentEventType.EFFECT_COMPLETED, {"result": receipt}),
+                    factory.create(AgentEventType.EFFECT_APPROVAL_REQUIRED, {"plan": {"plan_id": "next-plan"}}),
+                    factory.create(event_type, payload),
+                ]))
+                self.assertIsNone(view.approval)
+                self.assertEqual(view.effect_result, receipt)
+
     async def test_tool_failure_is_not_terminal_when_model_recovers(self) -> None:
         factory = EventFactory(session_id="s3", turn_id="t3", request_id="r3")
         events = [

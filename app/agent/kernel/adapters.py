@@ -206,7 +206,7 @@ class TurnViewBuilder:
             request_id=request_id,
             status=self._status,
             answer=self._answer,
-            approval=self._approval,
+            approval=self._approval if self._status == "approval_required" else None,
             effect_result=deepcopy(self._effect_result),
             error_code=self._error_code,
             error_message=self._error_message,

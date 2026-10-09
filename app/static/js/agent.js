@@ -895,7 +895,7 @@
         turn.cancelled = cancelled;
         cancelTurnMarkdownRender(turn);
         const trustedReceipt = trustedEffectReceipt(turn);
-        const protectedWriteStop = cancelled && Boolean(turn.activePlanId);
+        const protectedWriteStop = cancelled && turn.confirmationRequested === true;
         const finalMessage = protectedWriteStop
             ? CONFIRMATION_STOP_NOTICE
             : message || (cancelled ? '本次任务已停止。' : 'Agent 暂时无法完成该请求。');
@@ -1170,32 +1170,26 @@
     }
 
     function promoteTurnCard(turn) {
+        if (turn?.approvalNode && turn.approvalNode === turn.card) restoreTurnFromApproval(turn, turn.card);
         if (!turn?.approvalContainer || turn.approvalContainer === turn.card) return;
         turn.approvalContainer.replaceWith(turn.card);
         turn.approvalContainer = null;
     }
 
-    function continueTurnFromApproval(turn, card) {
+    function restoreTurnFromApproval(turn, card) {
         const stream = createStreamingCard();
         const trace = turn.toolTrace || card.querySelector('.agent-tool-trace');
-        if (trace) {
-            turn.toolTrace = trace;
-            stream.steps.remove();
-            stream.card.append(trace);
-            stream.steps = trace.querySelector('.agent-stream-steps') || stream.steps;
-        } else if (turn.steps && turn.steps !== stream.steps) {
-            stream.steps.remove();
-            stream.card.append(turn.steps);
-            stream.steps = turn.steps;
+        const steps = trace?.querySelector('.agent-stream-steps') || turn.steps;
+        if (steps) {
+            stream.steps.replaceWith(trace || steps);
+            stream.steps = steps;
         }
+        turn.toolTrace = trace;
         card.append(stream.card);
         Object.assign(turn, stream, {approvalNode: null});
         turn.approvalContainer = card;
         turn.item?.classList.remove('is-confirmation');
-        setTurnStatus(turn, '正在执行已确认计划');
-        showExecutingApproval(card);
         renderIcons(stream.card);
-        return turn;
     }
 
     function replaceApprovalWithResult(card, text, {error = false, cancelled = false} = {}) {
@@ -1248,6 +1242,7 @@
         const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
         switch (event?.type) {
         case 'turn.started':
+            turn.confirmationRequested = payload.kind === 'confirmation';
             turn.streamDisplayEnabled = payload.stream_display_enabled !== false;
             if (turn.boundSelection) expireVisibleApprovals();
             setTurnStatus(turn, payload.kind === 'confirmation' ? '正在执行已确认计划' : '正在理解任务');
@@ -1895,7 +1890,10 @@
         clearReceiptObserverForNewRequest();
         card.querySelectorAll('button').forEach(item => { item.disabled = true; });
         turn.activePlanId = planId;
-        continueTurnFromApproval(turn, card);
+        turn.confirmationRequested = true;
+        restoreTurnFromApproval(turn, card);
+        setTurnStatus(turn, '正在执行已确认计划');
+        showExecutingApproval(card);
         const targetSessionId = sessionId;
         const controller = new AbortController();
         const requestId = createId('confirm');
@@ -2256,7 +2254,7 @@
                 const turn = createAssistantTurn({recovered: true, scroll: !preserveScroll});
                 turn.boundSelection = active?.kind === 'candidate_preview';
                 turn.requestMessage = active?.turn?.requestMessage || '';
-                if (active?.kind === 'confirm') turn.activePlanId = active.turn?.activePlanId || '';
+                turn.confirmationRequested = active?.kind === 'confirm';
                 finalizeError(turn, message, {cancelled: terminalTurn.status === 'cancelled'});
             }
         }

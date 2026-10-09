@@ -1881,6 +1881,49 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             preference.assert_called_once_with("o", "tg")
         self.assertEqual([request.model for request in model.requests], ["", "chosen-model"])
 
+    async def test_cancel_after_preview_does_not_publish_revoked_approval(self):
+        """停止发生于真实预检发布与会话检查点之间；不能恢复已撤销按钮。"""
+        from unittest.mock import patch
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        executed = []
+        tool = KernelToolSpec(
+            name="download.pause", domain="download", description="暂停下载",
+            input_schema={"type": "object", "properties": {}}, effect=ToolEffect.WRITE,
+            prepare=lambda _a, _c: PreparedEffect(preview={"summary": "暂停测试任务"}, snapshot_fingerprint="v1"),
+            execute_confirmed=lambda *args: executed.append(args),
+        )
+        catalog = ToolCatalog([tool])
+        store = InMemorySessionStateStore()
+        model = ScriptedModel([[
+            ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("pause", tool.name, {})),
+            ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls"),
+        ]])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                               pipeline=ToolPipeline(catalog=catalog, state_store=store), state_store=store)
+        commit = store.commit
+
+        async def checkpoint(lease, *, conversation=None, updates=()):
+            if conversation and any(row.get("effect_plan_id") for row in conversation):
+                entered.set()
+                await release.wait()
+            return await commit(lease, conversation=conversation, updates=updates)
+
+        with patch.object(store, "commit", side_effect=checkpoint):
+            task = asyncio.create_task(consume_events(session.run(AgentInput(message="暂停下载", owner="o", session_id="s"))))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                state = await store.load(owner="o", session_id="s")
+                self.assertTrue(await session.cancel(owner="o", session_id="s"))
+                self.assertTrue(await session.cancel_effect(owner="o", session_id="s", plan_id=state.pending_effect_plan_id))
+            finally:
+                release.set()
+            result = await asyncio.wait_for(task, 2)
+        self.assertEqual(result.status, "cancelled")
+        self.assertIsNone(result.approval)
+        self.assertFalse((await store.load(owner="o", session_id="s")).pending_effect_plan_id)
+        self.assertEqual(executed, [])
+
     async def test_stop_during_protected_write_keeps_receipt_and_does_not_resume_model(self):
         started, release = asyncio.Event(), asyncio.Event()
         async def execute(_args, _snapshot, _context):

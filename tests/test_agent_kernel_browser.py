@@ -393,6 +393,30 @@ class AgentKernelBrowserTests(unittest.TestCase):
         self.assertTrue(card.locator("[data-effect-confirm]").is_visible())
         self.assertNotIn("未完成的准备文字", page.locator("#agentTranscript").inner_text())
 
+    def test_preview_terminal_replaces_confirmation_with_visible_result(self) -> None:
+        for event_type, payload, expected in (
+            ("turn.cancelled", {"reason": "user_cancelled"}, "本次任务已停止。"),
+            ("turn.failed", {"message": "预检后的检查点失败"}, "预检后的检查点失败"),
+            ("turn.completed", {"status": "partial", "answer": "预检未完成，请重新检查。"}, "预检未完成，请重新检查。"),
+        ):
+            with self.subTest(terminal=event_type):
+                page = self.make_page({"sessions": {"sessions": []}, "queryEvents": [
+                    _event(1, "turn.started", {"kind": "query"}),
+                    _event(2, "effect.approval_required", {"tool": "download.pause", "plan": {
+                        "plan_id": "cancelled-plan", "tool_name": "download.pause",
+                        "effect": "WRITE", "preview": {"summary": "暂停测试任务"},
+                    }}),
+                    _event(3, event_type, payload),
+                ]})
+                page.locator("#agentPrompt").fill("暂停下载")
+                page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+                page.get_by_text(expected, exact=True).wait_for()
+                self.assertEqual(page.locator("[data-effect-confirm]").count(), 0)
+                self.assertEqual(page.locator("[data-effect-cancel]").count(), 0)
+                self.assertEqual(page.locator(".agent-tool-trace").count(), 1)
+                self.assertNotIn("已提交操作可能继续执行", page.locator("#agentTranscript").inner_text())
+                page.close()
+
     def test_stream_display_toggle_hides_only_incremental_body(self) -> None:
         for enabled in (False, True):
             with self.subTest(enabled=enabled):
