@@ -142,7 +142,10 @@ def next_model_round(dto, *, kind="search", maximum=24_000):
         assert not any(event.type in {AgentEventType.TURN_FAILED, AgentEventType.TOOL_FAILED} for event in events)
         assert len(model.requests) == 2
         message = next(message for message in reversed(model.requests[1].messages) if message.role == "tool")
-        encoded, _, suffix = message.content.partition("\nopaque_refs=")
+        payload = json.loads(message.content)
+        auxiliary = {key: payload.pop(key) for key in ("opaque_refs", "reference_arguments", "candidate_numbers", "recommended_ingest_arguments", "result_handle", "read_tool") if key in payload}
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        suffix = json.dumps(auxiliary, ensure_ascii=False, separators=(",", ":")) if auxiliary else ""
         public = next(event.payload["result"] for event in events if event.type is AgentEventType.TOOL_COMPLETED)
         return json.loads(encoded), encoded, suffix, message.content, public, model.requests[1]
     return asyncio.run(exercise())
@@ -168,7 +171,7 @@ def test_real_resource_dto_reaches_next_model_request_without_business_field_los
     assert "result_id" not in json.dumps(public)
     if kind == "search":
         assert public["candidate_view"] is None
-        assert "candidate_numbers=" in suffix
+        assert '"candidate_numbers":' in suffix
     else:
         assert public["candidate_view"]["selection_ref"] not in content
     data = actual["data"]
@@ -258,11 +261,12 @@ def test_model_next_request_still_respects_projector_length_budget(has_refs):
     maximum = 2000
     expected = json.loads(DefaultProjector(max_model_chars=maximum).project(dto).model_content)
     actual, encoded, suffix, content, public, _ = next_model_round(dto, maximum=maximum)
-    assert expected.get("truncated") is True and actual == expected
+    assert expected.get("truncated") is True and actual.get("truncated") is True
+    assert actual["data"]["safe_details"]  # 有界明细，不再整块丢弃data
     assert len(encoded) <= maximum
-    # 继承原协议：JSON 预算之外仅追加一个资源引用的有界 suffix，绝不追加大卡片 DTO。
-    assert len(content) <= maximum + 512
-    assert bool(suffix) is has_refs
+    # 引用与候选附录也在同一预算内；完整明细可经result_handle续取。
+    assert len(content) <= maximum
+    assert "result_handle" in suffix
     assert public["candidate_view"] is None
-    assert ("candidate_numbers=" in suffix) is has_refs
+    assert ('"candidate_numbers":' in suffix) is has_refs
     assert "candidate_view" not in content and "selection" not in content

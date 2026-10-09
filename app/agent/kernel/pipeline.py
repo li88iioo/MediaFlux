@@ -11,6 +11,7 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, Protocol
 
+from app.agent.model_context_budget import compact_tool_content, decode_tool_content
 from app.agent.public_safety import sanitize_public_text
 from app.concurrency import CrossLoopAsyncLock
 
@@ -332,6 +333,64 @@ class ToolPipeline:
         self.authorization = authorization or DefaultAuthorizationPolicy()
         self.rate_limiter = rate_limiter or InMemoryRateLimiter()
         self.effect_lifecycle = effect_lifecycle or NoopEffectLifecycle()
+        if not catalog.has("agent.read_result"):
+            catalog.register(KernelToolSpec(
+                name="agent.read_result", domain="agent", effect=ToolEffect.READ,
+                description="续取被截断的工具结果；只读同一用户会话的脱敏快照，不重新执行业务。handle取result_handle，path取truncation.path(JSON Pointer)，按next_offset继续。",
+                input_schema={"type": "object", "required": ["handle", "path"], "properties": {
+                    "handle": {"type": "string", "minLength": 1, "maxLength": 200},
+                    "path": {"type": "string", "pattern": "^(/.*)?$", "maxLength": 1000},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                }, "additionalProperties": False},
+                read=self._read_result, metadata={"kernel_utility": True},
+            ))
+
+    async def _read_result(self, arguments: dict[str, Any], context: ToolCallContext) -> ToolOutcome:
+        handle = arguments["handle"]
+        try:
+            manifest = await self.reference_store.resolve(handle, owner=context.owner, session_id=context.session_id, expected_kind="tool_result")
+            parts = [await self.reference_store.resolve(part, owner=context.owner, session_id=context.session_id, expected_kind="tool_result_part") for part in manifest["parts"]]
+        except ReferenceError as exc:
+            raise ToolPipelineError("结果快照已过期或不属于当前会话，请重新观察原对象。", code="reference_invalid") from exc
+        node = json.loads("".join(parts))
+        path = arguments["path"]
+        try:
+            for part in path.split("/")[1:]:
+                key = part.replace("~1", "/").replace("~0", "~")
+                node = node[int(key)] if isinstance(node, list) and key.isdecimal() else node[key]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise ToolPipelineError("结果路径不存在；请使用原结果truncation中的path。", code="invalid_arguments") from exc
+        offset, limit = arguments.get("offset", 0), arguments.get("limit", 50)
+        if isinstance(node, dict):
+            values = [{"key": key, "value": value} for key, value in node.items()]
+        elif isinstance(node, (list, str)):
+            values = node
+        else:
+            values = [node]
+        total = len(values)
+        end = min(total, offset + limit)
+        maximum = self.projector.max_model_chars
+        data = {"path": path, "offset": offset, "total": total}
+        while True:
+            data.update(items=values[offset:end], returned=max(0, end - offset), has_more=end < total, next_offset=end if end < total else None)
+            payload = {"ok": True, "status": "success", "summary": "读取已保存的工具结果（不是实时重新查询）", "result_handle": handle, "read_tool": "agent.read_result", "data": data}
+            content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            if len(content) <= maximum or end - offset <= 1:
+                break
+            end = offset + max(1, (end - offset) // 2)
+        # 单个复杂对象仍可按path下钻；不得把它冒充完整数据。
+        content = compact_tool_content(content, maximum=maximum)
+        return ToolOutcome(model_content=content, public_content=json.loads(content))
+
+    async def _save_result(self, content: str, context: ToolCallContext) -> str:
+        chunk_size = min(16_384, (getattr(self.reference_store, "max_ref_bytes", 131_072) - 128) // 6)
+        parts = []
+        for offset in range(0, len(content), chunk_size):
+            part = await self.reference_store.put(owner=context.owner, session_id=context.session_id, kind="tool_result_part", value=content[offset:offset + chunk_size], ttl_seconds=900)
+            parts.append(part.ref)
+        snapshot = await self.reference_store.put(owner=context.owner, session_id=context.session_id, kind="tool_result", value={"parts": parts}, ttl_seconds=900)
+        return snapshot.ref
 
     def _effect_prepared(
         self,
@@ -480,8 +539,9 @@ class ToolPipeline:
                 projected = replace(
                     projected, public_content=public,
                     model_content=resource_model_content(
-                        projected.model_content, maximum=getattr(self.projector, "max_model_chars", 24_000),
+                        projected.model_content, maximum=self.projector.max_model_chars,
                     ),
+                    full_model_content=resource_model_content(projected.full_model_content, maximum=max(len(projected.full_model_content) * 2, self.projector.max_model_chars)) if projected.full_model_content else "",
                 )
             outcome = await self._materialize_refs(
                 projected, context=context,
@@ -771,7 +831,7 @@ class ToolPipeline:
         context: ToolCallContext,
         selected_positions: list[int] | None = None,
     ) -> ToolOutcome:
-        if not outcome.refs:
+        if not outcome.refs and not outcome.full_model_content:
             return outcome
         exposed: list[dict[str, str]] = []
         reference_arguments: dict[str, str] = {}
@@ -810,29 +870,30 @@ class ToolPipeline:
         public["refs"] = exposed
         if reference_arguments:
             public["reference_arguments"] = reference_arguments
-        model_content = (
-            (resource_model_content(outcome.model_content, maximum=getattr(self.projector, "max_model_chars", 24_000))
-             if has_candidates else outcome.model_content.rstrip())
-            + "\nopaque_refs="
-            + json.dumps(exposed, ensure_ascii=False, separators=(",", ":"))
-            + "\nreference_arguments="
-            + json.dumps(
-                reference_arguments,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        )
+        content = outcome.full_model_content or outcome.model_content
+        if has_candidates:
+            content = resource_model_content(content, maximum=max(len(content) * 2, self.projector.max_model_chars))
+        payload = decode_tool_content(content)
+        if exposed:
+            payload["opaque_refs"] = exposed
+            payload["reference_arguments"] = reference_arguments
         numbered_items = candidate_view["items"] if candidate_view else candidate_items
         if numbered_items:
-            model_content += "\ncandidate_numbers=" + json.dumps([
+            payload["candidate_numbers"] = [
                 {key: item[key] for key in ("position", "title", "coverage", "media_title", "requested_episode", "match")}
                 for item in numbered_items
-            ], ensure_ascii=False, separators=(",", ":"))
+            ]
             if candidate_view and candidate_view["recommended_positions"]:
-                model_content += "\nrecommended_ingest_arguments=" + json.dumps({
+                payload["recommended_ingest_arguments"] = {
                     "source_type": RESOURCE_KIND, "resource_candidates_ref": candidate_view["ref"],
                     "positions": candidate_view["recommended_positions"], "target": "preferred",
-                }, ensure_ascii=False, separators=(",", ":"))
+                }
+        model_content = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        if len(model_content) > self.projector.max_model_chars:
+            handle = await self._save_result(model_content, context)
+            payload.update(result_handle=handle, read_tool="agent.read_result")
+            public.update(result_handle=handle, read_tool="agent.read_result")
+            model_content = compact_tool_content(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), maximum=self.projector.max_model_chars)
         updates = tuple(outcome.state_updates) + (
             StateUpdate("recent_refs", [item["ref"] for item in exposed], mode="append"),
             StateUpdate("ref_kinds", [item["kind"] for item in exposed], mode="append"),
@@ -844,6 +905,7 @@ class ToolPipeline:
             public_content=public,
             model_content=model_content,
             state_updates=updates,
+            full_model_content="",
         )
 
     async def _commit_updates(

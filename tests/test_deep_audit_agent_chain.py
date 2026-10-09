@@ -61,9 +61,7 @@ class SearchModel:
                 for message in reversed(request.messages)
                 if message.role == "tool"
             )
-            refs = json.loads(
-                evidence.partition("reference_arguments=")[2].splitlines()[0]
-            )
+            refs = json.loads(evidence)["reference_arguments"]
             yield ModelEvent(
                 ModelEventType.TOOL_CALL_COMPLETED,
                 tool_call=ModelToolCall(

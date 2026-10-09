@@ -9,6 +9,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.agent.model_context_budget import compact_tool_content
 from app.agent.models import ToolReference
 from app.sensitive_data import is_sensitive_key, redact_sensitive_text
 
@@ -43,6 +44,7 @@ class ToolOutcome:
     state_updates: tuple[StateUpdate, ...] = ()
     telemetry: Mapping[str, Any] = field(default_factory=dict)
     effect_plan: Any | None = None
+    full_model_content: str = ""
 
     def model_message(self) -> str:
         return self.model_content
@@ -54,11 +56,11 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
     if value is None or isinstance(value, (int, float, bool)):
         return value
     if isinstance(value, str):
-        return redact_sensitive_text(value)[:2_000]
+        return redact_sensitive_text(value)
     if isinstance(value, Mapping):
         result: dict[str, Any] = {}
-        for raw_key, raw_value in list(value.items())[:200]:
-            key = str(raw_key)[:160]
+        for raw_key, raw_value in value.items():
+            key = str(raw_key)
             result[key] = (
                 "[已隐藏]"
                 if is_sensitive_key(key) or _SECRET_KEY_RE.search(key)
@@ -66,7 +68,7 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
             )
         return result
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
-        return [_json_safe(item, depth=depth + 1) for item in list(value)[:500]]
+        return [_json_safe(item, depth=depth + 1) for item in value]
     to_dict = getattr(value, "to_dict", None)
     if callable(to_dict):
         try:
@@ -74,11 +76,11 @@ def _json_safe(value: Any, *, depth: int = 0) -> Any:
         except Exception as exc:  # noqa: BLE001 - arbitrary domain DTO boundary
             logger.debug("Agent DTO 序列化降级 type=%s", type(exc).__name__)
             return redact_sensitive_text(value)[:500]
-    return redact_sensitive_text(value)[:2_000]
+    return redact_sensitive_text(value)
 
 
 def _model_safe(value: Any, *, depth: int = 0, key: str = "") -> Any:
-    safe = _json_safe(value, depth=depth)
+    safe = _json_safe(value) if depth == 0 else value
     # 唯一固定应用内路由，不把calendar_url变成任意文件路径/外链的放行口。
     if key == "calendar_url":
         return "/discovery/calendar" if isinstance(safe, str) and safe == "/discovery/calendar" else "[页面地址无效]"
@@ -133,17 +135,12 @@ class DefaultProjector:
             separators=(",", ":"),
             allow_nan=False,
         )
-        if len(model_content) > self.max_model_chars:
-            summary = str(public.get("summary") or "工具执行完成")[:1_000]
-            compact = {
-                "ok": bool(public.get("ok")),
-                "status": str(public.get("status") or "success")[:80],
-                "summary": summary,
-                "truncated": True,
-            }
-            model_content = json.dumps(
-                compact, ensure_ascii=False, separators=(",", ":")
-            )
+        full_model_content = model_content
+        model_content = compact_tool_content(model_content, maximum=self.max_model_chars)
+        public = json.loads(compact_tool_content(
+            json.dumps(public, ensure_ascii=False, separators=(",", ":")),
+            maximum=self.max_model_chars * 2,
+        ))
         raw_references = getattr(value, "references", ())
         references: list[ReferenceValue] = []
         if isinstance(raw_references, Sequence) and not isinstance(
@@ -163,4 +160,5 @@ class DefaultProjector:
             model_content=model_content,
             public_content=public,
             refs=tuple(references),
+            full_model_content=full_model_content if full_model_content != model_content else "",
         )

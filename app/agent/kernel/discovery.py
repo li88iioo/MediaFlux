@@ -50,12 +50,14 @@ class CapabilityDiscovery:
     ) -> tuple[KernelToolSpec, ...]:
         visible = {tool.name: tool for tool in self._visible()}
         ordered = []
+        if "agent.read_result" in visible:
+            ordered.append(visible["agent.read_result"])
         if DISCOVERY_TOOL in visible:
             ordered.append(visible[DISCOVERY_TOOL])
         for tool in (*additions, *previous):
             if tool.name in visible and all(item.name != tool.name for item in ordered):
                 ordered.append(visible[tool.name])
-        return tuple(ordered[: self.maximum])
+        return tuple(ordered[: self.maximum + int("agent.read_result" in visible)])
 
     @staticmethod
     def _status(tool: KernelToolSpec) -> dict[str, str]:

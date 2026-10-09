@@ -20,83 +20,102 @@ def estimated_tokens(value: object) -> int:
     return max(1, (ascii_chars + 3) // 4 + len(text) - ascii_chars)
 
 
-def compact_tool_content(content: str, *, maximum: int) -> str:
+def decode_tool_content(content: str) -> dict[str, Any]:
+    """读取规范 JSON；只在恢复旧历史时迁移旧的多行引用附录。"""
     text = str(content or "")
-    json_text, _separator, suffix = text.partition("\nopaque_refs=")
+    body, separator, suffix = text.partition("\nopaque_refs=")
+    if text.startswith("opaque_refs="):
+        body, separator, suffix = "{}", "legacy", text.removeprefix("opaque_refs=")
     try:
-        payload = json.loads(json_text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        payload = {}
-    ok = bool(payload.get("ok", True)) if isinstance(payload, dict) else True
-    status = str(payload.get("status") or ("success" if ok else "error"))[:80]
-    summary = str(
-        payload.get("summary")
-        or payload.get("error")
-        or payload.get("message")
-        or ("工具执行完成" if ok else "工具未完成")
-    )
-    compact: dict[str, Any] = {
-        "ok": ok,
-        "status": status,
-        "summary": summary,
-        "truncated": True,
-    }
-    code = str(payload.get("code") or "")[:80] if isinstance(payload, dict) else ""
-    if not ok and code:
-        compact["code"] = code
-    reference_suffix = f"\nopaque_refs={suffix}" if suffix else ""
-    compact["summary"] = summary[: max(80, int(maximum) - len(reference_suffix) - 80)]
-    return json.dumps(compact, ensure_ascii=False, separators=(",", ":")) + reference_suffix
+        value = json.loads(body)
+    except (TypeError, ValueError):
+        value = {"summary": body}
+    payload = value if isinstance(value, dict) else {"data": value}
+    if separator:
+        for line in ("opaque_refs=" + suffix).splitlines():
+            key, _, raw = line.partition("=")
+            if key in {"opaque_refs", "reference_arguments", "candidate_numbers", "recommended_ingest_arguments"}:
+                try:
+                    payload[key] = json.loads(raw)
+                except ValueError:
+                    continue
+    return payload
+
+
+def compact_tool_content(content: str, *, maximum: int) -> str:
+    """只裁剪超预算结果中最大的枝叶，保留结构与可续取句柄；预算包括引用。"""
+    from copy import deepcopy
+
+    if len(content) <= maximum:
+        return content
+    payload = deepcopy(decode_tool_content(content))
+    payload["truncated"] = True
+    omitted: dict[str, dict[str, Any]] = {}
+    protected = {"ok", "status", "code", "result_handle", "read_tool"}
+
+    def encode() -> str:
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+    def candidates(node: Any, path: str = ""):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in protected or key == "truncation":
+                    continue
+                child = path + "/" + str(key).replace("~", "~0").replace("/", "~1")
+                if isinstance(value, (list, str)) and len(value) > (1 if isinstance(value, list) else 48):
+                    yield len(json.dumps(value, ensure_ascii=False)), node, key, child
+                yield from candidates(value, child)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                child = path + "/" + str(index)
+                if isinstance(value, str) and len(value) > 48:
+                    yield len(value), node, index, child
+                yield from candidates(value, child)
+
+    encoded = encode()
+    while len(encoded) > maximum:
+        choices = list(candidates(payload))
+        if not choices:
+            # 大量短字段也必须有明确的有损标志；完整结果仍由句柄续取。
+            removable = [key for key in payload if key not in protected | {"truncated", "summary"}]
+            if not removable:
+                break
+            key = max(removable, key=lambda key: len(json.dumps(payload[key], ensure_ascii=False)))
+            payload.pop(key)
+        else:
+            _, parent, key, path = max(choices, key=lambda item: item[0])
+            value = parent[key]
+            total = omitted.get(path, {}).get("total", len(value))
+            retained = max(1, len(value) // 2) if isinstance(value, list) else max(48, len(value) // 2)
+            parent[key] = value[:retained]
+            omitted[path] = {"path": path, "total": total, "returned": retained}
+            # 有界说明，不让描述截断的信息本身占满上下文。
+            payload["truncation"] = list(omitted.values())[:4]
+        encoded = encode()
+    if len(encoded) > maximum:
+        payload = {key: value for key, value in payload.items() if key in protected}
+        payload["truncated"] = True
+        encoded = encode()
+    return encoded
 
 
 def _compact_chain(messages: Sequence[Any], *, max_tool_chars: int) -> list[Any]:
-    result: list[Any] = []
-    for message in messages:
-        if message.role == "tool":
-            result.append(
-                replace(
-                    message,
-                    content=compact_tool_content(message.content, maximum=max_tool_chars),
-                )
-            )
-        elif message.role == "assistant" and message.tool_calls and message.content:
-            result.append(replace(message, content=""))
-        else:
-            result.append(message)
-    return result
+    return [
+        replace(message, content=compact_tool_content(message.content, maximum=max_tool_chars))
+        if message.role == "tool" and len(message.content) > max_tool_chars else message
+        for message in messages
+    ]
 
 
 def _compact_history_group(messages: Sequence[Any], *, max_tool_chars: int) -> list[Any]:
-    result: list[Any] = []
-    for message in messages:
-        if message.role == "tool":
-            result.append(
-                replace(
-                    message,
-                    content=compact_tool_content(message.content, maximum=max_tool_chars),
-                )
-            )
-        elif message.role == "assistant" and message.tool_calls:
-            result.append(
-                replace(
-                    message,
-                    content="",
-                )
-            )
-        else:
-            limit = 2_000 if message.role == "user" else 4_000
-            result.append(replace(message, content=str(message.content or "")[:limit]))
-    return result
+    return _compact_chain(messages, max_tool_chars=max_tool_chars)
 
 
 def _compact_legacy_history(messages: Sequence[Any]) -> list[Any]:
     return [
         replace(message, content=compact_tool_content(message.content, maximum=800))
-        if message.role == "tool"
-        and message.tool_name == "agent.capabilities"
-        and len(message.content) > 4_000
-        else message
-        for message in messages
+        if message.role == "tool" and message.tool_name == "agent.capabilities" and len(message.content) > 4_000
+        else message for message in messages
     ]
 
 

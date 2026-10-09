@@ -283,7 +283,7 @@ class CapabilityRetriever:
         context: Mapping[str, Any] | None = None,
     ) -> CapabilitySelection:
         runtime = context or {}
-        visible = list(catalog.visible(runtime))
+        visible = [tool for tool in catalog.visible(runtime) if not tool.metadata.get("kernel_utility")]
         if not visible:
             return CapabilitySelection((), {})
         query_tokens = _tokens(message)

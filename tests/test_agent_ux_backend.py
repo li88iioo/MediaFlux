@@ -365,7 +365,7 @@ async def _publish_candidates(pipeline, states, *, owner=OWNER, session_id=SESSI
     result = await pipeline.execute("indexer.search_resources", {"title": "Example"}, context=context)
     view = result.outcome.public_content["candidate_view"]
     if view is None:
-        numbers = json.loads(result.outcome.model_content.partition("candidate_numbers=")[2].splitlines()[0])
+        numbers = json.loads(result.outcome.model_content)["candidate_numbers"]
         if not any(item["requested_episode"] for item in numbers):
             result = await pipeline.execute("indexer.present_candidates", {
                 **result.outcome.public_content["reference_arguments"],
@@ -391,7 +391,7 @@ def test_candidate_projection_is_allowlisted_and_current_view_restores(store):
         view = presented.outcome.public_content["candidate_view"]
         public = json.dumps(presented.outcome.public_content, ensure_ascii=False)
         assert "result_id" not in public
-        model = json.loads(result.outcome.model_content.partition("\nopaque_refs=")[0])
+        model = json.loads(result.outcome.model_content)
         assert model["data"]["items"][0]["result_id"] == "ux-resource-result-001"
         encoded = public + result.outcome.model_content
         for private in ("rawresult", "torrent_url", "SECRET", "10.0.0.9", "/private/", "https://"):
@@ -840,8 +840,8 @@ def test_general_search_does_not_recommend_old_episodes_or_suggest_ingest(store)
         result = await pipeline.execute("indexer.search_resources", {"title": "Example"}, context=context)
         assert view["items"], "普通搜索仍应允许用户手动挑选"
         assert view["recommended_positions"] == []
-        assert "recommended_ingest_arguments=" not in result.outcome.model_content
-        assert "candidate_numbers=" in result.outcome.model_content
+        assert '"recommended_ingest_arguments":' not in result.outcome.model_content
+        assert '"candidate_numbers":' in result.outcome.model_content
         view, _ = await _publish_candidates(pipeline, states, context=context)
         # 旧会话曾按标题给出自动推荐，重新读取时不能继续沿用。
         state = await states.load(owner=OWNER, session_id=SESSION)
@@ -905,8 +905,8 @@ def test_missing_episode_search_without_verified_coverage_does_not_issue_a_card(
             result = await pipeline.execute("indexer.search_resources", {"title": "仙逆"}, context=context)
         assert result.outcome.public_content["candidate_view"] is None
         assert result.outcome.public_content["summary"] == "已检索,缺集覆盖仍需核对"
-        assert "candidate_numbers=" in result.outcome.model_content
-        assert "recommended_ingest_arguments=" not in result.outcome.model_content
+        assert '"candidate_numbers":' in result.outcome.model_content
+        assert '"recommended_ingest_arguments":' not in result.outcome.model_content
         state = await states.load(owner=OWNER, session_id=SESSION)
         assert state.metadata[CANDIDATE_VIEW_KEY] is None
         assert await current_candidate_view(state=state, store=store) is None
@@ -958,9 +958,9 @@ def test_raw_search_keeps_model_evidence_without_publishing_unselected_cards(sto
         for title in ("狐妖小红娘", "Fox Spirit Matchmaker"):
             result = await pipeline.execute("indexer.search_resources", {"title": title}, context=context)
             assert result.outcome.public_content["candidate_view"] is None
-            assert "candidate_numbers=" in result.outcome.model_content
+            assert '"candidate_numbers":' in result.outcome.model_content
             assert "resource_candidates_ref" in result.outcome.model_content
-            assert "recommended_ingest_arguments=" not in result.outcome.model_content
+            assert '"recommended_ingest_arguments":' not in result.outcome.model_content
         state = await states.load(owner=OWNER, session_id=SESSION)
         assert state.metadata[CANDIDATE_VIEW_KEY] is None
         assert await current_candidate_view(state=state, store=store) is None
@@ -1014,7 +1014,7 @@ def test_explicit_presentation_cannot_override_missing_episode_coverage(store):
             **searched.outcome.public_content["reference_arguments"], "positions": [1],
         }, context=context)
         assert presented.outcome.public_content["candidate_view"] is None
-        assert "recommended_ingest_arguments=" not in presented.outcome.model_content
+        assert '"recommended_ingest_arguments":' not in presented.outcome.model_content
     asyncio.run(exercise())
 
 
@@ -1110,7 +1110,7 @@ def test_general_resource_search_can_explicitly_present_a_relevant_subset(store)
                 tool = ModelToolCall("search", "indexer.search_resources", {"title": "Example"})
             elif self.calls == 2:
                 evidence = next(message.content for message in reversed(request.messages) if message.role == "tool")
-                refs = json.loads(evidence.partition("reference_arguments=")[2].splitlines()[0])
+                refs = json.loads(evidence)["reference_arguments"]
                 tool = ModelToolCall("present", "indexer.present_candidates", {**refs, "positions": [2]})
             else:
                 yield ModelEvent(ModelEventType.TEXT_DELTA, text="已挑选第2个版本，可先预览，尚未下载。")

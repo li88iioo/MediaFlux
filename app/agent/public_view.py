@@ -11,6 +11,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from app.agent.model_context_budget import decode_tool_content
 from app.agent.public_safety import (
     public_tool_label,
     sanitize_public_text,
@@ -504,18 +505,12 @@ def public_conversation_messages(
             continue
         if role == "tool":
             if candidate_view:
-                for line in str(item.get("content") or "").splitlines():
-                    if not line.startswith("opaque_refs="):
-                        continue
-                    try:
-                        refs = json.loads(line.partition("=")[2])
-                    except (TypeError, ValueError):
-                        continue
-                    if isinstance(refs, list) and any(
-                        isinstance(ref, dict) and ref.get("kind") == "resource_candidates"
-                        and ref.get("ref") == candidate_view.get("ref") for ref in refs
-                    ):
-                        pending_candidate = True
+                refs = decode_tool_content(str(item.get("content") or "")).get("opaque_refs", [])
+                if isinstance(refs, list) and any(
+                    isinstance(ref, dict) and ref.get("kind") == "resource_candidates"
+                    and ref.get("ref") == candidate_view.get("ref") for ref in refs
+                ):
+                    pending_candidate = True
             remember_tool(item.get("tool_name"))
             continue
         if role != "assistant":

@@ -299,16 +299,15 @@ def _multi_work_search_result() -> ToolResult:
 
 
 def _model_json_field(request: ModelRequest, field: str) -> Any:
-    prefix = f"{field}="
     for message in reversed(request.messages):
         content = message.content
         if message.role == "assistant" and content.startswith("历史工具观察"):
             content = json.loads(content.partition("\n")[2])["result"]
         elif message.role != "tool":
             continue
-        for line in content.splitlines():
-            if line.startswith(prefix):
-                return json.loads(line.partition("=")[2])
+        payload = json.loads(content)
+        if field in payload:
+            return payload[field]
     raise AssertionError(f"{field} missing from model history")
 
 
@@ -457,8 +456,8 @@ class AgentKernelResourceIngestTests(unittest.IsolatedAsyncioTestCase):
         submit_resource.assert_not_called()
         state = await store.load(owner="o", session_id="s")
         model_text = "\n".join(str(m) for m in state.conversation)
-        self.assertIn("candidate_numbers=", model_text)
-        self.assertNotIn("recommended_ingest_arguments=", model_text)
+        self.assertIn('"candidate_numbers":', model_text)
+        self.assertNotIn('"recommended_ingest_arguments":', model_text)
 
     @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
     async def test_followup_turn_reuses_persisted_resource_reference(
