@@ -486,28 +486,26 @@ def register_specs(
             name="guangya.episode_naming.plan",
             description=(
                 "把光鸭共同父目录中的发布组剧集按紧凑篇章映射编译为 TMDB 标准分季文件："
-                "工具会在预检时自行建立完整最新快照，再按精确 source_path 或唯一目录名片段、"
+                "工具会在预检时自行建立完整最新快照，再按盘点引用和source_group编号、"
                 "源季集区间和目标季集区间自动选择全部正片，保留扩展名，创建缺失的 Season XX 目录，"
                 "并携带同目录唯一匹配的字幕，生成移动加改名的单一冻结计划。"
                 "字幕语言/forced/default标签按统一规则保留，歧义字幕不可猜配。"
                 "普通正片映射默认排除 E00/Movie/广告/特典；明确 S0 映射继承纳入意图，include_extras=false 始终排除。"
                 "源E00可用起止0单独显式映射，但不能自行猜成正片E01。"
                 "没有可靠映射时应答复待核对，不得按目录名、源季号或本地已观察集数猜偏移。"
-                "模型不得逐文件拼 object_ref，也不需要传分页快照引用；"
+                "必须原样传盘点返回的episode_naming_scope_ref，不得逐文件拼object_ref；"
                 "最多一次处理200个视频与字幕文件合计，并创建32个分季目录；expected_count仅指视频集数。"
                 "调用只产生人工确认卡，不会立即写入云盘；必须说明未匹配、未纳入的字幕。"
             ),
             risk=RiskLevel.DANGER,
             parameters={
                 "type": "object",
-                "required": ["title", "target_root", "groups"],
+                "required": ["title", "episode_naming_scope_ref", "groups"],
                 "properties": {
                     "title": {"type": "string", "minLength": 1, "maxLength": 180},
-                    "target_root": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 2048,
-                        "description": "待规整作品的共同父目录；工具会自行递归建立最新完整快照。",
+                    "episode_naming_scope_ref": {
+                        "type": "string", "minLength": 1, "maxLength": 200,
+                        "description": "盘点返回的范围引用；限定同一会话的根目录和分组，写前仍会刷新完整快照。",
                     },
                     "groups": {
                         "type": "array",
@@ -516,24 +514,14 @@ def register_specs(
                         "items": {
                             "type": "object",
                             "required": [
-                                "target_season",
+                                "source_group", "target_season",
                                 "source_episode_start",
                                 "source_episode_end",
                                 "expected_count",
                             ],
                             "properties": {
-                                "source_path": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "maxLength": 2048,
-                                    "description": "发布组或散落文件所在的精确绝对目录；与 source_directory_contains 二选一。",
-                                },
-                                "source_directory_contains": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "maxLength": 160,
-                                    "description": "唯一匹配来源父目录名称的稳定片段；与 source_path 二选一，适合冗长发布组目录。",
-                                },
+                                "source_group": {"type": "integer", "minimum": 1, "maximum": 2000,
+                                                 "description": "盘点返回的来源分组编号，避免同名目录歧义。"},
                                 "source_season": {
                                     "type": "integer",
                                     "minimum": 0,

@@ -296,27 +296,7 @@ def compile_episode_naming_operations(
             raise GuangYaEpisodeNamingError(f"第 {index} 个篇章映射格式无效")
         if type(group.get("include_extras", False)) is not bool:
             raise GuangYaEpisodeNamingError("include_extras 必须是布尔值")
-        raw_source_path = str(group.get("source_path") or "").strip()
-        directory_contains = str(group.get("source_directory_contains") or "").strip()
-        if bool(raw_source_path) == bool(directory_contains):
-            raise GuangYaEpisodeNamingError(
-                f"第 {index} 个篇章映射必须且只能提供 source_path 或 source_directory_contains"
-            )
-        if raw_source_path:
-            source_path = _normalize_path(raw_source_path, field="source_path")
-        else:
-            candidates = {
-                _normalize_path(item.get("parent_path"), field="parent_path")
-                for item in videos
-                if directory_contains.casefold()
-                in Path(str(item.get("parent_path") or "")).name.casefold()
-            }
-            if len(candidates) != 1:
-                raise GuangYaEpisodeNamingError(
-                    f"第 {index} 个篇章目录特征匹配到 {len(candidates)} 个目录，请提供更精确特征"
-                )
-            source_path = next(iter(candidates))
-
+        source_path = _normalize_path(group.get("source_path"), field="source_path")
         target_season = int(group["target_season"])
         source_start = int(group["source_episode_start"])
         source_end = int(group["source_episode_end"])

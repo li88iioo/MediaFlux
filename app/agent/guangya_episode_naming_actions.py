@@ -10,7 +10,7 @@ from app.agent.guangya_fs_change_actions import (
     prepare_guangya_fs_change_confirmation,
     preview_guangya_fs_change,
 )
-from app.agent.models import ToolContext, ToolResult
+from app.agent.models import ToolContext, ToolResult, ToolReference
 from app.clients.guangya import GuangYaClient
 from app.modules.guangya_episode_naming import (
     GuangYaEpisodeNamingError,
@@ -103,7 +103,19 @@ def inspect_guangya_episode_naming(
             f"{int(data['unmatched_subtitle_count'])} 个字幕未唯一匹配"
         ),
         data=data,
-        model_data=data,
+        model_data={
+            **{key: value for key, value in data.items() if key not in {"target_root", "groups"}},
+            "groups": [
+                {**{key: value for key, value in group.items() if key != "source_path"},
+                 "source_group": index,
+                 "relative_components": group["source_path"].removeprefix(data["target_root"]).strip("/").split("/")}
+                for index, group in enumerate(data["groups"], start=1)
+            ],
+        },
+        references=[ToolReference("episode_naming_scope", {
+            "target_root": data["target_root"],
+            "source_paths": [group["source_path"] for group in data["groups"]],
+        })],
         suggestions=[
             "先核对正片、extras/unknown及字幕配对；未匹配字幕不代表已处理，源季号/本地数量不能证明TMDB偏移。",
             "只在取得可靠 TMDB 映射或用户明确指定映射后建卡；缺依据则说明待核对，不能猜测。",
@@ -114,13 +126,15 @@ def inspect_guangya_episode_naming(
 def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise AgentToolError("光鸭剧集命名方案参数必须是对象")
-    allowed = {"title", "target_root", "groups", "trigger_strm"}
+    allowed = {"title", "episode_naming_scope_ref", "groups", "trigger_strm"}
     if set(arguments) - allowed:
         raise AgentToolError("光鸭剧集命名方案包含不支持的参数")
     title = str(arguments.get("title") or "").strip()
     if not 1 <= len(title) <= 180:
         raise AgentToolError("title 长度必须在 1 到 180 之间")
-    target_root = _path(arguments.get("target_root"), field="target_root")
+    scope_ref = arguments.get("episode_naming_scope_ref")
+    if not isinstance(scope_ref, str) or not scope_ref.startswith("ref_") or len(scope_ref) > 200:
+        raise AgentToolError("请先盘点目录，并原样传入 episode_naming_scope_ref")
     raw_groups = arguments.get("groups")
     if not isinstance(raw_groups, list) or not 1 <= len(raw_groups) <= 32:
         raise AgentToolError("groups 必须包含 1 到 32 个篇章映射")
@@ -129,8 +143,7 @@ def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str
         if not isinstance(raw, dict):
             raise AgentToolError(f"第 {index} 个篇章映射必须是对象")
         expected = {
-            "source_path",
-            "source_directory_contains",
+            "source_group",
             "target_season",
             "source_episode_start",
             "source_episode_end",
@@ -160,13 +173,8 @@ def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str
         )
         if source_end < source_start:
             raise AgentToolError("source_episode_end 不能小于 source_episode_start")
-        source_path = str(raw.get("source_path") or "").strip()
-        source_directory_contains = str(raw.get("source_directory_contains") or "").strip()
-        if bool(source_path) == bool(source_directory_contains):
-            raise AgentToolError(
-                f"第 {index} 个篇章映射必须且只能提供 source_path 或 source_directory_contains"
-            )
         group: dict[str, Any] = {
+            "source_group": _integer(raw.get("source_group"), field="source_group", minimum=1, maximum=2000),
             "target_season": _integer(
                 raw.get("target_season"), field="target_season", minimum=0, maximum=999
             ),
@@ -179,18 +187,6 @@ def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str
                 maximum=9999,
             ),
         }
-        if source_path:
-            normalized_source = _path(source_path, field="source_path")
-            if not (
-                normalized_source == target_root
-                or normalized_source.startswith(target_root.rstrip("/") + "/")
-            ):
-                raise AgentToolError("source_path 必须位于 target_root 内")
-            group["source_path"] = normalized_source
-        else:
-            if len(source_directory_contains) > 160:
-                raise AgentToolError("source_directory_contains 长度不能超过 160")
-            group["source_directory_contains"] = source_directory_contains
         if raw.get("source_season") is not None:
             group["source_season"] = _integer(
                 raw.get("source_season"), field="source_season", minimum=0, maximum=999
@@ -213,7 +209,7 @@ def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str
         raise AgentToolError("trigger_strm 必须是布尔值")
     return {
         "title": title,
-        "target_root": target_root,
+        "episode_naming_scope_ref": scope_ref,
         "groups": groups,
         "trigger_strm": trigger_strm,
     }
@@ -222,16 +218,23 @@ def guangya_episode_naming_plan_arguments(arguments: dict[str, Any]) -> dict[str
 def _compile(arguments: dict[str, Any], context: ToolContext) -> tuple[dict[str, Any], dict[str, Any]]:
     if not context.owner:
         raise AgentToolError("光鸭剧集命名需要已登录会话", code="precondition_failed")
-    target_root = str(arguments["target_root"])
-    # 写操作预检始终自己建立一个完整、最新、单一的根目录快照。此前的
-    # 分页只用于模型理解，不再要求模型跨轮保存 observation_ref。
+    scope = arguments["episode_naming_scope"]
+    target_root = str(scope["target_root"])
+    groups = []
+    for requested in arguments["groups"]:
+        index = requested["source_group"]
+        if not 1 <= index <= len(scope["source_paths"]):
+            raise AgentToolError("来源目录编号不在本次盘点中，请重新盘点", code="precondition_failed")
+        groups.append({**{key: value for key, value in requested.items() if key != "source_group"},
+                       "source_path": scope["source_paths"][index - 1]})
+    # 引用只绑定范围；写前仍刷新真实目录，冻结最新文件而非重放旧快照。
     observation = _fresh_observation(target_root=target_root, owner=context.owner)
     try:
         compiled = compile_episode_naming_operations(
             observation,
             title=str(arguments["title"]),
             target_root=target_root,
-            groups=list(arguments["groups"]),
+            groups=groups,
         )
         fs_arguments = guangya_fs_change_preview_arguments(
             {

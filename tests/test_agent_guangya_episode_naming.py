@@ -105,6 +105,23 @@ class EpisodeNamingClient:
         return True
 
 
+def observed_plan(arguments: dict) -> dict:
+    """测试夹具提供服务器已观察范围，再通过新工具validator；不保留旧工具入口。"""
+    source_paths = [group["source_path"] for group in arguments["groups"]]
+    normalized = episode_actions.guangya_episode_naming_plan_arguments({
+        **{key: value for key, value in arguments.items() if key not in {"target_root", "groups"}},
+        "episode_naming_scope_ref": "ref_test_scope",
+        "groups": [{**{key: value for key, value in group.items() if key != "source_path"}, "source_group": index}
+                   for index, group in enumerate(arguments["groups"], start=1)],
+    })
+    normalized.pop("episode_naming_scope_ref")
+    normalized["episode_naming_scope"] = {"target_root": arguments["target_root"], "source_paths": source_paths}
+    # 低层compiler测试接收已解析的服务端路径，而不是模型猜测路径。
+    for group, path in zip(normalized["groups"], source_paths):
+        group["source_path"] = path
+    return normalized
+
+
 class GuangYaEpisodeNamingTests(unittest.TestCase):
     def setUp(self):
         self.enterContext(isolated_test_database())
@@ -145,7 +162,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
 
     @staticmethod
     def _arguments() -> dict:
-        return episode_actions.guangya_episode_naming_plan_arguments(
+        return observed_plan(
             {
                 "title": "狐妖小红娘",
                 "target_root": "/狐妖小红娘",
@@ -379,7 +396,67 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
         self.assertIn("预期 4 集，实际匹配 3 集", str(raised.exception))
         self.assertEqual(list(self.plan_dir.glob("*.json")), [])
 
-    def test_directory_name_fragment_resolves_unique_release_group(self):
+    def test_same_named_directories_are_selected_by_scoped_reference(self):
+        import asyncio
+        import json
+        from dataclasses import replace
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from app.agent.domain_catalog.cloud import register_specs
+        from app.agent.kernel.capabilities import ToolCatalog
+        from app.agent.kernel.pipeline import ToolCallContext, ToolPipeline, ToolPipelineError
+        from app.agent.kernel.ports.existing_actions import adapt_tool_spec
+        from app.agent.kernel.references import InMemoryReferenceStore
+        from app.agent.kernel.state import CancellationToken, InMemorySessionStateStore
+
+        client = EpisodeNamingClient(episodes_per_group=1)
+        for prefix, directory in (("a", "release-a"), ("b", "release-b")):
+            video = client.directories[directory][0]
+            nested_id = prefix + "-season"
+            video.parent_id = nested_id
+            client.directories[directory] = [GuangYaFile(nested_id, "Season 01", True, parent_id=directory, etag=nested_id)]
+            client.directories[nested_id] = [video]
+        specs = []
+        register_specs(SimpleNamespace(register=specs.append), resource_store=None, active_ingest_store=None, ingest_actions=None)
+        catalog = ToolCatalog([adapt_tool_spec(spec) for spec in specs if spec.name.startswith("guangya.episode_naming.")])
+        clock = [0.0]
+        refs = InMemoryReferenceStore(clock=lambda: clock[0])
+
+        async def run():
+            state = InMemorySessionStateStore()
+            lease, _ = await state.begin_turn(owner="owner", session_id="session", request_id="scope")
+            context = ToolCallContext(owner="owner", session_id="session", request_id="scope", turn_id=lease.turn_id,
+                                      lease=lease, cancellation=CancellationToken(), report_progress=AsyncMock())
+            pipeline = ToolPipeline(catalog=catalog, state_store=state, reference_store=refs)
+            inspected = await pipeline.execute("guangya.episode_naming.inspect", {"target_root": "/狐妖小红娘"}, context=context)
+            model = json.loads(inspected.outcome.model_content)
+            groups = model["data"]["groups"]
+            self.assertEqual([group["directory_name"] for group in groups], ["Season 01", "Season 01"])
+            self.assertEqual([group["source_group"] for group in groups], [1, 2])
+            self.assertNotEqual(groups[0]["relative_components"], groups[1]["relative_components"])
+            self.assertNotIn("source_path", inspected.outcome.model_content)
+            self.assertNotIn("/狐妖小红娘", inspected.outcome.model_content)
+            arguments = {**model["reference_arguments"], "title": "狐妖小红娘", "trigger_strm": False,
+                         "groups": [{"source_group": 2, "source_season": 2, "source_episode_start": 1,
+                                     "source_episode_end": 1, "target_season": 2, "expected_count": 1}]}
+            prepared = await pipeline.execute("guangya.episode_naming.plan", arguments, context=context)
+            self.assertIsNotNone(prepared.effect_plan)
+            flow = change_actions._flow("owner")
+            plan = guangya_fs_change.load_fs_change_plan(flow.plan_id, owner="owner", expected_fingerprint=flow.fingerprint)
+            self.assertEqual({op["source"]["file_id"] for op in plan["operations"]}, {"b-1"})
+            for foreign in (replace(context, owner="other"), replace(context, session_id="other")):
+                with self.assertRaises(ToolPipelineError) as caught:
+                    await pipeline.execute("guangya.episode_naming.plan", arguments, context=foreign)
+                self.assertEqual(caught.exception.code, "reference_invalid")
+            clock[0] = 1000
+            with self.assertRaises(ToolPipelineError) as expired:
+                await pipeline.execute("guangya.episode_naming.plan", arguments, context=context)
+            self.assertEqual(expired.exception.code, "reference_invalid")
+
+        with mock.patch.object(episode_actions, "GuangYaClient", return_value=client), mock.patch.object(change_actions, "GuangYaClient", return_value=client):
+            asyncio.run(run())
+
+    def test_compiler_uses_exact_observed_release_path(self):
         client = EpisodeNamingClient(episodes_per_group=3)
         payload = guangya_workspace.create_directory_observation(
             client,
@@ -395,7 +472,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
             target_root="/狐妖小红娘",
             groups=[
                 {
-                    "source_directory_contains": "发布组A",
+                    "source_path": "/狐妖小红娘/发布组A",
                     "source_season": 1,
                     "source_episode_start": 1,
                     "source_episode_end": 3,
@@ -409,7 +486,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
 
     def test_validator_rejects_ambiguous_or_unsupported_group_fields(self):
         with self.assertRaisesRegex(AgentToolError, "不支持的参数"):
-            episode_actions.guangya_episode_naming_plan_arguments(
+            observed_plan(
                 {
                     "title": "狐妖小红娘",
                     "target_root": "/狐妖小红娘",
@@ -752,7 +829,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
         observation = self._b1_observation("Series S03E05.mkv", "Series S03E07.mkv")
         group = self._b1_mapping(source_episode_start=5, source_episode_end=7, expected_count=2)
         del group["target_episode_start"]
-        arguments = episode_actions.guangya_episode_naming_plan_arguments({
+        arguments = observed_plan({
             "title": "Series", "target_root": "/Series", "groups": [group],
         })
         self.assertEqual(arguments["groups"][0]["target_episode_start"], 1)
@@ -765,7 +842,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
             with self.subTest(include_extras=include_extras):
                 group = self._b1_mapping(include_extras=include_extras)
                 with self.assertRaisesRegex(AgentToolError, "include_extras 必须是布尔值"):
-                    episode_actions.guangya_episode_naming_plan_arguments({
+                    observed_plan({
                         "title": "Series", "target_root": "/Series", "groups": [group],
                     })
                 with self.assertRaisesRegex(GuangYaEpisodeNamingError, "include_extras 必须是布尔值"):
@@ -779,7 +856,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
                     source_episode_start=2, source_episode_end=5, source_season=3,
                     target_episode_start=target_start, expected_count=2,
                 )
-                args = episode_actions.guangya_episode_naming_plan_arguments({"title": "Series", "target_root": "/Series", "groups": [group]})
+                args = observed_plan({"title": "Series", "target_root": "/Series", "groups": [group]})
                 compiled = compile_episode_naming_operations(observation, title="Series", target_root="/Series", groups=args["groups"])
                 move = compiled["operations"][-1]
                 self.assertEqual([r["episode"] for r in move["items"]], [target_start, target_start + 3])
@@ -869,7 +946,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
             "Series - S01E01.mkv", "Series - S01E02.mkv", "Series - S01E03.mkv",
             parent="/Series/Season 01",
         )
-        args = episode_actions.guangya_episode_naming_plan_arguments({
+        args = observed_plan({
             "title": "Series", "target_root": "/Series", "trigger_strm": False,
             "groups": [self._b1_mapping(source_path="/Series/Season 01")],
         })
@@ -893,7 +970,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
                     group = self._b1_mapping(source_episode_end=1, expected_count=1, **seasons)
                     if explicit_false:
                         group["include_extras"] = False
-                    normalized = episode_actions.guangya_episode_naming_plan_arguments({
+                    normalized = observed_plan({
                         "title": "Series", "target_root": "/Series", "groups": [group],
                     })["groups"][0]
                     self.assertIs(normalized["include_extras"], not explicit_false)
@@ -909,7 +986,7 @@ class GuangYaEpisodeNamingTests(unittest.TestCase):
     def test_regular_mapping_still_excludes_movie_when_extra_flag_omitted(self):
         observation = self._b1_observation("Series S01E01.mkv", "Series S01E02 - Movie.mkv")
         group = self._b1_mapping(source_episode_end=2, expected_count=1)
-        normalized = episode_actions.guangya_episode_naming_plan_arguments({
+        normalized = observed_plan({
             "title": "Series", "target_root": "/Series", "groups": [group],
         })["groups"][0]
         self.assertIs(normalized["include_extras"], False)
