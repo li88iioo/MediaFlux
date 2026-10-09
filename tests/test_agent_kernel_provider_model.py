@@ -515,6 +515,71 @@ class ProviderModelStreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1].finish_reason, "tool_use")
 
 
+class ToolArgumentDecoderParityTests(unittest.IsolatedAsyncioTestCase):
+    async def stream_tool_arguments(self, arguments):
+        if isinstance(arguments, dict):
+            protocol = "anthropic_messages"
+            events = [
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call_args",
+                        "name": "inspect",
+                        "input": arguments,
+                    },
+                },
+                {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
+                {"type": "message_stop"},
+            ]
+        else:
+            protocol = "chat_completions"
+            events = [
+                {
+                    "choices": [{
+                        "delta": {"tool_calls": [{
+                            "index": 0,
+                            "id": "call_args",
+                            "function": {"name": "inspect", "arguments": arguments},
+                        }]},
+                        "finish_reason": "tool_calls",
+                    }]
+                },
+                "[DONE]",
+            ]
+        return await collect(iter_protocol_model_events(chunks(events), protocol=protocol))
+
+    async def test_streaming_tool_arguments_share_json_and_size_contract(self):
+        valid_dict = {"value": "x" * (32_768 - 12)}
+        valid_json = '{"value":"' + "x" * (32_768 - 12) + '"}'
+        for arguments, expected in (
+            ({"limit": 5}, {"limit": 5}),
+            ('{"limit":5}', {"limit": 5}),
+            (None, {}),
+            ("", {}),
+            (valid_dict, valid_dict),
+            (valid_json, valid_dict),
+        ):
+            with self.subTest(argument_type=type(arguments).__name__, size=len(str(arguments))):
+                events = await self.stream_tool_arguments(arguments)
+                call = next(event.tool_call for event in events if event.tool_call)
+                self.assertEqual(call.arguments, expected)
+
+        invalid = (
+            ("{broken", "模型工具参数不是有效 JSON"),
+            ("[]", "模型工具参数必须是对象"),
+            ('{"value":"' + "x" * (32_768 - 11) + '"}', "模型工具参数过大"),
+            ({"value": "x" * (32_768 - 11)}, "模型工具参数过大"),
+        )
+        for arguments, message in invalid:
+            with self.subTest(
+                message=message,
+                argument_type=type(arguments).__name__,
+            ), self.assertRaisesRegex(ModelProviderError, message):
+                await self.stream_tool_arguments(arguments)
+
+
 class CompleteTurnContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_done_without_finish_reason_rejects_text_and_tool_execution(self):
         seen = []

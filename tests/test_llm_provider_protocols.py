@@ -7,6 +7,7 @@ from app.clients.openai_compatible import (
     ANTHROPIC_VERSION,
     ProviderUsage,
     ProviderStreamError,
+    ToolArgumentsDecodeError,
     extract_output_text,
     extract_provider_usage,
     infer_protocol_from_url,
@@ -426,6 +427,48 @@ class LLMProviderProtocolTests(unittest.TestCase):
                     }],
                 }}],
             }, "chat_completions")
+
+    def test_native_tool_arguments_share_json_and_size_contract(self):
+        def parse(arguments):
+            return parse_native_tool_turn({
+                "choices": [{"finish_reason": "tool_calls", "message": {
+                    "tool_calls": [{
+                        "id": "call_args",
+                        "type": "function",
+                        "function": {
+                            "name": "mf_workspace_health",
+                            "arguments": arguments,
+                        },
+                    }],
+                }}],
+            }, "chat_completions").tool_calls[0].arguments
+
+        valid = {"value": "x" * (32_768 - 12)}
+        valid_json = '{"value":"' + "x" * (32_768 - 12) + '"}'
+        valid_cases = (
+            ({"limit": 5}, {"limit": 5}),
+            ('{"limit":5}', {"limit": 5}),
+            (None, {}),
+            ("", {}),
+            (valid, valid),
+            (valid_json, valid),
+        )
+        for arguments, expected in valid_cases:
+            with self.subTest(argument_type=type(arguments).__name__, size=len(str(arguments))):
+                self.assertEqual(parse(arguments), expected)
+
+        invalid = (
+            ([], "not_object"), (False, "not_object"), (0, "not_object"),
+            ("{broken", "invalid_json"),
+            ("[]", "not_object"),
+            ('{"value":"' + "x" * (32_768 - 11) + '"}', "too_large"),
+            ({"value": "x" * (32_768 - 11)}, "too_large"),
+        )
+        for arguments, reason in invalid:
+            with self.subTest(reason=reason, argument_type=type(arguments).__name__):
+                with self.assertRaises(ToolArgumentsDecodeError) as raised:
+                    parse(arguments)
+                self.assertEqual(raised.exception.reason, reason)
 
 
 async def _chunks(*parts: bytes):

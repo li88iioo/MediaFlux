@@ -14,11 +14,13 @@ import httpx
 from app.clients.openai_compatible import (
     ProviderStreamError,
     ReasoningDeltaFilter,
+    ToolArgumentsDecodeError,
     extract_provider_usage,
     native_tool_definitions,
     native_tool_request_body,
     normalize_provider_location,
     parse_native_tool_turn,
+    parse_tool_arguments,
     protocol_attempts,
     provider_finish_reason,
     provider_headers,
@@ -175,19 +177,16 @@ async def _iter_sse_json(chunks: AsyncIterator[bytes]) -> AsyncIterator[dict[str
         yield value
 
 
-def _parse_arguments(value: Any) -> dict[str, Any]:
-    if isinstance(value, dict):
-        return dict(value)
-    text = str(value or "").strip() or "{}"
-    if len(text) > 32_768:
-        raise ModelProviderError("模型工具参数过大")
+def _model_tool_arguments(value: Any) -> dict[str, Any]:
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ModelProviderError("模型工具参数不是有效 JSON") from exc
-    if not isinstance(parsed, dict):
-        raise ModelProviderError("模型工具参数必须是对象")
-    return parsed
+        return parse_tool_arguments(value)
+    except ToolArgumentsDecodeError as exc:
+        message = {
+            "too_large": "模型工具参数过大",
+            "invalid_json": "模型工具参数不是有效 JSON",
+            "not_object": "模型工具参数必须是对象",
+        }[exc.reason]
+        raise ModelProviderError(message) from exc
 
 
 def _usage_dict(value: Any, protocol: str) -> dict[str, int]:
@@ -221,7 +220,7 @@ async def iter_protocol_model_events(
         if not name:
             return
         call_id = str(raw.get("call_id") or raw.get("id") or key).strip()
-        arguments = _parse_arguments(raw.get("arguments"))
+        arguments = _model_tool_arguments(raw.get("arguments"))
         emitted_calls.add(key)
         yield ModelEvent(
             ModelEventType.TOOL_CALL_COMPLETED,
@@ -359,7 +358,9 @@ async def iter_protocol_model_events(
                     "call_id": block.get("id"),
                     "name": block.get("name"),
                     "arguments": json.dumps(
-                        block.get("input") or {}, ensure_ascii=False
+                        block.get("input") or {},
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     )
                     if block.get("input")
                     else "",

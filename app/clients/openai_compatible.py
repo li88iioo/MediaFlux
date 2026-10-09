@@ -898,14 +898,35 @@ async def iter_provider_text_deltas(
         yield tail
 
 
-def _native_arguments(value: object) -> dict[str, Any]:
+_MAX_TOOL_ARGUMENTS_CHARS = 32_768
+
+
+class ToolArgumentsDecodeError(ValueError):
+    """工具参数无法解码；reason 供协议适配层保留既有错误语义。"""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__("AI 工具参数格式无效")
+
+
+def parse_tool_arguments(value: object) -> dict[str, Any]:
     if isinstance(value, dict):
-        return dict(value)
-    if not isinstance(value, str) or len(value) > 8_192:
-        raise ValueError("AI 工具参数格式无效")
-    parsed = json.loads(value)
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError) as exc:
+            raise ToolArgumentsDecodeError("invalid_json") from exc
+    elif value is None or isinstance(value, str):
+        text = str(value or "").strip() or "{}"
+    else:
+        raise ToolArgumentsDecodeError("not_object")
+    if len(text) > _MAX_TOOL_ARGUMENTS_CHARS:
+        raise ToolArgumentsDecodeError("too_large")
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ToolArgumentsDecodeError("invalid_json") from exc
     if not isinstance(parsed, dict):
-        raise ValueError("AI 工具参数格式无效")
+        raise ToolArgumentsDecodeError("not_object")
     return parsed
 
 
@@ -931,7 +952,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
                 call = NativeToolCall(
                     call_id=str(item.get("call_id") or item.get("id") or ""),
                     name=str(item.get("name") or ""),
-                    arguments=_native_arguments(item.get("arguments")),
+                    arguments=parse_tool_arguments(item.get("arguments")),
                 )
                 calls.append(call)
                 assistant_items.append({
@@ -989,7 +1010,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
             call = NativeToolCall(
                 call_id=str(item.get("id") or ""),
                 name=str(function.get("name") or ""),
-                arguments=_native_arguments(function.get("arguments")),
+                arguments=parse_tool_arguments(function.get("arguments")),
             )
             calls.append(call)
             assistant_calls.append({
@@ -1036,7 +1057,7 @@ def parse_native_tool_turn(envelope: object, protocol: str) -> NativeToolTurn:
             call = NativeToolCall(
                 call_id=str(block.get("id") or ""),
                 name=str(block.get("name") or ""),
-                arguments=_native_arguments(block.get("input")),
+                arguments=parse_tool_arguments(block.get("input")),
             )
             calls.append(call)
             assistant_blocks.append({
