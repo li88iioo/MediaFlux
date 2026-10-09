@@ -375,6 +375,104 @@ class AgentKernelBrowserTests(unittest.TestCase):
         self.assertIn("/api/agent/query", paths)
         self.assertFalse(any("/tools/" in path or "/prepare" in path for path in paths))
 
+    def test_tool_call_preserves_streamed_body_until_terminal_replaces_draft(self) -> None:
+        events = [
+            _event(1, "turn.started", {"kind": "query"}),
+            _event(2, "model.started", {"round": 1}),
+            _event(3, "model.delta", {"round": 1, "delta": "工具前的正文"}),
+            _event(
+                4,
+                "model.tool_call",
+                {
+                    "round": 1,
+                    "call_id": "call-1",
+                    "tool": "library.search",
+                    "label": "工具阶段：媒体库查询",
+                },
+            ),
+            _event(
+                5,
+                "tool.started",
+                {"call_id": "call-1", "tool": "library.search", "label": "工具阶段：媒体库查询"},
+            ),
+            _event(
+                6,
+                "tool.completed",
+                {"call_id": "call-1", "tool": "library.search", "label": "媒体库查询"},
+            ),
+            _event(7, "model.started", {"round": 2}),
+            _event(8, "model.delta", {"round": 2, "delta": "新一轮草稿"}),
+            _event(
+                9,
+                "turn.completed",
+                {"status": "success", "answer": "权威最终答案"},
+            ),
+        ]
+        page = self.make_page(
+            {
+                "sessions": {"sessions": []},
+                "queryEvents": events,
+                "queryDelayMs": 160,
+            }
+        )
+        page.evaluate("""() => {
+          window.__agentBodySnapshots = [];
+          const transcript = document.querySelector('#agentTranscript');
+          new MutationObserver(() => {
+            const card = transcript.querySelector('.agent-result-card');
+            if (!card) return;
+            window.__agentBodySnapshots.push({
+              status: card.querySelector('.agent-stream-head')?.textContent.trim() || '',
+              body: card.querySelector('.agent-stream-text, .agent-narrative')?.textContent || '',
+            });
+          }).observe(transcript, {childList: true, characterData: true, subtree: true});
+        }""")
+        page.locator("#agentPrompt").fill("查询媒体库")
+        page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        page.wait_for_function("""() => window.__agentBodySnapshots.some(
+          item => item.status.includes('工具阶段：媒体库查询')
+        )""")
+        during_tools = page.evaluate("""() => window.__agentBodySnapshots.filter(
+          item => item.status.includes('工具阶段：媒体库查询')
+        )""")
+        self.assertTrue(during_tools)
+        self.assertTrue(
+            all(item["body"].strip() for item in during_tools),
+            "工具阶段状态变化不得清空已显示的模型正文",
+        )
+        self.assertTrue(any("工具前的正文" in item["body"] for item in during_tools))
+        page.locator(".agent-narrative").wait_for()
+        self.assertEqual(page.locator(".agent-narrative").inner_text(), "权威最终答案")
+        self.assertNotIn("工具前的正文", page.locator(".agent-narrative").inner_text())
+        self.assertNotIn("新一轮草稿", page.locator(".agent-narrative").inner_text())
+
+        terminal_cases = (
+            ("turn.failed", {"message": "终态失败说明"}, ".is-interrupted", "终态失败说明"),
+            ("turn.cancelled", {}, ".agent-cancelled", "本次任务已停止。"),
+        )
+        for event_type, payload, terminal_selector, expected in terminal_cases:
+            with self.subTest(terminal=event_type):
+                terminal_page = self.make_page(
+                    {
+                        "sessions": {"sessions": []},
+                        "queryEvents": [
+                            _event(1, "turn.started", {"kind": "query"}),
+                            _event(2, "model.started", {"round": 1}),
+                            _event(3, "model.delta", {"round": 1, "delta": "错误草稿，不可留存"}),
+                            _event(4, event_type, payload),
+                        ],
+                        "queryDelayMs": 40,
+                    }
+                )
+                terminal_page.locator("#agentPrompt").fill("触发终态")
+                terminal_page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+                terminal_page.locator(f".agent-result-card{terminal_selector}").wait_for()
+                body = terminal_page.locator(".agent-stream-text")
+                self.assertEqual(body.inner_text(), expected)
+                terminal_page.wait_for_timeout(100)
+                self.assertEqual(body.inner_text(), expected)
+                self.assertNotIn("错误草稿", body.inner_text())
+
     def test_partial_budget_answer_finishes_in_place_without_retry_error(self) -> None:
         answer = "## 部分完成\n\n已核对第一部，其余作品尚未检查。\n\n回复继续可接着核对。"
         events = [

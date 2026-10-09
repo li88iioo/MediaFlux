@@ -1269,9 +1269,6 @@
         case 'model.tool_call': {
             const key = `call:${payload.call_id || event.sequence}`;
             updateStep(turn, key, `${toolLabel(payload.tool, payload.label)}…`, {pending: true});
-            cancelTurnMarkdownRender(turn);
-            turn.pendingMarkdown = '';
-            turn.text.replaceChildren();
             setTurnStatus(turn, toolLabel(payload.tool, payload.label));
             break;
         }
