@@ -54,8 +54,6 @@ _ALLOWED_ID_RE = re.compile(r"^-?[1-9][0-9]*$")
 _ALLOWED_USER_RE = re.compile(r"^[1-9][0-9]*$")
 _TELEGRAM_MESSAGE_LIMIT = 4096
 _MAX_MESSAGE = 3900
-_STREAM_PREVIEW_MAX_CHARS = 720
-_STREAM_PREVIEW_MAX_LINES = 16
 _QUERY_LIMIT_PER_MINUTE = 12
 _CALLBACK_LIMIT_PER_MINUTE = 40
 _CALLBACK_RE = re.compile(
@@ -259,63 +257,15 @@ def _tool_chain_line(tool_calls: tuple[str, ...] | list[str]) -> str:
     return " → ".join(labels)
 
 
-def _stream_preview_source(value: object) -> tuple[str, bool]:
-    """截取流式回答的最新窗口，避免 Telegram 消息持续扩高推挤视口。"""
-
-    source = str(value or "").replace("\x00", "")
-    source = source.replace("\r\n", "\n").replace("\r", "\n")
-    if not source:
-        return "", False
-
-    line_starts = [match.end() for match in re.finditer("\n", source)]
-    line_start = (
-        line_starts[-_STREAM_PREVIEW_MAX_LINES]
-        if len(line_starts) >= _STREAM_PREVIEW_MAX_LINES
-        else 0
-    )
-    char_start = max(0, len(source) - _STREAM_PREVIEW_MAX_CHARS)
-    start = max(line_start, char_start)
-    if start <= 0:
-        return source, False
-
-    # 不从正文行中间开始，优先把窗口推进到下一条完整 Markdown 行。
-    if source[start - 1 : start] != "\n":
-        next_line = source.find("\n", start)
-        if next_line >= 0:
-            start = next_line + 1
-    preview = source[start:].lstrip("\n")
-    if not preview:
-        preview = source[-_STREAM_PREVIEW_MAX_CHARS:]
-
-    # 若窗口落在代码围栏内部，补回开围栏，让局部 Markdown 仍可安全渲染。
-    prefix = source[:start]
-    fences = list(re.finditer(r"(?m)^\s*(`{3,}|~{3,})[^\n]*$", prefix))
-    if len(fences) % 2 == 1:
-        preview = f"{fences[-1].group(1)}\n{preview}"
-    return preview, True
-
-
-def _truncate_stream_overflow_preview(rendered: object) -> str:
-    """保证每个 Telegram 流式预览都低于单条消息的硬上限。"""
-
-    body = str(rendered or "").strip()
-    suffix = "\n\n<i>正在输出…</i>"
-    candidate = body + suffix
-    if telegram_html_text_length(candidate) <= _TELEGRAM_MESSAGE_LIMIT:
-        return candidate
-
-    marker = "<i>前文已生成，完成后将分段发送；下面显示最新内容</i>\n\n"
-    budget = max(
-        256,
-        _TELEGRAM_MESSAGE_LIMIT
-        - telegram_html_text_length(marker)
-        - telegram_html_text_length(suffix),
-    )
-    latest = split_telegram_html(body, limit=budget)[-1]
-    candidate = marker + latest + suffix
-    if telegram_html_text_length(candidate) <= _TELEGRAM_MESSAGE_LIMIT:
-        return candidate
-    return split_telegram_html(candidate, limit=_TELEGRAM_MESSAGE_LIMIT)[-1]
+def _render_stream_preview(value: object, *, status: str = "正在输出…") -> str:
+    """正文从开头增长；超出单条限额保留首段，终态再完整分段发送。"""
+    source = str(value or "").replace("\x00", "").replace("\r\n", "\n").replace("\r", "\n")
+    chunks = split_telegram_html(render_telegram_markdown(source), limit=_MAX_MESSAGE)
+    if not chunks:
+        return ""
+    note = status + (" · 其余内容完成后分段发送" if len(chunks) > 1 else "")
+    # 与最终正文采用同一分段预算，状态文案使用4096上限内的剩余空间。
+    return chunks[0] + "\n\n<i>" + html.escape(note[:80]) + "</i>"
 
 
 def _preview_lines(
@@ -439,6 +389,7 @@ class _TelegramEventObserver:
         self.last_stream_at = 0.0
         self.last_stream = ""
         self.model_text = ""
+        self.visible_text = ""
         self.model_round: int | None = None
         self.active_tool = ""
 
@@ -499,19 +450,17 @@ class _TelegramEventObserver:
         now = time.monotonic()
         if not force and now - self.last_status_at < 0.65:
             return
-        self.last_status_at = now
-        self.last_status = text
-        rendered = f"<b>Media Agent</b>\n{html.escape(text)}"
-        await asyncio.to_thread(self.progress.update, rendered)
+        rendered = (
+            _render_stream_preview(self.visible_text, status=text)
+            if self.visible_text else f"<b>Media Agent</b>\n{html.escape(text)}"
+        )
+        if await asyncio.to_thread(self.progress.update, rendered):
+            self.last_status_at = now
+            self.last_status = text
+            self.last_stream = rendered
 
     async def _publish_stream(self, *, force: bool = False) -> None:
-        source, clipped = _stream_preview_source(self.model_text)
-        if not source:
-            return
-        rendered = render_telegram_markdown(source)
-        if clipped:
-            rendered = "<i>回答较长，下面显示最新生成内容</i>\n\n" + rendered
-        if not rendered or rendered == self.last_stream:
+        if not self.model_text:
             return
         now = time.monotonic()
         mode = str(getattr(self.progress, "mode", "") or "")
@@ -519,9 +468,12 @@ class _TelegramEventObserver:
         if not force and now - self.last_stream_at < interval:
             return
         self.last_stream_at = now
-        self.last_stream = rendered
-        preview = _truncate_stream_overflow_preview(rendered)
-        await asyncio.to_thread(self.progress.update, preview)
+        preview = _render_stream_preview(self.model_text)
+        if not preview or preview == self.last_stream:
+            return
+        if await asyncio.to_thread(self.progress.update, preview):
+            self.last_stream = preview
+            self.visible_text = self.model_text
 
 
 def _positive_int(value: object) -> int | None:

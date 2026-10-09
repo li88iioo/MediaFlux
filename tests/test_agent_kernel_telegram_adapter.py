@@ -390,7 +390,7 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("🔎 执行：", rendered)
         self.assertNotIn("Agent 暂时无法完成", rendered)
 
-    def test_long_stream_keeps_a_bounded_latest_preview(self):
+    def test_long_stream_keeps_the_first_page_until_final_continuations(self):
         factory = EventFactory(
             session_id="tg_session",
             turn_id="turn-long-stream",
@@ -437,10 +437,10 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         ]
         self.assertTrue(streamed)
         preview = streamed[-1]
-        self.assertIn("回答较长，下面显示最新生成内容", preview)
-        self.assertIn("<b>推荐 80</b>", preview)
-        self.assertNotIn("<b>推荐 1</b>", preview)
-        self.assertLess(len(preview), 1_600)
+        self.assertIn("完成后分段发送", preview)
+        self.assertIn("<b>推荐 1</b>", preview)
+        self.assertNotIn("<b>推荐 80</b>", preview)
+        self.assertLessEqual(adapter.telegram_html_text_length(preview), adapter._TELEGRAM_MESSAGE_LIMIT)
 
         final_chunks = [bot.edits[-1][0], *(text for _chat, text, _kwargs in bot.sent[1:])]
         self.assertGreater(len(final_chunks), 1)
@@ -455,16 +455,63 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("<b>推荐 80</b>", complete)
         self.assertNotIn("正在输出", complete)
 
+    def test_stream_keeps_opening_beyond_the_old_720_character_window(self):
+        import asyncio
+        from unittest.mock import Mock
+        progress = Mock(mode="edit")
+        progress.update.return_value = True
+        observer = adapter._TelegramEventObserver(progress)
+        factory = EventFactory(session_id="s", turn_id="t", request_id="r")
+        first = "正文起点。" + "第一段内容。" * 50
+        second = "第二段内容。" * 100
+        async def play():
+            await observer(factory.create(AgentEventType.MODEL_STARTED, {"round": 1}))
+            await observer(factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": first}))
+            observer.last_stream_at = 0
+            await observer(factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": second}))
+            for typ, payload in (
+                (AgentEventType.MODEL_TOOL_CALL, {"tool": "library.search"}),
+                (AgentEventType.TOOL_COMPLETED, {}),
+                (AgentEventType.MODEL_STARTED, {"round": 2}),
+            ):
+                observer.last_status_at = 0
+                await observer(factory.create(typ, payload))
+        asyncio.run(play())
+        rendered = [c.args[0] for c in progress.update.call_args_list]
+        self.assertTrue(all("正文起点。" in text for text in rendered[1:]))
+        self.assertIn(first + second, rendered[-1])
+        self.assertNotIn("下面显示最新", rendered[-1])
+
+    def test_full_preview_is_not_rerendered_for_every_hidden_tail_token(self):
+        import asyncio
+        from unittest.mock import Mock
+        progress = Mock(mode="edit")
+        progress.update.return_value = True
+        observer = adapter._TelegramEventObserver(progress)
+        observer.model_text = "正文" * 3000
+        async def play():
+            with patch.object(adapter.time, "monotonic", return_value=10):
+                await observer._publish_stream(force=True)
+            observer.model_text += "继续"
+            with patch.object(adapter.time, "monotonic", return_value=11), patch.object(adapter, "_render_stream_preview", wraps=adapter._render_stream_preview) as render:
+                await observer._publish_stream()
+                observer.model_text += "生成"
+                await observer._publish_stream()
+                self.assertEqual(render.call_count, 1)
+        asyncio.run(play())
+        self.assertEqual(progress.update.call_count, 1)
+
     def test_stream_overflow_preview_never_exceeds_telegram_hard_limit(self):
-        preview = adapter._truncate_stream_overflow_preview(
-            "<b>超长回答</b>\n" + ("😀" * 3_000)
+        preview = adapter._render_stream_preview(
+            "**超长回答**\n" + ("😀" * 3_000)
         )
 
         self.assertLessEqual(
             adapter.telegram_html_text_length(preview),
             adapter._TELEGRAM_MESSAGE_LIMIT,
         )
-        self.assertIn("前文已生成", preview)
+        self.assertIn("完成后分段发送", preview)
+        self.assertIn("<b>超长回答</b>", preview)
         self.assertIn("正在输出", preview)
 
     def test_query_renders_kernel_approval_with_direct_effect_buttons(self):
