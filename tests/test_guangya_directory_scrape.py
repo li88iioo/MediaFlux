@@ -187,6 +187,30 @@ class _ParsingScraper:
 
 
 class DirectoryMediaInspectorTests(unittest.TestCase):
+    def test_directory_inspection_excludes_samples_before_primary_media_grouping(self):
+        from app.modules.directory_media import DirectoryMediaInspector
+        from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
+
+        main = _file("main", "Iron.Man.2008.mkv", "source")
+        sample = _file("sample", "sample.mp4", "source")
+        proof_dir = _dir("proof", "Proof", "source")
+        proof = _file("proof-video", "Iron.Man.2008.mkv", "proof")
+        tree = {"source": [main, sample, proof_dir], "proof": [proof], "archive": []}
+        infos = {"source": _dir("source", "Iron Man (2008)"),
+                 "archive": _dir("archive", "媒体库"), "proof": proof_dir,
+                 "sample": sample}
+        inspector = DirectoryMediaInspector(client=_TreeClient(tree, infos), scraper=_ParsingScraper())
+        rules = OrganizeRules(target_dir_id="archive", small_file_mb=0)
+        inspection = inspector.inspect("source", rules)
+        self.assertEqual([item.file_id for item in inspection.videos], ["main"])
+        self.assertEqual(inspection.counts["video"], 1)
+        self.assertFalse(inspection.pending_videos)
+        # 真正的单文件人工检查入口不受目录自动过滤影响。
+        self.assertEqual(inspector.inspect_file("sample", rules).videos[0].file_id, "sample")
+        tree["source"] = [sample, proof_dir]
+        with self.assertRaisesRegex(DirectoryScrapeRequestError, "没有支持的视频"):
+            inspector.inspect("source", rules)
+
     def test_dynamis_b_global_filename_uses_shared_clean_title_in_guangya_inspection(self):
         from app.modules.directory_media import DirectoryMediaInspector
 
@@ -2185,6 +2209,23 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
             "movie",
         )["preview_id"]
 
+    def test_preview_and_group_execution_leave_sample_files_untouched(self):
+        sample = _file("sample", "Sample.mkv", "movie-dir", size=316_410_000)
+        proof_dir = _dir("proof", "Proof", "movie-dir")
+        proof = _file("proof-video", "Iron.Man.2008.mkv", "proof")
+        self.client.tree["movie-dir"].extend([sample, proof_dir])
+        self.client.tree["proof"] = [proof]
+        self.client.infos.update({item.file_id: item for item in (sample, proof_dir, proof)})
+        inspected = self.service.inspect("owner", "movie-dir")
+        preview = self.service.preview("owner", inspected["inspection_id"], "1726", "movie")
+        self.assertEqual({row["file_id"] for row in preview["plans"]}, {"v1", "v2"})
+        result = self.service.execute_preview("owner", preview["preview_id"])
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.assertEqual(self.client.infos["sample"], sample)
+        self.assertEqual(self.client.infos["proof-video"], proof)
+        self.assertIn(sample, self.client.tree["movie-dir"])
+        self.assertIn(proof, self.client.tree["proof"])
+
     def test_execute_preview_applies_fixed_match_and_existing_conflict_rules(self):
         self.scraper.confirm = Mock()
 
@@ -4139,9 +4180,11 @@ class OrganizeScanSampleTests(unittest.TestCase):
         self.assertEqual(stats["total"], 2)
         self.assertEqual(stats["skipped"], 2)
 
-    def test_explicit_selected_file_id_can_still_scan_a_sample(self):
+    def test_internal_group_file_ids_do_not_bypass_sample_filter(self):
         from app.modules.organize_models import OrganizeContext
-        from app.modules.organize_scan import OrganizerScanner, ScanRestriction
+        from app.modules.organize_scan import OrganizerScanner
+        from app.modules.organize import Organizer
+        from app.modules.organize_groups import enumerate_group_tasks
 
         sample = _file("sample-file", "Sample.mkv", "source", size=316_410_000)
         tree = {"source": [sample]}
@@ -4166,11 +4209,11 @@ class OrganizeScanSampleTests(unittest.TestCase):
             stats,
             video_exts={"mkv"},
             metadata_exts=set(),
-            restriction=ScanRestriction(
-                dir_id="source",
-                files_only=True,
-                file_ids=frozenset({"sample-file"}),
-            ),
+            restriction=Organizer._group_restriction(enumerate_group_tasks(
+                client, source_dir_id="source", source_name="Downloads", video_exts={"mkv"},
+            ).tasks[0]),
         )
 
-        self.assertEqual([item.file.file_id for item in result.scanned_videos], ["sample-file"])
+        self.assertEqual(result.scanned_videos, [])
+        self.assertEqual(stats["total"], 0)
+        self.assertEqual(stats["skipped"], 1)

@@ -18,6 +18,7 @@ from app.modules.directory_scrape_errors import (
 from app.modules.scraper import TMDBScraper
 from app.modules.subtitle_identity import plan_subtitle_companions
 from app.modules.special_media import (
+    is_sample_media_path,
     is_special_directory_name,
     is_special_media_name,
     is_special_path,
@@ -172,7 +173,7 @@ class DirectoryMediaInspector:
                     continue
                 ext = item.name.rsplit(".", 1)[-1].lower() if "." in item.name else ""
                 if ext in video_exts:
-                    if rules.small_file_mb and (
+                    if is_sample_media_path(f"{relative_dir}/{item.name}") or (
                         0 < item.size < rules.small_file_mb * 1024 * 1024
                     ):
                         continue

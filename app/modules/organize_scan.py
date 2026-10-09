@@ -356,7 +356,7 @@ class OrganizerScanner:
             ):
                 continue
             media_path = f"{rel}/{item.name}" if rel else item.name
-            if not selected_file_ids and is_sample_media_path(media_path):
+            if is_sample_media_path(media_path):
                 stats["skipped"] += 1
                 self.append_reason(
                     stats,
