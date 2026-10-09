@@ -3488,6 +3488,44 @@ class AgentPartialProgressTests(unittest.IsolatedAsyncioTestCase):
         prepare.assert_not_called()
         self.assertFalse(any(event.type == AgentEventType.EFFECT_APPROVAL_REQUIRED for event in events))
 
+    async def test_explicit_target_recovers_after_interleaved_tool(self):
+        for failure_code in ("rate_limited", "provider_timeout"):
+            with self.subTest(failure=failure_code):
+                calls = []
+                def read(arguments, _context):
+                    calls.append(arguments)
+                    if len(calls) == 1:
+                        raise ToolPipelineError("暂时未取得结果", code=failure_code)
+                    return {"ok": True, "summary": "对象A已核验"}
+                tool = KernelToolSpec(name="library.lookup", domain="library", description="核对媒体",
+                    input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+                    effect=ToolEffect.READ, read=read)
+                catalog, state = ToolCatalog([tool, read_tool("library.health")]), InMemorySessionStateStore()
+                def lookup(identifier):
+                    return [ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall(identifier, tool.name, {"query": "A"})),
+                            ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")]
+                model = ScriptedModel([lookup("first"), self.tool_round("library.health", "other"), lookup("retry"),
+                    [ModelEvent(ModelEventType.TEXT_DELTA, text="对象A已核验完成"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+                session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+                    pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+                result = await consume_events(session.run(AgentInput(message="核验A", owner="o", session_id="recovery")))
+                self.assertEqual(result.status, "success")
+                self.assertEqual(result.answer, "对象A已核验完成")
+                self.assertEqual(calls, [{"query": "A"}, {"query": "A"}])
+
+    async def test_other_success_does_not_erase_an_unresolved_read_error(self):
+        def broken(*_):
+            raise ToolPipelineError("第一项尚未核验", code="provider_timeout")
+        catalog, state = ToolCatalog([read_tool("library.first", handler=broken), read_tool("library.second")]), InMemorySessionStateStore()
+        model = ScriptedModel([self.tool_round("library.first", "first"), self.tool_round("library.second", "second"),
+            [ModelEvent(ModelEventType.TEXT_DELTA, text="全部完成"), ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+        session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state)
+        result = await consume_events(session.run(AgentInput(message="核验两项", owner="o", session_id="partial")))
+        self.assertEqual(result.status, "partial")
+        self.assertIn("第一项尚未核验", result.answer)
+        self.assertNotIn("全部完成", result.answer)
+
     async def test_unrelated_success_cannot_erase_a_limited_entry(self):
         for changed_context in (False, True):
             with self.subTest(changed_context=changed_context):
