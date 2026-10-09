@@ -1431,6 +1431,20 @@ def _register_commands(bot, telebot):
 
         return wrapped
 
+    @bot.message_handler(content_types=[
+        "forum_topic_created", "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened",
+    ])
+    @require_auth
+    def record_private_topic(msg):
+        if str(getattr(msg.chat, "type", "")) != "private":
+            return
+        from app.bot.agent_adapter import telegram_agent_owner
+        from app.modules.telegram_topic_routing import record_private_topic_service_message
+
+        # 私聊 chat.id 即用户 ID；机器人自己的改名服务消息仍属于用户话题。
+        owner = telegram_agent_owner(msg.chat.id, msg.chat.id)
+        record_private_topic_service_message(owner, msg)
+
     def topic_platform_capabilities():
         try:
             me = bot.get_me()

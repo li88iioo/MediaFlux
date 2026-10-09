@@ -71,6 +71,15 @@ class TelegramTopicControlsTests(unittest.TestCase):
             ),
         )
 
+    def test_service_messages_are_routed_without_starting_an_agent_turn(self):
+        handler = next(handler for filters, handler in self.registered_messages
+                       if "forum_topic_created" in filters.get("content_types", []))
+        message = self._call().message
+        message.from_user = SimpleNamespace(id=999, is_bot=True)
+        with patch("app.modules.telegram_topic_routing.record_private_topic_service_message") as record:
+            handler(message)
+        record.assert_called_once_with("tg:v1:100\x1f100", message)
+
     def test_success_edits_original_message_and_transmits_empty_inline_keyboard(self):
         call = self._call("off")
         with (

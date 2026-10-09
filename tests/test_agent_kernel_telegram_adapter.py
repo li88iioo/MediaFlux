@@ -919,6 +919,30 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("无法确认任务已停止", unknown_summary)
         self.assertNotIn("停止状态已返回", unknown_summary)
 
+    def test_private_topic_naming_cannot_replace_a_delivered_answer(self):
+        message = Message("检查媒体库", chat_id=7)
+        message.chat.type = "private"
+        message.message_thread_id = 41
+        self.config_values["TG_CHAT_ID"] = "7"
+        order = []
+        def query(*args, **kwargs):
+            order.append("answer-delivered")
+            return types.SimpleNamespace(status="success")
+        async def name(*args, **kwargs):
+            order.append("topic-title")
+            raise RuntimeError("title provider unavailable")
+        access = self._patch_access()
+        bot = FakeBot()
+        with (
+            access[0], access[1], access[2],
+            patch.object(adapter, "_execute_query", side_effect=query),
+            patch.object(adapter, "_session_for_source", return_value=("owner", "session", 41)),
+            patch("app.modules.telegram_topic_routing.auto_name_private_topic", side_effect=name),
+        ):
+            self.assertTrue(adapter.handle_agent_message(bot, TELEBOT, message))
+        self.assertEqual(order, ["answer-delivered", "topic-title"])
+        self.assertEqual(bot.replies, [])
+
     def test_model_menu_has_two_columns_eight_models_and_cancellation(self):
         import telebot
         settings = types.SimpleNamespace(api_url="https://provider.example/v1", api_key="key", protocol="auto", model="model-2")

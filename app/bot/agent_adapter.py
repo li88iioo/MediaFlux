@@ -698,7 +698,7 @@ def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
     if not text:
         return False
     try:
-        _execute_query(
+        view = _execute_query(
             bot,
             telebot_module,
             message,
@@ -706,6 +706,18 @@ def handle_agent_message(bot: Any, telebot_module: Any, message: Any) -> bool:
             user_id=user_id,
             text=text,
         )
+        if view.status in {"success", "partial", "approval_required"} and str(getattr(message.chat, "type", "")) == "private":
+            # 正文/确认卡已经送达，标题失败不能改写本轮真实结果。
+            from app.modules.telegram_topic_routing import auto_name_private_topic
+
+            owner, session_id, thread_id = _session_for_source(chat_id, user_id, message)
+            with suppress(Exception):
+                asyncio.run(auto_name_private_topic(
+                    bot, owner=owner, session_id=session_id, chat_id=chat_id,
+                    chat_type="private", thread_id=thread_id, topic_open=True,
+                    first_user_message=text,
+                ))
+
     except Exception as exc:  # noqa: BLE001 - Telegram transport boundary
         if isinstance(exc, SelectionInvalidError) or (
             isinstance(exc, RuntimeError) and ("频繁" in str(exc) or "重复" in str(exc))
