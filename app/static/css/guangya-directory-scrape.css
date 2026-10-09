@@ -1841,17 +1841,27 @@
     }
     .gy-scrape-episode-fields { display: contents; }
     .gy-scrape-episode-fields[hidden] { display: none; }
-    .gy-scrape-searchbar:has(.gy-scrape-episode-fields.is-season-only:not([hidden]))
-        > label:not(.gy-scrape-query-label) {
-        grid-column: span 2;
+    .gy-scrape-searchbar:has(.gy-scrape-episode-fields.is-season-only:not([hidden]), .gy-scrape-episode-fields[hidden]) {
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr) minmax(44px, .7fr) 80px;
+        column-gap: 6px;
+    }
+    .gy-scrape-searchbar:has(.gy-scrape-episode-fields.is-season-only:not([hidden])) .form-select {
+        padding-inline: 6px 2px;
     }
     .gy-scrape-searchbar:has(.gy-scrape-episode-fields[hidden])
         > label:not(.gy-scrape-query-label) {
-        grid-column: 1 / -1;
+        grid-column: span 3;
     }
     .gy-scrape-searchbar > #gyScrapeSearchBtn {
         width: 100%;
+        min-width: 0;
         grid-column: 1 / -1;
+        padding-inline: 8px;
+        gap: 4px;
+    }
+    .gy-scrape-searchbar:has(.gy-scrape-episode-fields.is-season-only:not([hidden]), .gy-scrape-episode-fields[hidden])
+        > #gyScrapeSearchBtn {
+        grid-column: auto;
     }
     .gy-scrape-mobile-tabs {
         min-height: 47px;

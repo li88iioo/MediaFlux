@@ -795,6 +795,50 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.assertNotIn('更多', detail)
         self.assertEqual(self.page_errors, [])
 
+    def test_directory_search_shares_control_row_at_mobile_and_desktop_widths(self):
+        from jinja2 import Environment, FileSystemLoader, nodes
+        env = Environment(loader=FileSystemLoader(str(ROOT / "app/templates")), autoescape=True)
+        template = env.parse((ROOT / "app/templates/guangya.html").read_text("utf-8"))
+        options = next(node.node.as_const() for node in template.find_all(nodes.Assign)
+                       if getattr(node.target, "name", "") == "media_scrape")
+        markup = env.get_template("_media_scrape_modal.html").render(media_scrape=options)
+        for width in (320, 390, 650, 760, 1280):
+            with self.subTest(width=width):
+                page = self.browser.new_page(viewport={"width": width, "height": 900})
+                try:
+                    page.set_content('<html data-theme="light"><body>' + markup + '</body></html>')
+                    page.add_style_tag(content=(ROOT / "app/static/css/main.css").read_text("utf-8"))
+                    page.add_style_tag(content=STYLES)
+                    page.add_style_tag(content="*, *::before, *::after { animation: none !important; transition: none !important; }")
+                    page.add_script_tag(path=str(ROOT / "app/static/js/lucide.min.js"))
+                    page.evaluate("""() => {
+                        document.querySelector('#gyScrapeModal').hidden = false;
+                        document.querySelector('#gyScrapeEpisodeFields').hidden = false;
+                        document.querySelector('#gyScrapeEpisodeFields').classList.add('is-season-only');
+                        document.querySelector('#gyScrapeEpisodeField').hidden = true;
+                        document.querySelector('#gyScrapeType').value = 'tv';
+                        document.querySelector('#gyScrapeQuery').value = 'Angel Beats!';
+                        document.querySelector('#gyScrapeSeason').value = '1';
+                        window.lucide.createIcons();
+                    }""")
+                    ids = ('gyScrapeType', 'gyScrapeNumbering', 'gyScrapeSeason', 'gyScrapeSearchBtn')
+                    boxes = [page.locator('#' + name).bounding_box() for name in ids]
+                    for box in boxes:
+                        self.assertAlmostEqual(box['y'], boxes[0]['y'], delta=1)
+                        self.assertAlmostEqual(box['height'], boxes[0]['height'], delta=1)
+                        self.assertGreaterEqual(box['x'], 0)
+                        self.assertLessEqual(box['x'] + box['width'], width)
+                    for left, right in zip(boxes, boxes[1:]):
+                        self.assertLessEqual(left['x'] + left['width'], right['x'])
+                    button = page.locator('#gyScrapeSearchBtn')
+                    button.evaluate("node => { node.disabled = true; node.querySelector('span').textContent = '搜索中'; }")
+                    self.assertEqual(button.bounding_box(), boxes[-1])
+                    page.evaluate("document.querySelector('#gyScrapeEpisodeFields').hidden = true")
+                    movie, search = page.locator('#gyScrapeType').bounding_box(), button.bounding_box()
+                    self.assertAlmostEqual(movie['y'], search['y'], delta=1)
+                finally:
+                    page.close()
+
     def test_production_css_keeps_menu_and_scrape_controls_compact_and_equal_height(self):
         page = self.browser.new_page(viewport={"width": 1000, "height": 700})
         try:
