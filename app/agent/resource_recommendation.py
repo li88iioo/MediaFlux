@@ -70,13 +70,15 @@ def _episode_match(
     episode: int,
     mapping_context: dict[str, Any] | None = None,
 ) -> tuple[str, int, list[str], list[str]]:
-    position = parse_indexer_release_position(title)
-    source_season = position.get("season")
-    source_episode = position.get("episode")
-    source_end = position.get("episode_end") or source_episode
     detail = (
         mapping_context.get("detail") if isinstance(mapping_context, dict) else None
     )
+    position = parse_indexer_release_position(
+        title, media_title=str(detail.get("name") or "") if isinstance(detail, dict) else "",
+    )
+    source_season = position.get("season")
+    source_episode = position.get("episode")
+    source_end = position.get("episode_end") or source_episode
     season_detail = (
         mapping_context.get("season_detail")
         if isinstance(mapping_context, dict)
@@ -378,13 +380,10 @@ def rank_episode_search(
                 match["warnings"] + item["quality"]["warnings"], 4,
             )
     items.sort(key=_sort_key)
-    candidate_position = 0
     for rank, item in enumerate(items, start=1):
         item["quality"]["rank"] = rank
+        # 提交序号由冻结快照统一签发，排序名次不能冒充候选位置。
         item.pop("position", None)
-        if item["quality"]["eligible"]:
-            candidate_position += 1
-            item["position"] = candidate_position
     ranked_data["items"] = items
 
     eligible = [item for item in items if item["quality"]["eligible"]]
@@ -413,7 +412,6 @@ def rank_episode_search(
         "requires_confirmation": True,
         "prepare_tool": "ingest.submit",
         "supported_targets": ["qb", "guangya", "both"],
-        "candidate_position": 1 if selected_summary else None,
         "note": "当前仅生成建议；提交前将按当前会话候选序号重新校验资源和下载目标。",
     }
     return ranked_data

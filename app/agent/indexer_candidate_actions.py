@@ -248,7 +248,9 @@ class IndexerCandidateActions:
         position = int(arguments["position"])
         if position > len(candidates):
             raise AgentToolError(
-                "最近资源候选中没有这个序号", code="precondition_failed"
+                f"该快照只有 {len(candidates)} 项可提交候选，序号 {position} 不存在；"
+                "请使用 candidate_numbers 的 position，集号和排序名次不是提交序号。",
+                code="precondition_failed"
             )
         candidate = candidates[position - 1]
         result_id = str(candidate.get("result_id") or "").strip()
@@ -275,7 +277,8 @@ class IndexerCandidateActions:
         for position in arguments["positions"]:
             if int(position) > len(candidates):
                 raise AgentToolError(
-                    f"最近资源候选中没有第 {position} 项",
+                    f"该快照只有 {len(candidates)} 项可提交候选，序号 {position} 不存在；"
+                    "请使用 candidate_numbers 的 position，集号和排序名次不是提交序号。",
                     code="precondition_failed",
                 )
             candidate = candidates[int(position) - 1]

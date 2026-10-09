@@ -39,7 +39,7 @@ def _patrol_result() -> ToolResult:
 
 
 def _resource_result() -> ToolResult:
-    return ToolResult(
+    result = ToolResult(
         True,
         "completed",
         "搜索完成",
@@ -66,6 +66,10 @@ def _resource_result() -> ToolResult:
             },
         },
     )
+
+    candidate = result.data["search"]["recommendation"]["selected"]
+    result.data["search"]["items"] = [{**candidate, "quality": {key: candidate[key] for key in ("rank", "score", "confidence", "match")} | {"eligible": True}}]
+    return result
 
 
 def _generic_resource_result() -> ToolResult:
@@ -725,7 +729,7 @@ class AgentSessionContextRepositoryTests(IsolatedDatabaseTestCase):
         search_ids = []
         for index in range(5):
             result = _resource_result()
-            selected = result.data["search"]["recommendation"]["selected"]
+            selected = result.data["search"]["items"][0]
             selected["result_id"] = f"resource-result-{index}"
             selected["title"] = f"Example.S02E{index + 1:02d}.1080p"
             search_ids.append(store.capture(owner="session-bounded", result=result))

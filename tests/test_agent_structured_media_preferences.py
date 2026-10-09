@@ -285,7 +285,8 @@ def test_missing_resource_domain_wrapper_consumes_owner_profile_before_reference
             snapshot = next(ref.value for ref in result.references if ref.kind == "resource_candidates")
             assert snapshot["candidates"][0]["result_id"] == expected
             assert snapshot["candidates"][0]["position"] == 1
-            assert search["items"][0]["position"] == 1
+            assert "position" not in search["items"][0]
+            assert search["items"][0]["quality"]["rank"] == 1
             assert runtime.capture_search.call_args.kwargs["owner"] == owner
             assert runtime.capture_search.call_args.kwargs["result"] is result
             if owner == "viewer":

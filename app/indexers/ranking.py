@@ -130,7 +130,7 @@ def rank_item(
         reasons.append("year_conflict")
 
     if media is not None and (media.season is not None or media.episode is not None):
-        position = parse_indexer_release_position(item.title)
+        position = parse_indexer_release_position(item.title, media_title=media.title)
         position_match = classify_episode_position(
             source_season=position.get("season"),
             source_episode=position.get("episode"),

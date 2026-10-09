@@ -538,18 +538,15 @@ def _safe_snapshot(result: ToolResult) -> dict[str, Any]:
         search_data,
         verification_context,
     ) in search_entries:
-        recommendation = search_data.get("recommendation")
-        if not isinstance(recommendation, dict):
-            continue
-        raw_candidates = [recommendation.get("selected")]
-        alternatives = recommendation.get("alternatives")
-        if isinstance(alternatives, list):
-            raw_candidates.extend(alternatives[:3])
-        for raw in raw_candidates:
+        raw_candidates = search_data.get("items")
+        for raw in raw_candidates[:50] if isinstance(raw_candidates, list) else []:
             if len(candidates) >= _MAX_CANDIDATES:
                 break
+            quality = raw.get("quality") if isinstance(raw, dict) else None
+            if not isinstance(quality, dict) or quality.get("eligible") is not True:
+                continue
             projected = _safe_candidate(
-                raw,
+                {**raw, **quality},
                 season=season,
                 episode=episode,
                 episode_label=episode_label,

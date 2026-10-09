@@ -135,8 +135,9 @@ class SearchThenAnswerModel:
 
 
 class SubmitFromHistoryModel:
-    def __init__(self) -> None:
+    def __init__(self, position: int = 1) -> None:
         self.resource_candidates_ref = ""
+        self.position = position
 
     async def stream(
         self, request: ModelRequest, *, cancellation
@@ -152,7 +153,7 @@ class SubmitFromHistoryModel:
                 {
                     "source_type": "resource_candidates",
                     "target": "guangya",
-                    "positions": [1],
+                    "positions": [self.position],
                     "resource_candidates_ref": self.resource_candidates_ref,
                 },
             ),
@@ -164,13 +165,13 @@ async def _collect(stream) -> list:
     return [event async for event in stream]
 
 
-def _runtime(model):
+def _runtime(model, search_result=None):
     resource_store = RecentResourceCandidateStore()
     ingest_store = AgentIngestSessionStore()
     specs = {spec.name: spec for spec in build_tool_specs(resource_store, ingest_store)}
     search_spec = replace(
         specs["indexer.search_resources"],
-        handler=lambda _arguments: _search_result(),
+        handler=lambda _arguments: search_result if search_result is not None else _search_result(),
     )
     catalog = catalog_from_tool_specs((search_spec, specs["ingest.submit"]))
     state = InMemorySessionStateStore()
@@ -428,6 +429,36 @@ class AgentKernelResourceIngestTests(unittest.IsolatedAsyncioTestCase):
             {"result_id": "green-lantern-4k-001", "target": "guangya"},
             "green-lantern-4k-001:guangya",
         )
+
+    @patch("app.agent.indexer_candidate_actions.submit_resource_confirmed")
+    @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
+    async def test_review_seventh_candidate_survives_followup_and_only_previews(self, prepare_resource, submit_resource):
+        from app.agent.resource_recommendation import rank_episode_search
+        from app.agent.recent_resource_candidates import attach_resource_candidate_reference
+        items = [{"result_id": f"review-resource-{number:04d}", "title": f"理想禁区 {number:02d} 黑历史 1080P",
+                  "site_id": "mikan", "site_name": "Mikan", "download_state": "ready", "download_kinds": ["magnet"]}
+                 for number in range(1, 12)]
+        result = ToolResult(True, "success", "找到11项待核对资源", data={
+            "verification": {"title": "理想禁区", "tmdb_id": "74088", "season": 1, "episode": 7, "as_of": "2026-10-01", "verified_missing": True},
+            "search": rank_episode_search({"items": items}, season=1, episode=7),
+        })
+        attach_resource_candidate_reference(result)
+        first, pipeline, store = _runtime(SearchThenAnswerModel(), result)
+        events = await _collect(first.run(AgentInput(message="查找理想禁区第7集资源", owner="o", session_id="s")))
+        completed = next(e.payload["result"] for e in events if e.type is AgentEventType.TOOL_COMPLETED)
+        self.assertIsNone(completed["candidate_view"])
+        prepare_resource.return_value = (ToolResult(True, "confirmation_required", "预览第7项", data={"resource": {"title": items[6]["title"]}}), "seventh-context")
+        followup = AgentSession(model=SubmitFromHistoryModel(7), catalog=first.catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=store)
+        output = await _collect(followup.run(AgentInput(message="已核对候选7的集号，请预览到光鸭", owner="o", session_id="s")))
+        self.assertFalse(any(e.type is AgentEventType.TOOL_FAILED for e in output))
+        plan = next(e.payload["plan"] for e in output if e.type is AgentEventType.EFFECT_APPROVAL_REQUIRED)
+        self.assertTrue(plan["plan_id"])
+        prepare_resource.assert_called_once_with({"result_id": "review-resource-0007", "target": "guangya"})
+        submit_resource.assert_not_called()
+        state = await store.load(owner="o", session_id="s")
+        model_text = "\n".join(str(m) for m in state.conversation)
+        self.assertIn("candidate_numbers=", model_text)
+        self.assertNotIn("recommended_ingest_arguments=", model_text)
 
     @patch("app.agent.indexer_candidate_actions.prepare_submit_resource")
     async def test_followup_turn_reuses_persisted_resource_reference(

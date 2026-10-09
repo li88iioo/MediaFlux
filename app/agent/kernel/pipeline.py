@@ -822,12 +822,10 @@ class ToolPipeline:
                 separators=(",", ":"),
             )
         )
-        numbered_items = candidate_view["items"] if candidate_view else [
-            item for item in candidate_items if not item.get("requested_episode")
-        ]
+        numbered_items = candidate_view["items"] if candidate_view else candidate_items
         if numbered_items:
             model_content += "\ncandidate_numbers=" + json.dumps([
-                {key: item[key] for key in ("position", "title", "coverage", "media_title", "requested_episode")}
+                {key: item[key] for key in ("position", "title", "coverage", "media_title", "requested_episode", "match")}
                 for item in numbered_items
             ], ensure_ascii=False, separators=(",", ":"))
             if candidate_view and candidate_view["recommended_positions"]:

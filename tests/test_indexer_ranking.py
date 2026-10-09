@@ -19,6 +19,14 @@ class IndexerRankingTests(unittest.TestCase):
             published_at=datetime(2026, 8, 26, tzinfo=timezone.utc),
         )
 
+    def test_captioned_episode_is_ranked_before_truncating_search_results(self):
+        from app.indexers.ranking import candidate_sort_key
+        media = IndexerMediaSearchRequest.create(title="理想禁区", media_type="tv", season=1, episode=7)
+        items = [rank_item(self._item(f"【国产】理想禁区 {n:02d} 分集标题 1080P"), media=media, fallback_query=media.title) for n in range(1, 12)]
+        ranked = sorted(enumerate(items), key=lambda entry: candidate_sort_key((0, entry[0], entry[1]), "relevance_desc"))
+        self.assertEqual(ranked[0][0], 6)
+        self.assertGreater(ranked[0][1].relevance_score, ranked[1][1].relevance_score)
+
     def test_match_priority_separates_identity_from_popularity_and_year_conflicts(self):
         media = IndexerMediaSearchRequest.create(title="起义", original_title="The Uprising", year=2026)
         cases = [

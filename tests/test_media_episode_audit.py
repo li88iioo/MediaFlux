@@ -376,6 +376,8 @@ class EpisodeAuditTests(unittest.TestCase):
         self.assertEqual(result.data["missing_count"], 0)
         self.assertNotIn("resource_followups", result.data)
 
+        self.assertEqual(result.effect_metadata["episode_mapping_context"]["detail"]["name"], "The Show")
+
     def test_unmapped_local_inventory_uses_strict_title_year_tmdb_fallback(self):
         source = {
             **_ready([(1, 1)]),

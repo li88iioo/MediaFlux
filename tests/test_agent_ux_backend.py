@@ -905,7 +905,8 @@ def test_missing_episode_search_without_verified_coverage_does_not_issue_a_card(
             result = await pipeline.execute("indexer.search_resources", {"title": "仙逆"}, context=context)
         assert result.outcome.public_content["candidate_view"] is None
         assert result.outcome.public_content["summary"] == "已检索,缺集覆盖仍需核对"
-        assert "candidate_numbers=" not in result.outcome.model_content
+        assert "candidate_numbers=" in result.outcome.model_content
+        assert "recommended_ingest_arguments=" not in result.outcome.model_content
         state = await states.load(owner=OWNER, session_id=SESSION)
         assert state.metadata[CANDIDATE_VIEW_KEY] is None
         assert await current_candidate_view(state=state, store=store) is None

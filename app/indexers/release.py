@@ -62,7 +62,7 @@ def _first_int(match: re.Match[str] | None) -> int | None:
     return None
 
 
-def parse_indexer_release_position(value: str) -> dict[str, int | None]:
+def parse_indexer_release_position(value: str, *, media_title: str = "") -> dict[str, int | None]:
     """Extract season/episode/range from an indexer release title.
 
     Compared with :func:`app.modules.scraper.parse_release_position`, this also binds a season
@@ -113,6 +113,18 @@ def parse_indexer_release_position(value: str) -> dict[str, int | None]:
             complete_end = _first_int(complete_match)
             if _valid_episode(complete_end) is not None:
                 episode, episode_end = 1, complete_end
+
+    # 站点可把集名放在裸集号后。只有已核对作品名恰好位于编号前，才采用此格式；
+    # 不把作品名自身的数字、年份或清晰度猜成集号，也不补造季号。
+    known_title = unicodedata.normalize("NFKC", str(media_title or "")).strip()
+    if episode is None and known_title:
+        captioned = re.search(
+            rf"(?:^|[\s\]】]){re.escape(known_title)}\s+(0*[1-9]\d{{0,2}})(?!\d)\s+(?=[\u3400-\u9fff])",
+            text,
+            re.IGNORECASE,
+        )
+        if captioned:
+            episode = _valid_episode(int(captioned.group(1)))
 
     return {
         "season": _valid_season(season),

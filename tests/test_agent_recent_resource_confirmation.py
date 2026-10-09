@@ -61,7 +61,7 @@ def _single_result(*candidates: dict) -> ToolResult:
                 "sources": [{"path": "/secret/library"}],
             },
             "search": {
-                "items": [{"private_url": "https://secret.example"}],
+                "items": [{**item, "quality": {**item, "eligible": True}} for item in candidates],
                 "recommendation": {
                     "selected": selected,
                     "alternatives": list(candidates[1:]),
@@ -98,6 +98,7 @@ def _season_result(*candidates: dict) -> ToolResult:
                     "episode": 3,
                     "episode_label": "S02E03",
                     "search": {
+                        "items": [{**item, "quality": {**item, "eligible": True}} for item in candidates],
                         "recommendation": {
                             "selected": candidates[0] if candidates else None,
                             "alternatives": list(candidates[1:]),
@@ -111,6 +112,36 @@ def _season_result(*candidates: dict) -> ToolResult:
 
 
 class RecentResourceCandidateStoreTests(unittest.TestCase):
+    def test_review_search_freezes_all_numbered_candidates_not_only_top_four(self):
+        from app.agent.resource_recommendation import rank_episode_search
+        items = [dict(result_id=f"review-resource-{number:04d}", title=f"理想禁区 {number:02d} 黑历史 1080P",
+                      site_id="mikan", site_name="Mikan", download_state="ready", download_kinds=["magnet"])
+                 for number in range(1, 12)]
+        ranked = rank_episode_search({"items": items}, season=1, episode=7)
+        result = _single_result()
+        result.data["verification"].update(season=1, episode=7)
+        result.data["search"] = ranked
+        attach_resource_candidate_reference(result)
+        snapshot = restore_resource_candidate_reference(result.references[0].value)
+        eligible = [item for item in ranked["items"] if item["quality"]["eligible"]]
+        self.assertEqual(len(eligible), 11)
+        self.assertEqual([item["result_id"] for item in snapshot["candidates"]], [item["result_id"] for item in eligible])
+        self.assertEqual([item["position"] for item in snapshot["candidates"]], list(range(1, 12)))
+        self.assertEqual(snapshot["candidates"][6]["title"], "理想禁区 07 黑历史 1080P")
+        self.assertTrue(all(item["match"] == "unknown" for item in snapshot["candidates"]))
+
+    def test_snapshot_limit_dedup_and_ineligible_filter_keep_dense_positions(self):
+        candidates = [_candidate(f"bounded-resource-{i:03d}", rank=i + 1) for i in range(15)]
+        result = _single_result(*candidates)
+        result.data["search"]["items"].insert(0, result.data["search"]["items"][0])
+        result.data["search"]["items"][3]["quality"]["eligible"] = False
+        attach_resource_candidate_reference(result)
+        snapshot = restore_resource_candidate_reference(result.references[0].value)
+        self.assertEqual(len(snapshot["candidates"]), 12)
+        self.assertEqual([item["position"] for item in snapshot["candidates"]], list(range(1, 13)))
+        self.assertEqual(len({item["result_id"] for item in snapshot["candidates"]}), 12)
+        self.assertNotIn("bounded-resource-002", [item["result_id"] for item in snapshot["candidates"]])
+
     def test_private_reference_restores_verified_candidate_after_process_restart(self):
         original_store = IndexerResultStore()
         result_id = original_store.put(

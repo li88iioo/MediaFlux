@@ -50,7 +50,7 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertFalse(ranked["items"][-1]["quality"]["eligible"])
         self.assertEqual(
             [item.get("position") for item in ranked["items"]],
-            [1, 2, None],
+            [None, None, None],
         )
         self.assertTrue(any("冲突" in warning for warning in ranked["items"][-1]["quality"]["warnings"]))
         self.assertEqual(ranked["recommendation"]["status"], "recommended")
@@ -88,6 +88,17 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertEqual(order_one, ["alpha-result-id-001", "beta-result-id-0001"])
         self.assertEqual(order_one, order_two)
 
+    def test_captioned_episode_uses_verified_title_without_inventing_a_season(self):
+        source = {"items": [_item(f"captioned-result-{episode:03d}", f"【国产】理想禁区 {episode:02d} 分集标题 1080P") for episode in range(1, 12)]}
+        unknown = rank_episode_search(source, season=1, episode=7)
+        self.assertEqual(unknown["recommendation"]["status"], "review_required")
+        proved = rank_episode_search(source, season=1, episode=7, mapping_context={"detail": {"name": "理想禁区"}, "season_detail": {}})
+        self.assertEqual(proved["recommendation"]["status"], "recommended")
+        self.assertEqual(proved["recommendation"]["selected"]["result_id"], "captioned-result-007")
+        self.assertEqual(sum(item["quality"]["match"] == "exact_episode" for item in proved["items"]), 1)
+        later = rank_episode_search(source, season=2, episode=7, mapping_context={"detail": {"name": "理想禁区"}, "season_detail": {}})
+        self.assertNotEqual(later["recommendation"]["status"], "recommended")
+
     def test_season_pack_requires_review_and_never_auto_submits(self):
         source = {"items": [
             _item("season-pack-id-0001", "示例剧 S02 Complete 1080p BluRay", state="resolvable", seeders=10)
@@ -104,7 +115,7 @@ class ResourceRecommendationTests(unittest.TestCase):
         self.assertFalse(ranked["download_plan"]["auto_submit"])
         self.assertTrue(ranked["download_plan"]["requires_confirmation"])
         self.assertEqual(ranked["download_plan"]["prepare_tool"], "ingest.submit")
-        self.assertEqual(ranked["download_plan"]["candidate_position"], 1)
+        self.assertNotIn("candidate_position", ranked["download_plan"])
 
     def test_exact_episode_marker_wins_over_ambiguous_complete_tag(self):
         ranked = rank_episode_search({"items": [
@@ -253,7 +264,7 @@ class ResourceRecommendationTests(unittest.TestCase):
 
         self.assertEqual(unavailable["recommendation"]["status"], "no_downloadable_candidate")
         self.assertIsNone(unavailable["recommendation"]["selected"])
-        self.assertIsNone(unavailable["download_plan"]["candidate_position"])
+        self.assertNotIn("candidate_position", unavailable["download_plan"])
         self.assertEqual(invalid_handle["recommendation"]["status"], "no_downloadable_candidate")
         self.assertFalse(invalid_handle["items"][0]["quality"]["eligible"])
         self.assertTrue(any(
