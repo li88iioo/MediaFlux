@@ -1059,66 +1059,59 @@ def _telegram_model_page(
     start = page * _TELEGRAM_MODEL_PAGE_SIZE
     visible = models[start : start + _TELEGRAM_MODEL_PAGE_SIZE]
     lines = [
-        "<b>Media Agent · 当前会话模型</b>",
-        f"当前会话模型：<code>{html.escape(current_model)}</code>",
-        f"全局默认模型：<code>{html.escape(settings.model)}</code>",
-        "选择只对这个会话的后续回合生效；正在执行或已确认的任务不会被切换中断。",
+        "<b>⚙️ 模型配置</b>",
+        f"当前模型：<code>{html.escape(current_model)}</code>",
+        f"当前渠道 · 第 {start + 1 if visible else 0}–{start + len(visible)} 项，共 {len(models)} 项",
         f"可选模型（{page + 1}/{page_count}）：",
+        "仅切换当前会话，下一轮生效。",
     ]
-    markup = telebot_module.types.InlineKeyboardMarkup(row_width=1)
-    for index, model_id in enumerate(visible):
-        marker = "✓ " if model_id == current_model else ""
-        label = f"{marker}{model_id}"
-        if len(label) > 60:
-            label = label[:59] + "…"
+    markup = telebot_module.types.InlineKeyboardMarkup(row_width=2)
+
+    def button(label: str, action: str, *, model_id: str = "", target_page: int = page):
         token = create_model_callback(
-            owner,
-            session_id,
-            message_thread_id,
-            action="select",
-            model_id=model_id,
-            page=page,
+            owner, session_id, message_thread_id,
+            action=action, model_id=model_id, page=target_page,
         )
-        markup.add(
-            telebot_module.types.InlineKeyboardButton(
-                label, callback_data=f"tgm:{token}"
-            )
-        )
+        return telebot_module.types.InlineKeyboardButton(label, callback_data=f"tgm:{token}")
+
+    buttons = []
+    for model_id in visible:
+        label = f"{'✓ ' if model_id == current_model else ''}{model_id}"
+        buttons.append(button(label if len(label) <= 60 else label[:59] + "…", "select", model_id=model_id))
+    for index in range(0, len(buttons), 2):
+        markup.add(*buttons[index:index + 2])
     if page_count > 1:
         navigation = []
-        for label, target_page in (
-            ("‹ 上一页", page - 1),
-            ("下一页 ›", page + 1),
-        ):
-            if 0 <= target_page < page_count:
-                token = create_model_callback(
-                    owner,
-                    session_id,
-                    message_thread_id,
-                    action="page",
-                    page=target_page,
-                )
-                navigation.append(
-                    telebot_module.types.InlineKeyboardButton(
-                        label, callback_data=f"tgm:{token}"
-                    )
-                )
+        if page > 0:
+            navigation.append(button("◀ 上一页", "page", target_page=page - 1))
+        else:
+            navigation.append(button(f"{page + 1}/{page_count}", "page"))
+        if page + 1 < page_count:
+            navigation.append(button("下一页 ▶", "page", target_page=page + 1))
+        else:
+            navigation.append(button(f"{page + 1}/{page_count}", "page"))
         markup.add(*navigation)
+    footer = [button("✕ 取消", "cancel")]
+    if page > 0:
+        footer.insert(0, button("◀ 返回首页", "page", target_page=0))
+    markup.add(*footer)
     body = "\n".join(lines)
+    if not visible:
+        body += "\n当前渠道没有返回可选模型。"
     if edit:
         bot.edit_message_text(
             body,
             source.chat.id,
             source.message_id,
             parse_mode="HTML",
-            reply_markup=markup if visible else None,
+            reply_markup=markup,
         )
     else:
         bot.reply_to(
             source,
-            body if visible else body + "\n当前渠道没有返回可选模型。",
+            body,
             parse_mode="HTML",
-            reply_markup=markup if visible else None,
+            reply_markup=markup,
             **_thread_kwargs(source),
         )
 
@@ -1202,21 +1195,41 @@ def handle_agent_model_callback(
                 "无法刷新当前渠道模型列表，请重新发送 /model。",
                 source.chat.id,
                 source.message_id,
-                reply_markup=None,
+                reply_markup=telebot_module.types.InlineKeyboardMarkup(),
             )
         return
-    model_id = str(route.get("model_id") or "")
-    set_telegram_model_preference(owner, session_id, model_id)
-    bot.answer_callback_query(call.id, "已保存，下一轮生效")
-    bot.edit_message_text(
-        "<b>当前会话模型已更新</b>\n"
-        f"模型：<code>{html.escape(model_id)}</code>\n"
-        "从下一轮开始生效；正在执行或已确认的任务不会被中断。",
-        source.chat.id,
-        source.message_id,
-        parse_mode="HTML",
-        reply_markup=None,
-    )
+    if action == "select":
+        model_id = str(route.get("model_id") or "")
+        try:
+            set_telegram_model_preference(owner, session_id, model_id)
+        except Exception as exc:
+            logger.warning("Telegram 会话模型保存失败 type=%s", type(exc).__name__)
+            bot.answer_callback_query(call.id, "模型切换失败，请重试", show_alert=True)
+            return
+        body = (
+            "<b>当前会话模型已更新</b>\n"
+            f"模型：<code>{html.escape(model_id)}</code>\n"
+            "从下一轮开始生效；正在执行的任务不会被中断。"
+        )
+        notice = "已保存，下一轮生效"
+    else:
+        body = "已取消模型选择，当前会话模型未改变。"
+        notice = "已取消，模型未改变"
+    try:
+        edited = bot.edit_message_text(
+            body, source.chat.id, source.message_id, parse_mode="HTML",
+            reply_markup=telebot_module.types.InlineKeyboardMarkup(),
+        )
+        if edited is False:
+            raise RuntimeError("Telegram 未确认模型菜单更新")
+    except Exception as exc:
+        logger.warning("Telegram 模型菜单关闭失败 type=%s", type(exc).__name__)
+        bot.answer_callback_query(
+            call.id, ("模型已保存" if action == "select" else "模型未改变")
+            + "，但按钮消息更新失败；请重新发送 /model 查看。", show_alert=True,
+        )
+        return
+    bot.answer_callback_query(call.id, notice)
 
 
 def _stop_agent_summary(result: dict[str, Any]) -> str:

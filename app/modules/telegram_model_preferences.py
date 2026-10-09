@@ -75,7 +75,7 @@ def create_model_callback(
     normalized_thread = str(thread_id or "").strip()
     if normalized_thread and not _THREAD_RE.fullmatch(normalized_thread):
         raise ValueError("Telegram model callback topic is invalid")
-    if action not in {"select", "page"}:
+    if action not in {"select", "page", "cancel"}:
         raise ValueError("Telegram model callback action is invalid")
     normalized_model = normalize_provider_model_id(model_id)
     if action == "select" and not normalized_model:
@@ -120,7 +120,7 @@ def resolve_model_callback(
         or not _expiry_is_live(route.get("expires_at"))
         or str(route.get("thread_id") or "") != str(thread_id or "")
         or route.get("channel") != _channel_fingerprint()
-        or route.get("action") not in {"select", "page"}
+        or route.get("action") not in {"select", "page", "cancel"}
         or not isinstance(route.get("session_id"), str)
     ):
         return None

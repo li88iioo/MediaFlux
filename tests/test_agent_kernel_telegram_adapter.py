@@ -919,6 +919,97 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("无法确认任务已停止", unknown_summary)
         self.assertNotIn("停止状态已返回", unknown_summary)
 
+    def test_model_menu_has_two_columns_eight_models_and_cancellation(self):
+        import telebot
+        settings = types.SimpleNamespace(api_url="https://provider.example/v1", api_key="key", protocol="auto", model="model-2")
+        bot = FakeBot()
+        with (
+            patch("app.agent.kernel.provider_model.ProviderSettings.from_config", return_value=settings),
+            patch("app.agent.model_catalog.fetch_ai_models", new=AsyncMock(return_value=[f"model-{i}" for i in range(26)])),
+            patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value=""),
+            patch("app.modules.telegram_model_preferences.create_model_callback", return_value="abcdefgh"),
+        ):
+            adapter._telegram_model_page(bot, telebot, Message("/model"), owner="o", session_id="s", message_thread_id=41)
+        text, kwargs = bot.replies[-1]
+        rows = kwargs["reply_markup"].to_dict()["inline_keyboard"]
+        self.assertEqual([len(row) for row in rows[:4]], [2, 2, 2, 2])
+        self.assertEqual(rows[1][0]["text"], "✓ model-2")
+        self.assertEqual([button["text"] for button in rows[4]], ["1/4", "下一页 ▶"])
+        self.assertEqual(rows[-1][0]["text"], "✕ 取消")
+        self.assertIn("共 26 项", text)
+
+    def test_model_menu_empty_and_final_page_remain_navigable(self):
+        import telebot
+        for models, page in (([], 0), ([f"model-{i}" for i in range(26)], 3)):
+            with self.subTest(count=len(models)):
+                bot = FakeBot()
+                settings = types.SimpleNamespace(api_url="https://provider.example/v1", api_key="key", protocol="auto", model="default")
+                with (
+                    patch("app.agent.kernel.provider_model.ProviderSettings.from_config", return_value=settings),
+                    patch("app.agent.model_catalog.fetch_ai_models", new=AsyncMock(return_value=models)),
+                    patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value=""),
+                    patch("app.modules.telegram_model_preferences.create_model_callback", return_value="abcdefgh"),
+                ):
+                    adapter._telegram_model_page(bot, telebot, Message("/model"), owner="o", session_id="s", message_thread_id=41, page=page, edit=True)
+                rows = bot.edits[-1][3]["reply_markup"].to_dict()["inline_keyboard"]
+                if not models:
+                    self.assertIn("没有返回可选模型", bot.edits[-1][0])
+                    self.assertEqual(rows[0][0]["text"], "✕ 取消")
+                else:
+                    self.assertEqual([b["text"] for b in rows[0]], ["model-24", "model-25"])
+                    self.assertEqual([b["text"] for b in rows[-1]], ["◀ 返回首页", "✕ 取消"])
+                    self.assertEqual([b["text"] for b in rows[-2]], ["◀ 上一页", "4/4"])
+
+    def test_empty_keyboard_is_explicitly_serialized_by_telegram_sdk(self):
+        import json
+        import telebot
+        with patch("telebot.apihelper._make_request", return_value=True) as send:
+            telebot.TeleBot("12345:test").edit_message_text("已取消", chat_id=42, message_id=1, reply_markup=telebot.types.InlineKeyboardMarkup())
+        self.assertEqual(json.loads(send.call_args.kwargs["params"]["reply_markup"]), {"inline_keyboard": []})
+
+    def test_model_selection_and_cancel_explicitly_remove_the_keyboard(self):
+        import telebot
+        for action in ("select", "cancel"):
+            with self.subTest(action=action):
+                bot = FakeBot()
+                call = Call("tgm:abcdefgh", Message("/model"))
+                access = self._patch_access()
+                with (
+                    access[0], access[1], access[2],
+                    patch("app.modules.telegram_model_preferences.resolve_model_callback", return_value={"session_id": "topic-session", "action": action, "model_id": "model-2"}),
+                    patch("app.modules.telegram_model_preferences.set_telegram_model_preference") as save,
+                ):
+                    adapter.handle_agent_model_callback(bot, call, telebot)
+                self.assertEqual(bot.edits[-1][3]["reply_markup"].to_dict(), {"inline_keyboard": []})
+                if action == "select":
+                    save.assert_called_once_with(adapter.telegram_agent_owner(call.message.chat.id, call.from_user.id), "topic-session", "model-2")
+                    self.assertIn("已更新", bot.edits[-1][0])
+                else:
+                    save.assert_not_called()
+                    self.assertIn("未改变", bot.edits[-1][0])
+
+    def test_model_menu_failure_does_not_claim_success(self):
+        import telebot
+        for failed_stage in ("save", "edit"):
+            with self.subTest(stage=failed_stage):
+                bot = FakeBot()
+                call = Call("tgm:abcdefgh", Message("/model"))
+                access = self._patch_access()
+                with (
+                    access[0], access[1], access[2],
+                    patch("app.modules.telegram_model_preferences.resolve_model_callback", return_value={"session_id": "topic-session", "action": "select", "model_id": "model-2"}),
+                    patch("app.modules.telegram_model_preferences.set_telegram_model_preference", side_effect=RuntimeError("write failed") if failed_stage == "save" else None),
+                    patch.object(bot, "edit_message_text", side_effect=RuntimeError("transport failed")) as edit,
+                ):
+                    adapter.handle_agent_model_callback(bot, call, telebot)
+                self.assertTrue(bot.answers[-1][2]["show_alert"])
+                if failed_stage == "save":
+                    edit.assert_not_called()
+                    self.assertIn("切换失败", bot.answers[-1][1])
+                else:
+                    self.assertIn("模型已保存", bot.answers[-1][1])
+                    self.assertIn("按钮消息更新失败", bot.answers[-1][1])
+
     def test_model_page_uses_fixed_12_second_list_timeout(self):
         message = Message("/model", user_id=7, message_id=44)
         message.message_thread_id = 41

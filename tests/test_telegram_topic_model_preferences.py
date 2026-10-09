@@ -348,6 +348,14 @@ class TelegramTopicAndModelPreferenceTests(unittest.TestCase):
                     )
         self.assertEqual(normalize_provider_model_id("  model-a  "), "model-a")
 
+    def test_model_cancel_callback_is_bound_to_the_original_topic(self) -> None:
+        with self._channel():
+            token = model_preferences.create_model_callback(self.owner, "session-topic", 41, action="cancel")
+            route = model_preferences.resolve_model_callback(self.owner, token, 41)
+            self.assertEqual(route["action"], "cancel")
+            self.assertEqual(route["session_id"], "session-topic")
+            self.assertIsNone(model_preferences.resolve_model_callback(self.owner, token, 42))
+
     def test_model_callback_cannot_cross_topic_or_provider_channel(self) -> None:
         with self._channel():
             token = model_preferences.create_model_callback(
