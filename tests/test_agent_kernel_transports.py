@@ -90,7 +90,8 @@ class AgentKernelTransportTests(unittest.IsolatedAsyncioTestCase):
                     owner="owner-1", session_id="session-1", plan_id="plan-cancel-test-0001", request_id="request-1",
                 )
 
-    async def test_web_and_telegram_use_the_same_kernel_event_contract(self) -> None:
+    @patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value="")
+    async def test_web_and_telegram_use_the_same_kernel_event_contract(self, _preference) -> None:
         web = WebKernelTransport(make_session())
         web_request = QueryEnvelope(
             owner="owner-1",
@@ -142,7 +143,8 @@ class AgentKernelTransportTests(unittest.IsolatedAsyncioTestCase):
             request.to_agent_input()
 
 class TelegramCancellationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_stop_requested_before_turn_start_is_not_lost(self):
+    @patch("app.modules.telegram_model_preferences.get_telegram_model_preference", return_value="")
+    async def test_stop_requested_before_turn_start_is_not_lost(self, _preference):
         import asyncio
         from app.agent.kernel.state import CancellationToken
         from app.agent.kernel.events import AgentEventType

@@ -15,6 +15,10 @@ from starlette.datastructures import URL
 
 from app import config
 from app.agent.feature_gate import is_agent_enabled
+from app.defaults import (
+    DEFAULT_AGENT_STREAM_DISPLAY_ENABLED,
+    DEFAULT_BOOL_CONFIG_VALUES,
+)
 from app.main import create_app
 from app.routes import strm_api
 from app.routes.api import _validate_agent_llm_updates, get_config, save_config
@@ -62,6 +66,24 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertIn("AGENT_ENABLED:'0'", html)
         self.assertNotIn("AGENT_ENABLED:'1'", html)
 
+    def test_agent_stream_display_defaults_on_for_legacy_config(self):
+        self.assertTrue(DEFAULT_AGENT_STREAM_DISPLAY_ENABLED)
+        self.assertTrue(DEFAULT_BOOL_CONFIG_VALUES["AGENT_STREAM_DISPLAY_ENABLED"])
+        with patch(
+            "app.config.get",
+            side_effect=lambda _key, default="": default,
+        ):
+            self.assertTrue(config.get_bool("AGENT_STREAM_DISPLAY_ENABLED"))
+        with patch("app.routes.api.config.all_items", return_value={}), patch(
+            "app.routes.api.config.has_external_override", return_value=False
+        ), patch(
+            "app.routes.api.config.get",
+            side_effect=lambda _key, default="": default,
+        ):
+            payload = get_config(self._request())
+
+        self.assertEqual(payload["AGENT_STREAM_DISPLAY_ENABLED"], "1")
+
     def test_settings_expose_patrol_and_complete_tavily_controls(self):
         html = (Path("app/templates/settings.html").read_text(encoding="utf-8") + Path("app/static/js/settings.js").read_text(encoding="utf-8"))
         self.assertIn('<div class="card card-pad" id="settingsForm">', html)
@@ -77,6 +99,28 @@ class AgentSettingsUiTests(unittest.TestCase):
         self.assertNotIn('data-lucide="message-circle-check"', html)
         self.assertIn('data-settings-target="agent"', html)
         self.assertIn('data-settings-panel="agent"', html)
+        stream_toggle = '<input type="checkbox" data-key="AGENT_STREAM_DISPLAY_ENABLED" data-bool="1"'
+        self.assertEqual(
+            Path("app/templates/settings.html")
+            .read_text(encoding="utf-8")
+            .count('data-key="AGENT_STREAM_DISPLAY_ENABLED"'),
+            1,
+        )
+        self.assertLess(html.index('id="agent-model-heading"'), html.index(stream_toggle))
+        self.assertLess(html.index(stream_toggle), html.index('data-key="AGENT_LLM_API_URL"'))
+        self.assertIn(
+            'title="关闭后只隐藏 Web 与 Telegram 的模型增量文本；任务仍继续，进度、最终答案和确认不受影响。保存后下一轮生效。"',
+            html,
+        )
+        self.assertIn(
+            '<small title="关闭后只隐藏 Web 与 Telegram 的模型增量文本；任务仍继续，进度、最终答案和确认不受影响。保存后下一轮生效。">Web / Telegram · 下一轮生效</small>',
+            html,
+        )
+        self.assertIn("AGENT_STREAM_DISPLAY_ENABLED:'1'", html)
+        self.assertIn(
+            "const streamDisplayToggle=form.querySelector('[data-key=\"AGENT_STREAM_DISPLAY_ENABLED\"]')",
+            html,
+        )
         for key in (
             "AGENT_LIBRARY_PATROL_ENABLED",
             "AGENT_LIBRARY_PATROL_NOTIFY_ENABLED",
@@ -276,6 +320,7 @@ class AgentSettingsUiTests(unittest.TestCase):
         effective = {
             "TAVILY_API_KEY": "deployment-secret",
             "AGENT_LLM_API_KEY": "llm-deployment-secret",
+            "AGENT_STREAM_DISPLAY_ENABLED": "0",
             "AGENT_LLM_CONTEXT_WINDOW_TOKENS": "262144",
             "AGENT_LLM_MODEL": "deployment-model",
             "AGENT_LIBRARY_PATROL_ENABLED": "1",
@@ -306,6 +351,7 @@ class AgentSettingsUiTests(unittest.TestCase):
 
         self.assertEqual(payload["TAVILY_API_KEY"], "********")
         self.assertEqual(payload["AGENT_LLM_API_KEY"], "********")
+        self.assertEqual(payload["AGENT_STREAM_DISPLAY_ENABLED"], "0")
         self.assertEqual(payload["AGENT_LLM_CONTEXT_WINDOW_TOKENS"], "262144")
         self.assertEqual(payload["AGENT_LLM_MODEL"], "deployment-model")
         self.assertEqual(payload["AGENT_LIBRARY_PATROL_ENABLED"], "1")
@@ -322,6 +368,7 @@ class AgentSettingsUiTests(unittest.TestCase):
                 "AGENT_LLM_API_KEY",
                 "AGENT_LLM_CONTEXT_WINDOW_TOKENS",
                 "AGENT_LLM_MODEL",
+                "AGENT_STREAM_DISPLAY_ENABLED",
                 "DOWNLOAD_TORRENT_RETENTION_DAYS",
                 "GY_STRM_BASE_URL",
                 "PROXY_URL",
@@ -394,6 +441,75 @@ class AgentSettingsUiTests(unittest.TestCase):
         refresh_menu.assert_not_called()
         invalidate.assert_called_once_with()
         invalidate_kernel.assert_called_once_with()
+
+    def test_stream_display_only_save_does_not_invalidate_agent_runtime(self):
+        values = {"AGENT_STREAM_DISPLAY_ENABLED": "1"}
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch("app.routes.api.config.set_and_save") as persist, patch(
+            "app.services.clear_dashboard_cache"
+        ), patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation"
+        ) as invalidate_generation, patch(
+            "app.agent.kernel.bootstrap.invalidate_agent_kernel_runtime"
+        ) as invalidate_kernel:
+            result = save_config(
+                self._request(), {"AGENT_STREAM_DISPLAY_ENABLED": "0"}
+            )
+
+        self.assertEqual(result, {"success": True})
+        persist.assert_called_once_with({"AGENT_STREAM_DISPLAY_ENABLED": "0"})
+        invalidate_generation.assert_not_called()
+        invalidate_kernel.assert_not_called()
+
+    def test_stream_display_mixed_with_agent_config_keeps_runtime_invalidation(self):
+        values = {
+            "AGENT_STREAM_DISPLAY_ENABLED": "1",
+            "AGENT_LLM_MODEL": "old-model",
+        }
+        with patch(
+            "app.routes.api.config.get",
+            side_effect=lambda key, default="": values.get(key, default),
+        ), patch("app.routes.api.config.set_and_save") as persist, patch(
+            "app.services.clear_dashboard_cache"
+        ), patch(
+            "app.agent.feature_gate.invalidate_agent_runtime_generation"
+        ) as invalidate_generation, patch(
+            "app.agent.kernel.bootstrap.invalidate_agent_kernel_runtime"
+        ) as invalidate_kernel:
+            result = save_config(
+                self._request(),
+                {
+                    "AGENT_STREAM_DISPLAY_ENABLED": "0",
+                    "AGENT_LLM_MODEL": "new-model",
+                },
+            )
+
+        self.assertEqual(result, {"success": True})
+        persist.assert_called_once_with(
+            {
+                "AGENT_STREAM_DISPLAY_ENABLED": "0",
+                "AGENT_LLM_MODEL": "new-model",
+            }
+        )
+        invalidate_generation.assert_called_once_with()
+        invalidate_kernel.assert_called_once_with()
+
+    def test_agent_stream_display_boolean_validation(self):
+        for value, expected in (("on", "1"), ("off", "0")):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    _validate_agent_llm_updates(
+                        {"AGENT_STREAM_DISPLAY_ENABLED": value}
+                    ),
+                    {"AGENT_STREAM_DISPLAY_ENABLED": expected},
+                )
+        for value in ("maybe", "", "2"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _validate_agent_llm_updates(
+                    {"AGENT_STREAM_DISPLAY_ENABLED": value}
+                )
 
     def test_agent_llm_context_window_validation(self):
         self.assertEqual(
@@ -949,17 +1065,19 @@ class AgentSettingsUiTests(unittest.TestCase):
         })
 
     def test_config_save_rejects_environment_managed_agent_field(self):
-        with patch(
-            "app.routes.api.config.has_external_override",
-            side_effect=lambda key: key == "TAVILY_TIMEOUT_SECONDS",
-        ), patch("app.routes.api.config.set_and_save") as persist:
-            response = save_config(
-                self._request(), {"TAVILY_TIMEOUT_SECONDS": "12"}
-            )
+        for key, value in (
+            ("TAVILY_TIMEOUT_SECONDS", "12"),
+            ("AGENT_STREAM_DISPLAY_ENABLED", "0"),
+        ):
+            with self.subTest(key=key), patch(
+                "app.routes.api.config.has_external_override",
+                side_effect=lambda candidate, managed=key: candidate == managed,
+            ), patch("app.routes.api.config.set_and_save") as persist:
+                response = save_config(self._request(), {key: value})
 
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("部署环境管理", self._payload(response)["error"])
-        persist.assert_not_called()
+            self.assertEqual(response.status_code, 409)
+            self.assertIn(key, self._payload(response)["error"])
+            persist.assert_not_called()
 
     def test_config_save_rejects_all_environment_managed_ui_fields_early(self):
         for key, value in (

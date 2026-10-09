@@ -135,6 +135,7 @@ def build_agent_kernel_runtime(
         journal=kernel_store,
         limits=_session_limits_from_config(),
         turn_admission=MediaFluxTurnAdmission(),
+        stream_display=lambda: config.get_bool("AGENT_STREAM_DISPLAY_ENABLED"),
     )
     metrics = KernelMetrics()
     lifecycle = AgentSessionLifecycle(

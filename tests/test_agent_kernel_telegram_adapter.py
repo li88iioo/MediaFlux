@@ -9,6 +9,7 @@ from app.agent.kernel.adapters import ApprovalView, TurnView
 from app.agent.kernel.events import AgentEventType, EventFactory
 from app.agent.kernel.state import SessionBusyError
 from app.bot import agent_adapter as adapter
+from app.bot.telegram_markdown import telegram_html_text_length
 
 
 class Button:
@@ -312,6 +313,26 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
             self.assertFalse(adapter.handle_agent_message(bot, TELEBOT, Message()))
         self.assertEqual(bot.replies, [])
 
+    def test_stream_display_toggle_keeps_progress_and_final_reply(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                factory = EventFactory(session_id="s", turn_id="t", request_id="r")
+                transport = FakeTelegramTransport(
+                    TurnView(session_id="s", turn_id="t", request_id="r", status="success", answer="完整结果"),
+                    events=(factory.create(AgentEventType.TURN_STARTED, {"stream_display_enabled": enabled}),
+                            factory.create(AgentEventType.MODEL_STARTED, {"round": 1}),
+                            factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": "仅属于草稿的文字"}),
+                            factory.create(AgentEventType.MODEL_TOOL_CALL, {"tool": "library.search"})),
+                )
+                bot = FakeBot()
+                access = self._patch_access()
+                with access[0], access[1], access[2], patch.object(adapter, "get_agent_kernel_runtime", return_value=types.SimpleNamespace(telegram=transport, store=FakeStore())):
+                    adapter.handle_agent_message(bot, TELEBOT, Message())
+                text = "\n".join(edit[0] for edit in bot.edits)
+                self.assertEqual("仅属于草稿的文字" in text, enabled)
+                self.assertIn("正在查询媒体库", text)
+                self.assertIn("完整结果", bot.edits[-1][0])
+
     def test_query_streams_typing_and_renders_markdown_as_telegram_html(self):
         factory = EventFactory(
             session_id="tg_session",
@@ -440,13 +461,13 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertIn("完成后分段发送", preview)
         self.assertIn("<b>推荐 1</b>", preview)
         self.assertNotIn("<b>推荐 80</b>", preview)
-        self.assertLessEqual(adapter.telegram_html_text_length(preview), adapter._TELEGRAM_MESSAGE_LIMIT)
+        self.assertLessEqual(telegram_html_text_length(preview), adapter._TELEGRAM_MESSAGE_LIMIT)
 
         final_chunks = [bot.edits[-1][0], *(text for _chat, text, _kwargs in bot.sent[1:])]
         self.assertGreater(len(final_chunks), 1)
         self.assertTrue(
             all(
-                adapter.telegram_html_text_length(chunk) <= adapter._MAX_MESSAGE
+                telegram_html_text_length(chunk) <= adapter._MAX_MESSAGE
                 for chunk in final_chunks
             )
         )
@@ -507,7 +528,7 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         )
 
         self.assertLessEqual(
-            adapter.telegram_html_text_length(preview),
+            telegram_html_text_length(preview),
             adapter._TELEGRAM_MESSAGE_LIMIT,
         )
         self.assertIn("完成后分段发送", preview)

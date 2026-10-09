@@ -185,6 +185,7 @@ class AgentSession:
         limits: SessionLimits | None = None,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         turn_admission: TurnAdmissionPolicy | None = None,
+        stream_display: Callable[[], bool] | None = None,
     ) -> None:
         if pipeline.catalog is not catalog:
             raise ValueError("AgentSession and ToolPipeline must share one catalog")
@@ -199,6 +200,7 @@ class AgentSession:
         self.journal = journal
         self.limits = limits or SessionLimits()
         self.system_prompt = str(system_prompt or DEFAULT_SYSTEM_PROMPT).strip()
+        self.stream_display = stream_display
         self.turn_admission = turn_admission or AllowAllTurnAdmission()
         # 只串行化极短的“取得 generation + 注册 active turn + 保存安全输入”窗口；
         # 已确认写操作一旦开始就不会被后续聊天抢占。
@@ -591,6 +593,7 @@ class AgentSession:
                 {
                     "channel": agent_input.channel,
                     "generation": lease.generation,
+                    "stream_display_enabled": bool(self.stream_display()) if self.stream_display else True,
                     **({"kind": "confirmation"} if plan_id is not None else {}),
                 },
             )

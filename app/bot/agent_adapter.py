@@ -41,7 +41,6 @@ from app.bot.progress import TelegramProgress, send_typing
 from app.bot.telegram_markdown import (
     render_telegram_markdown,
     split_telegram_html,
-    telegram_html_text_length,
 )
 from app.modules.telegram_write_confirmations import (
     TelegramWriteConfirmationError,
@@ -390,10 +389,15 @@ class _TelegramEventObserver:
         self.last_stream = ""
         self.model_text = ""
         self.visible_text = ""
+        self.stream_display_enabled = True
         self.model_round: int | None = None
         self.active_tool = ""
 
     async def __call__(self, event: AgentEvent) -> None:
+        if event.type is AgentEventType.TURN_STARTED:
+            self.stream_display_enabled = event.payload.get("stream_display_enabled") is not False
+            return
+
         if event.type is AgentEventType.MODEL_STARTED:
             self.model_round = _positive_int(event.payload.get("round"))
             self.model_text = ""
@@ -407,6 +411,8 @@ class _TelegramEventObserver:
             return
 
         if event.type is AgentEventType.MODEL_DELTA:
+            if not self.stream_display_enabled:
+                return
             event_round = _positive_int(event.payload.get("round"))
             if event_round is not None and event_round != self.model_round:
                 self.model_round = event_round

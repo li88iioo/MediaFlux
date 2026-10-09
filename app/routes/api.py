@@ -18,6 +18,7 @@ from app.defaults import (
     DEFAULT_AGENT_EPISODE_RESEARCH_ENABLED,
     DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT,
     DEFAULT_AGENT_LLM_ENABLED,
+    DEFAULT_AGENT_STREAM_DISPLAY_ENABLED,
     DEFAULT_DOWNLOAD_TORRENT_RETENTION_DAYS,
     MAX_DOWNLOAD_TORRENT_RETENTION_DAYS,
 )
@@ -138,6 +139,7 @@ _AGENT_SETTINGS_DEFAULTS = {
     "AGENT_RECOGNITION_REVIEW_ENABLED": "0",
     "AGENT_EPISODE_RESEARCH_ENABLED": "1" if DEFAULT_AGENT_EPISODE_RESEARCH_ENABLED else "0",
     "AGENT_EPISODE_RESEARCH_DAILY_LIMIT": str(DEFAULT_AGENT_EPISODE_RESEARCH_DAILY_LIMIT),
+    "AGENT_STREAM_DISPLAY_ENABLED": str(int(DEFAULT_AGENT_STREAM_DISPLAY_ENABLED)),
     "AGENT_NSFW_CLEAN_REVIEW_ENABLED": "0",
     "AGENT_LIBRARY_PATROL_INTERVAL_HOURS": "24",
     "AGENT_LIBRARY_PATROL_MAX_SERIES": "50",
@@ -192,6 +194,7 @@ _CONFIG_UI_SAVEABLE_KEYS = frozenset({
     *_ORGANIZE_TAVILY_KEYS,
     *_ORGANIZE_POLICY_KEYS,
     *_AGENT_LLM_KEYS,
+    "AGENT_STREAM_DISPLAY_ENABLED",
     *_AGENT_EPISODE_RESEARCH_KEYS,
     *_WEB_SEARCH_KEYS,
     *_NSFW_ORGANIZE_KEYS,
@@ -480,6 +483,10 @@ def _validate_agent_llm_updates(data: dict[str, Any]) -> dict[str, str]:
     if "AGENT_LLM_ENABLED" in data:
         normalized["AGENT_LLM_ENABLED"] = _normalize_discovery_boolean(
             "AGENT_LLM_ENABLED", data["AGENT_LLM_ENABLED"]
+        )
+    if "AGENT_STREAM_DISPLAY_ENABLED" in data:
+        normalized["AGENT_STREAM_DISPLAY_ENABLED"] = _normalize_discovery_boolean(
+            "AGENT_STREAM_DISPLAY_ENABLED", data["AGENT_STREAM_DISPLAY_ENABLED"]
         )
 
     inferred_protocol = ""
@@ -1011,6 +1018,11 @@ def get_config(request: Request):
     # 季集研究是新的独立授权，旧主动复核开关不能隐式开启。
     for key in _AGENT_EPISODE_RESEARCH_KEYS:
         items.setdefault(key, _AGENT_SETTINGS_DEFAULTS[key])
+    # 旧配置缺少该展示偏好时，统一按流式显示开启处理。
+    items.setdefault(
+        "AGENT_STREAM_DISPLAY_ENABLED",
+        _AGENT_SETTINGS_DEFAULTS["AGENT_STREAM_DISPLAY_ENABLED"],
+    )
     # 运行目录只作为缺省值展示；用户保存的 STRM_ROOT（包括显式空值）仍优先。
     items.setdefault("STRM_ROOT", config.get("STRM_ROOT", ""))
     retention_key = "DOWNLOAD_TORRENT_RETENTION_DAYS"
@@ -1484,10 +1496,10 @@ def save_config(request: Request, data: Any = Body(default=None)):
 
             with agent_runtime_transition():
                 retired_source_ids = publish_config_updates()
-                # Agent 的只读结论、行动计划和外部连接都可能依赖项目配置。
-                # 任意真实配置变更均与代次推进共用同一发布窗口，避免新增
-                # 配置项后遗漏白名单，导致旧请求在新配置下迟到发布。
-                invalidate_agent_runtime_generation()
+                # Agent 的只读结论、行动计划和外部连接都可能依赖项目配置；
+                # 纯展示偏好不改变当前回合语义，因此不推进运行代次。
+                if changed_keys - {"AGENT_STREAM_DISPLAY_ENABLED"}:
+                    invalidate_agent_runtime_generation()
                 if _AGENT_LLM_KEYS & changed_keys:
                     from app.agent.kernel.bootstrap import (
                         invalidate_agent_kernel_runtime,

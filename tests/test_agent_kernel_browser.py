@@ -375,6 +375,48 @@ class AgentKernelBrowserTests(unittest.TestCase):
         self.assertIn("/api/agent/query", paths)
         self.assertFalse(any("/tools/" in path or "/prepare" in path for path in paths))
 
+    def test_stream_display_off_still_shows_confirmation_buttons(self) -> None:
+        plan = {"plan_id": "plan-stream-display-test-0001", "tool_name": "download.pause", "effect": "WRITE",
+                "preview": {"summary": "暂停指定下载"}, "result": {}, "expires_at": ""}
+        page = self.make_page({"sessions": {"sessions": []}, "queryDelayMs": 40, "queryEvents": [
+            _event(1, "turn.started", {"stream_display_enabled": False}),
+            _event(2, "model.started", {"round": 1}),
+            _event(3, "model.delta", {"round": 1, "delta": "未完成的准备文字"}),
+            _event(4, "effect.approval_required", {"plan": plan}),
+            _event(5, "turn.completed", {"status": "approval_required"}),
+        ]})
+        page.locator("#agentPrompt").fill("暂停下载")
+        page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+        card = page.locator(".agent-confirmation-card")
+        card.wait_for()
+        self.assertIn("暂停指定下载", card.inner_text())
+        self.assertTrue(card.locator("[data-effect-confirm]").is_visible())
+        self.assertNotIn("未完成的准备文字", page.locator("#agentTranscript").inner_text())
+
+    def test_stream_display_toggle_hides_only_incremental_body(self) -> None:
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                page = self.make_page({"sessions": {"sessions": []}, "queryDelayMs": 120, "queryEvents": [
+                    _event(1, "turn.started", {"kind": "query", "stream_display_enabled": enabled}),
+                    _event(2, "model.started", {"round": 1}),
+                    _event(3, "model.delta", {"round": 1, "delta": "尚未完成的草稿"}),
+                    _event(4, "model.tool_call", {"call_id": "call-1", "tool": "library.search", "label": "查询进行中"}),
+                    _event(5, "turn.completed", {"status": "success", "answer": "完整回答已取得"}),
+                ]})
+                page.evaluate("""() => {
+                    window.__streamSnapshots = [];
+                    new MutationObserver(() => window.__streamSnapshots.push(
+                        document.querySelector('#agentTranscript').textContent
+                    )).observe(document.querySelector('#agentTranscript'), {childList:true,characterData:true,subtree:true});
+                }""")
+                page.locator("#agentPrompt").fill("测试显示开关")
+                page.locator("#agentComposer").evaluate("form => form.requestSubmit()")
+                page.locator(".agent-narrative").wait_for()
+                snapshots = page.evaluate("window.__streamSnapshots")
+                self.assertEqual(any("尚未完成的草稿" in text for text in snapshots), enabled)
+                self.assertTrue(any("查询进行中" in text for text in snapshots))
+                self.assertEqual(page.locator(".agent-narrative").inner_text(), "完整回答已取得")
+
     def test_tool_call_preserves_streamed_body_until_terminal_replaces_draft(self) -> None:
         events = [
             _event(1, "turn.started", {"kind": "query"}),

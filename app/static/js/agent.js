@@ -1248,6 +1248,7 @@
         const payload = event?.payload && typeof event.payload === 'object' ? event.payload : {};
         switch (event?.type) {
         case 'turn.started':
+            turn.streamDisplayEnabled = payload.stream_display_enabled !== false;
             if (turn.boundSelection) expireVisibleApprovals();
             setTurnStatus(turn, payload.kind === 'confirmation' ? '正在执行已确认计划' : '正在理解任务');
             break;
@@ -1260,6 +1261,7 @@
             setTurnStatus(turn, turn.currentRound > 1 ? '正在汇总结果' : '正在规划下一步');
             break;
         case 'model.delta': {
+            if (turn.streamDisplayEnabled === false) break;
             const round = Number(payload.round || turn.currentRound || 1);
             const value = `${turn.rounds.get(round) || ''}${String(payload.delta || '')}`;
             turn.rounds.set(round, value);

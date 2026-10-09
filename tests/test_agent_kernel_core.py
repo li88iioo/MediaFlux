@@ -440,6 +440,31 @@ class AgentKernelCrossLoopTests(unittest.TestCase):
 
 
 class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stream_display_is_frozen_per_turn_without_changing_model_events(self):
+        enabled = [False]
+        reads = []
+        def display_setting():
+            reads.append(enabled[0])
+            return enabled[0]
+        class Model:
+            async def stream(self, request, *, cancellation):
+                enabled[0] = True  # 模拟回答生成期间保存了设置。
+                yield ModelEvent(ModelEventType.TEXT_DELTA, text="完整回答")
+                yield ModelEvent(ModelEventType.FINISH, finish_reason="stop")
+        state, catalog = InMemorySessionStateStore(), ToolCatalog([read_tool("library.search")])
+        session = AgentSession(model=Model(), catalog=catalog,
+            retriever=CapabilityRetriever(minimum=1, maximum=1),
+            pipeline=ToolPipeline(catalog=catalog, state_store=state), state_store=state,
+            stream_display=display_setting)
+        for expected in (False, True):
+            events = await collect(session.run(AgentInput(message="你好", owner="owner", session_id="session")))
+            start = next(e for e in events if e.type is AgentEventType.TURN_STARTED)
+            self.assertIs(start.payload["stream_display_enabled"], expected)
+            self.assertTrue(any(e.type is AgentEventType.MODEL_DELTA for e in events))
+            view = await consume_events(_events_stream(events))
+            self.assertEqual((view.status, view.answer), ("success", "完整回答"))
+        self.assertEqual(reads, [False, True])
+
     async def test_confirmed_partial_file_plan_has_factual_answer_without_more_model_calls(self):
         outcomes = [
             {"position": 1, "operation": "rename", "label": "改名：A → A-done", "status": "completed", "completed_actions": ["rename"]},
