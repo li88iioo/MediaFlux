@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import types
 import unittest
 from dataclasses import dataclass
@@ -130,6 +131,7 @@ class FakeTelegramTransport:
         if observe is not None:
             for event in self.events:
                 await observe(event)
+                await asyncio.sleep(0.01)  # 给独立显示发送者真实的调度机会。
         return self.view
 
     async def confirm(self, envelope, *, observe=None):
@@ -137,6 +139,7 @@ class FakeTelegramTransport:
         if observe is not None:
             for event in self.confirm_events:
                 await observe(event)
+                await asyncio.sleep(0.01)  # 给独立显示发送者真实的调度机会。
         if self.confirm_view is not None:
             return self.confirm_view
         return TurnView(
@@ -176,6 +179,9 @@ class FakeLifecycle:
 
 class AgentKernelTelegramAdapterTests(unittest.TestCase):
     def setUp(self):
+        cadence = patch.object(adapter, "_STREAM_EDIT_INTERVAL_SECONDS", 0.001)
+        cadence.start()
+        self.addCleanup(cadence.stop)
         model_preference = patch(
             "app.modules.telegram_model_preferences.get_telegram_model_preference",
             return_value="",
@@ -477,7 +483,6 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertNotIn("正在输出", complete)
 
     def test_stream_keeps_opening_beyond_the_old_720_character_window(self):
-        import asyncio
         from unittest.mock import Mock
         progress = Mock(mode="edit")
         progress.update.return_value = True
@@ -486,40 +491,38 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         first = "正文起点。" + "第一段内容。" * 50
         second = "第二段内容。" * 100
         async def play():
-            await observer(factory.create(AgentEventType.MODEL_STARTED, {"round": 1}))
-            await observer(factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": first}))
-            observer.last_stream_at = 0
-            await observer(factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": second}))
             for typ, payload in (
+                (AgentEventType.MODEL_STARTED, {"round": 1}),
+                (AgentEventType.MODEL_DELTA, {"round": 1, "delta": first}),
+                (AgentEventType.MODEL_DELTA, {"round": 1, "delta": second}),
                 (AgentEventType.MODEL_TOOL_CALL, {"tool": "library.search"}),
                 (AgentEventType.TOOL_COMPLETED, {}),
                 (AgentEventType.MODEL_STARTED, {"round": 2}),
             ):
-                observer.last_status_at = 0
                 await observer(factory.create(typ, payload))
-        asyncio.run(play())
+                await asyncio.sleep(0.02)
+        asyncio.run(observer.consume(play()))
         rendered = [c.args[0] for c in progress.update.call_args_list]
+        self.assertGreater(len(rendered), 1)
         self.assertTrue(all("正文起点。" in text for text in rendered[1:]))
         self.assertIn(first + second, rendered[-1])
         self.assertNotIn("下面显示最新", rendered[-1])
 
     def test_full_preview_is_not_rerendered_for_every_hidden_tail_token(self):
-        import asyncio
         from unittest.mock import Mock
         progress = Mock(mode="edit")
         progress.update.return_value = True
         observer = adapter._TelegramEventObserver(progress)
-        observer.model_text = "正文" * 3000
+        factory = EventFactory(session_id="s", turn_id="t", request_id="r")
         async def play():
-            with patch.object(adapter.time, "monotonic", return_value=10):
-                await observer._publish_stream(force=True)
-            observer.model_text += "继续"
-            with patch.object(adapter.time, "monotonic", return_value=11), patch.object(adapter, "_render_stream_preview", wraps=adapter._render_stream_preview) as render:
-                await observer._publish_stream()
-                observer.model_text += "生成"
-                await observer._publish_stream()
+            await observer(factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": "正文" * 3000}))
+            await asyncio.sleep(0.02)
+            with patch.object(adapter, "_render_stream_preview", wraps=adapter._render_stream_preview) as render:
+                for _ in range(100):
+                    await observer(factory.create(AgentEventType.MODEL_DELTA, {"round": 1, "delta": "继续"}))
+                await asyncio.sleep(0.02)
                 self.assertEqual(render.call_count, 1)
-        asyncio.run(play())
+        asyncio.run(observer.consume(play()))
         self.assertEqual(progress.update.call_count, 1)
 
     def test_stream_overflow_preview_never_exceeds_telegram_hard_limit(self):

@@ -13,6 +13,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Awaitable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import suppress
 from contextvars import ContextVar, copy_context
@@ -378,108 +379,119 @@ class _ExistingMessageProgress(TelegramProgress):
         return super().update(rendered, clear_reply_markup=True)
 
 
+_STREAM_EDIT_INTERVAL_SECONDS = 0.85
+_STREAM_DRAFT_INTERVAL_SECONDS = 0.2
+
+
 class _TelegramEventObserver:
-    """把 Kernel 真实事件流投影到一个 TelegramProgress，不另建状态机。"""
+    """事件投影不等待 Telegram；单个发送者始终取最新合并状态。"""
 
     def __init__(self, progress: Any) -> None:
         self.progress = progress
-        self.last_status_at = 0.0
-        self.last_status = ""
-        self.last_stream_at = 0.0
-        self.last_stream = ""
         self.model_text = ""
-        self.visible_text = ""
-        self.stream_display_enabled = True
         self.model_round: int | None = None
         self.active_tool = ""
+        self.stream_display_enabled = True
+        self._display_text = ""
+        self._status = "正在理解任务…"
+        self._changed = asyncio.Event()
+        self._closing = asyncio.Event()
+        self._sender: asyncio.Task[None] | None = None
+
+    async def consume(self, operation: Awaitable[Any]) -> Any:
+        try:
+            return await operation
+        finally:
+            # 不补播积压草稿；等待真实在途编辑结束后才允许发送终态，
+            # 不能cancel to_thread后让晚到编辑覆盖最终回执。
+            self._closing.set()
+            self._changed.set()
+            if self._sender is not None:
+                try:
+                    await self._sender
+                except Exception as exc:
+                    logger.warning("Telegram Agent 展示发送者退出 type=%s", type(exc).__name__)
 
     async def __call__(self, event: AgentEvent) -> None:
+        if event.type in {AgentEventType.TURN_COMPLETED, AgentEventType.TURN_FAILED, AgentEventType.TURN_CANCELLED}:
+            self._closing.set()
+            self._changed.set()
+            return
+        if self._closing.is_set():
+            return
         if event.type is AgentEventType.TURN_STARTED:
             self.stream_display_enabled = event.payload.get("stream_display_enabled") is not False
             return
-
         if event.type is AgentEventType.MODEL_STARTED:
             self.model_round = _positive_int(event.payload.get("round"))
             self.model_text = ""
-            self.last_stream = ""
-            status = (
-                "正在整理执行结果…"
-                if event.payload.get("phase") == "confirmed_synthesis"
-                else "正在规划下一步…"
-            )
-            await self._publish_status(status)
-            return
-
-        if event.type is AgentEventType.MODEL_DELTA:
+            self._status = "正在整理执行结果…" if event.payload.get("phase") == "confirmed_synthesis" else "正在规划下一步…"
+        elif event.type is AgentEventType.MODEL_DELTA:
             if not self.stream_display_enabled:
                 return
             event_round = _positive_int(event.payload.get("round"))
             if event_round is not None and event_round != self.model_round:
                 self.model_round = event_round
                 self.model_text = ""
-                self.last_stream = ""
             delta = str(event.payload.get("delta") or "")
             if not delta:
                 return
-            first_delta = not self.model_text
             self.model_text += delta
-            await self._publish_stream(force=first_delta)
-            return
+            self._display_text = self.model_text
+            self._status = "正在输出…"
+        else:
+            text = {
+                AgentEventType.CAPABILITIES_SELECTED: "正在理解任务…",
+                AgentEventType.TOOL_COMPLETED: "正在整理查询结果…",
+                AgentEventType.TOOL_FAILED: "当前方法不可用，正在调整方案…",
+                AgentEventType.EFFECT_PREVIEW_STARTED: "正在生成安全变更预览…",
+                AgentEventType.EFFECT_COMPLETED: "正在校验执行结果…",
+                AgentEventType.EFFECT_FAILED: "执行未完成，正在整理结果…",
+            }.get(event.type, "")
+            if event.type is AgentEventType.MODEL_TOOL_CALL:
+                self.model_text = ""
+                self.active_tool = str(event.payload.get("tool") or "")
+                text = _tool_progress(self.active_tool) + "…"
+            elif event.type is AgentEventType.TOOL_STARTED:
+                self.active_tool = str(event.payload.get("tool") or self.active_tool)
+                text = "正在执行已确认操作…" if event.payload.get("kind") == "confirmed_effect" else _tool_progress(self.active_tool) + "…"
+            elif event.type is AgentEventType.TOOL_PROGRESS:
+                text = (_safe_text(event.payload.get("summary"), limit=240)
+                        if event.payload.get("phase") == "background_job" else "")
+                text = text or _tool_progress(event.payload.get("tool") or self.active_tool) + "…"
+            if not text:
+                return
+            self._status = text
+        self._changed.set()
+        if self._sender is None:
+            self._sender = asyncio.create_task(self._send_latest(), name="telegram-agent-stream")
 
-        text, force = {
-            AgentEventType.CAPABILITIES_SELECTED: ("正在理解任务…", False),
-            AgentEventType.TOOL_COMPLETED: ("正在整理查询结果…", False),
-            AgentEventType.TOOL_FAILED: ("当前方法不可用，正在调整方案…", True),
-            AgentEventType.EFFECT_PREVIEW_STARTED: ("正在生成安全变更预览…", True),
-            AgentEventType.EFFECT_COMPLETED: ("正在校验执行结果…", False),
-            AgentEventType.EFFECT_FAILED: ("执行未完成，正在整理结果…", False),
-        }.get(event.type, ("", False))
-        if event.type is AgentEventType.MODEL_TOOL_CALL:
-            self.model_text = ""
-            self.last_stream = ""
-            self.active_tool = str(event.payload.get("tool") or "")
-            text = _tool_progress(self.active_tool) + "…"
-            force = True
-        elif event.type is AgentEventType.TOOL_STARTED:
-            self.active_tool = str(event.payload.get("tool") or self.active_tool)
-            text = "正在执行已确认操作…" if event.payload.get("kind") == "confirmed_effect" else _tool_progress(self.active_tool) + "…"
-        elif event.type is AgentEventType.TOOL_PROGRESS:
-            text = (_safe_text(event.payload.get("summary"), limit=240)
-                    if event.payload.get("phase") == "background_job" else "")
-            text = text or _tool_progress(event.payload.get("tool") or self.active_tool) + "…"
-        if text:
-            await self._publish_status(text, force=force)
-
-    async def _publish_status(self, text: str, *, force: bool = False) -> None:
-        if text == self.last_status:
-            return
-        now = time.monotonic()
-        if not force and now - self.last_status_at < 0.65:
-            return
-        rendered = (
-            _render_stream_preview(self.visible_text, status=text)
-            if self.visible_text else f"<b>Media Agent</b>\n{html.escape(text)}"
-        )
-        if await asyncio.to_thread(self.progress.update, rendered):
-            self.last_status_at = now
-            self.last_status = text
-            self.last_stream = rendered
-
-    async def _publish_stream(self, *, force: bool = False) -> None:
-        if not self.model_text:
-            return
-        now = time.monotonic()
-        mode = str(getattr(self.progress, "mode", "") or "")
-        interval = 0.2 if mode in {"draft", "rich_draft"} else 0.85
-        if not force and now - self.last_stream_at < interval:
-            return
-        self.last_stream_at = now
-        preview = _render_stream_preview(self.model_text)
-        if not preview or preview == self.last_stream:
-            return
-        if await asyncio.to_thread(self.progress.update, preview):
-            self.last_stream = preview
-            self.visible_text = self.model_text
+    async def _send_latest(self) -> None:
+        next_send_at = 0.0
+        last_rendered = ""
+        while not self._closing.is_set():
+            await self._changed.wait()
+            delay = next_send_at - time.monotonic()
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(self._closing.wait(), timeout=delay)
+                except TimeoutError:
+                    pass
+            if self._closing.is_set():
+                return
+            self._changed.clear()
+            mode = str(getattr(self.progress, "mode", "") or "")
+            interval = _STREAM_DRAFT_INTERVAL_SECONDS if mode in {"draft", "rich_draft"} else _STREAM_EDIT_INTERVAL_SECONDS
+            next_send_at = time.monotonic() + interval
+            rendered = (_render_stream_preview(self._display_text, status=self._status)
+                        if self._display_text else f"<b>Media Agent</b>\n{html.escape(self._status)}")
+            if rendered == last_rendered:
+                continue
+            try:
+                if await asyncio.to_thread(self.progress.update, rendered):
+                    last_rendered = rendered
+            except Exception as exc:  # 展示故障不终止真实任务或吞掉最终回执。
+                logger.info("Telegram Agent 增量展示失败 type=%s", type(exc).__name__)
 
 
 def _positive_int(value: object) -> int | None:
@@ -588,7 +600,7 @@ def _execute_query(
     ).begin("<b>Media Agent</b>\n正在理解任务…")
     observer = _TelegramEventObserver(progress)
     try:
-        view = asyncio.run(
+        view = asyncio.run(observer.consume(
             runtime.telegram.query(
                 QueryEnvelope(
                     owner=owner,
@@ -602,7 +614,7 @@ def _execute_query(
                 observe=observer,
                 cancellation=AGENT_CANCELLATION.get(),
             )
-        )
+        ))
         if view.approval is not None:
             body = "\n".join(
                 _preview_lines(view.approval, tool_calls=view.tool_calls)
@@ -818,12 +830,12 @@ def handle_agent_callback(bot: Any, call: Any, telebot_module: Any = None) -> No
         progress.update("<b>Media Agent</b>\n正在核对确认计划，确认接管后将继续显示执行进度…")
     observer = _TelegramEventObserver(progress)
     try:
-        view = asyncio.run(
+        view = asyncio.run(observer.consume(
             runtime.telegram.confirm(
                 envelope,
                 observe=observer,
             )
-        )
+        ))
         if (
             not view.effect_result
             and view.approval is None
