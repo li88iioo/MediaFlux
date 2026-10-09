@@ -49,6 +49,33 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
         self.assertEqual(outcome.public_content["data"], data)
         self.assertFalse(outcome.full_model_content)
 
+    def test_result_reader_is_loaded_only_after_a_snapshot_is_issued(self):
+        from app.agent.kernel.adapters import consume_events
+        from app.agent.kernel.capabilities import CapabilityRetriever
+        from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
+        from app.agent.kernel.session import AgentSession
+        from app.agent.kernel.state import AgentInput, InMemorySessionStateStore
+        from tests.test_agent_kernel_core import ScriptedModel
+
+        async def run():
+            tool = KernelToolSpec(name="library.inventory", domain="library", effect=ToolEffect.READ,
+                description="读取库存", input_schema={"type": "object", "properties": {}},
+                read=lambda *_: {"data": {"items": [{"title": "x"*1000, "id": i} for i in range(100)]}})
+            catalog, state = ToolCatalog([tool]), InMemorySessionStateStore()
+            model = ScriptedModel([[
+                ModelEvent(ModelEventType.TOOL_CALL_COMPLETED, tool_call=ModelToolCall("scan", tool.name, {})),
+                ModelEvent(ModelEventType.FINISH, finish_reason="tool_calls")], [
+                ModelEvent(ModelEventType.TEXT_DELTA, text="已取得快照，明细可继续读取"),
+                ModelEvent(ModelEventType.FINISH, finish_reason="stop")]])
+            pipeline = ToolPipeline(catalog=catalog, state_store=state, projector=DefaultProjector(max_model_chars=2000))
+            session = AgentSession(model=model, catalog=catalog, retriever=CapabilityRetriever(), pipeline=pipeline, state_store=state)
+            result = await consume_events(session.run(AgentInput(owner="owner", session_id="paging", message="读取库存")))
+            self.assertEqual(result.status, "success")
+            self.assertNotIn("agent__read_result", [tool["name"] for tool in model.requests[0].tools])
+            self.assertIn("agent__read_result", [tool["name"] for tool in model.requests[1].tools])
+            self.assertIn("tool_result", (await state.load(owner="owner", session_id="paging")).ref_kinds)
+        asyncio.run(run())
+
     def test_large_results_can_be_read_completely_after_runtime_recreation(self):
         async def run():
             data = [{"title": f"作品-{n}-" + "介绍" * 650, "tmdb_id": str(n)} for n in range(100)]

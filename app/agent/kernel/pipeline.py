@@ -898,6 +898,8 @@ class ToolPipeline:
             StateUpdate("recent_refs", [item["ref"] for item in exposed], mode="append"),
             StateUpdate("ref_kinds", [item["kind"] for item in exposed], mode="append"),
         )
+        if public.get("result_handle"):
+            updates += (StateUpdate("recent_refs", [public["result_handle"]], mode="append"), StateUpdate("ref_kinds", ["tool_result"], mode="append"))
         if has_candidates:
             updates += (StateUpdate(f"metadata.{CANDIDATE_VIEW_KEY}", candidate_view),)
         return replace(

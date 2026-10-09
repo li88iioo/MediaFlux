@@ -30,6 +30,8 @@ class CapabilityDiscovery:
     def _visible(self) -> tuple[KernelToolSpec, ...]:
         result = []
         for tool in self.catalog.visible(self.context):
+            if tool.name == "agent.read_result" and "tool_result" not in self.context.get("reference_kinds", ()):
+                continue
             try:
                 if tool.authorize is not None and not tool.authorize(self.context):
                     continue
@@ -50,10 +52,10 @@ class CapabilityDiscovery:
     ) -> tuple[KernelToolSpec, ...]:
         visible = {tool.name: tool for tool in self._visible()}
         ordered = []
-        if "agent.read_result" in visible:
-            ordered.append(visible["agent.read_result"])
         if DISCOVERY_TOOL in visible:
             ordered.append(visible[DISCOVERY_TOOL])
+        if "agent.read_result" in visible:
+            ordered.append(visible["agent.read_result"])
         for tool in (*additions, *previous):
             if tool.name in visible and all(item.name != tool.name for item in ordered):
                 ordered.append(visible[tool.name])

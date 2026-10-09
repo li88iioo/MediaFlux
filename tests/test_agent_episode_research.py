@@ -293,7 +293,8 @@ class EpisodeResearchRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(args["pipeline"].state_store, args["state_store"])
         limits = args["limits"]
         self.assertEqual((limits.max_model_rounds, limits.max_tool_calls, limits.max_output_tokens), (8, 14, 2000))
-        self.assertEqual(len(args["catalog"]), 7)
+        self.assertEqual(len([tool for tool in args["catalog"].visible({}) if not tool.metadata.get("kernel_utility")]), 7)
+        self.assertEqual(args["catalog"].get("agent.read_result").effect.value, "read")
         self.assertTrue(all(tool.effect is runner.ToolEffect.READ for tool in args["catalog"].visible()))
 
     async def test_model_failure_after_proposal_does_not_validate(self):
