@@ -173,7 +173,12 @@ def build_site_queries(site_id: str, request: IndexerMediaSearchRequest) -> tupl
     bases = list(_unique(bases, limit=8))
     if request.season is not None or request.episode is not None:
         positioned = [_with_position(value, request) for value in bases]
-        if site_id in {"btbtla", "mikan"} and request.episode is not None:
+        if site_id == "mikan" and request.episode is not None:
+            primary = bases[0] if bases else title
+            numbered = primary if _POSITION_MARKER.search(primary) else _append_position_suffix(primary, f"{request.episode:02d}")
+            # 蜜柑发布名常用裸集号，不先耗费预算查两种不存在的季集写法。
+            candidates = [numbered, primary, *positioned[1:], *bases[1:]]
+        elif site_id == "btbtla" and request.episode is not None:
             primary = bases[0] if bases else title
             localized = _with_chinese_episode(primary, request)
             candidates = [

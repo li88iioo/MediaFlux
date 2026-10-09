@@ -44,7 +44,7 @@ class IndexerQueryBudgetAuditTests(unittest.TestCase):
                             IndexerSearchRequest.create(query).query, query
                         )
                     if episode is not None:
-                        self.assertIn(f"E{episode:02d}", queries[0])
+                        self.assertIn(f"{episode:02d}" if provider == "mikan" else f"E{episode:02d}", queries[0])
                     else:
                         self.assertTrue(queries[0].endswith(f"S{season:02d}"))
             self.assertEqual(request.title, "中" * 120)

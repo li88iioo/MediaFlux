@@ -200,6 +200,7 @@ class IndexerService:
         site_ids: Iterable[str] | None = None,
         *,
         scope: str = "manual",
+        timeout_seconds: float | None = None,
         on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
     ) -> AggregatedIndexerResult:
         if not isinstance(request, IndexerMediaSearchRequest):
@@ -224,6 +225,7 @@ class IndexerService:
             ranking_context=request,
             sort_mode=request.sort_mode,
             on_progress=on_progress,
+            timeout_seconds=timeout_seconds,
         )
 
     async def _search_plans(
@@ -237,8 +239,12 @@ class IndexerService:
         ranking_context: IndexerMediaSearchRequest | None,
         sort_mode: str,
         on_progress: Callable[[AggregatedIndexerResult], None] | None = None,
+        timeout_seconds: float | None = None,
     ) -> AggregatedIndexerResult:
         self._ensure_open()
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise IndexerValidationError("invalid search timeout")
+        track_progress = on_progress is not None or timeout_seconds is not None
         cached = self._get_cached(cache_key)
         if cached is not None:
             return cached
@@ -260,7 +266,7 @@ class IndexerService:
         with self._runtime_condition:
             self._ensure_open_locked()
             self._search_waiters[inflight_key] = self._search_waiters.get(inflight_key, 0) + 1
-            if on_progress is not None:
+            if track_progress:
                 self._progress_callbacks.setdefault(inflight_key, set()).add(notify)
                 latest = self._progress_last.get(inflight_key)
                 if latest is not None:
@@ -296,7 +302,22 @@ class IndexerService:
 
                 task.add_done_callback(cleanup)
         try:
-            result = await asyncio.shield(task)
+            try:
+                result = await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+            except asyncio.TimeoutError:
+                with self._runtime_condition:
+                    latest = self._progress_last.get(inflight_key)
+                    result = latest.clone(cached=False) if latest is not None else None
+                if result is None:
+                    raise
+                # 只结束当前等待者：保留已到达的结果、不缓存未完成快照，
+                # 不缩短同时等待同一检索的其它请求的预算。
+                result.partial = True
+                result.complete = False
+                known = set(result.sites_succeeded) | {error.site_id for error in result.errors}
+                result.errors.extend(self._public_error(site_id, IndexerTimeout("caller search timeout"))
+                                     for site_id in selected if site_id not in known)
+                return stable_view(result) if on_progress is not None else result
             if on_progress is not None:
                 return stable_view(result)
             if created:
@@ -313,7 +334,7 @@ class IndexerService:
         finally:
             with self._runtime_condition:
                 callbacks = self._progress_callbacks.get(inflight_key)
-                if callbacks is not None and on_progress is not None:
+                if callbacks is not None and track_progress:
                     callbacks.discard(notify)
                     if not callbacks:
                         self._progress_callbacks.pop(inflight_key, None)
@@ -943,10 +964,9 @@ class IndexerService:
         for attempts, query in enumerate(queries, start=1):
             remaining_seconds = plan_budget_seconds - (perf_counter() - plan_started)
             if attempts > 1 and remaining_seconds <= 0:
-                if attempts <= minimum_queries:
-                    last_error = _ProviderOutcome(site_id=site_id, error=self._public_error(
-                        site_id, IndexerTimeout("bilingual search budget exhausted"),
-                    ))
+                last_error = _ProviderOutcome(site_id=site_id, error=self._public_error(
+                    site_id, IndexerTimeout("search variant budget exhausted"),
+                ))
                 break
             attempts_made = attempts
             media_type = (

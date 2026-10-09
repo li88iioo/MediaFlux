@@ -51,7 +51,7 @@ class FixtureIndexer:
     def site_ids_for_scope(self, scope="manual"):
         return tuple(self.enabled_site_ids)
 
-    async def search_media(self, request, sites=None, *, scope="manual"):
+    async def search_media(self, request, sites=None, *, scope="manual", timeout_seconds=None):
         label = (
             f"S{request.season:02d}E{request.episode:02d}"
             if request.season is not None and request.episode is not None

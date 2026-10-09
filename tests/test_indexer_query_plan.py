@@ -20,6 +20,12 @@ class IndexerQueryPlanTests(unittest.TestCase):
             media_type="tv",
         )
 
+    def test_mikan_uses_bare_episode_then_broad_title(self):
+        request = IndexerMediaSearchRequest.create(title="理想禁区", season=1, episode=7)
+        self.assertEqual(build_site_queries("mikan", request), ("理想禁区 07", "理想禁区"))
+        request = IndexerMediaSearchRequest.create(title="万古仙穹", season=3, episode=4)
+        self.assertEqual(build_site_queries("mikan", request), ("万古仙穹 04", "万古仙穹"))
+
     def test_chinese_sites_start_with_localized_title_without_year(self):
         for site_id in ("mikan", "btbtla"):
             with self.subTest(site_id=site_id):

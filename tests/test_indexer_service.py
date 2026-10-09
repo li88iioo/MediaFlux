@@ -1574,5 +1574,50 @@ class IndexerServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(registry.closed_after_operation)
 
 
+class CallerDeadlineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_short_waiter_keeps_ready_results_without_stopping_long_waiter(self):
+        fast = FakeAdapter("fast", [IndexerItem("fast", "Fast", "Example 1080p", magnet="magnet:?xt=urn:btih:" + HASH, download_state="ready", download_kinds=("magnet",))])
+        slow = FakeAdapter("slow", [IndexerItem("slow", "Slow", "Example 2160p", magnet="magnet:?xt=urn:btih:" + "b" * 40, download_state="ready", download_kinds=("magnet",))], delay=0.15)
+        service = IndexerService(registry=IndexerRegistry({"fast": fast, "slow": slow}), result_store=IndexerResultStore())
+        request = IndexerMediaSearchRequest.create(title="Example")
+        try:
+            short, full = await asyncio.gather(
+                service.search_media(request, timeout_seconds=0.05),
+                service.search_media(request, timeout_seconds=1),
+            )
+            self.assertEqual(len(short.items), 1)
+            self.assertEqual(short.sites_succeeded, ("fast",))
+            self.assertTrue(short.partial)
+            self.assertFalse(short.complete)
+            self.assertFalse(short.cached)
+            self.assertEqual([(e.site_id, e.code) for e in short.errors], [("slow", "timeout")])
+            self.assertEqual(len(full.items), 2)
+            self.assertTrue(full.complete)
+            self.assertFalse(full.partial)
+            self.assertEqual((fast.calls, slow.calls), (1, 1))
+            cached = await service.search_media(request)
+            self.assertEqual(len(cached.items), 2)
+            self.assertTrue(cached.complete)
+        finally:
+            await service.aclose()
+
+    async def test_deadline_without_results_cancels_last_waiter_and_does_not_cache_empty(self):
+        tracker = {"active": 0, "maximum": 0}
+        slow = FakeAdapter("slow", delay=1, tracker=tracker)
+        service = IndexerService(registry=IndexerRegistry({"slow": slow}), result_store=IndexerResultStore())
+        request = IndexerMediaSearchRequest.create(title="Example")
+        try:
+            with self.assertRaises(TimeoutError):
+                await service.search_media(request, timeout_seconds=0.02)
+            self.assertEqual(tracker["active"], 0)
+            slow.delay = 0
+            result = await service.search_media(request)
+            self.assertTrue(result.complete)
+            self.assertFalse(result.cached)
+            self.assertEqual(slow.calls, 2)
+        finally:
+            await service.aclose()
+
+
 if __name__ == "__main__":
     unittest.main()

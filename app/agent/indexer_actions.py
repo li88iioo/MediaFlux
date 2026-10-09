@@ -306,10 +306,14 @@ def search_resources(
         sort_mode=arguments.get("sort_mode", "relevance_desc"),
     )
     service = get_indexer_service()
-    search_awaitable = service.search_media(
-        request, arguments["sites"] or None, scope="agent"
-    )
     bounded_timeout = None if timeout_seconds is None else float(timeout_seconds)
+    # 为共享检索的取消收尾留出小预算；外层硬截止仍不延长。
+    search_options: dict[str, Any] = {"scope": "agent"}
+    if bounded_timeout is not None:
+        search_options["timeout_seconds"] = max(0.001, bounded_timeout - min(0.25, bounded_timeout / 10))
+    search_awaitable = service.search_media(
+        request, arguments["sites"] or None, **search_options,
+    )
     try:
         result = run_indexer_awaitable_sync(
             search_awaitable,
@@ -388,8 +392,8 @@ def search_resources(
             Evidence(
                 "indexer_service",
                 (
-                    "服务器端多站索引已完成；成功 "
-                    f"{len(result.sites_succeeded)}/{len(result.sites_attempted)} 个站点。"
+                    ("服务器端多站索引已完成；成功 " if result.complete else "本轮检索达到时限，保留已返回结果；已返回 ")
+                    + f"{len(result.sites_succeeded)}/{len(result.sites_attempted)} 个站点。"
                 ),
                 _now(),
             )

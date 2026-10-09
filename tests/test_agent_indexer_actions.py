@@ -81,7 +81,7 @@ class FakeIndexerService:
         assert scope == "agent"
         return self.result_store.get(result_id)
 
-    async def search_media(self, request, sites=None, *, scope="manual"):
+    async def search_media(self, request, sites=None, *, scope="manual", timeout_seconds=None):
         assert scope == "agent"
         self.search_calls.append((request, sites))
         return AggregatedIndexerResult(
@@ -505,7 +505,7 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
     def test_search_resources_enforces_caller_timeout(self):
         service = FakeIndexerService()
 
-        async def slow_search(_request, _sites=None, *, scope="agent"):
+        async def slow_search(_request, _sites=None, *, scope="agent", timeout_seconds=None):
             await asyncio.sleep(0.05)
             raise AssertionError("timeout should cancel the slow search")
 
