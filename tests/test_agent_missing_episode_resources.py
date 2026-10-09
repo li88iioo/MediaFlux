@@ -735,6 +735,40 @@ class MultiWorkResourceTests(unittest.TestCase):
         with self.assertRaises(AgentToolError):
             missing_season_resource_arguments({"items": [{"query": "剧", "season": 1}], "query": "另一部"})
 
+    def test_exact_episode_batch_does_not_search_other_earlier_missing_episodes(self):
+        args = missing_season_resource_arguments({"items": [
+            {"query": "万古仙穹", "season": 3, "episodes": [4]},
+            {"query": "理想禁区", "season": 1, "episodes": [7]},
+        ]})
+        def audit(arguments, **kwargs):
+            result = _audit_result(missing=[{"season": arguments["season"], "episode": n} for n in range(1, 12)])
+            result.data.update(title=arguments["query"], tmdb_id="79526" if arguments["season"] == 3 else "74088")
+            return result
+        seen = []
+        def search(arguments, **kwargs):
+            title = arguments["title"]
+            seen.append((title, arguments["season"], arguments["episode"]))
+            return _search_result(items=[{"result_id": f"batch-precise-{len(title):04d}-{title.count('穹')}", "title": f"{title} S{arguments['season']:02d}E{arguments['episode']:02d} 1080p", "site_id": "nyaa", "site_name": "Nyaa", "download_state": "ready", "download_kinds": ["magnet"]}])
+        with patch("app.agent.episode_resource_actions.audit_series_episodes", side_effect=audit), patch("app.agent.episode_resource_actions.search_resources", side_effect=search), patch("app.agent.episode_resource_actions.get_indexer_service", return_value=Mock(result_store=None)):
+            result = search_missing_season_resources(args)
+        self.assertEqual(len(seen), 2)
+        self.assertCountEqual(seen, [("万古仙穹", 3, 4), ("理想禁区", 1, 7)])
+        self.assertEqual(result.data["recommended_positions"], [1, 2])
+        self.assertEqual([r["positions"] for r in result.data["groups"]], [[1], [2]])
+        self.assertEqual(len(result.references), 1)
+        self.assertEqual([r["episode"] for r in result.references[0].value["candidates"]], [4, 7])
+
+    def test_explicit_episode_validation_and_already_present_target(self):
+        for episodes in ([], [0], [True], [1001], [1, 2, 3, 4], "7"):
+            with self.subTest(episodes=episodes), self.assertRaises(AgentToolError):
+                missing_season_resource_arguments({"query": "示例", "season": 1, "episodes": episodes})
+        args = missing_season_resource_arguments({"query": "示例", "season": 1, "episodes": [7]})
+        with patch("app.agent.episode_resource_actions.audit_series_episodes", return_value=_audit_result(missing=[{"season": 1, "episode": 1}])), patch("app.agent.episode_resource_actions.search_resources") as search:
+            result = search_missing_season_resources(args)
+        self.assertEqual(result.status, "not_missing")
+        self.assertIn("指定集", result.summary)
+        search.assert_not_called()
+
     def test_batch_exposes_unproved_arc_candidate_without_preselecting_it(self):
         from types import SimpleNamespace
 

@@ -110,7 +110,7 @@
 | `library.search` | READ | 在已配置的 Jellyfin / Emby 媒体库中搜索一个具体标题；适合单片核对，并在可用时返回已校验的 open_url。 |
 | `library.batch_presence` | READ | 一次按 TMDB ID 批量核对最多 50 部电影或剧集是否存在于已配置的 Jellyfin / Emby。 |
 | `library.search_missing_episode_resources` | READ | 先确认指定季集属于已播缺集，再按当前身份保存的资源偏好排序；本次 preference_overrides 优先于长期偏好（空数组/0/any 可取消对应约束），不会自动下载。 |
-| `library.search_missing_season_resources` | READ | 单部核对指定季度；多部用 items 一次核对最多 12 部/季，每部最多搜索 3 个已播缺集。统一输出最多 12 项全局候选及同一快照，保留未覆盖项和季集映射不确定性；一次预检整批、人工确认后才下载。 |
+| `library.search_missing_season_resources` | READ | 单部核对指定季度；多部用 items 一次核对最多 12 部/季。每部可用 episodes 指定 1–3 个集号（例如 `[4]`、`[7]`），不指定才从最早缺集开始，每部最多搜索 3 集。统一输出最多 12 项全局候选及同一快照，保留未覆盖项和季集映射不确定性；一次预检整批、人工确认后才下载。 |
 | `library.missing_media_workflows` | READ | 查看当前用户最近缺集补库流程的安全状态；只返回剧名、季集、阶段、目标类型与是否已建立下载任务，不返回资源句柄、磁力、URL、路径或凭据。 |
 | `library.check_updates` | READ | 单部或批量核对最多 20 部媒体；默认刷新 Jellyfin / Emby 库存，对照 TMDB 已播季集。逐部保留缺集、无已播缺集、歧义与不可用状态；不代表全网资源发布进度。 |
 | `library.audit_library_episodes` | READ | 有界枚举已配置媒体服务器中的剧集，并按可靠 TMDB 映射巡检截至指定日期的已播缺集。 |
@@ -181,6 +181,8 @@
 | `ingest.inspect` | READ | 统一只读检查资源接入来源：可识别光鸭官方分享、Magnet、ED2K、明确 HTTP(S) 下载直链，或读取当前会话最近资源搜索候选。 |
 | `ingest.submit` | DANGER | 在用户确认后统一提交最近检查的直链或光鸭分享，或按资源搜索候选序号提交。 |
 | `ingest.status` | READ | 按公开请求编号读取统一资源接入状态，覆盖 qB、光鸭、整理与 STRM 阶段；不返回链接、路径、哈希或后端任务标识。 |
+
+资源提交只使用 `candidate_numbers.position` 和配套候选引用，集号、质量排序名次不是提交序号。待核对资源不会自动推荐，但用户明确选择后可以生成预检卡；候选仍需确认才能提交。搜索展示的推荐摘要不再限制后续可选择候选的数量（同一快照最多 12 项）。
 
 ### 2.8 下载诊断与提交续查（3 项）
 

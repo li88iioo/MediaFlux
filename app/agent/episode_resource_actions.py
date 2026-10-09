@@ -144,9 +144,9 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
         for item in raw:
             if not isinstance(item, dict):
                 raise AgentToolError("items 每项必须是作品对象")
-            _reject_extra(item, {"query", "tmdb_id", "season", "library_name"})
+            _reject_extra(item, {"query", "tmdb_id", "season", "library_name", "episodes"})
             normalized = missing_season_resource_arguments({**shared, **item})
-            key = (normalized["query"].casefold(), normalized.get("tmdb_id"), normalized["season"], normalized.get("library_name"))
+            key = (normalized["query"].casefold(), normalized.get("tmdb_id"), normalized["season"], normalized.get("library_name"), tuple(normalized.get("episodes", [])))
             items.setdefault(key, normalized)
         return {"items": list(items.values())}
     _reject_extra(
@@ -155,6 +155,7 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
             "query",
             "tmdb_id",
             "season",
+            "episodes",
             "as_of",
             "sites",
             "max_episodes",
@@ -208,6 +209,13 @@ def missing_season_resource_arguments(arguments: dict[str, Any]) -> dict[str, An
         "max_episodes": max_episodes,
         "limit_per_episode": limit_per_episode,
     }
+    if "episodes" in arguments:
+        episodes = arguments["episodes"]
+        if not isinstance(episodes, list) or not 1 <= len(episodes) <= 3:
+            raise AgentToolError("episodes 必须包含 1 到 3 个指定集号")
+        normalized["episodes"] = sorted({
+            _positive_int(value, name="episodes", maximum=1000) for value in episodes
+        })
     if library_name:
         normalized["library_name"] = library_name
     if "preference_overrides" in arguments:
@@ -417,13 +425,16 @@ def search_missing_season_resources(
     audit = audit_series_episodes(audit_arguments, refresh=True)
     verification = _season_verification(arguments, audit)
     audit_data = audit.data if isinstance(audit.data, dict) else {}
+    requested_episodes = arguments.get("episodes")
+    if requested_episodes:
+        verification["requested_episodes"] = requested_episodes
 
     if not audit.ok or audit.status != "updates_available":
         if audit.status == "up_to_date":
             return ToolResult(
                 False,
                 "not_missing",
-                f"第 {arguments['season']} 季没有确认缺集",
+                f"第 {arguments['season']} 季{'指定集' if requested_episodes else ''}没有确认缺集",
                 data={"verification": verification, "episodes": []},
                 evidence=list(audit.evidence),
                 suggestions=["可重新核对季度，或直接进行普通资源搜索。"],
@@ -462,6 +473,7 @@ def search_missing_season_resources(
             or isinstance(episode, bool)
             or not isinstance(episode, int)
             or not 1 <= episode <= 1000
+            or (requested_episodes is not None and episode not in requested_episodes)
             or (season, episode) in seen
         ):
             continue
@@ -472,7 +484,7 @@ def search_missing_season_resources(
         return ToolResult(
             False,
             "not_missing",
-            f"第 {arguments['season']} 季没有确认缺集",
+            f"第 {arguments['season']} 季{'指定集' if requested_episodes else ''}没有确认缺集",
             data={"verification": verification, "episodes": []},
             evidence=list(audit.evidence),
             suggestions=["可重新核对季度，或直接进行普通资源搜索。"],
