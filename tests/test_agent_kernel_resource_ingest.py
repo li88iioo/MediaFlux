@@ -301,9 +301,7 @@ def _multi_work_search_result() -> ToolResult:
 def _model_json_field(request: ModelRequest, field: str) -> Any:
     for message in reversed(request.messages):
         content = message.content
-        if message.role == "assistant" and content.startswith("历史工具观察"):
-            content = json.loads(content.partition("\n")[2])["result"]
-        elif message.role != "tool":
+        if message.role != "tool":
             continue
         payload = json.loads(content)
         if field in payload:

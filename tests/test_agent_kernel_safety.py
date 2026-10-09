@@ -69,7 +69,7 @@ async def _context(
 
 
 class KernelPrivacyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_tool_arguments_are_not_published_or_persisted(self) -> None:
+    async def test_tool_arguments_are_redacted_in_persistence_and_not_published(self) -> None:
         secret = "rss-passkey-very-secret"
         private_path = "/home/aio/private/downloads"
         tool = KernelToolSpec(
@@ -155,7 +155,10 @@ class KernelPrivacyTests(unittest.IsolatedAsyncioTestCase):
             for item in persisted.conversation
             if item.get("role") == "assistant" and item.get("tool_calls")
         )
-        self.assertEqual(assistant_call["tool_calls"][0]["arguments"], {})
+        arguments = assistant_call["tool_calls"][0]["arguments"]
+        self.assertIn("url", arguments)
+        self.assertIn("********", arguments["url"])
+        self.assertNotEqual(arguments["path"], private_path)
 
 
 class EffectPlanStoreSafetyTests(unittest.TestCase):

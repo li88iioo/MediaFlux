@@ -246,7 +246,7 @@ class InMemoryEffectStateStoreTests(unittest.IsolatedAsyncioTestCase):
         second, state = await store.begin_turn(
             owner="owner", session_id="session", request_id="second",
         )
-        self.assertEqual(len(state.conversation), 80)
+        self.assertEqual(len(state.conversation), 81)
         self.assertEqual(state.conversation[-1]["completion_receipt_id"], "delivered")
         self.assertEqual(list(state.metadata["effect_waits"]), ["awaiting-delivery"])
         self.assertEqual(state.metadata["effect_next_poll_at"], 20)
@@ -581,7 +581,7 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
                     for i in range(2)]
         history = [request, *receipts, *({"role": "assistant", "content": str(i)} for i in range(81))]
         retained = retain_conversation(history)
-        self.assertEqual(len(retained), 80)
+        self.assertEqual(len(retained), len(history))
         self.assertEqual(retained[:3], [request, *receipts])
         self.assertEqual(retained[-1], history[-1])
         restored = AgentSession._restore_messages(
@@ -594,10 +594,34 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         newest = {"role": "user", "content": "换个任务，只查状态"}
         history += [newest, *({"role": "assistant", "content": str(i)} for i in range(81))]
         replaced = retain_conversation(history)
-        self.assertEqual(replaced[0], newest)
-        self.assertNotIn(request, replaced)
-        self.assertFalse(any(row.get("completion_receipt_id") for row in replaced))
+        self.assertEqual(replaced, history)
+        self.assertIn(newest, replaced)
+        self.assertIn(request, replaced)
         self.assertEqual(retain_conversation([]), [])
+
+    def test_history_storage_budget_preserves_turns_and_marks_eviction(self):
+        from app.agent.kernel.state import retain_conversation
+
+        original = {"role": "user", "content": "只推荐2015年之后且媒体库中没有的国漫"}
+        short = [original, *({"role": "assistant", "content": "观察"} for _ in range(79)),
+                 {"role": "user", "content": "继续"}]
+        self.assertEqual(retain_conversation(short), short)
+        request = {"role": "user", "content": "核对当前候选"}
+        call = {"role": "assistant", "tool_calls": [{"call_id": "owned", "name": "library.inspect", "arguments": {}}]}
+        result = {"role": "tool", "tool_call_id": "owned", "content": '{"ok":true}'}
+        history = [original, {"role": "assistant", "content": "旧摘要" * 9000}, request, call, result,
+                   {"role": "user", "content": "继续"}]
+        retained = retain_conversation(history, maximum_bytes=1000)
+        self.assertLessEqual(len(json.dumps(retained, ensure_ascii=False, separators=(",", ":")).encode()), 1000)
+        self.assertEqual(retained[0]["content"], request["content"])
+        self.assertTrue(retained[0]["history_before_truncated"])
+        self.assertEqual(retained[1:3], [call, result])
+        self.assertNotIn("history_before_truncated", request)
+        restored = AgentSession._restore_messages(SessionState(owner="o", session_id="s", conversation=retained))
+        self.assertIn("历史因存储预算已省略", restored[0].content)
+        saved = AgentSession._persisted_conversation(restored, current_user_index=None, original_message="", prior_conversation=retained)
+        self.assertEqual(saved[0]["content"], request["content"])
+        self.assertTrue(saved[0]["history_before_truncated"])
 
     def test_history_retains_whole_tool_batch_and_its_effect_receipt(self):
         request = {"role": "user", "content": "先核对再清洗入库"}
@@ -614,13 +638,13 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
             request, *batch, *({"role": "assistant", "content": str(i)} for i in range(81)),
         ])
         self.assertEqual(retained[:5], [request, *batch])
-        self.assertEqual(len(retained), 80)
-        # A read-only batch at the cutoff is kept whole or omitted whole.
+        self.assertEqual(len(retained), 86)
+        # 小消息不再因计数裁剪；原生工具调用与结果完整保留。
         plain_batch = [{k: v for k, v in row.items() if k != "effect_plan_id"} for row in batch[:3]]
         boundary = retain_conversation([request, *plain_batch, *(
             {"role": "assistant", "content": str(i)} for i in range(78)
         )])
-        self.assertFalse(any(row.get("tool_call_id") or row.get("tool_calls") for row in boundary))
+        self.assertEqual(boundary[1:4], plain_batch)
         self.assertEqual(boundary[0], request)
 
     async def test_confirmation_keeps_original_goal_beyond_history_window(self):
@@ -1528,10 +1552,11 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bounded[-1].content, "方案 A")
         self.assertTrue(any("完整读取狐妖小红娘" in item.content for item in bounded))
         self.assertTrue(any("方案 A：按 TMDB" in item.content for item in bounded))
-        self.assertFalse(any(item.tool_calls or item.role == "tool" for item in bounded))
-        self.assertTrue(any("历史工具观察" in item.content for item in bounded))
+        self.assertTrue(any(item.tool_calls for item in bounded))
+        self.assertTrue(any(item.role == "tool" for item in bounded))
+        self.assertFalse(any("历史工具观察" in item.content for item in bounded))
 
-    async def test_only_past_tool_calls_are_observations_current_calls_keep_native_pairs(self):
+    async def test_historical_tool_pairs_keep_roles_without_changing_current_calls(self):
         prior_call = ModelMessage(role="assistant", tool_calls=(ModelToolCall("old", "media.user.inspect", {}),))
         prior_result = ModelMessage(role="tool", tool_call_id="old",
                                     content='{"ok":false,"error":"未核验"}\nopaque_refs=ref_example')
@@ -1542,13 +1567,39 @@ class AgentSessionTests(unittest.IsolatedAsyncioTestCase):
         bounded = bounded_model_messages(messages, history_end=3, tool_definitions=(),
                                           system_prompt="", context_window_tokens=16384, output_tokens=1024)
         self.assertEqual(bounded[-3:], tuple(messages[-3:]))
-        self.assertFalse(any(row.tool_calls or row.role == "tool" for row in bounded[:-3]))
-        observation = next(row.content for row in bounded if "历史工具观察" in row.content)
+        historical_call = next(row for row in bounded[:-3] if row.tool_calls)
+        historical_result = next(row for row in bounded[:-3] if row.role == "tool")
+        self.assertEqual(historical_call.tool_calls[0].call_id, historical_result.tool_call_id)
+        self.assertNotEqual(historical_result.tool_call_id, "old")
+        observation = historical_result.content
         self.assertIn("未核验", observation)
         self.assertIn("ref_example", observation)
-        self.assertIn("media.user.inspect", observation)
+        self.assertEqual(historical_call.tool_calls[0].name, "media.user.inspect")
         self.assertEqual(prior_call.tool_calls[0].arguments, {})
         self.assertEqual(prior_result.role, "tool")
+
+    def test_persisted_history_keeps_safe_filters_without_exposing_credentials(self):
+        arguments = {"must_match": ["动画", "中国"], "year_min": 2016, "exclude_owned": True,
+                     "cookie": "private-cookie", "path": "/home/private/library", "item_ref": "ref_safe"}
+        stored = AgentSession._persisted_conversation([
+            ModelMessage(role="user", content="推荐库内没有的国漫"),
+            ModelMessage(role="assistant", tool_calls=(ModelToolCall("call", "discovery.recommend", arguments),)),
+            ModelMessage(role="tool", tool_call_id="call", tool_name="discovery.recommend", content='{"ok":true}'),
+        ], current_user_index=0, original_message="推荐库内没有的国漫")
+        saved = stored[1]["tool_calls"][0]["arguments"]
+        self.assertEqual(saved["must_match"], ["动画", "中国"])
+        self.assertEqual(saved["year_min"], 2016)
+        self.assertTrue(saved["exclude_owned"])
+        self.assertEqual(saved["item_ref"], "ref_safe")
+        self.assertNotIn("private-cookie", str(saved))
+        self.assertNotIn("/home/private", str(saved))
+        restored = AgentSession._restore_messages(SessionState(owner="o", session_id="s", conversation=stored))
+        bounded = bounded_model_messages(restored + [ModelMessage(role="user", content="继续")], history_end=3,
+                                         tool_definitions=(), system_prompt="", context_window_tokens=16384, output_tokens=1024)
+        self.assertEqual(bounded[1].tool_calls[0].arguments["must_match"], ["动画", "中国"])
+        self.assertEqual(bounded[1].tool_calls[0].call_id, bounded[2].tool_call_id)
+        self.assertEqual(bounded[2].role, "tool")
+        self.assertFalse(any("历史工具观察" in row.content for row in bounded))
 
     async def test_compacted_failed_tool_keeps_failure_fact(self) -> None:
         compact = compact_tool_content(

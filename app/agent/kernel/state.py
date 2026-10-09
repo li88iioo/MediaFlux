@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import secrets
 import threading
 import time
@@ -12,6 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from app.agent.model_context_budget import compact_tool_content
 from app.concurrency import CrossLoopAsyncLock
 
 
@@ -243,32 +245,61 @@ class SessionState:
                         self.metadata[field_name] = deepcopy(update.value)
 
 
-def retain_conversation(conversation: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """最多80条；优先当前请求与执行事实，原生tool问答不得从中间切开。"""
-    if len(conversation) <= 80:
+def retain_conversation(
+    conversation: Sequence[Mapping[str, Any]], *, maximum_bytes: int = 160 * 1024,
+) -> list[dict[str, Any]]:
+    """按实际存储预算保留完整用户回合，不因80条短消息删除原始条件。"""
+    def cost(rows: Sequence[Mapping[str, Any]]) -> int:
+        return len(json.dumps(rows, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+
+    if cost(conversation) <= maximum_bytes:
         return list(conversation)
-    latest_user = next((i for i in range(len(conversation) - 1, -1, -1)
-                        if conversation[i].get("role") == "user"), -1)
-    groups: list[list[int]] = []
-    pending_calls: set[str] = set()
-    for i, row in enumerate(conversation):
-        if row.get("role") == "tool" and row.get("tool_call_id") in pending_calls:
-            groups[-1].append(i)
-            pending_calls.discard(row["tool_call_id"])
-        else:
-            groups.append([i])
-            pending_calls = {call.get("call_id") for call in (row.get("tool_calls") or ())}
-    priority = sorted(groups, key=lambda group: (
-        latest_user in group,
-        any(i > latest_user and (conversation[i].get("effect_plan_id")
-                                 or conversation[i].get("completion_receipt_id")) for i in group),
-        group[-1],
-    ), reverse=True)
-    selected: list[int] = []
-    for group in priority:
-        if len(selected) + len(group) <= 80:
-            selected.extend(group)
-    return [conversation[i] for i in sorted(selected)]
+    turns: list[list[dict[str, Any]]] = []
+    for item in conversation:
+        row = deepcopy(dict(item))
+        if row.get("role") == "tool":
+            row["content"] = compact_tool_content(str(row.get("content") or ""), maximum=2000)
+        elif row.get("role") == "assistant" and len(str(row.get("content") or "")) > 8000:
+            row["content"] = str(row["content"])[:8000] + "\n[历史长文本已截断]"
+        for call in row.get("tool_calls") or ():
+            call["arguments"] = json.loads(compact_tool_content(
+                json.dumps(call.get("arguments") or {}, ensure_ascii=False), maximum=2000,
+            ))
+        if row.get("role") == "user" or not turns:
+            turns.append([])
+        turns[-1].append(row)
+    kept: list[dict[str, Any]] = []
+    for turn in reversed(turns):
+        if cost(turn + kept) <= maximum_bytes:
+            kept = turn + kept
+            continue
+        if not kept:
+            # 单次长任务也必须保留用户请求和已执行回执；工具批次不可拆开。
+            blocks: list[list[dict[str, Any]]] = []
+            pending: set[str] = set()
+            for row in turn:
+                if row.get("role") == "tool" and row.get("tool_call_id") in pending:
+                    blocks[-1].append(row)
+                    pending.discard(row["tool_call_id"])
+                else:
+                    blocks.append([row])
+                    pending = {call.get("call_id") for call in row.get("tool_calls") or ()}
+            order = sorted(range(len(blocks)), key=lambda i: (
+                any(row.get("role") == "user" for row in blocks[i]),
+                any(row.get("effect_plan_id") or row.get("completion_receipt_id") for row in blocks[i]), i,
+            ), reverse=True)
+            chosen = []
+            used = 256
+            for index in order:
+                size = cost(blocks[index])
+                if used + size <= maximum_bytes:
+                    chosen.append(index)
+                    used += size
+            kept = [row for index in sorted(chosen) for row in blocks[index]]
+        if kept:
+            kept[0] = {**kept[0], "history_before_truncated": True}
+        break
+    return kept
 
 
 def merge_effect_receipts(

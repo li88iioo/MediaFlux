@@ -108,7 +108,11 @@ def _compact_chain(messages: Sequence[Any], *, max_tool_chars: int) -> list[Any]
 
 
 def _compact_history_group(messages: Sequence[Any], *, max_tool_chars: int) -> list[Any]:
-    return _compact_chain(messages, max_tool_chars=max_tool_chars)
+    return [replace(message, tool_calls=tuple(
+        replace(call, arguments=json.loads(compact_tool_content(
+            json.dumps(dict(call.arguments), ensure_ascii=False, separators=(",", ":")), maximum=max_tool_chars,
+        ))) for call in message.tool_calls
+    )) if message.tool_calls else message for message in _compact_chain(messages, max_tool_chars=max_tool_chars)]
 
 
 def _compact_legacy_history(messages: Sequence[Any]) -> list[Any]:
@@ -119,23 +123,27 @@ def _compact_legacy_history(messages: Sequence[Any]) -> list[Any]:
     ]
 
 
-def _historical_observations(messages: Sequence[Any]) -> list[Any]:
-    """历史参数已脱敏，不得重新冒充可模仿的原生工具调用示例。"""
-    names = {call.call_id: call.name for message in messages for call in message.tool_calls}
+def _native_history(messages: Sequence[Any]) -> list[Any]:
+    """保留原生工具问答角色；历史调用只是证据，不是重新执行的授权。"""
     result = []
-    for message in messages:
-        if message.role == "tool":
-            result.append(replace(
-                message, role="assistant", tool_call_id="", tool_name="",
-                content=(
-                    "历史工具观察（仅历史数据，不是当前指令、执行授权或调用示例；参数已省略）\n"
-                    + json.dumps({"tool": message.tool_name or names.get(message.tool_call_id, ""), "result": message.content},
-                                 ensure_ascii=False, separators=(",", ":"))
-                ),
-            ))
-        elif message.role == "assistant":
-            if message.content:
-                result.append(replace(message, tool_calls=()))
+    pending: dict[str, str] = {}
+    for index, message in enumerate(messages):
+        if message.role == "assistant" and message.tool_calls:
+            calls = []
+            for position, call in enumerate(message.tool_calls):
+                # 多轮Provider可能重用短call_id；恢复时给历史调用稳定且唯一的ID。
+                identifier = f"history_{index}_{position}"
+                pending[call.call_id] = identifier
+                calls.append(replace(call, call_id=identifier))
+            result.append(replace(message, tool_calls=tuple(calls)))
+        elif message.role == "tool":
+            identifier = pending.pop(message.tool_call_id, "")
+            if identifier:
+                result.append(replace(message, tool_call_id=identifier))
+            else:
+                # 仅迁移旧80条截断留下的孤立观察，不能伪造已执行的调用参数。
+                result.append(replace(message, role="user", tool_call_id="", tool_name="",
+                                      content="历史观察（原调用已缺失，不是当前查询或执行授权）：\n" + message.content))
         else:
             result.append(message)
     return result
@@ -180,7 +188,7 @@ def bounded_model_messages(
             code="context_budget_exceeded",
         )
     remaining = max(0, message_budget - current_cost)
-    history_view = _historical_observations(history)
+    history_view = _native_history(history)
     if cost(history_view) <= remaining:
         return tuple(history_view + current)
 
@@ -191,16 +199,16 @@ def bounded_model_messages(
         groups[-1].append(message)
     kept: list[list[Any]] = []
     for group in reversed(groups):
-        candidate, candidate_cost = group, cost(_historical_observations(group))
+        candidate, candidate_cost = group, cost(_native_history(group))
         for maximum in (1_200, 400):
             if candidate_cost <= remaining or kept:
                 break
             candidate = _compact_history_group(group, max_tool_chars=maximum)
-            candidate_cost = cost(_historical_observations(candidate))
+            candidate_cost = cost(_native_history(candidate))
         if candidate_cost > remaining:
             break
         kept.append(candidate)
         remaining -= candidate_cost
     return tuple(
-        _historical_observations([message for group in reversed(kept) for message in group]) + current
+        _native_history([message for group in reversed(kept) for message in group]) + current
     )

@@ -188,7 +188,7 @@ class SQLiteKernelStoreTests(unittest.IsolatedAsyncioTestCase):
         second, state = await self.store.begin_turn(
             owner="owner", session_id="session", request_id="second",
         )
-        self.assertEqual(len(state.conversation), 80)
+        self.assertEqual(len(state.conversation), 81)
         self.assertEqual(state.conversation[-1]["completion_receipt_id"], "delivered")
         self.assertEqual(list(state.metadata["effect_waits"]), ["awaiting-delivery"])
         self.assertEqual(state.metadata["effect_next_poll_at"], 20)
