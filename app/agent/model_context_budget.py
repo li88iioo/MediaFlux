@@ -63,13 +63,13 @@ def compact_tool_content(content: str, *, maximum: int) -> str:
                     continue
                 child = path + "/" + str(key).replace("~", "~0").replace("/", "~1")
                 if isinstance(value, (list, str)) and len(value) > (1 if isinstance(value, list) else 48):
-                    yield len(json.dumps(value, ensure_ascii=False)), node, key, child
+                    yield int(isinstance(value, str)), len(json.dumps(value, ensure_ascii=False)), node, key, child
                 yield from candidates(value, child)
         elif isinstance(node, list):
             for index, value in enumerate(node):
                 child = path + "/" + str(index)
                 if isinstance(value, str) and len(value) > 48:
-                    yield len(value), node, index, child
+                    yield 1, len(value), node, index, child
                 yield from candidates(value, child)
 
     encoded = encode()
@@ -83,14 +83,14 @@ def compact_tool_content(content: str, *, maximum: int) -> str:
             key = max(removable, key=lambda key: len(json.dumps(payload[key], ensure_ascii=False)))
             payload.pop(key)
         else:
-            _, parent, key, path = max(choices, key=lambda item: item[0])
+            _, _, parent, key, path = max(choices, key=lambda item: item[:2])
             value = parent[key]
             total = omitted.get(path, {}).get("total", len(value))
             retained = max(1, len(value) // 2) if isinstance(value, list) else max(48, len(value) // 2)
             parent[key] = value[:retained]
-            omitted[path] = {"path": path, "total": total, "returned": retained}
+            omitted[path] = {"path": path, "kind": "array" if isinstance(value, list) else "string", "total": total, "returned": retained}
             # 有界说明，不让描述截断的信息本身占满上下文。
-            payload["truncation"] = list(omitted.values())[:4]
+            payload["truncation"] = sorted(omitted.values(), key=lambda item: item["kind"] != "array")[:4]
         encoded = encode()
     if len(encoded) > maximum:
         payload = {key: value for key, value in payload.items() if key in protected}

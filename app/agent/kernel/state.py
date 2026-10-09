@@ -252,13 +252,16 @@ def retain_conversation(
     def cost(rows: Sequence[Mapping[str, Any]]) -> int:
         return len(json.dumps(rows, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
 
-    if cost(conversation) <= maximum_bytes:
+    original_bytes = cost(conversation)
+    if original_bytes <= maximum_bytes:
         return list(conversation)
+    ratio = maximum_bytes / original_bytes * 0.75
     turns: list[list[dict[str, Any]]] = []
     for item in conversation:
         row = deepcopy(dict(item))
         if row.get("role") == "tool":
-            row["content"] = compact_tool_content(str(row.get("content") or ""), maximum=2000)
+            content = str(row.get("content") or "")
+            row["content"] = compact_tool_content(content, maximum=max(512, int(len(content) * ratio)))
         elif row.get("role") == "assistant" and len(str(row.get("content") or "")) > 8000:
             row["content"] = str(row["content"])[:8000] + "\n[历史长文本已截断]"
         for call in row.get("tool_calls") or ():

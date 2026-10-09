@@ -25,6 +25,15 @@ class ResultPagingTests(IsolatedDatabaseTestCase):
         self.assertLessEqual(len(compacted[1].content), 400)
         self.assertTrue(json.loads(compacted[1].content)["truncated"])
 
+    def test_long_overviews_are_trimmed_before_candidate_identity_fields(self):
+        records = [{"tmdb_id": str(i), "year": 2010+i, "region": "CN", "overview": "冗长描述"*500} for i in range(20)]
+        result = json.loads(compact_tool_content(json.dumps({"data": {"items": records, "total": 20}}, ensure_ascii=False), maximum=4500))
+        self.assertTrue(result["truncated"])
+        self.assertEqual(len(result["data"]["items"]), 20)
+        self.assertEqual([(item["tmdb_id"],item["year"],item["region"]) for item in result["data"]["items"]],
+                         [(item["tmdb_id"],item["year"],item["region"]) for item in records])
+        self.assertTrue(all(item["kind"] == "string" for item in result["truncation"]))
+
     def test_reference_appendix_is_counted_and_legacy_history_is_readable(self):
         old = '{"ok":true,"data":{"count":200}}\nopaque_refs=[]\nreference_arguments={}\ncandidate_numbers=' + json.dumps([{"title": "x" * 100}] * 200)
         content = compact_tool_content(old, maximum=400)
