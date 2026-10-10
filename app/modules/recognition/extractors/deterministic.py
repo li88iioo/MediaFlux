@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 
+from app.modules.recognition.cleaner import _AUDIO_CODEC_TOKEN
 from app.modules.special_media import fractional_episode_position, special_media_position
 
 
@@ -284,6 +285,8 @@ def _extract_episode(
     ``allow_plain_trailing_episode`` 只供显式 TV 批量映射使用；默认关闭，
     保持普通自动识别对标题尾部数字的保守契约。
     """
+    # 编码后的 5.1 / 7.1 属于音频规格，不能作为尾部裸集号参与解析。
+    text = _AUDIO_CODEC_TOKEN.sub(lambda match: ' ' * len(match.group(0)), str(text or ''))
     # 小数集属于特别篇语义。若继续套用裸数字规则，``12.5`` 会被错误解析
     # 成第 5 集；其最终整数位置由特别篇统一分配器决定。
     if fractional_episode_position(text) is not None:

@@ -250,6 +250,25 @@ def _serialize_match(result: MatchResult, detail: dict) -> dict:
     }
 
 
+@router.post("/scrape/clean-query")
+def clean_scrape_query(request: Request, data: dict | None = Body(default=None)):
+    """手动整理共用识别清洗，仅处理名称，不请求外部元数据。"""
+    require_api_login(request)
+    payload = data or {}
+    query = payload.get("query")
+    if not isinstance(query, str) or not query.strip():
+        return api_error("请输入需要精简的搜索名称", 400)
+    if len(query) > 1024:
+        return api_error("搜索名称不能超过 1024 个字符", 400)
+    scraper = TMDBScraper()
+    try:
+        return api_response({"query": scraper.clean_title(
+            query, keep_year=True,
+        )})
+    finally:
+        _close_scraper(scraper)
+
+
 @router.post("/scrape/preview")
 def scrape_preview(request: Request, data: dict | None = Body(default=None)):
     """输入文件名，返回识别诊断、TMDB 详情、候选和最终命名预览。"""

@@ -306,48 +306,25 @@ class GuangYaDirectoryScrapeUiTests(InitializedWebTestCase):
         )
 
     def test_one_click_clean_preserves_bracketed_title_and_removes_release_tags(self):
-        if not shutil.which("node"):
-            self.skipTest("node 不可用")
-        shared_script = POSITION_SCRIPT.read_text("utf-8")
-        directory_script = DIRECTORY_SCRIPT.read_text("utf-8")
-        self.assertIn("window.MediaScrapePosition.sanitizeSearchQuery", directory_script)
-        node_script = "const window = {};\n" + shared_script + textwrap.dedent(
-            """
-            const sanitizeSearchQuery = window.MediaScrapePosition.sanitizeSearchQuery;
-            const results = [];
-            results.push(sanitizeSearchQuery(
-                '[Arifureta Shokugyou de Sekai Saikyou S2][01-12][BIG5][1080P][MP4]'
-            ));
-            results.push(sanitizeSearchQuery(
-                '[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生（仅限港澳台)'
-            ));
-            results.push(sanitizeSearchQuery(
-                '[Sakurato] Kage no Jitsuryokusha ni Naritakute! [01-20 FIN][AVC-8bit 1080P AAC][CHS]'
-            ));
-            results.push(sanitizeSearchQuery(
-                '[LoliHouse] The Ghost in the Shell - 03 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv',
-                {knownEpisode: 3}
-            ));
-            process.stdout.write(results.join('\\n'));
-            """
+        self.assertIn("window.MediaScrapePosition.bindSearchCleaner", DIRECTORY_SCRIPT.read_text("utf-8"))
+        cases = (
+            ('[Arifureta Shokugyou de Sekai Saikyou S2][01-12][BIG5][1080P][MP4]',
+             'Arifureta Shokugyou de Sekai Saikyou'),
+            ('[ANi] 被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生（仅限港澳台)',
+             '被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生'),
+            ('[Sakurato] Kage no Jitsuryokusha ni Naritakute! [01-20 FIN][AVC-8bit 1080P AAC][CHS]',
+             'Kage no Jitsuryokusha ni Naritakute!'),
+            ('[LoliHouse] The Ghost in the Shell - 03 [WebRip 1080p HEVC-10bit AAC SRTx2].mkv',
+             'The Ghost in the Shell'),
         )
-        completed = subprocess.run(
-            ["node", "-e", node_script],
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-        self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(
-            completed.stdout.splitlines(),
-            [
-                "Arifureta Shokugyou de Sekai Saikyou",
-                "被解雇的暗黑士兵（30多岁）开始了慢生活的第二人生",
-                "Kage no Jitsuryokusha ni Naritakute!",
-                "The Ghost in the Shell",
-            ],
-        )
+        headers = {"X-CSRF-Token": self._csrf(self.client.get('/guangya').text)}
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                response = self.client.post('/api/tools/scrape/clean-query', headers=headers, json={
+                    'query': raw,
+                })
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()['query'], expected)
 
     def test_preview_renderer_does_not_truncate_directory_files(self):
         script = DIRECTORY_SCRIPT.read_text("utf-8")

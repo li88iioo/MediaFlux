@@ -49,6 +49,8 @@ from app.modules.recognition.models import (
     ReleaseParseToken,
 )
 from app.modules.recognition.cleaner import (
+    _AUDIO_CODEC_PATTERN,
+    _AUDIO_CODEC_TOKEN,
     _comparison_key,
     _split_title_variants,
     _unique_text,
@@ -157,9 +159,7 @@ _NOISE = re.compile(
     r'hd[ ._-]?(?:2160|1080|720)[pi]|(?:2160|1440|1080|720|480|576)[pi]|4k|uhd|'
     r'hq(?=[ ._-]+(?:web-?dl|webrip|2160p|1080p|hdr|h[ ._-]?26[45]))|'
     r'hdr10plus|hdr10|hdr|dolby|atmos|'
-    r'(?:true[ ._-]?hd|dts(?:[ ._-]*(?:hd|x))?(?:[ ._-]*(?:ma|hra))?|'
-    r'ddp|eac3|ac3|aac|flac|mp3|opus)'
-    r'(?:[ ._-]*atmos)?(?:[ ._-]*[1-8][ ._-]?[01](?:[ ._-][24])?)?|'
+    + _AUDIO_CODEC_PATTERN + r'|'
     r'ddp5|ddp7|(?:2|3|5|7)[ ._-]?1|'
     r'h[ ._-]?264|h[ ._-]?265|x264|x265|hevc|avc|vc[ ._-]?1|mpeg[ ._-]?2|'
     r'nvenc|vp9|av1|10bit|10-bit|8bit|'
@@ -1370,6 +1370,11 @@ def _strip_known_episode_suffix(
         return str(value or "")
 
     def replace(match: re.Match) -> str:
+        if any(
+            token.start() <= match.start(1) < token.end()
+            for token in _AUDIO_CODEC_TOKEN.finditer(match.string)
+        ):
+            return match.group(0)
         try:
             return " " if int(match.group(1)) == int(episode) else match.group(0)
         except (TypeError, ValueError):
@@ -4996,7 +5001,9 @@ class TMDBScraper:
             result.effective_season = result.season_override
         return result
 
-    def clean_title(self, title: str) -> str:
+    def clean_title(
+        self, title: str, *, keep_year: bool = False,
+    ) -> str:
         """生成搜索词；只删除已知发布噪声，保留正式括号副标题。"""
         if not title:
             return ""
@@ -5043,7 +5050,11 @@ class TMDBScraper:
         ):
             cleaned = guessed_title
         cleaned = _strip_season_tokens(cleaned)
-        return re.sub(r"\s+", " ", cleaned).strip(" ._-")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._-")
+        year = _position_number(guessed.get("year")) if keep_year else None
+        if cleaned and year and not re.search(rf"(?<!\d){year}(?!\d)", cleaned):
+            cleaned = f"{cleaned} {year}"
+        return cleaned
 
     @staticmethod
     def parse_resource_tags(filename: str) -> dict[str, str]:

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import shutil
+import json
 import textwrap
 import unittest
 from pathlib import Path
+from starlette.requests import Request
+
+from app.routes.tools_api import clean_scrape_query
 
 try:
     from playwright.sync_api import sync_playwright
@@ -141,6 +145,9 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
         self.page_errors: list[str] = []
         self.page.on("pageerror", lambda error: self.page_errors.append(str(error)))
         self.page.set_content(HARNESS)
+        self.page.expose_function("__cleanQuery", lambda body: json.loads(clean_scrape_query(
+            Request({"type": "http", "session": {"logged_in": True}}), body,
+        ).body))
         self.page.evaluate(
             """
             () => {
@@ -161,6 +168,9 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                 window.fetch = async (path, options = {}) => {
                     const body = options.body ? JSON.parse(options.body) : null;
                     window.__requests.push({path, body});
+                    if (path === '/api/tools/scrape/clean-query') {
+                        return {ok: true, json: () => window.__cleanQuery(body)};
+                    }
                     if (path.endsWith('/inspect')) {
                         return {
                             ok: true,

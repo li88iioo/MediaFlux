@@ -1460,33 +1460,15 @@
         const paneButton = event.target.closest('[data-scrape-mobile-pane]');
         if (paneButton) setMobilePane(paneButton.dataset.scrapeMobilePane);
     });
-    function sanitizeSearchQuery(query) {
-        return window.MediaScrapePosition.sanitizeSearchQuery(query, {
-            knownEpisode: state.inspection?.episode,
-        });
-    }
-
     elements.close.addEventListener('click', closeModal);
     elements.cancel.addEventListener('click', closeModal);
     elements.search.addEventListener('click', searchCandidates);
     elements.externalBtn.addEventListener('click', loadExternalHints);
-    if (elements.cleanBtn) {
-        elements.cleanBtn.addEventListener('click', () => {
-            const raw = elements.query.value;
-            const cleaned = sanitizeSearchQuery(raw);
-            if (!cleaned) {
-                elements.status.textContent = '未识别到可保留的标题，请手动修改';
-                elements.query.focus();
-                elements.query.select();
-                return;
-            }
-            elements.query.value = cleaned;
-            elements.status.textContent = cleaned === raw.trim()
-                ? '名称无需精简，正在搜索'
-                : '已精简，正在搜索';
-            searchCandidates();
-        });
-    }
+    window.MediaScrapePosition.bindSearchCleaner({
+        root: modal, button: elements.cleanBtn, query: elements.query, status: elements.status,
+        getInspection: () => state.inspection,
+        onSearch: searchCandidates,
+    });
     elements.query.addEventListener('keydown', (event) => {
         if (event.key === 'Enter') searchCandidates();
     });

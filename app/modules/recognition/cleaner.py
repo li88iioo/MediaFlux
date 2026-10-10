@@ -5,6 +5,14 @@ import re
 import unicodedata
 
 
+_AUDIO_CODEC_PATTERN = (
+    r'(?:true[ ._-]?hd|dts(?:[ ._-]*(?:hd|x))?(?:[ ._-]*(?:ma|hra))?|'
+    r'ddp|eac3|ac3|aac|flac|mp3|opus)'
+    r'(?:[ ._-]*atmos)?(?:[ ._-]*[1-8][ ._-]?[01](?:[ ._-][24])?)?'
+)
+_AUDIO_CODEC_TOKEN = re.compile(rf'(?i)\b{_AUDIO_CODEC_PATTERN}\b')
+
+
 _MEDIA_FILE_SUFFIX = re.compile(
     r"(?i)\.(?:mkv|mp4|ts|m2ts|mts|avi|mov|m4v|webm|mpeg|mpg|wmv|flv|"
     r"vob|tp|f4v|rm|rmvb|nfo|srt|ass|ssa|sup|vtt|sub|idx|jpg|jpeg|png|webp)$"

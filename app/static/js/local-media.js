@@ -1761,18 +1761,11 @@
     $('lmRefreshItemsBtn').addEventListener('click', refreshMediaItems);
     $('lmSearchBtn').addEventListener('click', search);
     $('lmAutoPreviewBtn').addEventListener('click', () => preview());
-    $('lmScrapeCleanBtn')?.addEventListener('click', () => {
-        const cleaned = window.MediaScrapePosition.sanitizeSearchQuery(
-            $('lmSearchQuery').value,
-            {knownEpisode: inspection?.parsed_episode},
-        );
-        if (!cleaned) {
-            $('lmScrapeStatus').textContent = '请手动修改搜索名称';
-            return $('lmSearchQuery').focus();
-        }
-        $('lmSearchQuery').value = cleaned;
-        invalidatePreview();
-        $('lmSearchQuery').focus();
+    window.MediaScrapePosition.bindSearchCleaner({
+        root: $('lmScrapeModal'), button: $('lmScrapeCleanBtn'),
+        query: $('lmSearchQuery'), status: $('lmScrapeStatus'),
+        getInspection: () => inspection,
+        onChange: invalidatePreview, onSearch: search,
     });
     $('lmScrapeExternalBtn')?.addEventListener('click', loadExternalHints);
     $('lmScrapeExternalHints')?.addEventListener('click', (event) => {
