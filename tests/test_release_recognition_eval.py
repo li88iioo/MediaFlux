@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.modules.scraper import TMDBScraper, extract_recognition_context
+from app.modules.recognition.cleaner import _comparison_key
 from tests.support import release_parse_fields
 from tests.recognition_eval_helpers import (
     classify_field,
@@ -144,6 +145,18 @@ class ReleaseRecognitionFixtureSchemaTests(unittest.TestCase):
 
 
 class ReleaseRecognitionEvaluationTests(unittest.TestCase):
+    def test_instance_metadata_keeps_complete_title_in_release_projection(self):
+        parser = TMDBScraper()
+        self.addCleanup(parser.close)
+        for case in load_release_recognition_cases(FIXTURE):
+            if "source-instance-20261010" not in case.tags:
+                continue
+            with self.subTest(case_id=case.case_id):
+                parsed = parser.parse_media(case.filename, case.parent_path)
+                self.assertEqual(_comparison_key(parsed.title), _comparison_key(case.expected["title"]))
+                self.assertEqual(parsed.context.normalized_title, case.expected["title"])
+                self.assertEqual(parsed.year, case.expected["year"])
+
     def test_real_release_name_corpus_matches_expected_field_metrics(self):
         cases = load_release_recognition_cases(FIXTURE)
         outcomes = []

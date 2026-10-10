@@ -152,17 +152,21 @@ _CR_WEBRIP_SOURCE = re.compile(
 
 _NOISE = re.compile(
     r'(?i)\b('
-    r'web-?dl|webrip|bluray|blu-?ray|remux|bdrip|brrip|dvdrip|vhsrip|hdtv|pdtv|cam|ts|tc|'
-    r'hd[ ._-]?(?:2160|1080|720)p|2160p|1080p|720p|480p|576p|4k|uhd|'
+    r'web-?dl|webrip|bluray|blu-?ray|remux|bdrip|brrip|(?:ldvd|dvd|vhs|ld|tv)rip|'
+    r'hdctv|hdtv|pdtv|cam|ts|tc|'
+    r'hd[ ._-]?(?:2160|1080|720)[pi]|(?:2160|1440|1080|720|480|576)[pi]|4k|uhd|'
     r'hq(?=[ ._-]+(?:web-?dl|webrip|2160p|1080p|hdr|h[ ._-]?26[45]))|'
-    r'hdr|hdr10|hdr10plus|dolby|atmos|truehd|'
-    r'(?:ddp|eac3|aac|dts|flac|opus)[ ._-]?(?:1|2|3|5|7)[ ._-]?[01]|'
-    r'ddp|ddp5|ddp7|eac3|ac3|aac|dts|dts-hd|dts-ma|flac|mp3|opus|(?:2|3|5|7)[ ._-]?1|'
-    r'h[ ._-]?264|h[ ._-]?265|x264|x265|hevc|avc|nvenc|vp9|av1|10bit|10-bit|8bit|'
+    r'hdr10plus|hdr10|hdr|dolby|atmos|'
+    r'(?:true[ ._-]?hd|dts(?:[ ._-]*(?:hd|x))?(?:[ ._-]*(?:ma|hra))?|'
+    r'ddp|eac3|ac3|aac|flac|mp3|opus)'
+    r'(?:[ ._-]*atmos)?(?:[ ._-]*[1-8][ ._-]?[01](?:[ ._-][24])?)?|'
+    r'ddp5|ddp7|(?:2|3|5|7)[ ._-]?1|'
+    r'h[ ._-]?264|h[ ._-]?265|x264|x265|hevc|avc|vc[ ._-]?1|mpeg[ ._-]?2|'
+    r'nvenc|vp9|av1|10bit|10-bit|8bit|'
     r'23\.976fps|24fps|25fps|30fps|60fps|fps|'
     r'netflix|nf|amazon|amzn|disney|dsnp|hbo[ ._-]?max|hbo|hulu|atvp|'
     r'apple[ ._-]?tv\+?|apple|itunes|catchplay|bilibili|baha|'
-    r'cht|chs|big5|gb|mp4|mkv|assx?\d*|srtx?\d*|'
+    r'cht|chs|big5|gb|mp4|mkv|assx\d+|srtx\d+|'
     r'colortv|color?tv|dreamhd|ddhdtv|bitsrc|frds|'
     r'complete|全集|全季|全\s*\d+\s*集|全[零〇一二两三四五六七八九十]{1,3}集|finale|'
     r's\d{1,2}e\d{1,4}(?:v\d+)?|s\d{1,2}|e\d{1,4}(?:v\d+)?|'
@@ -614,7 +618,7 @@ _STRUCTURED_EPISODE_POSITION = re.compile(
 _BRACKET_RELEASE_META_NOISE = re.compile(
     r"(?i)^(?:cr|iq|adn|repack|readnfo|rartv|multi(?:-?subs?)?|msubs?|subs?|"
     r"subfrench|vostfr|jpn?|jap|rus|tver|tv|(?:tv|тв)\s*-\s*(?:0[1-9]|[1-9]\d?)|"
-    r"bd|fhd|mpeg2|vhsrip|audio|b[ ._-]?hmt|version[ ._-]*light|final)$"
+    r"bd|fhd|mpeg2|vhsrip|audio|ass|srt|pgs|b[ ._-]?hmt|version[ ._-]*light|final)$"
 )
 _BRACKET_RELEASE_DATE = re.compile(
     r"^((?:19|20)\d{2})([./-])(0?[1-9]|1[0-2])\2"
@@ -662,15 +666,22 @@ _PRIMARY_TRAILING_RELEASE_EDITION_NOISE = re.compile(
     r"(?:(?:\d{1,3}(?:st|nd|rd|th))[ ._\-]*remaster(?:ed)?|"
     r"(?:4k|uhd)[ ._\-]*remaster(?:ed)?)$"
 )
-_LEGACY_MULTI_TECH_TAIL = re.compile(
-    r"(?ix)\bvhsrip\b"
-    r"(?=.*\b(?:\d{3,4}p|x26[45]|h[ ._-]?26[45]|hevc|avc|aac|flac|dts)\b)"
-    r".*?(?P<separator>[ ._-]+)(?P<tag>multi(?:-?subs?)?|msubs?)\s*$"
+_RELEASE_TECHNICAL_EVIDENCE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:2160[pi]|1440[pi]|1080[pi]|720[pi]|480[pi]|4k|uhd|"
+    r"web[ ._-]?(?:dl|rip)|blu[ ._-]?ray|bdrip|(?:ldvd|dvd|vhs|ld|tv)rip|"
+    r"hdctv|hdtv|remux|h[ ._-]?26[45]|x26[45]|hevc|avc|vc[ ._-]?1|"
+    r"true[ ._-]?hd|aac|ddp|eac3|dts|flac)"
 )
-_IMPLICIT_SEASON_TECHNICAL_EVIDENCE = re.compile(
-    r"(?i)(?:2160p|1080p|720p|480p|4k|uhd|web[ ._-]?(?:dl|rip)|"
-    r"blu[ ._-]?ray|bdrip|remux|h[ ._-]?26[45]|x26[45]|hevc|avc|"
-    r"(?:aac|ddp|eac3|dts|flac)(?:[ ._-]?[257]\.?1)?)"
+# 裸词可能是正式片名；只有年份/技术规格之后的整个尾段都能解释为发布
+# 元数据时才移除。未知词和篇章副标题会使该尾段保留，继续接受严格评分。
+_RELEASE_TECHNICAL_METADATA = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:[1-9]\d?[ ._-]*audios?|"
+    r"proper|repack|readnfo|internal|uncut|unrated|extended(?:[ ._-]+cut)?|"
+    r"remaster(?:ed)?|imax|dc|director'?s[ ._-]+cut|v\d{1,3}|"
+    r"(?:ai[ ._-]+)?hybrid|upscaled?|dovi|dv(?:[ ._-]*p[ ._-]?\d{1,2})?|"
+    r"p[ ._-]?\d{1,2}|mnhd|halfcd|multi(?:-?subs?)?|msubs?|ass|srt|pgs|"
+    r"usa|ger|portuguese|english|chinese|mandarin|cantonese|japanese|korean)"
+    r"(?![A-Za-z0-9])"
 )
 _RELEASE_SOURCE_BRACKET = re.compile(
     r"(?i)^(?:(?:高清影视之家|高清剧集网)(?:发布)?\s*)?"
@@ -1162,7 +1173,7 @@ def _implicit_season_has_release_evidence(
     if match.groupdict().get("volume"):
         return True
     tail = str(source or "")[match.end("season"):]
-    if _IMPLICIT_SEASON_TECHNICAL_EVIDENCE.search(tail):
+    if _RELEASE_TECHNICAL_EVIDENCE.search(tail):
         return True
     return any(
         _is_bracket_noise(item.group(1))
@@ -1702,7 +1713,7 @@ def _non_destructive_release_title_candidates(
             and re.search(r"[\u3040-\u30ff\u3400-\u9fff]", parts[2])
             and re.search(r"[A-Za-z]", parts[3]) and not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", parts[3])
             and re.fullmatch(r"(?:(?:19|20)\d{2}|\d{1,3}(?:v\d+)?)", parts[4])
-            and any(_IMPLICIT_SEASON_TECHNICAL_EVIDENCE.search(part) for part in parts[5:])):
+            and any(_RELEASE_TECHNICAL_EVIDENCE.search(part) for part in parts[5:])):
         primary = re.sub(r"\s+", " ", _strip_season_tokens(parts[2])).strip(" ._-")
         if primary and not _low_information_query(primary):
             components["media_kinds"].append(parts[1])
@@ -1908,6 +1919,14 @@ def _candidate_tail_release_group(stem: str) -> tuple[str, int] | None:
 
 def _tail_release_group(stem: str) -> tuple[str, int] | None:
     """保守提取紧凑的尾部制作组，避免把 ``WEB-DL.1080p...`` 当作组名。"""
+    dot_at = str(stem or "").rfind(".")
+    if dot_at >= 0:
+        dot_suffix = stem[dot_at + 1:].strip()
+        if (
+            _RELEASE_GROUP_SUFFIX.fullmatch(dot_suffix)
+            and _known_recognition_value(dot_suffix, "release_suffix")
+        ):
+            return dot_suffix, dot_at
     split_at = str(stem or "").rfind("-")
     if split_at < 0:
         return None
@@ -2025,10 +2044,17 @@ def _clean_release_stem(value: str) -> tuple[str, dict[str, list[str]]]:
     # ``AAC.English.CHS-ENG`` 中的 English 是音轨语言而不是片名；只有它
     # 同时夹在技术标记与语言代码之间时才删除，不能全局清理 English。
     stem = _RELEASE_LANGUAGE_NAME_AFTER_TECH.sub(strip_release_language_name, stem)
-    legacy_multi = _LEGACY_MULTI_TECH_TAIL.search(stem)
-    if legacy_multi:
-        cleaned["noise_tokens"].append(legacy_multi.group("tag"))
-        stem = stem[:legacy_multi.start("separator")]
+    technical = _RELEASE_TECHNICAL_EVIDENCE.search(stem)
+    if technical:
+        years = list(_YEAR_TOKEN.finditer(stem, 0, technical.start()))
+        tail_start = years[-1].end() if years else technical.start()
+        tail = stem[tail_start:]
+        unexplained = _RELEASE_TECHNICAL_METADATA.sub(" ", _NOISE.sub(" ", tail))
+        if not unexplained.strip(" ._-+[]()【】（）"):
+            cleaned["noise_tokens"].extend(
+                match.group(0) for match in _RELEASE_TECHNICAL_METADATA.finditer(tail)
+            )
+            stem = stem[:tail_start] + _RELEASE_TECHNICAL_METADATA.sub(" ", tail)
     chinese_episode_tokens = [
         match.group(0) for match in _CHINESE_EPISODE_TOKEN.finditer(stem)
     ]
@@ -2288,6 +2314,8 @@ def _parse_release_surface(
             or implicit_season is not None
             or episode_title_prefix is not None
             or _low_information_query(release_title)
+            or _NOISE.fullmatch(release_title)
+            or _has_distinctive_title_remainder([canonical_title], release_title)
             or (
                 len(_comparison_key(canonical_title).replace(" ", ""))
                 > len(_comparison_key(release_title).replace(" ", ""))
@@ -2532,7 +2560,7 @@ def _enclosed_high_season_fallback_context(
             or _probable_unknown_release_prefix(prefix_content, title_remainder)
         ):
             continue
-        if not _IMPLICIT_SEASON_TECHNICAL_EVIDENCE.search(tail):
+        if not _RELEASE_TECHNICAL_EVIDENCE.search(tail):
             continue
         title, title_cleaned = _clean_release_stem(match.group("title"))
         title = re.sub(r"\s+", " ", title).strip(" ._-—–:：")

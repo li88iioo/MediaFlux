@@ -38,6 +38,85 @@ class RecognitionContractMixin:
 
 
 class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
+    def test_instance_technical_metadata_does_not_reject_complete_movie_identity(self):
+        scraper = self.recognition_module()
+        cases = (
+            ("血玫瑰.1988.DVDRip.x264.2Audios.mkv", "血玫瑰", "", "1988"),
+            ("妖怪都市.Wizard_s.Curse.1992.LDVDRip.HALFCD.2Audios.mkv",
+             "妖怪都市", "Wizard's Curse", "1992"),
+            ("City.Hunter.1993.BluRay.1080p.x265.10bit.2Audio.MNHD-FRDS.mkv",
+             "城市猎人", "City Hunter", "1993"),
+            ("The.Predator.2018.PROPER.2160p.BluRay.REMUX.HEVC.DTS-HD.MA.TrueHD.7.1.Atmos-FGT.mkv",
+             "铁血战士", "The Predator", "2018"),
+            ("Predator Badlands 2025 USA V2 BluRay REMUX UHD DoVi HDR10 2160p Atmos TrueHD7.1-DreamHD.mkv",
+             "铁血战士：杀戮之地", "Predator Badlands", "2025"),
+            ("Kick-Ass.2.2013.2160p.UHD.BluRay.x265.10bit.HDR.DTS-X.MA7.1-NukeHD.mkv",
+             "海扁王2", "Kick-Ass 2", "2013"),
+        )
+        for filename, title, original, year in cases:
+            with self.subTest(filename=filename):
+                context = scraper.extract_recognition_context(filename)
+                candidate = {
+                    "title": title, "original_title": original,
+                    "release_date": year + "-01-01", "media_type": "movie",
+                }
+                score = scraper.score_candidate(context, candidate)
+                self.assertEqual(score.rejected_constraints, [])
+                self.assertGreaterEqual(score.final_score, 0.9)
+                self.assertIsNone(context.episode)
+                self.assertIsNone(context.season)
+                self.assertTrue(any(
+                    token.kind == "noise_tokens"
+                    for token in scraper.TMDBScraper._release_parse_tokens(context)
+                ))
+                wrong_year = scraper.score_candidate(
+                    context, {**candidate, "release_date": "1970-01-01"},
+                )
+                self.assertLess(wrong_year.final_score, 0.9)
+                wrong_type = scraper.score_candidate(
+                    context, {**candidate, "media_type": "tv"},
+                )
+                self.assertIn("media_type_mismatch", wrong_type.rejected_constraints)
+
+    def test_technical_metadata_cleanup_preserves_unexplained_title_remainder(self):
+        scraper = self.recognition_module()
+        context = scraper.extract_recognition_context(
+            "The.Example.2024.PROPER.1080p.BluRay.Secret.Chapter.mkv"
+        )
+        self.assertIn("Secret Chapter", context.normalized_title)
+        candidate = {
+            "title": "The Example", "release_date": "2024-01-01",
+            "media_type": "movie",
+        }
+        score = scraper.score_candidate(context, candidate)
+        self.assertLess(score.final_score, 0.9)
+        self.assertTrue(scraper.has_unresolved_candidate_title_remainder(context, None, candidate))
+
+    def test_dot_release_suffix_requires_enabled_knowledge(self):
+        from tests.support import isolated_test_database
+        from app.modules import recognition_knowledge as knowledge
+
+        self.enterContext(isolated_test_database("dot-release-group.db"))
+        scraper = self.recognition_module()
+        knowledge.ensure_seed_knowledge()
+        filename = "The.Movie.2024.WEB-DL.1080p.x264.2Audio.BOBO.mkv"
+        context = scraper.extract_recognition_context(filename)
+        self.assertEqual(context.normalized_title, "The Movie")
+        self.assertEqual(context.cleaned_components["release_groups"], ["BOBO"])
+        self.assertEqual(
+            scraper.TMDBScraper.parse_resource_tags(filename)["release_group"], "BOBO",
+        )
+        entry = next(
+            item for item in knowledge.list_entries()["items"]
+            if item["knowledge_key"] == "release-suffix:bobo"
+        )
+        knowledge.update_entry(entry["id"], {"disabled": True})
+        disabled = scraper.extract_recognition_context(filename)
+        self.assertIn("BOBO", disabled.normalized_title)
+        self.assertEqual(disabled.cleaned_components["release_groups"], [])
+        unknown = scraper.extract_recognition_context(filename.replace("BOBO", "UnknownWord"))
+        self.assertIn("UnknownWord", unknown.normalized_title)
+
     def test_tv_mapping_retains_explicit_zero_before_special_normalization(self):
         scraper = self.recognition_module()
         cases = (
@@ -2963,6 +3042,31 @@ def _merged_four_season_timeline() -> dict:
 
 
 class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
+    def test_cleaned_instance_movie_matches_and_still_checks_ambiguous_identity(self):
+        scraper = self.recognition_module()
+        candidate = {
+            "id": 90965, "title": "血玫瑰", "original_title": "Blood Rose",
+            "release_date": "1988-01-01", "media_type": "movie",
+        }
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous):
+                candidates = [candidate]
+                if ambiguous:
+                    candidates.append({**candidate, "id": 90966})
+                client = _DeterministicClient(
+                    candidates, {str(item["id"]): item for item in candidates},
+                )
+                parser = scraper.TMDBScraper(client)
+                self.addCleanup(parser.close)
+                result = parser.deterministic_recognize(
+                    "血玫瑰.1988.DVDRip.x264.2Audios.mkv",
+                )
+                self.assertEqual(result.need_confirm, ambiguous)
+                if not ambiguous:
+                    self.assertEqual(result.status, "matched")
+                    self.assertEqual(result.tmdb_id, "90965")
+                self.assertTrue(all("2Audios" not in query for query, _, _ in client.search_calls))
+
     def test_classified_animation_release_rejects_live_action_homonym_without_relaxing_gates(self):
         scraper = self.recognition_module()
         filename = "[GM-Team][国漫][大主宰 第2季][The Great Ruler Ⅱ][2026][38][HEVC][GB][4K].mp4"

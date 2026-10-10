@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 6,
+  "revision": 7,
   "entries": [
     {
       "knowledge_key": "release-group:ani",
@@ -450,6 +450,14 @@
       "canonical_value": "FRDS",
       "aliases": [
         "FRDS"
+      ]
+    },
+    {
+      "knowledge_key": "release-suffix:bobo",
+      "knowledge_type": "release_suffix",
+      "canonical_value": "BOBO",
+      "aliases": [
+        "BOBO"
       ]
     },
     {
