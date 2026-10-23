@@ -1,28 +1,29 @@
 # MediaFlux Jellyfin 插件
 
-版本 **0.1.2**（程序集 / manifest：**0.1.2.0**）。仅支持 **Jellyfin 12.2 系列 / .NET 10**，API 基线 `12.2.0`，manifest ABI `12.2.0.0`。
+版本 **0.1.3**（程序集 / manifest：**0.1.3.0**）。验证 **Jellyfin 12.2 / 12.3，.NET 10**；编译 API 基线保持 `12.2.0`，manifest 最低 ABI `12.2.0.0`。不再把同一主版本的小版本升级当成删除失败；未来版本仍需独立验证。
 
 插件默认关闭，仅拦截用户明确发起的 Jellyfin `DELETE /Items/{itemId}`、`DELETE /Items?ids=...`。扫描发现 STRM 消失、清库或定时任务不会触发 MF 云端删除；插件关闭或请求完全不涉及映射内 STRM 时，继续原生删除行为。
 
 ## 配置
 
-将整合后生成的 DLL / `meta.json` 放入 Jellyfin 插件目录并重启。在管理员插件配置页：
+安装与在线更新见 [用户指南](../../docs/jellyfin-plugin.md)。仓库地址：
+
+```text
+https://github.com/li88iioo/MediaFlux/releases/download/manifest/manifest.json
+```
+
+在管理员插件配置页：
 
 1. 保持关闭，保存 MF URL、用户名、密码并测试连接。连接使用登录会话和 CSRF，HTTPS 使用系统证书验证。
-2. 选择一种映射模式：`mf` 同步并缓存 MF 的 Jellyfin 映射及媒体库，或 `manual` 仅使用手动映射；两者不合并。
-3. MF 模式需同步成功后才启用；MF URL / 用户名变化后必须重新同步。手动映射示例：
-
-   ```json
-   [{"local":"/mf/strm","server":"/jellyfin/strm"}]
-   ```
-
-4. 启用后仍需由真实 Jellyfin 用户发起纳管删除。API key 不能绕过用户可见性和 `CanDelete`，整批请求在云端写入前统一校验。
+2. 点击“同步 MF 范围”，统一读取 MF 的 Jellyfin 映射和媒体库，不再支持手动映射。
+3. 核对范围后启用。MF URL / 用户名变化后必须重新同步。旧手动配置首次升级会停用并清空旧范围，保留连接凭据，重新同步后才能启用；旧 MF 同步配置保留。
+4. 仍需由真实 Jellyfin 用户发起纳管删除。API key 不能绕过用户可见性和 `CanDelete`，整批请求在云端写入前统一校验。
 
 ## 删除协议与范围
 
 每次删除在同一已登录 MF 会话中先请求 `GET api/jellyfin/delete-capabilities`，必须返回 `scope_version: 1`，且 `kinds` 包含全部 `movie / episode / season / series`。能力不缓存；接口不存在、鉴权失败、返回格式或版本 / kind 不匹配均不发送删除 POST。
 
-通过握手并再次复核本地状态后，调用原有 `POST api/jellyfin/delete`，保留 `paths / fingerprints / mapping_mode / mappings`，仅新增 `scopes`：
+通过握手并再次复核本地状态后，调用原有 `POST api/jellyfin/delete`，固定使用 `mapping_mode=mf`，发送路径、指纹及范围：
 
 ```json
 {
@@ -33,7 +34,7 @@
 }
 ```
 
-`manual` 模式还发送当前手动 `mappings`；`mf` 模式不发送该字段。所有路径都是 Jellyfin 文件系统路径，顶层 `paths` 与完整 `fingerprints` 对应所有 scopes 的 STRM 并集。
+插件不发送手动 `mappings` 字段。所有路径都是 Jellyfin 文件系统路径，顶层 `paths` 与完整 `fingerprints` 对应所有 scopes 的 STRM 并集。
 
 | kind | root | 授权范围 |
 | --- | --- | --- |
@@ -64,26 +65,17 @@
 
 ## 本地构建与官方 TestServer 测试
 
-常规环境：
+使用 .NET SDK 10.0.402：
 
 ```bash
 dotnet build plugins/MediaFlux.Jellyfin/MediaFlux.Jellyfin.csproj -c Release
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.2
+DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/verify.sh 12.3
 ```
 
-已有本地官方源码构建和 SDK / NuGet 缓存时，可直接引用官方 DLL 测试，不重新构建共享源码：
+可用 `DOTNET_BIN` 指定 SDK，`JELLYFIN_VERIFY_CACHE` 指定官方源码缓存。脚本复用已下载源码，不改变生产插件 12.2.0 的编译基线。
 
-```bash
-cache="$PWD/.superpowers/tmp/jellyfin-plugin"
-export DOTNET_ROOT="$cache/dotnet10"
-export DOTNET_CLI_HOME="$cache/dotnet-home"
-export NUGET_PACKAGES="$cache/nuget"
-"$DOTNET_ROOT/dotnet" test plugins/MediaFlux.Jellyfin/Tests/MediaFlux.Jellyfin.Tests.csproj \
-  -c Release --no-restore --nologo \
-  "-p:JellyfinApiDir=$cache/jellyfin-12.2/Jellyfin.Api/bin/Release/net10.0"
-```
-
-测试在 ASP.NET TestServer 中加载**真实官方 12.2 `LibraryController` / `PluginsController`**，不是复制控制器；底层媒体库 / 用户存储和 MF HTTP 响应为可控测试替身。覆盖四种范围、完整指纹、能力握手、权限 / 版本保护、原生对象缓存及文件竞态、成功后缺失文件、失败不重放和设置接口回归。不启动生产 Jellyfin，不连接生产 MF / 云盘。
+测试在 ASP.NET TestServer 中分别加载**真实官方 12.2 / 12.3 `LibraryController` / `PluginsController`**，不是复制控制器；底层媒体库 / 用户存储和 MF HTTP 响应为可控测试替身。覆盖四种范围、完整指纹、能力握手、权限 / 版本保护、文件竞态、失败不重放、配置迁移和 Logo HTTP 接口。不启动生产 Jellyfin，不连接生产 MF / 云盘。
 
 ## 打包
 
@@ -93,4 +85,4 @@ export NUGET_PACKAGES="$cache/nuget"
 DOTNET_BIN=dotnet bash plugins/MediaFlux.Jellyfin/scripts/package.sh
 ```
 
-脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.2.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。
+脚本校验版本、框架 / ABI、插件 ID，生成 `artifacts/MediaFlux.Jellyfin-0.1.3.0.zip` 和 SHA256。包内 README 使用 `docs/jellyfin-plugin.md` 用户指南；本文件说明插件开发协议与验证方式。打包不会改写文档。

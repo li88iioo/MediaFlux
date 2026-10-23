@@ -5,18 +5,21 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+    <JellyfinVersion Condition="'$(JellyfinVersion)' == ''">12.2.0</JellyfinVersion>
   </PropertyGroup>
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="../MediaFlux.Jellyfin.csproj" />
-    <PackageReference Include="Jellyfin.Controller" Version="12.2.0" />
-    <PackageReference Include="Jellyfin.Model" Version="12.2.0" />
+    <PackageReference Include="Jellyfin.Controller" Version="$(JellyfinVersion)" />
+    <PackageReference Include="Jellyfin.Model" Version="$(JellyfinVersion)" />
     <PackageReference Include="Microsoft.AspNetCore.TestHost" Version="10.0.13" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageReference Include="Moq" Version="4.21.0" />
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" PrivateAssets="all" />
     <Reference Include="Jellyfin.Api"><HintPath>$(JellyfinApiDir)/Jellyfin.Api.dll</HintPath></Reference>
+    <None Include="../meta.json" Link="plugin-meta.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../Resources/logo.png" Link="logo.png" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="RequireOfficialApi" BeforeTargets="ResolveReferences">
     <Error Condition="!Exists('$(JellyfinApiDir)/Jellyfin.Api.dll')" Text="Use scripts/verify.sh, or set JellyfinApiDir to the pinned official Jellyfin.Api build directory. Tests use the real official HTTP controller, not a replica." />

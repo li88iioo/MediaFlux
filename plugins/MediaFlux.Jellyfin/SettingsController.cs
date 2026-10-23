@@ -1,6 +1,5 @@
 using System.Text.Json.Serialization;
 using MediaBrowser.Common.Api;
-using MediaBrowser.Controller.Library;
 using MediaFlux.Jellyfin.Configuration;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
@@ -10,7 +9,7 @@ namespace MediaFlux.Jellyfin;
 [ApiController]
 [Route("MediaFlux")]
 [Authorize(Policy = Policies.RequiresElevation)]
-public sealed class SettingsController(Plugin plugin, MfClient mf, ILibraryManager library) : ControllerBase
+public sealed class SettingsController(Plugin plugin, MfClient mf) : ControllerBase
 {
     [HttpGet("Settings")]
     public ActionResult<SettingsView> GetSettings() => View();
@@ -23,8 +22,6 @@ public sealed class SettingsController(Plugin plugin, MfClient mf, ILibraryManag
             var c = plugin.Snapshot();
             c.Enabled = request.Enabled; c.MfUrl = request.MfUrl; c.Username = request.Username;
             if (!string.IsNullOrEmpty(request.Password)) c.Password = request.Password;
-            c.MappingMode = request.MappingMode;
-            if (request.MappingMode == "manual") c.ManualMappings = request.Mappings;
             c.TaskTimeoutSeconds = request.TaskTimeoutSeconds;
             plugin.UpdateConfiguration(c);
             return View();
@@ -49,7 +46,6 @@ public sealed class SettingsController(Plugin plugin, MfClient mf, ILibraryManag
         try
         {
             var c = plugin.Snapshot();
-            if (c.MappingMode != "mf") throw new PluginFault("手动模式只使用手动映射，不合并或同步 MF 映射。");
             var overview = await mf.OverviewAsync(c, token).ConfigureAwait(false);
             plugin.CommitSync(c, overview);
             return View();
@@ -61,9 +57,7 @@ public sealed class SettingsController(Plugin plugin, MfClient mf, ILibraryManag
     {
         var c = plugin.Snapshot();
         return new SettingsView(c.Enabled, c.MfUrl, c.Username, c.Password.Length > 0,
-            c.MappingMode, c.ManualMappings, Plugin.ActiveMappings(c).Mappings,
-            c.MappingMode == "mf" ? c.MfLibraries : library.GetVirtualFolders()
-                .Select(l => new LibraryScope { Id = l.ItemId, Name = l.Name, Locations = l.Locations }).ToArray(),
+            Plugin.ActiveMappings(c).Mappings, c.MfLibraries,
             c.TaskTimeoutSeconds, c.SyncedAtUtc, Plugin.CacheCurrent(c), plugin.LastDeleteError, Plugin.CompiledBaseline, Plugin.SourceCheckedVersions);
     }
 
@@ -78,8 +72,6 @@ public sealed class SettingsRequest
     [JsonPropertyName("mf_url")] public string MfUrl { get; set; } = "";
     [JsonPropertyName("username")] public string Username { get; set; } = "";
     [JsonPropertyName("password")] public string? Password { get; set; }
-    [JsonPropertyName("mapping_mode")] public string MappingMode { get; set; } = "mf";
-    [JsonPropertyName("mappings")] public PathMapping[] Mappings { get; set; } = [];
     [JsonPropertyName("task_timeout_seconds")] public int TaskTimeoutSeconds { get; set; } = 120;
 }
 
@@ -88,8 +80,6 @@ public sealed record SettingsView(
     [property: JsonPropertyName("mf_url")] string MfUrl,
     [property: JsonPropertyName("username")] string Username,
     [property: JsonPropertyName("password_set")] bool PasswordSet,
-    [property: JsonPropertyName("mapping_mode")] string MappingMode,
-    [property: JsonPropertyName("manual_mappings")] PathMapping[] ManualMappings,
     [property: JsonPropertyName("active_mappings")] PathMapping[] ActiveMappings,
     [property: JsonPropertyName("libraries")] LibraryScope[] Libraries,
     [property: JsonPropertyName("task_timeout_seconds")] int TaskTimeoutSeconds,

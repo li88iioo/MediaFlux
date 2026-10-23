@@ -7,6 +7,7 @@ using System.Xml.Serialization;
 using Jellyfin.Api.Controllers;
 using Jellyfin.Database.Implementations.Entities;
 using Jellyfin.Database.Implementations.Enums;
+using Jellyfin.Extensions.Json;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Common.Configuration;
 using MediaBrowser.Common.Plugins;
@@ -56,12 +57,14 @@ internal sealed class TestFixture : IDisposable
     public List<Guid> NativeChildDeletes { get; } = [];
     public User User { get; } = new("tester", "auth", "reset");
     public Plugin Plugin { get; }
+    public LocalPlugin InstalledPlugin { get; }
+    public Func<Plugin> ReloadPlugin { get; }
     public FakeMfHandler Handler { get; } = new();
     public int NativeDeletes { get; private set; }
     private readonly WebApplication _application;
     public HttpClient Client { get; }
 
-    public TestFixture(bool enabled = true, string version = "12.2.0", string mode = "mf")
+    public TestFixture(bool enabled = true, string? version = null)
     {
         Directory.CreateDirectory(Root);
         User.Permissions.Add(new Permission(PermissionKind.EnableContentDeletion, true));
@@ -97,16 +100,17 @@ internal sealed class TestFixture : IDisposable
             new XmlSerializer(o.GetType()).Serialize(stream, o);
         });
         var host = new Mock<IServerApplicationHost>();
-        host.SetupGet(h => h.ApplicationVersion).Returns(Version.Parse(version));
-        Plugin = new Plugin(paths.Object, serializer.Object, host.Object);
-        Plugin.UpdateConfiguration(new PluginConfiguration { MfUrl = "http://mf.invalid", Username = "mf-user", Password = "private-password", MappingMode = mode });
-        if (mode == "mf") Plugin.CommitSync(Plugin.Snapshot(), new MfOverview([new PathMapping { Local = "/mf/strm", Server = Root }], []));
+        host.SetupGet(h => h.ApplicationVersion).Returns(
+            version is null ? typeof(IServerApplicationHost).Assembly.GetName().Version! : Version.Parse(version));
+        ReloadPlugin = () => new Plugin(paths.Object, serializer.Object, host.Object);
+        Plugin = ReloadPlugin();
+        Plugin.UpdateConfiguration(new PluginConfiguration { MfUrl = "http://mf.invalid", Username = "mf-user", Password = "private-password" });
+        Plugin.CommitSync(Plugin.Snapshot(), new MfOverview([new PathMapping { Local = "/mf/strm", Server = Root }], []));
         var config = Plugin.Snapshot();
-        config.ManualMappings = [new PathMapping { Local = "/manual/strm", Server = Root }];
         // Tests can construct enabled out-of-family configurations to check unmanaged passthrough.
         config.Enabled = enabled;
-        if (Version.Parse(version) is { Major: 12, Minor: 2 } || !enabled) Plugin.UpdateConfiguration(config);
-        else { Plugin.Configuration.Enabled = enabled; Plugin.Configuration.ManualMappings = config.ManualMappings; }
+        if (Plugin.IsTargetVersion || !enabled) Plugin.UpdateConfiguration(config);
+        else Plugin.Configuration.Enabled = enabled;
         Users.Setup(u => u.GetUserById(User.Id)).Returns(User);
         Library.Setup(l => l.GetItemById<BaseItem>(It.IsAny<Guid>(), It.IsAny<User?>()))
             .Returns((Guid id, User? user) => user is not null && Hidden.Contains(id) ? null : Items.GetValueOrDefault(id));
@@ -133,7 +137,10 @@ internal sealed class TestFixture : IDisposable
         services.AddSingleton(Mock.Of<ILibraryMonitor>()); services.AddSingleton(Mock.Of<IServerConfigurationManager>());
         services.AddSingleton(Mock.Of<IInstallationManager>());
         var plugins = new Mock<IPluginManager>();
-        plugins.Setup(p => p.GetPlugin(Plugin.Id, null)).Returns(new LocalPlugin(Root, true, new PluginManifest { Id = Plugin.Id, Name = Plugin.Name, Version = "0.1.2.0" }) { Instance = Plugin });
+        var manifest = JsonSerializer.Deserialize<PluginManifest>(
+            File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "plugin-meta.json")), JsonDefaults.Options)!;
+        InstalledPlugin = new LocalPlugin(Root, true, manifest) { Instance = Plugin };
+        plugins.Setup(p => p.GetPlugin(Plugin.Id, It.IsAny<Version?>())).Returns(InstalledPlugin);
         services.AddSingleton(plugins.Object);
         new PluginServiceRegistrator().RegisterServices(services, host.Object);
         services.AddSingleton(Plugin);

@@ -92,8 +92,7 @@ public sealed class MfClient
                 || !new[] { "movie", "episode", "season", "series" }.All(k => kinds.EnumerateArray().Any(v => v.GetString() == k)))
                 throw new PluginFault("MF 不支持完整 scopes v1 删除协议；请升级 MF。本地删除已取消，未提交云任务。", 502);
             await beforeSubmit(waitToken).ConfigureAwait(false);
-            var payload = new DeleteRequest(plan.Fingerprints.Keys.ToArray(), c.MappingMode,
-                c.MappingMode == "manual" ? new MappingSet(c.ManualMappings).Mappings : null, plan.Fingerprints, plan.Scopes);
+            var payload = new DeleteRequest(plan.Fingerprints.Keys.ToArray(), "mf", plan.Fingerprints, plan.Scopes);
             using var request = new HttpRequestMessage(HttpMethod.Post, "api/jellyfin/delete")
             {
                 Content = new StringContent(JsonSerializer.Serialize(payload), System.Text.Encoding.UTF8, "application/json")
@@ -157,7 +156,6 @@ public sealed class MfClient
     private sealed record DeleteRequest(
         [property: JsonPropertyName("paths")] string[] Paths,
         [property: JsonPropertyName("mapping_mode")] string MappingMode,
-        [property: JsonPropertyName("mappings"), JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] PathMapping[]? Mappings,
         [property: JsonPropertyName("fingerprints")] IReadOnlyDictionary<string, string> Fingerprints,
         [property: JsonPropertyName("scopes")] DeleteScope[] Scopes);
 

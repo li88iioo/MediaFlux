@@ -14,9 +14,7 @@ public sealed class PluginConfiguration : BasePluginConfiguration
     [JsonIgnore]
     public string Password { get; set; } = "";
 
-    public string MappingMode { get; set; } = "mf";
     public int TaskTimeoutSeconds { get; set; } = 120;
-    public PathMapping[] ManualMappings { get; set; } = [];
     public PathMapping[] MfMappings { get; set; } = [];
     public LibraryScope[] MfLibraries { get; set; } = [];
     public string SyncedMfUrl { get; set; } = "";

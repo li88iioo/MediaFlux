@@ -1,0 +1,136 @@
+name: Jellyfin plugin
+
+on:
+  push:
+    tags: ['jellyfin-plugin-v*']
+
+# 所有插件版本共用发布门，防止并发读写固定 manifest 丢失历史。
+concurrency:
+  group: jellyfin-plugin-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        jellyfin: ['12.2', '12.3']
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Select pinned SDK
+        run: printf '%s\n' '{"sdk":{"version":"10.0.402","rollForward":"disable"}}' > global.json
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Test packaging scripts
+        run: python3 -B tests/test_jellyfin_plugin_packaging.py
+      - name: Test official Jellyfin HTTP routes
+        env:
+          JELLYFIN_VERIFY_CACHE: ${{ runner.temp }}/jellyfin-verify
+        run: bash plugins/MediaFlux.Jellyfin/scripts/verify.sh '${{ matrix.jellyfin }}'
+
+  publish:
+    needs: verify
+    if: github.repository == 'li88iioo/MediaFlux'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+      - name: Select pinned SDK
+        run: printf '%s\n' '{"sdk":{"version":"10.0.402","rollForward":"disable"}}' > global.json
+      - uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Build production plugin and check release tag
+        run: |
+          set -euo pipefail
+          plugin=plugins/MediaFlux.Jellyfin
+          python3 "$plugin/scripts/manifest.py" info > "$RUNNER_TEMP/plugin.json"
+          test "$GITHUB_REF_NAME" = "$(jq -r .tag "$RUNNER_TEMP/plugin.json")"
+          bash "$plugin/scripts/package.sh"
+      - name: Verify assets, then update plugin repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          plugin=plugins/MediaFlux.Jellyfin
+          archive=$(jq -r .archive "$RUNNER_TEMP/plugin.json")
+          tag=$(jq -r .tag "$RUNNER_TEMP/plugin.json")
+          output="$PWD/$plugin/artifacts"
+          previous="$RUNNER_TEMP/previous.json"
+          candidate="$RUNNER_TEMP/manifest.json"
+          mkdir -p "$RUNNER_TEMP/existing" "$RUNNER_TEMP/published" "$RUNNER_TEMP/current"
+          (cd "$output" && sha256sum --check "$archive.sha256")
+
+          # 只有确认仓库既无清单 release 也无同名 tag 时才允许初始化。
+          gh api --paginate --slurp "repos/$GH_REPO/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          if jq -e 'any(.[][]; .tag_name == "manifest")' "$RUNNER_TEMP/releases.json" > /dev/null; then
+            has_manifest=true
+            jq -e 'any(.[][]; .tag_name == "manifest" and .draft == false)' "$RUNNER_TEMP/releases.json" > /dev/null
+            gh release download manifest --pattern manifest.json --output "$previous"
+          else
+            has_manifest=false
+            gh api --paginate --slurp "repos/$GH_REPO/tags?per_page=100" > "$RUNNER_TEMP/tags.json"
+            if jq -e 'any(.[][]; .name == "manifest")' "$RUNNER_TEMP/tags.json" > /dev/null; then
+              echo 'Refusing unknown manifest tag without a repository release.' >&2
+              exit 1
+            fi
+            printf '[]\n' > "$previous"
+          fi
+          python3 "$plugin/scripts/manifest.py" update "$previous" "$output/$archive" "$candidate"
+
+          if ! jq -e --arg tag "$tag" 'any(.[][]; .tag_name == $tag)' "$RUNNER_TEMP/releases.json" > /dev/null; then
+            gh release create "$tag" --verify-tag --draft --latest=false \
+              --title "MediaFlux Jellyfin ${tag#jellyfin-plugin-v}" --notes 'Jellyfin plugin; install through manifest.json.'
+          fi
+          gh release view "$tag" --json assets,isDraft > "$RUNNER_TEMP/plugin-release.json"
+          # 已有资产必须逐字节相同；插件 ZIP、校验和与 Logo 永不 clobber。
+          for asset in "$archive" "$archive.sha256" logo.png; do
+            if jq -e --arg name "$asset" 'any(.assets[]; .name == $name)' "$RUNNER_TEMP/plugin-release.json" > /dev/null; then
+              gh release download "$tag" --pattern "$asset" --dir "$RUNNER_TEMP/existing"
+              cmp "$output/$asset" "$RUNNER_TEMP/existing/$asset"
+            fi
+          done
+          for asset in "$archive" "$archive.sha256" logo.png; do
+            if [ ! -f "$RUNNER_TEMP/existing/$asset" ]; then
+              gh release upload "$tag" "$output/$asset"
+            fi
+          done
+          if jq -e .isDraft "$RUNNER_TEMP/plugin-release.json" > /dev/null; then
+            gh release edit "$tag" --draft=false --latest=false
+          fi
+          for asset in "$archive" "$archive.sha256" logo.png; do
+            gh release download "$tag" --pattern "$asset" --dir "$RUNNER_TEMP/published"
+            cmp "$output/$asset" "$RUNNER_TEMP/published/$asset"
+          done
+          (cd "$RUNNER_TEMP/published" && sha256sum --check "$archive.sha256")
+
+          # 再次检查读取以来清单未变化；网络错误或未知内容绝不降级为空清单。
+          if "$has_manifest"; then
+            gh release download manifest --pattern manifest.json --dir "$RUNNER_TEMP/current"
+            cmp "$previous" "$RUNNER_TEMP/current/manifest.json"
+            if ! cmp --silent "$candidate" "$previous"; then
+              gh release upload manifest "$candidate" --clobber
+            fi
+          else
+            gh release create manifest "$candidate" --target "$GITHUB_SHA" --latest=false \
+              --title 'Jellyfin plugin repository' --notes 'Add this release manifest.json URL as a Jellyfin plugin repository.'
+          fi
+          gh release download manifest --pattern manifest.json --output "$RUNNER_TEMP/verified-manifest.json"
+          cmp "$candidate" "$RUNNER_TEMP/verified-manifest.json"

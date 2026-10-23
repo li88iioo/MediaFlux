@@ -52,9 +52,9 @@ public sealed class ExplicitDeleteFilter(Plugin plugin, ILibraryManager library,
             var plan = await DeletePlanner.PrepareAsync(items, mappings, library, user, token).ConfigureAwait(false);
             if (plan.Fingerprints.Count > 0)
             {
-                if (!plugin.IsTargetVersion) throw new PluginFault("纳管删除仅允许 Jellyfin 12.2 系列；本地删除已取消。", 503);
+                if (!plugin.IsTargetVersion) throw new PluginFault("当前 Jellyfin 版本不满足插件 API 基线 12.2；本地删除已取消，请安装匹配版本的插件。", 503);
                 Plugin.RequireCredentials(config);
-                if (config.MappingMode == "mf" && !Plugin.CacheCurrent(config))
+                if (!Plugin.CacheCurrent(config))
                     throw new PluginFault("MF 范围缓存不属于当前连接配置；请先关闭插件并重新同步。本地删除已取消。");
                 async Task Recheck(bool completed, CancellationToken checkToken)
                 {

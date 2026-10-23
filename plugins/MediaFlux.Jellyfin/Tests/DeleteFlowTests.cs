@@ -256,10 +256,13 @@ public sealed class DeleteFlowTests
         Assert.Equal(1, f.Handler.DeletePosts); Assert.Equal(1, f.NativeDeletes);
     }
 
-    [Fact]
-    public async Task OutOfTargetVersionDoesNotBlockPlainLocalVideo()
+    [Theory]
+    [InlineData("10.11.11")]
+    [InlineData("12.1.0")]
+    [InlineData("13.0.0")]
+    public async Task OutOfTargetVersionDoesNotBlockPlainLocalVideo(string version)
     {
-        using var f = new TestFixture(version: "10.11.11");
+        using var f = new TestFixture(version: version);
         using var response = await f.Delete(f.Episode("local.mp4").Object);
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode); Assert.Equal(1, f.NativeDeletes); Assert.Equal(0, f.Handler.DeletePosts);
         using var managed = await f.Delete(f.Episode("managed.strm").Object);
@@ -274,14 +277,17 @@ public sealed class DeleteFlowTests
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode); Assert.Equal(1, f.NativeDeletes); Assert.Equal(0, f.Handler.DeletePosts);
     }
 
-    [Fact]
-    public async Task ManualModeOnlySendsManualMappings()
+    [Theory]
+    [InlineData("12.2.0")]
+    [InlineData("12.3.0")]
+    [InlineData("12.3.1")]
+    public async Task SupportedHostsAlwaysSendMfMappingsWithoutManualOverrides(string version)
     {
-        using var f = new TestFixture(mode: "manual");
+        using var f = new TestFixture(version: version);
         using var response = await f.Delete(f.Episode().Object);
         Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
         using var body = JsonDocument.Parse(f.Handler.DeleteBody!);
-        Assert.Equal("manual", body.RootElement.GetProperty("mapping_mode").GetString());
-        Assert.Equal("/manual/strm", body.RootElement.GetProperty("mappings")[0].GetProperty("local").GetString());
+        Assert.Equal("mf", body.RootElement.GetProperty("mapping_mode").GetString());
+        Assert.False(body.RootElement.TryGetProperty("mappings", out _));
     }
 }

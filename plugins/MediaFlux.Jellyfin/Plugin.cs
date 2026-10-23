@@ -4,13 +4,15 @@ using MediaBrowser.Controller;
 using MediaBrowser.Model.Plugins;
 using MediaBrowser.Model.Serialization;
 using MediaFlux.Jellyfin.Configuration;
+using System.Xml.Linq;
+using System.Xml;
 
 namespace MediaFlux.Jellyfin;
 
 public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
 {
     public const string CompiledBaseline = "12.2.0";
-    public const string SourceCheckedVersions = "12.2";
+    public const string SourceCheckedVersions = "12.2 / 12.3";
     public static Plugin? Instance { get; private set; }
     private readonly IServerApplicationHost _host;
     private readonly object _gate = new();
@@ -21,12 +23,13 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     {
         _host = host;
         Instance = this;
+        MigrateMappingConfiguration();
     }
 
     public override string Name => "MediaFlux";
-    public override string Description => "明确删除 STRM 前先由 MediaFlux 校验并完成云端删除；默认关闭。";
+    public override string Description => "联动 MediaFlux 删除云盘内容";
     public override Guid Id => Guid.Parse("9037f29f-2ebc-4b8a-952f-960e24402bb5");
-    public bool IsTargetVersion => _host.ApplicationVersion is { Major: 12, Minor: 2 };
+    public bool IsTargetVersion => _host.ApplicationVersion is { Major: 12, Minor: >= 2 };
 
     public IEnumerable<PluginPageInfo> GetPages() =>
     [new PluginPageInfo { Name = Name, EmbeddedResourcePath = "MediaFlux.Jellyfin.Configuration.configPage.html" }];
@@ -39,8 +42,7 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
             return new PluginConfiguration
             {
                 Enabled = c.Enabled, MfUrl = c.MfUrl, Username = c.Username, Password = c.Password,
-                MappingMode = c.MappingMode, TaskTimeoutSeconds = c.TaskTimeoutSeconds,
-                ManualMappings = c.ManualMappings.Select(m => m with { }).ToArray(),
+                TaskTimeoutSeconds = c.TaskTimeoutSeconds,
                 MfMappings = c.MfMappings.Select(m => m with { }).ToArray(),
                 MfLibraries = c.MfLibraries.Select(l => l with { Locations = l.Locations.ToArray() }).ToArray(),
                 SyncedMfUrl = c.SyncedMfUrl, SyncedUsername = c.SyncedUsername,
@@ -52,13 +54,36 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
     public static bool CacheCurrent(PluginConfiguration c) => c.SyncedAtUtc.Length > 0
         && c.MfUrl == c.SyncedMfUrl && c.Username == c.SyncedUsername;
 
-    public static MappingSet ActiveMappings(PluginConfiguration c) => new(
-        c.MappingMode switch
+    public static MappingSet ActiveMappings(PluginConfiguration c) => new(c.MfMappings);
+
+    private void MigrateMappingConfiguration()
+    {
+        if (!File.Exists(ConfigurationFilePath)) return;
+        string? mode;
+        try
         {
-            "mf" => c.MfMappings,
-            "manual" => c.ManualMappings,
-            _ => throw new PluginFault("映射模式无效；请在插件配置中重新保存。")
-        });
+            mode = XDocument.Load(ConfigurationFilePath).Root?.Elements()
+                .FirstOrDefault(element => element.Name.LocalName == "MappingMode")?.Value;
+        }
+        catch (Exception e) when (e is XmlException or IOException or UnauthorizedAccessException)
+        {
+            // 保持宿主恢复默认关闭配置的行为，不因迁移失败阻止插件加载。
+            _lastDeleteError = "插件配置无法读取，请检查配置文件后重新保存并同步。";
+            return;
+        }
+        if (mode is null) return;
+        var c = Configuration;
+        if (mode != "mf")
+        {
+            c.Enabled = false;
+            c.MfMappings = []; c.MfLibraries = [];
+            c.SyncedMfUrl = ""; c.SyncedUsername = ""; c.SyncedAtUtc = "";
+            _lastDeleteError = "旧手动映射已停用，请从 MediaFlux 同步范围后再启用联动删除。";
+        }
+        c.Revision++;
+        // 单次迁移后不再保存或使用旧映射模式，避免沿用历史手动范围。
+        base.UpdateConfiguration(c);
+    }
 
     // This also validates writes from Jellyfin's built-in generic config endpoint.
     // Generic JSON cannot read or replace Password, nor inject a trusted MF cache.
@@ -73,16 +98,14 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
             c.SyncedMfUrl = old.SyncedMfUrl; c.SyncedUsername = old.SyncedUsername;
             c.SyncedAtUtc = old.SyncedAtUtc;
             c.MfUrl = c.MfUrl.Trim(); c.Username = c.Username.Trim();
-            if (c.MappingMode is not ("mf" or "manual")) throw new PluginFault("请选择 MF 或手动映射模式。");
             if (c.MfUrl.Length > 0) c.MfUrl = MfClient.BaseUri(c.MfUrl).AbsoluteUri.TrimEnd('/');
             if (c.Username.Length > 128 || c.Password.Length > 512) throw new PluginFault("MF 用户名或密码超出允许长度。");
             if (c.TaskTimeoutSeconds is < 5 or > 600) throw new PluginFault("任务等待时间必须为 5–600 秒。");
-            c.ManualMappings = new MappingSet(c.ManualMappings).Mappings;
             if (c.Enabled)
             {
-                if (!IsTargetVersion) throw new PluginFault("纳管删除目标为 Jellyfin 12.2 系列，当前服务器版本不允许启用。");
+                if (!IsTargetVersion) throw new PluginFault("当前 Jellyfin 版本不满足插件 API 基线 12.2，请安装匹配版本的插件。");
                 RequireCredentials(c);
-                if (c.MappingMode == "mf" && !CacheCurrent(c))
+                if (!CacheCurrent(c))
                     throw new PluginFault("请先关闭插件、保存凭据并成功同步 MF 范围，再启用。");
                 if (ActiveMappings(c).Mappings.Length == 0)
                     throw new PluginFault("启用前必须至少配置一条有效映射。");
@@ -104,7 +127,7 @@ public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages
         lock (_gate)
         {
             var current = Snapshot();
-            if (current.Revision != expected.Revision || current.MappingMode != "mf")
+            if (current.Revision != expected.Revision)
                 throw new PluginFault("同步期间配置已变化；请重新同步。");
             current.MfMappings = overview.Mappings;
             current.MfLibraries = overview.Libraries;

@@ -2,11 +2,19 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><title>MediaFlux</title></head>
 <body>
-<div id="MediaFluxConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-select,emby-checkbox,emby-textarea">
+<div id="MediaFluxConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button,emby-checkbox">
   <div data-role="content"><div class="content-primary">
-    <h2>MediaFlux · STRM 明确删除联动</h2>
-    <p>默认关闭。先保存连接信息并测试，再选择一种映射模式。MF 确认云任务全部成功后才允许原生本地删除。</p>
-    <p class="fieldDescription">支持电影 / 单集 / 季 / 剧的明确删除；先检查 MF scopes v1 能力及全部子项权限。目录混放视频、其它归属对象、映射根、链接或不确定的多版本会被拒绝；非纳管媒体保持原功能。扫描消失不会触发云端删除。</p>
+    <div style="display:flex;align-items:center;gap:.75em;margin-bottom:1em">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="44" height="44" role="img" aria-label="MediaFlux" style="flex:none">
+        <rect width="16" height="16" rx="2.5" fill="#18201d"/>
+        <path fill="#65f0c2" d="M2 3h3l3 2 3-2h3v3h-2L8 8 4 6H2V3Z"/>
+        <path fill="#9de8ff" d="M2 13v-3h2l4-2 4 2h2v3h-3l-3-2-3 2H2Z"/>
+        <path fill="#18201d" d="m6 5.5 6 2.5-6 2.5v-5Z"/>
+      </svg>
+      <h2 style="margin:0;min-width:0">MediaFlux · STRM 联动删除</h2>
+    </div>
+    <p>联动 MediaFlux 删除云盘内容。保存连接信息并同步管理范围后，即可启用。</p>
+    <p class="fieldDescription">支持电影、单集、季和整剧。云端删除确认成功后继续本地删除；普通本地媒体保持原功能，扫库和条目消失不会触发云端删除。</p>
     <form id="MediaFluxConfigForm" autocomplete="off">
       <fieldset id="mfFields" disabled style="border:0;padding:0;margin:0;min-width:0">
         <div class="inputContainer">
@@ -23,27 +31,15 @@
           <input is="emby-input" type="password" id="mfPassword" maxlength="512" autocomplete="new-password">
           <div class="fieldDescription" id="mfPasswordInfo" style="min-height:4.5em">密码只保存在 Jellyfin 服务端；不回显。</div>
         </div>
-        <div class="selectContainer">
-          <label class="selectLabel" for="mfMode">映射模式（二选一，不合并）</label>
-          <select is="emby-select" id="mfMode" class="emby-select-withcolor emby-select">
-            <option value="mf">MF：同步并缓存 Jellyfin 映射及媒体库</option>
-            <option value="manual">手动：仅使用下面的映射</option>
-          </select>
-        </div>
-        <div class="inputContainer">
-          <label class="inputLabel inputLabelUnfocused" for="mfMappings">手动映射 JSON</label>
-          <textarea is="emby-textarea" id="mfMappings" rows="6" spellcheck="false" style="resize:vertical" aria-describedby="mfMappingHelp">[]</textarea>
-          <div class="fieldDescription" id="mfMappingHelp">结构：[ {"local":"/MF容器/STRM目录","server":"/Jellyfin容器/STRM目录"} ]。只在手动模式生效；按路径片段最长前缀匹配，同一目标目录不得有多个来源。</div>
-        </div>
         <div class="inputContainer">
           <label class="inputLabel inputLabelUnfocused" for="mfTimeout">云任务等待上限（秒）</label>
           <input is="emby-input" type="number" id="mfTimeout" min="5" max="600" step="1" value="120" required>
         </div>
         <div class="checkboxContainer checkboxContainer-withDescription">
           <label class="emby-checkbox-label">
-            <input is="emby-checkbox" type="checkbox" id="mfEnabled"><span>启用明确删除联动</span>
+            <input is="emby-checkbox" type="checkbox" id="mfEnabled"><span>启用联动删除</span>
           </label>
-          <div class="fieldDescription">MF 模式首次启用前：保持关闭 → 保存 → 测试连接 → 同步 MF 范围 → 勾选启用并保存。</div>
+          <div class="fieldDescription">映射和媒体库统一从 MediaFlux 同步。首次使用请先保存连接、同步范围，再勾选启用并保存。</div>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:.75em">
           <button is="emby-button" type="submit" class="raised button-submit emby-button"><span>保存配置</span></button>
@@ -54,7 +50,7 @@
     </form>
     <p id="mfStatus" role="status" aria-live="polite" style="min-height:4.5em;overflow-wrap:anywhere">正在读取配置…</p>
     <h3>当前已保存的管理范围</h3>
-    <p class="fieldDescription" id="mfCacheInfo" style="min-height:3em">范围以最后一次成功同步 / 保存为准。MF 离线时缓存不会清空；已管理 STRM 不会静默放行。</p>
+    <p class="fieldDescription" id="mfCacheInfo" style="min-height:3em">范围以最后一次成功同步为准。MediaFlux 离线时保留已同步范围，不执行纳管删除。</p>
     <pre id="mfScope" tabindex="0" style="height:16em;overflow:auto;scrollbar-gutter:stable;white-space:pre-wrap;overflow-wrap:anywhere;margin:0">尚未读取范围。</pre>
     <p class="fieldDescription">范围变更后请重新同步。部分 Jellyfin 客户端仅显示通用删除失败提示；详细错误也显示在下面（仅管理员可读）。禁止盲目重试云端删除。</p>
     <p id="mfLastError" role="note" style="min-height:4.5em;overflow-wrap:anywhere">最近删除错误：无。</p>
@@ -71,8 +67,6 @@
     function el(id) { return page.querySelector('#' + id); }
     function controls() {
       fields.disabled = busy || !loaded;
-      el('mfMappings').disabled = el('mfMode').value !== 'manual';
-      el('mfSync').disabled = busy || el('mfMode').value !== 'mf';
       page.setAttribute('aria-busy', String(busy));
     }
     function request(path, method, data) {
@@ -88,13 +82,9 @@
       el('mfUsername').value = c.username;
       // Never set the password field from a server response.
       el('mfPasswordInfo').textContent = c.password_set ? '密码已保存；留空保持不变，输入新密码后保存可替换。' : '尚未保存密码；密码只保存在 Jellyfin 服务端，不回显。';
-      el('mfMode').value = c.mapping_mode;
-      el('mfMappings').value = JSON.stringify(c.manual_mappings, null, 2);
       el('mfTimeout').value = c.task_timeout_seconds;
-      el('mfCacheInfo').textContent = c.mapping_mode === 'mf'
-        ? 'MF 模式；同步时间：' + (c.synced_at_utc || '未同步') + '；连接缓存：' + (c.cache_current ? '匹配' : '需重新同步') + '。MF 离线不会清空此范围。'
-        : '手动模式；只使用手动映射，不使用或合并 MF 缓存。';
-      var lines = ['编译 API 基线：' + c.compiled_baseline, '官方源码核对：' + c.source_checked_versions, '完整 Jellyfin 服务 / 云端删除：未实机验证。', '', '映射（Jellyfin server → MF local）：'];
+      el('mfCacheInfo').textContent = '同步时间：' + (c.synced_at_utc || '未同步') + '；连接缓存：' + (c.cache_current ? '匹配' : '需重新同步') + '。MediaFlux 离线时保留已同步范围。';
+      var lines = ['编译 API 基线：' + c.compiled_baseline, '已验证 Jellyfin 版本：' + c.source_checked_versions, '', '映射（Jellyfin server → MF local）：'];
       c.active_mappings.forEach(function(m) { lines.push(m.server + ' → ' + m.local); });
       if (!c.active_mappings.length) lines.push('尚无有效映射，不能启用。');
       lines.push('', '媒体库（展示用途；管理边界以映射为准）：');
@@ -104,7 +94,6 @@
       controls();
     }
     function readableError(e) {
-      if (e && e.message === "manual-json") return Promise.resolve('手动映射必须是 JSON 数组，例如 [{"local":"/mf/strm","server":"/media"}]。');
       if (e && e.responseJSON) return Promise.resolve(e.responseJSON.message || e.responseJSON.Message || '操作失败。');
       if (e && e.responseText) {
         try { var d = JSON.parse(e.responseText); return Promise.resolve(d.message || d.Message || '操作失败。'); } catch (_) { /* no raw response echo */ }
@@ -122,20 +111,13 @@
     page.addEventListener('pageshow', function() {
       run(function() { return request('Settings', 'GET').then(function(c) { render(c); status.textContent = '配置已读取。测试和同步使用已保存的连接信息。'; }); }, '正在读取配置（保留已显示的范围）…');
     });
-    el('mfMode').addEventListener('change', controls);
     el('MediaFluxConfigForm').addEventListener('submit', function(e) {
       e.preventDefault();
       run(function() {
-        var mappings = [];
-        if (el('mfMode').value === 'manual') {
-          try { mappings = JSON.parse(el('mfMappings').value); } catch (_) { throw new Error('manual-json'); }
-          if (!Array.isArray(mappings)) throw new Error('manual-json');
-        }
         return request('Settings', 'POST', {
           enabled: el('mfEnabled').checked, mf_url: el('mfUrl').value, username: el('mfUsername').value,
-          password: el('mfPassword').value || null, mapping_mode: el('mfMode').value,
-          mappings: mappings, task_timeout_seconds: Number(el('mfTimeout').value)
-        }).then(function(c) { el('mfPassword').value = ''; render(c); status.textContent = '配置已保存。更改 MF 连接后需重新同步范围；手动映射不会混入 MF 映射。'; });
+          password: el('mfPassword').value || null, task_timeout_seconds: Number(el('mfTimeout').value)
+        }).then(function(c) { el('mfPassword').value = ''; render(c); status.textContent = '配置已保存。更改 MediaFlux 连接后，请重新同步管理范围。'; });
       }, '正在保存配置…');
     });
     el('mfTest').addEventListener('click', function() {
