@@ -47,7 +47,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -570,11 +570,15 @@ def init_db() -> None:
         conn = _connect()
         local_media_recovery_lock = None
         try:
-            _prepare_schema_migration(conn, database_existed=database_existed)
+            previous_schema_version = _prepare_schema_migration(conn, database_existed=database_existed)
 
             # 未打版本的早期数据库也可能已有 v1 约束表；补列与重建必须作为
             # 一个原子步骤完成，避免退出后留下半迁移 schema。
             def prepare_schema_baseline(connection: sqlite3.Connection) -> None:
+                rss_columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(rss_entries)")}
+                needs_rss_delivery_migration = previous_schema_version == 0 or bool(
+                    rss_columns and not {"download_request_id", "download_request_key", "download_backend"} <= rss_columns
+                )
                 _sync_missing_schema_columns(connection)
                 database_migrations._migrate_agent_session_context_v2(connection)
                 # 未打版本的早期数据库不会进入正式迁移链；仍需同步清除
@@ -589,6 +593,8 @@ def init_db() -> None:
                 database_migrations._migrate_unify_rss_download_requests_v20(connection)
                 database_migrations._migrate_durable_handoffs_v25(connection)
                 database_migrations._migrate_download_submission_clocks_v35(connection)
+                if needs_rss_delivery_migration:
+                    database_migrations._migrate_rss_delivery_ownership_v36(connection)
 
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(

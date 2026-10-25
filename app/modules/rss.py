@@ -900,7 +900,7 @@ class RSSEngine:
         )
 
         linked_key = str(self._entry_value(entry, "download_request_key", "") or "")
-        retry_source = db.get_download_request_by_request_key(linked_key) if linked_key else None
+        retry_source = db.get_download_request(delivery["request_id"]) if delivery["request_id"] else None
         runtime = qb_runtime_config if isinstance(qb_runtime_config, dict) else None
         # 先复用下载中心的准入判断，再重开历史回执。配置/规则拒绝不等于
         # 后端提交失败，不得覆盖原受理记录或让用户丢失再次重试的入口。

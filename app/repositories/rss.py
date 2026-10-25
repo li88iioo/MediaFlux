@@ -232,8 +232,7 @@ def delete_rss_subscription(sub_id: int) -> None:
 
 _RSS_MEDIA_DUPLICATE_REASON = "相同 TMDB 剧集已在 RSS 队列或下载记录中"
 _RSS_REQUEST_JOIN = (
-    " LEFT JOIN download_request_keys k ON k.request_key=e.download_request_key "
-    "LEFT JOIN download_requests r ON r.id=k.request_id "
+    " LEFT JOIN download_requests r ON r.id=e.download_request_id "
 )
 _RSS_SELECTED_BACKEND = "CASE e.download_backend WHEN 'qb' THEN r.qb_status WHEN 'guangya' THEN r.gy_status END"
 
@@ -257,7 +256,7 @@ def _rss_delivery_failed_sql(entry: str = "e") -> str:
 def _rss_delivery_retry_sql(entry: str = "e") -> str:
     backend = _RSS_SELECTED_BACKEND.replace("e.", f"{entry}.")
     return (
-        "(r.status IN ('failed','completed') "
+        "(r.status IN ('failed','completed','resubmitted') "
         "AND COALESCE(r.qb_status,'') NOT IN ('submitting','submitted','downloading','outcome_unknown','manual_review') "
         "AND COALESCE(r.gy_status,'') NOT IN ('submitting','submitted','downloading','outcome_unknown','manual_review') "
         f"AND (({backend})='failed' OR ({entry}.download_backend='guangya' "
@@ -271,7 +270,7 @@ def rss_retry_source_is_safe(source, target: str) -> bool:
     active = {"submitting", "submitted", "downloading", "outcome_unknown", "manual_review"}
     return (
         target in {"qb", "guangya"}
-        and source["status"] in {"failed", "completed"}
+        and source["status"] in {"failed", "completed", "resubmitted"}
         and source["qb_status"] not in active
         and source["gy_status"] not in active
         and (source["qb_status" if target == "qb" else "gy_status"] == "failed"
@@ -280,7 +279,7 @@ def rss_retry_source_is_safe(source, target: str) -> bool:
     )
 
 def _rss_delivery_columns() -> str:
-    # 读取 canonical key 当前所有者，不缓存另一套下载状态、不做列表逐条查询。
+    # 交付只读取稳定请求关联；内容 key 不再决定历史回执的所有者。
     return (
         "r.id AS delivery_request_id,r.status AS delivery_status,"
         f"({_RSS_SELECTED_BACKEND}) AS delivery_backend_status,"
@@ -290,7 +289,9 @@ def _rss_delivery_columns() -> str:
         "COALESCE((e.status='downloaded' OR (e.status='failed' AND e.failure_code IN "
         "('qb_outcome_unknown','guangya_outcome_unknown','submission_outcome_unknown'))) "
         f"AND {_rss_delivery_retry_sql()},0) AS delivery_retryable,"
-        f"COALESCE(r.status='manual_review' OR ({_RSS_SELECTED_BACKEND}) "
+        "COALESCE((r.id IS NULL AND e.download_request_key!='' "
+        "AND e.status='downloaded') OR r.status='manual_review' "
+        f"OR ({_RSS_SELECTED_BACKEND}) "
         "IN ('outcome_unknown','manual_review'),0) AS delivery_review_required"
     )
 
@@ -405,7 +406,7 @@ def _rss_entry_filters(sub_id: int | None = None, status: str | None = None,
 
 
 def bind_rss_entry_download(entry_id: int, request_key: str, backend: str) -> None:
-    """在副作用前绑定已验证内容身份与目标，重试沿统一请求键自动接续。"""
+    """副作用前记录内容意图；已有交付归属只允许由 successor 事务迁移。"""
     if backend not in {"qb", "guangya"} or not request_key:
         raise ValueError("RSS 下载目标或资源身份无效")
     duplicate = False
@@ -433,13 +434,15 @@ def bind_rss_entry_download(entry_id: int, request_key: str, backend: str) -> No
             )
         else:
             conn.execute(
-                "UPDATE rss_entries SET download_request_key=?,download_backend=? WHERE id=?",
-                (request_key, backend, entry_id),
+                "UPDATE rss_entries SET download_request_key=?,download_backend=?,"
+                "download_request_id=COALESCE(download_request_id,"
+                "(SELECT request_id FROM download_request_keys WHERE request_key=?)) WHERE id=?",
+                (request_key, backend, request_key, entry_id),
             )
             # 绑定与受理回写处于同一事务，既有受理与并发受理都不漏投影。
             existing = conn.execute(
-                "SELECT request_id FROM download_request_keys WHERE request_key=?",
-                (request_key,),
+                "SELECT download_request_id FROM rss_entries WHERE id=? AND download_request_id IS NOT NULL",
+                (entry_id,),
             ).fetchone()
             if existing:
                 _sync_rss_download_entries_conn(conn, int(existing[0]), db.now())
@@ -447,10 +450,45 @@ def bind_rss_entry_download(entry_id: int, request_key: str, backend: str) -> No
         raise RSSMediaAlreadyClaimedError(_RSS_MEDIA_DUPLICATE_REASON)
 
 
+def _bind_rss_download_entries_conn(
+    conn: sqlite3.Connection, request_id: int, *, source_request_id: int | None = None,
+    targets: str = "",
+) -> None:
+    """身份注册时接纳新意图，目标认领/重提只接管被选 backend 的回执。"""
+    if targets in {"qb", "guangya", "both"}:
+        backends = ("qb", "guangya") if targets == "both" else (targets,)
+        placeholders = ','.join('?' for _ in backends)
+        if source_request_id is not None:
+            conn.execute(
+                "UPDATE rss_entries SET download_request_id=? WHERE download_request_id=? "
+                f"AND download_backend IN ({placeholders})",
+                (request_id, source_request_id, *backends),
+            )
+        else:
+            # 新条目重试同内容时 create 尚不知道目标；在首次 claim 的同一事务中
+            # 只接续该目标的已知失败回执，不移动已取消/成功/未知的另一尝试。
+            conn.execute(
+                "UPDATE rss_entries SET download_request_id=? WHERE download_request_id!=? "
+                f"AND download_backend IN ({placeholders}) "
+                "AND download_request_key IN (SELECT request_key FROM download_request_keys WHERE request_id=?) "
+                "AND EXISTS (SELECT 1 FROM download_requests r WHERE r.id=rss_entries.download_request_id "
+                "AND r.status IN ('failed','completed','resubmitted') AND ("
+                + _RSS_SELECTED_BACKEND.replace('e.', 'rss_entries.') + ")='failed')",
+                (request_id, request_id, *backends, request_id),
+            )
+    # 这里只解析本轮已验证、尚未建请求的 submitting 意图，不为历史空 ID 做运行时猜测。
+    conn.execute(
+        "UPDATE rss_entries SET download_request_id=? WHERE download_request_id IS NULL "
+        "AND status='submitting' AND download_backend IN ('qb','guangya') "
+        "AND download_request_key IN (SELECT request_key FROM download_request_keys WHERE request_id=?)",
+        (request_id, request_id),
+    )
+
+
 def _sync_rss_download_entries_conn(conn: sqlite3.Connection, request_id: int, timestamp: str) -> int:
     """只投影选定后端的明确受理；已处理不是文件下载完成，不重写手动标记。"""
     row = conn.execute("SELECT status,qb_status,gy_status,organize_status FROM download_requests WHERE id=?", (request_id,)).fetchone()
-    if row is None or row["status"] in {"cancelled", "resubmitted"}:
+    if row is None or row["status"] == "cancelled":
         return 0
     accepted = tuple(backend for backend, field in (("qb", "qb_status"), ("guangya", "gy_status"))
                      if row[field] in {"submitted", "downloading", "completed"}
@@ -462,69 +500,17 @@ def _sync_rss_download_entries_conn(conn: sqlite3.Connection, request_id: int, t
     return conn.execute(
         "UPDATE rss_entries SET status='downloaded',processed=1,processed_at=?, "
         "failure_code='',failure_retryable=0,failed_at=NULL WHERE COALESCE(processed,0)=0 "
-        "AND status IN ('failed','submitting') AND download_request_key IN ("
-        "SELECT request_key FROM download_request_keys WHERE request_id=? UNION "
-        "SELECT request_key FROM download_requests WHERE id=?) "
+        "AND status IN ('failed','submitting') AND download_request_id=? "
         f"AND download_backend IN ({placeholders})",
-        (timestamp, request_id, request_id, *accepted),
+        (timestamp, request_id, *accepted),
     ).rowcount
 
 
 def _reconcile_rss_download_entries_conn(conn: sqlite3.Connection) -> None:
-    """启动时分页补关联旧失败，并只按原始链接/日志/持久种子身份确认结果。"""
-    import json
-
-    from app.modules.download_dispatcher import (
-        DownloadInput,
-        normalize_download_url,
-        request_keys,
-    )
-
-    after_id = 0
-    while True:
-        legacy = conn.execute(
-            "SELECT id,rss_item_id,title,payload FROM rss_entries WHERE status='failed' "
-            "AND COALESCE(processed,0)=0 AND download_request_key='' AND id>? "
-            "ORDER BY id ASC LIMIT 500",
-            (after_id,),
-        ).fetchall()
-        if not legacy:
-            break
-        after_id = int(legacy[-1]["id"])
-        for entry in legacy:
-            try:
-                payload = json.loads(entry["payload"] or "{}")
-                if not isinstance(payload, dict):
-                    continue
-                item = normalize_download_url(str(payload.get("torrent_url") or payload.get("link") or ""))
-                previous = conn.execute(
-                    "SELECT r.*,l.source AS rss_backend FROM download_log l "
-                    "JOIN download_requests r ON r.id=l.request_id "
-                    "WHERE l.rss_item_id=? AND l.title=? AND r.source_value=? "
-                    "AND l.source IN ('qb','guangya') ORDER BY l.id DESC LIMIT 1",
-                    (entry["rss_item_id"], entry["title"], item.source_value),
-                ).fetchone()
-                if previous is None:
-                    continue
-                # HTTP 种子已被清掉时不能把可变URL冒充已验证内容；保持旧失败供人工核对。
-                if previous["kind"] == "http" and not previous["torrent_data"]:
-                    continue
-                key = request_keys(DownloadInput(
-                    previous["kind"], previous["title"] or "", previous["source_value"] or "",
-                    torrent_data=previous["torrent_data"],
-                ))[0]
-            except (ValueError, TypeError):
-                continue
-            conn.execute(
-                "UPDATE rss_entries SET download_request_key=?,download_backend=? WHERE id=?",
-                (key, previous["rss_backend"], entry["id"]),
-            )
-
-    # 先完成关联，再投影已有明确受理的后端状态；不按标题或失效 URL 猜测成功。
+    """启动只投影已持久化的稳定归属；历史推断仅在正式升级中执行一次。"""
     requests = conn.execute(
-        "SELECT DISTINCT k.request_id FROM rss_entries e JOIN download_request_keys k "
-        "ON k.request_key=e.download_request_key WHERE e.status IN ('failed','submitting') "
-        "AND COALESCE(e.processed,0)=0"
+        "SELECT DISTINCT download_request_id FROM rss_entries WHERE status IN ('failed','submitting') "
+        "AND COALESCE(processed,0)=0 AND download_request_id IS NOT NULL"
     ).fetchall()
     for row in requests:
         _sync_rss_download_entries_conn(conn, int(row[0]), db.now())
@@ -590,9 +576,8 @@ def purge_processed_rss_entries(retention_days: int = 7) -> int:
             "DELETE FROM rss_entries WHERE COALESCE(processed,0)=1 "
             "AND processed_at IS NOT NULL "
             "AND datetime(processed_at) < datetime('now', ?) "
-            "AND NOT EXISTS (SELECT 1 FROM download_request_keys k "
-            "JOIN download_requests r ON r.id=k.request_id "
-            "WHERE k.request_key=rss_entries.download_request_key AND rss_entries.status!='skipped' AND ("
+            "AND NOT EXISTS (SELECT 1 FROM download_requests r "
+            "WHERE r.id=rss_entries.download_request_id AND rss_entries.status!='skipped' AND ("
             + _rss_delivery_failed_sql("rss_entries") + " OR r.status='manual_review' OR ("
             + _RSS_SELECTED_BACKEND.replace("e.", "rss_entries.") +
             ") IN ('outcome_unknown','manual_review')))",
@@ -929,19 +914,15 @@ def record_rss_entry_failure(
         if request_id:
             # 仅当前资源身份的请求可以结束等待者；迟到旧回执不能覆盖后继提交。
             binding = conn.execute(
-                "SELECT download_request_key,download_backend FROM rss_entries e WHERE id=? "
-                "AND download_request_key IN (SELECT request_key FROM download_request_keys "
-                "WHERE request_id=? UNION SELECT request_key FROM download_requests WHERE id=?)",
-                (entry_id, request_id, request_id),
+                "SELECT download_backend FROM rss_entries WHERE id=? AND download_request_id=?",
+                (entry_id, request_id),
             ).fetchone()
             if binding is None:
                 return
             scope += (
-                " OR (status='submitting' AND download_backend=? AND download_request_key IN ("
-                "SELECT request_key FROM download_request_keys WHERE request_id=? UNION "
-                "SELECT request_key FROM download_requests WHERE id=?))"
+                " OR (status='submitting' AND download_backend=? AND download_request_id=?)"
             )
-            params.extend((binding["download_backend"], request_id, request_id))
+            params.extend((binding["download_backend"], request_id))
         conn.execute(
             "UPDATE rss_entries SET status='failed', processed=0, processed_at=NULL, "
             "submitted_at=?, failure_code=?, failure_retryable=?, failed_at=? "
@@ -996,16 +977,16 @@ def _rss_processed_update_condition(processed: bool) -> str:
         return "status IN ('pending','failed','skipped')"
     # 受理回执不清空身份；当前请求的确定失败才足以撤销历史 unknown 防重。
     safe_source = (
-        "EXISTS (SELECT 1 FROM download_request_keys k JOIN download_requests r ON r.id=k.request_id "
-        "WHERE k.request_key=rss_entries.download_request_key AND "
+        "EXISTS (SELECT 1 FROM download_requests r "
+        "WHERE r.id=rss_entries.download_request_id AND "
         + _rss_delivery_retry_sql("rss_entries") + ")"
     )
     return (
         f"(status IN ('failed','skipped') OR (status='downloaded' AND {safe_source})) "
         "AND (failure_code NOT IN ('qb_outcome_unknown','guangya_outcome_unknown','submission_outcome_unknown') "
         f"OR {safe_source}) "
-        "AND NOT EXISTS (SELECT 1 FROM download_request_keys k JOIN download_requests r ON r.id=k.request_id "
-        "WHERE k.request_key=rss_entries.download_request_key AND (r.status='manual_review' OR ("
+        "AND NOT EXISTS (SELECT 1 FROM download_requests r "
+        "WHERE r.id=rss_entries.download_request_id AND (r.status='manual_review' OR ("
         + _RSS_SELECTED_BACKEND.replace("e.", "rss_entries.") +
         ") IN ('submitting','submitted','downloading','outcome_unknown','manual_review')))"
     )

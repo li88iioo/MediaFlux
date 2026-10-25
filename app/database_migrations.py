@@ -1599,6 +1599,100 @@ def _migrate_download_submission_clocks_v35(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_rss_delivery_ownership_v36(conn: sqlite3.Connection) -> None:
+    """一次性绑定有证据的 RSS 交付；内容 key 和归档名称都不充当历史请求 ID。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(rss_entries)")}
+    if not columns:
+        return
+    if "download_request_id" not in columns:
+        conn.execute("ALTER TABLE rss_entries ADD COLUMN download_request_id INTEGER REFERENCES download_requests(id) ON DELETE SET NULL")
+    required = {"id", "rss_item_id", "title", "status", "processed", "payload", "download_request_key", "download_backend"}
+    if not required <= columns:
+        return  # 更早的精简表由基线补齐后再迁移。
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rss_entries_delivery_request ON rss_entries(download_request_id,download_backend)")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='download_request_keys' AND type='table'").fetchone():
+        return
+
+    from app.modules.download_dispatcher import DownloadInput, normalize_download_url, request_keys
+
+    reader = conn.cursor()
+    reader.row_factory = sqlite3.Row
+    has_logs = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE name='download_log' AND type='table'").fetchone())
+    after_id = 0
+    while True:
+        entries = reader.execute(
+            "SELECT id,rss_item_id,title,payload,download_request_key,download_backend FROM rss_entries "
+            "WHERE download_request_id IS NULL AND id>? "
+            "AND (download_request_key!='' OR (status='failed' AND COALESCE(processed,0)=0)) ORDER BY id LIMIT 500",
+            (after_id,),
+        ).fetchall()
+        if not entries:
+            break
+        after_id = int(entries[-1]["id"])
+        for entry in entries:
+            key, backend = str(entry["download_request_key"] or ""), str(entry["download_backend"] or "")
+            owner = reader.execute(
+                "SELECT r.id FROM download_request_keys k JOIN download_requests r ON r.id=k.request_id "
+                "WHERE k.request_key=? AND CASE ? WHEN 'qb' THEN r.qb_status WHEN 'guangya' THEN r.gy_status END "
+                "NOT IN ('','resubmitted')",
+                (key, backend),
+            ).fetchone() if key and backend in {"qb", "guangya"} else None
+            if owner is not None:
+                conn.execute("UPDATE rss_entries SET download_request_id=? WHERE id=?", (owner[0], entry["id"]))
+                continue
+            if not has_logs:
+                continue
+            try:
+                payload = json.loads(entry["payload"] or "{}")
+                if not isinstance(payload, dict):
+                    continue
+                item = normalize_download_url(str(payload.get("torrent_url") or payload.get("link") or ""))
+            except (ValueError, TypeError):
+                continue
+            # 原始内容 + RSS + 后端日志是归档请求的证据，绝不解析可变 request_key 的 history 后缀。
+            logs = reader.execute(
+                "SELECT r.*,l.source AS rss_backend FROM download_log l JOIN download_requests r ON r.id=l.request_id "
+                "WHERE l.rss_item_id=? AND l.title=? AND r.source_value=? AND l.source IN ('qb','guangya') "
+                "AND (?='' OR l.source=?) ORDER BY l.id DESC",
+                (entry["rss_item_id"], entry["title"], item.source_value, backend, backend),
+            ).fetchall()
+            candidates: list[tuple[int, str, str]] = []
+            for previous in logs:
+                selected = str(previous["rss_backend"])
+                previous_status = previous["qb_status" if selected == "qb" else "gy_status"]
+                if not previous_status:
+                    continue
+                if previous["kind"] == "http" and not previous["torrent_data"]:
+                    continue  # 可变 URL 和已清除的种子不足以证明旧内容。
+                try:
+                    keys = request_keys(DownloadInput(
+                        previous["kind"], previous["title"] or "", previous["source_value"] or "",
+                        torrent_data=previous["torrent_data"],
+                    ))
+                except (ValueError, TypeError):
+                    continue
+                if key and key not in keys:
+                    continue
+                # 旧日志能证明该 RSS 的内容和所选后端；只在该后端确有当前尝试时接续，
+                # 不能把 current key 的另一后端冒充旧回执的交付。
+                current = reader.execute(
+                    "SELECT r.id FROM download_request_keys k JOIN download_requests r ON r.id=k.request_id "
+                    "WHERE k.request_key=? AND CASE ? WHEN 'qb' THEN r.qb_status WHEN 'guangya' THEN r.gy_status END "
+                    "NOT IN ('','resubmitted')",
+                    (key or keys[0], selected),
+                ).fetchone()
+                if current is None and previous_status == "resubmitted":
+                    continue
+                candidates.append((int(current[0] if current is not None else previous["id"]), selected, key or keys[0]))
+            if not candidates or len({candidate[1] for candidate in candidates}) != 1:
+                continue  # 旧条目连所选后端都不可确定时，不猜某一次成功。
+            request_id, backend, key = candidates[0]
+            conn.execute(
+                "UPDATE rss_entries SET download_request_id=?,download_backend=?,download_request_key=? WHERE id=?",
+                (request_id, backend, key, entry["id"]),
+            )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1635,4 +1729,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     32: _migrate_agent_kernel_effect_next_poll_index_v33,
     33: _migrate_agent_library_patrol_cycle_runs_v34,
     34: _migrate_download_submission_clocks_v35,
+    35: _migrate_rss_delivery_ownership_v36,
 }

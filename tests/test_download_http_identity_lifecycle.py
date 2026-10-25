@@ -10,7 +10,7 @@ from unittest.mock import patch
 from app import database as db
 from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher, offline
-from tests.support import isolated_test_database
+from tests.support import assert_present, isolated_test_database
 
 TORRENT_A = b"d4:infod6:lengthi10485760e4:name9:Movie.mkvee"
 TORRENT_B = TORRENT_A.replace(b"Movie.mkv", b"Other.mkv")
@@ -60,6 +60,28 @@ class HttpTorrentIdentityLifecycleTests(unittest.TestCase):
 
     def key(self, payload):
         return dispatcher.request_key(dispatcher.torrent_download_input("fixture.torrent", payload))
+
+    def test_archived_attempt_identity_requires_same_retained_content_not_shared_url(self):
+        from app.repositories.download_requests import check_download_request_torrent_identity
+
+        item = replace(self.raw, torrent_data=TORRENT_A)
+        original = int(dispatcher.create_request(item, "", "")["id"])
+        db.update_download_request(original, status="failed", gy_status="failed")
+        successor = int(dispatcher.create_request(item, "", "")["id"])
+        self.assertNotEqual(successor, original)
+        alias = dispatcher.request_source_alias_key(item)
+        check_download_request_torrent_identity(original, dispatcher.request_keys(item), source_alias_key=alias)
+        with self.assertRaisesRegex(ValueError, "内容身份已变化"):
+            check_download_request_torrent_identity(
+                original, dispatcher.request_keys(replace(item, torrent_data=TORRENT_B)), source_alias_key=alias,
+            )
+        for retained in (None, b"not-a-torrent"):
+            with self.subTest(retained=retained):
+                db.update_download_request(original, torrent_data=retained)
+                with self.assertRaises(ValueError):
+                    check_download_request_torrent_identity(original, dispatcher.request_keys(item), source_alias_key=alias)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(assert_present(db.get_download_request_by_request_key(self.key(TORRENT_A)))["id"], successor)
 
     def submit(self, target="guangya"):
         return submit_download_input(self.raw, target, origin="rss:identity-fixture")

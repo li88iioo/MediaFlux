@@ -323,7 +323,7 @@ class DownloadSubmissionClockTests(unittest.TestCase):
                     conn.execute(f"PRAGMA user_version={version}")
                 db.init_db()
                 with db.get_conn() as conn:
-                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 35)
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
                 row = self.row(active)
                 self.assertEqual((row["status"], row["qb_status"], row["gy_status"]),
                                  ("manual_review", "completed", "manual_review"))

@@ -559,6 +559,7 @@ CREATE TABLE IF NOT EXISTS rss_entries (
     failed_at TEXT,
     download_request_key TEXT NOT NULL DEFAULT '',
     download_backend TEXT NOT NULL DEFAULT '',
+    download_request_id INTEGER REFERENCES download_requests(id) ON DELETE SET NULL,
     pub_date TEXT,
     guid TEXT,
     payload TEXT,                    -- 原始 JSON
@@ -567,6 +568,8 @@ CREATE TABLE IF NOT EXISTS rss_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_rss_entries_download_request
     ON rss_entries(download_request_key, download_backend);
+CREATE INDEX IF NOT EXISTS idx_rss_entries_delivery_request
+    ON rss_entries(download_request_id, download_backend);
 CREATE INDEX IF NOT EXISTS idx_rss_entries_status_processed
     ON rss_entries(status, processed);
 CREATE INDEX IF NOT EXISTS idx_rss_entries_subscription_status

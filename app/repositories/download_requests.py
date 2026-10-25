@@ -265,7 +265,23 @@ def check_download_request_torrent_identity(
         if not conn.execute(
             "SELECT 1 FROM download_request_keys WHERE request_id=? LIMIT 1", (request_id,),
         ).fetchone():
-            raise ValueError("原下载请求已被接管，未重新提交")
+            # 归档只转移内容去重 key；未被重提的 RSS 后端仍属于原请求。
+            # 此时只能用原请求保存的种子校验内容，不能借当前 canonical 所有者猜身份。
+            source = conn.execute(
+                "SELECT kind,title,source_value,torrent_data FROM download_requests WHERE id=?",
+                (request_id,),
+            ).fetchone()
+            if source is None or not source["torrent_data"]:
+                raise ValueError("原下载内容身份已不可验证，未重新提交")
+            from app.modules.download_dispatcher import DownloadInput, request_keys
+
+            previous = set(request_keys(DownloadInput(
+                source["kind"], source["title"] or "", source["source_value"] or "",
+                torrent_data=source["torrent_data"],
+            ))) - {source_alias_key}
+            if not previous.intersection(set(keys) - {source_alias_key}):
+                raise ValueError("下载来源的BT内容身份已变化，未继续提交")
+            return
         _check_torrent_identity_conn(conn, request_id, keys, source_alias_key)
 
 
@@ -283,6 +299,10 @@ def _register_request_keys(
         "VALUES(?,?,?)",
         ((key, request_id, timestamp) for key in keys),
     )
+    # 首次创建和 HTTP 内容身份升级共用此事务，在成功/失败回执前绑定新 RSS 意图。
+    from app.repositories.rss import _bind_rss_download_entries_conn
+
+    _bind_rss_download_entries_conn(conn, request_id)
 
 
 def _bind_media_download_admission_conn(
@@ -422,6 +442,13 @@ def create_download_request(request_key: str, kind: str, title: str = "",
             )
             if not created and display_title:
                 _enrich_display_title_conn(conn, request_id, display_title)
+            if created and retry_source_request_id is not None:
+                from app.repositories.rss import _bind_rss_download_entries_conn
+
+                _bind_rss_download_entries_conn(
+                    conn, request_id, source_request_id=retry_source_request_id,
+                    targets=initial_targets,
+                )
             return request_id, created
 
         # 串行化“检查所有等价 key → 归档历史 → 新建 canonical 请求”。
@@ -448,8 +475,11 @@ def create_download_request(request_key: str, kind: str, title: str = "",
                 else [source["gy_status"]] if initial_targets == "guangya"
                 else [source["qb_status"]] if initial_targets == "qb" else []
             )
-            if any(status in {"submitting", "submitted", "downloading", "outcome_unknown", "resubmitted"}
-                   for status in selected_statuses):
+            selected_fields = ("qb_status", "gy_status") if initial_targets == "both" else (
+                ("gy_status",) if initial_targets == "guangya" else ("qb_status",) if initial_targets == "qb" else ()
+            )
+            if (any(status in {"submitting", "submitted", "downloading", "outcome_unknown"} for status in selected_statuses)
+                    or any(source[field] == "resubmitted" for field in selected_fields)):
                 raise DownloadRequestRetryFenceError(
                     "原下载后端仍在处理或结果待核验，未重新提交"
                 )
@@ -1016,6 +1046,10 @@ def _claim_download_request_conn(
         (targets, qb_status, gy_status, timestamp if qb_status else None,
          timestamp if gy_status else None, timestamp, request_id),
     )
+    if cur.rowcount:
+        from app.repositories.rss import _bind_rss_download_entries_conn
+
+        _bind_rss_download_entries_conn(conn, request_id, targets=targets)
     return cur.rowcount > 0
 
 

@@ -22,6 +22,14 @@ def _clear() -> None:
             conn.execute(f"DELETE FROM {table}")
 
 
+def _legacy_delivery_schema() -> None:
+    """模拟真实 v35 升级，不依赖启动时按 key 猜测归属的旧运行时路径。"""
+    with db.get_conn() as conn:
+        conn.execute("DROP INDEX idx_rss_entries_delivery_request")
+        conn.execute("ALTER TABLE rss_entries DROP COLUMN download_request_id")
+        conn.execute("PRAGMA user_version=35")
+
+
 def _submitted_result(request_id: int, *, task_id: str = "gy-task") -> dict:
     return {
         "ok": True,
@@ -412,6 +420,7 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
                 ],
             )
 
+        _legacy_delivery_schema()
         db.init_db()
 
         recovered = db.get_rss_entry(entry)
@@ -435,7 +444,7 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
             entry, request = self.failed_entry(url=f"https://feed.invalid/{suffix}.torrent")
             entries.append(entry)
             with db.get_conn() as conn:
-                conn.execute("UPDATE rss_entries SET download_request_key='',download_backend='' WHERE id=?", (entry,))
+                conn.execute("UPDATE rss_entries SET download_request_key='',download_backend='',download_request_id=NULL WHERE id=?", (entry,))
             # Retried through the same shared pipeline, but the pre-upgrade RSS row has no binding.
             result = self.retry(request, "guangya")
             get_rss_entry_result_17 = db.get_rss_entry(entry)
@@ -449,6 +458,7 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
                     conn.execute("UPDATE rss_entries SET payload=? WHERE id=?", (json.dumps({"torrent_url": "https://other.invalid/unrelated.torrent"}), entry))
             # Complete this request so the next fixture may submit identical torrent content.
             db.update_download_request(result["request_id"], status="completed", gy_status="completed")
+        _legacy_delivery_schema()
         db.init_db()
         get_rss_entry_result_18 = db.get_rss_entry(entries[0])
         assert get_rss_entry_result_18 is not None
@@ -476,6 +486,7 @@ class RSSDownloadRetryFeedbackTests(IsolatedDatabaseTestCase):
 
     def test_old_schema_adds_binding_columns_without_losing_failed_entry(self):
         entry, request = self.failed_entry()
+        _legacy_delivery_schema()
         with db.get_conn() as conn:
             conn.execute("DROP INDEX idx_rss_entries_download_request")
             conn.execute("ALTER TABLE rss_entries DROP COLUMN download_request_key")

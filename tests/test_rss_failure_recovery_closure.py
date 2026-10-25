@@ -68,6 +68,261 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
     def success(_row, **_kwargs):
         return {"ok": True, "task_id": "accepted-task", "task_ids": ["accepted-task"]}
 
+    def dual_receipts(self, failed_backend, *, source="", torrent_data=None):
+        _, qb_entry, item = self.pending()
+        _, gy_entry, _ = self.pending("guangya")
+        if source:
+            item = dispatcher.DownloadInput("http", "Episode", source, torrent_data=torrent_data)
+            dispatcher.create_request(item, "", "", origin="test:verified-http")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE rss_entries SET payload=? WHERE id=?",
+                         (json.dumps({"torrent_url": item.source_value}), gy_entry))
+            if source:
+                conn.execute("UPDATE rss_entries SET payload=? WHERE id=?",
+                             (json.dumps({"torrent_url": source}), qb_entry))
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        with patch.object(dispatcher, "_submit_qb", side_effect=self.success), patch.object(
+            dispatcher, "_submit_guangya", side_effect=self.success
+        ):
+            qb_result = engine.download(qb_entry)
+            gy_result = engine.download(gy_entry)
+        self.assertTrue(qb_result["ok"], qb_result)
+        self.assertTrue(gy_result["ok"], gy_result)
+        rid = qb_result["request_id"]
+        self.assertEqual(gy_result["request_id"], rid)
+        selected, other = ("qb_status", "gy_status") if failed_backend == "qb" else ("gy_status", "qb_status")
+        db.update_download_request(
+            rid, status="completed", **{selected: "failed", other: "completed"},
+            organize_started=0, organize_status="settle_wait" if failed_backend == "qb" else "",
+            local_import_status="queued" if failed_backend == "guangya" else "",
+        )
+        return rid, {"qb": qb_entry, "guangya": gy_entry}, engine
+
+    def test_single_backend_successor_never_steals_peer_rss_receipt(self):
+        for backend in ("qb", "guangya"):
+            for outcome in ("completed", "failed", "outcome_unknown"):
+                with self.subTest(backend=backend, outcome=outcome):
+                    original, entries, engine = self.dual_receipts(backend)
+                    peer = "guangya" if backend == "qb" else "qb"
+                    with patch.object(dispatcher, "_submit_qb", side_effect=self.success) as qb, patch.object(
+                        dispatcher, "_submit_guangya", side_effect=self.success
+                    ) as gy:
+                        retry = engine.download(entries[backend])
+                    self.assertTrue(retry["ok"], retry)
+                    self.assertEqual(qb.call_count, int(backend == "qb"))
+                    self.assertEqual(gy.call_count, int(backend == "guangya"))
+                    successor = retry["request_id"]
+                    self.assertNotEqual(successor, original)
+                    selected_field, peer_field = ("qb_status", "gy_status") if backend == "qb" else ("gy_status", "qb_status")
+                    root = "manual_review" if outcome == "outcome_unknown" else outcome
+                    db.update_download_request(successor, status=root, **{selected_field: outcome})
+                    current_peer = rss_entry_delivery(db.get_rss_entry(entries[peer]))
+                    self.assertEqual(current_peer["request_id"], original)
+                    self.assertEqual(current_peer["backend_status"], "completed")
+                    self.assertFalse(current_peer["failed"])
+                    self.assertFalse(current_peer["review_required"])
+                    current_selected = rss_entry_delivery(db.get_rss_entry(entries[backend]))
+                    self.assertEqual(current_selected["request_id"], successor)
+                    self.assertEqual(current_selected["backend_status"], outcome)
+                    self.assertEqual(current_selected["failed"], outcome == "failed")
+                    self.assertEqual(current_selected["review_required"], outcome == "outcome_unknown")
+                    self.assertEqual(assert_present(db.get_download_request(successor))[peer_field], "")
+                    failed_ids = {row["id"] for row in db.list_rss_entries(status="failed").items}
+                    self.assertNotIn(entries[peer], failed_ids)
+                    if outcome == "failed":
+                        self.assertIn(entries[backend], failed_ids)
+                    if peer == "guangya":
+                        self.assertTrue(db.claim_download_request_organize(original))
+                        db.update_download_request(original, organize_status="failed", organize_error="peer organize fixture")
+                        self.assertTrue(rss_entry_delivery(db.get_rss_entry(entries[peer]))["failed"])
+                    else:
+                        self.assertEqual(assert_present(db.get_download_request(original))["local_import_status"], "queued")
+                        db.update_download_request(original, local_import_status="failed", local_import_error="peer import fixture")
+                    self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[peer]))["request_id"], original)
+
+    def test_precreate_binding_gets_owner_in_creation_transaction_and_rolls_back_with_it(self):
+        _, eid, item = self.pending()
+        self.assertTrue(db.claim_rss_entry(eid))
+        bind_rss_entry_download(eid, dispatcher.request_key(item), "qb")
+        self.assertIsNone(assert_present(db.get_rss_entry(eid))["download_request_id"])
+        with patch("app.repositories.rss._bind_rss_download_entries_conn", side_effect=RuntimeError("binding-fault")):
+            with self.assertRaisesRegex(RuntimeError, "binding-fault"):
+                dispatcher.create_request(item, "", "")
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_request_keys").fetchone()[0], 0)
+        self.assertIsNone(assert_present(db.get_rss_entry(eid))["download_request_id"])
+        rid = int(dispatcher.create_request(item, "", "")["id"])
+        entry = assert_present(db.get_rss_entry(eid))
+        self.assertEqual((entry["download_request_id"], entry["status"]), (rid, "submitting"))
+        db.update_download_request(rid, status="submitted", targets="qb", qb_status="submitted")
+        self.assertEqual(assert_present(db.get_rss_entry(eid))["status"], "downloaded")
+
+    def test_successor_binding_failure_rolls_back_archive_claim_and_both_receipt_owners(self):
+        from app.repositories.rss import _bind_rss_download_entries_conn
+
+        original, entries, _ = self.dual_receipts("qb")
+        before = dict(assert_present(db.get_download_request(original)))
+        item = dispatcher.DownloadInput(before["kind"], before["title"], before["source_value"])
+
+        def fail_after_transfer(conn, request_id, **kwargs):
+            _bind_rss_download_entries_conn(conn, request_id, **kwargs)
+            if kwargs.get("source_request_id") == original:
+                raise RuntimeError("successor-binding-fault")
+
+        with patch("app.repositories.rss._bind_rss_download_entries_conn", side_effect=fail_after_transfer):
+            with self.assertRaisesRegex(RuntimeError, "successor-binding-fault"):
+                dispatcher.create_request(item, "", "", initial_targets="qb",
+                                          retry_source_request_id=original, retry_source_status="completed")
+        self.assertEqual(dict(assert_present(db.get_download_request(original))), before)
+        self.assertEqual(assert_present(db.get_download_request_by_request_key(dispatcher.request_key(item)))["id"], original)
+        for eid in entries.values():
+            self.assertEqual(assert_present(db.get_rss_entry(eid))["download_request_id"], original)
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM download_requests").fetchone()[0], 1)
+
+    def test_verified_http_alias_registration_binds_owner_before_failure_feedback(self):
+        from app.repositories.download_requests import bind_verified_torrent_identity
+        from tests.test_download_http_identity_lifecycle import TORRENT_A
+
+        raw = dispatcher.normalize_download_url("https://feed.invalid/untyped-http")
+        rid = int(dispatcher.create_request(raw, "", "")["id"])
+        self.assertTrue(db.claim_download_request(rid, "qb"))
+        db.update_download_request(rid, status="submitted", qb_status="submitted")
+        self.assertEqual(db.claim_download_request_targets(rid, "guangya"), ("guangya",))
+        verified = dispatcher.DownloadInput("http", "Episode", raw.source_value, torrent_data=TORRENT_A)
+        _, eid, _ = self.pending("guangya")
+        self.assertTrue(db.claim_rss_entry(eid))
+        bind_rss_entry_download(eid, dispatcher.request_key(verified), "guangya")
+        self.assertIsNone(assert_present(db.get_rss_entry(eid))["download_request_id"])
+        self.assertEqual(bind_verified_torrent_identity(
+            rid, raw.source_value, TORRENT_A, dispatcher.request_keys(verified),
+            source_alias_key=dispatcher.request_source_alias_key(verified),
+        ), rid)
+        self.assertEqual(assert_present(db.get_rss_entry(eid))["download_request_id"], rid)
+        db.update_download_request(rid, gy_status="failed")
+        db.record_rss_entry_failure(eid, "guangya_unavailable", True, request_id=rid)
+        self.assertEqual(assert_present(db.get_rss_entry(eid))["status"], "failed")
+
+    def test_peer_unknown_acceptance_after_manual_successor_keeps_original_owner(self):
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                original, entries, _ = self.dual_receipts(backend)
+                peer = "guangya" if backend == "qb" else "qb"
+                peer_field = "gy_status" if peer == "guangya" else "qb_status"
+                db.update_download_request(original, status="manual_review", **{peer_field: "outcome_unknown"})
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET status='failed',processed=0,failure_code=? WHERE id=?",
+                                 (f"{peer}_outcome_unknown", entries[peer]))
+                with patch.object(dispatcher, "_submit_qb", side_effect=self.success), patch.object(dispatcher, "_submit_guangya", side_effect=self.success):
+                    result = dispatcher.resubmit_download_request(original, backend)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[peer]))["request_id"], original)
+                self.assertTrue(rss_entry_delivery(db.get_rss_entry(entries[peer]))["review_required"])
+                db.update_download_request(original, **{peer_field: "completed"})
+                peer_entry = assert_present(db.get_rss_entry(entries[peer]))
+                self.assertEqual((peer_entry["status"], peer_entry["processed"]), ("downloaded", 1))
+                self.assertEqual(rss_entry_delivery(peer_entry)["request_id"], original)
+                self.assertFalse(rss_entry_delivery(peer_entry)["review_required"])
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[backend]))["request_id"], result["request_id"])
+
+    def test_late_failure_and_acceptance_only_touch_current_owner_and_selected_backend(self):
+        from app.repositories.rss import _sync_rss_download_entries_conn
+
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                original, entries, _ = self.dual_receipts(backend)
+                source = assert_present(db.get_download_request(original))
+                item = dispatcher.DownloadInput(source["kind"], source["title"], source["source_value"], torrent_data=source["torrent_data"])
+                successor = int(dispatcher.create_request(
+                    item, "", "", initial_targets=backend,
+                    retry_source_request_id=original, retry_source_status="completed",
+                )["id"])
+                _, waiter, _ = self.pending(backend)
+                self.assertTrue(db.claim_rss_entry(waiter))
+                bind_rss_entry_download(waiter, dispatcher.request_key(item), backend)
+                selected = entries[backend]
+                self.assertEqual(assert_present(db.get_rss_entry(selected))["download_request_id"], successor)
+                db.record_rss_entry_failure(selected, "qb_rate_limited", True, request_id=original)
+                self.assertEqual(assert_present(db.get_rss_entry(selected))["status"], "downloaded")
+                self.assertEqual(assert_present(db.get_rss_entry(waiter))["status"], "submitting")
+                self.assertEqual(db.update_rss_entries_processed([selected], False), 0)
+                # 把已受理回执模拟为新尝试的等待者，用当前 owner 才能终结同 backend 的等待者。
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET status='submitting',processed=0 WHERE id=?", (selected,))
+                db.record_rss_entry_failure(selected, "qb_rate_limited", True, request_id=successor)
+                self.assertEqual([assert_present(db.get_rss_entry(eid))["status"] for eid in (selected, waiter)], ["failed", "failed"])
+                field = "qb_status" if backend == "qb" else "gy_status"
+                with db.get_conn() as conn:
+                    conn.execute(f"UPDATE download_requests SET {field}='submitted' WHERE id=?", (original,))
+                    _sync_rss_download_entries_conn(conn, original, db.now())
+                self.assertEqual([assert_present(db.get_rss_entry(eid))["status"] for eid in (selected, waiter)], ["failed", "failed"])
+                db.update_download_request(successor, status="submitted", **{field: "submitted"})
+                self.assertEqual([assert_present(db.get_rss_entry(eid))["status"] for eid in (selected, waiter)], ["downloaded", "downloaded"])
+                peer = entries["guangya" if backend == "qb" else "qb"]
+                self.assertEqual(assert_present(db.get_rss_entry(peer))["download_request_id"], original)
+
+    def test_peer_postprocess_retry_reads_stable_owner_not_other_backend_canonical_owner(self):
+        original, entries, engine = self.dual_receipts("qb")
+        with patch.object(dispatcher, "_submit_qb", side_effect=self.success):
+            first = engine.download(entries["qb"])
+        qb_successor = first["request_id"]
+        db.update_download_request(qb_successor, status="failed", qb_status="failed")
+        db.update_download_request(original, organize_status="failed", organize_error="fixture organize failure")
+        with patch.object(dispatcher, "resubmit_download_request", wraps=dispatcher.resubmit_download_request) as resubmit, patch.object(
+            dispatcher, "_submit_guangya", side_effect=self.success
+        ) as gy, patch.object(dispatcher, "_submit_qb") as qb:
+            result = engine.download(entries["guangya"])
+        resubmit.assert_called_once()
+        self.assertEqual(resubmit.call_args.args[:2], (original, "guangya"))
+        self.assertTrue(result["ok"], result)
+        gy.assert_called_once()
+        qb.assert_not_called()
+        self.assertNotIn(result["request_id"], {original, qb_successor})
+        self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries["qb"]))["request_id"], qb_successor)
+        self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries["guangya"]))["request_id"], result["request_id"])
+
+    def test_unselected_failure_can_retry_its_archived_owner_without_stealing_first_successor(self):
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                original, entries, engine = self.dual_receipts(backend)
+                peer = "guangya" if backend == "qb" else "qb"
+                db.update_download_request(original, status="failed", qb_status="failed", gy_status="failed")
+                with patch.object(dispatcher, "_submit_qb", side_effect=self.success), patch.object(dispatcher, "_submit_guangya", side_effect=self.success):
+                    first = engine.download(entries[backend])
+                    self.assertTrue(first["ok"], first)
+                    field = "qb_status" if backend == "qb" else "gy_status"
+                    db.update_download_request(first["request_id"], status="failed", **{field: "failed"})
+                    peer_delivery = rss_entry_delivery(db.get_rss_entry(entries[peer]))
+                    self.assertEqual(peer_delivery["request_id"], original)
+                    self.assertTrue(peer_delivery["retryable"])
+                    second = engine.download(entries[peer])
+                self.assertTrue(second["ok"], second)
+                self.assertNotIn(second["request_id"], {original, first["request_id"]})
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[backend]))["request_id"], first["request_id"])
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[peer]))["request_id"], second["request_id"])
+
+    def test_archived_http_peer_retry_uses_frozen_content_not_current_canonical_owner(self):
+        from tests.test_download_http_identity_lifecycle import TORRENT_A, MIME
+
+        with patch("app.modules.rss._fetch_rss_payload", return_value=(TORRENT_A, {"content-type": MIME})):
+            original, entries, engine = self.dual_receipts("qb", source="https://feed.invalid/shared.torrent", torrent_data=TORRENT_A)
+        with patch.object(dispatcher, "_submit_qb", side_effect=self.success):
+            first = engine.download(entries["qb"])
+        self.assertTrue(first["ok"], first)
+        db.update_download_request(first["request_id"], status="failed", qb_status="failed")
+        db.update_download_request(original, organize_status="failed", organize_error="fixture organize failure")
+        cloud_entry = assert_present(db.get_rss_entry(entries["guangya"]))
+        self.assertEqual((cloud_entry["status"], cloud_entry["processed"], cloud_entry["delivery_retryable"]), ("downloaded", 1, 1))
+        with patch.object(dispatcher, "_submit_guangya", side_effect=self.success) as gy, patch.object(dispatcher, "_submit_qb") as qb:
+            result = engine.download(entries["guangya"])
+        self.assertTrue(result["ok"], result)
+        gy.assert_called_once()
+        qb.assert_not_called()
+        self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries["qb"]))["request_id"], first["request_id"])
+        self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries["guangya"]))["request_id"], result["request_id"])
+
     def test_accepted_failure_is_visible_in_api_failed_filter_without_rewriting_receipt(self):
         for backend in ("qb", "guangya"):
             with self.subTest(backend=backend):
@@ -388,7 +643,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
 
     def test_safe_retry_helper_matches_read_projection_for_all_backend_states(self):
         rid, eid, _ = self.accepted()
-        for root in ("failed", "completed", "cancelled", "manual_review", "submitted"):
+        for root in ("failed", "completed", "resubmitted", "cancelled", "manual_review", "submitted"):
             for target in ("qb", "guangya"):
                 for peer in ("", "completed", "submitted", "manual_review", "outcome_unknown"):
                     values = {"qb_status": "failed" if target == "qb" else peer, "gy_status": "failed" if target == "guangya" else peer}
@@ -568,6 +823,7 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         db.update_download_request(rid, status="cancelled", qb_status="cancelled")
         with db.get_conn() as conn:
             conn.execute("DELETE FROM download_request_keys WHERE request_id=?", (rid,))
+            conn.execute("UPDATE rss_entries SET download_request_id=NULL WHERE download_request_id=?", (rid,))
         _, alternate, _ = self.pending(media_key=key)
         self.assertEqual(assert_present(db.get_rss_entry(alternate))["status"], "skipped")
         self.assertEqual(db.update_rss_entries_processed([alternate], False), 1)
