@@ -253,6 +253,14 @@ def _rss_delivery_failed_sql(entry: str = "e") -> str:
     )
 
 
+def _rss_delivery_review_sql() -> str:
+    return (
+        "((r.id IS NULL AND e.download_request_key!='' AND e.status='downloaded') "
+        "OR r.status='manual_review' "
+        f"OR ({_RSS_SELECTED_BACKEND}) IN ('outcome_unknown','manual_review'))"
+    )
+
+
 def _rss_delivery_retry_sql(entry: str = "e") -> str:
     backend = _RSS_SELECTED_BACKEND.replace("e.", f"{entry}.")
     return (
@@ -289,10 +297,7 @@ def _rss_delivery_columns() -> str:
         "COALESCE((e.status='downloaded' OR (e.status='failed' AND e.failure_code IN "
         "('qb_outcome_unknown','guangya_outcome_unknown','submission_outcome_unknown'))) "
         f"AND {_rss_delivery_retry_sql()},0) AS delivery_retryable,"
-        "COALESCE((r.id IS NULL AND e.download_request_key!='' "
-        "AND e.status='downloaded') OR r.status='manual_review' "
-        f"OR ({_RSS_SELECTED_BACKEND}) "
-        "IN ('outcome_unknown','manual_review'),0) AS delivery_review_required"
+        f"COALESCE({_rss_delivery_review_sql()},0) AS delivery_review_required"
     )
 
 
@@ -569,18 +574,16 @@ def list_rss_entries(
 
 
 def purge_processed_rss_entries(retention_days: int = 7) -> int:
-    """清理超过保留期的已处理 RSS 条目；未处理和失败条目不受影响。"""
+    """清理过期已处理条目；失败和待核验回执保留，显式跳过仍可清理。"""
     days = max(1, (retention_days or 7))
     with db.get_conn() as conn:
         cur = conn.execute(
-            "DELETE FROM rss_entries WHERE COALESCE(processed,0)=1 "
-            "AND processed_at IS NOT NULL "
-            "AND datetime(processed_at) < datetime('now', ?) "
-            "AND NOT EXISTS (SELECT 1 FROM download_requests r "
-            "WHERE r.id=rss_entries.download_request_id AND rss_entries.status!='skipped' AND ("
-            + _rss_delivery_failed_sql("rss_entries") + " OR r.status='manual_review' OR ("
-            + _RSS_SELECTED_BACKEND.replace("e.", "rss_entries.") +
-            ") IN ('outcome_unknown','manual_review')))",
+            "DELETE FROM rss_entries WHERE id IN (SELECT e.id FROM rss_entries e "
+            + _RSS_REQUEST_JOIN +
+            "WHERE COALESCE(e.processed,0)=1 AND e.processed_at IS NOT NULL "
+            "AND datetime(e.processed_at) < datetime('now', ?) "
+            "AND (e.status='skipped' OR NOT COALESCE("
+            + _rss_delivery_failed_sql() + " OR " + _rss_delivery_review_sql() + ",0)))",
             (f"-{days} days",),
         )
         return (cur.rowcount or 0)

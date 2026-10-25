@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 from app import database as db, database_migrations
 from app.modules import download_dispatcher as dispatcher
-from app.modules.rss import rss_entry_delivery
+from app.modules.rss import RSSEngine, rss_entry_delivery
 from app.repositories.rss import bind_rss_entry_download
 from tests.support import assert_present, isolated_test_database
 
@@ -101,6 +101,52 @@ class RSSDeliveryOwnershipMigrationTests(unittest.TestCase):
         self.log(entries["guangya"], original, "guangya")
         db.init_db()
         self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries["guangya"])), cloud)
+
+    def test_unproven_migrated_receipt_survives_cleanup_and_refresh_without_resubmission(self):
+        for backend in ("qb", "guangya"):
+            with self.subTest(retried_backend=backend), isolated_test_database():
+                original, _, entries, item = self.dual_successor(backend)
+                peer = "guangya" if backend == "qb" else "qb"
+                eid = entries[peer]
+                row = assert_present(db.get_rss_entry(eid))
+                sid, guid = int(row["rss_item_id"]), str(row["guid"])
+                db.update_rss_subscription(sid, {"action": "download"})
+                logs = [int(log["id"]) for log in db.list_download_logs(limit=200)
+                        if log["request_id"] == original and log["source"] == peer]
+                self.assertTrue(logs)
+                self.assertEqual(db.delete_download_logs(logs), logs)
+                # schema36 清日志仍保留稳定归属；旧 schema 缺少这条独立证据。
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(eid))["request_id"], original)
+                self.legacy_schema()
+                db.init_db()
+                delivery = rss_entry_delivery(db.get_rss_entry(eid))
+                self.assertEqual(delivery["request_id"], 0)
+                self.assertTrue(delivery["review_required"])
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET processed_at=datetime('now','-8 days') WHERE id=?", (eid,))
+                self.assertEqual(db.purge_processed_rss_entries(), 0)
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(eid)), delivery)
+
+                feed = (
+                    '<rss version="2.0"><channel><title>Feed</title><item><title>Episode</title>'
+                    f'<guid>{guid}</guid><enclosure url="{item.source_value}" '
+                    'type="application/x-bittorrent" /></item></channel></rss>'
+                ).encode()
+                engine = RSSEngine()
+                self.addCleanup(engine.close)
+                with patch("app.modules.rss._fetch_rss_payload", return_value=(feed, {})), patch.object(
+                    dispatcher, "_submit_qb", return_value={"ok": True, "task_id": "duplicate-qb"}
+                ) as qb, patch.object(
+                    dispatcher, "_submit_guangya", return_value={"ok": True, "task_id": "duplicate-gy"}
+                ) as gy:
+                    refreshed = engine.auto_download(sid)
+                self.assertNotIn("error", refreshed)
+                self.assertEqual(refreshed["refresh"]["total"], 1)
+                self.assertEqual(refreshed["refresh"]["new"], 0)
+                self.assertEqual((refreshed["downloaded"], refreshed["failed"], refreshed["deferred"]), (0, 0, 0))
+                qb.assert_not_called()
+                gy.assert_not_called()
+                self.assertEqual(rss_entry_delivery(db.get_rss_entry(eid)), delivery)
 
     def test_unknown_and_partial_backend_receipts_never_become_completed_during_upgrade(self):
         for backend in ("qb", "guangya"):
