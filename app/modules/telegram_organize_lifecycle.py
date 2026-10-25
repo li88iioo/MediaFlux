@@ -578,6 +578,7 @@ def publish_organize_lifecycle(
         importance=_importance(stats),
         chat_id=chat_id,
         topic_enabled=topic_enabled,
+        delivery_route=stats.get("delivery_route"),
     )
 
 

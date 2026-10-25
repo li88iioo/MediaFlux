@@ -28,6 +28,7 @@ if TYPE_CHECKING:
     from app.modules.local_media_models import LocalMediaSource
 
 from app import database as db
+from app.agent.owner_routes import normalize_delivery_route
 from app.bot.progress import TelegramProgress, send_typing
 from app.config import get, get_bool
 from app.logger import get_logger, log_throttled
@@ -3651,11 +3652,18 @@ def _run_guangya_organize_stage(
             library_notify=False,
             strm_detail_notify=False,
         )
+    thread_id = getattr(progress, "message_thread_id", None)
+    if thread_id is None:
+        thread_id = _telegram_thread_id(getattr(progress, "source_message", None))
+    delivery_route = normalize_delivery_route({
+        "chat_id": chat_id, "message_thread_id": thread_id,
+    }) if thread_id is not None else {}
     result = manager.start(
         sources,
         rules,
         trigger_type="telegram",
         chat_id=str(chat_id),
+        **({"delivery_route": delivery_route} if delivery_route else {}),
     )
     if not result.get("ok"):
         return {

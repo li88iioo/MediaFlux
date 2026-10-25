@@ -930,6 +930,9 @@ def _publish(
                 event = replace(event, actions=valid_actions)
         if thread:
             event = _bounded_thread_event(event)
+        if existing and delivery_route is None:
+            # 生命周期更新只重建展示字段；物理话题地址沿用 outbox 中的原地址。
+            delivery_route = json.loads(existing["event_json"]).get("_delivery_route")
         event_json = serialize_notification_event(event)
         if agent_interaction_attempt_id or delivery_route or agent_continuation or agent_effect_delivery:
             payload = json.loads(event_json)
@@ -1144,6 +1147,7 @@ def publish_notification_thread(
     topic_enabled: bool = True,
     preferred_message_id: int = 0,
     deliver_now: bool = True,
+    delivery_route: Mapping[str, Any] | None = None,
     expected_confirmation_delivery: tuple[int, int] | None = None,
 ) -> NotificationPublishResult:
     return _publish(
@@ -1156,6 +1160,7 @@ def publish_notification_thread(
         topic_enabled=topic_enabled,
         preferred_message_id=preferred_message_id,
         deliver_now=deliver_now,
+        delivery_route=delivery_route,
         expected_confirmation_delivery=expected_confirmation_delivery,
     )
 

@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from datetime import datetime
@@ -18,6 +18,7 @@ from typing import Any, Callable
 
 from app import config
 from app import database as db
+from app.agent.owner_routes import normalize_delivery_route
 from app.clients.guangya import GuangYaClient, close_guangya_client
 from app.logger import get_logger
 from app.modules.directory_scrape import PreviewSnapshotGuangYaClient
@@ -400,6 +401,7 @@ class OrganizeTaskManager:
         *,
         trigger_type: str = "manual",
         chat_id: str = "",
+        delivery_route: Mapping[str, Any] | None = None,
         download_request_ids: Sequence[int | str | float] | None = None,
         client: Any | None = None,
         expected_credential_generation: int | None = None,
@@ -407,6 +409,14 @@ class OrganizeTaskManager:
     ) -> dict:
         if not sources:
             return {"ok": False, "error": "至少选择一个源目录"}
+        try:
+            route = normalize_delivery_route(delivery_route or {})
+            if route:
+                if chat_id.strip() and chat_id.strip() != route["chat_id"]:
+                    raise ValueError("Telegram delivery route mismatch")
+                chat_id = route["chat_id"]
+        except ValueError:
+            return {"ok": False, "error": "Telegram 通知地址无效"}
         try:
             request_ids = list(dict.fromkeys(
                 int(item) for item in (download_request_ids or [])
@@ -520,6 +530,8 @@ class OrganizeTaskManager:
                 task_id=task_id,
             )
             initial_result["source_count"] = len(sources)
+            if route:
+                initial_result["delivery_route"] = route
             run_payload = json.dumps(initial_result, ensure_ascii=False, default=str)
             run_id = db.add_task_run(
                 "guangya_organize", trigger_type, result=run_payload
@@ -566,6 +578,7 @@ class OrganizeTaskManager:
                     client,
                     expected_credential_generation,
                     owns_client,
+                    route,
                 ),
                 name=f"organize-{task_id[:8]}",
                 daemon=False,
@@ -609,6 +622,8 @@ class OrganizeTaskManager:
                             task_id=task_id,
                             error="整理任务启动失败",
                         )
+                        if route:
+                            failed_result["delivery_route"] = route
                         db.finish_task_run(
                             run_id,
                             "failed",
@@ -1670,8 +1685,11 @@ class OrganizeTaskManager:
         client: Any | None = None,
         expected_credential_generation: int | None = None,
         owns_client: bool = False,
+        delivery_route: Mapping[str, Any] | None = None,
     ) -> None:
-        aggregate: dict[str, Any] = {}
+        aggregate: dict[str, Any] = (
+            {"delivery_route": dict(delivery_route)} if delivery_route else {}
+        )
         source_results = []
         current_source = ""
         organizer = None
@@ -2127,6 +2145,8 @@ class OrganizeTaskManager:
                 task_id=task_id,
                 error=blocked_reason,
             )
+            if delivery_route:
+                structured_result["delivery_route"] = dict(delivery_route)
             with self._state_lock:
                 self._task.update({
                     "status": status,
@@ -2278,6 +2298,8 @@ class OrganizeTaskManager:
                 current_source=current_source,
                 error=public_error,
             )
+            if delivery_route:
+                structured_result["delivery_route"] = dict(delivery_route)
             if run_id:
                 try:
                     db.finish_task_run(
