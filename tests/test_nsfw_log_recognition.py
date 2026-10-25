@@ -185,38 +185,68 @@ def test_stale_preview_api_returns_conflict_before_task_submission(log_case):
         manager.assert_not_called()
 
 
-@pytest.mark.parametrize('filename,error', [('SSNI596C.mp4', '番号与原文件不一致'),
-                                           ('unknown.mp4', '未提取到可校验番号')])
-def test_manual_candidate_cannot_override_missing_or_different_source_identity(log_case, filename, error):
+@pytest.mark.parametrize('filename', ['324SRTD-0366.mp4', 'OTHER-123.mp4', 'unknown.mp4'])
+@pytest.mark.parametrize('status', ['skipped', 'success', 'reverted'])
+def test_manual_metatube_selection_corrects_identity_and_survives_return(log_case, filename, status):
     service, _ = log_case
-    log_id = make_log('', 'adult-source', name=filename, status='skipped')
-    recognizer = MagicMock()
-    recognizer.resolve.return_value = (MatchResult(provider='metatube'), {'number': 'SSNI-999'})
-    with patch.object(service.organizer, '_nsfw_recognizer_lease', return_value=nullcontext(recognizer)), \
-            pytest.raises(ValueError, match=error):
-        service.preview_reorganize(log_id, '', 'movie', provider='metatube', external_id='JavBus:SSNI-999')
-    service.client.move.assert_not_called()
-    service.client.rename.assert_not_called()
+    number = 'SRTD-0366'
+    log_id = make_log('', 'adult-source', name=filename, status=status)
+    metadata = {'provider': 'JavBus', 'id': number, 'number': number,
+                'title': '人工纠正测试', 'release_date': '2023-01-01'}
+    remote = {
+        'video': GuangYaFile('video', filename, False, 100, 'etag', 'existing'),
+        'input': GuangYaFile('input', '待整理', True, parent_id='0'),
+        'existing': GuangYaFile('existing', '原归档', True, parent_id='0'),
+        'archive': GuangYaFile('archive', '归档', True, parent_id='0'),
+        'category': GuangYaFile('category', 'NSFW', True, parent_id='archive'),
+    }
+    service.client.file_info.side_effect = remote.get
+    service.client.list_dir.side_effect = lambda parent: [item for item in remote.values() if item.parent_id == parent]
+    service.client.move.side_effect = lambda ids, parent: setattr(remote[ids[0]], 'parent_id', parent)
+    service.client.rename.side_effect = lambda fid, name: setattr(remote[fid], 'name', name)
+    recognizer = NsfwRecognizer('http://synthetic.invalid/manual-log')
+    clear_nsfw_cache()
+    try:
+        with patch.object(recognizer.client, '_get', side_effect=lambda path, **kw: [metadata] if path.endswith('/search') else metadata), \
+                patch.object(service.organizer, '_nsfw_recognizer_lease', return_value=nullcontext(recognizer)), \
+                patch.object(service.scraper, 'match_from_tmdb') as tmdb, \
+                patch.object(service, '_notify_reorganize_result', return_value=[]):
+            # 自动识别仍不接受另一个番号；人工选择允许纠正它。
+            automatic = recognizer.match(filename)
+            assert automatic is None or automatic.provider != 'metatube'
+            candidate = service.search_candidates(log_id, number)[0]
+            preview = service.preview_reorganize(log_id, '', 'movie', provider='metatube', external_id=candidate['external_id'])
+            assert preview['match']['external_id'] == 'JavBus:' + number
+            assert preview['target_path'].startswith('NSFW/' + number)
+            service.client.move.assert_not_called()
+            service.client.rename.assert_not_called()
+            remote['media'] = GuangYaFile('media', preview['media_dir'], True, parent_id='category')
+            result = service.reorganize(log_id, 'manual-correction', preview['version'], '', 'movie',
+                provider='metatube', external_id=candidate['external_id'])
+            assert result['success'] is True
+            assert remote['video'].parent_id == 'media'
+            assert remote['video'].name == preview['file_name']
+            saved = service.detail(log_id)
+            assert saved['external_id'] == 'JavBus:' + number
+            returned = service.return_to_source(log_id, 'manual-return', saved['version'])
+            assert returned['success'] is True
+            assert remote['video'].parent_id == 'input'
+            assert remote['video'].name == filename
+            again = service.preview_reorganize(log_id, '', 'movie', provider='metatube', external_id=candidate['external_id'])
+            assert again['match']['external_id'] == 'JavBus:' + number
+            tmdb.assert_not_called()
+    finally:
+        recognizer.close()
+        clear_nsfw_cache()
 
 
 @pytest.mark.parametrize('filename', ['SSNI596C.mp4', 'SSNI-596C.mp4'])
-def test_compact_identity_is_shared_by_directory_and_telegram_validation(filename):
-    from app.modules.directory_media import DirectoryInspection, MediaSnapshot
-    from app.modules.directory_scrape import DirectoryScrapeService
-    from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
+def test_automatic_confirmation_keeps_source_identity_validation(filename):
     from app.modules.organize_confirmations import _validate_metatube_confirmation_identity
 
     rules = OrganizeRules(nsfw_enabled=True, nsfw_exclusive=True)
-    inspection = DirectoryInspection(
-        directory_id='source', directory_name='incoming', media_type='movie', suggested_query='',
-        videos=(MediaSnapshot('video', 'source', filename, 100, 'etag', 'video', ''),),
-        companions=(), counts={}, mixed=False, fingerprint='synthetic',
-    )
     payload = {'directory': 'incoming', 'files': [{'name': filename}]}
-    DirectoryScrapeService._validate_metatube_source_identity(inspection, {'number': 'SSNI-596'}, rules)
     _validate_metatube_confirmation_identity(payload, {'number': 'SSNI-596'}, rules)
-    with pytest.raises(DirectoryScrapeRequestError, match='番号与当前目录不一致'):
-        DirectoryScrapeService._validate_metatube_source_identity(inspection, {'number': 'SSNI-999'}, rules)
     with pytest.raises(ValueError, match='番号与待确认文件不一致'):
         _validate_metatube_confirmation_identity(payload, {'number': 'SSNI-999'}, rules)
 

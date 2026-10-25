@@ -242,6 +242,7 @@
         const box = node('div', 'gy-scrape-placeholder');
         box.append(icon(iconName), node('strong', '', title), node('span', '', copy));
         target.replaceChildren(box);
+        target.setAttribute('aria-busy', 'false');
         renderIcons(target);
     }
 
@@ -271,14 +272,10 @@
 
     function closeModal() {
         invalidateManualInspection();
-        state.requestVersion += 1;
         state.searchController?.abort();
-        state.previewController?.abort();
         state.searchController = null;
-        state.previewController = null;
         state.pendingSearchKey = '';
-        state.pendingPreviewKey = '';
-        invalidateExternalHints();
+        invalidatePreview();
         modalLifecycle.close();
         elements.candidates.classList.remove('is-loading');
     }
@@ -350,6 +347,7 @@
         elements.run.disabled = true;
         elements.status.textContent = '搜索条件已更新';
         elements.planSummary.textContent = '请重新选择候选并生成预览';
+        if (state.selectedCandidate) renderDetail(state.selectedCandidate);
     }
 
     function pendingVideos(source = state.inspection) {
@@ -712,7 +710,8 @@
 
     function renderDetail(candidate, preview = null) {
         elements.detail.replaceChildren();
-        elements.detail.setAttribute('aria-busy', preview ? 'false' : 'true');
+        const previewPending = !preview && Boolean(state.pendingPreviewKey);
+        elements.detail.setAttribute('aria-busy', previewPending ? 'true' : 'false');
         const media = preview?.match ? {...candidate, ...preview.match} : candidate;
         const provider = String(media.provider || candidate.provider || 'tmdb').toLowerCase();
 
@@ -765,11 +764,15 @@
         );
 
         if (!preview) {
-            targetCopy.appendChild(node('strong', '', '正在生成无副作用预览…'));
+            targetCopy.appendChild(node('strong', '', previewPending
+                ? '正在生成无副作用预览…' : elements.status.textContent));
             targetBar.append(targetCopy, namingRule);
             planBox.appendChild(targetBar);
             const loading = node('div', 'gy-scrape-map-loading');
-            loading.append(icon('loader-circle', 'is-spinning'), node('span', '', '正在核对文件与归档目标'));
+            loading.append(
+                icon(previewPending ? 'loader-circle' : 'info', previewPending ? 'is-spinning' : ''),
+                node('span', '', previewPending ? '正在核对文件与归档目标' : elements.planSummary.textContent),
+            );
             planBox.appendChild(loading);
             elements.detail.appendChild(planBox);
             renderIcons(elements.detail);
@@ -935,6 +938,7 @@
             if (state.previewController === controller) {
                 state.previewController = null;
                 state.pendingPreviewKey = '';
+                if (!state.preview) renderDetail(candidate);
             }
         }
     }
@@ -988,14 +992,15 @@
         } catch (error) {
             if (error.name === 'AbortError') return;
             if (version !== state.requestVersion) return;
+            elements.status.textContent = '搜索失败';
+            elements.planSummary.textContent = error.message;
+            placeholder(elements.detail, 'search-x', '媒体搜索失败', error.message);
             window.appAlert?.({type: 'error', title: '媒体搜索失败', message: error.message});
         } finally {
-            if (version === state.requestVersion) {
+            if (state.searchController === controller) {
                 elements.search.disabled = false;
                 elements.search.querySelector('span').textContent = previous;
                 elements.candidates.classList.remove('is-loading');
-            }
-            if (state.searchController === controller) {
                 state.searchController = null;
                 state.pendingSearchKey = '';
             }

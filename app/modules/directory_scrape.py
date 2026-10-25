@@ -782,30 +782,6 @@ class DirectoryScrapeService:
                         ):
                             self._retired_nsfw_recognizers.pop(identity, None)
 
-    @staticmethod
-    def _validate_metatube_source_identity(
-        inspection: DirectoryInspection,
-        detail: dict,
-        rules: OrganizeRules,
-    ) -> None:
-        from app.modules.nsfw import extract_nsfw_identifier, normalize_code
-
-        source_codes: set[str] = set()
-        source_values = [inspection.directory_name]
-        for video in inspection.videos:
-            source_values.extend((video.name, video.relative_dir))
-        for value in source_values:
-            identifier = extract_nsfw_identifier(value, rules.nsfw_strip_domains)
-            if identifier is not None:
-                source_codes.add(normalize_code(identifier.code))
-        resolved_code = normalize_code(str(detail.get("number") or ""))
-        if not source_codes:
-            raise DirectoryScrapeRequestError(
-                "当前目录未提取到可校验番号，不能直接套用成人元数据"
-            )
-        if not resolved_code or resolved_code not in source_codes:
-            raise DirectoryScrapeRequestError("所选 MetaTube 条目番号与当前目录不一致")
-
     def _recognize(self, filename: str, parent_path: str, rules: OrganizeRules) -> MatchResult:
         with self._nsfw_recognizer_lease(rules) as recognizer:
             if recognizer is not None:
@@ -1137,7 +1113,7 @@ class DirectoryScrapeService:
                     raise DirectoryScrapeRequestError(
                         str(exc) or "MetaTube 详情不存在或无法确认"
                     ) from exc
-            self._validate_metatube_source_identity(current, detail, record.rules)
+            # 人工选定的真实详情是媒体身份；原名只决定已检查的文件范围，不否决纠正。
             normalized_type = "movie"
         else:
             # 先取含演职员的完整详情；真实 TMDBScraper 随后的 match_from_tmdb

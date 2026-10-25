@@ -26,7 +26,6 @@ from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.nsfw import (
     CleanTitleCandidate,
     build_clean_title_candidate,
-    extract_nsfw_identifier,
     normalize_code,
 )
 from app.modules.organize import (
@@ -502,17 +501,8 @@ class OrganizeCorrectionService:
         if effective_rules.nsfw_exclusive:
             if normalized_provider not in {"metatube", "clean_title"} or not (external_id or "").strip():
                 raise ValueError("请选择有效的成人内容候选")
-            source_codes: set[str] = set()
-            source_seed = ""
-            for value in source_values:
-                if not source_seed and (value or "").strip():
-                    source_seed = value
-                identifier = extract_nsfw_identifier(value, effective_rules.nsfw_strip_domains)
-                if identifier is not None:
-                    source_codes.add(normalize_code(identifier.code))
-            if not source_codes:
-                raise ValueError("原文件名未提取到可校验番号，不能执行成人内容人工整理")
             if normalized_provider == "clean_title":
+                source_seed = next((value for value in source_values if (value or "").strip()), "")
                 fallback = build_clean_title_candidate(
                     source_seed, effective_rules.nsfw_strip_domains,
                 )
@@ -537,10 +527,8 @@ class OrganizeCorrectionService:
             with self.organizer._nsfw_recognizer_lease(effective_rules) as recognizer:
                 if recognizer is None:
                     raise ValueError("成人来源未配置可用的 MetaTube 服务")
-                result, detail = recognizer.resolve(external_id.strip())
-            resolved_code = normalize_code(str(detail.get("number") or ""))
-            if not resolved_code or resolved_code not in source_codes:
-                raise ValueError("MetaTube 候选番号与原文件不一致，请重新搜索")
+                # 人工纠偏允许改正原来的错误番号，身份来自所选条目的真实详情。
+                result, _ = recognizer.resolve(external_id.strip())
             return result
         if normalized_provider not in {"", "tmdb"}:
             raise ValueError("普通媒体来源只允许使用 TMDB 候选")

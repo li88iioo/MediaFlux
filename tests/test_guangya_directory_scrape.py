@@ -14,6 +14,8 @@ import json
 import re
 import time
 import unittest
+import pytest
+from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -30,6 +32,7 @@ from tests.support import (
     InitializedWebTestCase,
     IsolatedDatabaseTestCase,
     release_parse_result,
+    isolated_test_database,
 )
 
 
@@ -2174,6 +2177,60 @@ class DirectoryScrapeServiceTests(unittest.TestCase):
             "owner", inspected["inspection_id"], "", "movie",
             provider="metatube", external_id="javbus:atid-675",
         )
+
+
+@pytest.mark.parametrize("scope", ["file", "directory"])
+@pytest.mark.parametrize("filename", ["324SRTD-0366.mp4", "unknown.mp4", "OTHER-123.mp4", "SRTD-0366.mp4"])
+def test_manual_metatube_identity_drives_preview_and_execution(scope, filename):
+    from app.modules.directory_scrape import DirectoryScrapeService
+    from app.modules.nsfw import NsfwRecognizer, clear_nsfw_cache
+
+    with isolated_test_database():
+        video = _file("selected", filename, "source")
+        subtitle = _file("subtitle", filename.rsplit(".", 1)[0] + ".srt", "source", size=1024)
+        other = _file("other", "OTHER-999.mp4", "source" if scope == "file" else "outside")
+        tree = {"source": [video, subtitle], "outside": [], "archive": []}
+        tree[other.parent_id].append(other)
+        infos = {
+            "source": _dir("source", "待整理"), "outside": _dir("outside", "其他文件"),
+            "archive": _dir("archive", "归档"),
+            **{item.file_id: item for values in tree.values() for item in values},
+        }
+        client = _MutableTreeClient(tree, infos)
+        rules = OrganizeRules(
+            target_dir_id="archive", small_file_mb=0, region_split=False, year_split=False,
+            clean_empty=False, link_strm=False, notify_enabled=False,
+            nsfw_enabled=True, nsfw_source_ids='["source"]',
+            nsfw_metatube_endpoint="http://synthetic.invalid/manual-directory",
+        )
+        metadata = {"provider": "JavBus", "id": "SRTD-0366", "number": "SRTD-0366",
+                    "title": "人工纠正测试", "release_date": "2023-01-01"}
+        recognizer = NsfwRecognizer(rules.nsfw_metatube_endpoint)
+        service = DirectoryScrapeService(client=cast(GuangYaClient, client),
+            scraper=cast(TMDBScraper, _DirectoryScrapeTMDB()), rules_loader=lambda: rules)
+        clear_nsfw_cache()
+        try:
+            with patch.object(recognizer.client, "_get", side_effect=lambda path, **kw: [metadata] if path.endswith("/search") else metadata), \
+                    patch.object(service, "_nsfw_recognizer_lease", return_value=nullcontext(recognizer)):
+                inspected = service.inspect_file("owner", "selected") if scope == "file" else service.inspect("owner", "source")
+                candidates = service.search("owner", inspected["inspection_id"], "SRTD-0366", "movie")
+                assert len(candidates) == 1
+                chosen = candidates[0]
+                preview = service.preview("owner", inspected["inspection_id"], "", "movie",
+                    provider=chosen["provider"], external_id=chosen["external_id"])
+                assert service.store.get_preview("owner", preview["preview_id"]).match.external_id == "JavBus:SRTD-0366"
+                assert [plan["file_id"] for plan in preview["plans"]] == ["selected"]
+                assert client.infos["selected"] == video
+                result = service.execute_preview("owner", preview["preview_id"])
+                assert result["stats"]["failed"] == 0
+                assert client.infos["selected"].parent_id != "source"
+                assert client.infos["selected"].name.startswith("SRTD-0366")
+                assert client.infos["subtitle"].parent_id == client.infos["selected"].parent_id
+                assert client.infos["other"] == other
+        finally:
+            service.close()
+            recognizer.close()
+            clear_nsfw_cache()
 
 
 class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):

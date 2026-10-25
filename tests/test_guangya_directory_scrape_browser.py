@@ -193,7 +193,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
                     if (path.endsWith('/search')) {
                         return {
                             ok: true,
-                            json: async () => ({candidates: [{
+                            json: async () => ({candidates: window.__candidates || [{
                                 tmdb_id: '255358',
                                 media_type: 'tv',
                                 title: '攻壳机动队',
@@ -306,6 +306,170 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
 
     def _close_menu(self) -> None:
         self.page.evaluate("window.GuangYaDirectoryScrapeUI.closeMenu()")
+
+    def _open_manual_directory(self) -> None:
+        binding = self._bind(is_directory=True, left=120, top=100)
+        self._open_button(binding)
+        self.page.locator('[data-scrape-action="manual"]').click()
+        self.page.locator('.gy-scrape-candidate').first.wait_for()
+
+    def _hold_scrape_replies(self, endpoint: str) -> None:
+        self.page.evaluate(
+            """
+            endpoint => {
+                const fetch = window.fetch;
+                window.__heldReplies ||= {};
+                window.__heldReplies[endpoint] = [];
+                window.fetch = async (path, options = {}) => {
+                    if (!path.endsWith(endpoint)) return fetch(path, options);
+                    window.__requests.push({path, body: JSON.parse(options.body)});
+                    let deliver;
+                    const body = new Promise(resolve => { deliver = resolve; });
+                    const response = {ok: true, json: () => body};
+                    // 故意在 abort 后仍交付，覆盖已读取响应无法撤回的竞态。
+                    window.__heldReplies[endpoint].push({
+                        signal: options.signal,
+                        reply: ({ok, data}) => { response.ok = ok; deliver(data); },
+                    });
+                    return response;
+                };
+            }
+            """,
+            endpoint,
+        )
+
+    def _reply_scrape(self, endpoint: str, index: int, *, ok: bool = True, **data) -> None:
+        self.page.evaluate(
+            """({endpoint, index, ok, data}) =>
+                window.__heldReplies[endpoint][index].reply({ok, data})""",
+            {"endpoint": endpoint, "index": index, "ok": ok, "data": data},
+        )
+
+    def _assert_preview_idle(self) -> None:
+        self.assertEqual(self.page.locator('#gyScrapeDetail').get_attribute('aria-busy'), 'false')
+        self.assertEqual(self.page.locator('#gyScrapeDetail .is-spinning').count(), 0)
+        self.assertNotIn('正在核对文件与归档目标', self.page.locator('#gyScrapeDetail').inner_text())
+        self.assertEqual(self.page_errors, [])
+
+    def test_preview_failure_stops_loading_and_same_candidate_can_retry(self):
+        self._hold_scrape_replies('/preview')
+        self._open_manual_directory()
+        candidate = self.page.locator('.gy-scrape-candidate').first
+        candidate.click()
+        self.assertEqual(self.page.locator('#gyScrapeDetail').get_attribute('aria-busy'), 'true')
+        self.assertEqual(self.page.locator('#gyScrapeDetail .is-spinning').count(), 1)
+        self.assertTrue(self.page.locator('#gyScrapeRunBtn').is_disabled())
+
+        self._reply_scrape('/preview', 0, ok=False, error='无法确认归档目标，请重试')
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '预览失败'")
+        self._assert_preview_idle()
+        self.assertIn('无法确认归档目标，请重试', self.page.locator('#gyScrapeDetail').inner_text())
+        self.assertEqual(candidate.get_attribute('aria-pressed'), 'true')
+        self.assertTrue(self.page.locator('#gyScrapeRunBtn').is_disabled())
+
+        candidate.click()
+        self.assertEqual(self.page.locator('#gyScrapeDetail').get_attribute('aria-busy'), 'true')
+        self._reply_scrape('/preview', 1, preview_id='retry-preview', plans=[{
+            'file_id': 'video-1', 'original_name': '原始视频.mkv',
+            'new_name': '攻壳机动队.S01E01.mkv', 'target_path': '攻壳机动队/Season 01',
+            'action': 'move', 'season': 1, 'episode': 1,
+        }])
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '预览完成 · 1 项'")
+        self._assert_preview_idle()
+        self.assertFalse(self.page.locator('#gyScrapeRunBtn').is_disabled())
+        self.assertEqual(self.page.locator('.gy-scrape-map-row').count(), 1)
+
+    def test_switching_candidates_keeps_current_loading_when_old_preview_fails(self):
+        self.page.evaluate("""() => { window.__candidates = [
+            {tmdb_id: '1', media_type: 'tv', title: '候选甲'},
+            {tmdb_id: '2', media_type: 'tv', title: '候选乙'},
+        ]; }""")
+        self._hold_scrape_replies('/preview')
+        self._open_manual_directory()
+        self.page.locator('.gy-scrape-candidate').nth(0).click()
+        self.page.locator('.gy-scrape-candidate').nth(1).click()
+        self.assertTrue(self.page.evaluate("window.__heldReplies['/preview'][0].signal.aborted"))
+        self._reply_scrape('/preview', 0, ok=False, error='旧候选失败')
+        self.assertEqual(self.page.locator('#gyScrapeStatus').inner_text(), '正在生成预览')
+        self.assertEqual(self.page.locator('#gyScrapeDetail').get_attribute('aria-busy'), 'true')
+        self.assertEqual(self.page.locator('#gyScrapeDetail .is-spinning').count(), 1)
+        self.assertIn('候选乙', self.page.locator('#gyScrapeDetail').inner_text())
+        self._reply_scrape('/preview', 1, preview_id='second-preview', plans=[])
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '预览完成 · 0 项'")
+        self._assert_preview_idle()
+        self.assertFalse(self.page.locator('#gyScrapeRunBtn').is_disabled())
+
+    def test_editing_conditions_stops_preview_and_ignores_late_success(self):
+        self._hold_scrape_replies('/preview')
+        self._open_manual_directory()
+        self.page.locator('.gy-scrape-candidate').first.click()
+        self.page.locator('#gyScrapeQuery').fill('新的搜索条件')
+        self._assert_preview_idle()
+        self.assertTrue(self.page.evaluate("window.__heldReplies['/preview'][0].signal.aborted"))
+        self._reply_scrape('/preview', 0, preview_id='obsolete-preview', plans=[])
+        self.assertEqual(self.page.locator('#gyScrapeStatus').inner_text(), '搜索条件已更新')
+        self.assertTrue(self.page.locator('#gyScrapeRunBtn').is_disabled())
+        self._assert_preview_idle()
+
+    def test_search_failure_stops_preview_and_search_retry_recovers(self):
+        self._hold_scrape_replies('/preview')
+        self._open_manual_directory()
+        self.page.locator('.gy-scrape-candidate').first.click()
+        self._hold_scrape_replies('/search')
+        self.page.locator('#gyScrapeSearchBtn').click()
+        self._assert_preview_idle()
+        self._reply_scrape('/search', 0, ok=False, error='搜索服务暂时不可用')
+        self.page.wait_for_function("!document.getElementById('gyScrapeSearchBtn').disabled")
+        self.assertEqual(self.page.locator('#gyScrapeStatus').inner_text(), '搜索失败')
+        self.assertIn('搜索服务暂时不可用', self.page.locator('#gyScrapeDetail').inner_text())
+        self.assertNotIn('is-loading', self.page.locator('#gyScrapeCandidates').get_attribute('class') or '')
+        self._reply_scrape('/preview', 0, preview_id='obsolete-preview', plans=[])
+        self.assertEqual(self.page.locator('#gyScrapeStatus').inner_text(), '搜索失败')
+        self.assertTrue(self.page.locator('#gyScrapeRunBtn').is_disabled())
+
+        self.page.locator('#gyScrapeSearchBtn').click()
+        self._reply_scrape('/search', 1, candidates=[{
+            'tmdb_id': '3', 'media_type': 'movie', 'title': '重试候选',
+        }])
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '请选择候选'")
+        self.page.locator('.gy-scrape-candidate').click()
+        self._reply_scrape('/preview', 1, preview_id='retry-preview', plans=[])
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '预览完成 · 0 项'")
+        self._assert_preview_idle()
+        self.assertFalse(self.page.locator('#gyScrapeRunBtn').is_disabled())
+
+    def test_search_cleanup_survives_selecting_candidate_during_search(self):
+        self._hold_scrape_replies('/preview')
+        self._open_manual_directory()
+        self._hold_scrape_replies('/search')
+        self.page.locator('#gyScrapeSearchBtn').click()
+        self.page.locator('.gy-scrape-candidate').first.click()
+        self._reply_scrape('/preview', 0, preview_id='current-preview', plans=[])
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '预览完成 · 0 项'")
+        self._reply_scrape('/search', 0, ok=False, error='旧搜索失败')
+        self.assertFalse(self.page.locator('#gyScrapeSearchBtn').is_disabled())
+        self.assertNotIn('is-loading', self.page.locator('#gyScrapeCandidates').get_attribute('class') or '')
+        self.assertEqual(self.page.locator('#gyScrapeStatus').inner_text(), '预览完成 · 0 项')
+        self._assert_preview_idle()
+
+    def test_close_stops_preview_and_late_reply_cannot_change_reopened_dialog(self):
+        self._hold_scrape_replies('/preview')
+        self._open_manual_directory()
+        self.page.locator('.gy-scrape-candidate').first.click()
+        self.page.locator('#gyScrapeCloseBtn').click()
+        self.assertTrue(self.page.locator('#gyScrapeModal').is_hidden())
+        self._assert_preview_idle()
+        self.assertTrue(self.page.locator('#gyScrapeRunBtn').is_disabled())
+
+        self._open_manual_directory()
+        self._assert_preview_idle()
+        self.page.locator('.gy-scrape-candidate').first.click()
+        self._reply_scrape('/preview', 0, ok=False, error='已关闭预览的旧错误')
+        self.assertEqual(self.page.locator('#gyScrapeStatus').inner_text(), '正在生成预览')
+        self.assertEqual(self.page.locator('#gyScrapeDetail').get_attribute('aria-busy'), 'true')
+        self._reply_scrape('/preview', 1, preview_id='reopened-preview', plans=[])
+        self.page.wait_for_function("document.getElementById('gyScrapeStatus').textContent === '预览完成 · 0 项'")
+        self._assert_preview_idle()
 
     def test_button_and_context_anchors_use_visual_viewport_offsets(self):
         binding = self._bind(is_directory=True, left=300, top=80)

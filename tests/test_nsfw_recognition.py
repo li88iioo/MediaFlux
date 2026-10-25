@@ -22,9 +22,7 @@ import requests
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
-from app.modules.directory_media import DirectoryInspection, MediaSnapshot
 from app.modules.directory_scrape import DirectoryScrapeService, FixedMatchScraper
-from app.modules.directory_scrape_errors import DirectoryScrapeRequestError
 from app.modules.local_media_service import LocalMediaService
 from app.modules.naming import build_context
 from app.modules.nsfw import (
@@ -977,24 +975,6 @@ class NsfwOrganizerTests(unittest.TestCase):
         self.assertEqual(context.tmdb_tag, "")
         self.assertEqual(context.identity_tag, "{metatube-javbus-ssis001}")
 
-    def test_manual_metatube_preview_requires_source_number_match(self):
-        inspection = DirectoryInspection(
-            directory_id="d1", directory_name="SSIS-001",
-            media_type="movie", suggested_query="SSIS-001",
-            videos=(MediaSnapshot(
-                file_id="f1", parent_id="d1", name="SSIS-001.mp4",
-                size=1, etag="e", role="video", relative_dir="",
-            ),),
-            companions=(), counts={}, mixed=False, fingerprint="fp",
-        )
-        rules = OrganizeRules(nsfw_strip_domains="")
-        DirectoryScrapeService._validate_metatube_source_identity(
-            inspection, {"number": "SSIS-001"}, rules,
-        )
-        with self.assertRaisesRegex(DirectoryScrapeRequestError, "番号与当前目录不一致"):
-            DirectoryScrapeService._validate_metatube_source_identity(
-                inspection, {"number": "ABP-123"}, rules,
-            )
 
 
 class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
@@ -1201,15 +1181,13 @@ class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
         assert get_organize_log_result_2 is not None
         self.assertEqual(get_organize_log_result_2["status"], "manual")
 
-    def test_pending_adult_preview_rejects_different_number(self):
+    def test_manual_metatube_preview_still_requires_real_valid_details(self):
         log_id = self._pending_log()
-        service = OrganizeCorrectionService(client=self._client(), scraper=TMDBScraper())
-        recognizer = MagicMock()
-        detail = {"number": "ABP-123"}
-        recognizer.resolve.return_value = (MatchResult(
-            title="ABP-123", year="2024", media_type="movie",
-            provider="metatube", external_id="javbus:abp123", metadata=detail,
-        ), detail)
+        client = self._client()
+        service = OrganizeCorrectionService(client=client, scraper=TMDBScraper())
+        recognizer = NsfwRecognizer("http://synthetic.invalid/invalid-details")
+        self.addCleanup(recognizer.close)
+        self.addCleanup(service.close)
 
         with patch(
             "app.modules.organize_correction.OrganizeRules.from_config",
@@ -1217,12 +1195,14 @@ class NsfwCorrectionIntegrationTests(IsolatedDatabaseTestCase):
         ), patch.object(
             service.organizer, "_nsfw_recognizer_lease",
             return_value=nullcontext(recognizer),
-        ), \
-                self.assertRaisesRegex(ValueError, "候选番号与原文件不一致"):
+        ), patch.object(recognizer.client, "_get", return_value={"number": "ABP-123"}), \
+                self.assertRaisesRegex(MetaTubeError, "详情格式无效"):
             service.preview_reorganize(
                 log_id, "", "movie", provider="metatube",
                 external_id="javbus:abp123",
             )
+        client.move.assert_not_called()
+        client.rename.assert_not_called()
 
 
 class NsfwAuditIdentityTests(IsolatedDatabaseTestCase):

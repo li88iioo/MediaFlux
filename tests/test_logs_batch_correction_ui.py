@@ -382,14 +382,14 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         self.page.evaluate("""() => Object.assign(window.__testConfig, {
             nsfw:true,
             nsfwCandidates:[{external_id:'JavBus:SSNI-596',provider:'metatube',media_type:'movie',title:'SSNI-596 归档测试',year:2019,score:1}],
-            singlePreviewFailures:['原文件名未提取到可校验番号'],
+            singlePreviewFailures:['MetaTube 详情格式无效'],
         })""")
         self.page.locator('.detail-btn').first.click()
         self.page.locator('#organizeTmdbQuery').fill('SSNI-596C.mp4')
         self.page.locator('#organizeTmdbSearchBtn').click()
         candidate = self.page.locator('.organize-candidate').first
         candidate.click()
-        self.page.locator('#organizeOperationState').filter(has_text='未提取到可校验番号').wait_for()
+        self.page.locator('#organizeOperationState').filter(has_text='MetaTube 详情格式无效').wait_for()
         self.assertTrue(self.page.locator('#organizeReorganizeBtn').is_disabled())
         self.assertTrue(self.page.locator('#organizePositionFields').is_hidden())
         candidate.click()
