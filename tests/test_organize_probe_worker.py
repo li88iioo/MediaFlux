@@ -4,6 +4,8 @@ from __future__ import annotations
 from app.clients.guangya import GuangYaClient
 from threading import Thread
 from typing import cast
+import sqlite3
+import threading
 
 from dataclasses import asdict
 from unittest.mock import patch
@@ -113,6 +115,79 @@ class OrganizeProbeWorkerTests(IsolatedDatabaseTestCase):
         self.assertEqual([item["id"] for item in claimed], [job_id])
         self.assertEqual(db.recover_stale_organize_probe_jobs(force=True), 1)
         self.assertEqual(db.count_organize_probe_jobs()["retry_wait"], 1)
+
+    def test_startup_recovery_retries_before_consuming_orphaned_jobs(self):
+        job_id = db.enqueue_organize_probe_completion(
+            self._create_log(), source_id="target", rel_dir="动漫/示例/Season 1",
+            rules=asdict(OrganizeRules(target_dir_id="target")), delay_seconds=0,
+        )
+        self._make_due()
+        self.assertEqual(
+            [row["id"] for row in db.claim_due_organize_probe_jobs(owner="old", limit=1)],
+            [job_id],
+        )
+        worker = OrganizeProbeWorker()
+        recovered = db.recover_stale_organize_probe_jobs
+        wait = worker._wake_event.wait
+        claimed: list[int] = []
+        errors: list[threading.ExceptHookArgs] = []
+        attempts = 0
+
+        def recover(*, force=False):
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return recovered(force=force)
+
+        def consume():
+            self.assertEqual(attempts, 3)
+            self._make_due()
+            claimed.extend(row["id"] for row in db.claim_due_organize_probe_jobs(
+                owner=worker._owner, limit=1,
+            ))
+            worker._stop_event.set()
+            return False
+
+        with patch("threading.excepthook", side_effect=errors.append), patch(
+            "app.modules.organize_probe_worker.db.recover_stale_organize_probe_jobs",
+            side_effect=recover,
+        ) as recovery, patch.object(worker, "_process_one", side_effect=consume) as process, patch.object(
+            worker._wake_event, "wait", side_effect=lambda timeout: wait(min(timeout, 0.01)),
+        ):
+            worker.start()
+            assert worker._thread is not None
+            worker._thread.join(timeout=2.0)
+            self.assertTrue(worker.stop(timeout=1.0))
+
+        self.assertEqual(errors, [])
+        self.assertEqual(recovery.call_count, 3)
+        self.assertEqual(process.call_count, 1)
+        self.assertEqual(claimed, [job_id])
+        self.assertTrue(worker._consumer_lock.acquire(blocking=False))
+        worker._consumer_lock.release()
+
+    def test_stop_during_unavailable_startup_recovery_releases_consumer(self):
+        worker = OrganizeProbeWorker()
+        attempted = threading.Event()
+        errors: list[threading.ExceptHookArgs] = []
+
+        def unavailable(*, force=False):
+            attempted.set()
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("threading.excepthook", side_effect=errors.append), patch(
+            "app.modules.organize_probe_worker.db.recover_stale_organize_probe_jobs",
+            side_effect=unavailable,
+        ), patch.object(worker, "_process_one") as process:
+            worker.start()
+            self.assertTrue(attempted.wait(timeout=2.0))
+            self.assertTrue(worker.stop(timeout=1.0))
+
+        self.assertEqual(errors, [])
+        process.assert_not_called()
+        self.assertTrue(worker._consumer_lock.acquire(blocking=False))
+        worker._consumer_lock.release()
 
     def test_queue_snapshot_excludes_token_and_worker_restores_current_server_secret(self):
         log_id = self._create_log()

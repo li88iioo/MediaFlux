@@ -114,11 +114,14 @@ class OrganizeProbeWorker:
                 self._stop_event.wait(1.0)
             if not owns_lock:
                 return
-            recovered = db.recover_stale_organize_probe_jobs(force=True)
-            if recovered:
-                logger.warning("已恢复中断的媒体规格补全任务 count=%s", recovered)
+            recovery_pending = True
             while not self._stop_event.is_set():
                 try:
+                    if recovery_pending:
+                        recovered = db.recover_stale_organize_probe_jobs(force=True)
+                        if recovered:
+                            logger.warning("已恢复中断的媒体规格补全任务 count=%s", recovered)
+                        recovery_pending = False
                     worked = self._process_one()
                 except Exception:
                     logger.exception("媒体规格后台补全轮询异常")
