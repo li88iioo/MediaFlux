@@ -247,16 +247,17 @@ class AgentTurn:
                 try:
                     self.scope.close()
                     if self.lease is not None and self.token is not None:
-                        if (not self.lease.continuation_id
-                                or continuation_record(self.state, self.lease.continuation_id, self.lease.continuation_kind).get("state") in {"claimed", "running"}):
-                            try:
+                        try:
+                            if (not self.lease.continuation_id
+                                    or continuation_record(self.state, self.lease.continuation_id, self.lease.continuation_kind).get("state") in {"claimed", "running"}):
                                 update = _ContinuationAction("", {
                                     "operation": "finish", "reason": "turn_ended",
                                 }, binding=self.session.continuation_binding) if self.lease.continuation_id else _PublicationFinished("", None)
                                 await self.session.state_store.commit(self.lease, updates=(update,))
-                            except (StalePublicationError, SessionBusyError):
-                                pass
-                        await self.session.coordinator.finish(self.lease, self.token)
+                        except (StalePublicationError, SessionBusyError):
+                            pass
+                        finally:
+                            await self.session.coordinator.finish(self.lease, self.token)
                 finally:
                     self.execution_scope.close()
 

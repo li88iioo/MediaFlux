@@ -5,9 +5,13 @@ from app.agent.kernel.session import TurnAdmissionPolicy
 
 import asyncio
 import json
+import sqlite3
 import unittest
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from unittest.mock import patch
+
+from starlette.requests import Request
 
 from app.agent.kernel.capabilities import (
     CapabilityRetriever,
@@ -15,7 +19,8 @@ from app.agent.kernel.capabilities import (
     ToolCatalog,
     ToolEffect,
 )
-from app.agent.kernel.events import AgentEvent
+from app.agent.kernel.events import AgentEvent, AgentEventType
+from app.agent.kernel.persistence import SQLiteKernelStore
 from app.agent.kernel.model import (
     ModelEvent,
     ModelEventType,
@@ -25,6 +30,7 @@ from app.agent.kernel.model import (
 from app.agent.kernel.pipeline import ToolPipeline
 from app.agent.kernel.session import AgentSession
 from app.agent.kernel.state import InMemorySessionStateStore
+from app.agent.kernel.state_types import AgentInput, _PublicationFinished
 from app.agent.transports import (
     EffectEnvelope,
     QueryEnvelope,
@@ -32,6 +38,8 @@ from app.agent.transports import (
     TransportInputError,
     WebKernelTransport,
 )
+from app.routes import agent_api
+from tests.support import isolated_test_database
 
 
 class ReadThenAnswerModel:
@@ -80,6 +88,50 @@ def make_session() -> AgentSession:
 
 
 class AgentKernelTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finished_turn_clears_activity_even_if_final_publication_write_fails(self):
+        with isolated_test_database():
+            template = make_session()
+            store = SQLiteKernelStore(secret_provider=lambda: "isolated-finish-secret")
+            session = AgentSession(
+                model=template.model, catalog=template.catalog, retriever=template.retriever,
+                pipeline=ToolPipeline(catalog=template.catalog, state_store=store),
+                state_store=store, journal=store,
+            )
+            commit = store.commit
+
+            async def fail_finish(lease, **kwargs):
+                if any(isinstance(update, _PublicationFinished) for update in kwargs.get('updates', ())):
+                    raise sqlite3.OperationalError('synthetic finish write failure')
+                return await commit(lease, **kwargs)
+
+            events = []
+            with patch.object(store, 'commit', side_effect=fail_finish), self.assertRaises(sqlite3.OperationalError):
+                async for event in session.run(AgentInput(
+                    owner='owner', session_id='finish-session-0001', request_id='request-1',
+                    message='媒体库有多少集', channel='web',
+                )):
+                    events.append(event)
+            self.assertEqual(events[-1].type, AgentEventType.TURN_COMPLETED)
+            self.assertIsNone(await session.coordinator.describe(owner='owner', session_id='finish-session-0001'))
+            self.assertIsNone(await session.activity(owner='owner', session_id='finish-session-0001'))
+            request = Request({'type': 'http', 'method': 'GET', 'path': '/', 'headers': []})
+            runtime = SimpleNamespace(session=session, store=store, web=WebKernelTransport(session))
+            with patch.object(agent_api, 'require_api_login'), \
+                    patch.object(agent_api, '_owner', return_value='owner'), \
+                    patch.object(agent_api, '_draft_scope', return_value='fixture'), \
+                    patch.object(agent_api, 'get_agent_kernel_runtime', return_value=runtime):
+                response = await agent_api.get_session(request, 'finish-session-0001')
+            self.assertEqual(response.status_code, 200)
+            snapshot = json.loads(bytes(response.body))
+            self.assertIsNone(snapshot['active_turn'])
+            self.assertEqual(snapshot['last_turn']['status'], 'completed')
+            following = [event async for event in session.run(AgentInput(
+                owner='owner', session_id='finish-session-0001', request_id='request-2',
+                message='再核查一次', channel='web',
+            ))]
+            self.assertEqual(following[-1].type, AgentEventType.TURN_COMPLETED)
+            self.assertIsNone(await session.activity(owner='owner', session_id='finish-session-0001'))
+
     async def test_cancel_effect_passes_only_normalized_cancellation_arguments(self):
         for transport_type in (WebKernelTransport, TelegramKernelTransport):
             with self.subTest(transport=transport_type.__name__):
