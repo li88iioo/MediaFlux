@@ -1565,38 +1565,6 @@ def update_organize_log_item(item_id: int, **fields) -> bool:
         )
         return cur.rowcount == 1
 
-
-
-
-
-
-def recover_interrupted_organize_operations() -> dict[str, int]:
-    """把进程退出遗留的忙碌状态转成需重新核验的中断状态。"""
-    timestamp = now()
-    with get_conn() as conn:
-        logs = conn.execute(
-            "UPDATE organize_log SET status='interrupted',error=CASE "
-            "WHEN COALESCE(error,'')='' THEN '上次进程在云端写操作期间中断，必须重新核验快照' "
-            "ELSE error END,updated_at=? "
-            "WHERE status IN ('reorganizing','returning','reverting','deleting')",
-            (timestamp,),
-        ).rowcount
-        steps = conn.execute(
-            "UPDATE organize_operation_steps SET status='interrupted',"
-            "error=CASE WHEN COALESCE(error,'')='' THEN '进程中断，步骤结果需要人工核验' ELSE error END,"
-            "finished_at=COALESCE(finished_at,?) WHERE status='running'",
-            (timestamp,),
-        ).rowcount
-        audits = conn.execute(
-            "UPDATE organize_delete_audit SET status='interrupted',"
-            "error='上次进程在光鸭 provider 调用期间中断，结果未知，需人工核验',"
-            "provider_result='光鸭回收站结果未知，需人工核验',updated_at=? "
-            "WHERE status='pending'",
-            (timestamp,),
-        ).rowcount
-    return {"logs": logs, "steps": steps, "delete_audits": audits}
-
-
 def clear_organize_logs(
     *, owner: str = "admin", origin: str = "all", status: str = "", keyword: str = ""
 ) -> dict[str, int]:
