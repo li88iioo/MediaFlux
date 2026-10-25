@@ -46,6 +46,7 @@ from app.modules.organize_postprocess import (
     companion_target_name,
     normalize_media_number,
 )
+from app.modules.organize_results import organize_strm_error
 from app.modules.recognition.cleaner import _comparison_key
 from app.modules.scraper import (
     Candidate,
@@ -1402,11 +1403,10 @@ class OrganizeCorrectionService:
                 warnings.append(f"TMDB 映射锁保存失败: {exc}")
                 logger.warning(warnings[-1])
         if rules.link_strm:
-            try:
-                Organizer._post_organize_link({"moved": moved}, rules)
-            except Exception as exc:
-                warnings.append(f"STRM/Jellyfin 后处理失败: {exc}")
-                logger.warning(warnings[-1])
+            stats = {"moved": moved}
+            Organizer._post_organize_link(stats, rules)
+            if error := organize_strm_error(stats):
+                warnings.append(f"云端操作已完成，STRM/Jellyfin 后处理未受理：{error}")
         return warnings
 
     def _download_recovery_snapshot(self, source_dir_id: str) -> dict | None:

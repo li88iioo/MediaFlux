@@ -287,6 +287,55 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.cloud.nodes['video'].name, 'Original.S01E01.mkv')
         self.assertNotIn('leaf', self.cloud.nodes)
 
+    def test_corrections_report_rejected_strm_handoff_without_replaying_cloud_writes(self):
+        self.rules.link_strm = True
+        actions = (
+            self._reorganize,
+            lambda: self.service.return_to_source(
+                self.log_id, 'return-strm-rejected', self.service.detail(self.log_id)['version'],
+            ),
+            self._reorganize,
+            lambda: self.service.revert_latest(
+                self.log_id, 'revert-strm-rejected', self.service.detail(self.log_id)['version'],
+            ),
+        )
+        with patch('app.modules.organize.get', side_effect=lambda key, default='': {
+            'GY_STRM_BASE_URL': 'http://synthetic.invalid', 'STRM_ROOT': '/synthetic/strm',
+        }.get(key, default)), patch('app.modules.scheduler.get_scheduler') as scheduler:
+            scheduler.return_value.trigger.return_value = {
+                'ok': False, 'error': 'STRM 调度器正在停止',
+            }
+            for index, action in enumerate(actions, start=1):
+                result = action()
+                with self.subTest(action=index):
+                    self.assertTrue(result['success'])
+                    self.assertIn('STRM 调度器正在停止', '；'.join(result['warnings']))
+                    self.assertEqual(scheduler.return_value.trigger.call_count, index)
+                    detail = self.service.detail(self.log_id)
+                    self.assertEqual(detail['status'], 'success' if index % 2 else 'reverted')
+                    self.assertEqual(detail['current_name'], self.cloud.nodes['video'].name)
+        self.assertEqual(self.cloud.nodes['video'].name, 'Original.S01E01.mkv')
+
+    def test_correction_strm_handoff_distinguishes_queued_skipped_and_failed(self):
+        self.rules.link_strm = True
+        with patch('app.modules.organize.get', side_effect=lambda key, default='': {
+            'GY_STRM_BASE_URL': 'http://synthetic.invalid', 'STRM_ROOT': '/synthetic/strm',
+        }.get(key, default)), patch('app.modules.scheduler.get_scheduler') as scheduler:
+            trigger = scheduler.return_value.trigger
+            for receipt in ({'ok': True, 'queued': True}, {'ok': False, 'skipped': True}):
+                with self.subTest(receipt=receipt):
+                    trigger.return_value = receipt
+                    self.assertEqual(self.service._run_post_actions(
+                        items=[], rules=self.rules, moved=1,
+                    ), [])
+            trigger.side_effect = RuntimeError('synthetic queue failure')
+            warnings = self.service._run_post_actions(items=[], rules=self.rules, moved=1)
+            self.assertIn('STRM 联动启动失败', '；'.join(warnings))
+            trigger.reset_mock()
+            self.rules.link_strm = False
+            self.assertEqual(self.service._run_post_actions(items=[], rules=self.rules, moved=1), [])
+            trigger.assert_not_called()
+
     def test_reorganize_after_return_cleans_restored_source_and_can_return_again(self):
         self._reorganize()
         self.service.return_to_source(self.log_id, 'return-first', self.service.detail(self.log_id)['version'])
