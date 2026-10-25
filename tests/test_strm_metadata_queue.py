@@ -1,16 +1,25 @@
 """STRM 伴随元数据持久化队列状态机。"""
 from __future__ import annotations
 
-from threading import Thread
+from threading import Event, Thread
+from pathlib import Path
+from unittest import TestCase
+from unittest.mock import patch
 
 from typing import TypedDict, cast
 from app.clients.guangya import GuangYaClient
 
+import sqlite3
+import tempfile
 import time
 
 from app import database as db
+from app.modules import strm_metadata_worker as metadata
+from app.modules.process_lock import CrossProcessLock
+from app.repositories.media_refresh_queue import media_refresh_queue_status
 from tests.support import IsolatedDatabaseTestCase
 from tests.support import PagedDirectoryTestMixin
+from tests.support import isolated_test_database
 
 
 def _job(**updates) -> dict:
@@ -718,3 +727,208 @@ class StrmMetadataQueueIntegrationTests(IsolatedDatabaseTestCase):
         self.assertTrue(worker.stop(timeout=0.1))
         self.assertIsNone(worker._thread)
         self.assertEqual(client.close_calls, 1)
+
+
+class StrmMetadataWorkerLifecycleTests(TestCase):
+    """真实线程、文件锁和 SQLite：存储故障不能切断持久交接或泄漏消费者锁。"""
+
+    def setUp(self):
+        from app.clients.guangya import GuangYaFile
+
+        self.enterContext(isolated_test_database())
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.remote = GuangYaFile("meta-1", "Movie.nfo", False, 8, "etag-1", "parent")
+        self.worker = metadata.STRMMetadataWorker()
+        self.worker._client = cast(GuangYaClient, _TreeClient({"parent": [self.remote]}))
+        self.handed_off = Event()
+        self.backoff = Event()
+        self.thread_errors = []
+        self.enterContext(patch.object(metadata, "get_bool", return_value=True))
+        self.enterContext(patch.object(metadata, "get", side_effect=lambda key, default="": {
+            "STRM_ROOT": str(self.root), "STRM_METADATA_EXTS": "nfo",
+        }.get(key, default)))
+        self.download = self.enterContext(patch("app.modules.strm.requests.get", return_value=_Response()))
+        self.enterContext(patch(
+            "app.modules.media_refresh_coordinator._configured_provider_names", return_value=("jellyfin",),
+        ))
+        self.enterContext(patch("threading.excepthook", side_effect=lambda args: self.thread_errors.append(args.exc_value)))
+        acknowledge = db.acknowledge_strm_refresh_paths
+        wait = self.worker._wake_event.wait
+
+        def handoff(entries):
+            result = acknowledge(entries)
+            self.handed_off.set()
+            return result
+
+        def idle_wait(timeout=None):
+            self.backoff.set()
+            return wait(timeout)
+
+        self.enterContext(patch.object(db, "acknowledge_strm_refresh_paths", side_effect=handoff))
+        self.enterContext(patch.object(self.worker._wake_event, "wait", side_effect=idle_wait))
+        self.addCleanup(self._stop_worker, self.worker)
+
+    def _stop_worker(self, worker):
+        self.assertTrue(worker.stop(timeout=3))
+        # 修前反例也必须清理真实锁；断言中的接管检查发生在此兜底之前。
+        if worker._worker_lock._handle is not None:
+            worker._worker_lock.release()
+
+    def _assert_lock_released(self):
+        self.assertFalse(self.worker.status()["consumer_active"])
+        successor_lock = CrossProcessLock("strm-metadata-worker")
+        self.assertTrue(successor_lock.acquire(blocking=False))
+        successor_lock.release()
+
+    def _assert_download_and_handoff(self):
+        self.assertTrue(self.handed_off.wait(7), "存储恢复后未继续完成元数据与刷新交接")
+        self.assertTrue(self.worker.stop(timeout=3))
+        self.assertEqual(self.download.call_count, 1)
+        self.assertEqual(dict(db.list_strm_metadata_queue()[0])["status"], "completed")
+        self.assertEqual(list(self.root.rglob("*.nfo"))[0].read_bytes(), b"metadata")
+        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(media_refresh_queue_status()["paths"], 1)
+        self.assertEqual(self.thread_errors, [])
+        self._assert_lock_released()
+
+    def test_idle_refresh_read_error_retries_then_downloads_new_work(self):
+        restored = Event()
+        read = db.list_strm_refresh_entries
+
+        def read_outbox(**kwargs):
+            if not restored.is_set():
+                raise sqlite3.OperationalError("isolated outbox read failure")
+            return read(**kwargs)
+
+        with patch.object(db, "list_strm_refresh_entries", side_effect=read_outbox):
+            self.worker.start()
+            self.assertTrue(self.backoff.wait(2), "刷新读取失败逃出了消费循环")
+            self.assertTrue(self.worker.status()["worker_running"])
+            db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
+            restored.set()
+            self.worker.wake()
+            self._assert_download_and_handoff()
+
+    def test_processing_error_retries_without_restarting_the_thread(self):
+        restored = Event()
+        runtime_client = self.worker._runtime_client
+
+        def client():
+            if not restored.is_set():
+                raise OSError("isolated client initialization failure")
+            return runtime_client()
+
+        db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
+        with patch.object(self.worker, "_runtime_client", side_effect=client):
+            self.worker.start()
+            self.assertTrue(self.backoff.wait(2))
+            self.assertEqual(dict(db.list_strm_metadata_queue()[0])["status"], "queued")
+            restored.set()
+            self.worker.wake()
+            self._assert_download_and_handoff()
+
+    def test_startup_recovery_retries_before_claiming_or_flushing(self):
+        restored = Event()
+        recover = db.recover_stale_strm_metadata_jobs
+        db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8)])
+        db.claim_due_strm_metadata_jobs(owner="previous-process")
+
+        def recover_jobs(**kwargs):
+            if not kwargs.get("owner") and not restored.is_set():
+                raise sqlite3.OperationalError("isolated startup recovery failure")
+            return recover(**kwargs)
+
+        with patch.object(db, "recover_stale_strm_metadata_jobs", side_effect=recover_jobs), \
+             patch.object(db, "list_strm_refresh_entries", wraps=db.list_strm_refresh_entries) as read:
+            self.worker.start()
+            self.assertTrue(self.backoff.wait(2), "首次恢复失败终止了消费者")
+            self.assertTrue(self.worker.status()["worker_running"])
+            self.assertEqual(dict(db.list_strm_metadata_queue()[0])["lease_owner"], "previous-process")
+            self.download.assert_not_called()
+            read.assert_not_called()
+            restored.set()
+            self.worker.wake()
+            self._assert_download_and_handoff()
+
+    def _exit_with_storage_failure(self, *, recovery_fails):
+        claimed = Event()
+        db.enqueue_strm_metadata_jobs([_job(filename=self.remote.name, size=8), _job(file_id="other")])
+        entries = db.enqueue_strm_refresh_paths([str(self.root / "Film")], allow_emby=False)
+        recover = db.recover_stale_strm_metadata_jobs
+
+        def process():
+            db.claim_due_strm_metadata_jobs(owner=self.worker._owner)
+            db.claim_due_strm_metadata_jobs(owner="other-worker")
+            claimed.set()
+            if not self.worker._stop_event.wait(10):
+                raise AssertionError("测试未及时停止消费者")
+            return True
+
+        def recover_jobs(**kwargs):
+            if recovery_fails and kwargs.get("owner"):
+                raise sqlite3.OperationalError("isolated exit recovery failure")
+            return recover(**kwargs)
+
+        with patch.object(self.worker, "_process_one", side_effect=process), \
+             patch.object(db, "list_strm_refresh_entries", side_effect=sqlite3.OperationalError("isolated exit flush failure")), \
+             patch.object(db, "recover_stale_strm_metadata_jobs", side_effect=recover_jobs) as recovery:
+            self.worker.start()
+            self.assertTrue(claimed.wait(2))
+            self.assertTrue(self.worker.stop(timeout=3))
+            self.assertTrue(any(call.kwargs.get("owner") == self.worker._owner for call in recovery.call_args_list))
+
+        rows = {row["file_id"]: dict(row) for row in db.list_strm_metadata_queue()}
+        self.assertEqual(rows["meta-1"]["status"], "running" if recovery_fails else "retry_wait")
+        self.assertEqual(rows["meta-1"]["attempts"], 0)
+        self.assertEqual(rows["other"]["lease_owner"], "other-worker")
+        self.assertEqual(db.list_strm_refresh_entries(), entries)
+        self.assertEqual(self.thread_errors, [])
+        self._assert_lock_released()
+
+        # 后继真实消费者立即接管未确认 outbox，也恢复前驱未能释放的租约。
+        successor = metadata.STRMMetadataWorker()
+        self.addCleanup(self._stop_worker, successor)
+        with patch.object(metadata, "get_bool", return_value=False):
+            successor.start()
+            self.assertTrue(self.handed_off.wait(7))
+            self.assertTrue(successor.stop(timeout=3))
+        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(media_refresh_queue_status()["paths"], 1)
+        self.assertEqual(db.count_strm_metadata_jobs()["running"], 0)
+        self.download.assert_not_called()
+
+    def test_exit_refresh_error_still_recovers_own_lease_and_releases_lock(self):
+        self._exit_with_storage_failure(recovery_fails=False)
+
+    def test_exit_refresh_and_recovery_errors_allow_successor_to_take_over(self):
+        self._exit_with_storage_failure(recovery_fails=True)
+
+    def test_stopped_lock_waiter_does_not_flush_or_recover_foreign_work(self):
+        holder = CrossProcessLock("strm-metadata-worker")
+        self.assertTrue(holder.acquire(blocking=False))
+        self.addCleanup(holder.release)
+        db.enqueue_strm_metadata_jobs([_job()])
+        db.claim_due_strm_metadata_jobs(owner="active-consumer")
+        entries = db.enqueue_strm_refresh_paths([str(self.root / "Film")], allow_emby=False)
+        attempted = Event()
+        acquire = self.worker._worker_lock.acquire
+
+        def acquire_lock(**kwargs):
+            acquired = acquire(**kwargs)
+            attempted.set()
+            return acquired
+
+        with patch.object(self.worker._worker_lock, "acquire", side_effect=acquire_lock), \
+             patch.object(db, "recover_stale_strm_metadata_jobs", wraps=db.recover_stale_strm_metadata_jobs) as recover, \
+             patch.object(db, "list_strm_refresh_entries", wraps=db.list_strm_refresh_entries) as read:
+            self.worker.start()
+            self.assertTrue(attempted.wait(2))
+            self.assertFalse(self.worker.status()["consumer_active"])
+            self.assertTrue(self.worker.stop(timeout=3))
+            recover.assert_not_called()
+            read.assert_not_called()
+
+        self.assertEqual(db.list_strm_refresh_entries(), entries)
+        self.assertEqual(dict(db.list_strm_metadata_queue()[0])["lease_owner"], "active-consumer")
+        self.assertEqual(media_refresh_queue_status()["paths"], 0)
+        self.assertEqual(self.thread_errors, [])

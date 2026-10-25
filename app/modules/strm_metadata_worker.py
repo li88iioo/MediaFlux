@@ -118,51 +118,49 @@ class STRMMetadataWorker:
 
     def _loop(self) -> None:
         owns_lock = False
+        recovery_pending = True
         try:
-            # 只允许一个进程消费同一持久队列。拿到独占锁后，才可以立即恢复
-            # 上个进程遗留的 running 租约，不会抢占仍活跃的下载器。
-            while not self._stop_event.is_set():
-                if self._worker_lock.acquire(blocking=False):
-                    owns_lock = True
-                    break
-                self._stop_event.wait(1.0)
-            if not owns_lock:
-                return
-            with self._state_lock:
-                self._consumer_active = True
-            recovered = db.recover_stale_strm_metadata_jobs(force=True)
-            if recovered:
-                logger.warning("已恢复中断的 STRM 元数据任务 count=%s", recovered)
             while not self._stop_event.is_set():
                 try:
-                    worked = self._process_one()
+                    if not owns_lock:
+                        owns_lock = self._worker_lock.acquire(blocking=False)
+                        if not owns_lock:
+                            self._stop_event.wait(1.0)
+                            continue
+                    # 只有持锁者可以恢复前驱租约；恢复成功前不开始消费。
+                    if recovery_pending:
+                        recovered = db.recover_stale_strm_metadata_jobs(force=True)
+                        recovery_pending = False
+                        with self._state_lock:
+                            self._consumer_active = True
+                        if recovered:
+                            logger.warning("已恢复中断的 STRM 元数据任务 count=%s", recovered)
+                    if self._process_one():
+                        self._stop_event.wait(max(0, min(
+                            get_int("STRM_METADATA_REQUEST_INTERVAL_MS", 0), 10000,
+                        )) / 1000.0)
+                        continue
+                    # 空闲刷新沿用配置节流，读取失败与处理失败共用轮询退避。
+                    self._flush_media_refresh(force=False)
                 except Exception:
                     logger.exception("STRM 元数据后台轮询异常")
-                    worked = False
-                if worked:
-                    interval_ms = max(
-                        0, min(
-                            get_int("STRM_METADATA_REQUEST_INTERVAL_MS", 0), 10000
-                        )
-                    )
-                    if interval_ms:
-                        self._stop_event.wait(interval_ms / 1000.0)
-                    continue
-                # 空闲轮询遵守配置的刷新间隔；force 仅用于进程退出前的最后
-                # 一次提交，避免永久路径失配时每 5 秒重复枚举媒体库。
-                self._flush_media_refresh(force=False)
                 self._wake_event.wait(timeout=5.0)
                 self._wake_event.clear()
         finally:
-            self._flush_media_refresh(force=True)
-            try:
-                db.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
-            except Exception:
-                logger.exception("恢复当前 STRM 元数据租约失败")
-            with self._state_lock:
-                self._consumer_active = False
             if owns_lock:
-                self._worker_lock.release()
+                try:
+                    self._flush_media_refresh(force=True)
+                except Exception:
+                    logger.exception("STRM 元数据退出刷新交接失败，保留 outbox 待恢复")
+                finally:
+                    try:
+                        db.recover_stale_strm_metadata_jobs(force=True, owner=self._owner)
+                    except Exception:
+                        logger.exception("恢复当前 STRM 元数据租约失败")
+                    finally:
+                        with self._state_lock:
+                            self._consumer_active = False
+                        self._worker_lock.release()
 
     def _process_one(self) -> bool:
         if not get_bool("STRM_METADATA_ENABLED", False):
