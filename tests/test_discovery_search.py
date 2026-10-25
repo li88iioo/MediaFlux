@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from app import config as app_config
+from app import config as app_config, database
 from app.clients.tmdb import TMDBClient
 from app.discovery.models import MediaCard, ProviderUnavailable
 from app.main import create_app
@@ -452,6 +452,69 @@ class DiscoverySearchAPITests(InitializedWebTestCase):
         self.authenticate()
         response = self.client.get("/api/discovery/search", params={"q": "Fight", "providers": "tmdb," * 40})
         self.assertEqual(response.status_code, 400)
+
+    def test_search_api_projects_watchlist_once_for_all_media_identities(self):
+        from app.discovery.search import DiscoverySearchService
+
+        self.authenticate()
+        database.add_media_watchlist("tmdb", "550", "movie", "已收藏电影")
+        database.add_media_watchlist("douban", "7", "movie", "已收藏豆瓣电影")
+        cards = (
+            MediaCard("tmdb", "550", "movie", "已收藏电影"),
+            MediaCard("tmdb", "550", "tv", "同 ID 剧集"),
+            MediaCard("douban", "550", "movie", "同 ID 豆瓣电影"),
+            MediaCard("douban", "7", "movie", "已收藏豆瓣电影"),
+        )
+        service = DiscoverySearchService(providers={
+            "tmdb": FakeSearchProvider("tmdb", cards=cards[:2]),
+            "douban": FakeSearchProvider("douban", cards=cards[2:]),
+        })
+        self.addCleanup(service.shutdown)
+        with patch("app.routes.discovery_api.get_discovery_search_service", return_value=service):
+            with patch(
+                "app.discovery.service.database.list_media_watchlist_keys",
+                wraps=database.list_media_watchlist_keys,
+            ) as lookup:
+                response = self.client.get("/api/discovery/search?q=电影&providers=tmdb,douban")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                [item["state"] for item in response.json()["items"]],
+                ["watchlisted", "none", "none", "watchlisted"],
+            )
+            lookup.assert_called_once_with([
+                (card.provider, card.external_id, card.media_type) for card in cards
+            ])
+            database.delete_media_watchlist("tmdb", "550", "movie")
+            refreshed = self.client.get("/api/discovery/search?q=电影&providers=tmdb,douban")
+            self.assertEqual(refreshed.json()["items"][0]["state"], "none")
+            self.assertTrue(all(card.state == "none" for card in cards))
+
+    def test_search_api_keeps_source_outcomes_for_failure_partial_and_zero_results(self):
+        from app.discovery.search import DiscoverySearchService
+
+        self.authenticate()
+        for failing in (("tmdb", "douban"), ("douban",), ()):
+            with self.subTest(failing=failing):
+                service = DiscoverySearchService(providers={
+                    name: FakeSearchProvider(
+                        name, error=ProviderUnavailable("数据源暂不可用") if name in failing else None,
+                    ) for name in ("tmdb", "douban")
+                })
+                try:
+                    with patch("app.routes.discovery_api.get_discovery_search_service", return_value=service):
+                        response = self.client.get("/api/discovery/search?q=电影&providers=tmdb,douban")
+                finally:
+                    service.shutdown()
+                self.assertEqual(response.status_code, 200)
+                payload = response.json()
+                self.assertEqual(payload["items"], [])
+                self.assertFalse(payload["has_more"])
+                self.assertEqual(payload["providers_attempted"], ["tmdb", "douban"])
+                self.assertEqual(payload["providers_succeeded"], [
+                    name for name in ("tmdb", "douban") if name not in failing
+                ])
+                self.assertEqual([error["provider"] for error in payload["errors"]], list(failing))
+                self.assertNotIn("partial", payload)
 
     def test_search_api_rejects_unknown_query_parameters(self):
         self.authenticate()

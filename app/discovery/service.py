@@ -53,6 +53,16 @@ _ERROR_TYPES = {
 }
 
 
+def project_watchlist_state(items: tuple[MediaCard, ...]) -> tuple[MediaCard, ...]:
+    """列表与搜索共用读取时的批量收藏投影，不污染来源卡片或缓存。"""
+    watched = database.list_media_watchlist_keys([
+        (item.provider, item.external_id, item.media_type) for item in items
+    ])
+    return tuple(replace(
+        item, state="watchlisted" if item.stable_id in watched else item.state,
+    ) for item in items)
+
+
 class DiscoveryService:
     def __init__(
         self,
@@ -381,8 +391,6 @@ class DiscoveryService:
         return self.cache_ttl_seconds
 
     def _decorate(self, page: DiscoveryPage, *, cached: bool, stale: bool) -> DiscoveryPage:
-        identities = [(item.provider, item.external_id, item.media_type) for item in page.items]
-        watched = database.list_media_watchlist_keys(identities)
         missing = [
             (item.provider, item.media_type, item.external_id)
             for item in page.items
@@ -390,7 +398,7 @@ class DiscoveryService:
         ]
         metadata = self.cache.get_detail_metadata(missing)
         items = []
-        for item in page.items:
+        for item in project_watchlist_state(page.items):
             detail = metadata.get((item.provider, item.media_type, item.external_id), {})
             year, release_date = item.year, item.release_date
             if not (year or "").strip() and self._valid_year(detail.get("year", "")):
@@ -399,7 +407,6 @@ class DiscoveryService:
                 release_date = detail["release_date"]
             items.append(replace(
                 item, year=year, release_date=release_date,
-                state="watchlisted" if item.stable_id in watched else item.state,
             ))
         return replace(page, items=tuple(items), cached=cached, stale=stale)
 

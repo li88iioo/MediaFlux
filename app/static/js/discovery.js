@@ -559,6 +559,19 @@
         return badge;
     }
 
+    function searchProviderHealth(payload) {
+        const errors = asArray(payload.errors);
+        const failedProviders = [...new Set(errors.map((error) => providerLabel(error.provider)))].join('、');
+        if (errors.length && !asArray(payload.providers_succeeded).length) {
+            throw new Error(`资料源暂不可用（${failedProviders}），请重试。`);
+        }
+        return {
+            provider: 'all',
+            status: errors.length ? 'degraded' : 'ready',
+            message: errors.length ? `部分来源未完成（${failedProviders}），结果可能不完整` : '',
+        };
+    }
+
     function updateProviderStatus(payload = {}) {
         const health = payload.provider_health || payload.health || payload.provider || {};
         const provider = typeof health === 'string' ? health : (health.provider || state.provider);
@@ -857,7 +870,8 @@
         const rows = asArray(items);
         if (!append) elements.grid.replaceChildren();
         if (!rows.length && !append) {
-            elements.grid.append(emptyPanel(state.mode === 'search' ? '没有找到匹配的影视资料。' : undefined));
+            elements.grid.append(emptyPanel(state.mode === 'search'
+                ? state.statusPayload?.health?.message || '没有找到匹配的影视资料。' : undefined));
         } else {
             const fragment = document.createDocumentFragment();
             const offset = append ? elements.grid.querySelectorAll('.discovery-card:not(.discovery-skeleton)').length : 0;
@@ -1201,6 +1215,7 @@
                     renderFilters(definitions);
                 }
                 const {payload, items} = itemResult;
+                state.statusPayload = state.mode === 'search' ? {health: searchProviderHealth(payload)} : payload;
                 state.hasMore = Boolean(payload.has_more ?? payload.hasMore);
                 state.appendError = null;
                 if (append) {
@@ -1211,13 +1226,11 @@
                     state.itemsData = mergeUniqueItems([], items).items;
                     renderGrid(state.itemsData, false);
                 }
+                updateProviderStatus(state.statusPayload);
                 if (state.mode === 'search') {
-                    state.statusPayload = {health: {provider: 'all', status: payload.partial ? 'warning' : 'ready'}};
-                    updateProviderStatus(state.statusPayload);
-                    announce(`已读取 ${state.itemsData.length} 条影视搜索记录。`);
+                    const warning = state.statusPayload.health.message;
+                    announce(`已读取 ${state.itemsData.length} 条影视搜索记录。${warning ? ` ${warning}。` : ''}`);
                 } else {
-                    state.statusPayload = payload;
-                    updateProviderStatus(payload);
                     announce(`已读取 ${state.itemsData.length} 条${providerLabel(state.provider)}${mediaLabel(state.mediaType)}记录。`);
                 }
                 saveCurrentViewSnapshot();

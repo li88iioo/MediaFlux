@@ -11,7 +11,7 @@ from app.discovery.calendar.models import SourceUnavailable
 from app.discovery.calendar.service import get_calendar_service
 from app.discovery.models import MediaCard, ProviderError
 from app.discovery.search import get_discovery_search_service
-from app.discovery.service import get_discovery_service
+from app.discovery.service import get_discovery_service, project_watchlist_state
 from app.routes.discovery_image import decode_poster_token, encode_poster_token
 from app.web import api_error, api_response, require_api_login
 
@@ -132,7 +132,7 @@ def search(
     payload = {
         "query": result.query,
         "page": result.page,
-        "items": [_card_payload(card) for card in result.items],
+        "items": [_card_payload(card) for card in project_watchlist_state(result.items)],
         "has_more": result.has_more,
         "providers_attempted": list(result.providers_attempted),
         "providers_succeeded": list(result.providers_succeeded),

@@ -5,6 +5,7 @@ import re
 import shutil
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 try:
     from playwright.sync_api import sync_playwright
@@ -1591,7 +1592,8 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(keyboard["rect"], initial["rect"])
 
 
-    def open_catalogue(self, *, width=1440, theme="light", cards=None, details=None, requests=None):
+    def open_catalogue(self, *, width=1440, theme="light", cards=None, details=None, requests=None,
+                       search_response=None, watchlist_requests=None):
         from jinja2 import Environment, FileSystemLoader
         templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
         html = templates.get_template("discovery.html").render(
@@ -1603,6 +1605,8 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         html = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", "", html)
         context = self.browser.new_context(viewport={"width": width, "height": 850}, reduced_motion="reduce")
         self.addCleanup(context.close)
+        if search_response is not None:
+            context.add_init_script("window.IntersectionObserver = undefined")
         page = context.new_page()
         errors = []
         page.on("pageerror", lambda error: errors.append(str(error)))
@@ -1616,7 +1620,13 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
             if path.startswith("/api/"):
                 if requests is not None:
                     requests.append(path)
-                if path.startswith("/api/discovery/detail/"):
+                if path.startswith("/api/discovery/search?") and search_response is not None:
+                    payload = search_response(parse_qs(urlsplit(path).query))
+                elif path.startswith("/api/discovery/watchlist"):
+                    if watchlist_requests is not None:
+                        watchlist_requests.append((route.request.method, path))
+                    payload = {"success": True}
+                elif path.startswith("/api/discovery/detail/"):
                     payload = details or {}
                 elif path.startswith("/api/discovery/items?"):
                     payload = {"items": cards, "has_more": False}
@@ -1640,6 +1650,152 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.locator(".discovery-card").first.wait_for()
         self.assertEqual(errors, [])
         return page, errors
+
+    @staticmethod
+    def search_payload(*, items=(), failed=(), has_more=False):
+        providers = ("tmdb", "douban", "bangumi")
+        return {
+            "items": list(items), "has_more": has_more,
+            "providers_attempted": list(providers),
+            "providers_succeeded": [name for name in providers if name not in failed],
+            "errors": [{"provider": name, "code": "unavailable", "message": "数据源暂不可用", "retry_after": 0}
+                       for name in failed],
+        }
+
+    @staticmethod
+    def submit_catalogue_search(page):
+        page.locator("#discovery-search-query").fill("状态测试")
+        page.locator("#discovery-search-form").evaluate("form => form.requestSubmit()")
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+
+    def test_search_saved_card_first_click_removes_watchlist(self):
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                "title": "已收藏电影", "state": "watchlisted"}
+        mutations = []
+        page, errors = self.open_catalogue(
+            search_response=lambda _params: self.search_payload(items=[card]),
+            watchlist_requests=mutations,
+        )
+        self.submit_catalogue_search(page)
+        button = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
+        self.assertEqual(button.get_attribute("aria-pressed"), "true")
+        button.click()
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已移出')")
+        self.assertEqual(mutations, [("DELETE", "/api/discovery/watchlist/tmdb/movie/550")])
+        self.assertEqual(button.get_attribute("aria-pressed"), "false")
+        self.assertEqual(errors, [])
+
+    def test_search_all_sources_failed_retries_first_page(self):
+        calls = []
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "恢复结果"}
+
+        def respond(params):
+            calls.append(int(params["page"][0]))
+            return self.search_payload(failed=("tmdb", "douban", "bangumi")) if len(calls) == 1 else self.search_payload(items=[card])
+
+        page, errors = self.open_catalogue(search_response=respond)
+        self.submit_catalogue_search(page)
+        self.assertEqual(page.locator(".discovery-state-error").count(), 1)
+        self.assertEqual(page.locator(".discovery-state-empty").count(), 0)
+        self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+        page.locator(".discovery-state-error button").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 1)
+        self.assertEqual(page.locator(".discovery-state-error").count(), 0)
+        self.assertEqual(calls, [1, 1])
+        self.assertEqual(errors, [])
+
+    def test_search_append_failure_keeps_cards_and_retries_same_page(self):
+        for width in (390, 1440):
+            with self.subTest(width=width):
+                calls = []
+                first = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "第一页"}
+                second = {**first, "external_id": "2", "title": "第二页"}
+
+                def respond(params):
+                    calls.append(int(params["page"][0]))
+                    if len(calls) == 1:
+                        return self.search_payload(items=[first], has_more=True)
+                    if len(calls) == 2:
+                        return self.search_payload(failed=("tmdb", "douban", "bangumi"))
+                    return self.search_payload(items=[first, second])
+
+                page, errors = self.open_catalogue(width=width, search_response=respond)
+                self.submit_catalogue_search(page)
+                page.locator("#discovery-grid .discovery-card").evaluate("card => window.originalSearchCard = card")
+                card_box = page.locator("#discovery-grid .discovery-card").bounding_box()
+                page.evaluate("""() => {
+                    window.searchSkeletonAdded = false;
+                    new MutationObserver(records => {
+                        window.searchSkeletonAdded ||= records.some(record => [...record.addedNodes].some(
+                            node => node.nodeType === 1 && (node.matches('.discovery-skeleton') || node.querySelector('.discovery-skeleton'))));
+                    }).observe(document.getElementById('discovery-grid'), {childList: true, subtree: true});
+                }""")
+                page.locator("#discovery-load-more").click()
+                page.wait_for_function("!document.getElementById('discovery-load-more').disabled")
+                self.assertTrue(page.locator("#discovery-load-more-row").is_visible())
+                self.assertIn("重试", page.locator("#discovery-load-more").inner_text())
+                self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+                self.assertTrue(page.evaluate("window.originalSearchCard === document.querySelector('#discovery-grid .discovery-card')"))
+                self.assertEqual(page.locator("#discovery-grid .discovery-card").bounding_box(), card_box)
+                self.assertFalse(page.evaluate("window.searchSkeletonAdded"))
+                page.locator("#discovery-load-more").click()
+                page.wait_for_function("!document.getElementById('discovery-load-more').disabled")
+                self.assertEqual(calls, [1, 2, 2])
+                self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 2)
+                self.assertTrue(page.evaluate("window.originalSearchCard === document.querySelector('#discovery-grid .discovery-card')"))
+                self.assertTrue(page.locator("#discovery-load-more-row").is_hidden())
+                self.assertEqual(errors, [])
+
+    def test_search_partial_results_are_marked_incomplete_including_empty_results(self):
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "部分结果"}
+        for items in ([card], []):
+            with self.subTest(items=len(items)):
+                page, errors = self.open_catalogue(
+                    search_response=lambda _params: self.search_payload(items=items, failed=("douban",)),
+                )
+                self.submit_catalogue_search(page)
+                status = page.locator("#discovery-provider-status")
+                self.assertNotEqual(status.get_attribute("data-tone"), "ready")
+                self.assertIn("豆瓣", status.get_attribute("aria-label"))
+                self.assertIn("不完整", page.locator("#discovery-live").inner_text())
+                self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), len(items))
+                self.assertEqual(page.locator(".discovery-state-error").count(), 0)
+                if not items:
+                    self.assertIn("不完整", page.locator(".discovery-state-empty").inner_text())
+                self.assertEqual(errors, [])
+
+    def test_search_successful_zero_results_remain_normal_empty_state(self):
+        page, errors = self.open_catalogue(search_response=lambda _params: self.search_payload())
+        self.submit_catalogue_search(page)
+        self.assertEqual(page.locator(".discovery-state-error").count(), 0)
+        self.assertEqual(page.locator(".discovery-state-empty").count(), 1)
+        self.assertIn("没有找到匹配的影视资料", page.locator(".discovery-state-empty").inner_text())
+        self.assertEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+        self.assertTrue(page.locator("#discovery-load-more-row").is_hidden())
+        self.assertEqual(errors, [])
+
+    def test_search_refresh_failure_preserves_existing_cards(self):
+        calls = []
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "保留结果"}
+
+        def respond(params):
+            calls.append(int(params["page"][0]))
+            return self.search_payload(failed=("tmdb", "douban", "bangumi")) if len(calls) == 2 else self.search_payload(items=[card])
+
+        page, errors = self.open_catalogue(search_response=respond)
+        self.submit_catalogue_search(page)
+        page.locator("#discovery-grid .discovery-card").evaluate("card => window.originalSearchCard = card")
+        page.locator("#discovery-refresh").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.assertTrue(page.evaluate("window.originalSearchCard === document.querySelector('#discovery-grid .discovery-card')"))
+        self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+        self.assertEqual(page.locator(".discovery-state-empty").count(), 0)
+        page.locator("#discovery-refresh").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.assertEqual(calls, [1, 1, 1])
+        self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 1)
+        self.assertEqual(errors, [])
 
     def test_detail_dates_fill_cards_and_saved_views_without_extra_requests(self):
         from playwright.sync_api import expect
