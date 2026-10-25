@@ -165,41 +165,67 @@ function loadOrganize(page=organizePage) {
       .finally(()=>{if(requestSerial===organizeRequestSerial)loadingOrg=false;});
 }
 
-function toggleOrganizeSelection(recordKey,checked){const row=organizeRows.find(item=>item.record_key===recordKey&&item.actions?.batch);if(!row)return;if(checked&&selectedOrganizeLogs.size>=50&&!selectedOrganizeLogs.has(recordKey)){_setOrganizeBatchState('批量纠正最多选择 50 条日志','error');return;}if(checked)selectedOrganizeLogs.set(recordKey,row);else selectedOrganizeLogs.delete(recordKey);updateOrganizeBatchState();}
+function toggleOrganizeSelection(recordKey,checked){const row=organizeRows.find(item=>item.record_key===recordKey&&item.actions?.batch);if(!row)return;if(checked&&selectedOrganizeLogs.size>=50&&!selectedOrganizeLogs.has(recordKey)){_setOrganizeBatchState('单次最多选择 50 条日志','error');return;}if(checked)selectedOrganizeLogs.set(recordKey,row);else selectedOrganizeLogs.delete(recordKey);updateOrganizeBatchState();}
 document.getElementById('organizePrev').addEventListener('click',()=>loadOrganize(organizePage-1));
 document.getElementById('organizeNext').addEventListener('click',()=>loadOrganize(organizePage+1));
-function updateOrganizeBatchState(){const count=selectedOrganizeLogs.size;const selectable=organizeRows.filter(row=>row.actions?.batch);document.getElementById('organizeBatchCount').textContent=`已选 ${count} 条光鸭记录`;['organizeBatchRenameBtn','organizeBatchRevertBtn','organizeBatchDeleteBtn'].forEach(id=>document.getElementById(id).disabled=count<2||count>50);document.querySelectorAll('.organize-row-select').forEach(input=>{input.disabled=!input.checked&&count>=50;});const all=selectable.length>0&&selectable.every(row=>selectedOrganizeLogs.has(row.record_key));document.getElementById('organizeSelectAll').checked=all;document.getElementById('organizeSelectAll').indeterminate=count>0&&!all;}
+function updateOrganizeBatchState(){
+    const count=selectedOrganizeLogs.size;
+    const selectable=organizeRows.filter(row=>row.actions?.batch);
+    document.getElementById('organizeBatchCount').textContent=`当前页已选 ${count} 条光鸭记录`;
+    ['organizeBatchRenameBtn','organizeBatchRevertBtn'].forEach(id=>document.getElementById(id).disabled=count<2||count>50);
+    document.getElementById('organizeBatchDeleteBtn').disabled=organizeBatchDeletePending||count<1||count>50;
+    document.querySelectorAll('.organize-row-select').forEach(input=>{input.disabled=!input.checked&&count>=50;});
+    const all=selectable.length>0&&selectable.every(row=>selectedOrganizeLogs.has(row.record_key));
+    document.getElementById('organizeSelectAll').checked=all;
+    document.getElementById('organizeSelectAll').indeterminate=count>0&&!all;
+}
 function _setOrganizeBatchState(message,type=''){const el=document.getElementById('organizeBatchState');el.textContent=message||'';el.className='inline-save-state'+(type?' is-'+type:'');}
 document.getElementById('organizeSelectAll').addEventListener('change',event=>{const checked=event.currentTarget.checked;let remaining=Math.max(0,50-selectedOrganizeLogs.size);document.querySelectorAll('.organize-row-select').forEach(input=>{if(checked&&!input.checked&&remaining<=0)return;input.checked=checked;if(checked&&!selectedOrganizeLogs.has(input.dataset.key))remaining--;toggleOrganizeSelection(input.dataset.key,checked);});});
-let organizeBatchTaskSerial=0;
+let organizeBatchTaskSerial=0,organizeBatchDeletePending=false;
 async function runOrganizeBatch(action){
     if(action==='reorganize'){await openBatchCorrection();return;}
+    const deleting=action==='delete';
+    if(deleting&&organizeBatchDeletePending)return;
     const rows=[...selectedOrganizeLogs.values()];
-    if(rows.length<2||rows.length>50)return;
+    if(rows.length<(deleting?1:2)||rows.length>50)return;
     const movieRows=rows.filter(row=>row.media_type!=='tv');
-    if(movieRows.length){_setOrganizeBatchState(`批量操作仅支持剧集，已混入 ${movieRows.length} 条电影或未知类型日志`,'error');return;}
-    const labels={revert:'批量回退最近操作',delete:'将所选剧集媒体组移入光鸭回收站'};
-    let confirmText='';
-    const confirmed=await appConfirm({title:action==='delete'?'批量移入光鸭回收站':'确认剧集批量操作',message:`${labels[action]}，共 ${rows.length} 条日志。${action==='delete'?'这会将日志明确记录的媒体文件移入光鸭回收站。MediaFlux 不提供恢复按钮。':''}`,confirmText:action==='delete'?'移入回收站':'开始执行',danger:action==='delete',verifyText:action==='delete'?'DELETE':'',verifyLabel:'输入 DELETE 确认批量移入回收站'});
-    if(!confirmed)return;
-    if(action==='delete')confirmText='DELETE';
-    const serial=++organizeBatchTaskSerial;
-    const entries=rows.map(row=>({log_id:row.id,expected_version:row.version,operation_token:_operationToken()}));
-    _setOrganizeBatchState('批量操作已提交，正在执行...');
+    if(action==='revert'&&movieRows.length){_setOrganizeBatchState(`批量操作仅支持剧集，已混入 ${movieRows.length} 条电影或未知类型日志`,'error');return;}
+    const labels={revert:'批量回退最近操作',delete:'将所选媒体组及移空的直接父目录移入光鸭回收站'};
+    let serial;
+    if(deleting){organizeBatchDeletePending=true;updateOrganizeBatchState();}
     try{
-        const response=await api('/api/logs/organize/batch',{method:'POST',body:JSON.stringify({action,entries,confirm:confirmText})});
+        const confirmed=await appConfirm({title:deleting?'批量移入光鸭回收站':'确认剧集批量操作',message:`${labels[action]}，共 ${rows.length} 条日志。${deleting?'全部媒体文件回收后，仅清理因此移空的直接父目录，不向上清理；其他内容、非空目录、来源根和归档根会保留。可在光鸭回收站恢复。':''}`,confirmText:deleting?'移入回收站':'开始执行',danger:deleting,verifyText:deleting?'DELETE':'',verifyLabel:'输入 DELETE 确认批量移入回收站'});
+        if(!confirmed)return;
+        serial=++organizeBatchTaskSerial;
+        const entries=rows.map(row=>({log_id:row.id,expected_version:row.version,operation_token:_operationToken()}));
+        _setOrganizeBatchState('批量操作已提交，正在执行...');
+        const response=await api('/api/logs/organize/batch',{method:'POST',body:JSON.stringify({action,entries,confirm:deleting?'DELETE':''})});
         const data=await response.json();
         if(!response.ok)throw new Error(data.error||'批量操作提交失败');
-        const task=await waitOrganizeTask(data.task_id,null);
+        const task=await waitOrganizeTask(data.task_id,null,null,deleting);
         if(serial!==organizeBatchTaskSerial)return;
+        const completed=Array.isArray(task.result?.completed)?task.result.completed:[];
         const failed=Array.isArray(task.result?.failed)?task.result.failed:[];
         const warnings=Array.isArray(task.result?.warnings)?task.result.warnings:[];
         const warningText=warnings.length?`；${warnings.join('；')}`:'';
+        const details=failed.map(item=>`${item.log_id!==undefined?`#${item.log_id} `:''}${item.error||item.message||'执行失败'}`).join('；');
+        if(deleting){
+            const outcomes=batchOutcomeMap({completed,failed});
+            const successful=rows.filter(row=>outcomes.get(String(row.id))?.status==='success').length;
+            const missing=rows.filter(row=>!outcomes.has(String(row.id))).length;
+            const files=task.result?.deleted;
+            const directories=task.result?.empty_dirs_cleaned;
+            const hasCounts=Number.isInteger(files)&&files>=0&&Number.isInteger(directories)&&directories>=0;
+            const receipt=hasCounts?`回收 ${files} 个文件、${directories} 个空目录`:'回收数量未返回，请核对日志';
+            const failure=organizeTaskFailure(task,true);
+            _setOrganizeBatchState(`批次完成，${successful} 条成功${failed.length?`，${failed.length} 条失败：${details}`:''}；${receipt}${missing?`；${missing} 条缺少执行结果，请刷新日志核实`:''}${failure?`；${failure}`:''}${warningText}`,failed.length||missing||failure||warnings.length||!hasCounts?'error':'success');
+            return;
+        }
         if(failed.length){
-            const details=failed.map(item=>`${item.log_id!==undefined?`#${item.log_id} `:''}${item.error||item.message||'执行失败'}`).join('；');
             _setOrganizeBatchState(`批次完成，${failed.length} 条失败：${details}${warningText}`,'error');
         }else _setOrganizeBatchState(`批次完成，共处理 ${rows.length} 条${warningText}`,warnings.length?'error':'success');
-    }catch(error){if(serial===organizeBatchTaskSerial)_setOrganizeBatchState(error.message,'error');}
+    }catch(error){if(serial===undefined||serial===organizeBatchTaskSerial)_setOrganizeBatchState(error.message,'error');}
+    finally{if(deleting){organizeBatchDeletePending=false;updateOrganizeBatchState();}}
 }
 
 function invalidateBatchCorrection(){
@@ -926,7 +952,7 @@ function organizeTaskFailure(task,batch=false){
     const fallback={stopped:'后台操作已停止',cancelled:'后台操作已取消',manual_review:'后台操作需要人工复核'};
     return task.error||result.error||failed[0]?.error||task.message||fallback[task.status]||'后台操作未完整完成，请核对日志';
 }
-async function waitOrganizeTask(taskId,logId,contextSerial=null){
+async function waitOrganizeTask(taskId,logId,contextSerial=null,deleting=false){
     if(!taskId)throw new Error('操作接口未返回 task_id');
     const batch=!logId;
     const terminalStatuses=new Set(['completed','partial','failed','stopped','cancelled','manual_review']);
@@ -943,7 +969,7 @@ async function waitOrganizeTask(taskId,logId,contextSerial=null){
             if(terminalStatuses.has(status)){
                 loadOverview();loadOrganize();
                 const failure=organizeTaskFailure(task,batch);
-                if(failure)throw new Error(failure);
+                if(failure&&!(batch&&deleting))throw new Error(failure);
                 if(batch)return task;
                 if(logId&&isCurrent()){
                     const reopenRequest=openOrganizeDetail(logId);
@@ -951,7 +977,9 @@ async function waitOrganizeTask(taskId,logId,contextSerial=null){
                     await reopenRequest;
                     if(reopenedSerial===organizeDetailSerial){
                         const warnings=Array.isArray(task.result?.warnings)?task.result.warnings:[];
-                        _setOrganizeState(warnings.length?`云端操作已完成；${warnings.join('；')}`:'云端操作已完成','success');
+                        const countsKnown=Number.isInteger(task.result?.deleted)&&task.result.deleted>=0&&Number.isInteger(task.result?.empty_dirs_cleaned)&&task.result.empty_dirs_cleaned>=0;
+                        const message=deleting?(countsKnown?`回收 ${task.result.deleted} 个文件、${task.result.empty_dirs_cleaned} 个空目录`:'回收数量未返回，请核对日志'):'云端操作已完成';
+                        _setOrganizeState(`${message}${warnings.length?`；${warnings.join('；')}`:''}`,deleting&&(warnings.length||!countsKnown)?'error':'success');
                     }
                 }
                 return task;
@@ -975,7 +1003,7 @@ async function runOrganizeAction(path,method='POST',extra={}){
         if(contextSerial!==organizeDetailSerial)return;
         if(!response.ok)throw new Error(data.error||'操作提交失败');
         _setOrganizeState(data.message||'操作已启动');
-        await waitOrganizeTask(data.task_id,logId,contextSerial);
+        await waitOrganizeTask(data.task_id,logId,contextSerial,method==='DELETE');
     }catch(error){
         if(contextSerial===organizeDetailSerial)_setOrganizeState(error.message,'error');
     }
@@ -1029,7 +1057,7 @@ async function runOrganizeReorganize(){
 
 async function returnOrganizeToSource(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'送回源目录',message:'将视频和全部伴随文件送回各自保存的原始父目录，并恢复原文件名。',confirmText:'送回源目录',danger:true});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('/return-to-source');}
 async function revertOrganize(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'回退最近操作',message:'按最近一次成功操作的持久化步骤回退，不会从路径猜测文件名。',confirmText:'执行回退',danger:true});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('/revert');}
-async function deleteOrganizeGroup(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'移入光鸭回收站',message:'会将该日志明确记录的整个媒体组移入光鸭回收站。MediaFlux 不提供恢复按钮。',confirmText:'移入回收站',danger:true,verifyText:'DELETE',verifyLabel:'输入 DELETE 确认移入回收站'});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('','DELETE',{confirm:'DELETE'});}
+async function deleteOrganizeGroup(){const serial=organizeDetailSerial;const confirmed=await appConfirm({title:'移入光鸭回收站',message:'会将该日志明确记录的整个媒体组及因此移空的直接父目录移入光鸭回收站，不向上清理；其他内容、非空目录、来源根和归档根会保留。可在光鸭回收站恢复。',confirmText:'移入回收站',danger:true,verifyText:'DELETE',verifyLabel:'输入 DELETE 确认移入回收站'});if(confirmed&&serial===organizeDetailSerial)await runOrganizeAction('','DELETE',{confirm:'DELETE'});}
 document.getElementById('organizeTmdbSearchBtn').addEventListener('click',searchOrganizeTmdb);
 document.getElementById('organizeTmdbQuery').addEventListener('keydown',event=>{if(event.key==='Enter')searchOrganizeTmdb();});
 document.getElementById('organizeTmdbQuery').addEventListener('input',invalidateBatchSearchInputs);

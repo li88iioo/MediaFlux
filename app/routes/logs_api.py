@@ -526,11 +526,11 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
         else:
             service.validate_batch([entry["log_id"] for entry in entries], action)
         if not service.client.logged_in:
-            return api_error("光鸭未登录，无法执行剧集批量操作", 503)
+            return api_error("光鸭未登录，无法执行批量操作", 503)
         labels = {
             "reorganize": "批量纠正识别",
             "revert": "剧集批量回退",
-            "delete": "剧集批量移入光鸭回收站",
+            "delete": "批量移入光鸭回收站",
         }
         result = get_organize_manager().start_operation(
             labels[action], f"{len(entries)} 条整理日志",
@@ -550,7 +550,7 @@ def run_organize_batch(request: Request, data: dict | None = Body(default=None))
     except ValueError as exc:
         return api_error(str(exc), 400)
     except Exception as exc:
-        logger.error("剧集批量操作提交失败 type=%s", type(exc).__name__)
+        logger.error("批量操作提交失败 type=%s", type(exc).__name__)
         return api_error(str(exc), 409)
     finally:
         if service is not None and not transferred:

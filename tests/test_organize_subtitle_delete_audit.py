@@ -12,6 +12,9 @@ from pathlib import Path
 import unittest
 import unittest.mock
 from unittest.mock import patch
+from fastapi import FastAPI, Request
+from fastapi.testclient import TestClient
+from starlette.middleware.sessions import SessionMiddleware
 
 from app import database as db
 from app.modules import strm
@@ -236,7 +239,7 @@ class ManualRecycleBinDeleteTests(IsolatedDatabaseTestCase):
             result = service.delete_group(log_id, "manual-token", version, "DELETE")
 
         post_action.assert_not_called()
-        self.assertEqual(result["warnings"], [])
+        self.assertIn("无法核验父目录 target", "；".join(result["warnings"]))
         self.assertEqual(result["deleted"], 2)
         self.assertEqual({row["status"] for row in db.list_organize_delete_audits(log_id)}, {"success"})
         self.assertEqual(len(service.detail(log_id)["delete_audits"]), 2)
@@ -373,6 +376,212 @@ class ManualRecycleBinDeleteTests(IsolatedDatabaseTestCase):
         self.assertEqual(get_organize_log_result_3["status"], "success")
 
 
+class SkippedLogBatchRecycleTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        from app.modules import organize_tasks
+        from tests.support import isolated_test_database
+
+        self.enterContext(isolated_test_database())
+        self.rules = OrganizeRules(target_dir_id="archive", link_strm=False, clean_empty=False)
+        self.enterContext(patch.object(OrganizeRules, "from_config", return_value=self.rules))
+        original_get = organize_tasks.config.get
+        self.enterContext(patch.object(organize_tasks.config, "get", side_effect=lambda key, default="":
+            '[{"id":"incoming","name":"待整理"}]' if key == "GY_ORGANIZE_SOURCE_DIRS" else original_get(key, default)))
+        self.remote = {
+            key: GuangYaFile(key, key, True, 0, "directory-v1", parent, updated_at=1)
+            for key, parent in (("incoming", "0"), ("archive", "0"), ("media", "incoming"))
+        }
+        self.client = unittest.mock.Mock(spec=GuangYaClient)
+        self.client.logged_in = True
+        self.client.supports_guarded_empty_directory_delete = True
+        self.client.file_info.side_effect = self.remote.get
+        self.client.list_dir.side_effect = lambda parent: [f for f in self.remote.values() if f.parent_id == parent]
+        self.deleted: list[str] = []
+
+        def delete(ids):
+            for file_id in ids:
+                item = self.remote[file_id]
+                if item.is_dir and self.client.list_dir(file_id):
+                    raise RuntimeError("目录非空，不递归删除")
+                self.deleted.append(file_id)
+                del self.remote[file_id]
+            return True
+
+        def delete_empty(file_id, *, expected_etag, expected_updated_at):
+            item = self.remote[file_id]
+            self.assertTrue(item.is_dir)
+            self.assertEqual((item.etag, item.updated_at), (expected_etag, expected_updated_at))
+            return delete([file_id])
+
+        self.client.delete.side_effect = delete
+        self.client.delete_empty_directory.side_effect = delete_empty
+        self.service = OrganizeCorrectionService(client=self.client, scraper=cast(TMDBScraper, object()))
+        self.addCleanup(self.service.close)
+
+    def seed(self, file_id="video", *, parent="media", media_type="", subtitle=False):
+        filename = file_id + ".mp4"
+        file = GuangYaFile(file_id, filename, False, 100, "etag-" + file_id, parent)
+        self.remote[file_id] = file
+        members = [file]
+        if subtitle:
+            sub = GuangYaFile(file_id + "-sub", file_id + ".srt", False, 2, "etag-sub", parent)
+            self.remote[sub.file_id] = sub
+            members.append(sub)
+        log_id = db.add_organize_log(
+            "guangya", parent, filename, file_id, "skipped", "", media_type=media_type,
+            source_dir_id="incoming", original_parent_id=parent, current_parent_id=parent,
+            original_name=filename, current_name=filename, legacy_incomplete=False,
+        )
+        db.add_organize_log_items(log_id, [{
+            "file_id": item.file_id, "role": "video" if item is file else "subtitle",
+            "original_parent_id": parent, "current_parent_id": parent,
+            "original_name": item.name, "current_name": item.name, "size": item.size, "etag": item.etag,
+        } for item in members])
+        return log_id
+
+    def entries(self, ids):
+        return [{"log_id": log_id, "operation_token": "recycle-" + str(log_id),
+                 "expected_version": self.service.detail(log_id)["version"]} for log_id in ids]
+
+    def test_single_selected_unknown_log_recycles_files_and_empty_parent(self):
+        log_id = self.seed(subtitle=True)
+        result = self.service.run_batch("delete", self.entries([log_id]), "DELETE")
+        self.assertTrue(result["success"])
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (2, 1))
+        self.assertEqual(self.deleted, ["video-sub", "video", "media"])
+        self.assertIn("incoming", self.remote)
+        self.assertFalse(result["warnings"])
+        self.assertEqual(len(db.list_organize_delete_audits(log_id)), 3)
+
+    def test_shared_parent_is_cleaned_once_after_all_selected_movies(self):
+        ids = [self.seed("a", media_type="movie"), self.seed("b", media_type="")]
+        result = self.service.run_batch("delete", self.entries(ids), "DELETE")
+        self.assertTrue(result["success"])
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (2, 1))
+        self.assertEqual(self.deleted, ["a", "b", "media"])
+        self.assertFalse(result["warnings"])
+
+    def test_repeated_log_for_same_file_only_sends_one_cloud_delete(self):
+        ids = [self.seed(), self.seed()]
+        result = self.service.run_batch("delete", self.entries(ids), "DELETE")
+        self.assertTrue(result["success"])
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (1, 1))
+        self.assertEqual(self.deleted, ["video", "media"])
+        self.assertTrue(all(self.service.detail(log_id)["status"] == "deleted" for log_id in ids))
+
+    def test_single_detail_delete_reuses_empty_parent_cleanup(self):
+        log_id = self.seed(media_type="movie")
+        result = self.service.delete_group(log_id, "single", self.service.detail(log_id)["version"], "DELETE")
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (1, 1))
+
+    def test_nonempty_parent_and_unselected_media_are_preserved(self):
+        selected = self.seed("selected")
+        self.seed("unselected")
+        result = self.service.run_batch("delete", self.entries([selected]), "DELETE")
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (1, 0))
+        self.assertEqual(self.deleted, ["selected"])
+        self.assertIn("media", self.remote)
+        self.assertIn("unselected", self.remote)
+        self.assertTrue(result["warnings"])
+
+    def test_permanent_source_and_archive_roots_are_never_deleted(self):
+        ids = [self.seed("a", parent="incoming"), self.seed("b", parent="archive")]
+        result = self.service.run_batch("delete", self.entries(ids), "DELETE")
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (2, 0))
+        self.client.delete_empty_directory.assert_not_called()
+        self.assertFalse(result["warnings"])
+
+    def test_changed_parent_identity_is_not_deleted(self):
+        log_id = self.seed()
+        original_delete = self.client.delete.side_effect
+
+        def move_parent(ids):
+            result = original_delete(ids)
+            self.remote["media"].parent_id = "elsewhere"
+            return result
+
+        self.client.delete.side_effect = move_parent
+        result = self.service.run_batch("delete", self.entries([log_id]), "DELETE")
+        self.assertEqual(result["empty_dirs_cleaned"], 0)
+        self.assertIn("media", self.remote)
+        self.assertTrue(result["warnings"])
+        self.client.delete_empty_directory.assert_not_called()
+
+    def test_partial_failure_reports_actual_deleted_files_without_parent_cleanup(self):
+        log_id = self.seed(subtitle=True)
+        original_delete = self.client.delete.side_effect
+
+        def fail_video(ids):
+            if ids == ["video"]:
+                raise RuntimeError("provider rejected video")
+            return original_delete(ids)
+
+        self.client.delete.side_effect = fail_video
+        result = self.service.run_batch("delete", self.entries([log_id]), "DELETE")
+        self.assertFalse(result["success"])
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (1, 0))
+        self.assertEqual(self.service.detail(log_id)["status"], "partial_failed")
+        self.assertIn("media", self.remote)
+
+    def test_parent_receiving_new_content_during_cleanup_is_preserved(self):
+        log_id = self.seed()
+        original_delete_empty = self.client.delete_empty_directory.side_effect
+
+        def add_new_file(file_id, **kwargs):
+            self.remote["new"] = GuangYaFile("new", "new.mp4", False, 100, "new-etag", file_id)
+            return original_delete_empty(file_id, **kwargs)
+
+        self.client.delete_empty_directory.side_effect = add_new_file
+        result = self.service.run_batch("delete", self.entries([log_id]), "DELETE")
+        self.assertEqual((result["deleted"], result["empty_dirs_cleaned"]), (1, 0))
+        self.assertIn("media", self.remote)
+        self.assertIn("new", self.remote)
+        self.assertTrue(result["warnings"])
+
+    def test_batch_version_conflict_stops_all_provider_writes(self):
+        log_id = self.seed()
+        entries = self.entries([log_id])
+        entries[0]["expected_version"] += 1
+        result = self.service.run_batch("delete", entries, "DELETE")
+        self.assertFalse(result["success"])
+        self.assertEqual(self.deleted, [])
+        self.assertIn("media", self.remote)
+
+    def test_http_batch_accepts_one_skipped_movie_after_auth_and_confirmation(self):
+        from app.routes import logs_api
+
+        log_id = self.seed(media_type="movie")
+        body = {"action": "delete", "entries": self.entries([log_id]), "confirm": "DELETE"}
+        application = FastAPI()
+        application.add_middleware(SessionMiddleware, secret_key="isolated-log-delete-test")
+        application.include_router(logs_api.router)
+
+        @application.post("/__test/login")
+        def login(request: Request):
+            request.session["logged_in"] = True
+            return {"ok": True}
+
+        manager = unittest.mock.Mock()
+        receipts = []
+
+        def start_operation(_label, _description, callback):
+            receipts.append(callback())
+            return {"ok": True, "task_id": "isolated-delete-task"}
+
+        manager.start_operation.side_effect = start_operation
+        with patch.object(logs_api, "OrganizeCorrectionService", return_value=self.service), \
+                patch.object(logs_api, "get_organize_manager", return_value=manager), TestClient(application) as client:
+            self.assertIn(client.post("/api/logs/organize/batch", json=body).status_code, (401, 403))
+            client.post("/__test/login")
+            self.assertEqual(client.post("/api/logs/organize/batch", json={**body, "confirm": ""}).status_code, 400)
+            manager.start_operation.assert_not_called()
+            response = client.post("/api/logs/organize/batch", json=body)
+            self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((receipts[0]["deleted"], receipts[0]["empty_dirs_cleaned"]), (1, 1))
+        self.assertEqual(self.deleted, ["video", "media"])
+
+
 class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
     def setUp(self):
         super().setUp()
@@ -380,6 +589,9 @@ class LogDeleteSTRMClosureTests(IsolatedDatabaseTestCase):
         from tests.support import isolated_test_database
 
         self.enterContext(isolated_test_database())
+        # 本组文件直接放在永久来源根，只测试定向 STRM 收尾，不删除来源根。
+        self.enterContext(patch("app.modules.organize_tasks._protected_organize_root_ids",
+                                return_value=({"0", "source"}, "")))
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         original_get = strm.get
         self.enterContext(patch.object(strm, "get", side_effect=lambda key, default="":

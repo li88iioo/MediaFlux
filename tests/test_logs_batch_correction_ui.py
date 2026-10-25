@@ -10,7 +10,7 @@ try:
     from jinja2 import ChoiceLoader, DictLoader, Environment, FileSystemLoader
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover - optional browser dependency
-    Environment = None
+    ChoiceLoader = DictLoader = Environment = FileSystemLoader = None
     sync_playwright = None
 
 
@@ -89,6 +89,7 @@ window.__pendingPreviews=[];
 window.__pendingSinglePreviews=[];
 window.__pendingDetails=[];
 window.__pendingTaskStatuses=[];
+window.__pendingTimelines=[];
 window.__testConfig=window.__testConfig||{};
 const jsonResponse=(body,status=200)=>({ok:status>=200&&status<300,status,json:async()=>body});
 const detailFor=id=>{
@@ -137,15 +138,22 @@ window.fetch=async(input,options={})=>{
   let body={};
   try{body=options.body?JSON.parse(options.body):{};}catch{}
   const taskId=url.searchParams.get('task_id');
-  window.__apiCalls.push({path:url.pathname,method,body,taskId});
+  window.__apiCalls.push({path:url.pathname,method,body,taskId,page:url.searchParams.get('page')});
   const config=window.__testConfig;
   if(url.pathname==='/api/logs/overview')return jsonResponse({timeline:{success:0,failed:0,skipped:0,reverted:0}});
-  if(url.pathname==='/api/logs/organize/timeline')return jsonResponse({items:config.rows||[],page:1,pages:1,total:(config.rows||[]).length});
+  if(url.pathname==='/api/logs/organize/timeline'){
+    const page=Number(url.searchParams.get('page'))||1;
+    const items=config.rowsByPage?.[page]||config.rows||[];
+    const response=jsonResponse({items,page,pages:config.rowsByPage?Object.keys(config.rowsByPage).length:1,total:config.rowsByPage?Object.values(config.rowsByPage).flat().length:items.length});
+    if(config.holdTimeline)return new Promise(resolve=>window.__pendingTimelines.push(()=>resolve(response)));
+    return response;
+  }
   const detail=url.pathname.match(/^\/api\/logs\/organize\/(\d+)$/);
   if(detail&&method==='GET'){
     if((config.holdDetailIds||[]).includes(detail[1]))return new Promise(resolve=>window.__pendingDetails.push(()=>resolve(jsonResponse(detailFor(detail[1])))));
     return jsonResponse(detailFor(detail[1]));
   }
+  if(detail&&method==='DELETE')return jsonResponse({task_id:'single-task'});
   if(url.pathname.endsWith('/recognition/search')&&method==='POST'){
     const candidates=config.nsfw
       ? (config.nsfwCandidates||[{external_id:'ABC-123',provider:'metatube',media_type:'movie',title:'成人候选',year:2024,score:0.9}])
@@ -202,6 +210,7 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         cls.playwright.stop()
 
     def setUp(self):
+        assert ChoiceLoader is not None and DictLoader is not None and FileSystemLoader is not None
         loader = ChoiceLoader([
             DictLoader({"base.html": BASE_TEMPLATE}),
             FileSystemLoader(str(ROOT / "app/templates")),
@@ -228,19 +237,40 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         self.page.goto("http://mediaflux.test/logs", wait_until="domcontentloaded")
         self.page.wait_for_function("() => window.__apiCalls?.some(call => call.path === '/api/logs/organize/timeline')")
 
-    def enable_batch_delete_fixture(self, task_status='completed', task_result=None):
-        rows = [
-            {**ROWS[0], "media_type": "tv"},
-            {**ROWS[1], "media_type": "tv"},
-        ]
+    def enable_batch_delete_fixture(self, task_status='completed', task_result=None, *, rows=None):
+        if rows is None:
+            rows = [{**row, "status": "skipped", "error": "未识别，跳过整理"} for row in ROWS]
         self.page.evaluate("""([rows, taskStatus, taskResult]) => Object.assign(window.__testConfig, {
             rows, taskStatus, taskResult,
-        })""", [rows, task_status, task_result or {
-            "success": True, "action": "delete", "requested": 2,
-            "completed": [], "failed": [], "warnings": [],
+        })""", [rows, task_status, task_result if task_result is not None else {
+            "success": True, "action": "delete", "requested": len(rows),
+            "completed": [{"log_id": row["id"], "result": {"deleted": 2}} for row in rows],
+            "deleted": len(rows) * 2, "empty_dirs_cleaned": 1, "failed": [], "warnings": [],
         }])
-        self.page.evaluate("() => loadOrganize()")
-        self.page.wait_for_function("() => document.querySelectorAll('.organize-row-select').length === 2")
+        self.page.evaluate("() => loadOrganize(1)")
+
+    def use_real_confirmation(self):
+        # 使用项目真实弹窗和事件处理；接口仍隔离，测试不访问网盘。
+        self.page.evaluate("""markup => {
+            const base=new DOMParser().parseFromString(markup,'text/html');
+            document.body.appendChild(base.getElementById('appConfirmModal'));
+        }""", (ROOT / "app/templates/base.html").read_text(encoding="utf-8"))
+        self.page.add_script_tag(path=str(ROOT / "app/static/js/app.js"))
+        self.page.evaluate("""() => {
+            const confirm=window.appConfirm;
+            window.appConfirm=options=>{window.__confirmCalls.push(options);return confirm(options);};
+        }""")
+
+    def confirm_batch_delete(self):
+        self.page.locator('#organizeBatchDeleteBtn').click()
+        self.page.locator('#appConfirmModal').wait_for(state='visible')
+        self.assertTrue(self.page.locator('#appConfirmSubmit').is_disabled())
+        self.page.locator('#appConfirmVerifyInput').fill('delete')
+        self.assertTrue(self.page.locator('#appConfirmSubmit').is_disabled())
+        self.page.locator('#appConfirmVerifyInput').fill('DELETE')
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.includes('批次完成')")
+        return self.page.locator('#organizeBatchState')
 
     def run_batch_delete(self):
         self.page.locator('.organize-row-select').nth(0).check()
@@ -621,14 +651,148 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         # 唯一 POST 是明确无副作用的整批预览，没有云盘写入/执行请求。
         self.assertEqual([call["path"] for call in calls if call["method"] == "POST"], ["/api/logs/organize/batch/preview"])
 
+    def test_skipped_movie_unknown_and_nsfw_can_be_recycled_individually(self):
+        self.use_real_confirmation()
+        for index, media_type, provider in ((0, 'unknown', 'tmdb'), (1, 'movie', 'tmdb'), (1, 'movie', 'metatube')):
+            with self.subTest(media_type=media_type, provider=provider):
+                row = {**ROWS[index], 'status': 'skipped', 'media_type': media_type, 'provider': provider}
+                self.enable_batch_delete_fixture(rows=[row])
+                self.page.locator('.organize-row-select').check()
+                self.assertTrue(self.page.locator('#organizeBatchDeleteBtn').is_enabled())
+                self.assertTrue(self.page.locator('#organizeBatchRenameBtn').is_disabled())
+                self.assertTrue(self.page.locator('#organizeBatchRevertBtn').is_disabled())
+                before = len(self.execute_calls())
+                state = self.confirm_batch_delete()
+                self.assertIn('1 条成功；回收 2 个文件、1 个空目录', state.inner_text())
+                self.assertIn('is-success', state.get_attribute('class') or '')
+                self.assertEqual(len(self.execute_calls()), before + 1)
+                payload = self.execute_calls()[-1]['body']
+                self.assertEqual((payload['action'], payload['confirm']), ('delete', 'DELETE'))
+                self.assertEqual([(item['log_id'], item['expected_version']) for item in payload['entries']], [(row['id'], row['version'])])
+                self.assertTrue(payload['entries'][0]['operation_token'])
+        self.assertEqual(len(self.page.evaluate('window.__confirmCalls')), 3)
+        self.assertEqual(self.batch_previews(), [])
+
+    def test_batch_delete_select_all_uses_only_current_page_cloud_rows_and_top_level_totals(self):
+        self.page.set_viewport_size({'width': 390, 'height': 844})
+        self.use_real_confirmation()
+        self.enable_batch_delete_fixture(task_result={
+            'success': True, 'action': 'delete', 'requested': 2, 'deleted': 6, 'empty_dirs_cleaned': 1,
+            'completed': [{'log_id': row['id'], 'result': {'deleted': 2, 'empty_dirs_cleaned': 99}} for row in ROWS],
+            'failed': [], 'warnings': [],
+        })
+        rows = self.page.evaluate('window.__testConfig.rows')
+        local = {**ROWS[0], 'id': 99, 'record_key': 'local:99', 'origin': 'local', 'origin_label': '本地整理', 'actions': {'batch': False, 'detail': False}}
+        other = {**rows[0], 'id': 12, 'record_key': 'guangya:12'}
+        self.page.evaluate('pages => window.__testConfig.rowsByPage=pages', {'1': [*rows, local], '2': [other]})
+        self.page.evaluate('() => loadOrganize(1)')
+        self.page.locator('#organizeSelectAll').check()
+        self.assertEqual(self.page.locator('.organize-row-select:checked').count(), 2)
+        self.assertIn('已选 2 条', self.page.locator('#organizeBatchCount').inner_text())
+        state = self.confirm_batch_delete()
+        self.assertIn('2 条成功；回收 6 个文件、1 个空目录', state.inner_text())
+        self.assertNotIn('99 个空目录', state.inner_text())
+        self.assertEqual([entry['log_id'] for entry in self.execute_calls()[0]['body']['entries']], [10, 11])
+        confirmation = self.page.evaluate('window.__confirmCalls[0]')
+        self.assertEqual(confirmation['verifyText'], 'DELETE')
+        for scope in ('直接父目录', '不向上清理', '其他内容', '来源根', '归档根'):
+            self.assertIn(scope, confirmation['message'])
+        self.assertEqual(len(self.page.evaluate('window.__confirmCalls')), 1)
+        self.assertFalse(any(call['page'] == '2' for call in self.calls()))
+        self.page.locator('#organizeNext').click()
+        self.page.wait_for_function("() => document.getElementById('organizePageInfo').textContent.includes('第 2 / 2 页')")
+        self.assertIn('已选 0 条', self.page.locator('#organizeBatchCount').inner_text())
+        self.page.locator('#organizeSelectAll').check()
+        self.assertEqual(self.page.locator('.organize-row-select:checked').count(), 1)
+        self.assertEqual(self.page.locator('.organize-row-select').get_attribute('data-key'), 'guangya:12')
+        self.assertIn('回收 6 个文件、1 个空目录', state.inner_text())
+
+    def test_batch_delete_missing_totals_are_not_reported_as_zero_deleted(self):
+        self.enable_batch_delete_fixture(task_result={
+            'success': True, 'action': 'delete', 'requested': 2,
+            'completed': [{'log_id': row['id'], 'result': {}} for row in ROWS],
+            'failed': [], 'warnings': [],
+        })
+        state = self.run_batch_delete()
+        self.assertIn('回收数量未返回，请核对日志', state.inner_text())
+        self.assertNotIn('回收 0 个文件', state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+
+    def test_batch_delete_cancel_confirmation_makes_no_write_and_preserves_selection(self):
+        self.enable_batch_delete_fixture()
+        self.use_real_confirmation()
+        for select_all, cancel in ((False, 'button'), (True, 'escape')):
+            with self.subTest(select_all=select_all, cancel=cancel):
+                if select_all:
+                    self.page.locator('#organizeSelectAll').check()
+                else:
+                    self.page.locator('.organize-row-select').first.check()
+                self.page.locator('#organizeBatchDeleteBtn').click()
+                self.page.locator('#appConfirmModal').wait_for(state='visible')
+                self.assertEqual([call for call in self.calls() if call['method'] != 'GET'], [])
+                self.page.locator('#appConfirmVerifyInput').fill('DELETE')
+                if cancel == 'button':
+                    self.page.locator('#appConfirmCancel').click()
+                else:
+                    self.page.keyboard.press('Escape')
+                self.page.locator('#appConfirmModal').wait_for(state='hidden')
+                self.assertTrue(self.page.locator('#organizeBatchDeleteBtn').is_enabled())
+                self.assertEqual(self.page.locator('.organize-row-select:checked').count(), 2 if select_all else 1)
+                self.assertEqual([call for call in self.calls() if call['method'] != 'GET'], [])
+
+    def test_batch_delete_disables_duplicate_submission_through_confirmation_and_polling(self):
+        self.enable_batch_delete_fixture()
+        self.use_real_confirmation()
+        self.page.evaluate("() => window.__testConfig.holdTaskIds=['batch-task']")
+        self.page.locator('#organizeSelectAll').check()
+        button = self.page.locator('#organizeBatchDeleteBtn')
+        original_size = button.bounding_box()
+        button.click()
+        self.assertTrue(button.is_disabled())
+        self.page.evaluate("() => runOrganizeBatch('delete')")
+        self.assertEqual(len(self.page.evaluate('window.__confirmCalls')), 1)
+        self.page.locator('#appConfirmVerifyInput').fill('DELETE')
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function('() => window.__pendingTaskStatuses.length===1')
+        self.assertTrue(button.is_disabled())
+        busy_size = button.bounding_box()
+        assert original_size is not None and busy_size is not None
+        self.assertEqual((original_size['width'], original_size['height']), (busy_size['width'], busy_size['height']))
+        self.page.evaluate("() => runOrganizeBatch('delete')")
+        self.assertEqual(len(self.execute_calls()), 1)
+        self.page.evaluate("() => window.__releaseTaskStatus('batch-task',{status:'completed',result:window.__testConfig.taskResult})")
+        self.page.wait_for_function("() => document.getElementById('organizeBatchState').textContent.includes('2 条成功')")
+        self.assertEqual(len(self.execute_calls()), 1)
+
+    def test_delete_relaxation_preserves_revert_and_correction_selection_rules(self):
+        self.enable_batch_delete_fixture()
+        self.page.locator('.organize-row-select').first.check()
+        self.assertTrue(self.page.locator('#organizeBatchRenameBtn').is_disabled())
+        self.assertTrue(self.page.locator('#organizeBatchRevertBtn').is_disabled())
+        self.page.evaluate("() => runOrganizeBatch('revert')")
+        self.page.locator('#organizeSelectAll').check()
+        self.assertTrue(self.page.locator('#organizeBatchRenameBtn').is_enabled())
+        self.page.locator('#organizeBatchRevertBtn').click()
+        self.assertIn('仅支持剧集', self.page.locator('#organizeBatchState').inner_text())
+        self.assertEqual(self.execute_calls(), [])
+        self.assertEqual(self.page.evaluate('window.__confirmCalls'), [])
+        self.enable_batch_delete_fixture(rows=[{**row, 'media_type': 'tv'} for row in ROWS])
+        self.page.locator('#organizeSelectAll').check()
+        self.page.locator('#organizeBatchRevertBtn').click()
+        self.page.wait_for_function("() => window.__apiCalls.some(call => call.path === '/api/logs/organize/batch' && call.method === 'POST')")
+        self.assertEqual(self.execute_calls()[0]['body']['action'], 'revert')
+        self.assertEqual(self.execute_calls()[0]['body']['confirm'], '')
+        self.assertEqual(len(self.execute_calls()[0]['body']['entries']), 2)
+
     def test_batch_delete_warning_without_failures_is_visible_as_error(self):
         warning = 'STRM 精准收尾未完成：目标文件暂不可写'
         self.enable_batch_delete_fixture(task_result={
             'success': True, 'action': 'delete', 'requested': 2,
-            'completed': [], 'failed': [], 'warnings': [warning],
+            'completed': [{'log_id': row['id'], 'result': {'deleted': 2}} for row in ROWS],
+            'deleted': 4, 'empty_dirs_cleaned': 0, 'failed': [], 'warnings': [warning],
         })
         state = self.run_batch_delete()
-        self.assertIn('批次完成，共处理 2 条', state.inner_text())
+        self.assertIn('批次完成，2 条成功；回收 4 个文件、0 个空目录', state.inner_text())
         self.assertIn(warning, state.inner_text())
         self.assertIn('is-error', state.get_attribute('class') or '')
         confirmation = self.page.evaluate('window.__confirmCalls.at(-1)')
@@ -644,18 +808,102 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
         error = '日志状态或版本已变化，请刷新后重试'
         self.enable_batch_delete_fixture(task_status='partial', task_result={
             'success': False, 'action': 'delete', 'requested': 2,
-            'completed': [], 'failed': [{'log_id': 11, 'error': error}],
-            'warnings': [warning],
+            'completed': [{'log_id': 10, 'result': {'deleted': 2, 'empty_dirs_cleaned': 99}}],
+            'failed': [{'log_id': 11, 'error': error}],
+            # 包含失败日志中已回收的一个文件，不能仅汇总 completed。
+            'deleted': 3, 'empty_dirs_cleaned': 1, 'warnings': [warning],
         })
         state = self.run_batch_delete()
         text = state.inner_text()
         self.assertIn('1 条失败', text)
+        self.assertIn('1 条成功', text)
+        self.assertIn('#11', text)
+        self.assertIn('回收 3 个文件、1 个空目录', text)
         self.assertIn(error, text)
         self.assertIn(warning, text)
         self.assertIn('is-error', state.get_attribute('class') or '')
         request = self.execute_calls()[-1]['body']
         self.assertEqual(request['action'], 'delete')
         self.assertEqual(request['confirm'], 'DELETE')
+
+        self.page.evaluate("() => Object.assign(window.__testConfig,{rows:[],holdTimeline:true})")
+        before = self.page.locator('#organizeList').inner_html()
+        self.page.locator('#refreshLogsBtn').click()
+        self.page.wait_for_function('() => window.__pendingTimelines.length===1')
+        self.assertEqual(self.page.locator('#organizeList').inner_html(), before)
+        self.assertEqual(state.inner_text(), text)
+        self.page.evaluate('() => window.__pendingTimelines.shift()()')
+        self.page.locator('#organizeList').filter(has_text='暂无整理日志').wait_for()
+        self.assertEqual(state.inner_text(), text)
+        self.assertIn('is-error', state.get_attribute('class') or '')
+        self.assertEqual(len(self.execute_calls()), 1)
+
+    def test_batch_delete_all_failed_retains_each_error_and_actual_partial_file_count(self):
+        self.enable_batch_delete_fixture(task_status='failed', task_result={
+            'success': False, 'action': 'delete', 'requested': 2,
+            'completed': [], 'failed': [{'log_id': 10, 'error': '视频暂不可写'}, {'log_id': 11, 'error': '字幕回收失败'}],
+            'deleted': 1, 'empty_dirs_cleaned': 0, 'warnings': ['直接父目录仍有其他内容，已保留'],
+        })
+        text = self.run_batch_delete().inner_text()
+        for expected in ('0 条成功', '2 条失败', '#10 视频暂不可写', '#11 字幕回收失败', '回收 1 个文件、0 个空目录', '直接父目录仍有其他内容，已保留'):
+            self.assertIn(expected, text)
+
+    def test_batch_delete_missing_or_duplicate_receipts_do_not_imply_success(self):
+        self.enable_batch_delete_fixture(task_result={
+            'success': True, 'action': 'delete', 'requested': 2,
+            'completed': [{'log_id': 10, 'result': {'deleted': 2}}, {'log_id': 10, 'result': {'deleted': 2}}],
+            'deleted': 2, 'empty_dirs_cleaned': 0, 'failed': [], 'warnings': [],
+        })
+        state = self.run_batch_delete()
+        self.assertIn('1 条成功', state.inner_text())
+        self.assertIn('1 条缺少执行结果，请刷新日志核实', state.inner_text())
+        self.assertNotIn('2 条成功', state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+
+    def test_batch_delete_submission_failure_stays_visible_after_refresh(self):
+        self.enable_batch_delete_fixture()
+        self.page.evaluate("""() => {
+            const oldApi=window.api;
+            window.api=(url,options={})=>url==='/api/logs/organize/batch'
+                ? Promise.reject(new Error('回收请求网络中断，请核实后重试')) : oldApi(url,options);
+        }""")
+        self.page.locator('#organizeSelectAll').check()
+        self.page.locator('#organizeBatchDeleteBtn').click()
+        state = self.page.locator('#organizeBatchState')
+        state.filter(has_text='回收请求网络中断').wait_for()
+        self.assertTrue(self.page.locator('#organizeBatchDeleteBtn').is_enabled())
+        self.page.evaluate('() => refreshActive()')
+        self.assertIn('回收请求网络中断，请核实后重试', state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+
+    def test_batch_delete_stopped_task_retains_receipts_counts_and_warning(self):
+        self.enable_batch_delete_fixture(task_status='stopped', task_result={
+            'success': False, 'action': 'delete', 'requested': 2,
+            'completed': [{'log_id': 10, 'result': {'deleted': 2}}], 'failed': [],
+            'deleted': 3, 'empty_dirs_cleaned': 0, 'warnings': ['父目录清理尚未完成'],
+        })
+        state = self.run_batch_delete()
+        for expected in ('1 条成功', '回收 3 个文件、0 个空目录', '1 条缺少执行结果', '后台操作已停止', '父目录清理尚未完成'):
+            self.assertIn(expected, state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+
+    def test_single_detail_delete_displays_actual_counts_and_directory_warning(self):
+        self.enable_batch_delete_fixture()
+        self.use_real_confirmation()
+        self.page.evaluate("""() => window.__testConfig.singleTaskResult={
+            success:true,deleted:3,empty_dirs_cleaned:1,warnings:['另一个直接父目录暂不可清理']
+        }""")
+        self.page.locator('.detail-btn').first.click()
+        self.page.locator('#organizeDeleteBtn').click()
+        self.page.locator('#appConfirmVerifyInput').fill('DELETE')
+        self.page.locator('#appConfirmSubmit').click()
+        self.page.wait_for_function("() => document.getElementById('organizeOperationState').textContent.includes('回收 3 个文件、1 个空目录')")
+        state = self.page.locator('#organizeOperationState')
+        self.assertIn('另一个直接父目录暂不可清理', state.inner_text())
+        self.assertIn('is-error', state.get_attribute('class') or '')
+        deletes = [call for call in self.calls() if call['method'] == 'DELETE']
+        self.assertEqual([(call['path'], call['body']['confirm']) for call in deletes], [('/api/logs/organize/10', 'DELETE')])
+        self.assertEqual(self.execute_calls(), [])
 
     def test_partial_task_result_uses_completed_and_failed_contract(self):
         self.page.evaluate("() => window.__testConfig.taskResult={success:false,action:'reorganize',requested:2,completed:[{log_id:10,result:{file_name:'done.mkv'}}],failed:[{log_id:11,error:'目标已存在'}],warnings:[]}")

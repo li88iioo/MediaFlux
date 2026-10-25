@@ -73,17 +73,17 @@
     </div>
     <div class="logs-batchbar">
         <div class="logs-batch-meta">
-            <span class="organize-batch-count" id="organizeBatchCount">已选 0 条</span>
+            <span class="organize-batch-count" id="organizeBatchCount">当前页已选 0 条</span>
             <span class="text-muted logs-refresh-time" id="lastRefresh">—</span>
-            <span class="inline-save-state" id="organizeBatchState"></span>
+            <span class="inline-save-state" id="organizeBatchState" role="status" aria-live="polite" aria-atomic="true"></span>
         </div>
         <div class="logs-batch-actions">
             <button type="button" class="jump-btn" id="organizeBatchRenameBtn" disabled><i data-lucide="scan-search"></i>批量纠正识别</button>
             <button type="button" class="jump-btn" id="organizeBatchRevertBtn" disabled><i data-lucide="undo-2"></i>批量回退</button>
-            <button type="button" class="jump-btn danger" id="organizeBatchDeleteBtn" disabled><i data-lucide="trash-2"></i>批量移入光鸭回收站</button>
+            <button type="button" class="jump-btn danger" id="organizeBatchDeleteBtn" title="选择当前页 1–50 条光鸭日志，回收其媒体组及因此移空的直接父目录" disabled><i data-lucide="trash-2"></i>批量移入光鸭回收站</button>
         </div>
     </div>
-    <div class="table-wrap"><table class="logs-table organize-batch-table"><colgroup><col class="select-col"><col class="origin-col"><col class="path-col"><col class="newpath-col"><col class="status-col"><col class="time-col"><col class="action-col"></colgroup><thead><tr><th><input type="checkbox" id="organizeSelectAll" aria-label="选择当前页全部光鸭整理日志"></th><th>来源</th><th>原路径</th><th>整理后路径</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody id="organizeList"><tr><td colspan="7" class="table-empty">读取中...</td></tr></tbody></table></div>
+    <div class="table-wrap"><table class="logs-table organize-batch-table"><colgroup><col class="select-col"><col class="origin-col"><col class="path-col"><col class="newpath-col"><col class="status-col"><col class="time-col"><col class="action-col"></colgroup><thead><tr><th><input type="checkbox" id="organizeSelectAll" aria-label="选择当前页全部光鸭整理日志" title="全选当前页光鸭记录，不包含其他页"></th><th>来源</th><th>原路径</th><th>整理后路径</th><th>状态</th><th>时间</th><th>操作</th></tr></thead><tbody id="organizeList"><tr><td colspan="7" class="table-empty">读取中...</td></tr></tbody></table></div>
     <div class="table-pagination is-initializing" id="organizePagination" aria-label="整理日志分页" aria-busy="true" aria-hidden="true">
         <span class="table-pagination-info" id="organizePageInfo">第 1 页</span>
         <div class="table-pagination-actions"><button type="button" class="jump-btn" id="organizePrev" disabled><i data-lucide="chevron-left"></i>上一页</button><button type="button" class="jump-btn" id="organizeNext" disabled>下一页<i data-lucide="chevron-right"></i></button></div>

@@ -2038,7 +2038,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
             "app.modules.organize_correction.execute_recycle_bin_delete",
             side_effect=run_delete,
         ) as audited_delete:
-            cleaned, warnings = service._cleanup_archive_directories(
+            cleaned, warnings = service._cleanup_empty_directories(
                 log_id=1,
                 directories=[directory],
                 protected=set(),
@@ -2118,7 +2118,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
             "app.modules.organize_correction.execute_recycle_bin_delete",
             side_effect=run_delete,
         ):
-            cleaned, warnings = service._cleanup_archive_directories(
+            cleaned, warnings = service._cleanup_empty_directories(
                 log_id=1,
                 directories=directories,
                 protected=set(),
@@ -2148,7 +2148,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
         )
         service = OrganizeCorrectionService(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, object()))
         with patch("app.modules.organize_correction.record_blocked_delete") as blocked:
-            cleaned, warnings = service._cleanup_archive_directories(
+            cleaned, warnings = service._cleanup_empty_directories(
                 log_id=1,
                 directories=[directory],
                 protected=set(),
@@ -2181,7 +2181,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
             "app.modules.organize_correction.record_blocked_delete",
             side_effect=RuntimeError("audit unavailable"),
         ):
-            cleaned, warnings = service._cleanup_archive_directories(
+            cleaned, warnings = service._cleanup_empty_directories(
                 log_id=1,
                 directories=[directory],
                 protected=set(),
@@ -2207,7 +2207,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
         client = SimpleNamespace(delete_empty_directory=Mock())
         service = OrganizeCorrectionService(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, object()))
         with patch("app.modules.organize_correction.record_blocked_delete") as blocked:
-            cleaned, warnings = service._cleanup_archive_directories(
+            cleaned, warnings = service._cleanup_empty_directories(
                 log_id=1,
                 directories=[directory],
                 protected=set(),
@@ -2321,7 +2321,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
         with patch(
             "app.modules.organize_correction.execute_recycle_bin_delete"
         ) as audited_delete:
-            cleaned, warnings = service._cleanup_archive_directories(
+            cleaned, warnings = service._cleanup_empty_directories(
                 log_id=1,
                 directories=[snapshot],
                 protected=set(),

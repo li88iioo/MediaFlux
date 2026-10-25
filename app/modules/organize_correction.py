@@ -229,7 +229,9 @@ class OrganizeCorrectionService:
         unique_ids = list(dict.fromkeys(log_id for log_id in log_ids))
         if len(unique_ids) != len(log_ids):
             raise ValueError("批量日志列表包含重复 ID")
-        if len(unique_ids) < 2:
+        if action == "delete" and not unique_ids:
+            raise ValueError("请至少选择一条整理日志")
+        if action != "delete" and len(unique_ids) < 2:
             raise ValueError("批量操作至少选择两条整理日志")
         if len(unique_ids) > 50:
             raise ValueError("单次批量操作最多支持 50 条整理日志")
@@ -242,7 +244,7 @@ class OrganizeCorrectionService:
             raise ValueError("不支持的批量操作")
         details = [self.detail(log_id) for log_id in unique_ids]
         movies = [str(item["id"]) for item in details if item.get("media_type") != "tv"]
-        if movies and action != "reorganize":
+        if movies and action == "revert":
             raise ValueError(
                 "批量操作仅支持剧集，选择中包含电影或未知类型日志: "
                 + ", ".join(f"#{item}" for item in movies)
@@ -253,7 +255,7 @@ class OrganizeCorrectionService:
         ]
         if blocked:
             raise ValueError(
-                "以下剧集日志当前不允许执行该批量操作: "
+                "以下日志当前不允许执行该批量操作: "
                 + ", ".join(f"#{item}" for item in blocked)
             )
         return details
@@ -377,6 +379,9 @@ class OrganizeCorrectionService:
         warnings: list[str] = []
 
         prepared_deletes: dict[int, list[CorrectionItem]] = {}
+        cleanup_directories: list[GuangYaFile] = []
+        cleanup_protected: set[str] = set()
+        deleted_in_batch: set[str] = set()
         if action == "delete":
             if confirm_text != "DELETE":
                 raise ValueError("请输入 DELETE 确认批量移入光鸭回收站")
@@ -385,12 +390,16 @@ class OrganizeCorrectionService:
                 try:
                     prepared_deletes[log_id] = self._prepare_delete_group(log_id, confirm_text)
                 except Exception as exc:
-                    logger.error("剧集批量删除预检失败 log=%s type=%s", log_id, type(exc).__name__)
+                    logger.error("批量删除预检失败 log=%s type=%s", log_id, type(exc).__name__)
                     return {
                         "success": False, "action": action, "requested": len(entries),
                         "completed": [], "failed": [{"log_id": log_id, "error": str(exc)}],
-                        "warnings": [],
+                        "warnings": [], "deleted": 0, "empty_dirs_cleaned": 0,
                     }
+            cleanup_directories, cleanup_protected, warnings = self._capture_delete_parent_directories(
+                {item.current_parent_id for items in prepared_deletes.values() for item in items},
+                OrganizeRules.from_config(),
+            )
             if not db.claim_organize_log_operations_batch(
                 entries, "deleting", tuple(DELETE_STATUSES)
             ):
@@ -400,7 +409,7 @@ class OrganizeCorrectionService:
                     "failed": [{"log_id": int(entry["log_id"]),
                                 "error": "日志状态或版本已变化，请刷新后重试"}
                                for entry in entries],
-                    "warnings": [],
+                    "warnings": [], "deleted": 0, "empty_dirs_cleaned": 0,
                 }
 
         for entry in entries:
@@ -413,18 +422,35 @@ class OrganizeCorrectionService:
                 elif action == "revert":
                     result = self.revert_latest(log_id, token, version)
                 else:
-                    result = self._execute_claimed_delete(log_id, token, prepared_deletes[log_id])
+                    result = self._execute_claimed_delete(
+                        log_id, token, prepared_deletes[log_id], deleted_in_batch=deleted_in_batch,
+                    )
                 completed.append({"log_id": log_id, "result": result})
                 warnings.extend(result.get("warnings") or [])
             except Exception as exc:
-                logger.error("剧集批量操作失败 action=%s log=%s type=%s", action, log_id, type(exc).__name__)
+                logger.error("批量操作失败 action=%s log=%s type=%s", action, log_id, type(exc).__name__)
                 failed.append({"log_id": log_id, "error": str(exc)})
+        empty_dirs_cleaned = 0
+        if action == "delete" and completed:
+            owners = {
+                item.current_parent_id: row["log_id"]
+                for row in completed for item in prepared_deletes[row["log_id"]]
+            }
+            empty_dirs_cleaned, directory_warnings = self._cleanup_empty_directories(
+                log_id=completed[0]["log_id"],
+                directories=[item for item in cleanup_directories if item.file_id in owners],
+                protected=cleanup_protected, directory_log_ids=owners,
+                trigger="manual_delete_empty_dir_cleanup",
+            )
+            warnings.extend(directory_warnings)
         return {
             "success": not failed,
             "action": action,
             "requested": len(entries),
             "completed": completed,
             "failed": failed,
+            "deleted": len(deleted_in_batch),
+            "empty_dirs_cleaned": empty_dirs_cleaned,
             "warnings": warnings,
         }
 
@@ -1179,16 +1205,18 @@ class OrganizeCorrectionService:
                 seen.add(directory_id)
         return captured, protected, list(dict.fromkeys(warnings))
 
-    def _cleanup_archive_directories(
+    def _cleanup_empty_directories(
         self,
         *,
         log_id: int,
         directories: list[GuangYaFile],
         protected: set[str],
-        target_root_id: str,
+        target_root_id: str | None = None,
         trigger: str = "return_to_source_empty_dir_cleanup",
+        directory_log_ids: dict[str, int] | None = None,
     ) -> tuple[int, list[str]]:
-        """纠偏提交后，自底向上安全回收本日志移空的旧归档目录。"""
+        """统一回收已捕获的空目录；归档纠偏额外要求仍在原目标根下。"""
+        audit_owners = directory_log_ids or {}
         if not directories:
             return 0, []
         delete_empty = getattr(self.client, "delete_empty_directory", None)
@@ -1215,7 +1243,7 @@ class OrganizeCorrectionService:
                             parent_id=(snapshot.parent_id or ""),
                             gcid=(snapshot.etag or ""),
                         ),
-                        organize_log_id=log_id,
+                        organize_log_id=audit_owners.get(directory_id, log_id),
                     )
                 except Exception as exc:
                     audit_failed = True
@@ -1285,7 +1313,7 @@ class OrganizeCorrectionService:
                             parent_id=(snapshot.parent_id or ""),
                             gcid=(snapshot.etag or ""),
                         ),
-                        organize_log_id=log_id,
+                        organize_log_id=audit_owners.get(directory_id, log_id),
                     )
                     warnings.append("部分整理目标目录仍含其他内容，已保留")
                     continue
@@ -1309,7 +1337,7 @@ class OrganizeCorrectionService:
                 if not expected_etag and expected_updated_at <= 0:
                     raise RuntimeError("目录缺少可验证版本")
                 normalized_target_root = (target_root_id or "").strip()
-                if not self._directory_belongs_to_target_root(
+                if target_root_id is not None and not self._directory_belongs_to_target_root(
                     current,
                     target_root_id=normalized_target_root,
                     forbidden_ancestor_ids=protected - {normalized_target_root},
@@ -1320,7 +1348,7 @@ class OrganizeCorrectionService:
                     self.client,
                     trigger=trigger,
                     reason=(
-                        "纠偏成功后清理本日志移空的旧归档目录；"
+                        "回收本次明确操作移空的媒体目录；"
                         f"{cleanup_strategy}"
                     ),
                     candidate=DeleteCandidate(
@@ -1329,7 +1357,7 @@ class OrganizeCorrectionService:
                         parent_id=(current.parent_id or ""),
                         gcid=expected_etag,
                     ),
-                    organize_log_id=log_id,
+                    organize_log_id=audit_owners.get(directory_id, log_id),
                     safe_failure_message="目标目录状态已变化，已安全保留",
                     delete_operation=lambda current_id=directory_id,
                     current_etag=expected_etag,
@@ -1655,7 +1683,7 @@ class OrganizeCorrectionService:
             self._cleanup_created_dirs(created_dirs)
             db.update_organize_log(log_id, status=self._failure_status(log_id, "failed"), error=str(exc))
             raise
-        empty_dirs_cleaned, directory_warnings = self._cleanup_archive_directories(
+        empty_dirs_cleaned, directory_warnings = self._cleanup_empty_directories(
             log_id=log_id, directories=cleanup_directories,
             protected=cleanup_protected | {target_id}, target_root_id=rules.target_dir_id,
             trigger="reorganize_empty_dir_cleanup",
@@ -1744,7 +1772,7 @@ class OrganizeCorrectionService:
             current_name=video.original_name, error="",
         )
         empty_dirs_cleaned, directory_warnings = (
-            self._cleanup_archive_directories(
+            self._cleanup_empty_directories(
                 log_id=log_id,
                 directories=cleanup_directories,
                 protected=cleanup_protected,
@@ -1872,6 +1900,28 @@ class OrganizeCorrectionService:
             "warnings": warnings,
         }
 
+    def _capture_delete_parent_directories(
+        self, parent_ids: set[str], rules: OrganizeRules,
+    ) -> tuple[list[GuangYaFile], set[str], list[str]]:
+        """只捕获所选媒体的直接父目录，不扫描来源或扩张到未选择的祖先。"""
+        from app.modules.organize_tasks import _protected_organize_root_ids
+
+        protected, error = _protected_organize_root_ids(rules)
+        if error:
+            return [], protected, ["来源根配置无法核验，已保留媒体父目录"]
+        directories: list[GuangYaFile] = []
+        warnings: list[str] = []
+        for directory_id in sorted(parent_ids - protected - {""}):
+            try:
+                directory = self.client.file_info(directory_id)
+                if directory is None or not directory.is_dir or directory.file_id != directory_id:
+                    raise ValueError("目录身份无法核验")
+                directories.append(replace(directory))
+            except Exception as exc:
+                logger.warning("删除前核验媒体父目录失败 dir=%s type=%s", directory_id, type(exc).__name__)
+                warnings.append(f"无法核验父目录 {directory_id}，已保留该目录")
+        return directories, protected, warnings
+
     def _prepare_delete_group(
         self, log_id: int, confirm_text: str,
     ) -> list[CorrectionItem]:
@@ -1899,9 +1949,10 @@ class OrganizeCorrectionService:
 
     def _execute_claimed_delete(
         self, log_id: int, operation_token: str,
-        ordered: list[CorrectionItem],
+        ordered: list[CorrectionItem], *, deleted_in_batch: set[str] | None = None,
     ) -> dict:
         deleted: set[str] = set()
+        batch_deleted = deleted_in_batch if deleted_in_batch is not None else set()
         error: Exception | None = None
         try:
             for index, item in enumerate(ordered, start=1):
@@ -1911,16 +1962,18 @@ class OrganizeCorrectionService:
                     from_name=item.current_name, status="running",
                 )
                 try:
-                    execute_recycle_bin_delete(
-                        self.client, trigger="manual",
-                        reason="用户在整理日志中输入 DELETE 显式确认",
-                        candidate=DeleteCandidate(
-                            item.file_id, item.current_name, item.current_parent_id,
-                            item.size, item.etag,
-                        ),
-                        organize_log_id=log_id,
-                    )
-                    deleted.add(item.file_id)
+                    if item.file_id not in batch_deleted:
+                        execute_recycle_bin_delete(
+                            self.client, trigger="manual",
+                            reason="用户在整理日志中输入 DELETE 显式确认",
+                            candidate=DeleteCandidate(
+                                item.file_id, item.current_name, item.current_parent_id,
+                                item.size, item.etag,
+                            ),
+                            organize_log_id=log_id,
+                        )
+                        deleted.add(item.file_id)
+                        batch_deleted.add(item.file_id)
                     db.update_organize_log_item(item.id, status="deleted", error="")
                     db.finish_organize_operation_step(step_id, "success")
                 except Exception as exc:
@@ -1954,11 +2007,23 @@ class OrganizeCorrectionService:
     def delete_group(self, log_id: int, operation_token: str,
                      expected_version: int, confirm_text: str) -> dict:
         ordered = self._prepare_delete_group(log_id, confirm_text)
+        directories, protected, warnings = self._capture_delete_parent_directories(
+            {item.current_parent_id for item in ordered}, OrganizeRules.from_config(),
+        )
         if not db.claim_organize_log_operation(
             log_id, operation_token, "deleting", tuple(DELETE_STATUSES), expected_version,
         ):
             raise RuntimeError("日志状态或版本已变化，请刷新后重试")
-        return self._execute_claimed_delete(log_id, operation_token, ordered)
+        result = self._execute_claimed_delete(log_id, operation_token, ordered)
+        cleaned, directory_warnings = self._cleanup_empty_directories(
+            log_id=log_id, directories=directories, protected=protected,
+            trigger="manual_delete_empty_dir_cleanup",
+        )
+        result["empty_dirs_cleaned"] = cleaned
+        result["warnings"].extend([*warnings, *directory_warnings])
+        if warnings or directory_warnings:
+            db.update_organize_log(log_id, error="；".join(result["warnings"]))
+        return result
 
 
 
