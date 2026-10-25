@@ -21,7 +21,7 @@ from app.discovery.models import (
     ProviderRateLimited,
     ProviderTimeout,
 )
-from app.discovery.registry import validate_filters
+from app.discovery.registry import list_filter_definitions, validate_filters
 
 
 def _identity(arguments):
@@ -89,6 +89,64 @@ def _recommend_fixture(service, inventory=None):
 
 
 class AgentRecommendationCompletionTests(unittest.TestCase):
+    def test_recommendation_uses_shared_provider_genre_options(self):
+        for provider, media_type, key in (
+            ("tmdb", "movie", "with_genres"), ("tmdb", "tv", "with_genres"),
+            ("douban", "movie", "tags"),
+        ):
+            definition = list_filter_definitions(provider, media_type)
+            choices = next(item["options"] for item in definition["filters"] if item["key"] == key)
+            for option in choices:
+                with self.subTest(provider=provider, media_type=media_type, genre=option["label"]):
+                    service = PagedDiscoveryService({1: _page([])})
+                    with _recommend_fixture(service):
+                        recommend_discovery({
+                            "provider": provider, "media_type": media_type, "genre": option["label"],
+                        })
+                    self.assertEqual(service.calls[0][4][key], option["value"])
+
+    def test_unsupported_constraints_cannot_be_silently_dropped(self):
+        for arguments in (
+            {"provider": "douban", "media_type": "movie", "region": "日本", "genre": "科幻"},
+            {"provider": "douban", "media_type": "tv", "region": "日本", "genre": "科幻"},
+            {"provider": "douban", "media_type": "tv", "region": "意大利"},
+            {"provider": "tmdb", "media_type": "movie", "region": "不存在的地区"},
+            {"provider": "tmdb", "media_type": "movie", "region": "欧美"},
+            {"provider": "douban", "media_type": "tv", "region": "欧美"},
+            {"provider": "tmdb", "media_type": "tv", "genre": "不存在的题材"},
+            {"provider": "douban", "media_type": "movie", "genre": "不存在的题材"},
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaises(AgentToolError):
+                    recommend_arguments(arguments)
+                service = PagedDiscoveryService({1: _page([_card()])})
+                with _recommend_fixture(service), self.assertRaises(AgentToolError):
+                    recommend_discovery(arguments)
+                self.assertEqual(service.calls, [])
+
+    def test_tmdb_region_accepts_country_codes_and_common_names(self):
+        for region, expected in (("意大利", "IT"), ("it", "IT"), ("ＥＳ", "ES")):
+            with self.subTest(region=region):
+                service = PagedDiscoveryService({1: _page([])})
+                with _recommend_fixture(service):
+                    recommend_discovery({"media_type": "movie", "region": region})
+                self.assertEqual(service.calls[0][4]["with_origin_country"], expected)
+
+    def test_supported_recommendation_aliases_keep_their_original_meaning(self):
+        for provider, media_type, argument, expected in (
+            ("tmdb", "movie", {"genre": "动漫"}, {"with_genres": "16"}),
+            ("tmdb", "tv", {"genre": "动作"}, {"with_genres": "10759"}),
+            ("tmdb", "tv", {"genre": "科幻"}, {"with_genres": "10765"}),
+            ("tmdb", "tv", {"genre": "历史"}, {"with_genres": "10768"}),
+            ("douban", "tv", {"region": "国产"}, {"tags": "国产剧"}),
+            ("douban", "tv", {"region": "日本"}, {"tags": "日剧"}),
+        ):
+            with self.subTest(provider=provider, media_type=media_type, argument=argument):
+                service = PagedDiscoveryService({1: _page([])})
+                with _recommend_fixture(service):
+                    recommend_discovery({"provider": provider, "media_type": media_type, **argument})
+                self.assertEqual(service.calls[0][4], expected)
+
     def test_continuation_consumes_every_card_including_last_source_page_remainder(self):
         for exclude_library in (False, True):
             with self.subTest(exclude_library=exclude_library):

@@ -12,6 +12,7 @@ from app import config
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolContext, ToolResult
 from app.discovery.models import DiscoveryPage, MediaCard, ProviderError
+from app.discovery.registry import list_filter_definitions
 from app.discovery.search import DiscoverySearchResult, get_discovery_search_service
 from app.discovery.service import get_discovery_service
 from app.services import collect_discovery_recommendations
@@ -52,81 +53,13 @@ _PROVIDER_STATUSES = {
 }
 _PUBLIC_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,180}$")
 
-_TMDB_MOVIE_GENRE_IDS = {
-    "动作": "28",
-    "冒险": "12",
-    "动画": "16",
-    "动漫": "16",
-    "喜剧": "35",
-    "犯罪": "80",
-    "纪录片": "99",
-    "剧情": "18",
-    "家庭": "10751",
-    "奇幻": "14",
-    "历史": "36",
-    "恐怖": "27",
-    "音乐": "10402",
-    "悬疑": "9648",
-    "爱情": "10749",
-    "科幻": "878",
-    "惊悚": "53",
-    "战争": "10752",
-}
-_TMDB_TV_GENRE_IDS = {
-    "动作": "10759",
-    "冒险": "10759",
-    "动画": "16",
-    "动漫": "16",
-    "喜剧": "35",
-    "犯罪": "80",
-    "纪录片": "99",
-    "剧情": "18",
-    "家庭": "10751",
-    "儿童": "10762",
-    "悬疑": "9648",
-    "科幻": "10765",
-    "奇幻": "10765",
-    "战争": "10768",
-    "历史": "10768",
-}
 _REGION_COUNTRY_ALIASES = {
     "美国": "US", "美剧": "US", "英国": "GB", "英剧": "GB",
     "中国": "CN", "中国大陆": "CN", "国产": "CN", "国产剧": "CN",
     "中国香港": "HK", "香港": "HK", "中国台湾": "TW", "台湾": "TW",
     "日本": "JP", "日剧": "JP", "韩国": "KR", "韩剧": "KR",
-    "法国": "FR", "德国": "DE", "印度": "IN",
+    "法国": "FR", "德国": "DE", "印度": "IN", "意大利": "IT", "西班牙": "ES",
 }
-_DOUBAN_TV_REGION_TAGS = {
-    "欧美": "美剧",
-    "美国": "美剧",
-    "美剧": "美剧",
-    "英国": "英剧",
-    "英剧": "英剧",
-    "日本": "日剧",
-    "日剧": "日剧",
-    "韩国": "韩剧",
-    "韩剧": "韩剧",
-    "中国": "国产剧",
-    "中国大陆": "国产剧",
-    "国产": "国产剧",
-    "国产剧": "国产剧",
-}
-_DOUBAN_MOVIE_GENRES = frozenset(
-    {
-        "喜剧",
-        "爱情",
-        "动作",
-        "科幻",
-        "动画",
-        "悬疑",
-        "犯罪",
-        "惊悚",
-        "冒险",
-        "奇幻",
-        "恐怖",
-        "战争",
-    }
-)
 _ERROR_MESSAGES = {
     "timeout": "数据源请求超时",
     "rate_limited": "数据源请求受限",
@@ -323,6 +256,7 @@ def recommend_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     normalized.update({key: value for key, value in {**years, "region": region, "genre": genre}.items() if value})
     if "exclude_library" in arguments:
         normalized["exclude_library"] = arguments["exclude_library"]
+    _recommend_provider_filters(normalized)
     return normalized
 
 
@@ -333,6 +267,15 @@ def _recommend_provider_filters(normalized: dict[str, Any]) -> dict[str, str]:
     year = str(normalized.get("year") or "")
     region = str(normalized.get("region") or "")
     genre = str(normalized.get("genre") or "")
+    # Provider 注册表是唯一的选项来源；Agent 仅翻译口语别名，不另养类型目录。
+    options = {
+        field["key"]: {item["label"]: item["value"] for item in field["options"]}
+        for field in list_filter_definitions(provider, media_type)["filters"]
+    }
+    country = _REGION_COUNTRY_ALIASES.get(region, "")
+    if not country and re.fullmatch(r"[A-Za-z]{2}", region):
+        country = region.upper()
+    genre = "动画" if genre == "动漫" else genre
     filters: dict[str, str] = {}
     if provider == "tmdb":
         date = "release_date" if media_type == "movie" else "first_air_date"
@@ -345,24 +288,27 @@ def _recommend_provider_filters(normalized: dict[str, Any]) -> dict[str, str]:
                 if media_type == "movie"
                 else "first_air_date_year"
             ] = year
-        country = _REGION_COUNTRY_ALIASES.get(region, "")
+        if region and not country:
+            raise AgentToolError("region 无法转换为明确产地；请使用国家/地区名称或双字母代码，不以语言代替地区")
         if country:
             filters["with_origin_country"] = country
-        elif region == "欧美":
-            filters["with_original_language"] = "en"
-        genre_ids = (
-            _TMDB_MOVIE_GENRE_IDS if media_type == "movie" else _TMDB_TV_GENRE_IDS
-        )
-        genre_id = genre_ids.get(genre, "")
-        if genre_id:
-            filters["with_genres"] = genre_id
-    elif media_type == "tv":
-        tag = _DOUBAN_TV_REGION_TAGS.get(region, "")
-        if tag:
-            filters["tags"] = tag
+        if media_type == "tv":
+            genre = {
+                "动作": "动作冒险", "冒险": "动作冒险", "科幻": "科幻奇幻",
+                "奇幻": "科幻奇幻", "战争": "战争政治", "历史": "战争政治",
+            }.get(genre, genre)
+        key, value = "with_genres", genre
     else:
-        if genre in _DOUBAN_MOVIE_GENRES:
-            filters["tags"] = genre
+        if (media_type == "movie" and region) or (media_type == "tv" and genre):
+            raise AgentToolError("豆瓣推荐接口仅支持电影题材或剧集地区筛选；请改用 tmdb 并保留全部原筛选条件")
+        key = "tags"
+        value = genre if media_type == "movie" else {
+            "CN": "国产剧", "US": "美剧", "GB": "英剧", "JP": "日剧", "KR": "韩剧",
+        }.get(country, region)
+    if value:
+        if value not in options[key]:
+            raise AgentToolError(f"{provider} 不支持该推荐筛选 {value}；可用选项：{'、'.join(options[key])}")
+        filters[key] = options[key][value]
     return filters
 
 

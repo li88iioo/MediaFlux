@@ -587,6 +587,7 @@ def register_specs(registry, *, mapping_actions) -> None:
             name="discovery.recommend",
             description=(
                 "读取已启用的 TMDB 或豆瓣推荐列表；按年份或年份范围、地区和题材筛选，服务有界续页补足目标数量。"
+                "组合地区与题材时使用 TMDB；豆瓣仅支持电影题材或剧集地区，不得通过删掉用户条件来绕过来源限制。"
                 "返回覆盖范围 scope（coverage），含 requested/returned/shortfall/pages_read/stop_reason 和 scope.next_page；"
                 "scope.complete=true 或 scope.returned>=scope.requested 即本次数量已完成；"
                 "has_more 仅表示来源仍有候选，不代表任务未完成，不自动追加调用；用户明确要求更多时将 scope.next_page/next_offset 分别传入 page/offset 续取，并保留筛选条件。"
@@ -646,7 +647,7 @@ def register_specs(registry, *, mapping_actions) -> None:
                         "type": "string",
                         "minLength": 1,
                         "maxLength": 24,
-                        "description": "用户明确给出的地区或剧集产地，例如美国、欧美、日本。",
+                        "description": "明确的国家/地区产地，例如美国、日本、意大利或双字母代码IT；不能用原始语言冒充产地。",
                     },
                     "genre": {
                         "type": "string",
