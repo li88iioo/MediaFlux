@@ -180,7 +180,7 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
                 ],
             )
 
-        # Historical work belongs to startup recovery, not each listing/page request.
+        # 历史归属属于一次迁移，不属于每次启动或列表/分页查询。
         db.init_db()
         statements: list[str] = []
         connect = db._connect
@@ -198,9 +198,10 @@ class RSSStatsStateTests(IsolatedDatabaseTestCase):
         queries = [statement for statement in statements if statement.lstrip().upper().startswith("SELECT")]
         self.assertEqual(len(queries), 20)  # 每页一次计数、一次读取，共用读事务。
         self.assertTrue(all(statement.lstrip().upper().startswith(("SELECT", "BEGIN", "COMMIT")) for statement in statements))
-        # 列表按 canonical key 读取当前请求投影，不扫描历史日志、不逐条补写。
+        # 列表只按稳定请求 ID 投影，不回退内容 key、不扫描历史日志或逐条补写。
         self.assertFalse(any("download_log" in statement for statement in statements))
-        self.assertTrue(all("LEFT JOIN download_request_keys" in statement for statement in queries))
+        self.assertFalse(any("download_request_keys" in statement for statement in queries))
+        self.assertTrue(all("LEFT JOIN download_requests r ON r.id=e.download_request_id" in statement for statement in queries))
         self.assertFalse(any(statement.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
                              for statement in statements))
 

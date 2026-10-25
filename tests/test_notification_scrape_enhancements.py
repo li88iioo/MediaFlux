@@ -221,7 +221,7 @@ class NotificationEmojiTests(unittest.TestCase):
             "notification_sent": True,
         }
         terminal_state = manager.task_result.return_value
-        progress = Mock()
+        progress = Mock(message_thread_id=None, source_message=None)
         handlers._task_lock.acquire()
         def assert_business_slot_released(*_args):
             self.assertFalse(handlers._task_lock.locked())
@@ -280,7 +280,7 @@ class NotificationEmojiTests(unittest.TestCase):
             "notification_sent": False,
             "stats": {"total": 3, "moved": 2, "need_confirm": 1, "failed": 0},
         }
-        progress = Mock()
+        progress = Mock(message_thread_id=None, source_message=None)
         handlers._task_lock.acquire()
         with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager):
             handlers._do_organize(
@@ -305,7 +305,7 @@ class NotificationEmojiTests(unittest.TestCase):
         manager = Mock()
         manager.start.return_value = {"ok": True, "task_id": "task-missing", "run_id": 43}
         manager.task_result.return_value = None
-        progress = Mock()
+        progress = Mock(message_thread_id=None, source_message=None)
         handlers._task_lock.acquire()
         with patch("app.modules.organize_tasks.get_organize_manager", return_value=manager):
             handlers._do_organize(
