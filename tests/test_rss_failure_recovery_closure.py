@@ -469,6 +469,116 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
         self.assertEqual(get_rss_entry_result_17["status"], "skipped")
         self.assertEqual(db.list_rss_entries(sub_id=sid).items[0]["skip_reason"], "")
 
+    def test_qb_cancellation_releases_explicit_alternative_without_replaying_original(self):
+        key = "tmdb:42:tv:S01E001"
+        rid, original, item = self.accepted(media_key=key)
+        _, alternate, _ = self.pending(media_key=key)
+        task_hash = item.source_value.rsplit(":", 1)[-1]
+        db.update_download_request(rid, qb_task_id=task_hash)
+        self.assertEqual(db.cancel_qb_download_tracking([task_hash]), [rid])
+        original_entry = assert_present(db.get_rss_entry(original))
+        self.assertEqual((original_entry["status"], original_entry["processed"]), ("downloaded", 1))
+        delivery = rss_entry_delivery(original_entry)
+        self.assertFalse(delivery["failed"])
+        self.assertFalse(delivery["retryable"])
+        self.assertFalse(delivery["review_required"])
+        self.assertEqual(db.update_rss_entries_processed([original], False), 0)
+
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        with patch.object(RSSEngine, "refresh", return_value={"total": 0, "new": 0, "skipped": 0}), patch.object(
+            dispatcher, "_submit_qb", side_effect=self.success
+        ) as qb, patch.object(dispatcher, "_submit_guangya") as gy:
+            self.assertTrue(engine.download(original)["existing"])
+            automatic = engine.auto_download(int(original_entry["rss_item_id"]))
+            self.assertEqual(automatic["downloaded"], 0, automatic)
+            qb.assert_not_called()
+            self.assertEqual(db.update_rss_entries_processed([alternate], False), 1)
+            result = engine.download(alternate)
+        qb.assert_called_once()
+        gy.assert_not_called()
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["existing"], result)
+        self.assertNotEqual(result["request_id"], rid)
+        self.assertEqual(assert_present(db.get_download_request(rid))["status"], "cancelled")
+        self.assertEqual(assert_present(db.get_rss_entry(original))["delivery_request_id"], rid)
+
+    def test_selected_backend_cancellation_releases_discovery_refresh_and_binding(self):
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        for backend in ("qb", "guangya"):
+            for peer in ("", "submitted", "completed", "outcome_unknown", "manual_review"):
+                with self.subTest(backend=backend, peer=peer):
+                    key = f"tmdb:{self.sequence+1}:tv:S01E001"
+                    rid, original, _ = self.accepted(backend, media_key=key)
+                    sid, alternate, item = self.pending(backend, media_key=key)
+                    alternate_entry = assert_present(db.get_rss_entry(alternate))
+                    self.assertEqual(alternate_entry["status"], "skipped")
+                    selected, other = ("qb_status", "gy_status") if backend == "qb" else ("gy_status", "qb_status")
+                    root = "downloading" if peer == "outcome_unknown" else peer or "cancelled"
+                    db.update_download_request(rid, status=root, targets="both" if peer else backend,
+                                               **{selected: "cancelled", other: peer})
+                    _, fresh, _ = self.pending(backend, media_key=key)
+                    self.assertEqual(assert_present(db.get_rss_entry(fresh))["status"], "pending")
+                    refreshed = db.add_rss_entry_with_media(
+                        sid, "Episode", alternate_entry["guid"],
+                        media_key=key, payload=json.dumps({"torrent_url": item.source_value}),
+                    )
+                    self.assertIsNone(refreshed["id"])
+                    self.assertEqual(assert_present(db.get_rss_entry(alternate))["status"], "pending")
+                    with patch.object(dispatcher, "_submit_qb", side_effect=self.success) as qb, patch.object(
+                        dispatcher, "_submit_guangya", side_effect=self.success
+                    ) as gy:
+                        result = engine.download(alternate)
+                    self.assertTrue(result["ok"], result)
+                    self.assertFalse(result["existing"], result)
+                    self.assertEqual(qb.call_count, int(backend == "qb"))
+                    self.assertEqual(gy.call_count, int(backend == "guangya"))
+                    self.assertEqual(assert_present(db.get_download_request(rid))[selected], "cancelled")
+                    self.assertEqual(assert_present(db.get_rss_entry(original))["status"], "downloaded")
+
+    def test_peer_cancellation_keeps_selected_live_unknown_and_partial_receipts_blocking(self):
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        states = (
+            ("submitted", "submitted"), ("downloading", "downloading"),
+            ("completed", "completed"), ("outcome_unknown", "downloading"),
+            ("manual_review", "manual_review"), ("completed", "manual_review"),
+        )
+        for backend in ("qb", "guangya"):
+            for selected_status, root in states:
+                with self.subTest(backend=backend, selected_status=selected_status, root=root):
+                    key = f"tmdb:{self.sequence+1}:tv:S01E001"
+                    rid, _, _ = self.accepted(backend, media_key=key)
+                    selected, other = ("qb_status", "gy_status") if backend == "qb" else ("gy_status", "qb_status")
+                    db.update_download_request(rid, status=root, targets="both",
+                                               **{selected: selected_status, other: "cancelled"})
+                    _, alternate, _ = self.pending(backend, media_key=key)
+                    self.assertEqual(assert_present(db.get_rss_entry(alternate))["status"], "skipped")
+                    self.assertEqual(db.update_rss_entries_processed([alternate], False), 1)
+                    with patch.object(dispatcher, "_submit_qb") as qb, patch.object(dispatcher, "_submit_guangya") as gy:
+                        result = engine.download(alternate)
+                    qb.assert_not_called()
+                    gy.assert_not_called()
+                    self.assertEqual(result["status"], "skipped", result)
+
+    def test_unlinked_historical_receipt_keeps_blocking_without_cancellation_evidence(self):
+        key = "tmdb:42:tv:S01E001"
+        rid, _, _ = self.accepted(media_key=key)
+        db.update_download_request(rid, status="cancelled", qb_status="cancelled")
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM download_request_keys WHERE request_id=?", (rid,))
+        _, alternate, _ = self.pending(media_key=key)
+        self.assertEqual(assert_present(db.get_rss_entry(alternate))["status"], "skipped")
+        self.assertEqual(db.update_rss_entries_processed([alternate], False), 1)
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        with patch.object(dispatcher, "_submit_qb") as qb, patch.object(dispatcher, "_submit_guangya") as gy:
+            result = engine.download(alternate)
+        qb.assert_not_called()
+        gy.assert_not_called()
+        self.assertEqual(result["status"], "skipped", result)
+
     def test_current_unknown_receipt_blocks_other_resources(self):
         for status in ("outcome_unknown", "manual_review"):
             key = f"tmdb:{self.sequence+1}:tv:S01E001"

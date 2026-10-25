@@ -298,10 +298,12 @@ def _rss_delivery_columns() -> str:
 def _rss_media_blocker(conn, media_key: str, *, exclude_id: int = 0, binding: bool = False):
     # pending 只是发现，不是消费凭据。绑定时忽略尚未绑定的批量 submitting：
     # 同批确认可一次 claim 多条，但第一个绑定身份的条目才获得外部提交权。
+    # 取消仅释放所选后端的消费权；另一后端的根状态、无归属的历史回执不能代替此证据。
     return conn.execute(
         "SELECT e.id FROM rss_entry_media m JOIN rss_entries e ON e.id=m.rss_entry_id "
         + _RSS_REQUEST_JOIN +
-        "WHERE m.media_key=? AND e.id!=? AND ("
+        "WHERE m.media_key=? AND e.id!=? "
+        f"AND COALESCE(({_RSS_SELECTED_BACKEND}),'')!='cancelled' AND ("
         "e.status='submitting' "
         + ("AND e.download_request_key!='' " if binding else "") +
         f"OR (e.status='downloaded' AND NOT COALESCE({_rss_delivery_failed_sql()},0)) "
