@@ -108,7 +108,7 @@ class NotificationThreadSnapshot:
 
 def serialize_notification_event(event: NotificationEvent) -> str:
     """序列化固定安全投影；动态展示值统一收敛为字符串。"""
-    payload = {
+    payload: dict[str, object] = {
         "title": str(event.title or ""),
         "fields": [
             [str(label or ""), str(value or "")]
@@ -128,6 +128,8 @@ def serialize_notification_event(event: NotificationEvent) -> str:
         "field_emojis": event.field_emojis,
         "state": (event.state or ""),
     }
+    if event.lifecycle:
+        payload["lifecycle"] = event.lifecycle
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -175,6 +177,7 @@ def deserialize_notification_event(payload: str) -> NotificationEvent:
         layout=str(data.get("layout") or "default"),
         field_emojis=bool(data.get("field_emojis", True)),
         state=str(data.get("state") or ""),
+        lifecycle=dict(data["lifecycle"]) if isinstance(data.get("lifecycle"), dict) else {},
     )
 
 
@@ -853,6 +856,7 @@ def _publish(
     agent_continuation_delivery: Mapping[str, Any] | None = None,
     agent_effect_delivery: Mapping[str, Any] | None = None,
     expected_confirmation_delivery: tuple[int, int] | None = None,
+    expected_revision: int | None = None,
 ) -> NotificationPublishResult:
     normalized_importance = NotificationImportance(_importance(importance))
     normalized_topic = _topic(topic)
@@ -968,6 +972,7 @@ def _publish(
         preferred_message_id=(preferred_message_id or 0),
         replace=thread,
         expected_confirmation_delivery=expected_confirmation_delivery,
+        **({"expected_revision": expected_revision} if expected_revision is not None else {}),
     )
     if row is None:
         return NotificationPublishResult(False, status="invalid", event_key=key)
@@ -1149,6 +1154,7 @@ def publish_notification_thread(
     deliver_now: bool = True,
     delivery_route: Mapping[str, Any] | None = None,
     expected_confirmation_delivery: tuple[int, int] | None = None,
+    expected_revision: int | None = None,
 ) -> NotificationPublishResult:
     return _publish(
         thread_key,
@@ -1162,6 +1168,7 @@ def publish_notification_thread(
         deliver_now=deliver_now,
         delivery_route=delivery_route,
         expected_confirmation_delivery=expected_confirmation_delivery,
+        expected_revision=expected_revision,
     )
 
 

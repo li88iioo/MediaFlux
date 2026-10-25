@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Sequence
 
 from app.modules.telegram_media_projection import (
@@ -12,10 +13,12 @@ from app.modules.telegram_media_projection import (
 )
 from app.modules.telegram_notification_center import (
     NotificationPublishResult,
-    get_notification_thread_event,
     get_notification_thread_snapshot,
     publish_notification_thread,
+    deserialize_notification_event,
 )
+from app.logger import get_logger
+from app.repositories.telegram_notifications import list_recovered_organize_refresh_notifications
 from app.modules.telegram_notification_policy import (
     NotificationImportance,
     NotificationTopic,
@@ -186,6 +189,11 @@ def build_organize_confirmation_rollup(
 
 
 def _event_downstream_failed(event: NotificationEvent) -> bool:
+    if event.lifecycle.get("refresh"):
+        return True
+    if "downstream" in event.lifecycle:
+        downstream = event.lifecycle["downstream"]
+        return bool(downstream.get("partial") or downstream.get("error"))
     values = (
         _field_value(event, "STRM"),
         _field_value(event, "媒体库"),
@@ -394,6 +402,12 @@ def build_organize_lifecycle_event(
         footer=footer,
         layout="relaxed",
         state=lifecycle_state,
+        lifecycle={"parent": {
+            "title": title, "footer": footer,
+            "state": lifecycle_state if lifecycle_state in {"stopped", "failed"} else
+                     "partial" if attention else "completed",
+            "importance": _importance(stats).value,
+        }},
     )
     return attach_bounded_media_details(
         event,
@@ -414,11 +428,12 @@ def update_organize_lifecycle_confirmations(
 ) -> NotificationPublishResult:
     """全部 Telegram 候选收口后，一次性回写原整理汇总。"""
     thread_key = f"organize:{task_id!s}"
-    previous = get_notification_thread_event(
+    snapshot = get_notification_thread_snapshot(
         thread_key, topic=NotificationTopic.ORGANIZE, chat_id=chat_id,
     )
-    if previous is None:
+    if snapshot is None:
         return NotificationPublishResult(False, status="missing_thread")
+    previous = snapshot.event
 
     base = {
         key: safe_int(baseline.get(key), 0, minimum=0)
@@ -470,15 +485,15 @@ def update_organize_lifecycle_confirmations(
     stopped = bool(baseline.get("stopped"))
     scan_incomplete = bool(baseline.get("scan_incomplete"))
     downstream_failed = _event_downstream_failed(previous)
-    attention = bool(
+    parent_attention = bool(
         stopped
         or scan_incomplete
         or counts["confirm"]
         or counts["skipped"]
         or counts["failed"]
         or expired
-        or downstream_failed
     )
+    attention = parent_attention or downstream_failed
     if stopped:
         title = "⏹️ 光鸭整理已停止"
     elif attention:
@@ -527,6 +542,16 @@ def update_organize_lifecycle_confirmations(
         layout=previous.layout,
         field_emojis=previous.field_emojis,
         state=lifecycle_state,
+        lifecycle={**previous.lifecycle, "downstream": previous.lifecycle.get("downstream", {
+            "partial": downstream_failed,
+            "error": str(previous.footer) if downstream_failed else "",
+        }), "parent": {
+            "title": ("⏹️ 光鸭整理已停止" if stopped else
+                      "⚠️ 光鸭整理部分完成" if parent_attention else "✅ 光鸭整理完成"),
+            "footer": footer,
+            "state": "stopped" if stopped else "partial" if parent_attention else "completed",
+            "importance": "error" if parent_attention else "result",
+        }},
     )
     return publish_notification_thread(
         thread_key,
@@ -538,6 +563,7 @@ def update_organize_lifecycle_confirmations(
         ),
         chat_id=chat_id,
         topic_enabled=topic_enabled,
+        expected_revision=snapshot.revision,
     )
 
 
@@ -591,48 +617,104 @@ def update_organize_lifecycle_downstream(
     partial: bool = False,
     error: str = "",
     topic_enabled: bool = True,
+    refresh_handoff: dict[str, Any] | None = None,
 ) -> NotificationPublishResult:
     thread_key = f"organize:{task_id!s}"
-    previous = get_notification_thread_event(
-        thread_key, topic=NotificationTopic.ORGANIZE, chat_id=chat_id,
+    for _ in range(3):
+        snapshot = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.ORGANIZE, chat_id=chat_id,
+        )
+        if snapshot is None:
+            return NotificationPublishResult(False, status="missing_thread")
+        previous = snapshot.event
+        downstream = previous.lifecycle.get("downstream", {})
+        receipt = previous.lifecycle.get("refresh")
+        if refresh_handoff:
+            entries = set(tuple(item) for item in (receipt or {}).get("entries", []))
+            entries.update((path, refresh_handoff["allow_emby"]) for path in refresh_handoff["paths"])
+            receipt = {"entries": sorted(entries), "pending_label": media_refresh, "error": error}
+        # 刷新错误单独结算；后续单批成功不能清掉前批非刷新错误。
+        preserve_failure = bool(refresh_handoff) or not (partial or error)
+        event, importance = _project_downstream(
+            previous, strm_status=strm_status, media_refresh=media_refresh,
+            partial=bool(downstream.get("partial")) if preserve_failure else partial,
+            error=str(downstream.get("error") or "") if preserve_failure else error,
+            refresh_handoff=receipt,
+        )
+        result = publish_notification_thread(
+            thread_key, event, topic=NotificationTopic.ORGANIZE,
+            importance=importance, chat_id=chat_id, topic_enabled=topic_enabled,
+            expected_revision=snapshot.revision,
+        )
+        if result or result.status != "invalid":
+            return result
+        # 确认汇总/刷新恢复抢先提交：重新读取后合并，不回写旧父统计和旧 marker。
+    return result
+
+
+def _project_downstream(
+    previous: NotificationEvent, *, strm_status: str, media_refresh: str,
+    partial: bool = False, error: str = "", refresh_handoff: dict[str, Any] | None = None,
+) -> tuple[NotificationEvent, str]:
+    # 老消息没有分层事实，保留原结论；不能把无法归因的警告推断成成功。
+    parent = previous.lifecycle.get("parent") or {
+        "title": str(previous.title), "footer": str(previous.footer),
+        "state": (previous.state if previous.state in {"stopped", "failed"} else
+                  "stopped" if str(previous.title).startswith("⏹️") else
+                  "partial" if str(previous.title).startswith(("⚠️", "⏳")) else "completed"),
+        "importance": "action" if str(previous.title).startswith("⏳") else "result",
+    }
+    failed = bool(partial or error or refresh_handoff)
+    state = (parent["state"] if parent["state"] in {"stopped", "failed"} else
+             "queued" if strm_status.strip() in _PENDING_STRM_STATES else
+             "partial" if failed else parent["state"])
+    fields = _replace_field(previous.fields, "STRM", strm_status)
+    if refresh_handoff:
+        media_refresh = refresh_handoff["pending_label"]
+    fields = _replace_field(fields, "媒体库", media_refresh)
+    lifecycle = {"parent": parent, "downstream": {"partial": partial, "error": error}}
+    if refresh_handoff:
+        lifecycle["refresh"] = refresh_handoff
+    downstream_error = error or (refresh_handoff or {}).get("error", "")
+    event = replace(
+        previous,
+        title="⚠️ 光鸭整理链路部分完成" if failed and state != "stopped" else parent["title"],
+        footer=downstream_error[:260] if downstream_error else parent["footer"], fields=fields,
+        state=state, lifecycle=lifecycle,
     )
-    if previous is None:
-        return NotificationPublishResult(False, status="missing_thread")
-    fields = _replace_field(previous.fields, "STRM", (strm_status or ""))
-    fields = _replace_field(fields, "媒体库", (media_refresh or ""))
-    title = str(previous.title)
-    footer = previous.footer
-    importance = NotificationImportance.RESULT
-    if partial or error:
-        title = "⚠️ 光鸭整理链路部分完成"
-        importance = NotificationImportance.ERROR
-        if error:
-            footer = error[:260]
-    elif title.startswith("⏳"):
-        importance = NotificationImportance.ACTION
-    if title.startswith("⏹️"):
-        lifecycle_state = "stopped"
-    elif (strm_status or "").strip() in _PENDING_STRM_STATES:
-        lifecycle_state = "queued"
-    elif partial or error or title.startswith(("⚠️", "⏳")):
-        lifecycle_state = "partial"
-    else:
-        lifecycle_state = "completed"
-    event = NotificationEvent(
-        title,
-        fields=fields,
-        lines=previous.lines,
-        footer=footer,
-        actions=previous.actions,
-        layout=previous.layout,
-        field_emojis=previous.field_emojis,
-        state=lifecycle_state,
-    )
-    return publish_notification_thread(
-        thread_key,
-        event,
-        topic=NotificationTopic.ORGANIZE,
-        importance=importance,
-        chat_id=chat_id,
-        topic_enabled=topic_enabled,
-    )
+    return event, "error" if failed else parent["importance"]
+
+
+def reconcile_organize_refresh_notifications() -> int:
+    """刷新 ACK 后（也包括进程重启），通过原通知 outbox 幂等收敛同一消息。"""
+    from app.modules.organize_probe_notifications import probe_downstream_state
+
+    updated = 0
+    try:
+        rows = list_recovered_organize_refresh_notifications()
+    except Exception:
+        get_logger(__name__).exception("读取整理刷新通知失败，下轮重试")
+        return 0
+    for row in rows:
+        try:
+            previous = deserialize_notification_event(row["event_json"])
+            downstream = previous.lifecycle.get("downstream", {})
+            status, partial, error = probe_downstream_state(
+                {"topic": "organize", "thread_key": row["thread_key"], "chat_id": row["chat_id"]},
+                strm_status=_field_value(previous, "STRM"),
+                partial=bool(downstream.get("partial")), error=str(downstream.get("error") or ""),
+            )
+            event, importance = _project_downstream(
+                # ACK 证明刷新队列已接管；配置可能已变，不猜测具体 provider 或扫描终态。
+                previous, strm_status=status, media_refresh="已排队",
+                partial=partial, error=error,
+            )
+            result = publish_notification_thread(
+                row["thread_key"], event, topic=NotificationTopic.ORGANIZE,
+                importance=importance, chat_id=row["chat_id"], expected_revision=row["revision"],
+            )
+            updated += bool(result)
+        except Exception:
+            # 保留原通知中的刷新依据，下轮重试；不能使成功 ACK 反向失败。
+            get_logger(__name__).exception("恢复整理刷新通知失败 event=%s", row["event_key"])
+    return updated

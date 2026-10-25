@@ -189,8 +189,15 @@ def publish_probe_scope(scope: dict, *, strm_status: str, media_refresh: str,
             )
             scoped_failed = bool(scoped_partial or scoped_error)
             # unknown 可以保存新期望内容；通知中心保持 unknown，不重新发送。
-            # 后台单项成功没有资格清掉父事务的待操作/异常结论。
-            if not failed and (previous.event.state == "partial" or str(previous.event.title).startswith(("⚠️", "⏳"))):
+            # 分层整理消息可更新已结算的 probe 状态，同时保留 parent 警告。
+            # 未归因的旧消息或仍存在其他下游错误时，单项成功不能清掉告警。
+            from app.modules.telegram_organize_lifecycle import _event_downstream_failed
+
+            can_project_parent = (
+                ref["topic"] == "organize" and previous.event.lifecycle.get("parent")
+                and not _event_downstream_failed(previous.event)
+            )
+            if not failed and not can_project_parent and (previous.event.state == "partial" or str(previous.event.title).startswith(("⚠️", "⏳"))):
                 handled = True
                 continue
             safe_error = "后台规格补全后的 STRM 同步异常，请在 Web 运行记录中查看。" if scoped_failed else ""

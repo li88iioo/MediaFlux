@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app.modules.organize import Organizer, OrganizeRules
@@ -263,8 +264,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         )
         published = []
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             side_effect=lambda _key, event, **_kwargs: (
@@ -301,8 +302,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
             media_refresh="Jellyfin 已排队",
         )
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             return_value=_accepted(),
@@ -350,8 +351,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
 
         published = []
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             side_effect=lambda _key, event, **_kwargs: (
@@ -402,8 +403,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         )
         published = []
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             side_effect=lambda _key, event, **_kwargs: (
@@ -459,8 +460,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         )
         published = []
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             side_effect=lambda _key, event, **_kwargs: (
@@ -503,8 +504,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         )
         published = []
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             side_effect=lambda _key, event, **_kwargs: (
@@ -539,8 +540,8 @@ class OrganizeNotificationDeliveryTests(IsolatedDatabaseTestCase):
         )
         published = []
         with patch(
-            "app.modules.telegram_organize_lifecycle.get_notification_thread_event",
-            return_value=previous,
+            "app.modules.telegram_organize_lifecycle.get_notification_thread_snapshot",
+            return_value=SimpleNamespace(event=previous, revision=1),
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_notification_thread",
             side_effect=lambda _key, event, **_kwargs: (

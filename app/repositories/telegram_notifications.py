@@ -35,6 +35,7 @@ def upsert_notification(
     preferred_message_id: int = 0,
     replace: bool = False,
     expected_confirmation_delivery: tuple[int, int] | None = None,
+    expected_revision: int | None = None,
 ) -> dict[str, Any] | None:
     """登记一次性事件或更新消息线程。
 
@@ -64,6 +65,8 @@ def upsert_notification(
             "telegram_notification_outbox WHERE event_key=?",
             (key,),
         ).fetchone()
+        if expected_revision is not None and (row is None or row["revision"] != expected_revision):
+            return None
         if row is None:
             conn.execute(
                 "INSERT INTO telegram_notification_outbox("
@@ -163,6 +166,22 @@ def get_notification(event_key: str) -> dict[str, Any] | None:
             ((event_key or ""),),
         ).fetchone()
         return dict(row) if row is not None else None
+
+
+def list_recovered_organize_refresh_notifications(*, limit: int = 100) -> list[dict[str, Any]]:
+    """仅选本消息全部刷新路径已交接的父通知；待恢复依据仍在原 outbox。"""
+    with db.get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM telegram_notification_outbox AS n WHERE topic='organize' "
+            "AND json_valid(event_json) "
+            "AND json_array_length(event_json,'$.lifecycle.refresh.entries')>0 "
+            "AND NOT EXISTS (SELECT 1 FROM strm_refresh_outbox AS r "
+            "JOIN json_each(n.event_json,'$.lifecycle.refresh.entries') AS p "
+            "ON r.path=json_extract(p.value,'$[0]') "
+            "WHERE r.allow_emby=json_extract(p.value,'$[1]')) "
+            "ORDER BY id LIMIT ?", (max(1, min(limit, 1000)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def invalidate_pending_download_notifications_conn(
@@ -578,6 +597,8 @@ def purge_notifications(*, retention_days: int = 30, limit: int = 1000) -> int:
             "SELECT candidate.id FROM telegram_notification_outbox AS candidate WHERE "
             "((status IN ('sent','suppressed') AND updated_at<?) OR "
             "(status IN ('failed','outcome_unknown') AND updated_at<?)) "
+            "AND (NOT json_valid(event_json) OR "
+            "COALESCE(json_array_length(event_json,'$.lifecycle.refresh.entries'),0)=0) "
             f"""AND (candidate.event_key NOT LIKE ? OR (
                 SELECT COUNT(CASE WHEN pending.status IN ('pending','retry_wait','sending') THEN 1 END)
                 FROM telegram_notification_outbox AS pending

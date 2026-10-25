@@ -258,6 +258,8 @@ class NotificationEvent:
     field_emojis: bool = True
     # 供 lifecycle/outbox 保存机器状态；展示层不得依赖或渲染该字段。
     state: str = ""
+    # 生命周期投影依据，仅持久化，不渲染为消息正文。
+    lifecycle: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

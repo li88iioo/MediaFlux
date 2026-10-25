@@ -176,6 +176,7 @@ def _publish_foreground_linked_notification_threads(
     media_refresh: str,
     partial: bool = False,
     error: str = "",
+    refresh_handoff: dict[str, Any] | None = None,
 ) -> bool:
     accepted = False
     if options.get("notify_override") is False:
@@ -216,6 +217,7 @@ def _publish_foreground_linked_notification_threads(
                     partial=scoped_partial,
                     error=scoped_error,
                     topic_enabled=bool(ref.get("topic_enabled", True)),
+                    **({"refresh_handoff": refresh_handoff} if refresh_handoff else {}),
                 )
             ) or accepted
     except Exception as exc:
@@ -254,6 +256,7 @@ def _publish_foreground_linked_notification_threads(
 def _publish_linked_notification_threads(
     options: dict[str, Any], *, strm_status: str, media_refresh: str,
     partial: bool = False, error: str = "",
+    refresh_handoff: dict[str, Any] | None = None,
 ) -> bool:
     accepted = False
     scopes = notification_scopes(options)
@@ -268,6 +271,8 @@ def _publish_linked_notification_threads(
             accepted = publish(
                 scope, strm_status=strm_status, media_refresh=media_refresh,
                 partial=partial, error=scoped_error,
+                **({"refresh_handoff": refresh_handoff}
+                   if refresh_handoff and not scope.get("probe") else {}),
             ) or accepted
         except Exception as exc:
             logger.warning("STRM 更新通知范围失败 type=%s", type(exc).__name__)
@@ -2007,6 +2012,7 @@ class STRMScheduler:
             stats = aggregate
             self._set_progress("refresh", 0, 1, "提交媒体库刷新")
             refresh_started = monotonic()
+            refresh_entries: list[dict[str, Any]] = []
             media_refresh = self._refresh_media_servers(
                 emby_enabled=options.get("emby_refresh_override"),
                 media_server_refresh_enabled=options.get(
@@ -2017,6 +2023,7 @@ class STRMScheduler:
                 changed_dirs=list(stats.get("changed_dirs") or []),
                 immediate=trigger_type in {"manual", "telegram"},
                 request_owners=options.get("download_request_owners"),
+                handoff_entries=refresh_entries,
             )
             stats["refresh_elapsed_seconds"] = round(
                 max(0.0, monotonic() - refresh_started), 3
@@ -2076,12 +2083,21 @@ class STRMScheduler:
                 empty_retry_delay=1.0,
             )
             refresh_label = _refresh_notification_label(media_refresh)
+            # 恢复只表示统一刷新队列已接管，契约与首次入队成功一致。
+            # 原通知持有精确路径；worker ACK 后即使重启也能恢复同一消息。
+            refresh_handoff = None
+            if refresh_pending and not strm_partial and refresh_entries:
+                refresh_handoff = {
+                    "paths": [entry["path"] for entry in refresh_entries],
+                    "allow_emby": refresh_entries[0]["allow_emby"],
+                }
             _publish_linked_notification_threads(
                 options,
                 strm_status="部分完成" if strm_partial else "完成",
                 media_refresh=refresh_label,
                 partial=partial,
                 error=partial_error,
+                refresh_handoff=refresh_handoff,
             )
             self._notify_scoped_results(
                 options, stats, media_refresh, elapsed, trigger_type, source_results, strm_root,
@@ -2181,6 +2197,7 @@ class STRMScheduler:
         immediate: bool = False,
         persist_only: bool = False,
         request_owners: Iterable[dict[str, Any]] | None = None,
+        handoff_entries: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """统一规划并保存刷新意图；关停时仅落盘，不唤醒消费者。"""
         if not has_changes:
@@ -2216,6 +2233,8 @@ class STRMScheduler:
         # 投递统一刷新队列；投递失败只重试刷新，绝不重新生成 STRM。
         owner_kwargs: _RefreshOwnerOptions = {"request_owners": request_owners} if request_owners else {}
         entries = db.enqueue_strm_refresh_paths(targets, allow_emby=allow_emby, **owner_kwargs)
+        if handoff_entries is not None:
+            handoff_entries.extend(entries)
         if persist_only:
             return {"媒体库": "pending"}
         try:
