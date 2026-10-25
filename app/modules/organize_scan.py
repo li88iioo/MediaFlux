@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable
 
 from app.clients.guangya import GuangYaFile
 from app.logger import get_logger
+from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
 from app.modules.special_media import (
     is_special_media_name,
     is_special_path,
@@ -34,6 +35,31 @@ def filter_source_entries(
     if source_member_ids is None:
         return entries
     return [item for item in entries if item.file_id in source_member_ids]
+
+
+def validate_source_snapshot(
+    expected: GuangYaFile, current: GuangYaFile | None, *, role: str,
+) -> GuangYaFile:
+    """扫描回读和最终写前回读遵守同一对象身份、位置及版本约束。"""
+    if (current is None or current.file_id != expected.file_id
+            or current.is_dir != expected.is_dir):
+        raise DirectoryScrapeConflictError(
+            f"{role}已不存在或类型已变化，请刷新目录后重试"
+        )
+    mismatches = []
+    if (current.name or "") != (expected.name or ""):
+        mismatches.append("文件名")
+    if (current.parent_id or "") != (expected.parent_id or ""):
+        mismatches.append("所在目录")
+    if not expected.is_dir and (current.size or 0) != (expected.size or 0):
+        mismatches.append("文件大小")
+    if expected.etag and (current.etag or "") != expected.etag:
+        mismatches.append("ETag")
+    if mismatches:
+        raise DirectoryScrapeConflictError(
+            f"{role}在预览后发生变化（{'、'.join(mismatches)}），请刷新目录后重试"
+        )
+    return current
 
 
 def record_protected_staging(
@@ -95,6 +121,7 @@ class OrganizeScanResult:
     video_files_by_path: dict[str, list[GuangYaFile]]
     protected_sources: set[str]
     source_root_name: str
+    source_entries: dict[str, tuple[GuangYaFile, ...]] = field(default_factory=dict)
 
 
 class TraversalLimitExceeded(RuntimeError):
@@ -146,6 +173,8 @@ class _ScanAccumulator:
     metadata_exts: set[str]
     source_root_name: str
     traversal: TraversalBudget
+    snapshots_by_parent: dict[str, list[GuangYaFile]] = field(default_factory=dict)
+    source_entries: dict[str, tuple[GuangYaFile, ...]] = field(default_factory=dict)
 
 
 class OrganizerScanner:
@@ -176,13 +205,18 @@ class OrganizerScanner:
         protected_sources = set(context.protected_source_ids) | set(context.protected_staging_ids)
         protected_sources.discard(context.source_dir_id)
         source_root_name = context.source_name.strip()
-        try:
-            stats["scan_file_info_calls"] += 1
-            source_info = self.client.file_info(context.source_dir_id)
-            if source_info is not None and getattr(source_info, "name", ""):
-                source_root_name = str(source_info.name).strip()
-        except Exception:
-            pass
+        if context.source_entries is None:
+            source_info = None
+            try:
+                stats["scan_file_info_calls"] += 1
+                source_info = self.client.file_info(context.source_dir_id)
+                if source_info is not None and getattr(source_info, "name", ""):
+                    source_root_name = str(source_info.name).strip()
+            except Exception:
+                pass
+            expected_root = (context.source_snapshots or {}).get(context.source_dir_id)
+            if expected_root is not None:
+                validate_source_snapshot(expected_root, source_info, role="待确认目录")
 
         accumulator = _ScanAccumulator(
             stats=stats,
@@ -196,6 +230,12 @@ class OrganizerScanner:
             source_root_name=source_root_name,
             traversal=TraversalBudget(*self.traversal_limits),
         )
+        for item in (context.source_snapshots or {}).values():
+            if item.file_id == context.source_dir_id or (
+                restriction is not None and item.file_id == restriction.dir_id
+            ):
+                continue
+            accumulator.snapshots_by_parent.setdefault(item.parent_id, []).append(item)
         try:
             if restriction is None:
                 self._scan_directory(
@@ -250,6 +290,8 @@ class OrganizerScanner:
         stats["scan_entries"] = accumulator.traversal.entries
         stats["scan_duplicate_dirs"] = accumulator.traversal.duplicates
         stats["scan_elapsed_seconds"] = round(time.monotonic() - started, 3)
+        if accumulator.snapshots_by_parent and not context.cancelled():
+            raise DirectoryScrapeConflictError("待确认来源集合已变化，请刷新目录后重试")
         return OrganizeScanResult(
             scanned_videos=accumulator.scanned_videos,
             scanned_dirs=accumulator.scanned_dirs,
@@ -257,6 +299,7 @@ class OrganizerScanner:
             video_files_by_path=accumulator.video_files_by_path,
             protected_sources=accumulator.protected_sources,
             source_root_name=accumulator.source_root_name,
+            source_entries=accumulator.source_entries,
         )
 
     def _max_files_reached(
@@ -299,8 +342,11 @@ class OrganizerScanner:
         if not accumulator.traversal.enter(dir_id, depth):
             return False
         try:
-            stats["scan_list_dir_calls"] += 1
-            files = self.client.list_dir(dir_id)
+            if context.source_entries is None:
+                stats["scan_list_dir_calls"] += 1
+                files = self.client.list_dir(dir_id)
+            else:
+                files = list(context.source_entries[dir_id])
             accumulator.traversal.consume_entries(len(files))
             files = filter_source_entries(files, context.source_member_ids)
         except TraversalLimitExceeded:
@@ -309,6 +355,17 @@ class OrganizerScanner:
             logger.error("列目录失败 dir_id=%s type=%s", dir_id, type(exc).__name__)
             stats["scan_errors"].append(f"{dir_id}: 目录读取失败")
             return False
+
+        if context.source_snapshots is not None and not context.cancelled():
+            current_by_id = {item.file_id: replace(item) for item in files}
+            for expected in accumulator.snapshots_by_parent.pop(dir_id, []):
+                validate_source_snapshot(
+                    expected, current_by_id.get(expected.file_id), role="待确认来源",
+                )
+                current_by_id[expected.file_id] = replace(expected)
+            # 成员范围与版本约束独立：允许目录只有成员 ID，文件仍保持原确认版本。
+            files = list(current_by_id.values())
+            accumulator.source_entries[dir_id] = tuple(files)
 
         accumulator.video_files_by_path[rel] = [
             item

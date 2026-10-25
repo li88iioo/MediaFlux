@@ -33,7 +33,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from difflib import SequenceMatcher
-from typing import TYPE_CHECKING, Any, Callable, Literal, overload
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping, overload
 
 from app import database as db
 from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
@@ -147,6 +148,7 @@ from app.modules.organize_scan import (
     ScanRestriction,
     TraversalBudget,
     TraversalLimitExceeded,
+    validate_source_snapshot,
 )
 from app.modules.recognition.resolver import (
     _has_explicit_tmdb_marker,
@@ -2445,7 +2447,7 @@ class Organizer:
             raise OrganizeScanUnsafeError(
                 "目录扫描超过安全上限，未执行整理；请缩小来源范围后重试"
             )
-        if context.require_complete_scan and stats.get("scan_errors"):
+        if (context.require_complete_scan or context.source_snapshots is not None) and stats.get("scan_errors"):
             raise OrganizeScanUnsafeError(
                 "目录扫描不完整，已在首次云盘写入前终止，请稍后重试"
             )
@@ -2519,6 +2521,7 @@ class Organizer:
             operation_token=context.operation_token,
             notification_context=context.notification_context,
             task_runtime=context.task_runtime,
+            source_snapshots=context.source_snapshots,
         )
         stats["execute_elapsed_seconds"] = round(
             time.monotonic() - execute_started, 3
@@ -2599,7 +2602,8 @@ class Organizer:
                  planning_executor: Executor | None = None,
                  execution_lock: object | None = None,
                  task_runtime: OrganizeTaskRuntime | None = None,
-                 source_member_ids: frozenset[str] | None = None) -> tuple[list, dict]:
+                 source_member_ids: frozenset[str] | None = None,
+                 source_snapshots: Mapping[str, GuangYaFile] | None = None) -> tuple[list, dict]:
         """兼容入口；内部阶段统一通过 :class:`OrganizeContext` 传参。"""
         from app.modules.organize_probe_notifications import (
             apply_notification_context,
@@ -2616,6 +2620,11 @@ class Organizer:
                 notify_enabled=rules.notify_enabled,
                 topic_enabled=rules.notify_enabled and rules.library_notify,
             )
+        frozen_sources = (
+            None if source_snapshots is None else MappingProxyType({
+                item.file_id: replace(item) for item in source_snapshots.values()
+            })
+        )
         context = OrganizeContext(
             source_dir_id=source_dir_id,
             dry_run=dry_run,
@@ -2643,9 +2652,9 @@ class Organizer:
             execution_lock=execution_lock,
             task_runtime=task_runtime,
             source_member_ids=(
-                None if source_member_ids is None
-                else frozenset(item for item in source_member_ids)
+                None if source_member_ids is None else frozenset(source_member_ids)
             ),
+            source_snapshots=frozen_sources,
         )
         plans, stats = self._organize(context, rules)
         apply_notification_context(stats, frozen_notification)
@@ -2911,6 +2920,13 @@ class Organizer:
         from app.modules.media_probe import resolve_media_probe_workers
 
         group_context = replace(context, post_actions=False)
+        group_contexts = {
+            task.key: (
+                group_context.for_group(self._group_restriction(task), self.video_exts(rules))
+                if context.source_entries is not None else group_context
+            )
+            for task in tasks
+        }
         plans: list[OrganizePlan] = []
         results: list[OrganizeGroupResult] = []
         planner_local = threading.local()
@@ -2954,9 +2970,9 @@ class Organizer:
             nonlocal probe_elapsed_total, planning_finished_at
             try:
                 planner = planner_for_thread()
-                run_context = group_context
+                run_context = group_contexts[task.key]
                 if probe_cap_event.is_set():
-                    run_context = replace(group_context, media_probe_cache_only=True)
+                    run_context = replace(run_context, media_probe_cache_only=True)
                 prepared = self._prepare_group_plan(
                     planner,
                     task,
@@ -3101,6 +3117,7 @@ class Organizer:
                     )
                 else:
                     try:
+                        write_context = group_contexts[task.key]
                         _stage(GROUP_STAGE_PLAN)
                         writer_wait_started = time.monotonic()
                         with _optional_execution_lock(context.execution_lock):
@@ -3111,12 +3128,12 @@ class Organizer:
                             # 仲裁必须在同一单写门内基于最新状态重新执行。
                             self._existing_variant_cache.clear()
                             target_loader, history_loader = self._task_conflict_loaders(
-                                group_context, rules, group_stats,
+                                write_context, rules, group_stats,
                             )
                             finalized = self._finalize_planning_result(
                                 prepared.scan_result,
                                 prepared.planning_result,
-                                group_context,
+                                write_context,
                                 rules,
                                 group_stats,
                                 target_inventory_loader=target_loader,
@@ -3126,7 +3143,7 @@ class Organizer:
                             self._run_execution_stage(
                                 prepared.scan_result,
                                 finalized,
-                                group_context,
+                                write_context,
                                 rules,
                                 group_stats,
                                 on_progress=_file_progress,
@@ -3276,6 +3293,23 @@ class Organizer:
                 "目录扫描不完整，已在首次云盘写入前终止，请稍后重试"
             )
 
+        if context.source_snapshots is not None:
+            # 先验证整份确认选集，防止枚举遗漏消失的文件/目录；后续组扫描
+            # 复用此次已读取的条目，并同步切片成员与版本约束，不再读取来源。
+            snapshot_stats = self._initial_stats()
+            source_scan = self._scan_source(context, rules, snapshot_stats)
+            self._validate_scan_for_execution(context, snapshot_stats)
+            if context.cancelled():
+                stats.update(snapshot_stats)
+                stats["stopped"] = 1
+                return [], stats
+            for key in ("scan_file_info_calls", "scan_list_dir_calls", "scan_elapsed_seconds"):
+                stats[key] = snapshot_stats[key]
+            context = replace(
+                context, source_entries=source_scan.source_entries,
+                source_name=source_scan.source_root_name,
+            )
+
         tasks = enumeration.tasks
         rows: dict[str, dict[str, Any]] = {
             task.key: {
@@ -3362,9 +3396,12 @@ class Organizer:
                     )
                 run_context = replace(group_context, media_probe_cache_only=True)
             try:
+                restriction = self._group_restriction(task)
+                if run_context.source_entries is not None:
+                    run_context = run_context.for_group(restriction, self.video_exts(rules))
                 scan_result = self._scan_source(
                     run_context, rules, group_stats,
-                    restriction=self._group_restriction(task),
+                    restriction=restriction,
                 )
                 # 组内写入前即拒绝不完整快照，避免基于部分目录规划云盘变更。
                 self._validate_scan_for_execution(run_context, group_stats)
@@ -7248,25 +7285,7 @@ class Organizer:
                 "远端客户端 file_info 返回未知类型，无法执行写前快照复核",
             )
             return expected
-        if current is None or current.is_dir:
-            raise DirectoryScrapeConflictError(
-                f"{role}已不存在或类型已变化，请刷新目录后重试"
-            )
-        mismatches: list[str] = []
-        if str(getattr(current, "name", "") or "") != (expected.name or ""):
-            mismatches.append("文件名")
-        if str(getattr(current, "parent_id", "") or "") != (expected.parent_id or ""):
-            mismatches.append("所在目录")
-        if int(getattr(current, "size", 0) or 0) != (expected.size or 0):
-            mismatches.append("文件大小")
-        expected_etag = (expected.etag or "")
-        if expected_etag and str(getattr(current, "etag", "") or "") != expected_etag:
-            mismatches.append("ETag")
-        if mismatches:
-            raise DirectoryScrapeConflictError(
-                f"{role}在预览后发生变化（{'、'.join(mismatches)}），请刷新目录后重试"
-            )
-        return current
+        return validate_source_snapshot(expected, current, role=role)
 
     @staticmethod
     def _write_organize_audit(

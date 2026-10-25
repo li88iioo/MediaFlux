@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
 
 from app import database as db
-from app.clients.guangya import GuangYaClient, close_guangya_client
+from app.clients.guangya import GuangYaClient, GuangYaFile, close_guangya_client
 from app.config import get
 from app.logger import get_logger
 from app.modules.directory_scrape import FixedMatchScraper
@@ -2576,6 +2576,14 @@ def _execute_guangya_confirmation(
 
         files = [dict(item) for item in (payload.get("files") or [])]
         companions = [dict(item) for item in (payload.get("companions") or [])]
+        source_snapshots = {
+            str(item.get("file_id") or ""): GuangYaFile(
+                str(item.get("file_id") or ""), str(item.get("name") or ""), False,
+                int(item.get("size") or 0), str(item.get("etag") or ""),
+                str(item.get("parent_id") or "0"),
+            )
+            for item in (*files, *companions)
+        }
         parent_id = str(payload.get("source_parent_id") or "0")
         if not files or any(str(item.get("parent_id") or "0") != parent_id for item in files):
             raise DirectoryScrapeConflictError("待确认文件作用域无效，请重新执行整理")
@@ -2639,6 +2647,7 @@ def _execute_guangya_confirmation(
             source_name=str(payload.get("directory") or payload.get("source_name") or ""),
             require_complete_scan=True,
             source_member_ids=frozenset(allowed_ids),
+            source_snapshots=source_snapshots,
             group_pipeline=False,
             # 预览在线探测并预热缓存，保证随后只读缓存的执行阶段命名一致。
             media_probe_cache_only=False,
@@ -2680,6 +2689,7 @@ def _execute_guangya_confirmation(
             source_name=str(payload.get("directory") or payload.get("source_name") or ""),
             require_complete_scan=True,
             source_member_ids=frozenset(allowed_ids),
+            source_snapshots=source_snapshots,
             group_pipeline=False,
             # 执行阶段只读缓存，保持与确认预览一致；缓存由预览阶段预热。
             media_probe_cache_only=True,

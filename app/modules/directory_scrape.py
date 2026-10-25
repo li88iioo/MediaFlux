@@ -1336,9 +1336,18 @@ class DirectoryScrapeService:
                 notify_enabled=record.rules.notify_enabled,
                 topic_enabled=record.rules.notify_enabled and record.rules.library_notify,
             )
-            source_member_ids = frozenset(
-                item.file_id for item in (*current.videos, *current.companions, *current.directories)
-            )
+            # 最终重扫只验证原确认版本，不能以 current 或实时属性重新绑定授权。
+            source_snapshots = {
+                item.file_id: self._as_cloud_file(item)
+                for item in (*record.inspection.videos, *record.inspection.companions)
+            }
+            source_snapshots.update({
+                item.file_id: GuangYaFile(
+                    item.file_id, item.name, True, 0, item.etag, item.parent_id,
+                )
+                for item in record.inspection.directories
+            })
+            source_member_ids = frozenset(source_snapshots)
             organizer = Organizer(
                 client=self.client,
                 scraper=FixedMatchScraper(
@@ -1364,6 +1373,7 @@ class DirectoryScrapeService:
                 dry_run=True,
                 post_actions=False,
                 source_member_ids=source_member_ids,
+                source_snapshots=source_snapshots,
             )
             current_companions = self._companion_plans(
                 current, current_plans, signature_organizer,
@@ -1377,6 +1387,7 @@ class DirectoryScrapeService:
                 dry_run=False,
                 post_actions=False,
                 source_member_ids=source_member_ids,
+                source_snapshots=source_snapshots,
                 group_pipeline=record.scope_type == "directory" and not current.pending_videos,
                 source_name=record.inspection.directory_name,
                 require_complete_scan=True,

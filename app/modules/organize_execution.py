@@ -5,7 +5,7 @@ import threading
 import time
 from dataclasses import replace
 from inspect import getattr_static
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from app import database as db
 from app.clients.guangya import GuangYaFile
@@ -66,6 +66,7 @@ def execute_organize_plans(
     operation_token: str = "",
     notification_context: dict | None = None,
     task_runtime: OrganizeTaskRuntime | None = None,
+    source_snapshots: Mapping[str, GuangYaFile] | None = None,
 ) -> None:
     operation_token = (operation_token or "").strip()
     from app.modules.organize_probe_notifications import apply_notification_context
@@ -344,9 +345,13 @@ def execute_organize_plans(
             write_guard = getattr(organizer, "_before_plan_write", None)
             if write_guard is not None:
                 write_guard(p, "prepare")
-            video_original = GuangYaFile(
-                p.file_id, p.original_name, False, p.size, p.etag, p.original_parent_id,
+            video_original = (
+                source_snapshots[p.file_id] if source_snapshots is not None else GuangYaFile(
+                    p.file_id, p.original_name, False, p.size, p.etag, p.original_parent_id,
+                )
             )
+            if source_snapshots is not None:
+                companions = [source_snapshots[item.file_id] for item in companions]
             organizer._verify_remote_snapshot(video_original, role="待整理视频")
             for item in companions:
                 organizer._verify_remote_snapshot(

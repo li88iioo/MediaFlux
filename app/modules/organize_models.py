@@ -7,15 +7,17 @@ from __future__ import annotations
 
 import threading
 from concurrent.futures import Executor
-from dataclasses import dataclass, field
-from typing import Callable
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
+from typing import Callable, Mapping
 
+from app.clients.guangya import GuangYaFile
 from app.modules.episode_mapping import EpisodeMappingPlan
 from app.modules.media_probe import MediaProfile
 from app.modules.media_variant import MediaVariant
 from app.modules.organize_groups import OrganizeGroupTask
 from app.modules.organize_runtime import OrganizeTaskRuntime
-from app.modules.organize_scan import OrganizeScanResult
+from app.modules.organize_scan import OrganizeScanResult, ScanRestriction
 from app.modules.scraper import MatchResult
 
 
@@ -152,6 +154,43 @@ class OrganizeContext:
     notification_context: dict | None = None
     # None 保留自动整理实时发现语义；空集合表示不接纳任何来源成员。
     source_member_ids: frozenset[str] | None = None
+    # 人工确认时的原始对象版本；扫描和最终写入共用，禁止实时扫描重绑定。
+    source_snapshots: Mapping[str, GuangYaFile] | None = None
+    # 冻结选集整源扫描的只读结果；组级扫描只复用本组切片，不额外回读来源。
+    source_entries: Mapping[str, tuple[GuangYaFile, ...]] | None = field(
+        default=None, repr=False, compare=False,
+    )
+
+    def for_group(self, restriction: ScanRestriction, video_exts: set[str]) -> OrganizeContext:
+        """按目录子树或根层媒体单元同时切片成员、版本约束及扫描结果。"""
+        assert self.source_entries is not None and self.source_snapshots is not None
+        entries_by_dir = {}
+        member_ids = {restriction.dir_id}
+        pending = [restriction.dir_id]
+        while pending:
+            dir_id = pending.pop()
+            if dir_id in entries_by_dir:
+                continue
+            entries = self.source_entries[dir_id]
+            if restriction.files_only:
+                entries = tuple(
+                    item for item in entries
+                    if not item.is_dir and (
+                        not restriction.file_ids or item.file_id in restriction.file_ids
+                        or item.name.rsplit(".", 1)[-1].lower() not in video_exts
+                    )
+                )
+            entries_by_dir[dir_id] = entries
+            member_ids.update(item.file_id for item in entries)
+            pending.extend(item.file_id for item in entries if item.is_dir)
+        return replace(
+            self, source_member_ids=frozenset(member_ids),
+            source_snapshots=MappingProxyType({
+                file_id: item for file_id, item in self.source_snapshots.items()
+                if file_id in member_ids
+            }),
+            source_entries=MappingProxyType(entries_by_dir),
+        )
 
     @property
     def probe_cache_only(self) -> bool:
