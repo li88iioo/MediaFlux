@@ -3663,7 +3663,7 @@ def _run_guangya_organize_stage(
         rules,
         trigger_type="telegram",
         chat_id=str(chat_id),
-        **({"delivery_route": delivery_route} if delivery_route else {}),
+        delivery_route=delivery_route or None,
     )
     if not result.get("ok"):
         return {

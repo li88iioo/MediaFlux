@@ -6,11 +6,13 @@ import socket
 import threading
 from copy import deepcopy
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock, patch
 
 import pytest
 
 from app import database as db
+from app.clients.guangya import GuangYaClient
 from app.bot import handlers
 from app.modules import organize_tasks
 from app.modules import telegram_notification_center as center
@@ -42,12 +44,12 @@ class _OfflineOrganizer(Organizer):
     failure = False
 
     def __init__(self, client=None):
-        self.client = client or SimpleNamespace()
+        self.client = cast(GuangYaClient, client or SimpleNamespace())
 
-    def close(self):
-        pass
+    def close(self) -> bool:
+        return True
 
-    def _validate_target_outside_source(self, *_args):
+    def _validate_target_outside_source(self, source_id: str, target_id: str) -> None:
         pass
 
     def organize(self, *_args, **_kwargs):
@@ -78,9 +80,11 @@ def offline(monkeypatch):
 
 
 def _outbox(task_id, chat_id):
-    return get_notification(center.notification_thread_event_key(
+    row = get_notification(center.notification_thread_event_key(
         f"organize:{task_id}", topic=NotificationTopic.ORGANIZE, chat_id=chat_id,
     ))
+    assert row is not None
+    return row
 
 
 @pytest.mark.parametrize("chat_id,thread_id,source_thread_id", [
@@ -229,6 +233,7 @@ def test_failed_organize_persists_and_delivers_source_route(offline):
     assert state["status"] == "failed"
     expected = {"chat_id": "100", "message_thread_id": 500}
     persisted = db.get_task_run(state["run_id"])
+    assert persisted is not None
     assert json.loads(persisted["result"]).get("delivery_route") == expected
     assert read_organize_result(json.loads(persisted["result"]))["delivery_route"] == expected
     assert state["result"]["delivery_route"] == expected
@@ -268,11 +273,13 @@ def test_queued_parent_update_restores_route_from_sqlite(offline, status):
         )
         assert updated.accepted
         row = get_notification(published.event_key)
+        assert row is not None
         assert row["revision"] == 2
         assert json.loads(row["event_json"])["_delivery_route"] == route
         dispatch_stop.clear()
         delivered = center.drain_telegram_notifications(event_key=published.event_key)
         row = get_notification(published.event_key)
+        assert row is not None
         if status == "outcome_unknown":
             assert not delivered
             assert row["status"] == "outcome_unknown"
@@ -305,7 +312,9 @@ def test_admission_persists_route_before_worker_or_start_failure(offline, start_
                 trigger_type="telegram", chat_id="100", delivery_route=route,
             )
         state = manager.task_result(manager._task["id"])
+        assert state is not None
         persisted = db.get_task_run(state["run_id"])
+        assert persisted is not None
         assert bool(accepted["ok"]) is not start_fails
         assert persisted["status"] == ("failed" if start_fails else "running")
         assert json.loads(persisted["result"])["delivery_route"] == route

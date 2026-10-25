@@ -1757,7 +1757,9 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 self.submit_catalogue_search(page)
                 status = page.locator("#discovery-provider-status")
                 self.assertNotEqual(status.get_attribute("data-tone"), "ready")
-                self.assertIn("豆瓣", status.get_attribute("aria-label"))
+                label = status.get_attribute("aria-label")
+                assert label is not None
+                self.assertIn("豆瓣", label)
                 self.assertIn("不完整", page.locator("#discovery-live").inner_text())
                 self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), len(items))
                 self.assertEqual(page.locator(".discovery-state-error").count(), 0)
