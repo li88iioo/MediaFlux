@@ -2572,6 +2572,8 @@ class Organizer:
                 )
         elif rules.clean_empty and not cleanup_safe:
             stats["empty_dir_cleanup_skipped"] = 1
+            if context.cancelled():
+                stats["stopped"] = 1
             self._append_reason(
                 stats,
                 "empty_dir_cleanup_reasons",
@@ -2582,8 +2584,6 @@ class Organizer:
         stats["cleanup_elapsed_seconds"] = round(
             time.monotonic() - cleanup_started, 3
         )
-        if context.cancelled():
-            stats["stopped"] = 1
         if post_actions and not context.cancelled():
             self.trigger_post_actions(stats, rules, source_name=source_name, strm_debounce_seconds=0)
 
@@ -7533,9 +7533,6 @@ class Organizer:
 
         failure_reasons: dict[str, int] = {}
         for item in sorted(unique_dirs.values(), key=lambda row: row[1], reverse=True):
-            if cancel_check is not None and cancel_check():
-                stopped = True
-                break
             dir_id, _depth = item[:2]
             expected_etag = (item[2] or "") if len(item) > 2 else ""
             try:
@@ -7545,6 +7542,9 @@ class Organizer:
             if dir_id in protected:
                 protected_count += 1
                 continue
+            if cancel_check is not None and cancel_check():
+                stopped = True
+                break
             try:
                 if self.client.list_dir(dir_id):
                     not_empty += 1

@@ -865,7 +865,7 @@ class OrganizeCleanupCancellationTests(IsolatedDatabaseTestCase):
                         audits = conn.execute("SELECT status FROM organize_delete_audit").fetchall()
                     self.assertEqual([row["status"] for row in audits], ["blocked"])
 
-    def test_cancel_after_final_directory_delete_still_reports_stopped(self):
+    def test_cancel_after_final_directory_delete_preserves_completed_work(self):
         for grouping in (True, False):
             with self.subTest(grouping=grouping), isolated_test_database():
                 cloud, organizer, rules = self._fixture()
@@ -884,4 +884,7 @@ class OrganizeCleanupCancellationTests(IsolatedDatabaseTestCase):
                         cancel_event=cancel, group_pipeline=grouping,
                     )
                 self.assertEqual(cloud.deleted, ["empty-a", "empty-b", "leaf"])
-                self.assertEqual((stats["moved"], stats["stopped"], stats["failed"]), (1, 1, 0))
+                self.assertTrue(cancel.is_set())
+                self.assertEqual((stats["moved"], stats["stopped"], stats["failed"]), (1, 0, 0))
+                if grouping:
+                    self.assertEqual([row["status"] for row in stats["source_groups"]], ["completed"])
