@@ -6,6 +6,7 @@ from app.clients.guangya import GuangYaClient
 from app.modules.scraper import TMDBScraper
 
 import json
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,11 +14,12 @@ from unittest.mock import patch
 from app import config
 from app import database as db
 from app.clients.guangya import GuangYaFile, GuangYaReadRejected
-from app.modules.organize import OrganizeRules
+from app.modules.directory_scrape import FixedMatchScraper
+from app.modules.organize import OrganizeRules, Organizer
 from app.modules.organize_correction import OrganizeCorrectionService
 from app.modules.process_lock import CrossProcessLock
 from app.modules.scraper import MatchResult
-from tests.support import IsolatedDatabaseTestCase, release_parse_result
+from tests.support import IsolatedDatabaseTestCase, isolated_test_database, release_parse_result
 
 
 class _Cloud:
@@ -739,3 +741,147 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         get_organize_log_result_5 = db.get_organize_log(self.log_id)
         assert get_organize_log_result_5 is not None
         self.assertEqual(get_organize_log_result_5["status"], "success")
+
+
+class OrganizeCleanupCancellationTests(IsolatedDatabaseTestCase):
+    def _fixture(self):
+        cloud = _Cloud()
+        cloud.add("empty-a", "leaf", "Empty A", is_dir=True)
+        cloud.add("empty-b", "leaf", "Empty B", is_dir=True)
+        rules = OrganizeRules(
+            target_dir_id="target", small_file_mb=0, region_split=False, year_split=False,
+            clean_empty=True, link_strm=False, notify_enabled=False, library_notify=False,
+            media_info_enabled=False, media_probe_enabled=False,
+        )
+        scraper = _Scraper()
+        organizer = Organizer(
+            client=cast(GuangYaClient, cloud),
+            scraper=FixedMatchScraper(
+                cast(TMDBScraper, scraper), scraper.match_from_tmdb("4242", "tv"),
+                scraper.get_detail("4242", "tv"),
+            ),
+        )
+        self.addCleanup(organizer.close)
+        return cloud, organizer, rules
+
+    def test_cleanup_cancel_boundaries_preserve_remaining_dirs_and_retry(self):
+        for grouping in (True, False):
+            for stop_at in ("none", "after_move", "first_cleanup"):
+                with self.subTest(grouping=grouping, stop_at=stop_at), isolated_test_database():
+                    cloud, organizer, rules = self._fixture()
+                    cancel = threading.Event()
+                    original_move = cloud.move
+                    original_delete = cloud.delete_empty_directory
+                    original_list = cloud.list_dir
+                    reads_after_cancel = []
+
+                    def move(ids, parent):
+                        result = original_move(ids, parent)
+                        if stop_at == "after_move":
+                            cancel.set()
+                        return result
+
+                    def delete(directory_id, **kwargs):
+                        result = original_delete(directory_id, **kwargs)
+                        if stop_at == "first_cleanup" and len(cloud.deleted) == 1:
+                            cancel.set()
+                        return result
+
+                    def list_dir(directory_id):
+                        if cancel.is_set():
+                            reads_after_cancel.append(directory_id)
+                        return original_list(directory_id)
+
+                    with patch.object(cloud, "move", side_effect=move), patch.object(
+                        cloud, "delete_empty_directory", side_effect=delete,
+                    ), patch.object(cloud, "list_dir", side_effect=list_dir):
+                        _, stats = organizer.organize(
+                            "source", rules, dry_run=False, post_actions=False,
+                            cancel_event=cancel, group_pipeline=grouping,
+                        )
+                    expected_deleted = {
+                        "none": ["empty-a", "empty-b", "leaf"],
+                        "after_move": [], "first_cleanup": ["empty-a"],
+                    }[stop_at]
+                    self.assertEqual(cloud.deleted, expected_deleted)
+                    self.assertEqual(stats.get("empty_dirs_cleaned", 0), len(expected_deleted))
+                    self.assertEqual(stats["moved"], 1)
+                    self.assertEqual(stats["failed"], 0)
+                    self.assertEqual(stats["stopped"], int(stop_at != "none"))
+                    self.assertEqual(reads_after_cancel, [])
+                    self.assertNotEqual(cloud.nodes["video"].parent_id, "leaf")
+                    for directory_id in {"empty-a", "empty-b", "leaf"} - set(expected_deleted):
+                        self.assertIn(directory_id, cloud.nodes)
+                    if grouping:
+                        self.assertEqual([row["status"] for row in stats["source_groups"]],
+                                         ["completed" if stop_at == "none" else "stopped"])
+
+                    # 重试只收尾保留的空目录，不重放已经成功的媒体移动。
+                    cancel.clear()
+                    with patch.object(cloud, "move", wraps=original_move) as move_again:
+                        _, retry = organizer.organize(
+                            "source", rules, dry_run=False, post_actions=False,
+                            cancel_event=cancel, group_pipeline=grouping,
+                        )
+                    move_again.assert_not_called()
+                    self.assertEqual(retry["moved"], 0)
+                    self.assertEqual(retry["stopped"], 0)
+                    self.assertEqual(cloud.deleted, ["empty-a", "empty-b", "leaf"])
+                    self.assertTrue({"source", "incoming", "target", "video"} <= cloud.nodes.keys())
+
+    def test_cleanup_rechecks_cancel_after_reads_and_audit_before_provider(self):
+        for grouping in (True, False):
+            for stop_at in ("file_info", "audit_intent"):
+                with self.subTest(grouping=grouping, stop_at=stop_at), isolated_test_database():
+                    cloud, organizer, rules = self._fixture()
+                    cancel = threading.Event()
+                    original_info = cloud.file_info
+                    original_audit = db.add_organize_delete_audit
+
+                    def file_info(file_id):
+                        result = original_info(file_id)
+                        if stop_at == "file_info" and file_id == "empty-a" and cloud.nodes["video"].parent_id != "leaf":
+                            cancel.set()
+                        return result
+
+                    def add_audit(**fields):
+                        audit_id = original_audit(**fields)
+                        if stop_at == "audit_intent" and fields.get("trigger") == "empty_dir_cleanup":
+                            cancel.set()
+                        return audit_id
+
+                    with patch.object(cloud, "file_info", side_effect=file_info), patch.object(
+                        db, "add_organize_delete_audit", side_effect=add_audit,
+                    ), patch.object(cloud, "delete_empty_directory", wraps=cloud.delete_empty_directory) as delete:
+                        _, stats = organizer.organize(
+                            "source", rules, dry_run=False, post_actions=False,
+                            cancel_event=cancel, group_pipeline=grouping,
+                        )
+                    delete.assert_not_called()
+                    self.assertEqual((stats["moved"], stats["stopped"], stats["failed"]), (1, 1, 0))
+                    self.assertEqual(stats.get("empty_dir_cleanup_failed", 0), 0)
+                    self.assertTrue({"empty-a", "empty-b", "leaf"} <= cloud.nodes.keys())
+                    with db.get_conn() as conn:
+                        audits = conn.execute("SELECT status FROM organize_delete_audit").fetchall()
+                    self.assertEqual([row["status"] for row in audits], ["blocked"])
+
+    def test_cancel_after_final_directory_delete_still_reports_stopped(self):
+        for grouping in (True, False):
+            with self.subTest(grouping=grouping), isolated_test_database():
+                cloud, organizer, rules = self._fixture()
+                cancel = threading.Event()
+                original_delete = cloud.delete_empty_directory
+
+                def delete(directory_id, **kwargs):
+                    result = original_delete(directory_id, **kwargs)
+                    if directory_id == "leaf":
+                        cancel.set()
+                    return result
+
+                with patch.object(cloud, "delete_empty_directory", side_effect=delete):
+                    _, stats = organizer.organize(
+                        "source", rules, dry_run=False, post_actions=False,
+                        cancel_event=cancel, group_pipeline=grouping,
+                    )
+                self.assertEqual(cloud.deleted, ["empty-a", "empty-b", "leaf"])
+                self.assertEqual((stats["moved"], stats["stopped"], stats["failed"]), (1, 1, 0))

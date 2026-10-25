@@ -42,6 +42,7 @@ from app.config import get, get_bool, get_int
 from app.database import add_organize_log, add_organize_log_items, get_media_probe_cache
 from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.repositories.organize_probe import normalize_notification_context
+from app.repositories.organize_operation_jobs import OrganizeOperationCancelled
 from app.modules.directory_scrape_errors import (
     DirectoryScrapeConflictError,
     DirectoryScrapeStateError,
@@ -2544,6 +2545,7 @@ class Organizer:
             ) or self._clean_empty_dirs_report(
                 scanned_dirs,
                 protected_source_ids=protected_sources,
+                cancel_check=context.cancelled,
             )
             stats["empty_dirs_cleaned"] = int(cleanup_report.get("cleaned", 0) or 0)
             for report_key, stats_key in (
@@ -2551,6 +2553,7 @@ class Organizer:
                 ("protected", "empty_dir_cleanup_protected"),
                 ("not_empty", "empty_dir_cleanup_not_empty"),
                 ("unavailable", "empty_dir_cleanup_unavailable"),
+                ("stopped", "stopped"),
             ):
                 value = int(cleanup_report.get(report_key, 0) or 0)
                 if value:
@@ -2579,6 +2582,8 @@ class Organizer:
         stats["cleanup_elapsed_seconds"] = round(
             time.monotonic() - cleanup_started, 3
         )
+        if context.cancelled():
+            stats["stopped"] = 1
         if post_actions and not context.cancelled():
             self.trigger_post_actions(stats, rules, source_name=source_name, strm_debounce_seconds=0)
 
@@ -7470,13 +7475,15 @@ class Organizer:
         scanned_dirs: list[tuple],
         *,
         protected_source_ids: set[str] | None = None,
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict:
         """安全清理空目录，并返回不泄露目录标识的结构化保留原因。"""
         cleaned = 0
         delete_failures = 0
-        protected_count = 0
-        not_empty = 0
-        unavailable = 0
+        protected_count: int = 0
+        not_empty: int = 0
+        unavailable: int = 0
+        stopped = False
         protected = {item for item in (protected_source_ids or set()) if item}
         delete_empty = getattr(self.client, "delete_empty_directory", None)
         explicit_capability = getattr(
@@ -7526,6 +7533,9 @@ class Organizer:
 
         failure_reasons: dict[str, int] = {}
         for item in sorted(unique_dirs.values(), key=lambda row: row[1], reverse=True):
+            if cancel_check is not None and cancel_check():
+                stopped = True
+                break
             dir_id, _depth = item[:2]
             expected_etag = (item[2] or "") if len(item) > 2 else ""
             try:
@@ -7554,6 +7564,17 @@ class Organizer:
                     expected_updated_at = 0
                 if not expected_etag and expected_updated_at <= 0:
                     raise RuntimeError("目录版本信息缺失，已保留")
+
+                def delete_operation():
+                    # 审计落盘期间也可能收到停止；真正发请求前仍须检查。
+                    if cancel_check is not None and cancel_check():
+                        raise OrganizeOperationCancelled("任务已停止，已保留剩余空目录")
+                    return delete_empty(
+                        dir_id,
+                        expected_etag=expected_etag,
+                        expected_updated_at=expected_updated_at,
+                    )
+
                 execute_recycle_bin_delete(
                     self.client,
                     trigger="empty_dir_cleanup",
@@ -7563,15 +7584,13 @@ class Organizer:
                         name=str(current.name),
                         parent_id=str(current.parent_id),
                     ),
-                    delete_operation=lambda current_id=dir_id, current_etag=expected_etag,
-                    current_updated_at=expected_updated_at: delete_empty(
-                        current_id,
-                        expected_etag=current_etag,
-                        expected_updated_at=current_updated_at,
-                    ),
+                    delete_operation=delete_operation,
                 )
                 cleaned += 1
                 logger.debug("清理空目录: %s", dir_id)
+            except OrganizeOperationCancelled:
+                stopped = True
+                break
             except Exception as exc:
                 delete_failures += 1
                 reason = " ".join(str(exc or type(exc).__name__).split())[:160]
@@ -7594,10 +7613,12 @@ class Organizer:
             )
         if unavailable:
             reasons.append(f"{unavailable} 个目录状态已变化，已安全保留")
+        if stopped:
+            reasons.append("任务已停止，已保留剩余空目录")
         reasons.extend(
             f"{reason}（{count} 个）" for reason, count in failure_reasons.items()
         )
-        return {
+        report = {
             "cleaned": cleaned,
             "delete_failures": delete_failures,
             "unsupported": 0,
@@ -7607,6 +7628,9 @@ class Organizer:
             "unavailable": unavailable,
             "reasons": reasons,
         }
+        if stopped:
+            report["stopped"] = 1
+        return report
 
     def _ensure_dir_chain(
         self,
