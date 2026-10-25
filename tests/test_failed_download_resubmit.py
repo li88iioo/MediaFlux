@@ -58,12 +58,9 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
             sub_id, "Episode", f"entry-{self.sequence}",
             payload=json.dumps({"torrent_url": source}),
         )["id"])
+        seed_rss_entry_state(entry_id, "submitting")
+        bind_rss_entry_download(entry_id, dispatcher.request_key(item), "guangya")
         seed_rss_entry_state(entry_id, "downloaded")
-        with db.get_conn() as conn:
-            conn.execute(
-                "UPDATE rss_entries SET download_request_key=?,download_backend='guangya' WHERE id=?",
-                (dispatcher.request_key(item), entry_id),
-            )
         return request_id, entry_id
 
     @staticmethod
@@ -184,6 +181,23 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         assert get_download_request_result_4 is not None
         self.assertEqual(get_download_request_result_4["organize_status"], "completed")
 
+    def test_legacy_failed_settle_receipt_is_retryable_after_schema_upgrade(self):
+        request_id, entry_id = self.resource()
+        # 旧库只有内容 key：必须经一次 schema 迁移建立归属，不能在查询时猜当前 owner。
+        with db.get_conn() as conn:
+            conn.execute("UPDATE rss_entries SET download_request_id=NULL WHERE id=?", (entry_id,))
+            conn.execute("PRAGMA user_version=35")
+        db.init_db()
+        entry = assert_present(db.get_rss_entry(entry_id))
+        self.assertEqual(entry["delivery_request_id"], request_id)
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        with patch.object(dispatcher, "_submit_guangya", side_effect=self.submitted) as backend:
+            result = engine.download(entry_id)
+        self.assertTrue(result["ok"], result)
+        self.assertNotEqual(result["request_id"], request_id)
+        backend.assert_called_once()
+
     def test_rss_direct_download_retries_failed_settle_without_manual_reset(self):
         request_id, entry_id = self.resource()
         with patch.object(dispatcher, "_submit_guangya", side_effect=self.submitted) as backend:
@@ -259,13 +273,9 @@ class FailedDownloadResubmitTests(InitializedWebTestCase):
         second_id = int(db.add_rss_entry_with_media(
             entry["rss_item_id"], "Duplicate", "duplicate-guid", payload=entry["payload"]
         )["id"])
+        seed_rss_entry_state(second_id, "submitting")
+        bind_rss_entry_download(second_id, entry["download_request_key"], "guangya")
         seed_rss_entry_state(second_id, "downloaded")
-        with db.get_conn() as conn:
-            assert entry is not None
-            conn.execute(
-                "UPDATE rss_entries SET download_request_key=?,download_backend='guangya' WHERE id=?",
-                (entry["download_request_key"], second_id),
-            )
         with patch.object(dispatcher, "_submit_guangya", side_effect=self.submitted) as backend:
             result = RSSEngine().download_many([entry_id, second_id])
         self.assertEqual(result["success_count"], 1, result)
