@@ -681,25 +681,48 @@
     }
 
     function isWatchlisted(item) {
-        return Boolean(item.in_watchlist || item.watchlisted || item.state === 'watchlisted');
+        return Boolean(item.in_watchlist ?? item.watchlisted ?? (item.state === 'watchlisted'));
     }
 
-    function watchlistButton(item, card) {
+    function paintWatchlistButton(button, active) {
+        button.classList.toggle('is-active', active);
+        button.setAttribute('aria-pressed', String(active));
+        button.title = active ? '移出探索收藏' : '加入探索收藏';
+        button.setAttribute('aria-label', button.title);
+        button.replaceChildren(icon(active ? 'bookmark-check' : 'bookmark'));
+        renderIcons(button);
+    }
+
+    function rememberWatchlistState(item, active) {
+        const key = itemKey(item);
+        const update = candidate => {
+            if (itemKey(candidate) !== key) return;
+            candidate.in_watchlist = active;
+            if ('watchlisted' in candidate) candidate.watchlisted = active;
+            if (!candidate.state || candidate.state === 'none' || candidate.state === 'watchlisted') {
+                candidate.state = active ? 'watchlisted' : 'none';
+            }
+        };
+        update(item);
+        // 收藏与详情日期一样回填现有模型和有界快照，不另存一套身份状态。
+        for (const view of [state, ...viewSnapshots.values()]) {
+            asArray(view.itemsData).forEach(update);
+            asArray(view.sectionsData).forEach(section => sectionItems(section).forEach(update));
+        }
+        for (const entry of cardNodes.values()) update(entry.item);
+        for (const button of root.querySelectorAll('[data-watchlist-key]')) {
+            if (button.dataset.watchlistKey !== key) continue;
+            paintWatchlistButton(button, active);
+            button.closest('.discovery-card')?.classList.toggle('is-watchlisted', active);
+        }
+    }
+
+    function watchlistButton(item) {
         const button = node('button', 'discovery-card-action discovery-watchlist-action');
         button.type = 'button';
         button.dataset.watchlistKey = itemKey(item);
-        button.setAttribute('aria-pressed', String(isWatchlisted(item)));
 
-        function paint(active) {
-            button.classList.toggle('is-active', active);
-            button.setAttribute('aria-pressed', String(active));
-            button.title = active ? '移出探索收藏' : '加入探索收藏';
-            button.setAttribute('aria-label', button.title);
-            button.replaceChildren(icon(active ? 'bookmark-check' : 'bookmark'));
-            renderIcons(button);
-        }
-
-        paint(isWatchlisted(item));
+        paintWatchlistButton(button, isWatchlisted(item));
         button.addEventListener('click', async (event) => {
             event.stopPropagation();
             if (button.disabled) return;
@@ -726,10 +749,7 @@
                         }),
                     });
                 }
-                item.in_watchlist = !active;
-                item.state = !active ? 'watchlisted' : '';
-                paint(!active);
-                card.classList.toggle('is-watchlisted', !active);
+                rememberWatchlistState(item, !active);
                 announce(!active ? `已收藏《${item.title || '未命名媒体'}》` : `已移出《${item.title || '未命名媒体'}》`);
             } catch (error) {
                 announce(error.message || '收藏操作失败');
@@ -762,7 +782,7 @@
         const mapping = node('span', `discovery-map-state${item.tmdb_id || item.mapped_tmdb_id ? ' is-mapped' : ''}`);
         mapping.append(icon(item.tmdb_id || item.mapped_tmdb_id ? 'link' : 'unlink'));
         mapping.append(node('span', '', item.tmdb_id || item.mapped_tmdb_id ? 'TMDB 已映射' : '待映射'));
-        footer.append(mapping, watchlistButton(item, card));
+        footer.append(mapping, watchlistButton(item));
         copy.append(sourceLine, title, footer);
         card.append(open, copy);
         open.addEventListener('click', () => openDetail(item, card));

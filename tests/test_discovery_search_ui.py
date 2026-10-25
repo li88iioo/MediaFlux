@@ -1685,6 +1685,201 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         self.assertEqual(button.get_attribute("aria-pressed"), "false")
         self.assertEqual(errors, [])
 
+    def test_watchlist_updates_all_matching_cards_without_replacing_nodes(self):
+        for width in (390, 1440):
+            with self.subTest(width=width):
+                card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                        "title": "同一作品", "state": "none"}
+                cards = [card, {**card, "media_type": "tv"}, {**card, "provider": "douban"}]
+                mutations = []
+                page, errors = self.open_catalogue(width=width, cards=cards, watchlist_requests=mutations)
+                matches = page.locator('[data-watchlist-key="tmdb:movie:550"]')
+                self.assertEqual(matches.count(), 6)
+                page.evaluate("window.originalCards = [...document.querySelectorAll('.discovery-card')]")
+                for active, method in ((True, "POST"), (False, "DELETE")):
+                    matches.nth(0 if active else 1).click()
+                    page.wait_for_function("!document.querySelector('.discovery-watchlist-action.is-pending')")
+                    self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"),
+                                     [str(active).lower()] * 6)
+                    self.assertEqual(page.locator('.discovery-card.is-watchlisted').count(), 6 if active else 0)
+                    self.assertEqual(mutations[-1][0], method)
+                    self.assertTrue(page.evaluate("window.originalCards.every(card => card.isConnected)"))
+                for key in ("tmdb:tv:550", "douban:movie:550"):
+                    self.assertEqual(page.locator(f'[data-watchlist-key="{key}"][aria-pressed="true"]').count(), 0)
+                self.assertEqual([method for method, _path in mutations], ["POST", "DELETE"])
+                self.assertEqual(errors, [])
+
+    def test_watchlist_updates_cached_views_and_preserves_subscription_state(self):
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                "title": "已订阅电影", "state": "subscribed", "in_watchlist": True, "watchlisted": True}
+        mutations, requests = [], []
+        page, errors = self.open_catalogue(cards=[card], requests=requests, watchlist_requests=mutations)
+        # 保留实际 response.json 交给产品的对象引用，验证订阅字段而不导出产品内部状态。
+        page.evaluate("""() => {
+            const originalFetch = window.fetch;
+            window.catalogueItems = [];
+            window.fetch = async (...args) => {
+                const response = await originalFetch(...args);
+                if (String(args[0]).startsWith('/api/discovery/items?')) {
+                    const parse = response.json.bind(response);
+                    response.json = async () => {
+                        const payload = await parse();
+                        window.catalogueItems = payload.items;
+                        return payload;
+                    };
+                }
+                return response;
+            };
+        }""")
+        page.locator('#discovery-tab-tmdb-movie').click()
+        button = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
+        button.wait_for()
+        reads = len(requests)
+        button.click()
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已移出')")
+        self.assertEqual(page.evaluate("catalogueItems.map(({state, in_watchlist, watchlisted}) => ({state, in_watchlist, watchlisted}))"),
+                         [{"state": "subscribed", "in_watchlist": False, "watchlisted": False}])
+        page.locator('#discovery-tab-sections').click()
+        matches = page.locator('[data-watchlist-key="tmdb:movie:550"]')
+        self.assertEqual(matches.count(), 6)
+        self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"), ["false"] * 6)
+        matches.first.click()
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已收藏')")
+        page.locator('#discovery-tab-tmdb-movie').click()
+        self.assertEqual(button.get_attribute("aria-pressed"), "true")
+        self.assertEqual(len(requests), reads + 2, "切换命中新鲜快照，不应靠额外请求修正收藏")
+        self.assertEqual(page.evaluate("catalogueItems[0].state"), "subscribed")
+        self.assertEqual([method for method, _path in mutations], ["DELETE", "POST"])
+        self.assertEqual(errors, [])
+
+    def test_watchlist_failure_after_tab_switch_keeps_old_values_and_allows_retry(self):
+        for active, failure in ((False, "http"), (True, "network")):
+            with self.subTest(active=active, failure=failure):
+                card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                        "title": "收藏重试", "state": "watchlisted" if active else "none"}
+                mutations, pending = [], []
+                page, errors = self.open_catalogue(cards=[card], watchlist_requests=mutations)
+                page.evaluate("window.appAlert = () => {}")
+                page.route("**/api/discovery/watchlist**", lambda route: pending.append(route))
+                matches = page.locator('[data-watchlist-key="tmdb:movie:550"]')
+                matches.first.click()
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"),
+                                 [str(active).lower()] * 6)
+                page.locator('#discovery-tab-tmdb-movie').click()
+                button = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
+                button.wait_for()
+                page.evaluate("document.getElementById('discovery-live').textContent = ''")
+                if failure == "http":
+                    pending.pop().fulfill(status=503, json={"error": "收藏暂不可用"})
+                else:
+                    pending.pop().abort("failed")
+                page.wait_for_function("document.getElementById('discovery-live').textContent.length > 0")
+                self.assertEqual(button.get_attribute("aria-pressed"), str(active).lower())
+                self.assertNotIn("已收藏", page.locator('#discovery-live').inner_text())
+                self.assertNotIn("已移出", page.locator('#discovery-live').inner_text())
+                page.locator('#discovery-tab-sections').click()
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"),
+                                 [str(active).lower()] * 6)
+                self.assertTrue(matches.first.is_enabled())
+                page.unroute("**/api/discovery/watchlist**")
+                matches.first.click()
+                page.wait_for_function("!document.querySelector('.discovery-watchlist-action.is-pending')")
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"),
+                                 [str(not active).lower()] * 6)
+                self.assertEqual([method for method, _path in mutations], ["DELETE" if active else "POST"])
+                self.assertEqual(errors, [])
+
+    def test_watchlist_late_success_updates_current_view_and_saved_sections(self):
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                "title": "迟到的收藏回执", "state": "none"}
+        pending = []
+        page, errors = self.open_catalogue(cards=[card])
+        page.route("**/api/discovery/watchlist**", lambda route: pending.append(route))
+        page.locator('[data-watchlist-key="tmdb:movie:550"]').first.click()
+        self.assertEqual(len(pending), 1)
+        page.locator('#discovery-tab-tmdb-movie').click()
+        button = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
+        button.wait_for()
+        self.assertEqual(button.get_attribute("aria-pressed"), "false")
+        pending.pop().fulfill(json={"success": True})
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已收藏')")
+        self.assertEqual(button.get_attribute("aria-pressed"), "true")
+        page.locator('#discovery-tab-sections').click()
+        self.assertEqual(page.locator('[data-watchlist-key="tmdb:movie:550"]').evaluate_all(
+            "buttons => buttons.map(b => b.getAttribute('aria-pressed'))"), ["true"] * 6)
+        self.assertEqual(errors, [])
+
+    def test_watchlist_explicit_false_is_not_overridden_by_legacy_flags(self):
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                "title": "旧快照", "state": "watchlisted", "watchlisted": True, "in_watchlist": False}
+        mutations = []
+        page, errors = self.open_catalogue(cards=[card], watchlist_requests=mutations)
+        buttons = page.locator('[data-watchlist-key="tmdb:movie:550"]')
+        self.assertEqual(buttons.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"), ["false"] * 6)
+        buttons.first.click()
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已收藏')")
+        self.assertEqual([method for method, _path in mutations], ["POST"])
+        self.assertEqual(errors, [])
+
+    def test_watchlist_detail_entry_keeps_cards_and_subscription_list_intact(self):
+        from jinja2 import Environment, FileSystemLoader
+
+        card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                "title": "已订阅电影", "state": "watchlisted", "tmdb_id": "550"}
+        requests, mutations = [], []
+        page, errors = self.open_catalogue(width=390, cards=[card], details=card,
+                                           requests=requests, watchlist_requests=mutations)
+        page.locator('.discovery-card-open').first.click()
+        page.locator('.discovery-detail-fields').wait_for()
+        page.keyboard.press("Escape")
+        page.locator('#discovery-detail-dialog').wait_for(state="hidden")
+        matches = page.locator('[data-watchlist-key="tmdb:movie:550"]')
+        self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"), ["true"] * 6)
+        matches.first.click()
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已移出')")
+        matches.last.click()
+        page.wait_for_function("document.getElementById('discovery-live').textContent.includes('已收藏')")
+
+        templates = Environment(loader=FileSystemLoader(ROOT / "app/templates"), autoescape=True)
+        html = templates.get_template("rss.html").render(
+            active="rss", discovery_enabled=True, resource_results_enabled=False,
+            csrf_token=lambda: "test", url_for=lambda name: "/" + name.split(".")[-1],
+            static_url=lambda path: "/static/" + path,
+        )
+        html = re.sub(r"<script\b[^>]*>[\s\S]*?</script>", "", html)
+        row = {**card, "subscription": {"id": 7, "enabled": True, "status": "active"}}
+        page.route("**/rss", lambda route: route.fulfill(body=html, content_type="text/html"))
+
+        def subscription_reply(route):
+            requests.append(route.request.url)
+            rows = [row] if mutations[-1][0] == "POST" else []
+            payload = ({"items": rows, "total": len(rows), "has_more": False, "next": None}
+                       if urlsplit(route.request.url).path.endswith("/watchlist") else {})
+            route.fulfill(json=payload)
+
+        page.route("**/api/subscriptions/**", subscription_reply)
+        page.goto("http://mediaflux.test/rss#watchlist", wait_until="domcontentloaded")
+        page.evaluate("window.renderLucideIcons = () => {}; window.appConfirm = async () => true; window.appAlert = () => {}")
+        page.add_script_tag(content=self.script)
+        page.add_script_tag(path=str(ROOT / "app/static/js/subscriptions.js"))
+        saved = page.locator('.subscription-watch-card')
+        saved.wait_for()
+        self.assertIn("已订阅", saved.inner_text())
+        saved.locator('a[data-media-profile-link]').first.click()
+        page.locator('.discovery-detail-fields').wait_for()
+        self.assertEqual(urlsplit(page.url).path, "/rss")
+        self.assertEqual(urlsplit(page.url).fragment, "watchlist")
+        page.keyboard.press("Escape")
+        page.locator('#discovery-detail-dialog').wait_for(state="hidden")
+        self.assertIn("已订阅", saved.inner_text())
+        self.assertEqual([method for method, _path in mutations], ["DELETE", "POST"])
+        saved.locator('[data-watch-action="remove"]').click()
+        saved.wait_for(state="detached")
+        self.assertEqual([method for method, _path in mutations], ["DELETE", "POST", "DELETE"])
+        self.assertFalse(any("/api/subscriptions/media/7" in path for path in requests))
+        self.assertEqual(errors, [])
+
     def test_search_all_sources_failed_retries_first_page(self):
         calls = []
         card = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "恢复结果"}
