@@ -8,6 +8,9 @@ from typing import Any
 
 from app import config
 from app import database as db
+from app.modules.agent_download_verification_notifications import (
+    _RESULT_LABELS as _VERIFICATION_RESULT_LABELS,
+)
 from app.modules.local_media_outcomes import (
     local_media_refresh_status,
     local_media_task_outcome,
@@ -144,7 +147,7 @@ def _overall_state(row, *, archive_status: str, verification_status: str = "", r
         return "attention"
     if states.intersection(_ERROR_STATES) or refresh_status == "failed":
         return "error"
-    if states.intersection(_PROCESSING_STATES):
+    if states.intersection(_PROCESSING_STATES) or verification in {"pending", "running", "retry_wait"}:
         return "processing"
     archive_states = {
         archive_status, _status(_value(row, "organize_status")),
@@ -374,13 +377,26 @@ def publish_download_lifecycle(
     *,
     stats: Mapping[str, Any] | None = None,
     media_refresh: str = "",
-    verification_status: str = "",
-    verification_result: str = "",
     deliver_now: bool = True,
 ) -> NotificationPublishResult:
     row = db.get_download_request(request_id)
     if row is None:
         return NotificationPublishResult(False, status="missing_request")
+    verification_status = ""
+    verification_result = ""
+    verification = db.get_agent_download_verification(request_id)
+    if verification is not None:
+        # 旧通知载荷、STRM 回调和 tracker 重试都不能覆盖当前复核代际。
+        verification_status = _status(verification["status"])
+        verification_result = (
+            _VERIFICATION_RESULT_LABELS.get(
+                _status(verification["result"]), _VERIFICATION_RESULT_LABELS["inconclusive"],
+            )
+            if verification_status in {"visible", "attention"}
+            else {
+                "pending": "等待复核", "running": "复核中", "retry_wait": "等待复核重试",
+            }.get(verification_status, _label(verification_status))
+        )
     probe_progress = _load_probe_progress(row)
     event = build_download_lifecycle_event(
         row,

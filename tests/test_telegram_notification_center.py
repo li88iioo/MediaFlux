@@ -5,6 +5,7 @@ import asyncio
 import threading
 import unittest
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -1460,15 +1461,16 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
     @patch("app.modules.telegram_notification_center.edit_event_result")
     @patch("app.modules.telegram_notification_center.send_event_result")
     def test_download_pipeline_collapses_into_one_message(self, sender, editor) -> None:
+        from app.modules.agent_download_verification_notifications import dump_download_verification_payload
         from app.modules.telegram_download_lifecycle import publish_download_lifecycle
 
         sender.return_value = TelegramSendResult(ok=True, message_id=99)
         editor.return_value = TelegramSendResult(ok=True, message_id=99)
         request_id, _ = db.create_download_request(
-            "tg-lifecycle", "magnet", title="测试剧", chat_id="100",
+            "tg-lifecycle", "magnet", title="测试剧", chat_id="100", origin="agent",
         )
         db.update_download_request(
-            request_id, status="completed", qb_status="completed",
+            request_id, targets="qb", status="completed", qb_status="completed",
             organize_status="running", strm_status="pending",
         )
         first = publish_download_lifecycle(request_id, stats={
@@ -1480,9 +1482,21 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         db.update_download_request(
             request_id, organize_status="completed", strm_status="completed",
         )
+        self.assertTrue(db.enqueue_agent_download_verification(
+            request_id, title="测试剧", tmdb_id="123", season=1, episode=3,
+            as_of="2026-10-26", owner="tg:v1:100\x1f456", chat_id="100",
+        ))
+        job = db.claim_due_agent_download_verification()
+        assert job is not None
+        self.assertTrue(db.finish_agent_download_verification(
+            request_id, status="visible", result="visible", attempts=1, next_check_at=db.now(),
+            expected_lease_generation=job["lease_generation"],
+            payload_json=dump_download_verification_payload(
+                title="测试剧", season=1, episode=3, status="visible", result="visible", attempts=1,
+            ),
+        ))
         second = publish_download_lifecycle(
             request_id, media_refresh="Jellyfin 已刷新",
-            verification_status="visible", verification_result="目标剧集已可见",
         )
         self.assertTrue(first.delivered)
         self.assertTrue(second.delivered)
@@ -1491,8 +1505,212 @@ class TelegramNotificationCenterTests(IsolatedDatabaseTestCase):
         final_event = editor.call_args.args[0]
         self.assertIn("下载与入库完成", final_event.title)
         self.assertIn(("媒体库", "Jellyfin 已刷新"), final_event.fields)
-        self.assertIn(("入库复核", "目标剧集已可见"), final_event.fields)
+        self.assertIn(("入库复核", "目标剧集已在媒体库中可见"), final_event.fields)
         self.assertTrue(any("S01E03" in line for line in final_event.lines))
+
+
+class DownloadVerificationProjectionTests(IsolatedDatabaseTestCase):
+    """真实复核队列/通知 outbox；只替换外部查询和 Telegram 发送。"""
+
+    def setUp(self) -> None:
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM agent_download_verification_notification_outbox")
+            conn.execute("DELETE FROM agent_download_verifications")
+            conn.execute("DELETE FROM telegram_notification_outbox")
+            conn.execute("DELETE FROM download_requests")
+        for target in ("socket.socket.connect", "socket.socket.connect_ex", "socket.create_connection"):
+            self.enterContext(patch(target, side_effect=AssertionError("R07 forbids network")))
+        self.enterContext(patch("app.modules.telegram_notification_policy.notifications_enabled", return_value=True))
+        self.enterContext(patch("app.modules.telegram_notification_policy.notification_level", return_value="standard"))
+        self.enterContext(patch.object(notification_center, "notification_target_chat_id", return_value="100"))
+        self.enterContext(patch.object(notification_center, "wake_telegram_notification_dispatcher"))
+        self.enterContext(patch.object(notification_center, "_dispatch_stop", threading.Event()))
+        self.sender = self.enterContext(patch.object(
+            notification_center, "send_event_result", return_value=TelegramSendResult(True, message_id=701),
+        ))
+        self.editor = self.enterContext(patch.object(
+            notification_center, "edit_event_result", return_value=TelegramSendResult(True, message_id=701),
+        ))
+        for module in ("agent_download_verification_scheduler", "agent_download_verification_notifications"):
+            self.enterContext(patch(
+                f"app.modules.{module}.telegram_owner_route_is_currently_authorized", return_value=True,
+            ))
+
+    def _request(self, key: str) -> int:
+        request_id, _ = db.create_download_request(
+            key, "magnet", title="测试剧 S01E03", chat_id="100", origin="agent",
+        )
+        db.update_download_request(
+            request_id, targets="qb", status="completed", qb_status="completed",
+            local_import_status="completed", strm_status="completed",
+            notification_event_status="completed", notification_delivery_status="retry_wait",
+            notification_next_retry_at="2000-01-01 00:00:00",
+        )
+        return request_id
+
+    def _verify(self, request_id: int, *, visible: bool) -> None:
+        from app.agent.models import ToolResult
+        from app.modules.agent_download_verification_scheduler import DownloadLibraryVerificationScheduler
+
+        self.assertTrue(db.enqueue_agent_download_verification(
+            request_id, title="测试剧", tmdb_id="123", season=1, episode=3,
+            as_of="2026-10-26", owner="tg:v1:100\x1f456", chat_id="100",
+        ))
+        current = datetime.now() + timedelta(seconds=1)
+        result = ToolResult(True, "up_to_date" if visible else "updates_available", "isolated audit", data={
+            "missing_count": 0 if visible else 1,
+            "missing_sample": [] if visible else [{"season": 1, "episode": 3}],
+            "missing_sample_truncated": False,
+        })
+        scheduler = DownloadLibraryVerificationScheduler(
+            audit_executor=lambda _arguments: (result, 1), max_attempts=1, clock=lambda: current,
+        )
+        # 真实入口先等待一个完整 tracker 周期，再查询媒体库并发布终态。
+        self.assertEqual(scheduler.run_once(), 1)
+        current += timedelta(seconds=31)
+        self.assertEqual(scheduler.run_once(), 1)
+        row = db.get_agent_download_verification(request_id)
+        assert row is not None
+        self.assertEqual(row["status"], "visible" if visible else "attention")
+        queued = db.list_agent_download_verification_notifications()
+        self.assertEqual(queued[-1]["status"], "sent")
+
+    def _snapshot(self, request_id: int):
+        snapshot = get_notification_thread_snapshot(
+            f"download:{request_id}", topic=NotificationTopic.DOWNLOAD, chat_id="100",
+        )
+        assert snapshot is not None
+        row = get_notification(notification_thread_event_key(
+            f"download:{request_id}", topic=NotificationTopic.DOWNLOAD, chat_id="100",
+        ))
+        assert row is not None
+        self.assertEqual(row["revision"], row["delivered_revision"])
+        return snapshot
+
+    def test_r07_terminal_verification_survives_plain_strm_and_tracker_retries(self) -> None:
+        from app.modules.download_tracker import DownloadTracker
+        from app.modules.scheduler import _publish_linked_notification_threads
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        for visible in (False, True):
+            with self.subTest(visible=visible):
+                request_id = self._request(f"r07-late-producers-{visible}")
+                self._verify(request_id, visible=visible)
+                before = self._snapshot(request_id)
+                expected_state = "completed" if visible else "attention"
+                expected_result = dict(before.event.fields)["入库复核"]
+                self.assertEqual(before.event.state, expected_state)
+
+                self.assertTrue(publish_download_lifecycle(request_id).delivered)
+                plain = self._snapshot(request_id)
+                self.assertEqual(plain.event.state, expected_state)
+                self.assertEqual(dict(plain.event.fields).get("入库复核"), expected_result)
+
+                self.assertTrue(_publish_linked_notification_threads(
+                    {"download_request_ids": [request_id]}, strm_status="完成", media_refresh="Jellyfin 已排队",
+                ))
+                linked = self._snapshot(request_id)
+                self.assertEqual(linked.event.state, expected_state)
+                self.assertEqual(dict(linked.event.fields).get("入库复核"), expected_result)
+                self.assertEqual(dict(linked.event.fields)["媒体库"], "Jellyfin 已排队")
+
+                # 真实 tracker.run_once 自行筛出已完成但通知待重试的请求并领取/ACK。
+                tracker = DownloadTracker()
+                with patch.object(tracker, "_qb_tasks", return_value=(False, [])), patch.object(
+                    tracker, "_run_staging_reconciliation_if_due", return_value=0,
+                ), patch.object(tracker, "_run_torrent_data_cleanup_if_due", return_value=0):
+                    self.assertEqual(tracker.run_once(), 1)
+                retried = self._snapshot(request_id)
+                self.assertEqual(retried.event.state, expected_state)
+                self.assertEqual(dict(retried.event.fields).get("入库复核"), expected_result)
+                row = db.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual(row["notification_delivery_status"], "sent")
+                durable = db.get_agent_download_verification(request_id)
+                assert durable is not None
+                self.assertEqual(durable["status"], "visible" if visible else "attention")
+
+    def test_r07_latest_persisted_generation_replaces_old_message_and_payload(self) -> None:
+        from app.modules.agent_download_verification_notifications import (
+            dump_download_verification_payload,
+        )
+        from app.modules.agent_download_verification_scheduler import DownloadLibraryVerificationScheduler
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        request_id = self._request("r07-new-generation")
+        self._verify(request_id, visible=False)
+        old = db.get_agent_download_verification(request_id)
+        assert old is not None
+        old_generation = old["lease_generation"]
+        self.assertEqual(self._snapshot(request_id).event.state, "attention")
+
+        for status, result, label, expected_state in (
+            ("visible", "visible", "目标剧集已在媒体库中可见", "completed"),
+            ("attention", "missing", "目标剧集仍未在媒体库中出现", "attention"),
+        ):
+            with self.subTest(new_status=status):
+                # 夹具重新准入复核；之后使用生产领取/结算，不伪造新租约。
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE agent_download_verifications SET status='retry_wait',next_check_at=? WHERE request_id=?",
+                        (db.now(), request_id),
+                    )
+                self.assertTrue(publish_download_lifecycle(request_id).delivered)
+                waiting = self._snapshot(request_id).event
+                self.assertEqual(waiting.state, "processing")
+                self.assertEqual(dict(waiting.fields)["入库复核"], "等待复核重试")
+
+                job = db.claim_due_agent_download_verification()
+                assert job is not None
+                self.assertGreater(job["lease_generation"], old_generation)
+                old_generation = job["lease_generation"]
+                self.assertTrue(publish_download_lifecycle(request_id).delivered)
+                running = self._snapshot(request_id).event
+                self.assertEqual(running.state, "processing")
+                self.assertEqual(dict(running.fields)["入库复核"], "复核中")
+                self.assertTrue(db.finish_agent_download_verification(
+                    request_id, status=status, result=result, attempts=2, next_check_at=db.now(),
+                    expected_lease_generation=job["lease_generation"],
+                    payload_json=dump_download_verification_payload(
+                        title="测试剧", season=1, episode=3, status=status, result=result, attempts=2,
+                    ),
+                ))
+                self.assertTrue(publish_download_lifecycle(request_id).delivered)
+                current = self._snapshot(request_id)
+                self.assertEqual(current.event.state, expected_state)
+                self.assertEqual(dict(current.event.fields)["入库复核"], label)
+
+                # 夹具重新排入旧代 outbox 载荷；真实消费仍须读取当前复核事实。
+                stale_payload = dump_download_verification_payload(
+                    title="测试剧", season=1, episode=3,
+                    status="attention" if status == "visible" else "visible",
+                    result="missing" if status == "visible" else "visible", attempts=1,
+                )
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "UPDATE agent_download_verification_notification_outbox "
+                        "SET status='retry_wait',payload_json=?,next_attempt_at=? WHERE request_id=?",
+                        (stale_payload, db.now(), request_id),
+                    )
+                self.assertEqual(DownloadLibraryVerificationScheduler().dispatch_notification_once(), 1)
+                latest = self._snapshot(request_id)
+                self.assertEqual(latest.event.state, expected_state)
+                self.assertEqual(dict(latest.event.fields)["入库复核"], label)
+
+    def test_r07_without_verification_keeps_existing_download_projection(self) -> None:
+        from app.modules.telegram_download_lifecycle import publish_download_lifecycle
+
+        request_id = self._request("r07-no-verification")
+        self.assertTrue(publish_download_lifecycle(request_id).delivered)
+        completed = self._snapshot(request_id)
+        self.assertEqual(completed.event.state, "completed")
+        self.assertEqual(completed.event.title, "✅ 下载与入库完成")
+        self.assertNotIn("入库复核", dict(completed.event.fields))
+        db.update_download_request(request_id, local_import_status="", strm_status="")
+        self.assertTrue(publish_download_lifecycle(request_id).delivered)
+        downloaded = self._snapshot(request_id)
+        self.assertEqual(downloaded.event.state, "downloaded")
+        self.assertNotIn("入库复核", dict(downloaded.event.fields))
 
 
 class TelegramNotificationSettingsTests(unittest.TestCase):

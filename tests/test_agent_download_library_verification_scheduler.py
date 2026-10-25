@@ -496,12 +496,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         notifier.assert_called_once_with(
             owner=_TG_OWNER,
             chat_id=_TG_CHAT_ID,
-            title="The Show",
-            season=2,
-            episode=3,
-            status="visible",
-            result="visible",
-            attempts=1,
+            request_id=request_id,
         )
         self.clock.value = datetime(2026, 8, 3, 12, 1, 0)
         self.assertEqual(scheduler.run_once(), 0)
@@ -583,7 +578,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
             current="2026-08-03 12:00:00",
         )
 
-        def notify_then_stop(**_payload):
+        def notify_then_stop(*, owner: str, chat_id: str, request_id: int):
             scheduler.stop(timeout=0)
             return False
 
@@ -969,12 +964,7 @@ class DownloadLibraryVerificationSchedulerTests(IsolatedDatabaseTestCase):
         notifier.assert_called_once_with(
             owner=_TG_OWNER,
             chat_id=_TG_CHAT_ID,
-            title="The Show",
-            season=2,
-            episode=3,
-            status="attention",
-            result="inconclusive",
-            attempts=2,
+            request_id=request_id,
         )
         scheduler._finish(
             new_job,

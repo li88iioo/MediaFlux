@@ -74,7 +74,6 @@ class DownloadLibraryVerificationScheduler:
         self._terminal_notifier = (
             terminal_notifier or notify_download_verification_terminal_result
         )
-        self._terminal_notifier_uses_request_id = terminal_notifier is None
         self._notification_enabled_override = terminal_notifier is not None
         self.interval = max(0.1, float(interval))
         self.max_attempts = max(1, min(max_attempts, len(_RETRY_DELAYS)))
@@ -615,7 +614,7 @@ class DownloadLibraryVerificationScheduler:
                 )
                 return 0
             try:
-                payload = load_download_verification_payload(item["payload_json"])
+                load_download_verification_payload(item["payload_json"])
             except (TypeError, ValueError):
                 db.discard_agent_download_verification_notification(
                     notification_id,
@@ -661,20 +660,11 @@ class DownloadLibraryVerificationScheduler:
                             next_attempt_at=current,
                         )
                         return 0
-                    if self._terminal_notifier_uses_request_id:
-                        raw_result = self._terminal_notifier(
-                            owner=owner,
-                            chat_id=chat_id,
-                            request_id=int(item["request_id"]),
-                            **payload,
-                        )
-                    else:
-                        # 外部注入器沿用既有公开签名，避免插件被内部关联 ID 破坏。
-                        raw_result = self._terminal_notifier(
-                            owner=owner,
-                            chat_id=chat_id,
-                            **payload,
-                        )
+                    raw_result = self._terminal_notifier(
+                        owner=owner,
+                        chat_id=chat_id,
+                        request_id=int(item["request_id"]),
+                    )
                 result = (
                     raw_result
                     if isinstance(raw_result, TelegramSendResult)
