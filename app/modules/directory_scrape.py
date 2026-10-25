@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass
 from functools import wraps
 from sqlite3 import Row
 from time import monotonic
-from typing import TYPE_CHECKING, Callable, Mapping
+from typing import TYPE_CHECKING, Callable, Literal, Mapping
 
 from app import config
 from app import database as db
@@ -111,6 +111,8 @@ class PreviewRecord:
     numbering_mode: str
     position_overrides: dict[str | tuple[str, str], tuple[int | None, int | None]]
     created_at: float
+    # 创建时绑定；执行模式和展示 payload 不能改变人工学习资格。
+    selection_source: Literal["manual", "automatic"]
     claimed: bool = False
 
 
@@ -198,6 +200,7 @@ class DirectoryScrapeStore:
         stats: dict,
         payload: dict,
         *,
+        selection_source: Literal["manual", "automatic"],
         scope_type: str = "directory",
         scope_id: str = "",
         season_override: int | None = None,
@@ -228,6 +231,7 @@ class DirectoryScrapeStore:
                 numbering_mode=normalize_numbering_mode(numbering_mode),
                 position_overrides=dict(position_overrides or {}),
                 created_at=self._clock(),
+                selection_source=selection_source,
             )
             self._prune()
             return preview_id
@@ -1072,6 +1076,7 @@ class DirectoryScrapeService:
         season: int | None = None,
         episode: int | None = None,
         numbering_mode: str = "auto",
+        selection_source: Literal["manual", "automatic"] = "manual",
     ) -> dict:
         record = self.store.get_inspection(owner, inspection_id)
         if media_type not in {"movie", "tv"}:
@@ -1211,6 +1216,7 @@ class DirectoryScrapeService:
             target_snapshot,
             stats,
             payload,
+            selection_source=selection_source,
             scope_type=record.scope_type,
             scope_id=record.scope_id,
             season_override=season_override,
@@ -1273,6 +1279,7 @@ class DirectoryScrapeService:
             }
         preview = self.preview(
             owner, inspection_id, match.tmdb_id, match.media_type,
+            selection_source="automatic",
             provider=str(getattr(match, "provider", "") or "tmdb"),
             external_id=str(getattr(match, "external_id", "") or ""),
         )
@@ -1428,7 +1435,8 @@ class DirectoryScrapeService:
         """仅把真正写入成功的人工预览结果沉淀为后续稳定知识。"""
         selected_id = (record.match.tmdb_id or "").strip()
         if (
-            not selected_id
+            record.selection_source != "manual"
+            or not selected_id
             or record.match.media_type not in {"movie", "tv"}
             or (record.match.provider or "tmdb").strip().lower() not in {"", "tmdb"}
         ):

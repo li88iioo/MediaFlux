@@ -2175,6 +2175,7 @@ class DirectoryScrapeServiceTests(unittest.TestCase):
         )
         preview.assert_called_once_with(
             "owner", inspected["inspection_id"], "", "movie",
+            selection_source="automatic",
             provider="metatube", external_id="javbus:atid-675",
         )
 
@@ -2426,6 +2427,139 @@ class DirectoryScrapeExecutionTests(IsolatedDatabaseTestCase):
         self.scraper.confirm.assert_called_once()
         with self.assertRaisesRegex(KeyError, "不存在或已过期"):
             self.service.execute_preview("owner", self.preview_id)
+
+    def test_auto_preview_does_not_write_manual_recognition_lock(self):
+        from app.repositories.recognition import get_tmdb_lock
+
+        self.enterContext(isolated_test_database("automatic-selection.db"))
+        learning = TMDBScraper(client=cast(TMDBClient, SimpleNamespace(api_key="offline")))
+        self.addCleanup(learning.close)
+        self.scraper.confirm = Mock(wraps=learning.confirm)
+
+        def read_lock():
+            return get_tmdb_lock(
+                raw_name="Iron.Man.2008.1080p.mkv", parent_path="钢铁侠",
+                media_type="movie", season=-1,
+            )
+
+        self.assertIsNone(read_lock())
+        inspection = self.service.inspect("owner", "movie-dir")
+        preview = self.service.auto_match("owner", inspection["inspection_id"])
+        self.assertEqual(preview["status"], "matched")
+
+        result = self.service.execute_preview("owner", preview["preview_id"])
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.assertEqual(result["stats"]["failed"], 0)
+        self.assertIsNone(read_lock())
+        self.scraper.confirm.assert_not_called()
+        db.init_db()
+        self.assertIsNone(read_lock())
+
+    def test_manual_preview_writes_recognition_lock_only_once(self):
+        from app.modules.directory_scrape_errors import DirectoryScrapeGoneError
+        from app.repositories.recognition import get_tmdb_lock
+
+        self.enterContext(isolated_test_database("manual-selection.db"))
+        learning = TMDBScraper(client=cast(TMDBClient, SimpleNamespace(api_key="offline")))
+        self.addCleanup(learning.close)
+        self.scraper.confirm = Mock(wraps=learning.confirm)
+
+        result = self.service.execute_preview("owner", self.preview_id)
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        lock = get_tmdb_lock(
+            raw_name="Iron.Man.2008.1080p.mkv", parent_path="钢铁侠",
+            media_type="movie", season=-1,
+        )
+        self.assertIsNotNone(lock)
+        assert lock is not None
+        self.assertEqual((lock["tmdb_id"], lock["lock_source"]), ("1726", "manual"))
+        with self.assertRaises(DirectoryScrapeGoneError):
+            self.service.execute_preview("owner", self.preview_id)
+        self.scraper.confirm.assert_called_once()
+
+    def test_restored_auto_preview_keeps_origin_after_prewrite_failure(self):
+        from app.modules.directory_scrape import DirectoryScrapeService
+        from app.modules.directory_scrape_errors import DirectoryScrapeGoneError
+
+        self.scraper.confirm = Mock()
+        inspection = self.service.inspect("owner", "movie-dir")
+        preview = self.service.auto_match("owner", inspection["inspection_id"])
+        preview_id = preview["preview_id"]
+        with (
+            patch.object(self.service, "_inspect_scope", side_effect=RuntimeError("prewrite read failed")),
+            self.assertRaisesRegex(RuntimeError, "prewrite read failed"),
+        ):
+            self.service.execute_preview("owner", preview_id)
+        self.assertFalse(self.store.get_preview("owner", preview_id).claimed)
+        self.scraper.confirm.assert_not_called()
+
+        restored = DirectoryScrapeService(
+            client=cast(GuangYaClient, self.client),
+            scraper=cast(TMDBScraper, self.scraper),
+            store=self.store,
+            rules_loader=lambda: self.rules,
+        )
+        self.addCleanup(restored.close)
+        result = restored.execute_preview("owner", preview_id)
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.scraper.confirm.assert_not_called()
+        with self.assertRaises(DirectoryScrapeGoneError):
+            restored.execute_preview("owner", preview_id)
+        self.scraper.confirm.assert_not_called()
+
+    def test_manual_run_parameters_cannot_promote_an_auto_preview(self):
+        import app.routes.guangya_scrape_api as scrape_api
+
+        self.scraper.confirm = Mock()
+        inspection = self.service.inspect("owner", "movie-dir")
+        preview = self.service.auto_match("owner", inspection["inspection_id"])
+        preview_id = preview["preview_id"]
+        # 展示 payload 不能替代服务端预览记录中的来源。
+        self.store.get_preview("owner", preview_id).payload["selection_source"] = "manual"
+        manager = Mock()
+        manager.start_operation.return_value = {"ok": True, "task_id": "resume-auto"}
+        with (
+            patch.object(scrape_api, "require_api_login"),
+            patch.object(scrape_api, "get_directory_scrape_service", return_value=self.service),
+            patch.object(scrape_api, "get_organize_manager", return_value=manager),
+        ):
+            response = scrape_api.run_directory(
+                scrape_api.Request({"type": "http", "session": {"csrf_token": "owner"}}),
+                {"mode": "manual", "preview_id": preview_id, "selection_source": "manual"},
+            )
+        self.assertEqual(response.status_code, 202)
+        callback = manager.start_operation.call_args.args[2]
+        result = callback()
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.scraper.confirm.assert_not_called()
+
+    def test_repeated_previews_keep_selection_origin_per_record(self):
+        self.scraper.confirm = Mock()
+        inspection = self.service.inspect("owner", "movie-dir")
+        inspection_id = inspection["inspection_id"]
+        automatic = self.service.auto_match("owner", inspection_id)
+        manual = self.service.preview("owner", inspection_id, "1726", "movie")
+        another_automatic = self.service.auto_match("owner", inspection_id)
+        self.assertEqual(len({automatic["preview_id"], manual["preview_id"], another_automatic["preview_id"]}), 3)
+
+        result = self.service.execute_preview("owner", automatic["preview_id"])
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.scraper.confirm.assert_not_called()
+
+    def test_later_auto_preview_does_not_disable_manual_selection_learning(self):
+        self.scraper.confirm = Mock()
+        record = self.store.get_preview("owner", self.preview_id)
+        self.service.auto_match("owner", record.inspection_id)
+
+        result = self.service.execute_preview("owner", self.preview_id)
+
+        self.assertEqual(result["stats"]["moved"], 1)
+        self.scraper.confirm.assert_called_once()
 
     def test_prewrite_error_releases_preview_and_preserves_original_error(self):
         with (
