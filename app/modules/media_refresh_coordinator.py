@@ -190,14 +190,18 @@ class MediaRefreshCoordinator:
                 self._stop_event.wait(1.0)
             if not owns_lock:
                 return
-            recovered = recover_media_refresh_leases()
-            if recovered:
-                logger.warning("已恢复中断的媒体库刷新请求 count=%s", recovered)
-            with self._state_lock:
-                self._consumer_active = True
+            recovery_pending = True
             while not self._stop_event.is_set():
                 worked = False
                 try:
+                    if recovery_pending:
+                        recovered = recover_media_refresh_leases()
+                        if recovered:
+                            logger.warning("已恢复中断的媒体库刷新请求 count=%s", recovered)
+                        recovery_pending = False
+                        with self._state_lock:
+                            self._consumer_active = True
+                            self._last_error_type = ""
                     claimed = claim_due_media_refreshes(
                         owner=self._owner,
                         lease_seconds=300,

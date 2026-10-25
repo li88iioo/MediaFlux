@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import threading
 from unittest.mock import Mock, patch
 
 from app import database as db
@@ -264,6 +266,70 @@ class MediaRefreshQueueTests(IsolatedDatabaseTestCase):
 class MediaRefreshCoordinatorTests(IsolatedDatabaseTestCase):
     def setUp(self) -> None:
         clear_media_refresh_queue()
+
+    def test_transient_startup_recovery_failure_retries_without_losing_refresh(self):
+        enqueue_media_refresh("jellyfin", ["/media/A.strm"], debounce_seconds=0)
+        worker = MediaRefreshCoordinator()
+        wait = worker._wake_event.wait
+        attempts = 0
+        errors: list[threading.ExceptHookArgs] = []
+
+        def recover():
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return recover_media_refresh_leases()
+
+        def refresh(*_args, **_kwargs):
+            self.assertEqual(attempts, 2)
+            worker._stop_event.set()
+            return {"ok": True, "scope": "item", "requested": 1, "succeeded_target_ids": ["film"]}
+
+        client = Mock(display_name="Jellyfin")
+        client.refresh_for_paths.side_effect = refresh
+        with patch("threading.excepthook", side_effect=errors.append), patch(
+            "app.modules.media_refresh_coordinator.recover_media_refresh_leases", side_effect=recover,
+        ), patch.object(worker, "_client_for", return_value=client), patch.object(
+            worker._wake_event, "wait", side_effect=lambda timeout: wait(min(timeout, 0.01)),
+        ):
+            worker.start()
+            assert worker._thread is not None
+            worker._thread.join(timeout=2.0)
+            self.assertTrue(worker.stop(timeout=1.0))
+
+        self.assertEqual(errors, [])
+        client.refresh_for_paths.assert_called_once()
+        self.assertEqual(media_refresh_queue_status()["paths"], 0)
+        self.assertEqual(worker.status()["completed_session"], 1)
+        self.assertEqual(worker.status()["last_error_type"], "")
+        self.assertTrue(worker._worker_lock.acquire(blocking=False))
+        worker._worker_lock.release()
+
+    def test_stop_while_startup_recovery_unavailable_keeps_refresh_queued(self):
+        enqueue_media_refresh("jellyfin", ["/media/A.strm"], debounce_seconds=0)
+        worker = MediaRefreshCoordinator()
+        attempted = threading.Event()
+        errors: list[threading.ExceptHookArgs] = []
+
+        def unavailable():
+            attempted.set()
+            raise sqlite3.OperationalError("database is locked")
+
+        with patch("threading.excepthook", side_effect=errors.append), patch(
+            "app.modules.media_refresh_coordinator.recover_media_refresh_leases", side_effect=unavailable,
+        ), patch.object(worker, "_client_for") as client:
+            worker.start()
+            self.assertTrue(attempted.wait(timeout=2.0))
+            self.assertTrue(worker.stop(timeout=1.0))
+
+        self.assertEqual(errors, [])
+        client.assert_not_called()
+        self.assertEqual(media_refresh_queue_status()["paths"], 1)
+        self.assertFalse(worker.status()["consumer_active"])
+        self.assertEqual(worker.status()["last_error_type"], "OperationalError")
+        self.assertTrue(worker._worker_lock.acquire(blocking=False))
+        worker._worker_lock.release()
 
     def test_successful_group_is_acknowledged_and_deduped(self):
         queued = enqueue_media_refresh(
