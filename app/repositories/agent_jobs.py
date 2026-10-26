@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from app.agent.errors import AgentToolError
+from app.agent.models import EFFECT_RECEIPT_RETENTION_SECONDS
 from app.modules.web_secret import get_web_secret
 
 _ALLOWED_JOB_TYPES = {"library_episode_audit"}
@@ -91,17 +92,15 @@ def _select_job(
 
 
 def _trim_owner_history(conn: sqlite3.Connection, *, owner_digest: str) -> None:
-    stale = conn.execute(
+    conn.execute(
+        "DELETE FROM agent_jobs WHERE owner_digest=? AND updated_at<datetime(?,?) "
+        "AND job_id IN ("
         "SELECT job_id FROM agent_jobs WHERE owner_digest=? "
         "AND status IN ('succeeded','failed','cancelled') "
-        "ORDER BY updated_at DESC,job_id DESC LIMIT -1 OFFSET ?",
-        (owner_digest, _MAX_HISTORY_PER_OWNER),
-    ).fetchall()
-    if stale:
-        conn.executemany(
-            "DELETE FROM agent_jobs WHERE owner_digest=? AND job_id=?",
-            [(owner_digest, str(row["job_id"])) for row in stale],
-        )
+        "ORDER BY updated_at DESC,job_id DESC LIMIT -1 OFFSET ?)",
+        (owner_digest, db.now(), f"-{EFFECT_RECEIPT_RETENTION_SECONDS} seconds",
+         owner_digest, _MAX_HISTORY_PER_OWNER),
+    )
 
 
 def create_agent_job(

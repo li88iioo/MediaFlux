@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
 
 from app import database as db
@@ -132,6 +133,92 @@ class AgentDurableJobTests(IsolatedDatabaseTestCase):
         second, created = self._create(owner="owner-idempotent")
         self.assertTrue(created)
         self.assertNotEqual(first["job_id"], second["job_id"])
+
+    def test_recent_history_survives_volume_until_cold_receipt_delivery(self):
+        from app.agent import effect_completion as effects
+        from app.agent.completion_observers import _CompletionTracker
+        from app.agent.kernel.completion_receipts import EffectCompletionScope
+        from app.agent.kernel.persistence import SQLiteKernelStore
+
+        async def exercise():
+            scope = {"owner": "history-owner", "session_id": "waiting-session"}
+            store = SQLiteKernelStore()
+            lease, _ = await store.begin_turn(**scope, request_id="start-audit")
+            executor = Mock(return_value=_result(ok=True, status="up_to_date", checked=1))
+            scheduler = AgentJobsScheduler(
+                audit_executor=executor, clock=lambda: datetime(2099, 1, 1),
+            )
+            first = ""
+            for index in range(52):
+                row, _ = self._create(owner=scope["owner"], job_id=f"job_{index:020d}")
+                if not first:
+                    first = str(row["job_id"])
+                    await effects._register_effect_wait(
+                        ToolResult(True, "accepted", "后台任务已提交"),
+                        _CompletionTracker("agent_job", {"job_id": first}),
+                        "test.audit", EffectCompletionScope(store, lease, "first-audit", "web"),
+                    )
+                    await store.commit(lease)
+                self.assertEqual(scheduler.run_once(), 1)
+
+            def due(state):
+                state.metadata["effect_waits"]["first-audit"]["next_poll_at"] = 0
+                state.metadata["effect_next_poll_at"] = 0
+
+            await store.update_effect_state(**scope, change=due)
+            cold = SQLiteKernelStore()
+            self.assertEqual(await effects.poll_effect_receipts(cold), 1)
+            state = await cold.load(**scope)
+            receipt = state.metadata["effect_waits"]["first-audit"]
+            self.assertEqual(receipt["state"], "terminal")
+            self.assertEqual(receipt["final_result"]["status"], "up_to_date")
+            self.assertTrue(receipt["delivered"])
+            self.assertIsNotNone(db.get_agent_job(owner=scope["owner"], job_id=first))
+            self.assertEqual(await effects.poll_effect_receipts(SQLiteKernelStore()), 0)
+            self.assertEqual(executor.call_count, 52)
+
+        with patch.object(db, "now", return_value="2099-01-01 00:00:00"), patch(
+            "app.agent.feature_gate.is_agent_enabled", return_value=True,
+        ):
+            asyncio.run(exercise())
+
+    def test_history_cleanup_preserves_recovery_window_latest_rows_and_other_owners(self):
+        from app.agent.models import EFFECT_RECEIPT_RETENTION_SECONDS
+
+        start = datetime(2099, 1, 1)
+        with patch.object(db, "now", return_value=start.strftime("%Y-%m-%d %H:%M:%S")):
+            other, _ = self._create(owner="other-history-owner")
+            db.cancel_agent_job(owner="other-history-owner", job_id=other["job_id"])
+            running, _ = self._create(dedupe_key="running")
+            claimed = db.claim_due_agent_job(
+                job_type=_JOB_TYPE, current_time=db.now(), stale_before="2098-12-31 23:00:00",
+            )
+            assert claimed is not None
+            self.assertEqual(claimed["job_id"], running["job_id"])
+            oldest = ""
+            for index in range(52):
+                row, _ = self._create(job_id=f"job_{index:020d}")
+                oldest = oldest or str(row["job_id"])
+                db.cancel_agent_job(owner="web-owner-a", job_id=row["job_id"])
+
+        # 回执窗口边界内不因超过50条而删除任何终态；窗口外仍保留最近50条。
+        boundary = start + timedelta(seconds=EFFECT_RECEIPT_RETENTION_SECONDS)
+        with patch.object(db, "now", return_value=boundary.strftime("%Y-%m-%d %H:%M:%S")):
+            self._create(dedupe_key="at-boundary")
+        self.assertIsNotNone(db.get_agent_job(owner="web-owner-a", job_id=oldest))
+        with patch.object(db, "now", return_value=(boundary + timedelta(seconds=1)).strftime("%Y-%m-%d %H:%M:%S")):
+            self._create(dedupe_key="after-boundary")
+        self.assertIsNone(db.get_agent_job(owner="web-owner-a", job_id=oldest))
+        self.assertIsNotNone(db.get_agent_job(owner="other-history-owner", job_id=other["job_id"]))
+        active = db.get_agent_job(owner="web-owner-a", job_id=running["job_id"])
+        assert active is not None
+        self.assertEqual(active["status"], "running")
+        with db.get_conn() as conn:
+            retained = conn.execute(
+                "SELECT count(*) FROM agent_jobs WHERE owner_digest=? AND status='cancelled'",
+                (running["owner_digest"],),
+            ).fetchone()[0]
+        self.assertEqual(retained, 50)
 
     def test_lease_renewal_and_generation_cas_reject_stale_worker(self):
         row, _ = self._create(owner="owner-lease")

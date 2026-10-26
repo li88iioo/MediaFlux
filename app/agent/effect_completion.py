@@ -11,7 +11,7 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
-from app.agent.models import ToolContext, ToolResult
+from app.agent.models import EFFECT_RECEIPT_RETENTION_SECONDS, ToolContext, ToolResult
 from app.agent.public_safety import sanitize_public_text
 
 from . import completion_observers as observers
@@ -27,7 +27,6 @@ _WAITABLE_STATUSES = frozenset(
 _WAIT_TIMEOUT_SECONDS = 30 * 60
 _WAIT_INTERVAL_SECONDS = 1.0
 _EFFECT_POLL_SECONDS = 10.0
-_EFFECT_RETENTION_SECONDS = 24 * 60 * 60
 _EFFECT_WAITS_KEY = "effect_waits"
 
 
@@ -86,7 +85,7 @@ def _effect_wait_registration(
             if existing_only:
                 raise StalePublicationError("后台任务缺少原确认跟踪，请查询任务状态，勿重复提交")
             waits[scope.plan_id] = {
-                "sealed": sealed, "created_at": now, "expires_at": now + _EFFECT_RETENTION_SECONDS,
+                "sealed": sealed, "created_at": now, "expires_at": now + EFFECT_RECEIPT_RETENTION_SECONDS,
                 "next_poll_at": now + _EFFECT_POLL_SECONDS, "delivered": False,
                 "state": "pending", "last_status": "", "read_errors": 0,
             }

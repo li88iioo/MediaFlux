@@ -8,6 +8,9 @@ from enum import Enum
 from functools import wraps
 from typing import Any
 
+# 后台业务终态至少覆盖回执恢复窗口，不能只按条数淘汰待核验结果。
+EFFECT_RECEIPT_RETENTION_SECONDS = 24 * 60 * 60
+
 
 class RiskLevel(str, Enum):
     """工具风险等级；首期只允许 READ 自动执行。"""
