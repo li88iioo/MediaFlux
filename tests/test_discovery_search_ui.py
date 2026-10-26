@@ -103,7 +103,7 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "state.mode === 'search'",
             "elements.searchForm.addEventListener('submit'",
             "'/api/discovery/search'",
-            "state.appendError?.page === page ? state.appendError.providers : state.searchProviders",
+            "searchRetry?.providers ?? state.searchProviders",
             "providers: providers.join(',')",
             "loadActive({preserveContent: true}",
         ):
@@ -222,8 +222,8 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "itemKey(item)",
             "appendError:",
             "showPaginationControl",
-            "loadActive({preserveContent: true, append: true}",
-            "state.page = previousPage",
+            "loadActive({preserveContent: true, append: true, requestedPage})",
+            "state.page = requestedPage",
         ):
             self.assertIn(contract, self.script)
         self.assertRegex(
@@ -1762,7 +1762,9 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 current = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
                 current.wait_for()
                 self.assertTrue(current.is_disabled(), "切 Tab 新建的同身份卡必须继承在途状态")
-                self.assertIn("is-pending", current.get_attribute("class"))
+                current_classes = current.get_attribute("class")
+                assert current_classes is not None
+                self.assertIn("is-pending", current_classes)
                 current.evaluate("button => button.click()")
                 page.locator('#discovery-tab-sections').click()
                 self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.disabled)"), [True] * 6)
@@ -1856,7 +1858,9 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                     pending.pop().abort("failed")
                 page.wait_for_function("document.getElementById('discovery-live').textContent.length > 0")
                 self.assertTrue(button.is_enabled())
-                self.assertNotIn("is-pending", button.get_attribute("class"))
+                button_classes = button.get_attribute("class")
+                assert button_classes is not None
+                self.assertNotIn("is-pending", button_classes)
                 self.assertEqual(button.get_attribute("aria-pressed"), str(active).lower())
                 self.assertNotIn("已收藏", page.locator('#discovery-live').inner_text())
                 self.assertNotIn("已移出", page.locator('#discovery-live').inner_text())
@@ -2024,6 +2028,133 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 self.assertTrue(page.locator("#discovery-load-more-row").is_hidden())
                 self.assertEqual(errors, [])
 
+    def test_cancelled_append_or_refresh_keeps_cached_committed_page(self):
+        for operation, width, ignore_abort in (("append", 390, False), ("append", 1440, True),
+                                                ("refresh", 390, False), ("refresh", 1440, True)):
+            with self.subTest(operation=operation, width=width, ignore_abort=ignore_abort):
+                def payload(number):
+                    return self.search_payload(items=[{
+                        "provider": "tmdb", "media_type": "movie", "external_id": str(number),
+                        "title": f"第{number}页",
+                    }], has_more=number < 3)
+
+                page, errors = self.open_catalogue(
+                    width=width, search_response=lambda params: payload(int(params["page"][0])),
+                )
+                target = 2 if operation == "append" else 1
+                page.evaluate("""({target, ignoreAbort, stalePayload}) => {
+                    const originalFetch = window.fetch;
+                    window.cataloguePages = [];
+                    window.holdCataloguePage = false;
+                    window.catalogueAborted = false;
+                    window.fetch = (url, options = {}) => {
+                        const parsed = new URL(String(url), location.href);
+                        if (parsed.pathname !== '/api/discovery/search') return originalFetch(url, options);
+                        const number = Number(parsed.searchParams.get('page'));
+                        window.cataloguePages.push(number);
+                        if (!window.holdCataloguePage || number !== target) return originalFetch(url, options);
+                        window.holdCataloguePage = false;
+                        return new Promise((resolve, reject) => {
+                            window.releaseCataloguePage = () => {
+                                resolve(new Response(JSON.stringify(stalePayload), {headers: {'Content-Type': 'application/json'}}));
+                                window.catalogueLateReturned = true;
+                            };
+                            options.signal.addEventListener('abort', () => {
+                                window.catalogueAborted = true;
+                                if (!ignoreAbort) reject(new DOMException('mock cancelled page', 'AbortError'));
+                            }, {once: true});
+                        });
+                    };
+                }""", {"target": target, "ignoreAbort": ignore_abort, "stalePayload": payload(target)})
+                self.submit_catalogue_search(page)
+                if operation == "refresh":
+                    page.locator('#discovery-load-more').click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                before = page.locator('#discovery-grid .discovery-card-title').all_text_contents()
+                page.evaluate("""() => {
+                    window.holdCataloguePage = true;
+                    window.previousCatalogueCards = [...document.querySelectorAll('#discovery-grid .discovery-card')];
+                }""")
+                page.locator('#discovery-load-more' if operation == "append" else '#discovery-refresh').click()
+                page.wait_for_function("typeof window.releaseCataloguePage === 'function'")
+                self.assertTrue(page.evaluate("window.previousCatalogueCards.every(card => card.isConnected)"))
+                page.locator('#discovery-tab-douban-tv').click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertTrue(page.evaluate('window.catalogueAborted'))
+                interrupted = page.evaluate('window.cataloguePages')
+                self.submit_catalogue_search(page)
+                self.assertEqual(page.evaluate('window.cataloguePages'), interrupted, "新鲜缓存恢复不能额外请求")
+                self.assertEqual(page.locator('#discovery-grid .discovery-card-title').all_text_contents(), before)
+                page.locator('#discovery-load-more').click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                expected_pages = [1, 2, 2] if operation == "append" else [1, 2, 1, 3]
+                self.assertEqual(page.evaluate('window.cataloguePages'), expected_pages)
+                expected_titles = ['第1页', '第2页'] if operation == "append" else ['第1页', '第2页', '第3页']
+                self.assertEqual(page.locator('#discovery-grid .discovery-card-title').all_text_contents(), expected_titles)
+                page.evaluate('window.releaseCataloguePage()')
+                page.wait_for_function('window.catalogueLateReturned === true')
+                self.assertEqual(page.locator('#discovery-grid .discovery-card-title').all_text_contents(), expected_titles)
+                self.assertEqual(errors, [])
+
+    def test_cancelled_refresh_preserves_partial_provider_retry_in_cached_search(self):
+        for partial_page in (1, 2):
+            with self.subTest(partial_page=partial_page):
+                calls = []
+                all_providers = "tmdb,douban,bangumi"
+                first = {"provider": "bangumi", "media_type": "tv", "external_id": "1", "title": "已有结果"}
+                recovered = {"provider": "tmdb", "media_type": "movie", "external_id": "2", "title": "补齐结果"}
+
+                def respond(params):
+                    number, providers = int(params["page"][0]), params["providers"][0]
+                    calls.append((number, providers))
+                    if len(calls) == partial_page:
+                        return self.search_payload(items=[first], failed=("tmdb",), has_more=True)
+                    return self.search_payload(items=[recovered] if providers == "tmdb" else [first], has_more=True)
+
+                page, errors = self.open_catalogue(search_response=respond)
+                self.submit_catalogue_search(page)
+                if partial_page == 2:
+                    page.locator('#discovery-load-more').click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertIn('重试当前页', page.locator('#discovery-load-more').inner_text())
+                page.evaluate("""() => {
+                    const originalFetch = window.fetch;
+                    window.refreshRequest = null;
+                    window.refreshAborted = false;
+                    window.fetch = (url, options = {}) => {
+                        const parsed = new URL(String(url), location.href);
+                        if (parsed.pathname !== '/api/discovery/search' || window.refreshRequest) return originalFetch(url, options);
+                        window.refreshRequest = Object.fromEntries(parsed.searchParams);
+                        return new Promise((resolve, reject) => {
+                            options.signal.addEventListener('abort', () => {
+                                window.refreshAborted = true;
+                                reject(new DOMException('mock cancelled refresh', 'AbortError'));
+                            }, {once: true});
+                        });
+                    };
+                }""")
+                page.locator('#discovery-refresh').click()
+                page.wait_for_function('window.refreshRequest !== null')
+                refresh = page.evaluate('window.refreshRequest')
+                self.assertEqual((refresh['page'], refresh['providers']), ('1', all_providers))
+                page.locator('#discovery-tab-douban-tv').click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertTrue(page.evaluate('window.refreshAborted'))
+                self.submit_catalogue_search(page)
+                self.assertEqual(len(calls), partial_page, "切回搜索应直接恢复快照")
+                page.locator('#discovery-load-more').click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertEqual(calls[-1], (partial_page, "tmdb"), "取消刷新不能丢失原页失败来源")
+                self.assertEqual(page.locator('#discovery-grid .discovery-card-title').all_text_contents(), ['已有结果', '补齐结果'])
+                page.locator('#discovery-refresh').click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertEqual(calls[-1], (1, all_providers))
+                self.assertNotIn('重试', page.locator('#discovery-load-more').inner_text())
+                page.locator('#discovery-load-more').click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertEqual(calls[-1], (2, all_providers), "成功刷新统一提交页码与已清除的重试范围")
+                self.assertEqual(errors, [])
+
     def test_search_partial_page_retries_failed_sources_before_advancing(self):
         for width in (390, 1440):
             with self.subTest(width=width):
@@ -2183,21 +2314,34 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         card = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "保留结果"}
 
         def respond(params):
-            calls.append(int(params["page"][0]))
-            return self.search_payload(failed=("tmdb", "douban", "bangumi")) if len(calls) == 2 else self.search_payload(items=[card])
+            number = int(params["page"][0])
+            calls.append(number)
+            return self.search_payload(failed=("tmdb", "douban", "bangumi")) if len(calls) == 3 else self.search_payload(
+                items=[{**card, "external_id": str(number)}], has_more=number < 3,
+            )
 
         page, errors = self.open_catalogue(search_response=respond)
         self.submit_catalogue_search(page)
-        page.locator("#discovery-grid .discovery-card").evaluate("card => window.originalSearchCard = card")
+        page.locator("#discovery-load-more").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        page.locator("#discovery-grid .discovery-card").evaluate_all("cards => window.originalSearchCards = cards")
         page.locator("#discovery-refresh").click()
         page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
-        self.assertTrue(page.evaluate("window.originalSearchCard === document.querySelector('#discovery-grid .discovery-card')"))
+        self.assertTrue(page.evaluate("window.originalSearchCards.every(card => card.isConnected)"))
         self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
         self.assertEqual(page.locator(".discovery-state-empty").count(), 0)
+        page.locator("#discovery-load-more").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.assertEqual(calls, [1, 2, 1, 3], "刷新失败仍从已提交的第 2 页继续")
+        self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 3)
         page.locator("#discovery-refresh").click()
         page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
-        self.assertEqual(calls, [1, 1, 1])
+        self.assertEqual(calls, [1, 2, 1, 3, 1])
         self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 1)
+        page.locator("#discovery-load-more").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.assertEqual(calls, [1, 2, 1, 3, 1, 2], "刷新成功后从第 1 页重新续页")
+        self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 2)
         self.assertEqual(errors, [])
 
     def test_detail_dates_fill_cards_and_saved_views_without_extra_requests(self):

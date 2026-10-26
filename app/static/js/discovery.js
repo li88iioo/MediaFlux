@@ -1141,9 +1141,8 @@
         }
     }
 
-    async function loadItemsMode(signal, page = 1) {
+    async function loadItemsMode(signal, page = 1, providers = state.searchProviders) {
         if (state.mode === 'search') {
-            const providers = state.appendError?.page === page ? state.appendError.providers : state.searchProviders;
             const params = {
                 q: state.searchQuery,
                 page,
@@ -1164,8 +1163,12 @@
         return {payload, items: extractItems(payload)};
     }
 
-    async function loadActive({preserveContent = false, append = false} = {}) {
-        const searchRetry = state.mode === 'search' && state.appendError?.page === state.page ? state.appendError : null;
+    async function loadActive({
+        preserveContent = false,
+        append = false,
+        requestedPage = state.page,
+        searchRetry = state.mode === 'search' && state.appendError?.page === requestedPage ? state.appendError : null,
+    } = {}) {
         append ||= Boolean(searchRetry);
         const requestId = state.requestId + 1;
         state.requestId = requestId;
@@ -1244,7 +1247,7 @@
                     elements.filters.replaceChildren();
                     elements.filters.hidden = true;
                 }
-                const itemsPromise = loadItemsMode(controller.signal, state.page);
+                const itemsPromise = loadItemsMode(controller.signal, requestedPage, searchRetry?.providers ?? state.searchProviders);
                 const [definitions, itemResult] = await Promise.all([definitionsPromise, itemsPromise]);
                 if (!(await keepSkeletonVisible(skeletonShownAt, requestId))) return false;
                 if (definitions) {
@@ -1253,6 +1256,8 @@
                 }
                 const {payload, items} = itemResult;
                 state.statusPayload = state.mode === 'search' ? {health: searchProviderHealth(payload)} : payload;
+                // 页码只随已接纳的结果提交，取消或失败的请求不能推进缓存进度。
+                state.page = requestedPage;
                 state.hasMore = Boolean(payload.has_more ?? payload.hasMore) || Boolean(searchRetry?.hasMore);
                 // 未完成的来源留在本页；只重试失败来源，保留先前成功来源的续页事实。
                 state.appendError = state.mode === 'search' && asArray(payload.errors).length
@@ -3609,42 +3614,24 @@
     async function refreshActive() {
         if (state.loading || state.loadingMore) return false;
         saveCurrentViewSnapshot();
-        const previousPage = state.page;
-        const previousHasMore = state.hasMore;
-        const previousAppendError = state.appendError;
-        state.page = 1;
-        state.appendError = null;
-        const loadPromise = loadActive({preserveContent: true});
-        const refreshRequestId = state.requestId;
-        const loaded = await loadPromise;
-        if (!loaded && state.requestId === refreshRequestId) {
-            state.page = previousPage;
-            state.hasMore = previousHasMore;
-            state.appendError = previousAppendError;
-            connectInfiniteScroll();
-        }
-        return loaded;
+        return loadActive({preserveContent: true, requestedPage: 1, searchRetry: null});
     }
 
     async function loadNextPage() {
         if (state.loadingMore || state.loading || !state.hasMore) return false;
         disconnectInfiniteScroll();
-        const previousPage = state.page;
-        state.page = state.appendError?.page ?? state.page + 1;
+        const requestedPage = state.appendError?.page ?? state.page + 1;
         showPaginationControl();
         setLoadingMore(true);
+        const loadPromise = loadActive({preserveContent: true, append: true, requestedPage});
+        const loadRequestId = state.requestId;
         try {
-            const loadPromise = loadActive({preserveContent: true, append: true});
-            const loadRequestId = state.requestId;
-            const loaded = await loadPromise;
-            if (!loaded && state.requestId === loadRequestId) {
-                state.page = previousPage;
-                if (!state.appendError) state.appendError = new Error('下一页读取失败');
-            }
-            return loaded;
+            return await loadPromise;
         } finally {
-            setLoadingMore(false);
-            connectInfiniteScroll();
+            if (state.requestId === loadRequestId) {
+                setLoadingMore(false);
+                connectInfiniteScroll();
+            }
         }
     }
 
