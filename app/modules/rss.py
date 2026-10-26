@@ -1064,12 +1064,17 @@ class RSSEngine:
 
         summary = submission.get("summary") or {}
         dispatch = submission.get("dispatch") or {}
-        current_request = db.get_download_request(request_id) if request_id else None
         current_entry = db.get_rss_entry(entry_id)
+        if (linked_key and summary.get("duplicate") and retry_source is not None
+                and (current_entry is None or current_entry["download_request_id"] != request_id)):
+            # 未接管的 canonical 冲突按原 owner 收尾；并发 successor 由仓储 owner 检查保护。
+            request_id = int(retry_source["id"])
+        current_request = db.get_download_request(request_id) if request_id else None
         existing = bool(summary.get("duplicate") and current_entry is not None
                         and current_entry["status"] == "downloaded")
         backend_field = "qb_status" if method == "qb" else "gy_status"
-        if (summary.get("duplicate") and current_request is not None
+        if (summary.get("duplicate") and current_entry is not None
+                and current_entry["download_request_id"] == request_id and current_request is not None
                 and current_request[backend_field] == "submitting"):
             return {"ok": False, "pending": True, "status": "submitting", "method": method,
                     "request_id": request_id, "infohash": infohash}
@@ -1099,11 +1104,6 @@ class RSSEngine:
                     ),
                 )
         else:
-            if linked_key and summary.get("duplicate") and retry_source is not None:
-                # 重试被活动 canonical 拒绝时没有新提交；回写仍属于冻结的原 owner。
-                # 若其间已有 successor 接管，仓储的 owner 检查会拒绝本次迟到反馈。
-                request_id = int(retry_source["id"])
-                current_request = db.get_download_request(request_id)
             failure_code, retryable, review_required = self._backend_failure(method, submission)
             if current_request is not None:
                 backend_field = "qb_status" if method == "qb" else "gy_status"

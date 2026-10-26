@@ -359,6 +359,110 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                     self.assertEqual(assert_present(db.get_rss_entry(entries[backend]))["download_request_id"],
                                      successor)
 
+    def test_submitting_canonical_conflict_settles_original_owner_without_replay(self):
+        from app.indexers.downloads import submit_download_input
+
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                original, entries, engine = self.dual_receipts(backend)
+                peer = "guangya" if backend == "qb" else "qb"
+                self.assertIsNotNone(apply_download_tracker_update(
+                    assert_present(db.get_download_request(original)),
+                    status="failed", qb_status="failed", gy_status="failed",
+                ))
+                with patch.object(dispatcher, "_submit_qb", side_effect=self.success), patch.object(
+                    dispatcher, "_submit_guangya", side_effect=self.success
+                ):
+                    first = engine.download(entries[backend])
+                self.assertTrue(first["ok"], first)
+                canonical = first["request_id"]
+                self.assertNotEqual(canonical, original)
+                source = assert_present(db.get_download_request(original))
+                item = dispatcher.DownloadInput(source["kind"], source["title"], source["source_value"])
+                first_receipt = dict(assert_present(db.get_rss_entry(entries[backend])))
+                entered, release = threading.Event(), threading.Event()
+
+                def delayed_submit(row, **kwargs):
+                    self.assertEqual(int(row["id"]), canonical)
+                    entered.set()
+                    self.assertTrue(release.wait(5), "canonical submission was not released")
+                    return self.success(row, **kwargs)
+
+                with patch.object(dispatcher, "_submit_qb", side_effect=delayed_submit) as qb, patch.object(
+                    dispatcher, "_submit_guangya", side_effect=delayed_submit
+                ) as gy, ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(submit_download_input, item, peer, origin="indexer:rss-conflict-test")
+                    try:
+                        self.assertTrue(entered.wait(5), "canonical did not reach the submit boundary")
+                        field = "qb_status" if peer == "qb" else "gy_status"
+                        self.assertEqual(assert_present(db.get_download_request(canonical))[field], "submitting")
+                        blocked = engine.download(entries[peer])
+                        settled = dict(assert_present(db.get_rss_entry(entries[peer])))
+                    finally:
+                        release.set()
+                    self.assertTrue(pending.result(timeout=5)["summary"]["ok"])
+                self.assertEqual(qb.call_count, int(peer == "qb"))
+                self.assertEqual(gy.call_count, int(peer == "guangya"))
+                self.assertFalse(blocked["ok"], blocked)
+                self.assertFalse(blocked.get("pending"), blocked)
+                self.assertEqual((blocked["status"], blocked["request_id"]), ("failed", original))
+                self.assertEqual((settled["status"], settled["processed"], settled["download_request_id"]),
+                                 ("failed", 0, original))
+                self.assertTrue(settled["failure_code"])
+                self.assertNotIn(settled["failure_code"], {
+                    "qb_outcome_unknown", "guangya_outcome_unknown", "submission_outcome_unknown",
+                })
+                self.assertEqual(dict(assert_present(db.get_download_request(original))), dict(source))
+                self.assertEqual(dict(assert_present(db.get_rss_entry(entries[backend]))), first_receipt)
+                self.assertEqual(assert_present(db.get_download_request(canonical))[field], "submitted")
+                self.assertEqual(dict(assert_present(db.get_rss_entry(entries[peer]))), settled)
+                db.init_db()
+                self.assertEqual(dict(assert_present(db.get_rss_entry(entries[peer]))), settled)
+                self.assertEqual(db.update_rss_entries_processed([entries[peer]], False), 1)
+
+    def test_duplicate_submission_pending_tracks_current_owner_until_acceptance(self):
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                _, first, item = self.pending(backend)
+                _, second, _ = self.pending(backend)
+                with db.get_conn() as conn:
+                    conn.execute("UPDATE rss_entries SET payload=? WHERE id=?",
+                                 (json.dumps({"torrent_url": item.source_value}), second))
+                engine = RSSEngine()
+                self.addCleanup(engine.close)
+                entered, release = threading.Event(), threading.Event()
+
+                def delayed_submit(row, **kwargs):
+                    entered.set()
+                    self.assertTrue(release.wait(5), "owner submission was not released")
+                    return self.success(row, **kwargs)
+
+                with patch.object(dispatcher, "_submit_qb", side_effect=delayed_submit) as qb, patch.object(
+                    dispatcher, "_submit_guangya", side_effect=delayed_submit
+                ) as gy, ThreadPoolExecutor(max_workers=1) as pool:
+                    task = pool.submit(engine.download, first)
+                    try:
+                        self.assertTrue(entered.wait(5), "owner did not reach the submit boundary")
+                        result = engine.download(second)
+                        self.assertFalse(result["ok"], result)
+                        self.assertTrue(result["pending"], result)
+                        for eid in (first, second):
+                            waiting = assert_present(db.get_rss_entry(eid))
+                            self.assertEqual((waiting["status"], waiting["processed"], waiting["download_request_id"]),
+                                             ("submitting", 0, result["request_id"]))
+                    finally:
+                        release.set()
+                    accepted = task.result(timeout=5)
+                self.assertTrue(accepted["ok"], accepted)
+                self.assertEqual(accepted["request_id"], result["request_id"])
+                self.assertEqual(qb.call_count, int(backend == "qb"))
+                self.assertEqual(gy.call_count, int(backend == "guangya"))
+                for eid in (first, second):
+                    receipt = assert_present(db.get_rss_entry(eid))
+                    self.assertEqual((receipt["status"], receipt["processed"], receipt["download_request_id"]),
+                                     ("downloaded", 1, result["request_id"]))
+                    self.assertFalse(receipt["failure_code"])
+
     def test_conflicting_retry_feedback_cannot_overwrite_a_new_peer_owner(self):
         for backend in ("qb", "guangya"):
             with self.subTest(backend=backend):
