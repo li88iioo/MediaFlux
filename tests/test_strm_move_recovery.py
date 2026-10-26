@@ -807,6 +807,25 @@ class StrmRetiredPathRecoveryTests(unittest.TestCase):
             {(str(old.parent), False)},
         )
 
+    def test_relative_retired_root_records_both_refresh_directories(self):
+        for root_text in (os.path.relpath(self.root), f"~/{self.root.name}"):
+            with self.subTest(root=root_text), patch.dict(os.environ, {"HOME": str(self.root.parent)}):
+                old, current = self._displaced_paths()
+                db.enqueue_strm_retired_source("source", "S", root_text)
+                result = self._retire()
+                self.assertEqual(result["blocked"], 0, result)
+                self.assertEqual(result["cleaned"], 2, result)
+                self.assertFalse(old.exists())
+                self.assertFalse(current.exists())
+                self.assertEqual(
+                    {entry["path"] for entry in db.list_strm_refresh_entries()},
+                    {str(old.parent), str(current.parent)},
+                )
+                self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+                self.assertEqual(db.list_strm_retired_sources(), [])
+                db.init_db()
+                self.assertEqual(self._retire()["sources"], 0)
+
     def test_retired_old_path_reused_by_active_index_is_not_deleted(self):
         old, current = self._displaced_paths()
         db.upsert_strm_index(

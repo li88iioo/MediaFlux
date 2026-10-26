@@ -71,6 +71,8 @@ def recover_pending_paths(
     """
     from app.modules import strm
 
+    # 所有权校验、删除和刷新规划必须使用同一个已展开的绝对根。
+    strm_root = str(Path(strm_root).expanduser().resolve(strict=False))
     current = None
     reported_paths = set(stats.get("changed_strm_paths") or [])
     after_id = 0
