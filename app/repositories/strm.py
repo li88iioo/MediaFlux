@@ -1054,6 +1054,10 @@ def _load_changes(raw: object) -> list[dict[str, Any]]:
     return [item for item in parsed if isinstance(item, dict)]
 
 
+def _object_key(change: dict[str, Any]) -> tuple[str, str]:
+    return str(change.get("kind") or "video"), str(change.get("file_id") or "")
+
+
 def merge_strm_changes(*groups: Iterable[object] | None) -> list[dict[str, Any]]:
     """按变化键去重合并；同一快照以后到值为准，溢出时强制全量。"""
     merged: dict[str, dict[str, Any]] = {}
@@ -1157,12 +1161,43 @@ def enqueue_strm_change_targets(
         # 同时读到旧快照，后提交者会覆盖另一批变化。把读取、合并和写入
         # 放进同一立即写事务，保持“不丢事件”的队列契约。
         conn.execute("BEGIN IMMEDIATE")
+        # ACK 重验只是旧观察的收尾，不是一次新的文件变更。生产者与恢复者
+        # 在同一事务按对象归并（不按目录），真实变化在任意到达顺序下都优先。
+        for source_id in dict.fromkeys(source for source, _ in grouped):
+            rows = conn.execute(
+                "SELECT id,pending_changes_json,inflight_changes_json FROM strm_change_queue "
+                "WHERE provider=? AND source_id=? AND state!='completed'",
+                (provider, source_id),
+            ).fetchall()
+            pending = {row["id"]: _load_changes(row["pending_changes_json"]) for row in rows}
+            business = {_object_key(item) for items in pending.values() for item in items
+                        if not item.get("_revalidation")}
+            incoming = {_object_key(item) for (source, _), items in grouped.items()
+                        if source == source_id for item in items if not item.get("_revalidation")}
+            for row in rows:
+                for column in ("pending_changes_json", "inflight_changes_json"):
+                    before = _load_changes(row[column])
+                    after = [item for item in before if not (
+                        item.get("_revalidation") and _object_key(item) in incoming
+                    )]
+                    if len(after) != len(before):
+                        conn.execute(
+                            f"UPDATE strm_change_queue SET {column}=? WHERE id=?",
+                            (json.dumps(after, ensure_ascii=False), row["id"]),
+                        )
+            for key, items in grouped.items():
+                if key[0] == source_id:
+                    grouped[key] = [item for item in items if not (
+                        item.get("_revalidation") and _object_key(item) in business | incoming
+                    )]
         from app.repositories.strm_request_ownership import (
             _attach_request_work,
             _begin_request_owners,
         )
         owners = _begin_request_owners(conn, download_request_ids, stamp)
         for (source_id, rel_dir), items in grouped.items():
+            if not items:
+                continue
             row = conn.execute(
                 "SELECT id,state,pending_changes_json,next_attempt_at "
                 "FROM strm_change_queue "

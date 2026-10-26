@@ -1644,6 +1644,7 @@ def _flush_failure_resolutions(
                         "source_id": source_id, "kind": "video" if current_action == "generate" else "metadata",
                         "action": "upsert", "file_id": file_id, "parent_id": file.parent_id,
                         "name": file.name, "etag": file.etag, "size": file.size, "rel_dir": rel_dir,
+                        "_revalidation": True,
                     })
                 try:
                     db.enqueue_strm_change_targets(changes, not_before_seconds=60.0)

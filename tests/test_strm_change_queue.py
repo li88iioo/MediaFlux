@@ -96,6 +96,24 @@ class StrmChangeQueueStateTests(IsolatedDatabaseTestCase):
         self.assertEqual(claimed[0]["changes"][0]["etag"], "new")
         self.assertEqual(claimed[0]["changes"][0]["size"], 2)
 
+    def test_new_business_change_supersedes_only_its_ack_revalidation(self):
+        retry = {**_change(), "_revalidation": True}
+        db.enqueue_strm_change_targets([
+            retry, {**retry, "file_id": "f2"}, {**retry, "kind": "metadata"},
+            {**retry, "source_id": "other"},
+        ])
+        claimed = db.claim_strm_change_targets(owner="old-revalidation")
+        db.enqueue_strm_change_targets([_change(rel_dir="", action="remove")])
+        # 已领取的旧重验即使失败退回，也不能恢复刚被新业务变更取代的快照。
+        self.assertEqual(db.release_strm_change_targets(claimed), 2)
+        current = db.claim_strm_change_targets(owner="newer-business")
+        changes = [change for row in current for change in row["changes"]]
+        video = [item for item in changes if item["source_id"] == "source"
+                 and item["file_id"] == "f1" and item["kind"] == "video"]
+        self.assertEqual([item["action"] for item in video], ["remove"])
+        self.assertEqual(len(changes), 4)
+        self.assertEqual(sum(bool(item.get("_revalidation")) for item in changes), 3)
+
     def test_concurrent_enqueue_serializes_read_merge_write(self):
         first_in_merge = threading.Event()
         release_first = threading.Event()

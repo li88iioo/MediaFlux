@@ -4,7 +4,9 @@ from __future__ import annotations
 import tests  # noqa: F401  # 必须在 app 前初始化隔离运行目录。
 
 from contextlib import ExitStack
+from dataclasses import replace
 import json
+import threading
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -60,6 +62,63 @@ def seed_failed_video(root):
         failed = _run(root, enabled=False)
     assert failed["strm_partial"] and failed["stats"]["failed"] == 1
     assert len(db.list_strm_failures(status="open")) == 1
+
+
+@pytest.mark.parametrize("action", ["remove", "upsert"])
+@pytest.mark.parametrize("arrival", ["before_ack_retry", "after_ack_retry"])
+def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arrival):
+    seed_failed_video(tmp_path)
+    tree = _tree()
+    reject_ack()
+    at_ack, submitted = threading.Event(), threading.Event()
+    errors = []
+
+    def publish_change():
+        try:
+            assert at_ack.wait(5)
+            if action == "remove":
+                tree["d"] = []
+                change = {"source_id": "s", "kind": "video", "action": "remove", "file_id": "v"}
+            else:
+                tree["d"] = [replace(tree["d"][0], name="Latest.mkv", etag="new")]
+                change = {"source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
+                          "parent_id": "d", "name": "Latest.mkv", "etag": "new", "size": 100, "rel_dir": "Film"}
+            assert STRMScheduler()._persist_change_targets([change])
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            submitted.set()
+
+    resolve = db.resolve_strm_failures_for_items
+
+    def pause_ack(*args, **kwargs):
+        if arrival == "before_ack_retry":
+            at_ack.set()
+            assert submitted.wait(5)
+        return resolve(*args, **kwargs)
+
+    producer = threading.Thread(target=publish_change)
+    producer.start()
+    try:
+        with patch.object(db, "resolve_strm_failures_for_items", side_effect=pause_ack):
+            first = _run(tmp_path, enabled=False, tree=tree)
+        assert first["stats"]["failure_ledger_failed"] == 1
+    finally:
+        at_ack.set()
+        producer.join(5)
+    assert not producer.is_alive() and not errors
+    old_path = next(tmp_path.rglob("*.strm"))
+    restore_ack_and_restart()
+    retry = _run(tmp_path, mode="fast", enabled=False, tree=tree, queue_only=True)
+    assert not retry["partial"], retry
+    assert db.count_pending_strm_change_targets() == 0
+    assert not old_path.exists()
+    rows = db.list_strm_index("guangya:s")
+    if action == "remove":
+        assert rows == []
+    else:
+        assert len(rows) == 1 and rows[0]["filename"] == "Latest.mkv"
+        assert rows[0]["etag"] == "new"
 
 
 @pytest.mark.parametrize("mode", ["full", "fast"])
