@@ -41,7 +41,7 @@ def _tree(*, flat=False, etag="e"):
 
 
 def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
-         flat=False, retire=False, configured_text=None):
+         flat=False, retire=False, configured_text=None, queue_only=False):
     """经真实 scheduler 注入策略；不直接为安装器伪造刷新行为。"""
     scheduler = STRMScheduler()
     sources = [] if retire else strm.plan_strm_sources([{"id": "s", "name": "S"}])
@@ -72,7 +72,7 @@ def _run(root, *, mode="full", enabled=True, allow_emby=True, tree=None,
         stack.enter_context(patch.object(scheduler, "_execute_locked", side_effect=execute_with_policy))
         changes = [{"source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
                     "parent_id": "s" if flat else "d", "name": "Movie.mkv", "rel_dir": "" if flat else "Film"}]
-        return scheduler.run_blocking("manual", sync_mode=mode, organize_changes=changes if mode == "fast" else None)
+        return scheduler.run_blocking("manual", sync_mode=mode, organize_changes=changes if mode == "fast" and not queue_only else None)
 
 
 @contextmanager

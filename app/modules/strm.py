@@ -1592,37 +1592,72 @@ def _record_failure(
 
 
 def _flush_failure_resolutions(
-    stats: dict, source_id: str, pending: dict[str, set[str]], action: str | None = None,
+    stats: dict, source_id: str,
+    pending: dict[str, dict[str, tuple[GuangYaFile, str]]],
+    snapshots: dict[str, dict[str, sqlite3.Row]], action: str | None = None,
+    *, rel_prefix: str = "",
 ) -> None:
-    """短事务批量关闭成功项的失败台账；台账异常不反向破坏已落盘文件。"""
+    """批量确认成功快照；未确认项用既有持久目标重验，不伪报文件生成失败。"""
     actions = (action,) if action else tuple(pending)
     for current_action in actions:
-        file_ids = pending.get(current_action, set())
-        if not file_ids:
+        items = pending[current_action]
+        expected = {
+            file_id: snapshots[current_action][file_id]
+            for file_id in items if file_id in snapshots[current_action]
+        }
+        if not expected:
+            items.clear()
             continue
         started = time.monotonic()
+        remaining = expected
+        reason = "失败项已更新，旧成功快照不再适用"
         try:
-            db.resolve_strm_failures_for_items(
-                source_id, tuple(file_ids), current_action,
+            updated = db.resolve_strm_failures_for_items(
+                source_id, tuple(expected), current_action, expected_failures=expected,
             )
             stats["failure_resolve_batches"] = int(
                 stats.get("failure_resolve_batches", 0) or 0
             ) + 1
+            if updated == len(expected):
+                remaining = {}
+            else:
+                latest = db.get_strm_failure_resolution_snapshot(source_id)[current_action]
+                remaining = {file_id: row for file_id, row in expected.items() if file_id in latest}
         except Exception as exc:
-            stats["failure_ledger_failed"] = int(
-                stats.get("failure_ledger_failed", 0) or 0
-            ) + 1
+            reason = f"失败账本确认失败（{type(exc).__name__}）"
             logger.warning(
                 "批量更新 STRM 失败台账失败 source=%s action=%s type=%s",
                 source_id, current_action, type(exc).__name__,
             )
         finally:
+            if remaining:
+                stats["failure_ledger_failed"] = int(stats.get("failure_ledger_failed", 0)) + 1
+                changes = []
+                prefix = safe_path_component(rel_prefix) if rel_prefix.strip() else ""
+                for file_id in remaining:
+                    file, rel_dir = items[file_id]
+                    if prefix:
+                        rel_dir = str(Path(rel_dir).relative_to(prefix))
+                        if rel_dir == ".":
+                            rel_dir = ""
+                    changes.append({
+                        "source_id": source_id, "kind": "video" if current_action == "generate" else "metadata",
+                        "action": "upsert", "file_id": file_id, "parent_id": file.parent_id,
+                        "name": file.name, "etag": file.etag, "size": file.size, "rel_dir": rel_dir,
+                    })
+                try:
+                    db.enqueue_strm_change_targets(changes, not_before_seconds=60.0)
+                except Exception as exc:
+                    feedback = f"{reason}；自动重验目标登记失败，可手动重试（{type(exc).__name__}）"
+                else:
+                    feedback = f"{reason}；成功文件已保留，已登记自动重验目标"
+                _append_error_sample(stats, "失败账本待确认", source_id, feedback)
             stats["failure_resolve_elapsed_seconds"] = round(
                 float(stats.get("failure_resolve_elapsed_seconds", 0.0) or 0.0)
                 + time.monotonic() - started,
                 3,
             )
-            file_ids.clear()
+            items.clear()
 
 
 def _sync_strm_incremental_impl(
@@ -1671,7 +1706,8 @@ def _sync_strm_incremental_impl(
         "stopped": False, "stop_stage": "", "mode": "incremental",
         "fallback_required": False, "fallback_reason": "",
     }
-    pending_resolutions = {"generate": set(), "metadata": set()}
+    pending_resolutions: dict[str, dict[str, tuple[GuangYaFile, str]]] = {"generate": {}, "metadata": {}}
+    failure_snapshots = db.get_strm_failure_resolution_snapshot(source_dir_id)
     fingerprint_backfills: list[dict[str, Any]] = []
 
     def stop_requested(stage: str) -> bool:
@@ -1731,7 +1767,7 @@ def _sync_strm_incremental_impl(
 
     for change in upserts:
         if stop_requested("incremental"):
-            _flush_failure_resolutions(stats, source_dir_id, pending_resolutions)
+            _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, failure_snapshots, rel_prefix=rel_prefix)
             stats["generate_elapsed_seconds"] = round(
                 time.monotonic() - generate_started, 3
             )
@@ -1816,7 +1852,7 @@ def _sync_strm_incremental_impl(
                     stats["generated"] += 1
                     stats["updated" if is_update else "created"] += 1
                     _track_change(stats, "generated", expected, strm_root, on_refresh_paths=on_refresh_paths)
-                pending_resolutions["generate"].add(file_id)
+                pending_resolutions["generate"][file_id] = (file, rel_dir)
             else:
                 stats["metadata_total"] += 1
                 if ext not in metadata:
@@ -1825,7 +1861,7 @@ def _sync_strm_incremental_impl(
                 current = metadata_by_id.get(file_id)
                 if current and _metadata_state_matches(current, file, expected):
                     stats["metadata_skipped"] += 1
-                    pending_resolutions["metadata"].add(file_id)
+                    pending_resolutions["metadata"][file_id] = (file, rel_dir)
                 else:
                     queued = db.enqueue_strm_metadata_jobs([
                         _metadata_queue_payload(
@@ -1852,7 +1888,7 @@ def _sync_strm_incremental_impl(
         completed += 1
         progress.emit("generate", completed, total_work, "精准更新 STRM")
 
-    _flush_failure_resolutions(stats, source_dir_id, pending_resolutions)
+    _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, failure_snapshots, rel_prefix=rel_prefix)
     _flush_fingerprint_backfills(video_key, fingerprint_backfills, video_by_id)
 
     if not stats["fallback_required"] and not stats["stopped"]:
@@ -2086,7 +2122,7 @@ def _sync_strm_impl(
     pending_metadata_targets: set[str] = set()
     scan_errors = 0
     consistency_errors = 0
-    pending_resolutions = {"generate": set(), "metadata": set()}
+    pending_resolutions: dict[str, dict[str, tuple[GuangYaFile, str]]] = {"generate": {}, "metadata": {}}
     video_candidates: dict[str, tuple[GuangYaFile, str, int]] = {}
     metadata_candidates: dict[str, tuple[GuangYaFile, str, int]] = {}
 
@@ -2385,6 +2421,7 @@ def _sync_strm_impl(
         )
         return stats
 
+    failure_snapshots = db.get_strm_failure_resolution_snapshot(source_dir_id)
     existing_rows = db.list_strm_index(source_key)
     existing_by_id, existing_by_path = _build_video_index_maps(existing_rows)
     fingerprint_backfills: list[dict[str, Any]] = []
@@ -2453,7 +2490,8 @@ def _sync_strm_impl(
                         if future is not None:
                             future.cancel()
                     _flush_failure_resolutions(
-                        stats, source_dir_id, pending_resolutions, "generate"
+                        stats, source_dir_id, pending_resolutions, failure_snapshots, "generate",
+                        rel_prefix=rel_prefix,
                     )
                     stats["generate_elapsed_seconds"] = round(
                         time.monotonic() - generate_started, 3
@@ -2493,7 +2531,7 @@ def _sync_strm_impl(
                         )
                     seen_ids.add(file.file_id)
                     stats["skipped"] += 1
-                    pending_resolutions["generate"].add(file.file_id)
+                    pending_resolutions["generate"][file.file_id] = (file, rel_dir)
                     progress.emit(
                         "generate", video_completed, video_progress_total,
                         "生成 STRM",
@@ -2513,7 +2551,7 @@ def _sync_strm_impl(
                     seen_ids.add(file.file_id)
                     stats["generated"] += 1
                     stats["updated" if is_update else "created"] += 1
-                    pending_resolutions["generate"].add(file.file_id)
+                    pending_resolutions["generate"][file.file_id] = (file, rel_dir)
                     _track_change(stats, "generated", expected, strm_root, on_refresh_paths=on_refresh_paths)
                     _update_video_index_snapshot(
                         existing_by_id, existing_by_path, file, expected,
@@ -2546,7 +2584,7 @@ def _sync_strm_impl(
                 )
 
     _flush_fingerprint_backfills(source_key, fingerprint_backfills, existing_by_id)
-    _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, "generate")
+    _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, failure_snapshots, "generate", rel_prefix=rel_prefix)
     stats["generate_elapsed_seconds"] = round(
         time.monotonic() - generate_started, 3
     )
@@ -2609,7 +2647,8 @@ def _sync_strm_impl(
                 if stop_requested("metadata-queue"):
                     flush_metadata_queue_batch()
                     _flush_failure_resolutions(
-                        stats, source_dir_id, pending_resolutions, "metadata"
+                        stats, source_dir_id, pending_resolutions, failure_snapshots, "metadata",
+                        rel_prefix=rel_prefix,
                     )
                     stats["metadata_elapsed_seconds"] = round(
                         time.monotonic() - metadata_started, 3
@@ -2679,7 +2718,7 @@ def _sync_strm_impl(
                     continue
                 if current and _metadata_state_matches(current, file, expected):
                     stats["metadata_skipped"] += 1
-                    pending_resolutions["metadata"].add(file.file_id)
+                    pending_resolutions["metadata"][file.file_id] = (file, rel_dir)
                     metadata_progress_completed += 1
                     progress.emit(
                         "metadata", metadata_progress_completed,
@@ -2698,7 +2737,7 @@ def _sync_strm_impl(
                 if len(queue_batch) >= 500:
                     flush_metadata_queue_batch()
             flush_metadata_queue_batch()
-    _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, "metadata")
+    _flush_failure_resolutions(stats, source_dir_id, pending_resolutions, failure_snapshots, "metadata", rel_prefix=rel_prefix)
     stats["metadata_elapsed_seconds"] = round(time.monotonic() - metadata_started, 3)
     if stats["stopped"] or stop_requested("cleanup"):
         return stats

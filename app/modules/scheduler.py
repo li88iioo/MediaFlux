@@ -1445,11 +1445,12 @@ class STRMScheduler:
             )
             stopped = bool(current.get("stopped"))
             fallback_reason = str(current.get("fallback_reason") or "")
-            source_partial = bool(
+            fallback_required = bool(
                 current.get("fallback_required")
                 or int(current.get("failed", 0) or 0)
                 or int(current.get("metadata_failed", 0) or 0)
             )
+            source_partial = fallback_required or bool(current.get("failure_ledger_failed"))
             with self._state_lock:
                 self._source_runtime[source_index].update({
                     "status": "stopped" if stopped else (
@@ -1466,7 +1467,7 @@ class STRMScheduler:
             self._merge_source_stats(aggregate, current, source["name"])
             if stopped:
                 break
-            if source_partial:
+            if fallback_required:
                 return aggregate, source_results, False, (
                     fallback_reason or "精准增量未能安全完成"
                 )
@@ -1544,6 +1545,7 @@ class STRMScheduler:
             source_partial = bool(
                 int(current.get("failed", 0) or 0)
                 or int(current.get("metadata_failed", 0) or 0)
+                or int(current.get("failure_ledger_failed", 0) or 0)
                 or current.get("scan_errors")
                 or current.get("scan_incomplete")
                 or (current.get("clean_skipped") and not source_stopped)
@@ -2049,6 +2051,7 @@ class STRMScheduler:
             strm_partial = bool(
                 int(stats.get("failed", 0) or 0)
                 or int(stats.get("metadata_failed", 0) or 0)
+                or int(stats.get("failure_ledger_failed", 0) or 0)
                 or stats.get("clean_skipped")
             )
             refresh_pending = any(
@@ -2290,6 +2293,7 @@ class STRMScheduler:
         partial = (
             int(stats.get("failed", 0) or 0) > 0
             or int(stats.get("metadata_failed", 0) or 0) > 0
+            or int(stats.get("failure_ledger_failed", 0) or 0) > 0
             or bool(stats.get("clean_skipped"))
             or any(value in {False, "failed", "pending"} for value in refresh.values())
         )
@@ -2518,6 +2522,7 @@ class STRMScheduler:
             partial = bool(
                 int(stats.get("failed", 0) or 0)
                 or int(stats.get("metadata_failed", 0) or 0)
+                or int(stats.get("failure_ledger_failed", 0) or 0)
                 or stats.get("clean_skipped")
                 or any(value in {False, "failed", "pending"} for value in refresh.values())
             )

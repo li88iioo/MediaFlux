@@ -2617,29 +2617,51 @@ def resolve_strm_failure_for_item(source_id: str, file_id: str, action: str) -> 
         )
 
 
+def get_strm_failure_resolution_snapshot(source_id: str) -> dict[str, dict[str, sqlite3.Row]]:
+    """在文件校验/安装前冻结待确认失败，后发失败不能被旧成功批次覆盖。"""
+    snapshot: dict[str, dict[str, sqlite3.Row]] = {"generate": {}, "metadata": {}}
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT id,file_id,action,failure_count,retry_count,updated_at "
+            "FROM strm_failures WHERE source_id=? AND status='open'",
+            (source_id,),
+        ).fetchall()
+    for row in rows:
+        snapshot[str(row["action"])][str(row["file_id"])] = row
+    return snapshot
+
+
 def resolve_strm_failures_for_items(
     source_id: str,
     file_ids: Iterable[str],
     action: str,
     *,
+    expected_failures: dict[str, sqlite3.Row],
     chunk_size: int = 400,
 ) -> int:
-    """批量关闭同一来源/动作下已成功落盘的 STRM 失败项。"""
-    ids = list(dict.fromkeys(item for item in file_ids if item))
-    if not ids:
+    """批量确认已验证的失败快照；保留被重试、更新或重建的后发失败。"""
+    items = [
+        (file_id, row["id"], row["failure_count"], row["retry_count"], row["updated_at"])
+        for file_id in dict.fromkeys(file_ids)
+        if file_id and (row := expected_failures.get(file_id)) is not None
+    ]
+    if not items:
         return 0
-    safe_chunk = max(1, min((chunk_size or 400), 400))
+    # 每项五个条件，仍兼容 SQLite 的 999 绑定参数预算。
+    safe_chunk = max(1, min((chunk_size or 400), 180))
     timestamp = now()
     updated = 0
     with get_conn() as conn:
-        for offset in range(0, len(ids), safe_chunk):
-            chunk = ids[offset : offset + safe_chunk]
-            placeholders = ",".join("?" for _ in chunk)
+        for offset in range(0, len(items), safe_chunk):
+            chunk = items[offset : offset + safe_chunk]
+            placeholders = ",".join("(?,?,?,?,?)" for _ in chunk)
             cur = conn.execute(
                 "UPDATE strm_failures SET status='resolved',updated_at=?,resolved_at=? "
                 "WHERE source_id=? AND action=? AND status='open' "
-                f"AND file_id IN ({placeholders})",
-                [timestamp, timestamp, source_id, action, *chunk],
+                "AND (file_id,id,failure_count,retry_count,updated_at) "
+                f"IN (VALUES {placeholders})",
+                [timestamp, timestamp, source_id, action,
+                 *(value for item in chunk for value in item)],
             )
             updated += (cur.rowcount or 0)
     return updated
