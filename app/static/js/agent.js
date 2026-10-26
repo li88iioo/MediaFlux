@@ -2391,7 +2391,7 @@
             if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
                 finalizeError(turn, streamFailureMessage(turn, error));
                 announce(responseStatus, error.message || '执行未完成，请核对状态');
-                if (await reconcilePendingApprovals(active) && isCurrentActiveRequest(active)) {
+                if (error.httpStatus === 429 && await reconcilePendingApprovals(active) && isCurrentActiveRequest(active)) {
                     finalizeError(turn, `${error.message}\n\n已核实本计划尚未执行，仍待确认。请稍后手动重试或取消，不会自动提交。`);
                 }
             } else startActiveObservation(active);
