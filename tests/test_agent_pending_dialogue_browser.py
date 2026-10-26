@@ -352,6 +352,97 @@ class AgentPendingDialogueBrowserTests(AgentShellBrowserCase):
                 self.assertIn("人工重试已执行一次", page.locator("#agentTranscript").inner_text())
                 self.assertIn("请求过于频繁", page.locator(".is-interrupted").inner_text())
 
+    def test_rejected_confirmation_late_read_cannot_restore_after_session_stop(self):
+        for width, confirmation in ((1280, "revoked"), (390, "cleared")):
+            with self.subTest(width=width, confirmation=confirmation):
+                page = self.dialogue_page({"width": width, "height": 844})
+                self.reject_next_confirmation(page)
+                # HTTP 429 未进入 Kernel，不能伪造本次确认的 last_turn。
+                page.evaluate("window.__dialogueMode = 'deferred'; window.__dialogueSnapshot.last_turn = null")
+                page.locator('[data-effect-confirm]').click()
+                page.wait_for_function("typeof window.__releaseDialogueSnapshot === 'function'")
+                page.evaluate("""confirmation => {
+                    const fixtureFetch = window.fetch;
+                    window.__stopCalls = [];
+                    window.fetch = async (url, options = {}) => {
+                        if (String(url) !== '/api/agent/session/stop') return fixtureFetch(url, options);
+                        window.__stopCalls.push(JSON.parse(options.body));
+                        // 旧核实读已捕获待确认计划；stop 后所有新读只能看到撤销状态。
+                        window.__dialogueMode = 'no_terminal';
+                        window.__dialogueSnapshot = {pending_approval: null, last_turn: null};
+                        return new Response(JSON.stringify({ok: true, status: 'stopped', stopped: true,
+                            model_turn: 'not_running', confirmation, background_tasks: [],
+                            uncancellable: [], stop_requested_generation: 0, cancelled_continuations: []}),
+                            {headers: {'Content-Type': 'application/json'}});
+                    };
+                }""", confirmation)
+                page.locator('#agentStopSession').click()
+                page.wait_for_function("window.__stopCalls.length === 1 && document.getElementById('agentStopSession').getAttribute('aria-busy') === 'false'")
+                page.evaluate('window.__releaseDialogueSnapshot()')
+                page.wait_for_function("window.__dialogueLateReturned === true")
+                # 即使已有观察器在三次无匹配轮次后退出，也不能留下可用的旧确认卡。
+                page.wait_for_function("document.getElementById('agentSend').getAttribute('aria-busy') === 'false'", timeout=8000)
+                calls = page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm')")
+                self.assertEqual(len(calls), 1, "停止和迟到核实读均不能自动重放确认")
+                self.assertEqual(page.evaluate('window.__stopCalls'), [{"session_id": json.loads(calls[0]['body'])['session_id']}])
+                self.assertEqual(page.locator(f'[data-effect-confirm="{PLAN_A}"]:enabled').count(), 0)
+                self.assertEqual(page.locator(f'[data-effect-cancel="{PLAN_A}"]:enabled').count(), 0)
+                self.assertEqual(page.locator('.agent-confirmation-card:not(.is-expired)').count(), 0)
+                self.assertNotIn('仍待确认', page.locator('#agentTranscript').inner_text())
+
+    def test_session_stop_preserves_confirmed_effect_until_observed_terminal(self):
+        page = self.dialogue_page()
+        page.evaluate("""events => {
+            window.__kernelConfig.confirmEvents = events;
+            window.__kernelConfig.confirmHoldOpen = true;
+            window.__confirmationAborted = false;
+            window.__stopCalls = [];
+            const fixtureFetch = window.fetch;
+            window.fetch = async (url, options = {}) => {
+                if (String(url) === '/api/agent/actions/confirm') {
+                    window.__confirmedRequest = JSON.parse(options.body);
+                    options.signal.addEventListener('abort', () => { window.__confirmationAborted = true; }, {once: true});
+                }
+                if (String(url) !== '/api/agent/session/stop') return fixtureFetch(url, options);
+                window.__stopCalls.push(JSON.parse(options.body));
+                const request = window.__confirmedRequest;
+                window.__dialogueMode = 'no_terminal';
+                window.__dialogueSnapshot = {
+                    pending_approval: null, last_turn: null,
+                    active_turn: {request_id: request.request_id, turn_id: `turn-${request.request_id}`,
+                        generation: 2, status: 'running', protected: true},
+                };
+                return new Response(JSON.stringify({ok: true, status: 'critical_pending', stopped: false,
+                    model_turn: 'critical_pending', confirmation: 'unchanged', background_tasks: []}),
+                    {headers: {'Content-Type': 'application/json'}});
+            };
+        }""", [_event(1, 'turn.started', {'kind': 'confirmation'})])
+        page.locator('[data-effect-confirm]').click()
+        page.wait_for_function("window.__confirmedRequest && document.getElementById('agentSend').getAttribute('aria-busy') === 'true'")
+        page.locator('#agentStopSession').click()
+        page.wait_for_function("window.__stopCalls.length === 1 && document.getElementById('agentStopSession').getAttribute('aria-busy') === 'false'")
+        self.assertFalse(page.evaluate('window.__confirmationAborted'))
+        self.assertEqual(page.locator('#agentSend').get_attribute('aria-busy'), 'true')
+        self.assertEqual(page.locator('.agent-cancelled').count(), 0)
+        # 流暂未给出终态；已确认写入仍需由原观察器收到最终持久化回执。
+        page.evaluate("""() => {
+            const request = window.__confirmedRequest;
+            window.__dialogueMode = '';
+            window.__dialogueSnapshot = {
+                pending_approval: null, active_turn: null,
+                last_turn: {request_id: request.request_id, turn_id: `turn-${request.request_id}`,
+                    status: 'completed'},
+                messages: [{role: 'user', content: '准备原计划'},
+                    {role: 'assistant', content: '已确认操作终态回执'}],
+            };
+        }""")
+        page.get_by_text('已确认操作终态回执', exact=True).wait_for()
+        self.assertEqual(page.locator('#agentSend').get_attribute('aria-busy'), 'false')
+        self.assertTrue(page.evaluate('window.__confirmationAborted'), '仅在读到终态后释放旧流')
+        calls = page.evaluate('window.__kernelCalls')
+        self.assertEqual(sum(call['url'] == '/api/agent/actions/confirm' for call in calls), 1)
+        self.assertNotIn('/api/agent/query/cancel', [call['url'] for call in calls])
+
     def test_rejected_confirmation_does_not_restore_unverified_or_retired_plan(self):
         cases = [("no_terminal", None), ("old_terminal", approval(PLAN_B))]
         cases.extend((mode, approval()) for mode in (

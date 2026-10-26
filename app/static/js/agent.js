@@ -2254,6 +2254,7 @@
         if (initialRestore || sessionStopPending) return;
         const targetSessionId = sessionId;
         const generation = sessionLoadGeneration;
+        const active = activeRequest;
         sessionStopPending = true;
         sessionStopButton?.setAttribute('aria-busy', 'true');
         syncSend();
@@ -2266,7 +2267,13 @@
             const message = SESSION_STOP_MESSAGES[payload.status] || SESSION_STOP_MESSAGES.stop_unconfirmed;
             announce(responseStatus, message);
             window.showToast?.(message, payload.stopped === true ? 'success' : 'warning', 6500);
-            const active = activeRequest;
+            // 只撤销尚未进入执行轮次的失败确认恢复；已确认写入继续观察终态回执。
+            if (isCurrentActiveRequest(active) && active.kind === 'confirm' && !active.receiptOnly
+                && active.turn?.failed && !active.turnId && payload.model_turn === 'not_running'
+                && ['revoked', 'cleared'].includes(payload.confirmation)) {
+                invalidateActiveRequest();
+                setBusy(false);
+            }
             if (isCurrentActiveRequest(active)) active.cancelNotice = message;
             if (isCurrentActiveRequest(active) && !active.receiptOnly
                 && ['stop_requested', 'already_cancelling'].includes(payload.model_turn)) {
