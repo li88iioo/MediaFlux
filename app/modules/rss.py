@@ -1099,6 +1099,11 @@ class RSSEngine:
                     ),
                 )
         else:
+            if linked_key and summary.get("duplicate") and retry_source is not None:
+                # 重试被活动 canonical 拒绝时没有新提交；回写仍属于冻结的原 owner。
+                # 若其间已有 successor 接管，仓储的 owner 检查会拒绝本次迟到反馈。
+                request_id = int(retry_source["id"])
+                current_request = db.get_download_request(request_id)
             failure_code, retryable, review_required = self._backend_failure(method, submission)
             if current_request is not None:
                 backend_field = "qb_status" if method == "qb" else "gy_status"

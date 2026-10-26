@@ -303,6 +303,110 @@ class RSSFailureRecoveryClosureTests(InitializedWebTestCase):
                 self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[backend]))["request_id"], first["request_id"])
                 self.assertEqual(rss_entry_delivery(db.get_rss_entry(entries[peer]))["request_id"], second["request_id"])
 
+    def test_active_successor_conflict_settles_archived_peer_rss_retry(self):
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                original, entries, engine = self.dual_receipts(backend)
+                peer = "guangya" if backend == "qb" else "qb"
+                self.assertIsNotNone(apply_download_tracker_update(
+                    assert_present(db.get_download_request(original)),
+                    status="failed", qb_status="failed", gy_status="failed",
+                ))
+                with patch.object(dispatcher, "_submit_qb", side_effect=self.success) as qb, patch.object(
+                    dispatcher, "_submit_guangya", side_effect=self.success
+                ) as gy:
+                    first = engine.download(entries[backend])
+                    self.assertTrue(first["ok"], first)
+                    successor = first["request_id"]
+                    first_receipt = dict(assert_present(db.get_rss_entry(entries[backend])))
+                    before = assert_present(db.get_rss_entry(entries[peer]))
+                    self.assertTrue(before["delivery_retryable"])
+                    self.assertEqual(before["download_request_id"], original)
+                    qb.reset_mock()
+                    gy.reset_mock()
+
+                    blocked = engine.download(entries[peer])
+                    qb.assert_not_called()
+                    gy.assert_not_called()
+                    self.assertFalse(blocked["ok"], blocked)
+                    self.assertEqual(dict(assert_present(db.get_rss_entry(entries[backend]))), first_receipt)
+                    after = assert_present(db.get_rss_entry(entries[peer]))
+                    self.assertEqual(after["download_request_id"], original)
+                    self.assertEqual((after["status"], after["processed"]), ("failed", 0),
+                                     "未调用后端的 canonical 冲突必须收尾，不能遗留 submitting")
+                    self.assertTrue(after["failure_code"])
+                    self.assertNotIn(after["failure_code"], {
+                        "qb_outcome_unknown", "guangya_outcome_unknown", "submission_outcome_unknown",
+                    })
+                    # 收尾仍受稳定 owner 保护；另一端 successor 的迟到反馈不得覆盖它。
+                    db.record_rss_entry_failure(entries[peer], "submission_outcome_unknown", False,
+                                                request_id=successor)
+                    self.assertEqual(dict(assert_present(db.get_rss_entry(entries[peer]))), dict(after))
+                    self.assertEqual(db.update_rss_entries_processed([entries[peer]], False), 1)
+
+                    selected_field = "qb_status" if backend == "qb" else "gy_status"
+                    self.assertIsNotNone(apply_download_tracker_update(
+                        assert_present(db.get_download_request(successor)), status="failed",
+                        **{selected_field: "failed"},
+                    ))
+                    retried = engine.download(entries[peer])
+                    self.assertTrue(retried["ok"], retried)
+                    self.assertNotIn(retried["request_id"], {original, successor})
+                    self.assertEqual(qb.call_count, int(peer == "qb"))
+                    self.assertEqual(gy.call_count, int(peer == "guangya"))
+                    self.assertEqual(assert_present(db.get_rss_entry(entries[peer]))["download_request_id"],
+                                     retried["request_id"])
+                    self.assertEqual(assert_present(db.get_rss_entry(entries[backend]))["download_request_id"],
+                                     successor)
+
+    def test_conflicting_retry_feedback_cannot_overwrite_a_new_peer_owner(self):
+        for backend in ("qb", "guangya"):
+            with self.subTest(backend=backend):
+                original, entries, engine = self.dual_receipts(backend)
+                peer = "guangya" if backend == "qb" else "qb"
+                self.assertIsNotNone(apply_download_tracker_update(
+                    assert_present(db.get_download_request(original)),
+                    status="failed", qb_status="failed", gy_status="failed",
+                ))
+                with patch.object(dispatcher, "_submit_qb", side_effect=self.success) as qb, patch.object(
+                    dispatcher, "_submit_guangya", side_effect=self.success
+                ) as gy:
+                    first = engine.download(entries[backend])
+                    self.assertTrue(first["ok"], first)
+                    qb.reset_mock()
+                    gy.reset_mock()
+                    resubmit = dispatcher.resubmit_download_request
+                    new_owner = {}
+
+                    def conflict_then_transfer(*args, **kwargs):
+                        conflict = resubmit(*args, **kwargs)
+                        self.assertTrue(conflict.get("duplicate"), conflict)
+                        field = "qb_status" if backend == "qb" else "gy_status"
+                        self.assertIsNotNone(apply_download_tracker_update(
+                            assert_present(db.get_download_request(first["request_id"])),
+                            status="failed", **{field: "failed"},
+                        ))
+                        source = assert_present(db.get_download_request(original))
+                        created = dispatcher.create_request(
+                            dispatcher.DownloadInput(source["kind"], source["title"], source["source_value"]),
+                            "", "late-peer-retry", origin=str(source["origin"]), initial_targets=peer,
+                            retry_source_request_id=original, retry_source_status=str(source["status"]),
+                        )
+                        self.assertTrue(created["created"])
+                        new_owner.update(dict(assert_present(db.get_rss_entry(entries[peer]))))
+                        self.assertEqual(new_owner["download_request_id"], created["id"])
+                        self.assertEqual((new_owner["status"], new_owner["processed"]), ("submitting", 0))
+                        return conflict
+
+                    with patch.object(dispatcher, "resubmit_download_request", side_effect=conflict_then_transfer):
+                        result = engine.download(entries[peer])
+                    self.assertFalse(result["ok"], result)
+                    qb.assert_not_called()
+                    gy.assert_not_called()
+                self.assertEqual(dict(assert_present(db.get_rss_entry(entries[peer]))), new_owner)
+                current = assert_present(db.get_download_request(new_owner["download_request_id"]))
+                self.assertEqual(current["qb_status" if peer == "qb" else "gy_status"], "submitting")
+
     def test_archived_http_peer_retry_uses_frozen_content_not_current_canonical_owner(self):
         from tests.test_download_http_identity_lifecycle import TORRENT_A, MIME
 
