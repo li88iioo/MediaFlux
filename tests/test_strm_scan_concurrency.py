@@ -95,11 +95,13 @@ class _BudgetTreeClient:
 class StrmDirectoryConcurrencyTests(unittest.TestCase):
     def test_full_scan_reaches_fifteen_directory_workers(self):
         client = _ConcurrentTreeClient(15)
-        with patch("app.modules.strm.db.list_strm_index", return_value=[]):
+        with isolated_test_database(), tempfile.TemporaryDirectory() as root, patch(
+            "app.modules.strm.db.list_strm_index", return_value=[],
+        ):
             stats = sync_strm(
                 "root",
                 "http://media.invalid",
-                "/tmp/mediaflux-strm-concurrency",
+                root,
                 client=cast(GuangYaClient, client),
                 clean_invalid=False,
                 scan_workers=15,

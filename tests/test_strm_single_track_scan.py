@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from app.clients.guangya import GuangYaClient
 from app.modules.strm import sync_strm
+from tests.support import isolated_test_database
 
 
 class StrmSingleTrackScanTests(unittest.TestCase):
@@ -44,6 +45,7 @@ class StrmSingleTrackScanTests(unittest.TestCase):
 
         client = PagedClient()
         with (
+            isolated_test_database(),
             tempfile.TemporaryDirectory() as root,
             patch("app.modules.strm.db.list_strm_index", return_value=[]),
             patch("app.modules.strm._scan_limits", return_value=(100, 17, 100, 60)),
