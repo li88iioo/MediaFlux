@@ -128,6 +128,7 @@
         observer: null,
         appendError: null,
         statusPayload: null,
+        watchlistPendingKeys: new Set(),
         manualPagination: typeof window.IntersectionObserver !== 'function',
         activeCard: null,
         resourceResultsEnabled: root.dataset.resourceResultsEnabled !== 'false',
@@ -685,6 +686,9 @@
     }
 
     function paintWatchlistButton(button, active) {
+        const pending = state.watchlistPendingKeys.has(button.dataset.watchlistKey);
+        button.disabled = pending;
+        button.classList.toggle('is-pending', pending);
         button.classList.toggle('is-active', active);
         button.setAttribute('aria-pressed', String(active));
         button.title = active ? '移出探索收藏' : '加入探索收藏';
@@ -717,18 +721,28 @@
         }
     }
 
+    function setWatchlistPending(key, pending) {
+        if (pending) state.watchlistPendingKeys.add(key);
+        else state.watchlistPendingKeys.delete(key);
+        for (const button of root.querySelectorAll('[data-watchlist-key]')) {
+            if (button.dataset.watchlistKey !== key) continue;
+            button.disabled = pending;
+            button.classList.toggle('is-pending', pending);
+        }
+    }
+
     function watchlistButton(item) {
+        const key = itemKey(item);
         const button = node('button', 'discovery-card-action discovery-watchlist-action');
         button.type = 'button';
-        button.dataset.watchlistKey = itemKey(item);
+        button.dataset.watchlistKey = key;
 
         paintWatchlistButton(button, isWatchlisted(item));
         button.addEventListener('click', async (event) => {
             event.stopPropagation();
-            if (button.disabled) return;
+            if (button.disabled || state.watchlistPendingKeys.has(key)) return;
             const active = button.getAttribute('aria-pressed') === 'true';
-            button.disabled = true;
-            button.classList.add('is-pending');
+            setWatchlistPending(key, true);
             try {
                 if (active) {
                     const provider = encodeURIComponent(item.provider || '');
@@ -755,8 +769,7 @@
                 announce(error.message || '收藏操作失败');
                 window.appAlert?.({type: 'error', title: '收藏操作失败', message: error.message || '请稍后重试。'});
             } finally {
-                button.disabled = false;
-                button.classList.remove('is-pending');
+                setWatchlistPending(key, false);
             }
         });
         return button;

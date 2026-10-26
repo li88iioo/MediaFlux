@@ -1711,6 +1711,82 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 self.assertEqual([method for method, _path in mutations], ["POST", "DELETE"])
                 self.assertEqual(errors, [])
 
+    def test_watchlist_serializes_same_identity_across_cards_and_tabs(self):
+        for width in (390, 1440):
+            with self.subTest(width=width):
+                card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
+                        "title": "同一作品", "state": "none"}
+                cards = [card, {**card, "media_type": "tv"}, {**card, "provider": "douban"}]
+                page, errors = self.open_catalogue(width=width, cards=cards)
+                # 服务端已提交第一个 POST，仅延迟回执；其它同身份入口不得再发写请求。
+                page.evaluate("""() => {
+                    const originalFetch = window.fetch;
+                    window.watchlistMethods = [];
+                    window.watchlistSaved = false;
+                    window.fetch = (url, options = {}) => {
+                        if (!String(url).startsWith('/api/discovery/watchlist')) return originalFetch(url, options);
+                        window.watchlistMethods.push(options.method);
+                        window.watchlistSaved = options.method === 'POST';
+                        const response = () => new Response(JSON.stringify({success: true}), {
+                            headers: {'Content-Type': 'application/json'},
+                        });
+                        if (window.watchlistMethods.length === 1) {
+                            return new Promise(resolve => { window.finishWatchlist = () => resolve(response()); });
+                        }
+                        return Promise.resolve(response());
+                    };
+                }""")
+                matches = page.locator('[data-watchlist-key="tmdb:movie:550"]')
+                first = matches.first
+                first.scroll_into_view_if_needed()
+                # 卡片原有 hover 会整体上移；核对卡内位置和尺寸以检查 pending 引发的跳位。
+                geometry = """button => {
+                    const card = button.closest('.discovery-card').getBoundingClientRect();
+                    return [button, button.querySelector('svg')].map(node => {
+                        const {x, y, width, height} = node.getBoundingClientRect();
+                        return {x: x - card.x, y: y - card.y, width, height};
+                    });
+                }"""
+                before = first.evaluate(geometry)
+                first.evaluate("button => window.originalWatchlistIcon = button.querySelector('svg')")
+                first.click()
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.disabled)"), [True] * 6)
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.classList.contains('is-pending'))"), [True] * 6)
+                self.assertEqual(first.evaluate(geometry), before)
+                self.assertTrue(first.evaluate("button => button.querySelector('svg') === window.originalWatchlistIcon"))
+                for key in ("tmdb:tv:550", "douban:movie:550"):
+                    self.assertTrue(page.locator(f'[data-watchlist-key="{key}"]').first.is_enabled())
+                matches.nth(1).evaluate("button => button.click()")
+
+                page.locator('#discovery-tab-tmdb-movie').click()
+                current = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
+                current.wait_for()
+                self.assertTrue(current.is_disabled(), "切 Tab 新建的同身份卡必须继承在途状态")
+                self.assertIn("is-pending", current.get_attribute("class"))
+                current.evaluate("button => button.click()")
+                page.locator('#discovery-tab-sections').click()
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.disabled)"), [True] * 6)
+                matches.nth(1).evaluate("button => button.click()")
+                self.assertEqual(page.evaluate("window.watchlistMethods"), ["POST"])
+
+                first.scroll_into_view_if_needed()
+                before = first.evaluate(geometry)
+                page.evaluate("window.finishWatchlist()")
+                page.wait_for_function("!document.querySelector('.discovery-watchlist-action.is-pending')")
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.disabled)"), [False] * 6)
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"), ["true"] * 6)
+                self.assertEqual(first.evaluate(geometry), before)
+                matches.nth(1).click()
+                page.wait_for_function("!document.querySelector('.discovery-watchlist-action.is-pending')")
+                self.assertEqual(page.evaluate("window.watchlistMethods"), ["POST", "DELETE"])
+                self.assertFalse(page.evaluate("window.watchlistSaved"))
+                page.locator('#discovery-tab-tmdb-movie').click()
+                self.assertTrue(current.is_enabled())
+                self.assertEqual(current.get_attribute("aria-pressed"), "false")
+                page.locator('#discovery-tab-sections').click()
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"), ["false"] * 6)
+                self.assertEqual(errors, [])
+
     def test_watchlist_updates_cached_views_and_preserves_subscription_state(self):
         card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
                 "title": "已订阅电影", "state": "subscribed", "in_watchlist": True, "watchlisted": True}
@@ -1766,17 +1842,21 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 matches = page.locator('[data-watchlist-key="tmdb:movie:550"]')
                 matches.first.click()
                 self.assertEqual(len(pending), 1)
+                self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.disabled)"), [True] * 6)
                 self.assertEqual(matches.evaluate_all("buttons => buttons.map(b => b.getAttribute('aria-pressed'))"),
                                  [str(active).lower()] * 6)
                 page.locator('#discovery-tab-tmdb-movie').click()
                 button = page.locator('#discovery-grid [data-watchlist-key="tmdb:movie:550"]')
                 button.wait_for()
+                self.assertTrue(button.is_disabled())
                 page.evaluate("document.getElementById('discovery-live').textContent = ''")
                 if failure == "http":
                     pending.pop().fulfill(status=503, json={"error": "收藏暂不可用"})
                 else:
                     pending.pop().abort("failed")
                 page.wait_for_function("document.getElementById('discovery-live').textContent.length > 0")
+                self.assertTrue(button.is_enabled())
+                self.assertNotIn("is-pending", button.get_attribute("class"))
                 self.assertEqual(button.get_attribute("aria-pressed"), str(active).lower())
                 self.assertNotIn("已收藏", page.locator('#discovery-live').inner_text())
                 self.assertNotIn("已移出", page.locator('#discovery-live').inner_text())
