@@ -242,6 +242,52 @@ class MediaConfigSaveTests(unittest.TestCase):
         self.assertEqual(config.read_env_snapshot(config.ENV_FILE)[1], initial)
         self.assertEqual(db.list_strm_retired_sources(), [])
 
+    def test_strm_source_publication_cannot_overtake_running_cleanup(self):
+        from app import config, database as db
+        from app.modules.process_lock import CrossProcessLock
+
+        self.initialize_publisher()
+        self.enterContext(patch.dict(os.environ))
+        self.enterContext(patch.object(config, "_cache", None))
+        initial = {"GY_STRM_SOURCE_DIRS": "[]", "STRM_ROOT": "/isolated/old"}
+        config.set_and_save(initial)
+        db.enqueue_strm_retired_source("11", "旧来源", "/isolated/old")
+        # 使用不同锁实例，验证文件互斥而不只检查 scheduler._running。
+        writer = CrossProcessLock("strm-operation")
+        self.assertTrue(writer.acquire(blocking=False))
+        try:
+            with patch.object(self.api, "require_api_login"):
+                for change in (
+                    {"GY_STRM_SOURCE_DIRS": '[{"id":"11","name":"旧来源"}]'},
+                    {"STRM_ROOT": "/isolated/new"},
+                ):
+                    with self.subTest(change=change):
+                        result = self.api.save_config(cast(Request, self.request), change)
+                        self.assertIsInstance(result, JSONResponse)
+                        self.assertEqual(result.status_code, 409)
+                        self.assertEqual(config.read_env_snapshot(config.ENV_FILE)[1], initial)
+                        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+        finally:
+            writer.release()
+        with patch.object(self.api, "require_api_login"), patch("app.services.clear_dashboard_cache"):
+            result = self.api.save_config(cast(Request, self.request), {
+                "GY_STRM_SOURCE_DIRS": '[{"id":"11","name":"旧来源"}]',
+            })
+        self.assertEqual(result, {"success": True})
+        self.assertEqual(db.list_strm_retired_sources(), [])
+
+    def test_strm_busy_does_not_reject_unrelated_setting(self):
+        from app.modules.strm import STRM_OPERATION_LOCK
+
+        self.initialize_publisher()
+        self.assertTrue(STRM_OPERATION_LOCK.acquire(blocking=False))
+        try:
+            result, save, _, _ = self._save({"TG_NOTIFICATION_LEVEL": "detailed"})
+            self.assertEqual(result, {"success": True})
+            save.assert_called_once()
+        finally:
+            STRM_OPERATION_LOCK.release()
+
     def test_advanced_media_server_mapping_is_validated_and_canonicalized(self):
         result, save, _, _ = self._save({
             "JELLYFIN_PATH_MAPPINGS": json.dumps({

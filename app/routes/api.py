@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from typing import Any
 
 import requests
@@ -1537,7 +1537,16 @@ def save_config(request: Request, data: Any = Body(default=None)):
                 publication = config.runtime_config_publication(persisted_updates)
             config_persisted = False
             try:
-                with publication:
+                with ExitStack() as write_scope:
+                    if changed_keys & {"GY_STRM_SOURCE_DIRS", "STRM_ROOT"}:
+                        from app.modules.strm import STRM_OPERATION_LOCK
+
+                        # 来源发布与清理共用文件锁；持配置锁时只能非阻塞获取，
+                        # 避免运行中 STRM 读取配置与保存操作反向等待。
+                        if not STRM_OPERATION_LOCK.acquire(blocking=False):
+                            return api_error("STRM 正在写入或清理，请完成后再保存来源或输出目录", 409)
+                        write_scope.callback(STRM_OPERATION_LOCK.release)
+                    write_scope.enter_context(publication)
                     try:
                         with retirement as retired_source_ids:
                             config.set_and_save(persisted_updates)
