@@ -1068,6 +1068,10 @@ _GUANGYA_FOLLOWUP_ALLOWED_SQL = (
     "AND COALESCE(attention_cleared_at,'')=''"
 )
 _GUANGYA_FOLLOWUP_READY_SQL = _GUANGYA_FOLLOWUP_ALLOWED_SQL + " AND organize_started=0"
+# STRM 的在途归属不因 qB 单端重提而撤销；重提后的光鸭资格沿用整理准入。
+_STRM_REQUEST_ACTIVE_SQL = (
+    "(status NOT IN ('cancelled','resubmitted','failed') OR (" + _GUANGYA_FOLLOWUP_ALLOWED_SQL + "))"
+)
 
 
 def claim_download_request_organize(request_id: int) -> bool:
@@ -1809,7 +1813,7 @@ def _recover_after_restart(conn, timestamp: str) -> None:
         "AND r.strm_generation=strm_request_work.generation "
         "AND COALESCE(r.organize_task_id,'')=strm_request_work.organize_task_id "
         "AND r.strm_status IN ('pending','queued','running') "
-        "AND r.status NOT IN ('cancelled','resubmitted','failed'))",
+        f"AND {_STRM_REQUEST_ACTIVE_SQL})",
         (_INTERRUPTION_PROOF,),
     )
     conn.execute(

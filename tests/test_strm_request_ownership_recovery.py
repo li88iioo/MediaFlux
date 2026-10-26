@@ -6,6 +6,7 @@ from typing import cast
 from app.clients.guangya import GuangYaClient
 
 import tests  # noqa: F401  # 先加载测试隔离环境，再导入 app。
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,7 @@ from app.clients.guangya import GuangYaFile
 from app.modules import strm
 from app.modules.scheduler import STRMScheduler
 from app.modules.strm_metadata_worker import STRMMetadataWorker
+from app.repositories.organize_history import settle_organize_task_run
 from tests.support import isolated_test_database
 from tests.test_strm_hardening import _TreeClient
 
@@ -230,6 +232,137 @@ class STRMRequestOwnershipRecoveryTests(unittest.TestCase):
         ) as queue:
             scheduler._schedule_persisted_change_queue(0)
         return queue.call_args.args[0]
+
+    def resubmit_qb(self, request):
+        db.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
+        successor, _ = db.create_download_request(f"qb-successor-{request}", "magnet", initial_targets="qb")
+        self.assertTrue(db.mark_download_request_resubmitted(
+            request, successor_request_id=successor, targets="qb",
+        ))
+        return successor
+
+    def test_qb_only_resubmit_preserves_organize_to_strm_completion(self):
+        request, _, _ = self.seed()
+        db.update_download_request(request, organize_started=0, organize_status="pending", strm_status="pending")
+        self.resubmit_qb(request)
+        self.assertTrue(db.claim_download_request_organize(request))
+        task_id = "cloud-followup-after-qb-retry"
+        run_id = db.add_task_run("guangya_organize", "download", result=json.dumps({"task_id": task_id}))
+        db.update_download_request(request, organize_task_id=task_id, organize_run_id=run_id, organize_status="running")
+        scheduler = self.scheduler()
+        options = self.queue(scheduler, [request], [self.change()])
+        settle_organize_task_run(run_id, {"task_id": task_id, "request_settlement": {
+            "status": "completed", "error": "", "message": "整理完成", "requests": {
+                str(request): {"organize_status": "completed", "organize_finished_at": db.now(), "_strm_generation": 0},
+            },
+        }})
+        result = self.execute(scheduler, options)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["stats"]["generated"], 1)
+        self.assertEqual(len(list(self.root.rglob("*.strm"))), 1)
+        self.assertEqual(db.count_pending_strm_change_targets(), 0)
+        self.refresh.assert_called_once()
+        db.init_db()
+        row = db.get_download_request(request)
+        assert row is not None
+        self.assertEqual((row["organize_status"], row["strm_status"]), ("completed", "completed"))
+        self.assertEqual((row["status"], row["qb_status"], row["gy_status"]),
+                         ("resubmitted", "resubmitted", "completed"))
+
+    def test_qb_only_resubmit_keeps_queued_work_recoverable_after_restart(self):
+        request, _, _ = self.seed()
+        scheduler = self.scheduler()
+        options = self.queue(scheduler, [request], [self.change()])
+        owner = options["download_request_owners"][0]
+        successor = self.resubmit_qb(request)
+        db.init_db()
+        # 新 qB 提交可由启动恢复独立转为待核验；后续光鸭工作不得再修改它。
+        next_row = db.get_download_request(successor)
+        assert next_row is not None
+        successor_snapshot = dict(next_row)
+        resumed = self.scheduler()
+        result = self.execute(resumed, self.recovered_options(resumed))
+        self.assertTrue(result["ok"], result)
+        row = db.get_download_request(request)
+        assert row is not None
+        self.assertEqual((row["strm_status"], row["strm_error"]), ("completed", ""))
+        self.assertEqual(row["strm_generation"], owner["generation"])
+        self.assertEqual(dict(db.get_download_request(successor) or {}), successor_snapshot)
+        self.assertEqual(len(list(self.root.rglob("*.strm"))), 1)
+
+    def test_qb_only_resubmit_keeps_failed_change_retry_owned(self):
+        request, _, _ = self.seed()
+        scheduler = self.scheduler()
+        options = self.queue(scheduler, [request], [self.change()])
+        old_owner = options["download_request_owners"][0]
+        with patch("app.modules.scheduler.sync_strm_incremental", side_effect=OSError("transient source failure")):
+            self.assertFalse(self.execute(scheduler, options)["ok"])
+        self.resubmit_qb(request)
+        db.reschedule_strm_change_targets([self.change()], not_before_seconds=0)
+        resumed = self.scheduler()
+        self.assertTrue(self.execute(resumed, self.recovered_options(resumed))["ok"])
+        row = db.get_download_request(request)
+        assert row is not None
+        self.assertEqual((row["strm_status"], row["strm_error"]), ("completed", ""))
+        self.assertGreater(row["strm_generation"], old_owner["generation"])
+        self.assertFalse(db.update_strm_request_state(old_owner, strm_status="failed", strm_error="late failure"))
+
+    def test_qb_only_resubmit_keeps_refresh_receipt_owned_after_restart(self):
+        request, _, _ = self.seed()
+        scheduler = self.scheduler()
+        options = self.queue(scheduler, [request], [self.change()])
+        self.refresh.side_effect = OSError("refresh temporarily unavailable")
+        result = self.execute(scheduler, options)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["refresh_pending"])
+        self.assertGreater(db.count_strm_refresh_paths(), 0)
+        self.resubmit_qb(request)
+        db.init_db()
+        self.refresh.side_effect = None
+        STRMMetadataWorker()._flush_media_refresh(force=True)
+        row = db.get_download_request(request)
+        assert row is not None
+        self.assertEqual((row["strm_status"], row["strm_error"]), ("completed", ""))
+        self.assertEqual(db.count_strm_refresh_paths(), 0)
+        self.assertEqual(len(list(self.root.rglob("*.strm"))), 1)
+
+    def test_qb_only_resubmit_does_not_bypass_cloud_or_generation_revocation(self):
+        cases = ("cancelled", "failed", "guangya", "both", "cleared", "qb_target", "new_task", "new_generation")
+        for episode, case in enumerate(cases, start=1):
+            with self.subTest(case=case):
+                request, _, _ = self.seed(episode)
+                successor = self.resubmit_qb(request)
+                change = self.change(episode)
+                scheduler = self.scheduler()
+                owner = self.queue(scheduler, [request], [change])["download_request_owners"][0]
+                if case in {"cancelled", "failed"}:
+                    db.update_download_request(request, status=case)
+                elif case in {"guangya", "both"}:
+                    db.update_download_request(request, organize_status="failed", strm_status="failed")
+                    self.assertTrue(db.mark_download_request_resubmitted(
+                        request, successor_request_id=successor, targets=case,
+                    ))
+                elif case == "cleared":
+                    db.update_download_request(request, organize_status="cleared", attention_cleared_at=db.now())
+                elif case == "qb_target":
+                    db.update_download_request(request, targets="qb")
+                elif case == "new_task":
+                    db.update_download_request(request, organize_task_id="replacement-task")
+                else:
+                    self.queue(scheduler, [request], [change])
+                row = db.get_download_request(request)
+                assert row is not None
+                snapshot = dict(row)
+                self.assertFalse(db.update_strm_request_state(owner, strm_status="running", strm_error="stale"))
+                self.assertEqual(dict(db.get_download_request(request) or {}), snapshot)
+                work_ids = [row["id"] for row in db.list_strm_change_queue()]
+                self.assertNotIn(owner, db.request_owners_for_work("change", work_ids))
+                if case != "new_generation":
+                    _, owners = db.enqueue_strm_change_targets([change], download_request_ids=[request], with_owners=True)
+                    if case != "new_task":
+                        self.assertEqual(owners, [], "已撤销的光鸭任务不能重新领取归属")
+                db.init_db()
+                self.assertFalse(db.update_strm_request_state(owner, strm_status="completed"))
 
     @staticmethod
     def admission(admission_id):

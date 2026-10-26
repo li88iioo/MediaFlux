@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from app.logger import redact_sensitive_text
+from app.repositories.download_requests import _STRM_REQUEST_ACTIVE_SQL
 
 INTERRUPTED_ERROR = "上次进程在 STRM 同步或排队期间中断"
 REFRESH_PENDING_ERROR = "STRM 已完成，媒体库刷新等待后台重试"
@@ -40,9 +41,9 @@ def _begin_request_owners(
         int(value) for value in (request_ids or ()) if int(value) > 0
     ):
         row = conn.execute(
-            "SELECT * FROM download_requests WHERE id=?", (request_id,)
+            f"SELECT * FROM download_requests WHERE id=? AND {_STRM_REQUEST_ACTIVE_SQL}", (request_id,)
         ).fetchone()
-        if row is None or row["status"] in {"cancelled", "resubmitted", "failed"}:
+        if row is None:
             continue
         generation = int(row["strm_generation"]) + 1
         task_id = str(row["organize_task_id"] or "")
@@ -73,7 +74,7 @@ def _begin_request_owners(
 def _current_owner_row(conn: sqlite3.Connection, owner: dict[str, Any]):
     return conn.execute(
         "SELECT * FROM download_requests WHERE id=? AND strm_generation=? "
-        "AND COALESCE(organize_task_id,'')=? AND status NOT IN ('cancelled','resubmitted','failed')",
+        f"AND COALESCE(organize_task_id,'')=? AND {_STRM_REQUEST_ACTIVE_SQL}",
         (
             int(owner["request_id"]),
             int(owner["generation"]),
@@ -167,7 +168,7 @@ def request_owners_for_work(
             "SELECT DISTINCT r.* FROM strm_request_work w JOIN download_requests r ON r.id=w.request_id "
             "AND r.strm_generation=w.generation AND COALESCE(r.organize_task_id,'')=w.organize_task_id "
             "WHERE w.kind=? AND w.work_key IN (" + placeholders + ") "
-            "AND r.status NOT IN ('cancelled','resubmitted','failed')",
+            f"AND {_STRM_REQUEST_ACTIVE_SQL}",
             [kind, *keys],
         ).fetchall()
         owners = []
