@@ -302,3 +302,118 @@ class AgentPendingDialogueBrowserTests(AgentShellBrowserCase):
         page.wait_for_function("window.__dialogueLateReturned === true")
         self.assertTrue(page.locator(f'[data-effect-confirm="{PLAN_B}"]').is_enabled())
         self.assertEqual(page.locator(".agent-confirmation-card:not(.is-expired)").count(), 1)
+
+    def reject_next_confirmation(self, page):
+        page.evaluate("""() => {
+            const fixtureFetch = window.fetch;
+            let rejected = false;
+            window.fetch = async (url, options = {}) => {
+                if (String(url) !== '/api/agent/actions/confirm' || rejected) return fixtureFetch(url, options);
+                rejected = true;
+                window.__kernelCalls.push({url: String(url), method: 'POST', body: options.body});
+                return new Response(JSON.stringify({error: 'Agent 请求过于频繁，请稍后重试'}), {
+                    status: 429, headers: {'Content-Type': 'application/json'},
+                });
+            };
+        }""")
+
+    def test_rejected_confirmation_rechecks_same_pending_plan_before_manual_retry(self):
+        for width, mode in ((1280, "no_terminal"), (390, "old_terminal")):
+            with self.subTest(width=width, mode=mode):
+                page = self.dialogue_page({"width": width, "height": 844})
+                self.reject_next_confirmation(page)
+                page.evaluate("mode => window.__dialogueMode = mode", mode)
+                reads = page.evaluate("window.__dialogueReads")
+                page.locator("[data-effect-confirm]").click()
+                page.wait_for_function("document.getElementById('agentSend').getAttribute('aria-busy') === 'false'")
+                self.assertEqual(page.evaluate("window.__dialogueReads"), reads + 1)
+                self.assertTrue(page.locator(f'[data-effect-confirm="{PLAN_A}"]').is_enabled())
+                self.assertTrue(page.locator(f'[data-effect-cancel="{PLAN_A}"]').is_enabled())
+                self.assertEqual(page.locator(".agent-confirmation-card:not(.is-expired)").count(), 1)
+                self.assertIn("请求过于频繁", page.locator(".is-interrupted").inner_text())
+                self.assertIn("尚未执行", page.locator("#agentTranscript").inner_text())
+                self.assertNotIn("此详情正文不得重建到当前页面", page.locator("#agentTranscript").inner_text())
+                calls = page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm')")
+                self.assertEqual(len(calls), 1)
+                snapshot = page.evaluate("window.__kernelCalls.filter(call => call.url.startsWith('/api/agent/sessions/') && call.method === 'GET').at(-1)")
+                self.assertEqual(snapshot["headers"]["x-agent-request-id"], json.loads(calls[0]["body"])["request_id"])
+                page.evaluate("events => window.__kernelConfig.confirmEvents = events", [
+                    _event(1, "turn.started", {"kind": "confirmation"}),
+                    _event(2, "effect.completed", {"plan_id": PLAN_A, "receipt": "人工重试已执行一次", "result": {"ok": True}}),
+                    _event(3, "turn.completed", {"status": "success", "answer": "人工重试已执行一次"}),
+                ])
+                page.locator(f'[data-effect-confirm="{PLAN_A}"]').click()
+                page.wait_for_function("document.getElementById('agentSend').getAttribute('aria-busy') === 'false'")
+                calls = page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm')")
+                self.assertEqual(len(calls), 2)
+                bodies = [json.loads(call["body"]) for call in calls]
+                self.assertEqual([body["plan_id"] for body in bodies], [PLAN_A, PLAN_A])
+                self.assertNotEqual(bodies[0]["request_id"], bodies[1]["request_id"])
+                self.assertIn("人工重试已执行一次", page.locator("#agentTranscript").inner_text())
+                self.assertIn("请求过于频繁", page.locator(".is-interrupted").inner_text())
+
+    def test_rejected_confirmation_does_not_restore_unverified_or_retired_plan(self):
+        cases = [("no_terminal", None), ("old_terminal", approval(PLAN_B))]
+        cases.extend((mode, approval()) for mode in (
+            "network", "http", "malformed", "missing", "foreign", "protected", "other_active", "timeout",
+        ))
+        for mode, pending in cases:
+            with self.subTest(mode=mode, pending=pending and pending["plan_id"]):
+                page = self.dialogue_page()
+                self.reject_next_confirmation(page)
+                page.evaluate("({mode, pending}) => { window.__dialogueMode = mode; window.__dialogueSnapshot = {pending_approval: pending}; }",
+                              {"mode": mode, "pending": pending})
+                page.locator("[data-effect-confirm]").click()
+                page.wait_for_function("document.getElementById('agentSend').getAttribute('aria-busy') === 'false'")
+                self.assertEqual(page.locator("[data-effect-confirm], [data-effect-cancel]").count(), 0)
+                self.assertIn("请求过于频繁", page.locator(".is-interrupted").inner_text())
+                self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
+
+    def test_rejected_confirmation_late_read_cannot_restore_into_new_session(self):
+        page = self.dialogue_page()
+        self.reject_next_confirmation(page)
+        page.evaluate("window.__dialogueMode = 'deferred'")
+        page.locator("[data-effect-confirm]").click()
+        page.wait_for_function("typeof window.__releaseDialogueSnapshot === 'function'")
+        page.locator("#agentNewSession").click()
+        self.send(page, preview_events(approval(PLAN_B)), approval(PLAN_B), "准备另一个会话的计划")
+        page.evaluate("window.__releaseDialogueSnapshot()")
+        page.wait_for_function("window.__dialogueLateReturned === true")
+        self.assertEqual(page.locator(f'[data-effect-confirm="{PLAN_A}"]').count(), 0)
+        self.assertTrue(page.locator(f'[data-effect-confirm="{PLAN_B}"]').is_enabled())
+        self.assertEqual(page.locator(".agent-confirmation-card:not(.is-expired)").count(), 1)
+        self.assertNotIn("请求过于频繁", page.locator("#agentTranscript").inner_text())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
+
+    def test_rejected_candidate_confirmation_preserves_selection_and_cancel_context(self):
+        page = self.dialogue_page({"width": 390, "height": 844})
+        self.send(page, [
+            _event(1, "turn.started"),
+            _event(2, "tool.completed", {"tool": "resource.search", "result": {"candidate_view": candidate_view()}}),
+            _event(3, "turn.completed", {"status": "success", "answer": "候选已找到。"}),
+        ], approval())
+        plan = approval(PLAN_B)
+        page.evaluate("({events, plan}) => { window.__kernelConfig.queryEvents = events; window.__dialogueSnapshot = {pending_approval: plan}; }",
+                      {"events": preview_events(plan), "plan": plan})
+        page.locator("[data-candidate-select]").click()
+        page.wait_for_function("document.getElementById('agentSend').getAttribute('aria-busy') === 'false'")
+        page.evaluate("""() => {
+            window.__candidateGroup = document.querySelector('.agent-candidates');
+            window.__candidateSelection = window.__candidateGroup.querySelector('.agent-confirmation-card')._candidateSelection;
+            window.__dialogueMode = 'old_terminal';
+        }""")
+        self.reject_next_confirmation(page)
+        page.locator(f'[data-effect-confirm="{PLAN_B}"]').click()
+        page.wait_for_function("document.getElementById('agentSend').getAttribute('aria-busy') === 'false'")
+        self.assertTrue(page.evaluate("""() => {
+            const card = document.querySelector('.agent-candidates .agent-confirmation-card:not(.is-expired)');
+            return window.__candidateGroup.isConnected && card?._agentTurn.candidateGroup === window.__candidateGroup
+                && JSON.stringify(card._candidateSelection) === JSON.stringify(window.__candidateSelection);
+        }"""))
+        self.assertIn("请求过于频繁", page.locator(".agent-candidates .is-interrupted").inner_text())
+        page.locator(f'[data-effect-cancel="{PLAN_B}"]').click()
+        page.locator(".agent-candidates .agent-cancelled").wait_for()
+        self.assertTrue(page.locator("[data-candidate-select]").is_enabled())
+        self.assertTrue(page.locator('[data-candidate-position="1"]').is_checked())
+        self.assertEqual(page.evaluate("window.__kernelCalls.filter(call => call.url === '/api/agent/actions/confirm').length"), 1)
+        self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), 390)

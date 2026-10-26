@@ -187,6 +187,40 @@ def api_client(runtime, monkeypatch, csrf="explain-csrf"):
             yield client, agent_api.web_kernel_owner("explain-account")
 
 
+def test_confirm_rate_limit_preserves_pending_ticket_for_readonly_recovery(monkeypatch):
+    from app.routes import agent_api
+
+    with isolated_test_database("confirm-rate-limit.db"):
+        runtime = NativeRuntime()
+        with api_client(runtime, monkeypatch) as (client, owner):
+            client.get("/_test_login")
+            session_id = "session_confirm_rate_limit_001"
+            approval = runtime.preview(owner, session_id)
+            before = asyncio.run(runtime.session.pipeline.get_pending_plan(owner=owner, session_id=session_id))
+            assert before is not None
+            for _ in range(12):
+                agent_api._check_rate_limit("confirm", limit=12)
+            request_id = "confirm_rate_limit_rejected"
+            response = client.post("/api/agent/actions/confirm", json={
+                "session_id": session_id, "plan_id": approval.plan_id, "request_id": request_id, "stream": True,
+            }, headers={"X-CSRF-Token": "explain-csrf"})
+            assert response.status_code == 429
+            assert "请求过于频繁" in response.json()["error"]
+            assert asyncio.run(runtime.session.pipeline.get_pending_plan(owner=owner, session_id=session_id)) == before
+            observed = {"X-Agent-Request-Id": request_id}
+            snapshot = client.get(f"/api/agent/sessions/{session_id}", headers=observed)
+            assert snapshot.status_code == 200
+            payload = snapshot.json()
+            assert payload["session_id"] == session_id
+            assert payload["pending_approval"]["plan_id"] == approval.plan_id
+            assert payload["active_turn"] is None and payload["last_turn"] is None
+            assert "no-store" in snapshot.headers["Cache-Control"]
+            runtime.now = before.expires_at + 1
+            expired = client.get(f"/api/agent/sessions/{session_id}", headers=observed)
+            assert expired.status_code == 200 and expired.json()["pending_approval"] is None
+            assert runtime.writes == [] and len(runtime.prepares) == 1 and len(runtime.wires) == 1
+
+
 def test_web_security_cold_confirm_and_tool_rejection(monkeypatch):
     with isolated_test_database("explain-web.db"):
         runtime = NativeRuntime()

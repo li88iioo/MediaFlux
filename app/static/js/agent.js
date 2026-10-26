@@ -1823,8 +1823,9 @@
     }
 
     async function reconcilePendingApprovals(active) {
+        const rejectedPlanId = active?.kind === 'confirm' ? active.turn?.activePlanId : '';
         if (!isCurrentActiveRequest(active)
-            || !transcript?.querySelector('.agent-confirmation-card[data-plan-id]:not(.is-expired)')) return;
+            || (!rejectedPlanId && !transcript?.querySelector('.agent-confirmation-card[data-plan-id]:not(.is-expired)'))) return;
         const controller = new AbortController();
         const abort = () => controller.abort();
         const timeout = window.setTimeout(abort, 3000);
@@ -1837,12 +1838,22 @@
             if (!isCurrentActiveRequest(active) || payload?.session_id !== active.sessionId) return;
             // protected 会暂时隐藏已接管的票据；其它活动轮次也不能作为本轮的撤卡依据。
             if (payload.active_turn && (payload.active_turn.protected || !sameActiveTurn(payload.active_turn, active))) return;
+            if (rejectedPlanId) {
+                // HTTP 拒绝发生在领取票据之前，未必有本请求的 last_turn；只恢复只读核实的同一待确认计划。
+                if (payload.active_turn || payload.pending_approval?.plan_id !== rejectedPlanId) return;
+                const card = buildApproval({...payload.pending_approval, scoped_trust: payload.scoped_trust});
+                card._candidateSelection = active.turn.candidateSelection;
+                active.turn.card.after(card);
+                approvalTurnForCard(card);
+                expireVisibleApprovals(rejectedPlanId);
+                return true;
+            }
             // 缺少本轮终态的旧/缺省快照不能证明票据已撤销。
             if (!sameActiveTurn(payload.last_turn, active) || payload.last_turn.status === 'interrupted') return;
             if (payload.pending_approval === null) expireVisibleApprovals();
             else if (payload.pending_approval?.plan_id) expireVisibleApprovals(String(payload.pending_approval.plan_id));
         } catch (_) {
-            // 无法核实就保留原卡，不把网络故障伪装成取消，也不重放写操作。
+            // 无法核实就保持现状，不把网络故障伪装成取消，也不重放写操作。
         } finally {
             window.clearTimeout(timeout);
             active.controller.signal.removeEventListener('abort', abort);
@@ -2380,6 +2391,9 @@
             if (Number.isInteger(error?.httpStatus) && error.httpStatus >= 400 && error.httpStatus < 500) {
                 finalizeError(turn, streamFailureMessage(turn, error));
                 announce(responseStatus, error.message || '执行未完成，请核对状态');
+                if (await reconcilePendingApprovals(active) && isCurrentActiveRequest(active)) {
+                    finalizeError(turn, `${error.message}\n\n已核实本计划尚未执行，仍待确认。请稍后手动重试或取消，不会自动提交。`);
+                }
             } else startActiveObservation(active);
         } finally {
             if (activeRequest === active && !active.observing) {
