@@ -1522,8 +1522,11 @@ def _finalize_download_request_submission_conn(
     statuses = [status for status in (effective_qb, effective_gy) if status]
     if any(status == "manual_review" for status in statuses):
         root_status = "manual_review"
+    elif "submitting" in statuses:
+        # 后端身份可提前确认，但整单尚在提交；重复项仍沿原批次收敛契约等待。
+        root_status = "submitting"
     elif any(
-        status in {"submitting", "submitted", "downloading", "outcome_unknown"}
+        status in {"submitted", "downloading", "outcome_unknown"}
         for status in statuses
     ):
         root_status = "submitted"

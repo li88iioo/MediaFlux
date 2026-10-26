@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app import database as db
-from app.clients.qbittorrent import TorrentAddResult
+from app.clients.qbittorrent import TorrentAddResult, TorrentTask
 from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
 from app.modules.download_tracker import DownloadTracker
@@ -207,6 +207,10 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
 
                     def cloud(row, **_kwargs):
                         seen["request_id"] = row["id"]
+                        current = db.get_download_request(int(row["id"]))
+                        assert current is not None
+                        self.assertEqual((current["status"], current["qb_status"], current["gy_status"]),
+                                         ("submitting", "submitted", "submitting"))
                         entered.set()
                         self.assertTrue(release.wait(5))
                         return receipt
@@ -298,6 +302,39 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                 row = db.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(row["error"], f"{failed}: {error}")
+
+    def test_tracker_preserves_inflight_submission_while_peer_receipt_is_pending(self):
+        request_id, _item, torrent_hash, operation = self.prepare("first", target="both")
+        tracker = DownloadTracker()
+        observed = []
+
+        def cloud(row, **_kwargs):
+            for progress in (0.5, 1.0):
+                task = TorrentTask(
+                    hash=torrent_hash, name="Tracked", progress=progress,
+                    state="uploading" if progress == 1.0 else "downloading",
+                    save_path="/downloads", content_path="/downloads/Tracked.mkv",
+                    size=100, downloaded=int(100 * progress), dlspeed=0, upspeed=0,
+                    eta=0, ratio=0.0, category="", added_on=0,
+                )
+                current = db.get_download_request(request_id)
+                assert current is not None
+                tracker._update_request(current, [task], [], gy_available=False)
+                current = db.get_download_request(request_id)
+                assert current is not None
+                observed.append((current["status"], current["qb_status"], current["gy_status"]))
+            return {"ok": True, "task_id": "cloud-after-tracking"}
+
+        with patch.object(dispatcher, "_submit_guangya", side_effect=cloud), patch.object(
+            tracker, "_start_local_import",
+        ), patch.object(tracker, "_start_organize"), patch.object(tracker, "_notify_completion"):
+            self.assertTrue(operation()["ok"])
+        self.assertEqual(observed, [("submitting", "downloading", "submitting"),
+                                    ("submitting", "completed", "submitting")])
+        current = db.get_download_request(request_id)
+        assert current is not None
+        self.assertEqual((current["status"], current["qb_status"], current["gy_status"]),
+                         ("submitted", "completed", "submitted"))
 
     def test_cloud_persistence_failure_cannot_revive_cancelled_qb(self):
         _request_id, item, torrent_hash, _operation = self.prepare("first", target="both")

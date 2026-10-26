@@ -498,6 +498,8 @@ class DownloadTracker:
             if any(status == "manual_review" for status in statuses):
                 updates["status"] = "manual_review"
                 updates["completed_at"] = db.now()
+            elif "submitting" in statuses:
+                updates["status"] = "submitting"
             elif statuses and all(status in {"completed", "failed", "cancelled", "resubmitted"} for status in statuses):
                 updates["status"] = (
                     "completed" if "completed" in statuses else "failed" if "failed" in statuses else "cancelled"
