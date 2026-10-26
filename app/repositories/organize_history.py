@@ -105,6 +105,67 @@ def finish_organize_operation_step(step_id: int, status: str, error: str = "") -
         return cur.rowcount == 1
 
 
+def begin_return_compensation(log_id: int, token: str, step_ids: list[int]) -> None:
+    """先撤销成功步骤的提交资格，再允许反向移动；不可记账时不启动补偿。"""
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        updated = conn.executemany(
+            "UPDATE organize_operation_steps SET status='running',finished_at=NULL,"
+            "error='送回操作正在补偿，结果待核验' WHERE id=? AND log_id=? AND operation_token=? "
+            "AND EXISTS(SELECT 1 FROM organize_log WHERE id=? AND operation_token=? AND status='returning')",
+            [(step_id, log_id, token, log_id, token) for step_id in step_ids],
+        )
+        if updated.rowcount != len(step_ids):
+            raise RuntimeError("送回操作身份已变化，未执行补偿")
+
+
+def _recover_return_receipts_conn(conn, timestamp: str, *, limit: int) -> int:
+    """仅按原 token 的完整已提交步骤补记回执；不执行云端写入或后处理。"""
+    logs = conn.execute(
+        "SELECT * FROM organize_log WHERE status='returning' ORDER BY id LIMIT ?", (limit,),
+    ).fetchall()
+    for log in logs:
+        items = conn.execute("SELECT * FROM organize_log_items WHERE log_id=?", (log["id"],)).fetchall()
+        steps = conn.execute(
+            "SELECT * FROM organize_operation_steps WHERE log_id=? AND operation_token=? "
+            "AND action='return_to_source'", (log["id"], log["operation_token"]),
+        ).fetchall()
+        by_file = {step["file_id"]: step for step in steps}
+        video = next((item for item in items if item["file_id"] == log["file_id"]), None)
+        complete = video is not None and len(items) == len(steps) == len(by_file) and all(
+            (step := by_file.get(item["file_id"])) is not None
+            and item["status"] == step["status"] == "success"
+            and (item["current_parent_id"], item["current_name"]) == (step["to_parent_id"], step["to_name"])
+            for item in items
+        )
+        notice = (
+            "文件送回步骤已完成，终态已补记；空目录清理、STRM与媒体库刷新未执行，请按需重新同步"
+            if complete else "送回操作已中断，步骤或补偿结果不完整；执行前必须重新核验全部云端快照"
+        )
+        conn.execute(
+            "UPDATE organize_log SET status=?,current_parent_id=?,current_name=?,operation_type=?,"
+            "error=?,version=version+1,updated_at=? WHERE id=?",
+            ("reverted" if complete else "interrupted",
+             video["current_parent_id"] if complete and video is not None else log["current_parent_id"],
+             video["current_name"] if complete and video is not None else log["current_name"],
+             "return_to_source" if complete else log["operation_type"], notice, timestamp, log["id"]),
+        )
+        if not complete:
+            conn.execute(
+                "UPDATE organize_operation_steps SET status='interrupted',error=?,finished_at=? "
+                "WHERE log_id=? AND operation_token=? AND status='running'",
+                (notice, timestamp, log["id"], log["operation_token"]),
+            )
+    return len(logs)
+
+
+def recover_return_receipts() -> int:
+    """调用方须持有整理写锁；既有 dispatcher 每周期最多补记一条。"""
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return _recover_return_receipts_conn(conn, db.now(), limit=1)
+
+
 def _validated_snapshot(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or value.get("version", 1) != 1:
         raise ValueError("整理业务前像格式无效")
@@ -292,6 +353,7 @@ def next_unsettled_organize_task_run(after_id: int = 0) -> sqlite3.Row | None:
 
 def _recover_after_restart(conn, timestamp: str) -> None:
     """恢复整理确认、写审计与版本化运行结果；回执使用同一事务。"""
+    _recover_return_receipts_conn(conn, timestamp, limit=-1)
     for run in conn.execute(
         "SELECT id,result FROM task_runs WHERE task_name='guangya_organize' AND status='partial' "
         "AND json_valid(result) AND json_type(result,'$.request_settlement')='object'"

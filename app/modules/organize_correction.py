@@ -23,6 +23,7 @@ from app.clients.guangya import (
 from app.logger import get_logger
 from app.modules.guangya_compensation import restore_guangya_file
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+from app.repositories.organize_history import begin_return_compensation
 from app.modules.nsfw import (
     CleanTitleCandidate,
     build_clean_title_candidate,
@@ -1759,18 +1760,27 @@ class OrganizeCorrectionService:
                 except Exception as exc:
                     db.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
+            video = self._video(items)
+            if not db.update_organize_log(
+                log_id, status="reverted", operation_type="return_to_source",
+                current_parent_id=restored[video.original_parent_id],
+                current_name=video.original_name, error="",
+            ):
+                raise RuntimeError("送回后的业务状态未能持久化")
         except Exception as exc:
+            if completed:
+                try:
+                    begin_return_compensation(log_id, operation_token, [item.step_id for item in completed])
+                except Exception as persist_exc:
+                    raise DirectoryScrapeConflictError(
+                        "送回回执暂未保存，未启动无法记账的补偿；数据库恢复后将核对日志。"
+                        "清理、STRM等后处理未执行，请勿重复操作"
+                    ) from persist_exc
             self._rollback_transitions(completed)
             db.update_organize_log(
                 log_id, status=self._failure_status(log_id, "failed" if targets_verified else detail["status"]), error=str(exc)
             )
             raise
-        video = self._video(items)
-        db.update_organize_log(
-            log_id, status="reverted", operation_type="return_to_source",
-            current_parent_id=restored[video.original_parent_id],
-            current_name=video.original_name, error="",
-        )
         empty_dirs_cleaned, directory_warnings = (
             self._cleanup_empty_directories(
                 log_id=log_id,

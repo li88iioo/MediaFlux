@@ -6,9 +6,11 @@ from app.clients.guangya import GuangYaClient
 from app.modules.scraper import TMDBScraper
 
 import json
+import sqlite3
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
+from time import monotonic, sleep
 from unittest.mock import patch
 
 from app import config
@@ -250,6 +252,115 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         assert get_organize_log_result_2 is not None
         self.assertEqual(get_organize_log_result_2['current_parent_id'], parent.file_id)
         self.assertNotIn('leaf', self.cloud.nodes)
+
+    def test_return_terminal_write_failure_is_inside_compensation_boundary(self):
+        self.rules.clean_empty = False
+        self._reorganize()
+        archived = replace(self.cloud.nodes["video"])
+        update = db.update_organize_log
+        for mode in ("sql-error", "false-result"):
+            with self.subTest(mode=mode):
+                def fail_terminal(log_id, **fields):
+                    if fields.get("status") == "reverted":
+                        if mode == "false-result":
+                            return False
+                        raise sqlite3.OperationalError("terminal receipt unavailable")
+                    return update(log_id, **fields)
+                with patch.object(db, "update_organize_log", side_effect=fail_terminal), patch.object(
+                    self.service, "_run_post_actions",
+                ) as post, patch.object(self.service, "_cleanup_empty_directories") as cleanup:
+                    with self.assertRaises((sqlite3.OperationalError, RuntimeError)):
+                        self.service.return_to_source(self.log_id, mode, self.service.detail(self.log_id)["version"])
+                post.assert_not_called()
+                cleanup.assert_not_called()
+                detail = self.service.detail(self.log_id)
+                self.assertEqual(detail["status"], "failed")
+                self.assertEqual(self.cloud.nodes["video"], archived)
+                self.assertEqual(detail["items"][0]["current_parent_id"], archived.parent_id)
+                self.assertEqual([step["status"] for step in detail["operations"]
+                                  if step["operation_token"] == mode], ["rolled_back"])
+
+    def _return_under_persistent_lock(self, *, startup=False, incomplete=False):
+        from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+        from app.modules.organize_tasks import OrganizeTaskManager
+
+        self.rules.clean_empty = False
+        self._reorganize()
+        manager = OrganizeTaskManager()
+        blocker = sqlite3.connect(db.resolve_db_path(), isolation_level=None)
+        update = db.update_organize_log
+        connect = db._connect
+
+        def short_timeout():
+            conn = connect()
+            conn.execute("PRAGMA busy_timeout=30")
+            return conn
+
+        def contend(log_id, **fields):
+            if fields.get("status") == "reverted":
+                blocker.execute("BEGIN IMMEDIATE")
+            return update(log_id, **fields)
+
+        try:
+            with patch.object(db, "_connect", side_effect=short_timeout):
+                with patch.object(db, "update_organize_log", side_effect=contend), patch.object(
+                    self.cloud, "move", wraps=self.cloud.move,
+                ) as move, patch.object(self.service, "_run_post_actions") as post:
+                    with self.assertRaises(DirectoryScrapeConflictError):
+                        self.service.return_to_source(self.log_id, "locked-return", self.service.detail(self.log_id)["version"])
+                # 锁直到原调用退出才释放；无法记账时没有反向补偿，不伪装成完成。
+                self.assertTrue(blocker.in_transaction)
+                self.assertEqual(self.service.detail(self.log_id)["status"], "returning")
+                self.assertEqual(self.cloud.nodes["video"].parent_id, "leaf")
+                self.assertEqual(move.call_count, 1)
+                post.assert_not_called()
+                blocker.rollback()
+                if incomplete:
+                    steps = db.list_organize_operation_steps(self.log_id)
+                    step_id = next(step["id"] for step in steps if step["operation_token"] == "locked-return")
+                    db.finish_organize_operation_step(step_id, "running", "补偿意图已提交，结果尚未核验")
+                if startup:
+                    db.init_db()
+                else:
+                    # 持有同一写锁时不能收束别的进程尚在执行的日志。
+                    self.assertTrue(manager._lock.acquire(blocking=False))
+                    try:
+                        manager._retry_task_settlement()
+                        self.assertEqual(self.service.detail(self.log_id)["status"], "returning")
+                    finally:
+                        manager._lock.release()
+                    manager.resume()
+                    manager._settlement_retry_at = 0
+                    manager._operation_queue_wakeup.set()
+                    deadline = monotonic() + 3
+                    while monotonic() < deadline and self.service.detail(self.log_id)["status"] == "returning":
+                        sleep(0.01)
+                detail = self.service.detail(self.log_id)
+                self.assertEqual(detail["status"], "interrupted" if incomplete else "reverted")
+                self.assertTrue(detail["allowed_actions"]["preview"])
+                if incomplete:
+                    self.assertIn("重新核验", detail["error"])
+                else:
+                    self.assertEqual(detail["current_parent_id"], "leaf")
+                    self.assertEqual(detail["current_name"], "Original.S01E01.mkv")
+                    self.assertIn("未执行", detail["error"])
+                    self.assertIn("STRM", detail["error"])
+                self.assertEqual(self.cloud.nodes["video"].parent_id, "leaf")
+        finally:
+            blocker.rollback()
+            blocker.close()
+            manager.shutdown(timeout=2)
+            if manager._operation_dispatcher:
+                manager._operation_dispatcher.join(2)
+
+    def test_return_receipt_recovers_after_lock_outlives_original_call(self):
+        self._return_under_persistent_lock()
+
+    def test_return_receipt_startup_uses_same_completed_step_evidence(self):
+        self._return_under_persistent_lock(startup=True)
+
+    def test_return_receipt_does_not_promote_unverified_compensation(self):
+        self._return_under_persistent_lock(incomplete=True)
 
     def test_confirmation_cleanup_receipts_preserve_return_with_companions(self):
         from app.modules.organize_confirmations import _cleanup_confirmed_source

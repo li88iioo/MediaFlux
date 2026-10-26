@@ -43,7 +43,7 @@ from app.repositories.download_staging import (
     complete_staging_confirmation_phase,
     list_staging_cleanup_requests,
 )
-from app.repositories.organize_history import next_unsettled_organize_task_run, settle_organize_task_run
+from app.repositories.organize_history import next_unsettled_organize_task_run, recover_return_receipts, settle_organize_task_run
 from app.repositories.organize_operation_jobs import (
     CLOUD_COPY_PENDING_CODE,
     OrganizeOperationAdmissionError,
@@ -1703,6 +1703,12 @@ class OrganizeTaskManager:
                 self._settlement_cursor = int(row["id"])
                 if self._settlement_cursor != local_run_id:
                     self._settle_task_result(self._settlement_cursor, json.loads(row["result"]))
+            # 另一进程仍在整理时不能把它的 returning 日志当成中断回执。
+            if self._lock.acquire(blocking=False):
+                try:
+                    recover_return_receipts()
+                finally:
+                    self._lock.release()
         except Exception as exc:
             logger.warning("读取整理待结算回执失败 type=%s", type(exc).__name__)
 
