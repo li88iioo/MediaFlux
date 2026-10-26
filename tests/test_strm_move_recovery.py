@@ -711,3 +711,229 @@ class StrmMoveRecoveryTests(unittest.TestCase):
             self.assertEqual(stats["cleaned"], 1)
             self.assertEqual(len(removed), 1, stats)
             self.assertEqual(len(stats["changed_strm_paths"]), 2, stats)
+
+
+class StrmRetiredPathRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        for name in ("socket.socket.connect", "socket.socket.connect_ex",
+                     "socket.create_connection", "socket.getaddrinfo"):
+            self.enterContext(patch(name, side_effect=AssertionError("network forbidden")))
+        self.database_path = self.enterContext(isolated_test_database())
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.policy = StrmRefreshPolicy(
+            media_root=str(self.root / strm.STRM_SUBDIR), allow_emby=False,
+        )
+
+    def _displaced_paths(self, namespace="guangya:source", suffix=".strm"):
+        old = self.root / strm.STRM_SUBDIR / "Old" / f"video{suffix}"
+        current = self.root / strm.STRM_SUBDIR / "New" / old.name
+        for path in (old, current):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"trusted generated content")
+            db.upsert_strm_index(
+                namespace, "video", "etag", 100, path.name, str(path),
+                strm._content_fingerprint(path),
+            )
+        db.enqueue_strm_retired_source("source", "S", str(self.root))
+        return old, current
+
+    def _retire(self, **kwargs):
+        return strm.clean_retired_strm_sources(
+            set(), clean_empty_dirs=False, refresh_policy=self.policy, **kwargs,
+        )
+
+    def _assert_task_status(self, status):
+        run = db.get_last_task_run("strm_sync")
+        assert run is not None
+        self.assertEqual(run["status"], status)
+
+    def _fail_old_refresh(self, old):
+        old_directory = str(old.parent).replace("'", "''")
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER retired_old_refresh_fail BEFORE INSERT ON strm_refresh_outbox "
+                f"WHEN NEW.path='{old_directory}' "
+                "BEGIN SELECT RAISE(FAIL, 'isolated old refresh failure'); END"
+            )
+
+    def test_actual_move_crash_then_source_removal_retires_both_paths(self):
+        from tests.test_strm_refresh_closure import _consume, _providers, _run
+
+        sync(self.root)
+        old = next(self.root.rglob("*.strm"))
+        crash_move(self.database_path, self.root, "after_index")
+        db.init_db()
+        current = Path(db.list_strm_index("guangya:source")[0]["strm_path"])
+        self.assertTrue(old.is_file())
+        self.assertTrue(current.is_file())
+        self.assertEqual(len(db.list_strm_path_cleanup("guangya:source")), 1)
+        # 无可信凭据的同内容文件不在退役删除范围，禁止扩大成目录扫删。
+        untracked = old.parent / "Untracked.strm"
+        untracked.write_bytes(old.read_bytes())
+        db.enqueue_strm_retired_source("source", "S", str(self.root))
+        runtime_root = self.root / "ChangedRuntimeRoot"
+        with _providers("jellyfin"):
+            result = _run(runtime_root, retire=True, allow_emby=False)
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["strm_partial"], result)
+        self.assertEqual(result["stats"]["cleaned"], 2, result)
+        self.assertEqual(result["stats"]["retired_blocked"], 0)
+        self._assert_task_status("success")
+        self.assertFalse(old.exists())
+        self.assertFalse(current.exists())
+        self.assertTrue(untracked.is_file())
+        self.assertEqual(db.list_strm_index("guangya:source"), [])
+        self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        _consume(providers=("jellyfin",), expected_paths={str(old.parent), str(current.parent)})
+        db.init_db()
+        again = self._retire()
+        self.assertEqual(again["sources"], 0)
+        self.assertTrue(untracked.is_file())
+
+    def test_retired_metadata_receipt_is_consumed_even_without_current_index(self):
+        old, current = self._displaced_paths("guangya-meta:source", ".nfo")
+        current.unlink()
+        db.delete_strm_index_ids("guangya-meta:source", ["video"])
+        result = self._retire()
+        self.assertEqual(result["cleaned"], 1, result)
+        self.assertEqual(result["blocked"], 0)
+        self.assertEqual(result["removed_paths"], [str(old)])
+        self.assertFalse(old.exists())
+        self.assertEqual(db.list_strm_path_cleanup("guangya-meta:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertEqual(
+            {(entry["path"], entry["allow_emby"]) for entry in db.list_strm_refresh_entries()},
+            {(str(old.parent), False)},
+        )
+
+    def test_retired_old_path_reused_by_active_index_is_not_deleted(self):
+        old, current = self._displaced_paths()
+        db.upsert_strm_index(
+            "guangya:active", "other", "etag", 100, old.name, str(old),
+            strm._content_fingerprint(old),
+        )
+        result = strm.clean_retired_strm_sources(
+            {"active"}, clean_empty_dirs=False, refresh_policy=self.policy,
+        )
+        self.assertEqual(result["cleaned"], 1)
+        self.assertEqual(result["blocked"], 0)
+        self.assertTrue(old.is_file())
+        self.assertFalse(current.exists())
+        self.assertEqual(len(db.list_strm_index("guangya:active")), 1)
+        self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertNotIn(str(old), result["removed_paths"])
+
+    def test_modified_old_path_keeps_retirement_partial_until_restored(self):
+        from tests.test_strm_refresh_closure import _providers, _run
+
+        old, current = self._displaced_paths()
+        expected = old.read_bytes()
+        old.write_bytes(b"external modification")
+        with _providers("jellyfin"):
+            result = _run(self.root, retire=True, allow_emby=False)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["strm_partial"], result)
+        self._assert_task_status("partial")
+        self.assertEqual(result["stats"]["retired_blocked"], 1)
+        self.assertTrue(result["stats"]["error_samples"])
+        self.assertEqual(old.read_bytes(), b"external modification")
+        self.assertFalse(current.exists())
+        self.assertEqual(len(db.list_strm_path_cleanup("guangya:source")), 1)
+        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+        old.write_bytes(expected)
+        with _providers("jellyfin"):
+            retry = _run(self.root, retire=True, allow_emby=False)
+        self.assertFalse(retry["strm_partial"], retry)
+        self._assert_task_status("success")
+        self.assertFalse(old.exists())
+        self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+
+    def test_old_path_refresh_sql_failure_keeps_receipt_and_retirement_for_retry(self):
+        old, current = self._displaced_paths()
+        self._fail_old_refresh(old)
+        result = self._retire()
+        self.assertTrue(result["stopped"], result)
+        self.assertGreater(result["blocked"], 0)
+        self.assertTrue(result["errors"])
+        self.assertFalse(old.exists())
+        self.assertFalse(current.exists())
+        self.assertEqual(db.list_strm_index("guangya:source"), [])
+        self.assertEqual(len(db.list_strm_path_cleanup("guangya:source")), 1)
+        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+        self.assertNotIn(str(old.parent), {entry["path"] for entry in db.list_strm_refresh_entries()})
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER retired_old_refresh_fail")
+        db.init_db()
+        retry = self._retire()
+        self.assertFalse(retry["stopped"], retry)
+        self.assertEqual(retry["blocked"], 0)
+        self.assertIn(str(old), retry["removed_paths"])
+        self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        self.assertEqual(
+            {(entry["path"], entry["allow_emby"]) for entry in db.list_strm_refresh_entries()},
+            {(str(old.parent), False), (str(current.parent), False)},
+        )
+
+    def test_scheduler_reports_refresh_sql_failure_then_recovers_retired_receipt(self):
+        from tests.test_strm_refresh_closure import _consume, _providers, _run
+
+        old, current = self._displaced_paths()
+        self._fail_old_refresh(old)
+        with _providers("jellyfin"):
+            result = _run(self.root, retire=True, allow_emby=False)
+        self.assertFalse(result["ok"], result)
+        self._assert_task_status("failed")
+        self.assertFalse(old.exists())
+        self.assertFalse(current.exists())
+        self.assertEqual(len(db.list_strm_path_cleanup("guangya:source")), 1)
+        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER retired_old_refresh_fail")
+        db.init_db()
+        with _providers("jellyfin"):
+            retry = _run(self.root, retire=True, allow_emby=False)
+        self.assertTrue(retry["ok"], retry)
+        self.assertFalse(retry["strm_partial"], retry)
+        self._assert_task_status("success")
+        self.assertIn(str(old), retry["stats"]["changed_strm_paths"])
+        self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])
+        _consume(providers=("jellyfin",), expected_paths={str(old.parent), str(current.parent)})
+
+    def test_cancellation_after_old_delete_keeps_unacked_receipts_and_remaining_file(self):
+        old, current = self._displaced_paths()
+        remaining = old.parent / "Remaining.strm"
+        remaining.write_bytes(old.read_bytes())
+        db.enqueue_strm_path_cleanup([{
+            "source": "guangya:source", "file_id": "remaining", "strm_path": str(remaining),
+            "content_fingerprint": strm._content_fingerprint(remaining),
+        }])
+        stopped = False
+        real_delete = strm._delete_owned_file
+
+        def delete_then_stop(path, rows, action):
+            nonlocal stopped
+            deleted = real_delete(path, rows, action)
+            if path == old:
+                stopped = True
+            return deleted
+
+        with patch.object(strm, "_delete_owned_file", side_effect=delete_then_stop):
+            result = self._retire(should_stop=lambda: stopped)
+        self.assertTrue(result["stopped"], result)
+        self.assertFalse(old.exists())
+        self.assertFalse(current.exists())
+        self.assertTrue(remaining.is_file())
+        self.assertEqual(len(db.list_strm_path_cleanup("guangya:source")), 2)
+        self.assertEqual(len(db.list_strm_retired_sources()), 1)
+        retry = self._retire()
+        self.assertFalse(retry["stopped"], retry)
+        self.assertEqual(retry["blocked"], 0)
+        self.assertFalse(remaining.exists())
+        self.assertIn(str(old), retry["removed_paths"])
+        self.assertEqual(db.list_strm_path_cleanup("guangya:source"), [])
+        self.assertEqual(db.list_strm_retired_sources(), [])

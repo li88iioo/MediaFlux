@@ -3585,8 +3585,9 @@ def clean_retired_strm_sources(
             replace(refresh_policy, media_root=str(owned_root))
             if refresh_policy is not None else None
         )
+        namespaces = (f"guangya:{source_id}", f"guangya-meta:{source_id}")
         rows = []
-        for namespace in (f"guangya:{source_id}", f"guangya-meta:{source_id}"):
+        for namespace in namespaces:
             rows.extend(db.list_strm_index(namespace))
         blocked = 0
         for row in rows:
@@ -3651,8 +3652,33 @@ def clean_retired_strm_sources(
             result["cleaned"] += 1
             result["index_cleaned"] += 1
             result["removed_paths"].append(str(resolved))
+        recovery: dict[str, Any] = {"cleaned": 0, "metadata_cleaned": 0}
+        if not result["stopped"]:
+            for namespace in namespaces:
+                # 来源已退役，不再要求新副本存活；只消费原根内的可信旧路径，
+                # 继续复用全局归属、删除前指纹复核及刷新持久化后 ACK。
+                recover_pending_paths(
+                    namespace, root_text, recovery, valid_ids=set(),
+                    should_stop=should_stop, on_refresh_paths=retired_refresh,
+                )
+                if recovery.get("stopped"):
+                    result["stopped"] = True
+                    break
+        result["cleaned"] += recovery["cleaned"] + recovery["metadata_cleaned"]
+        result["removed_paths"].extend(recovery.get("changed_strm_paths") or [])
+        pending = int(recovery.get("recovery_pending", 0))
+        blocked += pending
+        result["blocked"] += pending
+        result["errors"].extend(
+            f"{source_id}: {error}" for error in recovery.get("error_samples") or []
+        )
         if result["stopped"]:
-            db.update_strm_retired_source_error(source_id, "服务停止，退役清理已安全中止")
+            error = (
+                "旧目录刷新交接未完成，退役清理待重试"
+                if recovery.get("stop_stage") == "refresh-persist"
+                else "服务停止，退役清理已安全中止"
+            )
+            db.update_strm_retired_source_error(source_id, error)
             break
         if blocked:
             error = f"仍有 {blocked} 个文件无法安全清理"
