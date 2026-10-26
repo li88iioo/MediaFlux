@@ -22,6 +22,7 @@ from app.modules.telegram_media_projection import (
 from app.modules.telegram_notification_center import (
     NotificationPublishResult,
     get_notification_thread_event,
+    get_notification_thread_snapshot,
     publish_notification_thread,
 )
 from app.modules.telegram_notification_policy import (
@@ -379,48 +380,61 @@ def publish_download_lifecycle(
     media_refresh: str = "",
     deliver_now: bool = True,
 ) -> NotificationPublishResult:
-    row = db.get_download_request(request_id)
-    if row is None:
-        return NotificationPublishResult(False, status="missing_request")
-    verification_status = ""
-    verification_result = ""
-    verification = db.get_agent_download_verification(request_id)
-    if verification is not None:
-        # 旧通知载荷、STRM 回调和 tracker 重试都不能覆盖当前复核代际。
-        verification_status = _status(verification["status"])
-        verification_result = (
-            _VERIFICATION_RESULT_LABELS.get(
-                _status(verification["result"]), _VERIFICATION_RESULT_LABELS["inconclusive"],
-            )
-            if verification_status in {"visible", "attention"}
-            else {
-                "pending": "等待复核", "running": "复核中", "retry_wait": "等待复核重试",
-            }.get(verification_status, _label(verification_status))
+    thread_key = f"download:{request_id}"
+    result = NotificationPublishResult(False, status="invalid")
+    for attempt in range(3):
+        row = db.get_download_request(request_id)
+        if row is None:
+            return NotificationPublishResult(False, status="missing_request")
+        chat_id = _chat_id(row)
+        snapshot = get_notification_thread_snapshot(
+            thread_key, topic=NotificationTopic.DOWNLOAD, chat_id=chat_id,
         )
-    probe_progress = _load_probe_progress(row)
-    event = build_download_lifecycle_event(
-        row,
-        stats=stats,
-        media_refresh=media_refresh,
-        verification_status=verification_status,
-        verification_result=verification_result,
-        probe_progress=probe_progress,
-    )
-    importance = {
-        "attention": NotificationImportance.ACTION,
-        "error": NotificationImportance.ERROR,
-        "partial": NotificationImportance.ERROR,
-    }.get(event.state, NotificationImportance.RESULT)
-    topic_enabled = config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
-    # 下载异常和人工处理不应被“整理成功通知”开关吞掉；全局通知总开关仍生效。
-    if importance in {NotificationImportance.ACTION, NotificationImportance.ERROR}:
-        topic_enabled = True
-    return publish_notification_thread(
-        f"download:{request_id}",
-        event,
-        topic=NotificationTopic.DOWNLOAD,
-        importance=importance,
-        chat_id=_chat_id(row),
-        topic_enabled=topic_enabled,
-        deliver_now=deliver_now,
-    )
+        verification_status = ""
+        verification_result = ""
+        verification = db.get_agent_download_verification(request_id)
+        if verification is not None:
+            # 旧通知载荷、STRM 回调和 tracker 重试都不能覆盖当前复核代际。
+            verification_status = _status(verification["status"])
+            verification_result = (
+                _VERIFICATION_RESULT_LABELS.get(
+                    _status(verification["result"]), _VERIFICATION_RESULT_LABELS["inconclusive"],
+                )
+                if verification_status in {"visible", "attention"}
+                else {
+                    "pending": "等待复核", "running": "复核中", "retry_wait": "等待复核重试",
+                }.get(verification_status, _label(verification_status))
+            )
+        # 冲突后仅重投影当前事实，不能继续套用迟到回调的阶段提示。
+        event = build_download_lifecycle_event(
+            row,
+            stats=stats if attempt == 0 else None,
+            media_refresh=media_refresh if attempt == 0 else "",
+            verification_status=verification_status,
+            verification_result=verification_result,
+            probe_progress=_load_probe_progress(row),
+        )
+        importance = {
+            "attention": NotificationImportance.ACTION,
+            "error": NotificationImportance.ERROR,
+            "partial": NotificationImportance.ERROR,
+        }.get(event.state, NotificationImportance.RESULT)
+        topic_enabled = config.get_bool("GY_ORGANIZE_NOTIFY_ENABLED", True)
+        # 下载异常和人工处理不应被“整理成功通知”开关吞掉；全局通知总开关仍生效。
+        if importance in {NotificationImportance.ACTION, NotificationImportance.ERROR}:
+            topic_enabled = True
+        result = publish_notification_thread(
+            thread_key,
+            event,
+            topic=NotificationTopic.DOWNLOAD,
+            importance=importance,
+            chat_id=chat_id,
+            topic_enabled=topic_enabled,
+            deliver_now=deliver_now,
+            expected_revision=snapshot.revision if snapshot is not None else 0,
+            # 同内容发布不递增 revision；业务快照也必须在原 outbox 写事务内匹配。
+            expected_download_state=(dict(row), dict(verification) if verification is not None else None),
+        )
+        if result or result.status != "invalid":
+            return result
+    return result

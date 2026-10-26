@@ -36,11 +36,13 @@ def upsert_notification(
     replace: bool = False,
     expected_confirmation_delivery: tuple[int, int] | None = None,
     expected_revision: int | None = None,
+    expected_download_state: tuple[dict[str, Any], dict[str, Any] | None] | None = None,
 ) -> dict[str, Any] | None:
     """登记一次性事件或更新消息线程。
 
     ``replace=False`` 是一次性幂等事件；已有 key 不会重发。
     ``replace=True`` 会递增 revision，并在同一 Telegram 消息上更新。
+    ``expected_revision=0`` 要求线程尚不存在，首次插入也遵守同一 CAS。
     """
     key = (event_key or "").strip()
     payload = (event_json or "").strip()
@@ -65,8 +67,25 @@ def upsert_notification(
             "telegram_notification_outbox WHERE event_key=?",
             (key,),
         ).fetchone()
-        if expected_revision is not None and (row is None or row["revision"] != expected_revision):
+        if expected_revision is not None and (row["revision"] if row is not None else 0) != expected_revision:
             return None
+        if expected_download_state is not None:
+            request, verification = expected_download_state
+            current = conn.execute(
+                "SELECT * FROM download_requests WHERE id=?", (request["id"],),
+            ).fetchone()
+            if current is None or dict(current) != request:
+                return None
+            current_verification = conn.execute(
+                "SELECT * FROM agent_download_verifications WHERE request_id=?", (request["id"],),
+            ).fetchone()
+            if verification is None:
+                if current_verification is not None:
+                    return None
+            elif current_verification is None or any(
+                current_verification[key] != value for key, value in verification.items()
+            ):
+                return None
         if row is None:
             conn.execute(
                 "INSERT INTO telegram_notification_outbox("
