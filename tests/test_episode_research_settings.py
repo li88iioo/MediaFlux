@@ -71,7 +71,7 @@ def _load_settings_api(config) -> dict[str, Any]:
     functions = {"_is_config_mask", "_normalize_discovery_boolean", VALIDATOR, "get_config", "save_config"}
     nodes: list[ast.stmt] = [ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)]
     for node in tree.body:
-        if isinstance(node, ast.ImportFrom) and node.module == "app.indexers.config":
+        if isinstance(node, ast.ImportFrom) and node.module in {"app.indexers.config", "contextlib"}:
             nodes.append(node)
         elif isinstance(node, ast.Assign) and all(
             isinstance(target, ast.Name) and target.id.startswith("_") for target in node.targets
@@ -107,6 +107,8 @@ class EpisodeResearchSettingsTests(unittest.TestCase):
                 "app.modules.offline", DEFAULT_VIDEO_EXTS_CSV="mkv,mp4",
                 normalize_video_extensions=lambda _: ("mkv", "mp4"),
             ),
+            # 本组不修改本地媒体配置；显式隔离该依赖，不借用其它测试的导入缓存。
+            "app.modules.local_media_service": _module("app.modules.local_media_service", LOCAL_MEDIA_RUNTIME_KEYS=()),
             # 任何意外加载这些运行时依赖都会立即失败，不会连接真实资源。
             "app.database": None, "sqlite3": None, "requests": None,
             "app.agent.kernel.bootstrap": None,

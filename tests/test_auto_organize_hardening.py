@@ -1498,7 +1498,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
 
     def test_stopped_download_organize_is_marked_for_attention(self):
         request_id, _created = db.create_download_request(
-            "stopped-organize", "magnet", title="Stopped",
+            "stopped-organize", "magnet", title="Stopped", initial_targets="guangya",
             source_value="magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
         )
         db.update_download_request(
