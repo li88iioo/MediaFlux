@@ -274,8 +274,13 @@ def list_pending_organize_probe_steps(
 
 def _settle_organize_task_run_conn(conn, run_id: int, result: dict, timestamp: str) -> dict:
     """只结算已执行的整理回执；单请求失败不回滚其它请求或重放云端动作。"""
-    from app.repositories.download_requests import _update_download_request_conn
-    from app.repositories.media_subscriptions import _sync_media_download_admissions_conn
+    from app.repositories.download_requests import (
+        _GUANGYA_FOLLOWUP_ALLOWED_SQL,
+        _update_download_request_conn,
+    )
+    from app.repositories.media_subscriptions import (
+        _sync_media_download_admissions_conn,
+    )
 
     row = conn.execute(
         "SELECT status,result FROM task_runs WHERE id=? AND task_name='guangya_organize'",
@@ -296,12 +301,11 @@ def _settle_organize_task_run_conn(conn, run_id: int, result: dict, timestamp: s
         conn.execute("SAVEPOINT organize_request_settlement")
         try:
             request = conn.execute(
-                "SELECT * FROM download_requests WHERE id=?", (int(request_id),),
+                "SELECT * FROM download_requests WHERE id=? AND "
+                + _GUANGYA_FOLLOWUP_ALLOWED_SQL, (int(request_id),),
             ).fetchone()
             if (request is not None and request["organize_task_id"] == result["task_id"]
-                    and request["organize_run_id"] == run_id
-                    and request["gy_status"] == "completed"
-                    and request["status"] not in {"cancelled", "resubmitted", "failed"}):
+                    and request["organize_run_id"] == run_id):
                 fields = dict(original_fields)
                 generation = fields.pop("_strm_generation", 0)
                 if (request["strm_generation"] != generation

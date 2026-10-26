@@ -420,6 +420,103 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
                     self.assertIsNone(row["organize_finished_at"])
                     self.assertIn("1 项媒体等待人工确认", row["organize_error"])
 
+    def _request_with_qb_successor(self, name):
+        request = self._request(name)
+        db.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
+        successor, _ = db.create_download_request(name + "-successor", "magnet")
+        self.assertTrue(db.mark_download_request_resubmitted(
+            request, successor_request_id=successor, targets="qb",
+        ))
+        return request
+
+    def test_qb_only_resubmit_settles_completed_cloud_task(self):
+        request = self._request_with_qb_successor("qb-only-settlement")
+        self.assertTrue(db.claim_download_request_organize(request))
+        accepted = self._start([request])
+        self._join()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+        row = self._request_row(request)
+        self.assertEqual(row["organize_status"], "completed")
+        self.assertEqual((row["status"], row["qb_status"], row["gy_status"]),
+                         ("resubmitted", "resubmitted", "completed"))
+        self.assertNotIn("request_settlement", json.loads(self._run_row(accepted["run_id"])["result"]))
+        self.manager._retry_task_settlement()
+        db.init_db()
+        self.assertEqual(self._request_row(request)["organize_status"], "completed")
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+        self.organizer.organize.assert_called_once()
+
+    def test_qb_only_resubmit_recovers_receipt_without_overwriting_new_strm_generation(self):
+        request = self._request_with_qb_successor("qb-only-late-settlement")
+        with db.get_conn() as conn:
+            conn.execute(
+                f"CREATE TRIGGER reject_qb_only_settlement BEFORE UPDATE ON download_requests "
+                f"WHEN NEW.id={request} AND NEW.organize_status='completed' "
+                "BEGIN SELECT RAISE(FAIL,'request settlement fault'); END"
+            )
+        accepted = self._start([request])
+        self._join()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "partial")
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER reject_qb_only_settlement")
+            conn.execute(
+                "UPDATE download_requests SET strm_generation=1,strm_status='failed',"
+                "strm_error='new generation failure' WHERE id=?", (request,),
+            )
+        self._retry()
+        row = self._request_row(request)
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+        self.assertEqual(row["organize_status"], "completed")
+        self.assertEqual((row["strm_generation"], row["strm_status"], row["strm_error"]),
+                         (1, "failed", "new generation failure"))
+        self.organizer.organize.assert_called_once()
+
+    def test_settlement_preserves_requests_after_backend_handoff_or_fence_change(self):
+        changes = {
+            "cancelled": {"status": "cancelled"},
+            "cleared": {"organize_status": "cleared"},
+            "attention_cleared": {"attention_cleared_at": "2026-10-26 12:00:00"},
+            "task_changed": {"organize_task_id": "new-task"},
+            "run_changed": {"organize_run_id": 9999},
+            "backend_unfinished": {"gy_status": "downloading"},
+            "targets_changed": {"targets": "qb"},
+            "guangya": {},
+            "both": {},
+        }
+        for case, fields in changes.items():
+            with self.subTest(case=case):
+                if case in {"guangya", "both"}:
+                    request = self._request("handoff-" + case)
+                    db.update_download_request(request, targets="both", status="manual_review", qb_status="manual_review")
+                else:
+                    request = self._request_with_qb_successor("fence-" + case)
+                snapshot = {}
+
+                def organize(*args, case=case, request=request, fields=fields,
+                             snapshot=snapshot, **kwargs):
+                    result = self._organize(*args, **kwargs)
+                    if case in {"guangya", "both"}:
+                        db.update_download_request(request, organize_status="failed")
+                        successor, _ = db.create_download_request("handoff-successor-" + case, "magnet")
+                        db.mark_download_request_resubmitted(request, successor_request_id=successor, targets=case)
+                        self.assertEqual(self._request_row(request)["organize_status"], "resubmitted")
+                    else:
+                        with db.get_conn() as conn:
+                            conn.execute(
+                                "UPDATE download_requests SET " + ",".join(f"{key}=?" for key in fields) + " WHERE id=?",
+                                (*fields.values(), request),
+                            )
+                    snapshot.update(dict(self._request_row(request)))
+                    return result
+
+                self.organizer.organize.side_effect = organize
+                accepted = self._start([request])
+                self._join()
+                self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+                self.assertEqual(dict(self._request_row(request)), snapshot)
+                self.assertNotIn("request_settlement", json.loads(self._run_row(accepted["run_id"])["result"]))
+        self.assertEqual(self.organizer.organize.call_count, len(changes))
+
 
 class OrganizerCleanupSafetyTests(unittest.TestCase):
     def test_audit_failure_skips_empty_directory_cleanup(self):
