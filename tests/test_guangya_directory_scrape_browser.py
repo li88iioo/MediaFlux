@@ -309,7 +309,7 @@ class GuangYaDirectoryScrapeBrowserTests(unittest.TestCase):
 
     def _open_manual_directory(self) -> None:
         binding = self._bind(is_directory=True, left=120, top=100)
-        self._open_button(binding)
+        self.page.locator(str(binding["action"])).click()
         self.page.locator('[data-scrape-action="manual"]').click()
         self.page.locator('.gy-scrape-candidate').first.wait_for()
 
