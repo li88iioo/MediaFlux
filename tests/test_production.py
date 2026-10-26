@@ -6121,7 +6121,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(first["failed"], ["guangya"])
         self.assertFalse(second["ok"])
         self.assertTrue(second["duplicate"])
-        finalize.assert_called_once()
+        self.assertEqual([call.args[1] for call in finalize.call_args_list], [("qb",), ("guangya",)])
         self.assertEqual(add_log.call_count, 2)
 
     def test_download_dispatcher_contains_backend_exception(self):
@@ -6165,9 +6165,13 @@ class SecurityTests(InitializedWebTestCase):
         self.assertIn("下载提交回执无法确认", result["error"])
         self.assertNotIn("qB unavailable", result["error"])
         # 根状态由真实仓储在事务中归并，执行器不再传入另一份推导结果。
-        self.assertNotIn("status", finalize.call_args.kwargs)
-        self.assertEqual(finalize.call_args.kwargs["gy_status"], "submitted")
-        self.assertEqual(finalize.call_args.kwargs["qb_status"], "outcome_unknown")
+        qb_receipt, gy_receipt = finalize.call_args_list
+        self.assertNotIn("status", qb_receipt.kwargs)
+        self.assertNotIn("status", gy_receipt.kwargs)
+        self.assertEqual(gy_receipt.kwargs["gy_status"], "submitted")
+        self.assertEqual(qb_receipt.kwargs["qb_status"], "outcome_unknown")
+        self.assertNotIn("qb_status", gy_receipt.kwargs)
+        self.assertNotIn("gy_status", qb_receipt.kwargs)
         self.assertEqual(add_log.call_count, 2)
 
     def test_download_tracker_marks_qb_error_state_failed(self):

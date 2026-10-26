@@ -1477,7 +1477,8 @@ def _finalize_download_request_submission_conn(
 
     外部下载器调用可能长时间阻塞；期间请求可能已经被超时恢复、人工接管或
     标记为重新提交。最终写入必须再次核对被认领后端仍处于 ``submitting``，
-    否则迟到结果只能进入审计日志，不能复活旧请求。
+    否则迟到结果只能进入审计日志，不能复活旧请求。目标级收尾只允许
+    改写本目标字段，另一目标的取消、恢复或跟踪进度不受影响。
     """
     normalized = tuple(dict.fromkeys(
         (target or "").strip() for target in claimed_targets
@@ -1505,7 +1506,17 @@ def _finalize_download_request_submission_conn(
     updates = {
         key: value for key, value in fields.items()
         if key in _DOWNLOAD_REQUEST_UPDATE_FIELDS and key != "status"
+        and not (key.startswith("qb_") and "qb" not in normalized)
+        and not (key.startswith("gy_") and "guangya" not in normalized)
     }
+    if "error" in updates:
+        # 分目标即时提交不能用后到的成功回执抹掉另一目标的失败原因。
+        replaced = tuple(f"{target}: " for target in normalized)
+        errors = [part for part in re.split(r"; (?=(?:qb|guangya): )", str(row["error"] or ""))
+                  if part and not part.startswith(replaced)]
+        if updates["error"]:
+            errors.append(str(updates["error"]))
+        updates["error"] = "; ".join(errors)
     effective_qb = str(updates.get("qb_status", row["qb_status"]) or "")
     effective_gy = str(updates.get("gy_status", row["gy_status"]) or "")
     statuses = [status for status in (effective_qb, effective_gy) if status]

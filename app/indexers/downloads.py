@@ -387,37 +387,50 @@ def _persist_and_dispatch(
             **dispatch_kwargs,
         )
     except Exception as exc:
-        # 请求已与 admission 原子绑定；此后任何异常都不能再当成可安全重试。
-        # 远端可能已经接收任务，保守转入人工核验并持续占用 media_key。
-        updates: dict[str, Any] = {
-            "status": "manual_review",
-            "error": "下载后端提交结果未知，请先核对下载器，勿直接重复提交",
-            "completed_at": db.now(),
-        }
-        if dispatch_target in {"qb", "both"}:
-            updates["qb_status"] = "manual_review"
-        if dispatch_target in {"guangya", "both"}:
-            updates["gy_status"] = "manual_review"
-        try:
-            db.update_download_request_and_sync_media_admission(request_id, **updates)
-        except Exception as persist_exc:
-            logger.error(
-                "下载异常状态持久化失败 request_id=%s type=%s",
-                request_id, type(persist_exc).__name__,
-            )
+        # 只将仍持有认领、受理未知的目标转人工核验；已收尾/已取消的
+        # 同伴不能因后续目标落盘失败而被覆盖，准入仍沿同一收尾事务同步。
+        unknown_error = "下载后端提交结果未知，请先核对下载器，勿直接重复提交"
+        for source, prefix in (("qb", "qb"), ("guangya", "gy")):
+            if dispatch_target not in {source, "both"}:
+                continue
+            try:
+                db.finalize_download_request_submission(
+                    request_id, (source,),
+                    **{f"{prefix}_status": "manual_review", "error": f"{source}: {unknown_error}"},
+                )
+            except Exception as persist_exc:
+                logger.error(
+                    "下载异常状态持久化失败 request_id=%s type=%s",
+                    request_id, type(persist_exc).__name__,
+                )
         logger.warning(
             "下载提交结果未知 request_id=%s type=%s",
             request_id, type(exc).__name__,
         )
+        try:
+            current = db.get_download_request(request_id)
+        except Exception as read_exc:
+            logger.error(
+                "下载异常状态读取失败 request_id=%s type=%s",
+                request_id, type(read_exc).__name__,
+            )
+            current = None
         return created, request_id, {
             "handled": True,
             "ok": False,
             "request_id": request_id,
-            "status": "manual_review",
-            "succeeded": [],
+            "status": str(current["status"] or "manual_review") if current else "manual_review",
+            "succeeded": [source for source, prefix in (("qb", "qb"), ("guangya", "gy"))
+                          if dispatch_target in {source, "both"} and current is not None
+                          and current[f"{prefix}_status"] in {"submitted", "downloading", "completed"}],
             "failed": [],
             "duplicate": False,
-            "error": "下载后端提交结果未知，请先核对下载器，勿直接重复提交",
+            "error": unknown_error,
+            "review_required": current is None or any(
+                current[f"{prefix}_status"] in {"submitting", "outcome_unknown", "manual_review"}
+                for source, prefix in (("qb", "qb"), ("guangya", "gy"))
+                if dispatch_target in {source, "both"}
+            ),
         }
     return created, request_id, result
 

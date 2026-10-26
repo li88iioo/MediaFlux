@@ -7,6 +7,7 @@ import ipaddress
 import json
 import re
 import unicodedata
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import Any, TypedDict
 from urllib.parse import parse_qs, quote, unquote, urlparse
@@ -21,6 +22,7 @@ from app.config import get
 from app.indexers.providers.base import augment_public_magnet, magnet_infohash
 from app.logger import get_logger
 from app.modules.offline import analyze_offline_url, detect_protocol, submit_offline
+from app.modules.qb_control import qb_control_write_lease
 from app.repositories.download_requests import (
     download_display_title,
     usable_download_title,
@@ -1142,7 +1144,7 @@ def _dispatch_claimed_targets(
     rss_item_id: int | None = None,
     log_path: str | None = None,
 ) -> dict[str, Any]:
-    """两个认领入口共用唯一提交/结果转换/日志执行链，根状态只由仓储原子归并。"""
+    """第一提交、补投与 successor 共用目标级受理链，根状态由仓储原子归并。"""
     request_id = int(row["id"])
     title = download_display_title(row)
     source_value = str(row["source_value"] or "")
@@ -1166,22 +1168,84 @@ def _dispatch_claimed_targets(
         "qb": lambda: _submit_qb(row, **qb_options),
         "guangya": lambda: _submit_guangya(row, **guangya_options),
     }
+    late_notices = []
+    status = "submitting"
     for source in claimed_targets:
-        submitter = submissions[source]
-        try:
-            result = submitter()
-            if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
-                raise ValueError("invalid backend submission receipt")
-        except Exception as exc:
-            # 进入提交边界后无法证明未写入，不能把未分类异常降为可重投失败。
-            logger.warning("下载回执无法确认 request=%s backend=%s type=%s",
-                           request_id, source, type(exc).__name__)
-            result = {
-                "ok": False, "outcome_unknown": True,
-                "failure_code": f"{source}_outcome_unknown",
-                "error": "下载提交回执无法确认，请先核对下载器，勿重复提交",
+        # 远端任务从出现到身份落盘必须与用户移除串行；不能只保护 add，
+        # 也不能为等待另一后端的回执长期占用 qB 控制 writer。
+        with qb_control_write_lease() if source == "qb" else nullcontext():
+            try:
+                result: dict[str, Any] = submissions[source]()
+                if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):
+                    raise ValueError("invalid backend submission receipt")
+            except Exception as exc:
+                # 进入提交边界后无法证明未写入，不能降为可重投失败。
+                logger.warning("下载回执无法确认 request=%s backend=%s type=%s",
+                               request_id, source, type(exc).__name__)
+                result = {
+                    "ok": False, "outcome_unknown": True,
+                    "failure_code": f"{source}_outcome_unknown",
+                    "error": "下载提交回执无法确认，请先核对下载器，勿重复提交",
+                }
+            results[source] = result
+            updates: dict[str, Any] = {
+                "error": "" if result.get("ok") else f"{source}: {result.get('error', '提交失败')}",
             }
-        results[source] = result
+            if source == "qb":
+                updates["qb_status"] = _backend_submission_status(source, result)
+                updates["qb_task_id"] = result.get("task_id") or (
+                    torrent_identity(row) if updates["qb_status"] == "outcome_unknown" else ""
+                )
+            else:
+                updates["gy_status"] = _backend_submission_status(source, result)
+                task_ids = [str(item) for item in (result.get("task_ids") or []) if str(item)]
+                updates["gy_task_ids"] = json.dumps(task_ids, ensure_ascii=False)
+                updates["gy_task_id"] = task_ids[0] if task_ids else str(result.get("task_id") or "")
+                updates["gy_batch_count"] = int(result.get("batch_count") or len(task_ids))
+                decision = result.get("decision") or {}
+                staging = result.get("staging") or {}
+                # 回调已在云写之前保存隔离身份；无回执不等于没有隔离目录。
+                if decision:
+                    updates["gy_target_dir"] = decision.get("target_dir_id", "")
+                    updates["gy_target_name"] = decision.get("target_dir_name", "")
+                if staging:
+                    updates.update({
+                        "gy_isolated": int(bool(staging.get("isolated"))),
+                        "gy_staging_parent_dir": str(staging.get("parent_id") or ""),
+                        "gy_staging_name": str(staging.get("name") or ""),
+                        "gy_staging_cleanup_status": str(staging.get("cleanup_status") or (
+                            "pending" if staging.get("isolated") and (
+                                result.get("ok") or result.get("partial_success")
+                            ) else ""
+                        )),
+                        "gy_staging_cleanup_error": str(staging.get("cleanup_error") or "")[:500],
+                    })
+                updates["gy_expected_file_count"] = max(0, int(result.get("selected_count") or 0))
+                updates["gy_settle_observed_file_count"] = 0
+                updates["gy_settle_attempts"] = 0
+                updates["gy_settle_snapshot"] = ""
+                updates["gy_settle_stable_count"] = 0
+                updates["gy_selection_mode"] = str(result.get("selection_mode") or "")
+                updates["gy_unverified_manifest"] = 1 if result.get("unverified_manifest") else 0
+            status, late_notice = _finalize_submission_state(request_id, (source,), updates)
+            if late_notice:
+                late_notices.append(late_notice)
+            # 先写 qB 日志再释放 writer，随后用户移除才能同时取消该日志。
+            # 请求与订阅受理已原子收尾；展示日志失败不能反转事实或阻断跟踪。
+            try:
+                db.add_download_log(
+                    source=source,
+                    title=title,
+                    path=source_value if log_path is None else log_path,
+                    rss_item_id=rss_item_id,
+                    request_id=request_id,
+                    backend_task_id=str(result.get("task_id") or ""),
+                    status=_backend_submission_status(source, result),
+                    error=_submission_log_error(result, late_notice),
+                )
+            except Exception as exc:
+                logger.warning("下载日志写入失败，保留已持久化请求 request=%s backend=%s type=%s",
+                               request_id, source, type(exc).__name__)
 
     succeeded = [name for name, result in results.items() if result.get("ok")]
     failed = [name for name, result in results.items() if not result.get("ok")]
@@ -1189,64 +1253,7 @@ def _dispatch_claimed_targets(
     error = "; ".join(
         f"{name}: {results[name].get('error', '提交失败')}" for name in failed
     )
-    updates: dict[str, Any] = {"error": error}
-    if "qb" in results:
-        updates["qb_status"] = _backend_submission_status("qb", results["qb"])
-        updates["qb_task_id"] = results["qb"].get("task_id") or (
-            torrent_identity(row) if updates["qb_status"] == "outcome_unknown" else ""
-        )
-    if "guangya" in results:
-        gy_result = results["guangya"]
-        updates["gy_status"] = _backend_submission_status("guangya", gy_result)
-        task_ids = [str(item) for item in (gy_result.get("task_ids") or []) if str(item)]
-        updates["gy_task_ids"] = json.dumps(task_ids, ensure_ascii=False)
-        updates["gy_task_id"] = task_ids[0] if task_ids else str(gy_result.get("task_id") or "")
-        updates["gy_batch_count"] = int(gy_result.get("batch_count") or len(task_ids))
-        decision = gy_result.get("decision") or {}
-        staging = gy_result.get("staging") or {}
-        # 回调已在云写之前保存隔离身份；无回执不等于没有隔离目录。
-        if decision:
-            updates["gy_target_dir"] = decision.get("target_dir_id", "")
-            updates["gy_target_name"] = decision.get("target_dir_name", "")
-        if staging:
-            updates.update({
-                "gy_isolated": int(bool(staging.get("isolated"))),
-                "gy_staging_parent_dir": str(staging.get("parent_id") or ""),
-                "gy_staging_name": str(staging.get("name") or ""),
-                "gy_staging_cleanup_status": str(staging.get("cleanup_status") or (
-                    "pending" if staging.get("isolated") and (
-                        gy_result.get("ok") or gy_result.get("partial_success")
-                    ) else ""
-                )),
-                "gy_staging_cleanup_error": str(staging.get("cleanup_error") or "")[:500],
-            })
-        updates["gy_expected_file_count"] = max(0, int(gy_result.get("selected_count") or 0))
-        updates["gy_settle_observed_file_count"] = 0
-        updates["gy_settle_attempts"] = 0
-        updates["gy_settle_snapshot"] = ""
-        updates["gy_settle_stable_count"] = 0
-        updates["gy_selection_mode"] = str(gy_result.get("selection_mode") or "")
-        updates["gy_unverified_manifest"] = 1 if gy_result.get("unverified_manifest") else 0
-    status, late_notice = _finalize_submission_state(
-        request_id, list(claimed_targets), updates
-    )
-
-    for source, result in results.items():
-        # 请求与订阅受理已原子收尾；展示日志失败不能反转事实或阻断跟踪。
-        try:
-            db.add_download_log(
-                source=source,
-                title=title,
-                path=source_value if log_path is None else log_path,
-                rss_item_id=rss_item_id,
-                request_id=request_id,
-                backend_task_id=str(result.get("task_id") or ""),
-                status=_backend_submission_status(source, result),
-                error=_submission_log_error(result, late_notice),
-            )
-        except Exception as exc:
-            logger.warning("下载日志写入失败，保留已持久化请求 request=%s backend=%s type=%s",
-                           request_id, source, type(exc).__name__)
+    late_notice = "; ".join(dict.fromkeys(late_notices))
     if late_notice:
         return {
             "ok": False, "request_id": request_id, "status": status,

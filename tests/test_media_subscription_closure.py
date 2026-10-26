@@ -368,9 +368,13 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             source_value="magnet:?xt=urn:btih:unknown-result",
         )
 
+        def fail_after_claim(request_id, targets, **_kwargs):
+            self.assertTrue(db.claim_download_request(request_id, targets))
+            raise RuntimeError("persist after backend failed")
+
         with patch(
             "app.indexers.downloads.dispatch_request",
-            side_effect=RuntimeError("persist after backend failed"),
+            side_effect=fail_after_claim,
         ):
             created, request_id, result = _persist_and_dispatch(
                 item, "indexer:test", "qb", admission_id=admission_id,
@@ -399,11 +403,14 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
             source_value="magnet:?xt=urn:btih:backend-accepted",
         )
         finalize_calls = 0
+        real_finalize = db.finalize_download_request_submission
 
         def fail_finalize(_request_id, _claimed_targets, **_fields):
             nonlocal finalize_calls
             finalize_calls += 1
-            raise RuntimeError("simulated sqlite write failure")
+            if finalize_calls == 1:
+                raise RuntimeError("simulated sqlite write failure")
+            return real_finalize(_request_id, _claimed_targets, **_fields)
 
         with patch(
             "app.modules.download_dispatcher._submit_qb",
@@ -416,7 +423,7 @@ class MediaSubscriptionClosureTests(IsolatedDatabaseTestCase):
                 item, "indexer:test", "qb", admission_id=admission_id,
             )
 
-        self.assertEqual(finalize_calls, 1)
+        self.assertEqual(finalize_calls, 2)
         self.assertEqual(result["status"], "manual_review")
         self.assertEqual(result["request_id"], request_id)
         request = db.get_download_request(request_id)
