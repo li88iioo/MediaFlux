@@ -4,6 +4,7 @@ from __future__ import annotations
 import tests  # noqa: F401 - 应用导入前隔离运行路径与数据库
 
 from concurrent.futures import Future
+import json
 import socket
 import sqlite3
 import threading
@@ -18,6 +19,7 @@ from app.modules import download_dispatcher as dispatcher
 from app.modules.download_tracker import DownloadTracker
 from app.modules.process_lock import CrossProcessLock
 from app.modules.qb_control import qb_control_write_lease, remove_qb_tasks
+from app.modules.rss import RSSEngine
 from app.repositories.rss import bind_rss_entry_download
 from tests.support import isolated_test_database
 
@@ -402,6 +404,160 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                     self.assertIn("读取失败", logger.error.call_args.args[0])
                 row = db.get_download_request(result["request_id"])
                 assert row is not None
-                self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", ""))
+                self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", torrent_hash))
                 self.assertTrue(submit_download_input(item, "qb", origin="read-fault")["summary"].get("duplicate"))
                 self.client.add_torrent_detailed.assert_called_once()
+
+    def test_qb_receipt_persistence_failure_keeps_identity_inside_original_lease(self):
+        for path, kind in (
+            (path, kind) for path in ("first", "supplement", "retry", "successor")
+            for kind in ("magnet", "http")
+        ):
+            with self.subTest(path=path, kind=kind):
+                _request_id, item, torrent_hash, operation = self.prepare(path, kind=kind)
+                lock_name = "qb-control-write" if kind == "http" else f"qb-submit-{torrent_hash}"
+                observed = []
+                finalize = db.finalize_download_request_submission
+
+                def observe_finalize(request_id, targets, **fields):
+                    status = finalize(request_id, targets, **fields)
+                    if status is not None and fields.get("qb_status") == "manual_review":
+                        contender = CrossProcessLock(lock_name)
+                        acquired = contender.acquire(blocking=False)
+                        if acquired:
+                            contender.release()
+                        row = db.get_download_request(request_id)
+                        assert row is not None
+                        observed.append((acquired, row["qb_task_id"]))
+                    return status
+
+                with db.get_conn() as conn:
+                    conn.execute(
+                        "CREATE TRIGGER reject_qb_receipt BEFORE UPDATE ON download_requests "
+                        "WHEN NEW.qb_status='submitted' BEGIN SELECT RAISE(ABORT,'receipt write fault'); END"
+                    )
+                try:
+                    with patch.object(db, "finalize_download_request_submission", side_effect=observe_finalize):
+                        if path == "first":
+                            result = submit_download_input(item, "qb", origin="receipt-fault")
+                            self.assertFalse(result["summary"]["ok"])
+                            self.assertEqual(result["summary"]["status"], "manual_review")
+                        else:
+                            with self.assertRaisesRegex(sqlite3.IntegrityError, "receipt write fault"):
+                                operation()
+                finally:
+                    with db.get_conn() as conn:
+                        conn.execute("DROP TRIGGER reject_qb_receipt")
+                self.client.add_torrent_detailed.assert_called_once()
+                self.assertEqual(observed, [(False, torrent_hash)],
+                                 "已验证身份必须在原 lease 释放前随核验状态提交")
+                row = db.get_download_request_by_request_key(dispatcher.request_key(item))
+                assert row is not None
+                self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", torrent_hash))
+                if path in {"supplement", "retry"}:
+                    self.assertEqual((row["gy_status"], row["gy_task_id"], row["gy_task_ids"]),
+                                     ("downloading", "kept-cloud", '["kept-cloud"]'))
+
+    def test_qb_receipt_fault_recovery_preserves_cancelled_and_settled_target(self):
+        for status in ("cancelled", "submitted", "completed"):
+            with self.subTest(status=status):
+                request_id, _item, torrent_hash, operation = self.prepare("first")
+                original_error = RuntimeError("original receipt acknowledgement failure")
+                committed = {}
+
+                def commit_then_fault(request_id, targets, updates):
+                    # 模拟事务已经结算/被接管，随后调用方才收到异常。
+                    self.assertIsNotNone(db.finalize_download_request_submission(request_id, targets, **updates))
+                    if status == "cancelled":
+                        db.cancel_qb_download_tracking([torrent_hash])
+                    elif status == "completed":
+                        db.update_download_request(request_id, status="completed", qb_status="completed")
+                    row = db.get_download_request(request_id)
+                    assert row is not None
+                    committed.update(dict(row))
+                    raise original_error
+
+                with patch.object(dispatcher, "_finalize_submission_state", side_effect=commit_then_fault):
+                    with self.assertRaises(RuntimeError) as raised:
+                        operation()
+                self.assertIs(raised.exception, original_error)
+                row = db.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual(dict(row), committed)
+                self.client.add_torrent_detailed.assert_called_once()
+
+    def test_qb_identity_recovery_failure_preserves_original_exception(self):
+        request_id, _item, _torrent_hash, operation = self.prepare("first")
+        original_error = sqlite3.OperationalError("original receipt commit failure")
+        recovery_error = sqlite3.OperationalError("identity recovery failure")
+        with patch.object(db, "finalize_download_request_submission", side_effect=[
+            original_error, recovery_error,
+        ]) as finalize:
+            with self.assertRaises(sqlite3.OperationalError) as raised:
+                operation()
+        self.assertIs(raised.exception, original_error)
+        self.assertEqual([call.kwargs["qb_status"] for call in finalize.call_args_list],
+                         ["submitted", "manual_review"])
+        row = db.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["status"], row["qb_status"], row["qb_task_id"]), ("submitting", "submitting", ""))
+        self.client.add_torrent_detailed.assert_called_once()
+
+    def test_unknown_qb_receipt_persistence_failure_cannot_invent_identity_or_success(self):
+        request_id, item, _torrent_hash, _operation = self.prepare("first", kind="http")
+        self.client.add_torrent_detailed.return_value = TorrentAddResult(False, "qb_outcome_unknown", False)
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_unknown_receipt BEFORE UPDATE ON download_requests "
+                "WHEN NEW.qb_status='outcome_unknown' BEGIN SELECT RAISE(ABORT,'unknown receipt fault'); END"
+            )
+        result = submit_download_input(item, "qb", origin="unknown-receipt-fault")
+        self.assertFalse(result["summary"]["ok"])
+        self.assertEqual(result["summary"]["status"], "manual_review")
+        self.assertEqual(result["dispatch"]["succeeded"], [])
+        row = db.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["qb_status"], row["qb_task_id"]), ("manual_review", ""))
+        self.assertTrue(submit_download_input(item, "qb", origin="unknown-receipt-fault")["summary"]["duplicate"])
+        self.client.add_torrent_detailed.assert_called_once()
+
+    def test_qb_receipt_persistence_failure_can_be_cancelled_and_release_rss_claim(self):
+        request_id, item, torrent_hash, _operation = self.prepare("first")
+        media_key = "tmdb:900006:tv:S01E001"
+        sid = db.add_rss_subscription("Receipt fault", "https://rss.invalid/receipt-fault", download_method="qb")
+        eid = db.add_rss_entry_with_media(
+            sid, item.title, "receipt-fault", media_key=media_key,
+            payload=json.dumps({"torrent_url": item.source_value}),
+        )["id"]
+        engine = RSSEngine()
+        self.addCleanup(engine.close)
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_qb_receipt BEFORE UPDATE ON download_requests "
+                "WHEN NEW.qb_status='submitted' BEGIN SELECT RAISE(ABORT,'receipt write fault'); END"
+            )
+        try:
+            result = engine.download(eid)
+        finally:
+            # 用户移除时 DB 已恢复正常，不能把残留归因于持续的数据库故障。
+            with db.get_conn() as conn:
+                conn.execute("DROP TRIGGER reject_qb_receipt")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["request_id"], request_id)
+        self.client.add_torrent_detailed.assert_called_once()
+        with qb_control_write_lease():
+            self.assertTrue(remove_qb_tasks(self.client, [torrent_hash]))
+        self.client.delete_torrents.assert_called_once_with(torrent_hash, delete_files=False)
+        db.init_db()
+        row = db.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["status"], row["qb_status"], row["qb_task_id"]),
+                         ("cancelled", "cancelled", torrent_hash))
+        entry = db.get_rss_entry(eid)
+        assert entry is not None
+        self.assertEqual(entry["download_request_id"], request_id)
+        alternative = db.add_rss_entry_with_media(
+            sid, "Alternative", "receipt-alternative", media_key=media_key,
+            payload=json.dumps({"torrent_url": f"magnet:?xt=urn:btih:{'b' * 40}"}),
+        )
+        self.assertEqual(alternative["status"], "pending")

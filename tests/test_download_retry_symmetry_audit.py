@@ -465,7 +465,7 @@ class DownloadSubmissionLogFailureTests(unittest.TestCase):
         request = db.get_download_request(result["request_id"])
         assert request is not None
         self.assertEqual((request["status"], request["qb_status"]), ("manual_review", "manual_review"))
-        self.assertEqual(request["qb_task_id"], "")
+        self.assertEqual(request["qb_task_id"], f"{self.serial:040x}")
         self.assertEqual(db.list_download_logs(), [])
         repeated = submit_download_input(item, "qb", origin="acceptance-fault")
         self.assertTrue(repeated["summary"]["duplicate"])

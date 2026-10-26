@@ -1231,7 +1231,23 @@ def _dispatch_claimed_targets(
                 updates["gy_settle_stable_count"] = 0
                 updates["gy_selection_mode"] = str(result.get("selection_mode") or "")
                 updates["gy_unverified_manifest"] = 1 if result.get("unverified_manifest") else 0
-            status, late_notice = _finalize_submission_state(request_id, (source,), updates)
+            try:
+                status, late_notice = _finalize_submission_state(request_id, (source,), updates)
+            except Exception:
+                # 回执事务失败也要在原 lease 内保留已知身份，供用户精确取消。
+                # 沿原目标 CAS 保存核验状态；已取消/已收尾的目标不得被覆盖。
+                qb_task_id = str(updates.get("qb_task_id") or "").strip().lower()
+                if source == "qb" and _QB_TORRENT_ID_RE.fullmatch(qb_task_id):
+                    try:
+                        db.finalize_download_request_submission(
+                            request_id, (source,), qb_status="manual_review", qb_task_id=qb_task_id,
+                            error=updates["error"] or "qb: 下载回执持久化失败，请先核对下载器",
+                        )
+                    except Exception as persist_exc:
+                        logger.error("下载回执身份持久化失败 request=%s backend=%s type=%s",
+                                     request_id, source, type(persist_exc).__name__)
+                # 身份补存不是成功回执；即使补存失败也保留原异常原因。
+                raise
             if late_notice:
                 late_notices.append(late_notice)
             # 先写 qB 日志再释放 writer，随后用户移除才能同时取消该日志。
