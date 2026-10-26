@@ -274,9 +274,9 @@ class BackupTests(unittest.TestCase):
             )
 
     def test_create_app_recovers_pending_restore_before_reading_session_secret(self) -> None:
-        from app import main
         from tests.support import initialized_web_runtime
         self.enterContext(initialized_web_runtime())
+        from app import main
 
         events: list[str] = []
 
@@ -301,9 +301,9 @@ class BackupTests(unittest.TestCase):
         self.assertLess(events.index("recover"), events.index("secret"))
 
     def test_background_app_holds_startup_lifecycle_until_lifespan_or_launcher_releases(self) -> None:
-        from app import main
         from tests.support import initialized_web_runtime
         self.enterContext(initialized_web_runtime())
+        from app import main
 
         events: list[str] = []
 
@@ -330,12 +330,13 @@ class BackupTests(unittest.TestCase):
         self.assertEqual(events, ["enter", "exit"])
 
     def test_background_app_releases_startup_guard_when_late_construction_fails(self) -> None:
+        from tests.support import initialized_web_runtime
+        self.enterContext(initialized_web_runtime())
         from app import main
 
         with tempfile.TemporaryDirectory() as directory:
             paths = make_paths(Path(directory))
             paths.ensure_writable_dirs()
-            from tests.support import initialized_web_runtime
             self.enterContext(initialized_web_runtime(paths))
             with patch.object(main.config, "PATHS", paths), patch.object(
                 main, "_secret_key", return_value="test-secret"
@@ -357,9 +358,9 @@ class BackupTests(unittest.TestCase):
                 lock.release()
 
     def test_normal_startup_guard_unregisters_atexit_callback_when_released(self) -> None:
-        from app import main
         from tests.support import initialized_web_runtime
         self.enterContext(initialized_web_runtime())
+        from app import main
 
         @contextmanager
         def lifecycle_guard(_paths):
