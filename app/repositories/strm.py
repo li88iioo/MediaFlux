@@ -1177,9 +1177,9 @@ def enqueue_strm_change_targets(
             for row in rows:
                 for column in ("pending_changes_json", "inflight_changes_json"):
                     before = _load_changes(row[column])
-                    after = [item for item in before if not (
-                        item.get("_revalidation") and _object_key(item) in incoming
-                    )]
+                    # 新业务快照也替代旧普通 inflight；否则旧租约失败退回时
+                    # 仍会把过时快照排到新目录/删除之后，再次覆盖新事实。
+                    after = [item for item in before if _object_key(item) not in incoming]
                     if len(after) != len(before):
                         conn.execute(
                             f"UPDATE strm_change_queue SET {column}=? WHERE id=?",

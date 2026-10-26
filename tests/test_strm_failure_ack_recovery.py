@@ -64,11 +64,17 @@ def seed_failed_video(root):
     assert len(db.list_strm_failures(status="open")) == 1
 
 
-@pytest.mark.parametrize("action", ["remove", "upsert"])
+@pytest.mark.parametrize("mode", ["full", "fast"])
+@pytest.mark.parametrize("action", ["remove", "upsert", "move"])
 @pytest.mark.parametrize("arrival", ["before_ack_retry", "after_ack_retry"])
-def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arrival):
+def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arrival, mode):
     seed_failed_video(tmp_path)
     tree = _tree()
+    if mode == "fast":
+        db.enqueue_strm_change_targets([{
+            "source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
+            "parent_id": "d", "name": "Movie.mkv", "rel_dir": "Film", "etag": "e", "size": 100,
+        }])
     reject_ack()
     at_ack, submitted = threading.Event(), threading.Event()
     errors = []
@@ -80,9 +86,14 @@ def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arri
                 tree["d"] = []
                 change = {"source_id": "s", "kind": "video", "action": "remove", "file_id": "v"}
             else:
-                tree["d"] = [replace(tree["d"][0], name="Latest.mkv", etag="new")]
+                parent, directory = ("new-dir", "Moved") if action == "move" else ("d", "Film")
+                file = replace(tree["d"][0], name="Latest.mkv", etag="new", parent_id=parent)
+                tree["d"] = []
+                tree[parent] = [file]
+                if action == "move":
+                    tree["s"].append(GuangYaFile(file_id=parent, name=directory, is_dir=True, parent_id="s"))
                 change = {"source_id": "s", "kind": "video", "action": "upsert", "file_id": "v",
-                          "parent_id": "d", "name": "Latest.mkv", "etag": "new", "size": 100, "rel_dir": "Film"}
+                          "parent_id": parent, "name": "Latest.mkv", "etag": "new", "size": 100, "rel_dir": directory}
             assert STRMScheduler()._persist_change_targets([change])
         except BaseException as exc:
             errors.append(exc)
@@ -101,7 +112,7 @@ def test_ack_revalidation_never_overrides_business_change(tmp_path, action, arri
     producer.start()
     try:
         with patch.object(db, "resolve_strm_failures_for_items", side_effect=pause_ack):
-            first = _run(tmp_path, enabled=False, tree=tree)
+            first = _run(tmp_path, mode=mode, enabled=False, tree=tree, queue_only=mode == "fast")
         assert first["stats"]["failure_ledger_failed"] == 1
     finally:
         at_ack.set()
