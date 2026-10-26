@@ -1670,6 +1670,272 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         page.locator("#discovery-search-form").evaluate("form => form.requestSubmit()")
         page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
 
+    @staticmethod
+    def catalogue_page(number, genre="all"):
+        return {"items": [{"provider": "tmdb", "media_type": "movie", "external_id": f"{genre}-{number}",
+                           "title": f"{genre} 第{number}页"}], "has_more": number < 3}
+
+    def open_paged_catalogue(self, *, width, search=False):
+        from app.discovery.registry import list_filter_definitions
+
+        calls = []
+
+        def search_response(params):
+            number = int(params["page"][0])
+            calls.append(("search", number, params["providers"][0]))
+            payload = self.catalogue_page(number)
+            return self.search_payload(items=payload["items"], has_more=payload["has_more"])
+
+        page, errors = self.open_catalogue(width=width, search_response=search_response)
+
+        def filters(route):
+            provider, media_type = urlsplit(route.request.url).path.rsplit("/", 2)[-2:]
+            route.fulfill(json=list_filter_definitions(provider, media_type))
+
+        def items(route):
+            params = parse_qs(urlsplit(route.request.url).query)
+            number, genre = int(params["page"][0]), params.get("with_genres", ["all"])[0]
+            calls.append((params["provider"][0], number, genre))
+            route.fulfill(json=self.catalogue_page(number, genre))
+
+        page.route("**/api/discovery/filters/**", filters)
+        page.route("**/api/discovery/items?**", items)
+        if search:
+            self.submit_catalogue_search(page)
+        else:
+            page.locator("#discovery-tab-tmdb-movie").click()
+            page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        page.locator("#discovery-load-more").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                         ["all 第1页", "all 第2页"])
+        return page, errors, calls
+
+    @staticmethod
+    def hold_catalogue_request(page, *, search=False, ignore_abort=False, payload=None, status=200):
+        page.evaluate("""({search, ignoreAbort, payload, status}) => {
+            const original = window.fetch;
+            window.catalogueAborted = false;
+            window.heldCatalogueQuery = null;
+            window.fetch = (url, options = {}) => {
+                const parsed = new URL(String(url), location.href);
+                if (window.heldCatalogueQuery || parsed.pathname !== (search ? '/api/discovery/search' : '/api/discovery/items')
+                    || (!search && parsed.searchParams.get('provider') !== 'tmdb')) return original(url, options);
+                window.heldCatalogueQuery = Object.fromEntries(parsed.searchParams);
+                return new Promise((resolve, reject) => {
+                    window.releaseCataloguePage = () => {
+                        resolve(new Response(JSON.stringify(payload), {status, headers: {'Content-Type': 'application/json'}}));
+                        window.catalogueReturned = true;
+                    };
+                    options.signal.addEventListener('abort', () => {
+                        window.catalogueAborted = true;
+                        if (!ignoreAbort) reject(new DOMException('cancelled catalogue request', 'AbortError'));
+                    }, {once: true});
+                });
+            };
+        }""", {"search": search, "ignoreAbort": ignore_abort, "payload": payload, "status": status})
+
+    def test_cancelled_standard_filter_keeps_committed_cache_and_late_results_out(self):
+        for width in (1440, 390):
+            for ignore_abort in (False, True):
+                with self.subTest(width=width, ignore_abort=ignore_abort):
+                    page, errors, calls = self.open_paged_catalogue(width=width)
+                    self.hold_catalogue_request(page, ignore_abort=ignore_abort, payload=self.catalogue_page(1, "28"))
+                    page.locator("select[data-filter-key='with_genres']").select_option("28")
+                    page.wait_for_function("window.heldCatalogueQuery !== null")
+                    self.assertEqual(page.evaluate("window.heldCatalogueQuery.with_genres"), "28")
+                    self.assertEqual(page.evaluate("window.heldCatalogueQuery.page"), "1")
+                    page.locator("#discovery-tab-douban-tv").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    before_restore = list(calls)
+                    page.locator("#discovery-tab-tmdb-movie").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertTrue(page.evaluate("window.catalogueAborted"))
+                    self.assertEqual(calls, before_restore, "新鲜的已提交缓存应直接恢复")
+                    self.assertEqual(page.locator("select[data-filter-key='with_genres']").input_value(), "")
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页"])
+                    self.assertTrue(page.locator("#discovery-load-more-row").is_visible())
+                    page.locator("#discovery-load-more").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertEqual(calls[-1], ("tmdb", 3, "all"))
+                    page.evaluate("window.releaseCataloguePage()")
+                    page.wait_for_function("window.catalogueReturned === true")
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页", "all 第3页"])
+                    self.assertEqual(page.locator("select[data-filter-key='with_genres']").input_value(), "")
+                    self.assertTrue(page.locator("#discovery-load-more-row").is_hidden())
+                    self.assertEqual(errors, [])
+                    page.close()
+
+    def test_standard_filter_commits_only_success_and_reuses_matching_cache(self):
+        for width in (1440, 390):
+            for success in (True, False):
+                with self.subTest(width=width, success=success):
+                    page, errors, calls = self.open_paged_catalogue(width=width)
+                    page.evaluate("window.committedCards = [...document.querySelectorAll('#discovery-grid .discovery-card')]")
+                    sizes = page.locator(".discovery-toolbar, #discovery-grid, #discovery-load-more").evaluate_all(
+                        "nodes => nodes.map(node => {const box = node.getBoundingClientRect(); return [box.width, box.height]})")
+                    self.hold_catalogue_request(page, payload=self.catalogue_page(1, "28") if success else {"detail": "筛选暂不可用"},
+                                                status=200 if success else 503)
+                    page.locator("select[data-filter-key='with_genres']").select_option("28")
+                    page.wait_for_function("window.heldCatalogueQuery !== null")
+                    page.wait_for_timeout(350)
+                    self.assertTrue(page.evaluate("window.committedCards.every(card => card.isConnected)"))
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页"])
+                    self.assertTrue(page.locator("#discovery-load-more-row").is_visible())
+                    self.assertEqual(page.locator(".discovery-toolbar, #discovery-grid, #discovery-load-more").evaluate_all(
+                        "nodes => nodes.map(node => {const box = node.getBoundingClientRect(); return [box.width, box.height]})"), sizes)
+                    self.assertEqual(page.locator(".discovery-skeleton").count(), 0)
+                    page.evaluate("window.releaseCataloguePage()")
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertEqual(page.locator("select[data-filter-key='with_genres']").input_value(), "28" if success else "")
+                    if not success:
+                        self.assertIn("筛选暂不可用", page.locator("#discovery-live").inner_text())
+                        self.assertTrue(page.evaluate("window.committedCards.every(card => card.isConnected)"))
+                    page.locator("#discovery-load-more").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertEqual(calls[-1], ("tmdb", 2, "28") if success else ("tmdb", 3, "all"))
+                    if success:
+                        count = len(calls)
+                        page.locator("select[data-filter-key='with_genres']").select_option("")
+                        self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                         ["all 第1页", "all 第2页"])
+                        page.locator("select[data-filter-key='with_genres']").select_option("28")
+                        self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                         ["28 第1页", "28 第2页"])
+                        self.assertEqual(len(calls), count, "条件各自命中的新鲜缓存无需重新请求")
+                        page.evaluate("() => {const original = Date.now; Date.now = () => original() + 121000}")
+                        page.locator("select[data-filter-key='with_genres']").select_option("")
+                        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                        self.assertEqual(calls[-1], ("tmdb", 1, "all"))
+                        self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(), ["all 第1页"])
+                    else:
+                        page.locator("#discovery-tab-douban-tv").click()
+                        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                        page.locator("#discovery-tab-tmdb-movie").click()
+                        self.assertEqual(page.locator("select[data-filter-key='with_genres']").input_value(), "")
+                        self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                         ["all 第1页", "all 第2页", "all 第3页"])
+                    self.assertLessEqual(page.evaluate("document.documentElement.scrollWidth"), width)
+                    self.assertEqual(errors, [])
+                    page.close()
+
+    def test_expired_multipage_cache_rebuilds_from_first_page(self):
+        for width in (1440, 390):
+            for search in (False, True):
+                with self.subTest(width=width, search=search):
+                    page, errors, calls = self.open_paged_catalogue(width=width, search=search)
+                    page.locator("#discovery-tab-douban-tv").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    page.evaluate("() => {const original = Date.now; Date.now = () => original() + 121000}")
+                    payload = self.catalogue_page(1)
+                    if search:
+                        payload = self.search_payload(items=payload["items"], has_more=True)
+                    self.hold_catalogue_request(page, search=search, payload=payload)
+                    if search:
+                        page.locator("#discovery-search-form").evaluate("form => form.requestSubmit()")
+                    else:
+                        page.locator("#discovery-tab-tmdb-movie").click()
+                    page.wait_for_function("window.heldCatalogueQuery !== null")
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页"])
+                    self.assertEqual(page.evaluate("window.heldCatalogueQuery.page"), "1", "过期累计列表必须从首页重建")
+                    page.evaluate("window.releaseCataloguePage()")
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(), ["all 第1页"])
+                    page.locator("#discovery-load-more").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertEqual(calls[-1][1], 2)
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页"])
+                    self.assertEqual(errors, [])
+                    page.close()
+
+    def test_expired_cache_failure_or_cancel_preserves_committed_pages(self):
+        for width, search in ((1440, False), (390, True)):
+            for outcome in ("failure", "cancel", "late"):
+                with self.subTest(width=width, search=search, outcome=outcome):
+                    page, errors, calls = self.open_paged_catalogue(width=width, search=search)
+                    page.locator("#discovery-tab-douban-tv").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    page.evaluate("() => {const original = Date.now; Date.now = () => original() + 121000}")
+                    payload = self.catalogue_page(1)
+                    if search:
+                        payload = self.search_payload(items=payload["items"], has_more=True)
+                    self.hold_catalogue_request(page, search=search, ignore_abort=outcome == "late",
+                                                payload={"detail": "刷新暂不可用"} if outcome == "failure" else payload,
+                                                status=503 if outcome == "failure" else 200)
+                    if search:
+                        page.locator("#discovery-search-form").evaluate("form => form.requestSubmit()")
+                    else:
+                        page.locator("#discovery-tab-tmdb-movie").click()
+                    page.wait_for_function("window.heldCatalogueQuery !== null")
+                    self.assertEqual(page.evaluate("window.heldCatalogueQuery.page"), "1")
+                    if outcome == "failure":
+                        page.evaluate("window.releaseCataloguePage()")
+                        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                        self.assertIn("刷新暂不可用", page.locator("#discovery-live").inner_text())
+                    else:
+                        page.locator("#discovery-tab-douban-tv").click()
+                        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                        self.assertTrue(page.evaluate("window.catalogueAborted"))
+                        count = len(calls)
+                        if search:
+                            self.submit_catalogue_search(page)
+                        else:
+                            page.locator("#discovery-tab-tmdb-movie").click()
+                        self.assertEqual(len(calls), count, "取消的首页刷新不能污染可直接恢复的累计缓存")
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页"])
+                    page.locator("#discovery-load-more").click()
+                    page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                    self.assertEqual(calls[-1][1], 3, "失败或取消不能提交首页页码")
+                    page.evaluate("window.releaseCataloguePage()")
+                    page.wait_for_function("window.catalogueReturned === true")
+                    self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                     ["all 第1页", "all 第2页", "all 第3页"])
+                    self.assertTrue(page.locator("#discovery-load-more-row").is_hidden())
+                    self.assertEqual(errors, [])
+                    page.close()
+
+    def test_expired_partial_search_rebuilds_all_sources_from_page_one(self):
+        for width in (1440, 390):
+            with self.subTest(width=width):
+                calls = []
+                responses = [
+                    self.search_payload(items=self.catalogue_page(1)["items"], has_more=True),
+                    self.search_payload(items=self.catalogue_page(2)["items"], failed=("tmdb",)),
+                    self.search_payload(items=self.catalogue_page(1)["items"], has_more=True),
+                    self.search_payload(items=self.catalogue_page(2)["items"]),
+                ]
+
+                def respond(params):
+                    calls.append((int(params["page"][0]), params["providers"][0]))
+                    return responses[len(calls) - 1]
+
+                page, errors = self.open_catalogue(width=width, search_response=respond)
+                self.submit_catalogue_search(page)
+                page.locator("#discovery-load-more").click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertIn("重试当前页", page.locator("#discovery-load-more").inner_text())
+                page.locator("#discovery-tab-douban-tv").click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                page.evaluate("() => {const original = Date.now; Date.now = () => original() + 121000}")
+                self.submit_catalogue_search(page)
+                self.assertEqual(calls[-1], (1, "tmdb,douban,bangumi"))
+                self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(), ["all 第1页"])
+                self.assertNotIn("重试", page.locator("#discovery-load-more").inner_text())
+                page.locator("#discovery-load-more").click()
+                page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+                self.assertEqual(calls, [(1, "tmdb,douban,bangumi"), (2, "tmdb,douban,bangumi"),
+                                         (1, "tmdb,douban,bangumi"), (2, "tmdb,douban,bangumi")])
+                self.assertEqual(page.locator("#discovery-grid .discovery-card-title").all_text_contents(),
+                                 ["all 第1页", "all 第2页"])
+                self.assertEqual(errors, [])
+                page.close()
+
     def test_search_saved_card_first_click_removes_watchlist(self):
         card = {"provider": "tmdb", "media_type": "movie", "external_id": "550",
                 "title": "已收藏电影", "state": "watchlisted"}

@@ -203,7 +203,7 @@
         return ['items', state.provider, state.mediaType, state.category].join(':');
     }
 
-    function activeViewKey() {
+    function activeViewKey(filters = state.filters) {
         return JSON.stringify({
             mode: state.mode,
             provider: state.provider,
@@ -211,7 +211,7 @@
             category: state.category,
             searchQuery: state.searchQuery,
             searchProviders: [...state.searchProviders].sort(),
-            filters: sortedObject(state.filters),
+            filters: sortedObject(filters),
         });
     }
 
@@ -971,30 +971,19 @@
                     return;
                 }
                 saveCurrentViewSnapshot();
-                const previousFilters = {...state.filters};
-                const previousPage = state.page;
-                const previousHasMore = state.hasMore;
-                state.filters[definition.key] = select.value;
-                if (!select.value) delete state.filters[definition.key];
+                const filters = {...state.filters, [definition.key]: select.value};
+                if (!select.value) delete filters[definition.key];
                 label.classList.toggle('is-active', Boolean(select.value));
-                state.page = 1;
-                state.hasMore = false;
-                state.appendError = null;
-                elements.loadMoreRow.hidden = true;
-                const cachedSnapshot = restoreCachedView(activeViewKey());
+                const cachedSnapshot = restoreCachedView(activeViewKey(filters));
                 if (cachedSnapshot && snapshotIsFresh(cachedSnapshot)) {
                     announce('已恢复最近浏览的筛选结果。');
                     return;
                 }
-                const loadPromise = loadActive({preserveContent: true});
+                const loadPromise = loadActive({preserveContent: true, filters});
                 const loadRequestId = state.requestId;
                 const loaded = await loadPromise;
-                if (!loaded && state.requestId === loadRequestId && !cachedSnapshot) {
-                    state.filters = previousFilters;
-                    state.page = previousPage;
-                    state.hasMore = previousHasMore;
+                if (!loaded && state.requestId === loadRequestId) {
                     renderFilters(state.filterDefinitions);
-                    elements.loadMoreRow.hidden = !state.hasMore;
                 }
             });
             label.append(select);
@@ -1141,7 +1130,7 @@
         }
     }
 
-    async function loadItemsMode(signal, page = 1, providers = state.searchProviders) {
+    async function loadItemsMode(signal, page, providers, filters) {
         if (state.mode === 'search') {
             const params = {
                 q: state.searchQuery,
@@ -1157,7 +1146,7 @@
             media_type: state.mediaType,
             category,
             page,
-            ...state.filters,
+            ...filters,
         };
         const payload = await api(`/api/discovery/items?${queryString(params)}`, {}, signal);
         return {payload, items: extractItems(payload)};
@@ -1166,10 +1155,11 @@
     async function loadActive({
         preserveContent = false,
         append = false,
-        requestedPage = state.page,
-        searchRetry = state.mode === 'search' && state.appendError?.page === requestedPage ? state.appendError : null,
+        // 整表刷新统一从首页重建；只有追加请求显式携带续页及失败来源。
+        requestedPage = 1,
+        filters: requestFilters = {...state.filters},
     } = {}) {
-        append ||= Boolean(searchRetry);
+        const searchRetry = append && state.mode === 'search' && state.appendError?.page === requestedPage ? state.appendError : null;
         const requestId = state.requestId + 1;
         state.requestId = requestId;
         state.controller?.abort();
@@ -1240,16 +1230,16 @@
                 }
             } else {
                 let definitionsPromise = Promise.resolve(null);
-                const requestFilters = state.filters;
                 if (!append && state.mode === 'items' && !state.filterDefinitions.length) {
                     definitionsPromise = loadFilterDefinitions(controller.signal, requestFilters);
                 } else if (!append && state.mode === 'search') {
                     elements.filters.replaceChildren();
                     elements.filters.hidden = true;
                 }
-                const itemsPromise = loadItemsMode(controller.signal, requestedPage, searchRetry?.providers ?? state.searchProviders);
+                const itemsPromise = loadItemsMode(controller.signal, requestedPage, searchRetry?.providers ?? state.searchProviders, requestFilters);
                 const [definitions, itemResult] = await Promise.all([definitionsPromise, itemsPromise]);
                 if (!(await keepSkeletonVisible(skeletonShownAt, requestId))) return false;
+                state.filters = requestFilters;
                 if (definitions) {
                     state.filterDefinitions = definitions;
                     renderFilters(definitions);
@@ -3614,7 +3604,7 @@
     async function refreshActive() {
         if (state.loading || state.loadingMore) return false;
         saveCurrentViewSnapshot();
-        return loadActive({preserveContent: true, requestedPage: 1, searchRetry: null});
+        return loadActive({preserveContent: true});
     }
 
     async function loadNextPage() {
