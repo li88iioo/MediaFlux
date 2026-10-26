@@ -205,14 +205,15 @@ class StagingResumeTests(IsolatedDatabaseTestCase):
         from app.modules.telegram_organize_lifecycle import build_organize_lifecycle_event
         self.client.file_info = lambda file_id: self.stage if file_id == 'stage' else GuangYaFile(file_id, 'Fixture', True, parent_id='0')
         manager = organize_tasks.OrganizeTaskManager()
-        manager._task = {'id': 'fixture-scan', 'status': 'running', 'stats': {}}
+        run_id = db.add_task_run('guangya_organize', 'telegram', result=json.dumps({'task_id': 'fixture-scan'}))
+        manager._task = {'id': 'fixture-scan', 'run_id': run_id, 'status': 'running', 'stats': {}}
         self.assertTrue(manager._lock.acquire(blocking=False))
         rules = OrganizeRules(target_dir_id='target', clean_empty=False, link_strm=False, notify_enabled=False,
                               nsfw_enabled=True, nsfw_source_ids='["new"]')
         with patch.object(Organizer, '_validate_target_outside_source'), patch.object(Organizer, 'trigger_post_actions'), patch.object(
             Organizer, 'notify_task_results'), patch.object(organize_tasks, '_publish_download_lifecycles'), patch.object(
             manager, '_wake_download_tracker'), patch.object(organize_tasks, 'resolve_organize_workers', return_value=1):
-            manager._run('fixture-scan', 0, [{'id': 'new', 'name': 'Fixture'}], rules, trigger_type='telegram', client=self.client)
+            manager._run('fixture-scan', run_id, [{'id': 'new', 'name': 'Fixture'}], rules, trigger_type='telegram', client=self.client)
         result = manager.task_status()
         self.assertEqual(result['status'], 'partial')
         self.assertEqual(result['result']['resumed_download_ids'], [self.request])

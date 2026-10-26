@@ -359,14 +359,3 @@ def complete_staging_confirmation_phase(expected: dict) -> bool:
              *(str(expected.get(key) or '') for key in _IDENTITY_KEYS)],
         )
     return cur.rowcount == 1
-
-
-def mark_staging_waiting_confirmation(request_id: int, task_id: str, count: int) -> bool:
-    with db.get_conn() as conn:
-        cur = conn.execute(
-            "UPDATE download_requests SET organize_status='requires_manual',organize_error=?,"
-            "organize_finished_at=NULL,updated_at=? WHERE id=? AND organize_task_id=? "
-            "AND gy_status='completed' AND status NOT IN ('cancelled','resubmitted','failed')",
-            (f'仍有 {max(1, count)} 项媒体等待人工确认', db.now(), request_id, task_id),
-        )
-    return cur.rowcount == 1

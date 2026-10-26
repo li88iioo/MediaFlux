@@ -5,6 +5,10 @@ import json
 import sqlite3
 from typing import Any
 
+from app.logger import get_logger
+
+logger = get_logger(__name__)
+
 _BUSINESS_LOG_FIELDS = (
     "tmdb_id", "provider", "external_id", "media_type", "title", "year",
     "season", "episode", "new_path", "target_parent_id", "release_parse_json",
@@ -207,8 +211,92 @@ def list_pending_organize_probe_steps(
         ).fetchall()
 
 
+def _settle_organize_task_run_conn(conn, run_id: int, result: dict, timestamp: str) -> dict:
+    """只结算已执行的整理回执；单请求失败不回滚其它请求或重放云端动作。"""
+    from app.repositories.download_requests import _update_download_request_conn
+    from app.repositories.media_subscriptions import _sync_media_download_admissions_conn
+
+    row = conn.execute(
+        "SELECT status,result FROM task_runs WHERE id=? AND task_name='guangya_organize'",
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        raise LookupError("整理运行记录不存在")
+    stored = json.loads(row["result"] or "{}")
+    if stored.get("task_id") != result.get("task_id"):
+        raise ValueError("整理运行身份已变化")
+    if row["status"] != "running" and not stored.get("request_settlement"):
+        return stored
+    # 另一个进程可能已结算其中一部分，旧内存回执不能复活已移除的待结算项。
+    result = dict(stored if stored.get("request_settlement") else result)
+    settlement = dict(result["request_settlement"])
+    pending = {}
+    for request_id, original_fields in settlement["requests"].items():
+        conn.execute("SAVEPOINT organize_request_settlement")
+        try:
+            request = conn.execute(
+                "SELECT * FROM download_requests WHERE id=?", (int(request_id),),
+            ).fetchone()
+            if (request is not None and request["organize_task_id"] == result["task_id"]
+                    and request["organize_run_id"] == run_id
+                    and request["gy_status"] == "completed"
+                    and request["status"] not in {"cancelled", "resubmitted", "failed"}):
+                fields = dict(original_fields)
+                generation = fields.pop("_strm_generation", 0)
+                if (request["strm_generation"] != generation
+                        or request["strm_status"] not in {"pending", "failed"}):
+                    fields = {key: value for key, value in fields.items() if not key.startswith("strm_")}
+                if "organize_started" not in fields:
+                    fields["organize_started"] = 1
+                _update_download_request_conn(conn, int(request_id), fields, timestamp)
+                _sync_media_download_admissions_conn(conn, int(request_id), timestamp)
+        except Exception as exc:
+            conn.execute("ROLLBACK TO organize_request_settlement")
+            pending[str(request_id)] = original_fields
+            logger.warning("整理请求结算待恢复 request=%s type=%s", request_id, type(exc).__name__)
+        finally:
+            conn.execute("RELEASE organize_request_settlement")
+    result.update({key: settlement[key] for key in ("status", "error", "message")})
+    if pending:
+        settlement["requests"] = pending
+        result["request_settlement"] = settlement
+        result.update(status="partial", message="云端整理已结束，关联请求仍待结算",
+                      error="部分关联请求结算未完成；恢复时仅补结算，勿重复整理")
+    else:
+        result.pop("request_settlement", None)
+    conn.execute(
+        "UPDATE task_runs SET status=?,finished_at=?,result=?,error=? WHERE id=?",
+        ({"completed": "success", "stopped": "skipped"}.get(result["status"], result["status"]),
+         timestamp, json.dumps(result, ensure_ascii=False, default=str),
+         result.get("persistence_error") or result["error"], run_id),
+    )
+    return result
+
+
+def settle_organize_task_run(run_id: int, result: dict) -> dict:
+    """任务回执、关联请求及订阅准入在同一提交点可见。"""
+    with db.get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        return _settle_organize_task_run_conn(conn, run_id, result, db.now())
+
+
+def next_unsettled_organize_task_run(after_id: int = 0) -> sqlite3.Row | None:
+    """既有 dispatcher 每周期取一个回执，轮转而非只看近期运行记录。"""
+    with db.get_conn() as conn:
+        return conn.execute(
+            "SELECT id,result FROM task_runs WHERE task_name='guangya_organize' AND status='partial' "
+            "AND json_valid(result) AND json_type(result,'$.request_settlement')='object' "
+            "ORDER BY (id<=?),id LIMIT 1", (after_id,),
+        ).fetchone()
+
+
 def _recover_after_restart(conn, timestamp: str) -> None:
     """恢复整理确认、写审计与版本化运行结果；回执使用同一事务。"""
+    for run in conn.execute(
+        "SELECT id,result FROM task_runs WHERE task_name='guangya_organize' AND status='partial' "
+        "AND json_valid(result) AND json_type(result,'$.request_settlement')='object'"
+    ).fetchall():
+        _settle_organize_task_run_conn(conn, int(run["id"]), json.loads(run["result"]), timestamp)
     interrupted_confirmations = conn.execute(
         "SELECT token,chat_id,directory_path,payload_json FROM organize_confirmations "
         "WHERE status='running'"

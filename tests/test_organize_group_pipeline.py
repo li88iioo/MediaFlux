@@ -889,11 +889,16 @@ class GroupProgressProjectionTests(unittest.TestCase):
 class TaskStateProjectionTests(unittest.TestCase):
     """Task 1.5：任务状态对外暴露组级进度，供 Web 轮询局部更新。"""
 
+    def setUp(self):
+        self.enterContext(isolated_test_database())
+
     def _run_manager(self, snapshots: list[dict]):
         from app.modules import organize_tasks as tasks_module
+        from app import database as db
 
         manager = tasks_module.OrganizeTaskManager()
-        manager._task = {"id": "task-a", "status": "running", "stats": {}}
+        run_id = db.add_task_run("guangya_organize", "manual", result=json.dumps({"task_id": "task-a"}))
+        manager._task = {"id": "task-a", "run_id": run_id, "status": "running", "stats": {}}
 
         class _NoopLock:
             def acquire(self, *_args, **_kwargs):
@@ -958,7 +963,7 @@ class TaskStateProjectionTests(unittest.TestCase):
             lambda *_args, **_kwargs: None, create=True,
         ):
             manager._run(
-                "task-a", 0, [{"id": "root", "name": "待整理"}],
+                "task-a", run_id, [{"id": "root", "name": "待整理"}],
                 OrganizeRules(target_dir_id="target"),
             )
         return manager
@@ -1027,7 +1032,8 @@ class ProtectedStagingTaskTests(unittest.TestCase):
         client = _TreeClient(tree, root_name="NewNsfw")
         harness = _PipelineHarness(client)
         manager = tasks_module.OrganizeTaskManager()
-        manager._task = {"id": "protected-task", "status": "running", "stats": {}}
+        run_id = db.add_task_run("guangya_organize", "telegram", result=json.dumps({"task_id": "protected-task"}))
+        manager._task = {"id": "protected-task", "run_id": run_id, "status": "running", "stats": {}}
         self.assertTrue(manager._lock.acquire(blocking=False))
         with patch.object(Organizer, "_build_plans", harness._build_plans), patch(
             "app.modules.organize.execute_organize_plans", side_effect=harness._execute,
@@ -1037,7 +1043,7 @@ class ProtectedStagingTaskTests(unittest.TestCase):
             tasks_module, "resolve_organize_workers", return_value=1,
         ):
             manager._run(
-                "protected-task", 0, [{"id": "root", "name": "NewNsfw"}],
+                "protected-task", run_id, [{"id": "root", "name": "NewNsfw"}],
                 harness.rules, trigger_type="telegram", client=client,
             )
         return manager.task_status(), client, db.get_download_request(request_id)

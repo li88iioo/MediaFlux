@@ -9,6 +9,7 @@ from app.modules.scraper import TMDBScraper
 from app.modules.organize_scan import OrganizeScanResult
 
 import os
+import json
 import threading
 import time
 import unittest
@@ -16,6 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app import database as db
+from tests.support import isolated_test_database
 from app.modules.organize import (
     OrganizeContext,
     OrganizePlan,
@@ -438,6 +441,9 @@ class OrganizeGroupParallelPlanningTests(unittest.TestCase):
 
 
 class OrganizeSourceParallelPlanningTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_test_database())
+
     def _run_manager(
         self,
         rules: OrganizeRules,
@@ -530,7 +536,8 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
 
         manager = OrganizeTaskManager()
         manager._lock = cast(CrossProcessLock, _NoopLock())
-        manager._task = {"id": "parallel-task", "status": "running", "stats": {}}
+        run_id = db.add_task_run("guangya_organize", "manual", result=json.dumps({"task_id": "parallel-task"}))
+        manager._task = {"id": "parallel-task", "run_id": run_id, "status": "running", "stats": {}}
         manager._wake_download_tracker = lambda *_args, **_kwargs: None
         sources = [
             {
@@ -550,7 +557,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
             "app.modules.organize_tasks._cleanup_manual_source_root",
             return_value=None,
         ):
-            manager._run("parallel-task", 0, sources, rules)
+            manager._run("parallel-task", run_id, sources, rules)
         setattr(manager, "_test_writer_order", writer_order)
         return manager, planning_peak, writer_peak, organize_kwargs
 
@@ -713,7 +720,8 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
 
         manager = OrganizeTaskManager()
         manager._lock = cast(CrossProcessLock, _NoopLock())
-        manager._task = {"id": "partial-task", "status": "running", "stats": {}}
+        run_id = db.add_task_run("guangya_organize", "manual", result=json.dumps({"task_id": "partial-task"}))
+        manager._task = {"id": "partial-task", "run_id": run_id, "status": "running", "stats": {}}
         manager._wake_download_tracker = lambda *_args, **_kwargs: None
         with patch(
             "app.modules.organize_tasks.Organizer", _PartiallyFailingOrganizer
@@ -727,7 +735,7 @@ class OrganizeSourceParallelPlanningTests(unittest.TestCase):
         ):
             manager._run(
                 "partial-task",
-                0,
+                run_id,
                 [
                     {"id": "source-a", "name": "来源 A"},
                     {"id": "source-b", "name": "来源 B"},

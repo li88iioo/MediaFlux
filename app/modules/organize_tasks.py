@@ -42,8 +42,8 @@ from app.modules.process_lock import CrossProcessLock
 from app.repositories.download_staging import (
     complete_staging_confirmation_phase,
     list_staging_cleanup_requests,
-    mark_staging_waiting_confirmation,
 )
+from app.repositories.organize_history import next_unsettled_organize_task_run, settle_organize_task_run
 from app.repositories.organize_operation_jobs import (
     CLOUD_COPY_PENDING_CODE,
     OrganizeOperationAdmissionError,
@@ -392,6 +392,8 @@ class OrganizeTaskManager:
         self._task_history: deque[dict[str, Any]] = deque(maxlen=32)
         self._operation_queue_wakeup = threading.Event()
         self._operation_dispatcher: threading.Thread | None = None
+        self._settlement_retry_at = 0.0
+        self._settlement_cursor = 0
         self._shutting_down = False
 
     def start(
@@ -431,6 +433,10 @@ class OrganizeTaskManager:
             if self._shutting_down:
                 self._admission_lock.release()
                 return {"ok": False, "error": "服务正在停止，暂不接受新的整理任务"}
+            if (self._task.get("status") == "running"
+                    and (self._task.get("result") or {}).get("request_settlement")):
+                self._admission_lock.release()
+                return {"ok": False, "error": "网盘整理任务正在运行：前次回执尚待结算，数据库恢复后将自动结算；勿重复整理"}
             try:
                 pending_operation = count_pending_organize_operation_jobs() > 0
             except Exception as exc:
@@ -949,6 +955,9 @@ class OrganizeTaskManager:
                 if self._shutting_down:
                     return {"ok": False, "error": "服务正在停止，暂不接受新的整理操作"}
                 duplicate = self._find_operation_locked(dedupe_key)
+                if (self._task.get("status") == "running"
+                        and (self._task.get("result") or {}).get("request_settlement")):
+                    return {"ok": False, "error": "整理回执尚未保存，数据库恢复后将自动结算", "retryable": True}
                 if duplicate is not None:
                     return {
                         "ok": True,
@@ -1537,6 +1546,13 @@ class OrganizeTaskManager:
                         memory_pending = bool(self._operation_queue)
                         if self._worker is not None:
                             break
+                    if time.monotonic() >= self._settlement_retry_at:
+                        self._settlement_retry_at = time.monotonic() + 5.0
+                        self._retry_task_settlement()
+                    with self._state_lock:
+                        if (self._task.get("status") == "running"
+                                and (self._task.get("result") or {}).get("request_settlement")):
+                            break  # 不能让排队操作覆盖唯一的未持久化回执。
                     try:
                         durable_pending = count_pending_organize_operation_jobs() > 0
                         durable_running = count_running_organize_operation_jobs() > 0
@@ -1673,6 +1689,55 @@ class OrganizeTaskManager:
             self._operation_queue_wakeup.set()
             self._wake_download_tracker()
 
+    def _retry_task_settlement(self) -> None:
+        """复用 dispatcher：每周期至多补本进程回执和一条持久回执。"""
+        with self._state_lock:
+            pending = dict(self._task)
+        local_run_id = 0
+        if (pending.get("result") or {}).get("request_settlement"):
+            local_run_id = int(pending["run_id"])
+            self._settle_task_result(local_run_id, pending["result"])
+        try:
+            row = next_unsettled_organize_task_run(self._settlement_cursor)
+            if row is not None:
+                self._settlement_cursor = int(row["id"])
+                if self._settlement_cursor != local_run_id:
+                    self._settle_task_result(self._settlement_cursor, json.loads(row["result"]))
+        except Exception as exc:
+            logger.warning("读取整理待结算回执失败 type=%s", type(exc).__name__)
+
+    def _settle_task_result(self, run_id: int, result: dict) -> None:
+        """持久事实先于 UI 终态；不可写时由既有 dispatcher 自动补结算。"""
+        with self._state_lock:
+            if (self._task.get("id") == result.get("task_id")
+                    and not (self._task.get("result") or {}).get("request_settlement")):
+                self._task.update({
+                    "status": "running", "stoppable": False,
+                    "message": "整理执行已结束，等待保存结算结果",
+                    "error": "数据库恢复后将自动补结算；未持久化回执在进程退出后会丢失，勿重复整理",
+                    "current_source": result.get("current_source", ""), "group_progress": {}, "finished_at": "",
+                    "stats": result["stats"], "source_results": result["sources"],
+                    "notification_sent": result["notification"]["sent"],
+                    "result": {**result, "status": "running"},
+                })
+        try:
+            settlement = result["request_settlement"]
+            settled = settle_organize_task_run(run_id, result)
+        except Exception as exc:
+            logger.error("保存整理结算失败，保留待结算回执 task_id=%s type=%s",
+                         result.get("task_id"), type(exc).__name__)
+            return
+        with self._state_lock:
+            for task in (self._task, *self._task_history):
+                if task.get("id") == settled.get("task_id"):
+                    task.update(status=settled["status"], message=settled["message"],
+                                error=settled["error"], result=settled,
+                                finished_at=db.now(), stoppable=False)
+                    self._remember_task_locked(task)
+                    break
+        _publish_download_lifecycles([int(item) for item in settlement["requests"]], stats=settled["stats"])
+        self._wake_download_tracker()
+
     def _run(
         self,
         task_id: str,
@@ -1693,6 +1758,7 @@ class OrganizeTaskManager:
         source_results = []
         current_source = ""
         organizer = None
+        request_generations: dict[int, int] = {}
         try:
             if not _credential_snapshot_is_current(client, expected_credential_generation):
                 raise RuntimeError("光鸭登录凭据已变化，已拒绝执行整理")
@@ -1716,6 +1782,7 @@ class OrganizeTaskManager:
                     row = db.get_download_request(request_id)
                     if row is not None:
                         request_sources[request_id] = str(row["gy_target_dir"] or "")
+                        request_generations[request_id] = int(row["strm_generation"] or 0)
                 except Exception as exc:
                     # 通知身份读取失败不能改写整理业务结果，更不能猜测私聊归属。
                     logger.warning("冻结补全通知归属失败 type=%s", type(exc).__name__)
@@ -2059,17 +2126,14 @@ class OrganizeTaskManager:
                     for key in ("need_confirm", "unresolved_skipped", "moved"):
                         root_stats[key] = root_stats.get(key, 0) + max(0, int(source_stats.get(key) or 0))
                 for request_id in download_request_ids or []:
-                    request_row = db.get_download_request(request_id)
-                    if request_row is None:
-                        continue
-                    source_stats = stats_by_root.get(str(request_row["gy_target_dir"] or ""), {})
+                    source_stats = stats_by_root.get(request_sources.get(request_id, ""), {})
                     unresolved = max(0, (source_stats.get("unresolved_skipped") or 0))
                     if unresolved:
                         unresolved_downloads[request_id] = (
                             unresolved, max(0, (source_stats.get("moved") or 0)),
                         )
                     pending_count = max(0, (source_stats.get("need_confirm") or 0))
-                    if not partial and pending_count and mark_staging_waiting_confirmation(request_id, task_id, pending_count):
+                    if not partial and pending_count:
                         pending_downloads[request_id] = pending_count
             notification_sent = False
             if source_results or stopped:
@@ -2117,7 +2181,6 @@ class OrganizeTaskManager:
                 message = f"整理任务部分完成，{len(blocked)} 个受保护下载目录未扫描：{blocked[0]['path']}"
                 if aggregate.get('resumed_download_ids'):
                     message += f"；已恢复 {len(aggregate['resumed_download_ids'])} 个下载整理任务，等待后台落稳核验"
-            finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             if status == "completed":
                 cleanup = self._cleanup_download_staging(organizer.client, download_request_ids or [], sources, rules=rules)
                 if isinstance(cleanup, dict):
@@ -2147,21 +2210,10 @@ class OrganizeTaskManager:
             )
             if delivery_route:
                 structured_result["delivery_route"] = dict(delivery_route)
-            with self._state_lock:
-                self._task.update({
-                    "status": status,
-                    "message": message,
-                    "error": blocked_reason,
-                    "current_source": "",
-                    "group_progress": {},
-                    "finished_at": finished_at,
-                    "stats": aggregate,
-                    "source_results": source_results,
-                    "notification_sent": notification_sent,
-                    "result": structured_result,
-                })
+            request_updates = {}
             for request_id in download_request_ids or []:
                 fields: dict[str, Any] = {
+                    "_strm_generation": request_generations.get(request_id, 0),
                     "organize_status": "requires_manual" if request_id in pending_downloads else request_base_status,
                     "organize_error": (f"仍有 {pending_downloads[request_id]} 项媒体等待人工确认"
                                        if request_id in pending_downloads else ""),
@@ -2220,26 +2272,14 @@ class OrganizeTaskManager:
                         "strm_status": strm_status, "strm_error": strm_error[:500],
                         "strm_finished_at": db.now(),
                     })
-                db.update_download_request_and_sync_media_admission(request_id, **fields)
-            if download_request_ids:
-                _publish_download_lifecycles(
-                    list(download_request_ids), stats=aggregate,
-                )
-            if run_id:
-                try:
-                    db.finish_task_run(
-                        run_id,
-                        "skipped" if stopped else ("partial" if status == "partial" else "success"),
-                        result=json.dumps(
-                            structured_result, ensure_ascii=False, default=str
-                        ),
-                    )
-                except Exception as persist_exc:
-                    logger.error(
-                        "保存整理完成状态失败 task_id=%s type=%s",
-                        task_id,
-                        type(persist_exc).__name__,
-                    )
+                request_updates[str(request_id)] = fields
+            structured_result["message"] = message
+            structured_result["stats"] = aggregate
+            structured_result["request_settlement"] = {
+                "status": status, "error": blocked_reason, "message": message,
+                "requests": request_updates,
+            }
+            self._settle_task_result(run_id, structured_result)
         except Exception as exc:
             logger.exception(
                 "整理后台任务失败 task_id=%s source=%s type=%s",
@@ -2248,15 +2288,15 @@ class OrganizeTaskManager:
                 type(exc).__name__,
             )
             public_error = "整理任务失败，且可能已有部分文件完成移动；请先查看整理日志，勿直接重复执行"
-            finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            request_updates = {}
             for request_id in download_request_ids or []:
-                db.update_download_request(
-                    request_id, organize_started=-1, organize_status="failed",
-                    organize_error=public_error, organize_finished_at=db.now(),
-                    strm_status="skipped",
-                    strm_error="整理失败，未执行 STRM 同步",
-                    strm_finished_at=db.now(),
-                )
+                request_updates[str(request_id)] = {
+                    "_strm_generation": request_generations.get(request_id, 0),
+                    "organize_started": -1, "organize_status": "failed",
+                    "organize_error": public_error, "organize_finished_at": db.now(),
+                    "strm_status": "skipped", "strm_error": "整理失败，未执行 STRM 同步",
+                    "strm_finished_at": db.now(),
+                }
             notification_sent = False
             if download_request_ids:
                 notification_sent = _publish_download_lifecycles(
@@ -2300,35 +2340,12 @@ class OrganizeTaskManager:
             )
             if delivery_route:
                 structured_result["delivery_route"] = dict(delivery_route)
-            if run_id:
-                try:
-                    db.finish_task_run(
-                        run_id,
-                        "failed",
-                        result=json.dumps(
-                            structured_result, ensure_ascii=False, default=str
-                        ),
-                        error=persistence_error,
-                    )
-                except Exception as persist_exc:
-                    logger.error(
-                        "保存整理失败状态失败 task_id=%s type=%s",
-                        task_id,
-                        type(persist_exc).__name__,
-                    )
-            with self._state_lock:
-                if str(self._task.get("id") or "") == task_id:
-                    self._task.update({
-                        "status": "failed",
-                        "message": "整理任务失败",
-                        "error": public_error,
-                        "current_source": current_source,
-                        "finished_at": finished_at,
-                        "stats": dict(aggregate),
-                        "source_results": source_results,
-                        "notification_sent": notification_sent,
-                        "result": structured_result,
-                    })
+            structured_result.update(message="整理任务失败", stats=aggregate, persistence_error=persistence_error)
+            structured_result["request_settlement"] = {
+                "status": "failed", "error": public_error, "message": "整理任务失败",
+                "requests": request_updates,
+            }
+            self._settle_task_result(run_id, structured_result)
         finally:
             close = getattr(organizer, "close", None)
             if callable(close):

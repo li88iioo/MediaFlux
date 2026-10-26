@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 import unittest
 from contextlib import ExitStack
@@ -119,6 +120,9 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
                     organizer, plans, rules, stats, {}, source_dir_id=root
                 )
         manager = OrganizeTaskManager()
+        run_id = db.add_task_run("guangya_organize", "download", result=json.dumps({"task_id": "test-task"}))
+        for request in requests:
+            db.update_download_request(request, organize_task_id="test-task", organize_run_id=run_id)
         manager._lock.acquire()
         manager._task = {"id": "test-task", "status": "running", "stats": {}}
         with ExitStack() as stack:
@@ -157,7 +161,7 @@ class UnresolvedDownloadCompletionTests(unittest.TestCase):
             )
             manager._run(
                 "test-task",
-                0,
+                run_id,
                 [{"id": root, "name": root} for root in sources],
                 rules,
                 download_request_ids=requests,

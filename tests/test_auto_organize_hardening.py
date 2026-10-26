@@ -1465,7 +1465,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         manager = OrganizeTaskManager()
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch.object(db, "add_task_run", return_value=0):
+        ):
             result = manager.start(
                 [{"id": "source", "name": "来源"}],
                 OrganizeRules(target_dir_id="archive"),
@@ -1485,7 +1485,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         manager = OrganizeTaskManager()
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch.object(db, "add_task_run", return_value=0):
+        ):
             result = manager.start(
                 [{"id": "source", "name": "来源"}],
                 OrganizeRules(target_dir_id="archive"),
@@ -1507,7 +1507,9 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
         )
         manager = OrganizeTaskManager()
         manager._lock.acquire()
-        manager._task = {"id": "stop-task", "status": "running", "stats": {}}
+        run_id = db.add_task_run("guangya_organize", "download", result=json.dumps({"task_id": "stop-task"}))
+        db.update_download_request(request_id, organize_task_id="stop-task", organize_run_id=run_id, strm_status="pending")
+        manager._task = {"id": "stop-task", "run_id": run_id, "status": "running", "stats": {}}
         organizer = Mock()
         organizer._validate_target_outside_source = Mock()
 
@@ -1527,7 +1529,7 @@ class AutoOrganizeHardeningTests(IsolatedDatabaseTestCase):
             organizer_cls.trigger_post_actions = Mock()
             organizer_cls.notify_task_results = Mock()
             manager._run(
-                "stop-task", 0, [{"id": "source", "name": "来源"}],
+                "stop-task", run_id, [{"id": "source", "name": "来源"}],
                 OrganizeRules(target_dir_id="archive"),
                 download_request_ids=[request_id], trigger_type="download",
             )

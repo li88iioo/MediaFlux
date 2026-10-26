@@ -12,6 +12,7 @@ from pathlib import Path
 from time import monotonic, sleep, time
 from unittest.mock import MagicMock, patch
 
+from app import database as db
 from app.clients.guangya import GuangYaClient
 from app.notifier import TelegramSendResult
 from app.modules.organize import (
@@ -23,6 +24,8 @@ from app.modules.organize import (
 )
 from app.modules.organize_scan import OrganizeScanResult
 from app.modules.organize_tasks import OrganizeTaskManager, _cleanup_manual_source_root
+from app.repositories.organize_history import settle_organize_task_run
+from tests.support import isolated_test_database
 
 
 class _ImmediateThread:
@@ -32,6 +35,252 @@ class _ImmediateThread:
 
     def start(self):
         self.target(*self.args)
+
+
+class OrganizeTaskSettlementTests(unittest.TestCase):
+    def setUp(self):
+        self.path = self.enterContext(isolated_test_database("organize-settlement.db"))
+        self.manager = OrganizeTaskManager()
+        self.addCleanup(self._shutdown)
+        self.organizer = MagicMock()
+        self.worker: threading.Thread | None = None
+        self.worker_started = threading.Event()
+        self.enterContext(patch("app.modules.organize_tasks.Organizer", return_value=self.organizer))
+        self.publish = self.enterContext(patch("app.modules.organize_tasks._publish_download_lifecycles", return_value=False))
+        self.enterContext(patch.object(self.manager, "_cleanup_download_staging", return_value={}))
+        self.enterContext(patch.object(self.manager, "_wake_download_tracker"))
+        self.enterContext(patch("socket.socket.connect", side_effect=AssertionError("network forbidden")))
+        self.enterContext(patch("socket.socket.connect_ex", side_effect=AssertionError("network forbidden")))
+        self.thread_errors: list[threading.ExceptHookArgs] = []
+        self.enterContext(patch("threading.excepthook", side_effect=self.thread_errors.append))
+        self.organizer.organize.side_effect = self._organize
+
+    def _shutdown(self):
+        self.manager.shutdown(timeout=2)
+        if self.manager._operation_dispatcher:
+            self.manager._operation_dispatcher.join(2)
+
+    def _organize(self, *_args, **_kwargs):
+        self.worker = threading.current_thread()
+        self.worker_started.set()
+        return [], {"total": 1, "moved": 1, "failed": 0}
+
+    def _request(self, name):
+        request_id, _ = db.create_download_request(name, "magnet")
+        db.update_download_request(request_id, status="completed", gy_status="completed",
+                                   gy_target_dir="source", targets="guangya")
+        return request_id
+
+    def _request_row(self, request_id: int) -> sqlite3.Row:
+        row = db.get_download_request(request_id)
+        assert row is not None
+        return row
+
+    def _run_row(self, run_id: int) -> sqlite3.Row:
+        row = db.get_task_run(run_id)
+        assert row is not None
+        return row
+
+    def _start(self, requests):
+        self.worker_started.clear()
+        self.worker = None
+        self.manager._settlement_retry_at = monotonic() + 60
+        self.manager.resume()
+        result = self.manager.start(
+            [{"id": "source", "name": "离线来源"}],
+            OrganizeRules(target_dir_id="target", clean_empty=False, link_strm=False,
+                          notify_enabled=False, library_notify=False, media_probe_enabled=False),
+            download_request_ids=requests,
+        )
+        self.assertTrue(result["ok"], result)
+        return result
+
+    def _retry(self):
+        self.manager._settlement_retry_at = 0
+        self.manager._operation_queue_wakeup.set()
+        deadline = monotonic() + 3
+        while monotonic() < deadline:
+            if not self.manager.task_status()["result"].get("request_settlement"):
+                return
+            sleep(0.01)
+        self.fail("existing dispatcher did not settle receipt")
+
+    def _join(self):
+        self.assertTrue(self.worker_started.wait(2))
+        worker = self.worker
+        assert worker is not None
+        worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(self.thread_errors, [])
+
+    def test_request_failure_is_isolated_and_restart_only_settles_receipt(self):
+        first, second = self._request("first"), self._request("second")
+        with db.get_conn() as conn:
+            conn.execute(
+                f"CREATE TRIGGER fail_first_completion BEFORE UPDATE ON download_requests "
+                f"WHEN NEW.id={first} AND NEW.organize_status='completed' "
+                "BEGIN SELECT RAISE(FAIL, 'settlement sentinel'); END"
+            )
+        accepted = self._start([first, second])
+        self._join()
+        run = self._run_row(accepted["run_id"])
+        self.assertEqual(run["status"], "partial")
+        self.assertEqual(self._request_row(first)["organize_status"], "running")
+        self.assertEqual(self._request_row(second)["organize_status"], "completed")
+        self.assertEqual(self.manager.task_status()["status"], "partial")
+        self.assertEqual(json.loads(run["result"])["counters"]["moved"], 1)
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER fail_first_completion")
+        db.init_db()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+        for request in (first, second):
+            self.assertEqual(self._request_row(request)["organize_status"], "completed")
+        self.organizer.organize.assert_called_once()
+
+    def test_late_settlement_updates_history_without_replacing_new_task(self):
+        request = self._request("late-settlement-history")
+        with db.get_conn() as conn:
+            conn.execute(
+                f"CREATE TRIGGER reject_old_settlement BEFORE UPDATE ON download_requests "
+                f"WHEN NEW.id={request} AND NEW.organize_status='completed' "
+                "BEGIN SELECT RAISE(FAIL,'old settlement fault'); END"
+            )
+        first = self._start([request])
+        self._join()
+        self.assertEqual(self._run_row(first["run_id"])["status"], "partial")
+        second = self._start([])
+        self._join()
+        second_snapshot = self.manager.task_result(second["task_id"])
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER reject_old_settlement")
+        self.manager._retry_task_settlement()
+        self.assertEqual(self._run_row(first["run_id"])["status"], "success")
+        self.assertEqual(self._request_row(request)["organize_status"], "completed")
+        visible = self.manager.task_result(first["task_id"])
+        assert visible is not None
+        self.assertEqual(visible["status"], "completed")
+        self.assertEqual(visible["result"]["status"], "completed")
+        self.assertEqual(visible["error"], "")
+        self.assertEqual(self.manager.task_result(second["task_id"]), second_snapshot)
+        self.assertEqual(self.manager.task_status()["id"], second["task_id"])
+        self.assertEqual(self.organizer.organize.call_count, 2)
+
+    def test_real_write_lock_automatically_settles_without_replaying_cloud(self):
+        request = self._request("locked")
+        blocker = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self.addCleanup(blocker.close)
+        self.addCleanup(blocker.rollback)
+        lock_acquired = threading.Event()
+        finish_failed = threading.Event()
+        connect = db._connect
+
+        def short_timeout():
+            conn = connect()
+            conn.execute("PRAGMA busy_timeout=50")
+            return conn
+
+        def organize(*args, **kwargs):
+            result = self._organize(*args, **kwargs)
+            blocker.execute("BEGIN IMMEDIATE")
+            lock_acquired.set()
+            return result
+
+        self.organizer.organize.side_effect = organize
+        # release 由确定的写失败事件驱动，不能把锁一直持到 worker join。
+        with patch("app.modules.organize_tasks.db._connect", side_effect=short_timeout), patch(
+            "app.modules.organize_tasks.logger.error", side_effect=lambda *_a, **_k: finish_failed.set()
+        ):
+            accepted = self._start([request])
+            self.assertTrue(lock_acquired.wait(2))
+            self.assertTrue(finish_failed.wait(2))
+            self.assertNotEqual(self.manager.task_status()["status"], "completed")
+            blocker.rollback()
+            self._join()
+        self.assertEqual(self.manager.task_status()["status"], "running")
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "running")
+        self._retry()
+        self.assertEqual(self.manager.task_status()["status"], "completed")
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+        self.assertEqual(self._request_row(request)["organize_status"], "completed")
+        self.organizer.organize.assert_called_once()
+        self.assertEqual(self.publish.call_args.kwargs["stats"]["moved"], 1)
+
+    def test_execution_failure_uses_same_isolated_settlement(self):
+        first, second = self._request("failed-first"), self._request("failed-second")
+
+        def fail(*args, **kwargs):
+            self._organize(*args, **kwargs)
+            raise RuntimeError("execution sentinel")
+
+        self.organizer.organize.side_effect = fail
+        with db.get_conn() as conn:
+            conn.execute(
+                f"CREATE TRIGGER fail_first_failure BEFORE UPDATE ON download_requests "
+                f"WHEN NEW.id={first} AND NEW.organize_status='failed' "
+                "BEGIN SELECT RAISE(FAIL, 'failure settlement sentinel'); END"
+            )
+        accepted = self._start([first, second])
+        self._join()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "partial")
+        self.assertEqual(self._request_row(first)["organize_status"], "running")
+        self.assertEqual(self._request_row(second)["organize_status"], "failed")
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER fail_first_failure")
+        self._retry()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "failed")
+        self.assertEqual(self.manager.task_status()["status"], "failed")
+        self.assertIn("RuntimeError", self._run_row(accepted["run_id"])["error"])
+        self.assertEqual(self._request_row(first)["organize_status"], "failed")
+        self.organizer.organize.assert_called_once()
+
+    def test_run_write_failure_rolls_back_request_facts_until_automatic_recovery(self):
+        request = self._request("run-write-failure")
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER fail_run_completion BEFORE UPDATE ON task_runs "
+                "WHEN NEW.status='success' BEGIN SELECT RAISE(FAIL, 'run sentinel'); END"
+            )
+        accepted = self._start([request])
+        self._join()
+        self.assertEqual(self.manager.task_status()["status"], "running")
+        self.assertEqual(self._request_row(request)["organize_status"], "running")
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "running")
+        callback = MagicMock()
+        rejected = self.manager.start_operation("新操作", "must-not-overwrite", callback)
+        self.assertFalse(rejected["ok"])
+        callback.assert_not_called()
+        self.assertEqual(self.manager.task_status()["id"], accepted["task_id"])
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER fail_run_completion")
+            conn.execute("UPDATE download_requests SET strm_generation=1,strm_status='completed' WHERE id=?", (request,))
+        self._retry()
+        self.assertEqual(self.manager.task_status()["status"], "completed")
+        self.assertEqual(self._request_row(request)["organize_status"], "completed")
+        self.assertEqual(self._request_row(request)["strm_status"], "completed")
+        self.organizer.organize.assert_called_once()
+
+    def test_confirmation_settlement_keeps_completed_backend_and_identity_cas(self):
+        for changed in ({}, {"gy_status": "downloading"}, {"status": "cancelled"},
+                        {"status": "resubmitted"}, {"organize_task_id": "new-task"},
+                        {"organize_run_id": 9999}):
+            with self.subTest(changed=changed):
+                request = self._request("confirmation-cas-" + str(changed))
+                db.update_download_request(request, gy_staging_cleanup_status="retained")
+
+                def need_confirmation(*args, **kwargs):
+                    self._organize(*args, **kwargs)
+                    db.update_download_request(request, **changed)
+                    return [], {"total": 1, "need_confirm": 1, "moved": 0, "failed": 0}
+
+                self.organizer.organize.side_effect = need_confirmation
+                self._start([request])
+                self._join()
+                row = self._request_row(request)
+                self.assertEqual(row["organize_status"], "running" if changed else "requires_manual")
+                self.assertEqual(row["gy_staging_cleanup_status"], "retained")
+                if not changed:
+                    self.assertIsNone(row["organize_finished_at"])
+                    self.assertIn("1 项媒体等待人工确认", row["organize_error"])
 
 
 class OrganizerCleanupSafetyTests(unittest.TestCase):
@@ -167,7 +416,12 @@ class ManualSourceRootCleanupTests(unittest.TestCase):
 
 
 class OrganizeTaskFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_test_database("organize-task-failures.db"))
+
     def test_strm_rejection_keeps_completed_cloud_work_without_requeuing_it(self):
+        request_id, _ = db.create_download_request("test_strm_rejection_keeps_completed_cloud_work_without_requeuing_it", "magnet")
+        db.update_download_request(request_id, status="completed", gy_status="completed", gy_target_dir="source")
         manager = OrganizeTaskManager()
         organizer = MagicMock()
         organizer.organize.return_value = ([], {"total": 1, "moved": 1, "failed": 0})
@@ -177,22 +431,24 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=77), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
-        ) as finish, patch("app.modules.organize_tasks.db.update_download_request"), patch(
-            "app.modules.organize_tasks.db.update_download_request_and_sync_media_admission"
-        ) as update_request, patch("app.modules.organize_tasks.db.get_download_request", return_value=None), patch(
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run",
+            wraps=settle_organize_task_run,
+        ) as finish, patch(
+            "app.modules.organize_tasks.db.get_download_request", return_value=None
+        ), patch(
             "app.modules.organize_tasks.Organizer.trigger_post_actions", side_effect=reject_handoff
         ), patch("app.modules.organize_tasks._publish_download_lifecycles", return_value=False), patch.object(
             manager, "_cleanup_download_staging", return_value={}
         ):
             result = manager.start([{"id": "source", "name": "源目录"}],
-                OrganizeRules(target_dir_id="target", link_strm=True), download_request_ids=[91])
+                OrganizeRules(target_dir_id="target", link_strm=True), download_request_ids=[request_id])
 
         self.assertTrue(result["ok"])
         self.assertEqual(manager.task_status()["status"], "partial")
-        self.assertEqual(finish.call_args.args[1], "partial")
-        final = update_request.call_args_list[-1].kwargs
+        receipt = finish.call_args.args[1]
+        self.assertEqual(receipt["status"], "partial")
+        final = receipt["request_settlement"]["requests"][str(request_id)]
         self.assertEqual(final["organize_status"], "completed")
         self.assertNotIn("organize_started", final)  # 不重置已领取的整理请求。
         self.assertEqual(final["strm_status"], "failed")
@@ -206,8 +462,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=77), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ) as finish, patch(
             "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle",
             return_value=True,
@@ -230,8 +486,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         organizer.organize.assert_called_once()
         self.assertTrue(organizer.organize.call_args.kwargs["require_complete_scan"])
         finish.assert_called_once()
-        self.assertEqual(finish.call_args.args[1], "failed")
-        self.assertIn("ProgrammingError", finish.call_args.kwargs["error"])
+        self.assertEqual(finish.call_args.args[1]["status"], "failed")
+        self.assertIn("ProgrammingError", finish.call_args.args[1]["persistence_error"])
         send_event.assert_called_once()
         self.assertEqual(send_event.call_args.kwargs["chat_id"], "12345")
         self.assertEqual(send_event.call_args.args[0], result["task_id"])
@@ -244,8 +500,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=78), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ), patch(
             "app.modules.telegram_organize_lifecycle.publish_organize_lifecycle",
             return_value=False,
@@ -288,8 +544,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer) as organizer_cls, patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=81), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ):
             result = manager.start(
                 [{"id": "s1", "name": "来源一"}, {"id": "s2", "name": "来源二"}],
@@ -325,8 +581,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=validator), patch(
             "app.modules.organize_tasks.threading.Thread", _SwitchDefaultCredentialThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=80), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ) as finish, patch(
             "app.modules.telegram_notification_center.send_event_result",
             return_value=TelegramSendResult(ok=True),
@@ -340,8 +596,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertEqual(manager.task_status()["status"], "failed")
         validator.organize.assert_not_called()
         finish.assert_called_once()
-        self.assertEqual(finish.call_args.args[1], "failed")
-        self.assertIn("RuntimeError", finish.call_args.kwargs["error"])
+        self.assertEqual(finish.call_args.args[1]["status"], "failed")
+        self.assertIn("RuntimeError", finish.call_args.args[1]["persistence_error"])
 
     def test_confirmed_client_generation_change_blocks_background_writes(self):
         manager = OrganizeTaskManager()
@@ -357,8 +613,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _SwitchCredentialThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=79), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ) as finish, patch(
             "app.modules.telegram_notification_center.send_event_result",
             return_value=TelegramSendResult(ok=True),
@@ -374,8 +630,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertEqual(manager.task_status()["status"], "failed")
         organizer.organize.assert_not_called()
         finish.assert_called_once()
-        self.assertEqual(finish.call_args.args[1], "failed")
-        self.assertIn("RuntimeError", finish.call_args.kwargs["error"])
+        self.assertEqual(finish.call_args.args[1]["status"], "failed")
+        self.assertIn("RuntimeError", finish.call_args.args[1]["persistence_error"])
 
     def test_same_client_token_refresh_does_not_invalidate_multi_source_task(self):
         class _RotatingRawClient:
@@ -435,9 +691,9 @@ class OrganizeTaskFailureTests(unittest.TestCase):
                 ), patch(
                     "app.modules.organize_tasks.threading.Thread", _ImmediateThread
                 ), patch(
-                    "app.modules.organize_tasks.db.add_task_run", return_value=81
+                    "app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run
                 ), patch(
-                    "app.modules.organize_tasks.db.finish_task_run"
+                    "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
                 ), patch(
                     "app.modules.telegram_notification_center.send_event_result",
                     return_value=TelegramSendResult(ok=True),
@@ -470,8 +726,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=78), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ), patch(
             "app.modules.organize_tasks.db.list_protected_guangya_staging_ids",
             return_value={"active-download-staging"},
@@ -629,6 +885,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         manager._admission_lock.release()
 
     def test_per_file_failure_persists_partial_state(self):
+        request_id, _ = db.create_download_request("test_per_file_failure_persists_partial_state", "magnet")
+        db.update_download_request(request_id, status="completed", gy_status="completed", gy_target_dir="source")
         manager = OrganizeTaskManager()
         organizer = MagicMock()
         organizer.organize.return_value = ([], {
@@ -638,13 +896,10 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=88), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run",
+            wraps=settle_organize_task_run,
         ) as finish, patch(
-            "app.modules.organize_tasks.db.update_download_request"
-        ), patch(
-            "app.modules.organize_tasks.db.update_download_request_and_sync_media_admission"
-        ) as update_request, patch(
             "app.modules.organize_tasks.db.get_download_request", return_value=None
         ), patch(
             "app.modules.organize_tasks.Organizer.trigger_post_actions"
@@ -654,18 +909,18 @@ class OrganizeTaskFailureTests(unittest.TestCase):
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
                 OrganizeRules(target_dir_id="target", link_strm=True),
-                download_request_ids=[91],
+                download_request_ids=[request_id],
             )
 
         self.assertTrue(result["ok"])
         self.assertEqual(manager.task_status()["status"], "partial")
         finish.assert_called_once()
-        self.assertEqual(finish.call_args.args[1], "partial")
-        final_update = update_request.call_args_list[-1]
-        self.assertEqual(final_update.args[0], 91)
-        self.assertEqual(final_update.kwargs["organize_started"], -1)
-        self.assertEqual(final_update.kwargs["organize_status"], "partial")
-        self.assertIn("人工处理", final_update.kwargs["organize_error"])
+        receipt = finish.call_args.args[1]
+        self.assertEqual(receipt["status"], "partial")
+        fields = receipt["request_settlement"]["requests"][str(request_id)]
+        self.assertEqual(fields["organize_started"], -1)
+        self.assertEqual(fields["organize_status"], "partial")
+        self.assertIn("人工处理", fields["organize_error"])
 
 
     def test_audit_failure_persists_partial_state(self):
@@ -679,8 +934,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=90), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ) as finish:
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
@@ -690,7 +945,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(manager.task_status()["status"], "partial")
         finish.assert_called_once()
-        self.assertEqual(finish.call_args.args[1], "partial")
+        self.assertEqual(finish.call_args.args[1]["status"], "partial")
 
     def test_empty_directory_cleanup_failure_persists_partial_state(self):
         manager = OrganizeTaskManager()
@@ -704,8 +959,8 @@ class OrganizeTaskFailureTests(unittest.TestCase):
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
             "app.modules.organize_tasks.threading.Thread", _ImmediateThread
-        ), patch("app.modules.organize_tasks.db.add_task_run", return_value=89), patch(
-            "app.modules.organize_tasks.db.finish_task_run"
+        ), patch("app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run), patch(
+            "app.modules.organize_tasks.settle_organize_task_run", wraps=settle_organize_task_run
         ) as finish:
             result = manager.start(
                 [{"id": "source", "name": "源目录"}],
@@ -715,7 +970,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(manager.task_status()["status"], "partial")
         finish.assert_called_once()
-        self.assertEqual(finish.call_args.args[1], "partial")
+        self.assertEqual(finish.call_args.args[1]["status"], "partial")
 
     def test_manual_operations_queue_fifo_and_keep_terminal_history(self):
         manager = OrganizeTaskManager()
@@ -802,7 +1057,7 @@ class OrganizeTaskFailureTests(unittest.TestCase):
         organizer.organize.side_effect = organize
 
         with patch("app.modules.organize_tasks.Organizer", return_value=organizer), patch(
-            "app.modules.organize_tasks.db.add_task_run", return_value=0
+            "app.modules.organize_tasks.db.add_task_run", wraps=db.add_task_run
         ), patch.object(OrganizeTaskManager, "_wake_download_tracker"):
             full = manager.start(
                 [{"id": "source", "name": "源目录"}],
