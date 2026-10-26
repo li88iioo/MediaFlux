@@ -164,7 +164,9 @@ class DownloadSubmissionCancellationTests(unittest.TestCase):
                                 assert current is not None
                                 self.assertEqual((current["qb_status"], current["qb_task_id"]), ("submitting", ""))
                                 self.assertEqual(remote_tasks, {torrent_hash})
-                                contender = CrossProcessLock("qb-control-write")
+                                contender = CrossProcessLock(
+                                    "qb-control-write" if kind == "http" else f"qb-submit-{torrent_hash}"
+                                )
                                 acquired = contender.acquire(blocking=False)
                                 if acquired:
                                     contender.release()

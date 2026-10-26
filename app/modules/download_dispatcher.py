@@ -22,7 +22,7 @@ from app.config import get
 from app.indexers.providers.base import augment_public_magnet, magnet_infohash
 from app.logger import get_logger
 from app.modules.offline import analyze_offline_url, detect_protocol, submit_offline
-from app.modules.qb_control import qb_control_write_lease
+from app.modules.qb_control import qb_control_write_lease, qb_submission_write_lease
 from app.repositories.download_requests import (
     download_display_title,
     usable_download_title,
@@ -1170,10 +1170,14 @@ def _dispatch_claimed_targets(
     }
     late_notices = []
     status = "submitting"
+    qb_identity = (torrent_identity(row) or qb_task_id_hint).strip().lower()
+    if not _QB_TORRENT_ID_RE.fullmatch(qb_identity):
+        qb_identity = ""
+    qb_lease = qb_submission_write_lease([qb_identity]) if qb_identity else qb_control_write_lease()
     for source in claimed_targets:
         # 远端任务从出现到身份落盘必须与用户移除串行；不能只保护 add，
         # 也不能为等待另一后端的回执长期占用 qB 控制 writer。
-        with qb_control_write_lease() if source == "qb" else nullcontext():
+        with qb_lease if source == "qb" else nullcontext():
             try:
                 result: dict[str, Any] = submissions[source]()
                 if not isinstance(result, dict) or not isinstance(result.get("ok"), bool):

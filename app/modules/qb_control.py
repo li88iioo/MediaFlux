@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Generator, Iterable
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 
 from app import database as db
 from app.logger import get_logger
@@ -26,9 +26,10 @@ class QBControlSafetyUnavailable(QBControlConflict):
 
 @contextmanager
 def qb_control_write_lease() -> Generator[None, None, None]:
-    """串行化所有会改变 qB 任务状态的入口。
+    """串行化控制入口与本地整理的 qB 状态转换。
 
     调用方必须在 lease 内完成安全检查和真实 qB 请求，不能只保护其中一段。
+    不同任务的提交可并发，提交与移除另由同一任务身份锁协调。
     """
     try:
         acquired = _QB_CONTROL_WRITE_LOCK.acquire(blocking=True)
@@ -40,6 +41,26 @@ def qb_control_write_lease() -> Generator[None, None, None]:
         yield
     finally:
         _QB_CONTROL_WRITE_LOCK.release()
+
+
+@contextmanager
+def qb_submission_write_lease(hashes: Iterable[str]) -> Generator[None, None, None]:
+    """同一任务的受理与移除互斥，不串行化不同资源的批量提交。
+
+    控制入口先持有全局控制锁，再按稳定顺序取得任务锁；提交只持有任务锁。
+    未知身份的历史 HTTP 提交仍由调用方使用全局控制锁保护。
+    """
+    with ExitStack() as held:
+        for task_id in sorted({value.strip().lower() for value in hashes}):
+            lock = CrossProcessLock(f"qb-submit-{task_id}")
+            try:
+                acquired = lock.acquire(blocking=True)
+            except OSError as exc:
+                raise QBControlSafetyUnavailable("qB 提交状态暂不可用，请稍后重试") from exc
+            if not acquired:
+                raise QBControlSafetyUnavailable("qB 提交状态暂不可用，请稍后重试")
+            held.callback(lock.release)
+        yield
 
 
 def assert_qb_control_allowed(hashes: Iterable[str], *, operation: str) -> None:
@@ -81,18 +102,19 @@ def remove_qb_tasks(client, hashes: Iterable[str]) -> bool:
     先落盘停止跟踪意图，防止远端成功、回包丢失或重启后旧请求再次告警。
     """
     normalized = list(dict.fromkeys((value or "").strip().lower() for value in hashes))
-    try:
-        changed = db.cancel_qb_download_tracking(normalized)
-    except Exception as exc:
-        raise QBControlSafetyUnavailable("下载跟踪状态暂不可用，未执行 qB 任务移除") from exc
-    if changed:
-        logger.info("用户移除 qB 任务，已停止 %s 条未完成下载请求的跟踪", len(changed))
-    try:
-        if not client.delete_torrents("|".join(normalized), delete_files=False):
-            raise RuntimeError("qB 未确认接收任务移除")
-    except Exception as exc:
-        raise QBTaskRemovalUnconfirmed(
-            "相关未完成下载的本地跟踪已停止，但 qB 任务移除未确认；"
-            "请核对 qB 实时任务。不会删除已下载文件，也不会重新提交下载。"
-        ) from exc
+    with qb_submission_write_lease(normalized):
+        try:
+            changed = db.cancel_qb_download_tracking(normalized)
+        except Exception as exc:
+            raise QBControlSafetyUnavailable("下载跟踪状态暂不可用，未执行 qB 任务移除") from exc
+        if changed:
+            logger.info("用户移除 qB 任务，已停止 %s 条未完成下载请求的跟踪", len(changed))
+        try:
+            if not client.delete_torrents("|".join(normalized), delete_files=False):
+                raise RuntimeError("qB 未确认接收任务移除")
+        except Exception as exc:
+            raise QBTaskRemovalUnconfirmed(
+                "相关未完成下载的本地跟踪已停止，但 qB 任务移除未确认；"
+                "请核对 qB 实时任务。不会删除已下载文件，也不会重新提交下载。"
+            ) from exc
     return True
