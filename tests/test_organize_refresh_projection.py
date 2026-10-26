@@ -40,6 +40,7 @@ def transport(monkeypatch):
     monkeypatch.setattr(center, "notification_target_chat_id", lambda chat="": chat or CHAT)
     monkeypatch.setattr(center, "_dispatch_stop", threading.Event())
     monkeypatch.setattr(center, "wake_telegram_notification_dispatcher", Mock())
+    monkeypatch.setattr(lifecycle, "_refresh_recovery_after_id", 0)
     send = Mock(return_value=TelegramSendResult(True, message_id=501))
     edit = Mock(return_value=TelegramSendResult(True, message_id=501))
     monkeypatch.setattr(center, "send_event_result", send)
@@ -193,8 +194,8 @@ def test_confirmation_rollup_survives_refresh_recovery(transport, monkeypatch, a
     if after_read:
         read_ready = lifecycle.list_recovered_organize_refresh_notifications
 
-        def read_then_confirm():
-            rows = read_ready()
+        def read_then_confirm(*args, **kwargs):
+            rows = read_ready(*args, **kwargs)
             assert len(rows) == 1
             confirm()  # 真实提交新汇总，使已读恢复快照的 revision 过期。
             return rows

@@ -858,6 +858,7 @@ def _publish(
     expected_confirmation_delivery: tuple[int, int] | None = None,
     expected_revision: int | None = None,
     expected_download_state: tuple[dict[str, Any], dict[str, Any] | None] | None = None,
+    update_existing_only: bool = False,
 ) -> NotificationPublishResult:
     normalized_importance = NotificationImportance(_importance(importance))
     normalized_topic = _topic(topic)
@@ -903,11 +904,14 @@ def _publish(
         )
         return NotificationPublishResult(False, status="invalid_key")
     existing = get_notification(key) if thread else None
+    if update_existing_only and (not existing or not expected_revision):
+        return NotificationPublishResult(False, status="invalid", event_key=key)
     continuation = bool(
         existing
         and int(existing.get("message_id") or 0) > 0
         and int(existing.get("delivered_revision") or 0) > 0
     )
+    allowed = True
     if not agent_interaction and not agent_continuation:
         allowed = allows_notification(
             normalized_importance, topic_enabled=topic_enabled,
@@ -918,7 +922,8 @@ def _publish(
             # 已经展示给用户的线程需要完成终态更新，避免 essential 等级下
             # 候选按钮、错误或“等待后处理”永久停留。
             allowed = (thread and continuation and notifications_enabled())
-        if not allowed:
+        # 事实恢复沿原序列化、route 与 revision CAS 落盘，不等同于允许发送。
+        if not allowed and not update_existing_only:
             return NotificationPublishResult(False, status="disabled")
     try:
         if event.actions:
@@ -979,11 +984,11 @@ def _publish(
     if row is None:
         return NotificationPublishResult(False, status="invalid", event_key=key)
     status = str(row.get("status") or "pending")
-    if deliver_now and not _dispatch_stop.is_set() and status in {"pending", "retry_wait"}:
+    if allowed and deliver_now and not _dispatch_stop.is_set() and status in {"pending", "retry_wait"}:
         drain_telegram_notifications(limit=1, event_key=key)
         row = get_notification(key) or row
         status = str(row.get("status") or status)
-    if status in {"pending", "retry_wait", "sending"}:
+    if allowed and status in {"pending", "retry_wait", "sending"}:
         wake_telegram_notification_dispatcher()
     return NotificationPublishResult(
         True,
@@ -1158,6 +1163,7 @@ def publish_notification_thread(
     expected_confirmation_delivery: tuple[int, int] | None = None,
     expected_revision: int | None = None,
     expected_download_state: tuple[dict[str, Any], dict[str, Any] | None] | None = None,
+    update_existing_only: bool = False,
 ) -> NotificationPublishResult:
     return _publish(
         thread_key,
@@ -1173,6 +1179,7 @@ def publish_notification_thread(
         expected_confirmation_delivery=expected_confirmation_delivery,
         expected_revision=expected_revision,
         expected_download_state=expected_download_state,
+        update_existing_only=update_existing_only,
     )
 
 

@@ -48,6 +48,8 @@ _TERMINAL_LIFECYCLE_STATES = frozenset({
 })
 _CONFIRMATION_ROLLUP_VERSION = 1
 _INCOMPLETE_MEDIA_STATUS_MARKER = "暂不生成最终缺集结论"
+_refresh_recovery_after_id = 0
+_refresh_recovery_lock = threading.Lock()
 
 
 def _field_value(event: NotificationEvent, label: str) -> str:
@@ -687,11 +689,17 @@ def _project_downstream(
 
 def reconcile_organize_refresh_notifications() -> int:
     """刷新 ACK 后（也包括进程重启），通过原通知 outbox 幂等收敛同一消息。"""
+    global _refresh_recovery_after_id
     from app.modules.organize_probe_notifications import probe_downstream_state
 
     updated = 0
     try:
-        rows = list_recovered_organize_refresh_notifications()
+        with _refresh_recovery_lock:
+            rows = list_recovered_organize_refresh_notifications(after_id=_refresh_recovery_after_id)
+            if not rows and _refresh_recovery_after_id:
+                rows = list_recovered_organize_refresh_notifications()
+            # 无论本页写入成功、CAS 冲突或载荷损坏都推进；到尾后绕回重试。
+            _refresh_recovery_after_id = int(rows[-1]["id"]) if rows else 0
     except Exception:
         get_logger(__name__).exception("读取整理刷新通知失败，下轮重试")
         return 0
@@ -712,6 +720,7 @@ def reconcile_organize_refresh_notifications() -> int:
             result = publish_notification_thread(
                 row["thread_key"], event, topic=NotificationTopic.ORGANIZE,
                 importance=importance, chat_id=row["chat_id"], expected_revision=row["revision"],
+                update_existing_only=True,
             )
             updated += bool(result)
         except Exception:

@@ -187,18 +187,20 @@ def get_notification(event_key: str) -> dict[str, Any] | None:
         return dict(row) if row is not None else None
 
 
-def list_recovered_organize_refresh_notifications(*, limit: int = 100) -> list[dict[str, Any]]:
+def list_recovered_organize_refresh_notifications(
+    *, after_id: int = 0, limit: int = 100,
+) -> list[dict[str, Any]]:
     """仅选本消息全部刷新路径已交接的父通知；待恢复依据仍在原 outbox。"""
     with db.get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM telegram_notification_outbox AS n WHERE topic='organize' "
+            "SELECT * FROM telegram_notification_outbox AS n WHERE id>? AND topic='organize' "
             "AND json_valid(event_json) "
             "AND json_array_length(event_json,'$.lifecycle.refresh.entries')>0 "
             "AND NOT EXISTS (SELECT 1 FROM strm_refresh_outbox AS r "
             "JOIN json_each(n.event_json,'$.lifecycle.refresh.entries') AS p "
             "ON r.path=json_extract(p.value,'$[0]') "
             "WHERE r.allow_emby=json_extract(p.value,'$[1]')) "
-            "ORDER BY id LIMIT ?", (max(1, min(limit, 1000)),),
+            "ORDER BY id LIMIT ?", (max(0, after_id), max(1, min(limit, 1000))),
         ).fetchall()
     return [dict(row) for row in rows]
 
