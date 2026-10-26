@@ -25,6 +25,7 @@ from app.modules.organize import (
 from app.modules.organize_scan import OrganizeScanResult
 from app.modules.organize_tasks import OrganizeTaskManager, _cleanup_manual_source_root
 from app.repositories.organize_history import settle_organize_task_run
+from app.repositories.organize_operation_jobs import get_organize_operation_job
 from tests.support import isolated_test_database
 
 
@@ -232,6 +233,143 @@ class OrganizeTaskSettlementTests(unittest.TestCase):
         self.assertIn("RuntimeError", self._run_row(accepted["run_id"])["error"])
         self.assertEqual(self._request_row(first)["organize_status"], "failed")
         self.organizer.organize.assert_called_once()
+
+    def _assert_durable_waits_for_unpersisted_receipt(self, outcome):
+        request = self._request("durable-after-" + outcome)
+        blocker = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self.addCleanup(blocker.close)
+        self.addCleanup(blocker.rollback)
+        connect = db._connect
+
+        def short_timeout():
+            conn = connect()
+            conn.execute("PRAGMA busy_timeout=30")
+            return conn
+
+        def organize(*args, **kwargs):
+            result = self._organize(*args, **kwargs)
+            blocker.execute("BEGIN IMMEDIATE")
+            if outcome == "failed":
+                raise RuntimeError("execution sentinel")
+            if outcome == "stopped":
+                self.assertTrue(self.manager.stop()["ok"])
+            return result
+
+        self.organizer.organize.side_effect = organize
+        with patch.object(db, "_connect", side_effect=short_timeout):
+            accepted = self._start([request])
+            self._join()
+        self.assertTrue(blocker.in_transaction)
+        blocker.rollback()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "running")
+        self.assertTrue(self.manager.task_status()["result"].get("request_settlement"))
+
+        # 数据库恢复到下次 dispatcher 重试之间，所有入口都必须保留唯一回执。
+        rejected = self.manager.start([{"id": "source"}], OrganizeRules(target_dir_id="target"))
+        self.assertFalse(rejected["ok"])
+        callback = MagicMock()
+        self.assertFalse(self.manager.start_operation("新操作", "must-wait", callback)["ok"])
+        callback.assert_not_called()
+        self.assertFalse(self.manager.stop(expected_task_id=accepted["task_id"])["ok"])
+        started, release = threading.Event(), threading.Event()
+        workers = []
+        observed = []
+
+        def execute(_row):
+            workers.append(threading.current_thread())
+            observed.append((self._run_row(accepted["run_id"])["status"],
+                             self._request_row(request)["organize_status"]))
+            started.set()
+            self.assertTrue(release.wait(3))
+            return {"stats": {"moved": 1}}
+
+        arguments = dict(job_kind="agent_directory_scrape", owner="settlement-test",
+                         payload={"version": 1}, dedupe_key="after-" + outcome)
+        with patch.object(self.manager, "_execute_durable_operation", side_effect=execute) as run:
+            try:
+                queued = self.manager.start_durable_operation("目录刮削", "离线目录", **arguments)
+                self.assertTrue(queued["ok"], queued)
+                self.assertTrue(queued.get("queued"), queued)
+                durable = get_organize_operation_job(queued["task_id"])
+                assert durable is not None
+                self.assertEqual(durable["status"], "pending")
+                replayed = self.manager.start_durable_operation("目录刮削", "离线目录", **arguments)
+                self.assertTrue(replayed["replayed"])
+                self.assertEqual(replayed["task_id"], queued["task_id"])
+                self.assertEqual(self.manager.task_status()["id"], accepted["task_id"])
+                run.assert_not_called()
+                self.manager._settlement_retry_at = 0
+                self.manager._operation_queue_wakeup.set()
+                self.assertTrue(started.wait(3), "结算完成后未自动执行排队操作")
+                run_status = {"completed": "success", "stopped": "skipped"}.get(outcome, outcome)
+                self.assertEqual(observed, [(run_status, outcome)])
+                old_task = self.manager.task_result(accepted["task_id"])
+                assert old_task is not None
+                self.assertEqual(old_task["status"], outcome)
+                self.assertNotIn("request_settlement", old_task["result"])
+            finally:
+                worker = self.manager._worker
+                release.set()
+                if worker is not None:
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive())
+                for worker in workers:
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive())
+            run.assert_called_once()
+        durable = get_organize_operation_job(queued["task_id"])
+        assert durable is not None
+        self.assertEqual(durable["status"], "completed")
+        self.organizer.organize.assert_called_once()
+        self.assertEqual(self.thread_errors, [])
+
+    def test_durable_operation_waits_for_unpersisted_success_receipt(self):
+        self._assert_durable_waits_for_unpersisted_receipt("completed")
+
+    def test_durable_operation_waits_for_unpersisted_failure_receipt(self):
+        self._assert_durable_waits_for_unpersisted_receipt("failed")
+
+    def test_durable_operation_waits_for_unpersisted_stop_receipt(self):
+        self._assert_durable_waits_for_unpersisted_receipt("stopped")
+
+    def test_durable_operation_can_start_with_persisted_partial_receipt(self):
+        request = self._request("durable-after-persisted-partial")
+        with db.get_conn() as conn:
+            conn.execute(
+                f"CREATE TRIGGER reject_settlement BEFORE UPDATE ON download_requests "
+                f"WHEN NEW.id={request} AND NEW.organize_status='completed' "
+                "BEGIN SELECT RAISE(FAIL,'request settlement fault'); END"
+            )
+        accepted = self._start([request])
+        self._join()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "partial")
+        started = threading.Event()
+        workers = []
+
+        def execute(_row):
+            workers.append(threading.current_thread())
+            started.set()
+            return {"stats": {"moved": 1}}
+
+        with patch.object(self.manager, "_execute_durable_operation", side_effect=execute):
+            next_task = self.manager.start_durable_operation(
+                "目录刮削", "离线目录", job_kind="agent_directory_scrape",
+                owner="settlement-test", payload={"version": 1}, dedupe_key="after-partial",
+            )
+            self.assertTrue(next_task["ok"], next_task)
+            self.assertFalse(next_task.get("queued", False))
+            self.assertTrue(started.wait(2))
+            for worker in workers:
+                worker.join(3)
+                self.assertFalse(worker.is_alive())
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER reject_settlement")
+        self.manager._retry_task_settlement()
+        self.assertEqual(self._run_row(accepted["run_id"])["status"], "success")
+        self.assertEqual(self._request_row(request)["organize_status"], "completed")
+        self.assertEqual(self.manager._task["id"], next_task["task_id"])
+        self.organizer.organize.assert_called_once()
+        self.assertEqual(self.thread_errors, [])
 
     def test_run_write_failure_rolls_back_request_facts_until_automatic_recovery(self):
         request = self._request("run-write-failure")

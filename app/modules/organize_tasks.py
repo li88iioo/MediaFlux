@@ -396,6 +396,12 @@ class OrganizeTaskManager:
         self._settlement_cursor = 0
         self._shutting_down = False
 
+    def _has_unpersisted_settlement_locked(self) -> bool:
+        """调用方须持有 _state_lock；仅内存回执阻止当前任务被替换。"""
+        return self._task.get("status") == "running" and bool(
+            (self._task.get("result") or {}).get("request_settlement")
+        )
+
     def start(
         self,
         sources: list[dict[str, str]],
@@ -433,8 +439,7 @@ class OrganizeTaskManager:
             if self._shutting_down:
                 self._admission_lock.release()
                 return {"ok": False, "error": "服务正在停止，暂不接受新的整理任务"}
-            if (self._task.get("status") == "running"
-                    and (self._task.get("result") or {}).get("request_settlement")):
+            if self._has_unpersisted_settlement_locked():
                 self._admission_lock.release()
                 return {"ok": False, "error": "网盘整理任务正在运行：前次回执尚待结算，数据库恢复后将自动结算；勿重复整理"}
             try:
@@ -955,8 +960,7 @@ class OrganizeTaskManager:
                 if self._shutting_down:
                     return {"ok": False, "error": "服务正在停止，暂不接受新的整理操作"}
                 duplicate = self._find_operation_locked(dedupe_key)
-                if (self._task.get("status") == "running"
-                        and (self._task.get("result") or {}).get("request_settlement")):
+                if self._has_unpersisted_settlement_locked():
                     return {"ok": False, "error": "整理回执尚未保存，数据库恢复后将自动结算", "retryable": True}
                 if duplicate is not None:
                     return {
@@ -1104,7 +1108,10 @@ class OrganizeTaskManager:
                 }
 
             with self._state_lock:
-                can_launch_now = self._worker is None and not self._operation_queue
+                can_launch_now = (
+                    self._worker is None and not self._operation_queue
+                    and not self._has_unpersisted_settlement_locked()
+                )
             if can_launch_now and self._lock.acquire(blocking=False):
                 try:
                     claimed = claim_organize_operation_job(task_id)
@@ -1550,8 +1557,7 @@ class OrganizeTaskManager:
                         self._settlement_retry_at = time.monotonic() + 5.0
                         self._retry_task_settlement()
                     with self._state_lock:
-                        if (self._task.get("status") == "running"
-                                and (self._task.get("result") or {}).get("request_settlement")):
+                        if self._has_unpersisted_settlement_locked():
                             break  # 不能让排队操作覆盖唯一的未持久化回执。
                     try:
                         durable_pending = count_pending_organize_operation_jobs() > 0
