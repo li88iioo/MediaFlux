@@ -478,7 +478,7 @@
         elements.searchSubmit.disabled = isLoading || state.loading;
         elements.loadMore.classList.toggle('is-loading', isLoading);
         const label = elements.loadMore.querySelector('span');
-        if (label) label.textContent = isLoading ? '正在调取' : (state.appendError ? '重试下一页' : '调取下一卷');
+        if (label) label.textContent = isLoading ? '正在调取' : (state.appendError ? (state.appendError.page ? '重试当前页' : '重试下一页') : '调取下一卷');
     }
 
     function showPaginationControl() {
@@ -487,7 +487,7 @@
         elements.loadMoreRow.hidden = !showManual;
         elements.sentinel.hidden = !canPaginate;
         const label = elements.loadMore.querySelector('span');
-        if (label && !state.loadingMore) label.textContent = state.appendError ? '重试下一页' : '调取下一卷';
+        if (label && !state.loadingMore) label.textContent = state.appendError ? (state.appendError.page ? '重试当前页' : '重试下一页') : '调取下一卷';
     }
 
     function disconnectInfiniteScroll() {
@@ -889,7 +889,8 @@
         delete elements.grid.dataset.globalSkeleton;
         const rows = asArray(items);
         if (!append) elements.grid.replaceChildren();
-        if (!rows.length && !append) {
+        else elements.grid.querySelector('.discovery-state-empty')?.remove();
+        if (!rows.length && !elements.grid.childElementCount) {
             elements.grid.append(emptyPanel(state.mode === 'search'
                 ? state.statusPayload?.health?.message || '没有找到匹配的影视资料。' : undefined));
         } else {
@@ -1129,10 +1130,11 @@
 
     async function loadItemsMode(signal, page = 1) {
         if (state.mode === 'search') {
+            const providers = state.appendError?.page === page ? state.appendError.providers : state.searchProviders;
             const params = {
                 q: state.searchQuery,
                 page,
-                providers: state.searchProviders.join(','),
+                providers: providers.join(','),
             };
             const payload = await api(`${DISCOVERY_SEARCH_PATH}?${queryString(params)}`, {}, signal);
             return {payload, items: extractItems(payload)};
@@ -1150,6 +1152,8 @@
     }
 
     async function loadActive({preserveContent = false, append = false} = {}) {
+        const searchRetry = state.mode === 'search' && state.appendError?.page === state.page ? state.appendError : null;
+        append ||= Boolean(searchRetry);
         const requestId = state.requestId + 1;
         state.requestId = requestId;
         state.controller?.abort();
@@ -1236,8 +1240,15 @@
                 }
                 const {payload, items} = itemResult;
                 state.statusPayload = state.mode === 'search' ? {health: searchProviderHealth(payload)} : payload;
-                state.hasMore = Boolean(payload.has_more ?? payload.hasMore);
-                state.appendError = null;
+                state.hasMore = Boolean(payload.has_more ?? payload.hasMore) || Boolean(searchRetry?.hasMore);
+                // 未完成的来源留在本页；只重试失败来源，保留先前成功来源的续页事实。
+                state.appendError = state.mode === 'search' && asArray(payload.errors).length
+                    ? Object.assign(new Error(state.statusPayload.health.message), {
+                        page: state.page,
+                        providers: asArray(payload.errors).map(error => error.provider),
+                        hasMore: state.hasMore,
+                    }) : null;
+                state.hasMore ||= Boolean(state.appendError);
                 if (append) {
                     const merged = mergeUniqueItems(state.itemsData, items);
                     state.itemsData = merged.items;
@@ -1261,7 +1272,7 @@
             if (!(await keepSkeletonVisible(skeletonShownAt, requestId))) return false;
             const target = state.mode === 'sections' ? elements.sections : elements.grid;
             if (append) {
-                state.appendError = error;
+                state.appendError = searchRetry || error;
             } else if (!shouldPreserve) {
                 delete target.dataset.globalSkeleton;
                 target.replaceChildren(errorPanel(error, () => loadActive()));
@@ -3606,8 +3617,7 @@
         if (state.loadingMore || state.loading || !state.hasMore) return false;
         disconnectInfiniteScroll();
         const previousPage = state.page;
-        state.page += 1;
-        state.appendError = null;
+        state.page = state.appendError?.page ?? state.page + 1;
         showPaginationControl();
         setLoadingMore(true);
         try {

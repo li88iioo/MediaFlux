@@ -5,6 +5,7 @@ import re
 import shutil
 import unittest
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 try:
@@ -102,7 +103,8 @@ class DiscoverySearchUIContractTests(unittest.TestCase):
             "state.mode === 'search'",
             "elements.searchForm.addEventListener('submit'",
             "'/api/discovery/search'",
-            "providers: state.searchProviders.join(',')",
+            "state.appendError?.page === page ? state.appendError.providers : state.searchProviders",
+            "providers: providers.join(',')",
             "loadActive({preserveContent: true}",
         ):
             self.assertIn(contract, self.script)
@@ -1652,7 +1654,7 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
         return page, errors
 
     @staticmethod
-    def search_payload(*, items=(), failed=(), has_more=False):
+    def search_payload(*, items=(), failed=(), has_more=False) -> dict[str, Any]:
         providers = ("tmdb", "douban", "bangumi")
         return {
             "items": list(items), "has_more": has_more,
@@ -1941,6 +1943,130 @@ class DiscoveryResourceSiteFilterBrowserTests(unittest.TestCase):
                 self.assertTrue(page.evaluate("window.originalSearchCard === document.querySelector('#discovery-grid .discovery-card')"))
                 self.assertTrue(page.locator("#discovery-load-more-row").is_hidden())
                 self.assertEqual(errors, [])
+
+    def test_search_partial_page_retries_failed_sources_before_advancing(self):
+        for width in (390, 1440):
+            with self.subTest(width=width):
+                calls = []
+                first = [{"provider": "tmdb" if index == 1 else "bangumi", "media_type": "movie" if index == 1 else "tv", "external_id": str(index),
+                          "title": f"第一页 {index}", "in_watchlist": index == 1} for index in range(1, 19)]
+                second = {"provider": "bangumi", "media_type": "tv", "external_id": "20", "title": "第二页番组"}
+                recovered = {"provider": "tmdb", "media_type": "movie", "external_id": "21", "title": "第二页恢复"}
+                douban = {"provider": "douban", "media_type": "movie", "external_id": "22", "title": "第二页豆瓣"}
+                responses = [
+                    self.search_payload(items=first, has_more=True),
+                    self.search_payload(items=[first[1], second], failed=("tmdb", "douban"), has_more=True),
+                    self.search_payload(items=[first[0], recovered], failed=("douban",)),
+                    self.search_payload(items=[douban]),
+                    self.search_payload(items=[{**recovered, "external_id": "31", "title": "第三页"}]),
+                ]
+
+                def respond(params):
+                    calls.append((int(params["page"][0]), params["providers"][0]))
+                    payload = responses[len(calls) - 1]
+                    providers = params["providers"][0].split(",")
+                    failed = {error["provider"] for error in payload["errors"]}
+                    payload.update(providers_attempted=providers,
+                                   providers_succeeded=[name for name in providers if name not in failed])
+                    return payload
+
+                page, errors = self.open_catalogue(width=width, search_response=respond)
+                self.submit_catalogue_search(page)
+                page.evaluate("""() => {
+                    window.originalSearchCards = [...document.querySelectorAll('#discovery-grid .discovery-card')];
+                    window.scrollTo(0, 300);
+                }""")
+                scroll = page.evaluate("window.scrollY")
+                for missing in ("TMDB", "豆瓣"):
+                    page.locator("#discovery-load-more").evaluate("button => button.click()")
+                    page.wait_for_function("!document.getElementById('discovery-load-more').disabled")
+                    self.assertIn("重试", page.locator("#discovery-load-more").inner_text())
+                    self.assertIn(missing, page.locator("#discovery-provider-status").get_attribute("aria-label") or "")
+                    self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+                    self.assertEqual(page.evaluate("window.scrollY"), scroll)
+                    self.assertTrue(page.evaluate("window.originalSearchCards.every(card => card.isConnected)"))
+                    self.assertEqual(page.locator('[data-watchlist-key="tmdb:movie:1"]').get_attribute("aria-pressed"), "true")
+                page.locator("#discovery-load-more").evaluate("button => button.click()")
+                page.wait_for_function("!document.getElementById('discovery-load-more').disabled")
+                self.assertEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+                self.assertNotIn("重试", page.locator("#discovery-load-more").inner_text())
+                self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 21)
+                page.locator("#discovery-load-more").evaluate("button => button.click()")
+                page.wait_for_function("document.getElementById('discovery-load-more-row').hidden")
+                self.assertEqual(calls, [(1, "tmdb,douban,bangumi"), (2, "tmdb,douban,bangumi"),
+                                         (2, "tmdb,douban"), (2, "douban"), (3, "tmdb,douban,bangumi")])
+                self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 22)
+                self.assertEqual(errors, [])
+
+    def test_search_partial_first_and_last_pages_allow_retry_without_more_results(self):
+        for number, recovered_count in ((1, 0), (1, 1), (2, 0), (2, 1)):
+            with self.subTest(page=number, recovered=recovered_count):
+                calls = []
+                first = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "已有结果"}
+                recovered = {**first, "external_id": "2", "title": "恢复结果"}
+
+                def respond(params):
+                    calls.append((int(params["page"][0]), params["providers"][0]))
+                    if len(calls) < number:
+                        return self.search_payload(items=[first], has_more=True)
+                    if len(calls) == number:
+                        return self.search_payload(failed=("tmdb",))
+                    return self.search_payload(items=[recovered] if recovered_count else [])
+
+                page, errors = self.open_catalogue(search_response=respond)
+                self.submit_catalogue_search(page)
+                if number == 2:
+                    page.locator("#discovery-load-more").click()
+                    page.wait_for_function("!document.getElementById('discovery-load-more').disabled")
+                self.assertTrue(page.locator("#discovery-load-more-row").is_visible())
+                self.assertIn("重试", page.locator("#discovery-load-more").inner_text())
+                self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+                page.locator("#discovery-load-more").click()
+                page.wait_for_function("document.getElementById('discovery-load-more-row').hidden")
+                self.assertEqual(calls[-1], (number, "tmdb"))
+                self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), number - 1 + recovered_count)
+                self.assertEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+                if number == 1 and not recovered_count:
+                    self.assertIn("没有找到匹配的影视资料", page.locator(".discovery-state-empty").inner_text())
+                else:
+                    self.assertEqual(page.locator(".discovery-state-empty").count(), 0)
+                self.assertEqual(errors, [])
+
+    def test_search_failed_partial_retry_and_cached_search_keep_pending_page(self):
+        calls = []
+        first = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "原有结果"}
+        partial = {"provider": "bangumi", "media_type": "tv", "external_id": "2", "title": "第二页结果"}
+        recovered = {**first, "external_id": "3", "title": "故障恢复"}
+
+        def respond(params):
+            calls.append((int(params["page"][0]), params["providers"][0]))
+            if len(calls) == 1:
+                return self.search_payload(items=[first], has_more=True)
+            if len(calls) == 2:
+                return self.search_payload(items=[partial], failed=("tmdb",))
+            if len(calls) == 3:
+                payload = self.search_payload(failed=("tmdb",))
+                payload.update(providers_attempted=["tmdb"], providers_succeeded=[])
+                return payload
+            return self.search_payload(items=[recovered])
+
+        page, errors = self.open_catalogue(search_response=respond)
+        self.submit_catalogue_search(page)
+        for _ in range(2):
+            page.locator("#discovery-load-more").click()
+            page.wait_for_function("!document.getElementById('discovery-load-more').disabled")
+            self.assertNotEqual(page.locator("#discovery-provider-status").get_attribute("data-tone"), "ready")
+        self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 2)
+        page.locator("#discovery-tab-douban-tv").click()
+        page.wait_for_function("!document.getElementById('discovery-refresh').disabled")
+        self.submit_catalogue_search(page)
+        self.assertEqual(len(calls), 3)
+        self.assertIn("重试", page.locator("#discovery-load-more").inner_text())
+        page.locator("#discovery-load-more").click()
+        page.wait_for_function("document.getElementById('discovery-load-more-row').hidden")
+        self.assertEqual(calls, [(1, "tmdb,douban,bangumi"), (2, "tmdb,douban,bangumi"), (2, "tmdb"), (2, "tmdb")])
+        self.assertEqual(page.locator("#discovery-grid .discovery-card").count(), 3)
+        self.assertEqual(errors, [])
 
     def test_search_partial_results_are_marked_incomplete_including_empty_results(self):
         card = {"provider": "tmdb", "media_type": "movie", "external_id": "1", "title": "部分结果"}
