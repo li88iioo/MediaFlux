@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import tests  # noqa: F401 - 应用导入前隔离运行路径与数据库
+
+import json
+import socket
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 from app import database as db
+from app.clients.qbittorrent import TorrentTask
+from app.indexers.downloads import submit_download_input
 from app.modules import download_dispatcher as dispatcher
+from app.modules.download_tracker import DownloadTracker
+from app.modules.rss import RSSEngine, rss_entry_delivery
 from tests.support import isolated_test_database
 
 
@@ -284,6 +292,185 @@ class DownloadRetrySymmetryAuditTests(unittest.TestCase):
         get_rss_entry_result = db.get_rss_entry(entry)
         assert get_rss_entry_result is not None
         self.assertEqual(get_rss_entry_result["status"], "failed")
+
+
+class DownloadSubmissionLogFailureTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(isolated_test_database())
+        for target, name in (
+            (socket.socket, "connect"), (socket.socket, "connect_ex"), (socket, "getaddrinfo"),
+        ):
+            self.enterContext(patch.object(target, name, side_effect=AssertionError("禁止测试访问网络")))
+        self.enterContext(patch.object(
+            dispatcher, "get", side_effect=lambda key, default="": "http://qb.invalid" if key == "QB_URL" else default,
+        ))
+        self.enterContext(patch.object(
+            dispatcher, "analyze_offline_url", return_value=SimpleNamespace(allowed=True, reason=""),
+        ))
+        self.qb = self.enterContext(patch.object(dispatcher, "_submit_qb", side_effect=lambda row, **kwargs: {
+            "ok": True, "task_id": dispatcher.torrent_identity(row),
+        }))
+        self.gy = self.enterContext(patch.object(dispatcher, "_submit_guangya", return_value={
+            "ok": True, "task_id": "cloud-accepted", "task_ids": ["cloud-accepted"],
+        }))
+        self.engine = RSSEngine()
+        self.addCleanup(self.engine.close)
+        self.serial = 0
+
+    def item(self):
+        self.serial += 1
+        return dispatcher.normalize_download_url(f"magnet:?xt=urn:btih:{self.serial:040x}")
+
+    def pending_rss_entry(self):
+        item = self.item()
+        sid = db.add_rss_subscription(f"日志故障 {self.serial}", f"https://feed.invalid/{self.serial}", download_method="qb")
+        eid = db.add_rss_entry_with_media(
+            sid, "Episode", f"guid-{self.serial}", payload=json.dumps({"torrent_url": item.source_value}),
+        )["id"]
+        return eid, item
+
+    @staticmethod
+    def reject_log_writes():
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_download_log BEFORE INSERT ON download_log "
+                "BEGIN SELECT RAISE(ABORT,'injected download log failure'); END"
+            )
+
+    def test_rss_log_failure_preserves_receipt_and_tracker_completion(self):
+        eid, item = self.pending_rss_entry()
+        self.reject_log_writes()
+        result = self.engine.download(eid)
+        self.assertTrue(result["ok"], result)
+        request_id = result["request_id"]
+        request = db.get_download_request(request_id)
+        assert request is not None
+        self.assertEqual((request["status"], request["qb_status"]), ("submitted", "submitted"))
+        self.assertEqual(request["qb_task_id"], dispatcher.torrent_identity(request))
+        entry = db.get_rss_entry(eid)
+        assert entry is not None
+        self.assertEqual((entry["status"], entry["processed"]), ("downloaded", 1))
+        self.assertFalse(rss_entry_delivery(entry)["review_required"])
+        self.assertEqual(db.list_download_logs(), [])
+        self.assertTrue(self.engine.download(eid)["existing"])
+        self.qb.assert_called_once()
+        with db.get_conn() as conn:
+            conn.execute("DROP TRIGGER reject_download_log")
+        task = TorrentTask(
+            hash=dispatcher.torrent_identity(request), name=item.title,
+            progress=1.0, state="uploading", save_path="/downloads", content_path="/downloads/Episode.mkv",
+            size=1024, downloaded=1024, dlspeed=0, upspeed=0, eta=0, ratio=0.0, category="", added_on=0,
+        )
+        tracker = DownloadTracker()
+        with (
+            patch.object(tracker, "_run_staging_reconciliation_if_due", return_value=0),
+            patch.object(tracker, "_run_torrent_data_cleanup_if_due", return_value=0),
+            patch.object(tracker, "_qb_tasks", return_value=(True, [task])) as scan,
+            patch.object(tracker, "_start_local_import") as local_import,
+            patch.object(DownloadTracker, "_publish_lifecycle", return_value=False),
+        ):
+            self.assertEqual(tracker.run_once(), 1)
+        scan.assert_called_once()
+        local_import.assert_called_once()
+        self.assertEqual(local_import.call_args.args[0]["qb_status"], "completed")
+        request = db.get_download_request(request_id)
+        assert request is not None
+        self.assertEqual((request["status"], request["qb_status"]), ("completed", "completed"))
+        self.assertEqual(request["notification_event_status"], "completed")
+        entry = db.get_rss_entry(eid)
+        assert entry is not None
+        self.assertEqual(entry["processed"], 1)
+        self.qb.assert_called_once()
+
+    def test_log_failure_preserves_first_supplement_and_successor_results(self):
+        self.reject_log_writes()
+        for entry in ("first", "supplement", "successor"):
+            for target in ("qb", "guangya", "both"):
+                if entry == "supplement" and target == "both":
+                    continue
+                with self.subTest(entry=entry, target=target):
+                    self.qb.reset_mock()
+                    self.gy.reset_mock()
+                    item = self.item()
+                    source_id = 0
+                    peer_status = "downloading" if entry == "supplement" else "completed"
+                    if entry != "first":
+                        source_id = dispatcher.create_request(item, "", "log-fault")["id"]
+                        selected = {"qb", "guangya"} if target == "both" else {target}
+                        db.update_download_request(
+                            source_id, status="submitted" if entry == "supplement" else "completed",
+                            targets="both", qb_status="failed" if "qb" in selected else peer_status,
+                            gy_status="failed" if "guangya" in selected else peer_status,
+                            qb_task_id=dispatcher.torrent_identity({"kind": "magnet", "source_value": item.source_value}),
+                            gy_task_id="cloud-kept", gy_task_ids='["cloud-kept"]',
+                        )
+                    if entry == "successor":
+                        result = dispatcher.resubmit_download_request(source_id, target)
+                        self.assertNotEqual(result["request_id"], source_id)
+                    else:
+                        result = submit_download_input(item, target, origin="log-fault")["dispatch"]
+                        if source_id:
+                            self.assertEqual(result["request_id"], source_id)
+                    self.assertTrue(result["ok"], result)
+                    self.assertFalse(result["review_required"], result)
+                    request = db.get_download_request(result["request_id"])
+                    assert request is not None
+                    for backend, field, submit in (("qb", "qb_status", self.qb), ("guangya", "gy_status", self.gy)):
+                        expected = target in {backend, "both"}
+                        self.assertEqual(submit.call_count, int(expected))
+                        if expected:
+                            self.assertEqual(request[field], "submitted")
+                            if entry == "successor":
+                                source = db.get_download_request(source_id)
+                                assert source is not None
+                                self.assertEqual(source[field], "resubmitted")
+                        elif source_id:
+                            source = db.get_download_request(source_id)
+                            assert source is not None
+                            self.assertEqual(source[field], peer_status)
+
+    def test_log_failure_keeps_unknown_backend_receipts_blocked(self):
+        self.reject_log_writes()
+        for backend_error in (False, True):
+            with self.subTest(backend_error=backend_error):
+                self.qb.reset_mock()
+                self.qb.side_effect = RuntimeError("backend receipt unavailable") if backend_error else None
+                self.qb.return_value = {"ok": False, "failure_code": "qb_outcome_unknown", "error": "回执未知"}
+                eid, _item = self.pending_rss_entry()
+                result = self.engine.download(eid)
+                self.assertFalse(result["ok"], result)
+                self.assertTrue(result["review_required"], result)
+                request = db.get_download_request(result["request_id"])
+                assert request is not None
+                self.assertEqual(request["qb_status"], "outcome_unknown")
+                entry = db.get_rss_entry(eid)
+                assert entry is not None
+                self.assertEqual((entry["status"], entry["processed"]), ("failed", 0))
+                self.assertTrue(rss_entry_delivery(entry)["review_required"])
+                self.assertFalse(self.engine.download(eid)["ok"])
+                self.qb.assert_called_once()
+
+    def test_failed_acceptance_transaction_still_requires_manual_review(self):
+        self.reject_log_writes()
+        with db.get_conn() as conn:
+            conn.execute(
+                "CREATE TRIGGER reject_download_acceptance BEFORE UPDATE ON download_requests "
+                "WHEN NEW.qb_status='submitted' "
+                "BEGIN SELECT RAISE(ABORT,'injected acceptance failure'); END"
+            )
+        item = self.item()
+        result = submit_download_input(item, "qb", origin="acceptance-fault")
+        self.assertEqual(result["summary"]["status"], "manual_review")
+        self.assertFalse(result["summary"]["ok"])
+        request = db.get_download_request(result["request_id"])
+        assert request is not None
+        self.assertEqual((request["status"], request["qb_status"]), ("manual_review", "manual_review"))
+        self.assertEqual(request["qb_task_id"], "")
+        self.assertEqual(db.list_download_logs(), [])
+        repeated = submit_download_input(item, "qb", origin="acceptance-fault")
+        self.assertTrue(repeated["summary"]["duplicate"])
+        self.assertEqual(repeated["request_id"], result["request_id"])
+        self.qb.assert_called_once()
 
 
 class GuangYaRetryDestinationTests(unittest.TestCase):

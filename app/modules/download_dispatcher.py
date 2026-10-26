@@ -1232,16 +1232,21 @@ def _dispatch_claimed_targets(
     )
 
     for source, result in results.items():
-        db.add_download_log(
-            source=source,
-            title=title,
-            path=source_value if log_path is None else log_path,
-            rss_item_id=rss_item_id,
-            request_id=request_id,
-            backend_task_id=str(result.get("task_id") or ""),
-            status=_backend_submission_status(source, result),
-            error=_submission_log_error(result, late_notice),
-        )
+        # 请求与订阅受理已原子收尾；展示日志失败不能反转事实或阻断跟踪。
+        try:
+            db.add_download_log(
+                source=source,
+                title=title,
+                path=source_value if log_path is None else log_path,
+                rss_item_id=rss_item_id,
+                request_id=request_id,
+                backend_task_id=str(result.get("task_id") or ""),
+                status=_backend_submission_status(source, result),
+                error=_submission_log_error(result, late_notice),
+            )
+        except Exception as exc:
+            logger.warning("下载日志写入失败，保留已持久化请求 request=%s backend=%s type=%s",
+                           request_id, source, type(exc).__name__)
     if late_notice:
         return {
             "ok": False, "request_id": request_id, "status": status,
