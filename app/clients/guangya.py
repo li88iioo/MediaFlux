@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import math
+import mimetypes
 import os
 import random
 import re
@@ -754,6 +755,36 @@ def _to_int(value) -> int:
         return int(float(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _video_variant(gcid: str, info: dict, *, original: bool = False, filename: str = "") -> dict:
+    """保留真实尺寸和资源身份；同尺寸的原文件与云端转码不能合并。"""
+    container = str(info.get("videoType") or (
+        Path(filename).suffix.lstrip(".") if original else ""
+    )).lower()
+    hls = not original and container in {"mpegts", "m3u8", "hls"}
+    mime_type = "application/x-mpegURL" if hls else {
+        "mp4": "video/mp4", "mov": "video/quicktime", "mkv": "video/x-matroska",
+        "matroska": "video/x-matroska", "mpegts": "video/MP2T",
+    }.get(container, str(info.get("mimeType") or "") or (
+        mimetypes.guess_type(filename)[0] if original else None
+    ) or "application/octet-stream")
+    resolution = info.get("resolution") or {}
+    width = _to_int(resolution.get("width")) or None
+    height = _to_int(resolution.get("height")) or None
+    return {
+        "id": "original" if original else gcid,
+        "original": original,
+        "label": "原画" if original else str(info.get("resolutionName") or f"{width}×{height}"),
+        "width": width, "height": height,
+        "video_codec": str(info.get("videoCodec") or "").lower() or None,
+        "audio_codec": str(info.get("audioCodec") or "").lower() or None,
+        "bitrate": _to_int(info.get("bitRate")) or None,
+        "duration": _to_int(info.get("duration")) or None,
+        "container": container or None,
+        "transport": "hls" if hls else "file",
+        "mime_type": mime_type,
+    }
 
 
 def _to_file(raw: dict, parent_id: str = "0") -> GuangYaFile:
@@ -3022,6 +3053,82 @@ class GuangYaClient:
         return result
 
     # ===== 直链（STRM 302 反代用）=====
+    def playback_info(
+        self, file_id: str, *, quality: str | None = None, timeout: float = 8.0,
+    ) -> dict:
+        """枚举现有画质，或解析其中一档；不发起云端转码，不持久化播放地址。
+
+        枚举与选档共用文件详情作为资源归属依据。解析时重新读取，避免拿其它
+        文件的 gcid 换取直链；整个详情 + 取流过程共用一个只读截止时间。
+        """
+        deadline = monotonic() + max(0.001, float(timeout))
+
+        def read(endpoint: str, payload: dict, operation: str) -> dict:
+            def fetch():
+                if self._invalidate_if_stale():
+                    raise RuntimeError("光鸭登录凭证已撤销，请重新登录")
+                if self._raw is None:
+                    raise RuntimeError("光鸭未登录")
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("光鸭画质读取超时")
+                return self._raw.request(
+                    f"https://api.guangyapan.com/{endpoint}", method="POST",
+                    json=payload, timeout=remaining,
+                ).json()
+
+            try:
+                result = self._call_read(operation, fetch, deadline=deadline)
+            except Exception as exc:
+                if self._is_timeout_error(exc):
+                    raise TimeoutError("光鸭画质读取超时") from exc
+                raise
+            _validate_read_response(result)
+            data = result.get("data")
+            if not isinstance(data, dict):
+                raise TypeError("光鸭播放响应不完整")
+            return data
+
+        detail = read("userres/v1/file/get_file_detail", {"fileId": file_id}, "file_info")
+        file = detail.get("fileInfo")
+        if not isinstance(file, dict) or str(file.get("fileId") or "") != file_id:
+            raise RuntimeError("光鸭播放文件详情不完整")
+        resources = detail.get("videoResource") or []
+        if not isinstance(resources, list):
+            raise TypeError("光鸭画质列表不完整")
+        variants = [_video_variant("", {}, original=True, filename=str(file.get("fileName") or ""))]
+        seen = {"original"}
+        for resource in resources:
+            if not isinstance(resource, dict):
+                raise TypeError("光鸭画质条目不完整")
+            gcid = str(resource.get("gcid") or "")
+            info = resource.get("info") or {}
+            if not gcid or not isinstance(info, dict):
+                continue
+            original = gcid == str(file.get("gcid") or "")
+            variant = _video_variant(gcid, info, original=original, filename=str(file.get("fileName") or ""))
+            if original:
+                variants[0] = variant
+            elif (gcid not in seen and variant["width"] and variant["height"]
+                  and variant["mime_type"] != "application/octet-stream"):
+                # 不把未生成的视频资源、音频或未知传输格式当作可选画质。
+                variants.append(variant)
+                seen.add(gcid)
+        if quality is None:
+            return {"variants": variants}
+        selected = next((item for item in variants if item["id"] == quality), None)
+        if selected is None:
+            raise FileNotFoundError("所选画质不属于该文件或已不可用，请刷新画质列表")
+        if selected["original"]:
+            data = read("nd.bizuserres.s/v1/get_res_download_url", {"fileId": file_id}, "get_download_url")
+        else:
+            data = read("userres/v1/file/get_vod_download_url", {"fileId": file_id, "gcid": quality}, "get_vod_download_url")
+        url = str(data.get("signedURL") or "")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise RuntimeError("光鸭未返回有效播放地址")
+        return {"variant": selected, "url": url, "expires_in": _to_int(data.get("urlDuration")) or None}
+
     def get_download_url(
         self,
         file_id: str,

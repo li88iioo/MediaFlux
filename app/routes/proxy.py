@@ -1,4 +1,4 @@
-"""光鸭 302 播放代理路由。"""
+"""光鸭原画 302 与同一签名 STRM 的云端画质发现/解析。"""
 from __future__ import annotations
 
 import hashlib
@@ -30,6 +30,7 @@ def play_gy(
     file_id: str, etag: str, size: str, filename: str,
     request: Request = None,  # type: ignore[assignment]
     v: str = "", sig: str = "", enc: str = "",
+    view: str = "", quality: str = "",
 ):
     from app.modules.playgy_signing import decode_playgy_path_token, verify_playgy
 
@@ -47,6 +48,10 @@ def play_gy(
     if not verify_playgy(file_id, etag, size, v, sig):
         return JSONResponse({"error": "播放地址签名无效"}, status_code=403)
     is_head = str(getattr(request, "method", "")).upper() == "HEAD"
+    if view not in {"", "variants", "resolve"} or bool(quality) != (view == "resolve"):
+        return JSONResponse({"error": "画质查询参数无效"}, status_code=400)
+    if view and is_head:
+        return JSONResponse({"error": "画质查询请使用 GET"}, status_code=405, headers={"Allow": "GET"})
     content_length = 0
     if is_head:
         try:
@@ -62,6 +67,18 @@ def play_gy(
             logger.warning("playgy 被访问但光鸭未登录")
             _playgy_signed_urls.clear()
             return JSONResponse({"error": "光鸭未登录"}, status_code=503)
+        if view:
+            try:
+                payload = client.playback_info(
+                    file_id, quality=quality if view == "resolve" else None,
+                    timeout=PLAYGY_SIGNED_URL_TIMEOUT_SECONDS,
+                )
+            except FileNotFoundError:
+                return JSONResponse({"error": "所选画质已不可用，请刷新画质列表"}, status_code=404)
+            return JSONResponse(
+                {"protocol": "mediaflux.playback.v1", **payload},
+                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"},
+            )
         try:
             raw_client = client.raw
         except (AttributeError, RuntimeError):
@@ -169,7 +186,7 @@ def play_gy(
             logger, logging.ERROR, f"playgy-error:{type(exc).__name__}",
             "playgy 异常 type=%s", type(exc).__name__,
         )
-        return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=500)
+        return JSONResponse({"error": "光鸭播放地址获取失败"}, status_code=502 if view else 500)
     finally:
         close_guangya_client(client)
 
@@ -195,6 +212,8 @@ def play_gy_endpoint(
     v: str = "",
     sig: str = "",
     enc: str = "",
+    view: str = "",
+    quality: str = "",
 ):
     return play_gy(
         file_id,
@@ -205,4 +224,6 @@ def play_gy_endpoint(
         v=v,
         sig=sig,
         enc=enc,
+        view=view,
+        quality=quality,
     )
