@@ -333,6 +333,48 @@ class _TvVariantScraper(_VariantScraper):
 
 
 class MediaIdentitySafetyTests(unittest.TestCase):
+    def test_movie_title_words_do_not_bypass_existing_version_policy(self):
+        organizer = Organizer(client=Mock(), scraper=TMDBScraper(client=Mock()))
+        self.addCleanup(organizer.close)
+        for title in ("The Interview", "Extras", "Interview with the Vampire"):
+            for marker in ("", ".{tmdb-123}"):
+                with self.subTest(title=title, marker=marker):
+                    basename = title.replace(" ", ".")
+                    existing = GuangYaFile(
+                        "existing", f"{basename}.2026{marker}.1080p.mkv",
+                        False, 2000, parent_id="library",
+                    )
+                    plan = OrganizePlan(
+                        file_id="incoming", original_name=f"{basename}.2026.1080p.mp4",
+                        original_path="", original_parent_id="source", size=1000,
+                        new_name=f"{basename}.2026.1080p.mp4", action="move",
+                        target_path=f"电影/{title} (2026) {{tmdb-123}}",
+                        match=MatchResult(
+                            tmdb_id="123", title=title, year="2026", media_type="movie",
+                        ),
+                    )
+                    organizer._preview_conflicts_with_inventory(
+                        [plan], OrganizeRules(conflict_strategy=1),
+                        lambda _: ("library", [existing], {}),
+                    )
+                    self.assertEqual(plan.action, "skip")
+                    self.assertEqual(plan.conflict_existing_id, "existing")
+
+    def test_movie_title_is_separate_from_same_identity_bonus_features(self):
+        organizer = Organizer(client=Mock(), scraper=TMDBScraper(client=Mock()))
+        self.addCleanup(organizer.close)
+        plan = OrganizePlan(
+            file_id="incoming", original_name="The.Interview.2026.mkv", original_path="",
+            match=MatchResult(tmdb_id="123", title="The Interview", year="2026", media_type="movie"),
+        )
+        for extra in ("Trailer", "Interview"):
+            with self.subTest(extra=extra):
+                self.assertFalse(organizer._same_media_identity(
+                    plan, GuangYaFile(
+                        "extra", f"The.Interview.2026.{extra}.{{tmdb-123}}.mkv", False, 100,
+                    ), OrganizeRules(),
+                ))
+
     def test_ambiguous_movie_and_tv_identity_fail_closed(self):
         organizer = Organizer(client=Mock(), scraper=cast(TMDBScraper, _VariantScraper()))
         rules = OrganizeRules()
@@ -763,6 +805,30 @@ class OrganizeMultiVersionExecutionTests(IsolatedDatabaseTestCase):
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(execute_client.moves, [])
         self.assertEqual(execute_client.deleted, [])
+
+    def test_movie_named_interview_preserves_existing_version_in_preview_and_execution(self):
+        incoming = GuangYaFile("incoming", "The.Interview.2026.1080p.mp4", False, 1000)
+        existing = GuangYaFile("existing", "The.Interview.2026.{tmdb-123}.1080p.mkv", False, 2000)
+        client = _VariantTreeClient(incoming, existing)
+        client.tree["category"][0].name = "The Interview (2026) {tmdb-123}"
+        scraper = _VariantScraper()
+        scraper.match_result = MatchResult(
+            tmdb_id="123", title="The Interview", year="2026", media_type="movie", confidence=1.0,
+        )
+        organizer = Organizer(client=cast(GuangYaClient, client), scraper=cast(TMDBScraper, scraper))
+        self.addCleanup(organizer.close)
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                plans, stats = organizer.organize(
+                    "source", self._rules(conflict_strategy=1), dry_run=dry_run, post_actions=False,
+                )
+                self.assertEqual(plans[0].action, "skip")
+                self.assertEqual(plans[0].conflict_existing_id, "existing")
+                self.assertEqual(stats["moved"], 0)
+                self.assertEqual(stats["skipped"], 1)
+                self.assertEqual(client.moves, [])
+                self.assertEqual(client.renames, [])
+                self.assertEqual(client.deleted, [])
 
     def test_dovi_and_sdr_reach_production_coexistence_helper(self):
         coexist_spy = Mock(wraps=variants_can_coexist)

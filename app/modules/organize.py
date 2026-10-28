@@ -6730,12 +6730,21 @@ class Organizer:
         if not plan.match:
             return False
         if plan.match.media_type != "tv":
+            # 片名本身可包含 Interview / Extras；仅在已知片名之外判断花絮标记。
+            title = build_context(title=plan.match.title, year=plan.match.year).title
+            title_pattern = r"[ ._-]+".join(
+                re.escape(part) for part in re.split(r"[ ._-]+", title)
+            )
+            auxiliary_name = re.sub(
+                rf"^{title_pattern}(?=$|[\W_])", "", candidate.name,
+                count=1, flags=re.IGNORECASE,
+            )
             auxiliary = re.search(
                 r"(?i)(?:^|[._ \-])(?:trailer|teaser|sample|preview|"
                 r"behind[._ \-]*the[._ \-]*scenes|deleted[._ \-]*scenes?|"
                 r"featurettes?|extras?|interviews?|花絮|预告|彩蛋)"
                 r"(?:[._ \-]|$)",
-                candidate.name,
+                auxiliary_name,
             )
             if auxiliary:
                 return False
