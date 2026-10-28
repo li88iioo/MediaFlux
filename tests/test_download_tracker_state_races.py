@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import socket
 import unittest
 from types import SimpleNamespace
@@ -166,17 +167,31 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                 self.organize.assert_called_once()
 
     def test_partial_cloud_result_retains_admission_and_never_organizes(self) -> None:
-        for task_ids in ('[]', '["gy-1"]'):
-            with self.subTest(task_ids=task_ids), isolated_test_database():
+        for task_ids, error in (
+            ('[]', ''), ('["gy-1"]', ''),
+            ('[]', '光鸭错误 112：参数错误'), ('["gy-1"]', '光鸭错误 112：参数错误'),
+        ):
+            with self.subTest(task_ids=task_ids, error=error), isolated_test_database():
                 request_id = self._request(targets="guangya", qb_status="", gy_task_ids=task_ids)
                 subscription_id = self._bind_admission(request_id)
+                db.add_download_log(source="guangya", request_id=request_id)
+                tasks = [GuangYaClient._to_offline_task({
+                    "taskId": "gy-1", "status": 5,
+                    "errCode": 112 if error else "", "errMsg": "参数错误" if error else "",
+                })]
                 self.tracker._update_request(
-                    db.get_download_request(request_id), [], self._gy_batch(5), qb_available=False,
+                    db.get_download_request(request_id), [], tasks, qb_available=False,
                 )
                 row = db.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
-                self.assertTrue(row["error"])
+                expected_error = error or (
+                    "光鸭下载仅部分完成，已停止自动整理，请人工核验" if task_ids == '[]'
+                    else "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
+                )
+                self.assertEqual(row["error"], expected_error)
+                self.assertEqual(db.list_download_logs()[0]["error"], expected_error)
+                self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
                 self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
                 self.organize.assert_not_called()
                 self.staging.assert_not_called()
@@ -204,24 +219,57 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
                     "failed",
                 )
 
+    def test_failed_task_preserves_safe_provider_error_but_success_drops_it(self) -> None:
+        raw = {"taskId": "failed-single", "status": 3, "errCode": 112, "errMsg": "参数错误"}
+        task = GuangYaClient._to_offline_task(raw)
+        self.assertEqual(task["error_code"], "112")
+        self.assertEqual(task["error"], "光鸭错误 112：参数错误")
+        task = GuangYaClient._to_offline_task({**raw, "errMsg": "参数错误 https://example.test/?token=private-secret"})
+        self.assertNotIn("private-secret", task["error"])
+        self.assertNotIn("https://", task["error"])
+        for status in (0, 1, 2):
+            task = GuangYaClient._to_offline_task({**raw, "status": status})
+            self.assertEqual((task["error_code"], task["error"]), ("", ""))
+
     def test_guangya_failure_releases_admission_without_organizing(self) -> None:
-        for task_ids in ("[]", '["gy-1"]'):
-            with self.subTest(task_ids=task_ids), isolated_test_database():
+        self.notify.side_effect = DownloadTracker._notify_completion
+        for task_ids, error in (
+            ('[]', ''), ('["gy-1"]', ''),
+            ('[]', '光鸭错误 112：参数错误'), ('["gy-1"]', '光鸭错误 112：参数错误'),
+        ):
+            with self.subTest(task_ids=task_ids, error=error), isolated_test_database():
                 request_id = self._request(
                     targets="guangya", qb_status="", gy_task_ids=task_ids
                 )
                 subscription_id = self._bind_admission(request_id)
+                db.add_download_log(source="guangya", request_id=request_id)
                 task = GuangYaClient._to_offline_task(
-                    {"taskId": "gy-1", "status": 4, "progress": 20}
+                    {"taskId": "gy-1", "status": 3, "progress": 20,
+                     "errCode": 112 if error else "", "errMsg": "参数错误" if error else ""}
                 )
-                self.tracker._update_request(
-                    db.get_download_request(request_id), [], [task], qb_available=False
-                )
+                with patch.object(DownloadTracker, "_publish_lifecycle", return_value=True) as publish:
+                    for _ in range(2):
+                        self.tracker._update_request(
+                            db.get_download_request(request_id), [], [task], qb_available=False
+                        )
+                    publish.assert_called_once_with(request_id)
                 row = db.get_download_request(request_id)
                 assert row is not None
                 self.assertEqual(
                     (row["status"], row["gy_status"]), ("failed", "failed")
                 )
+                expected_error = error or (
+                    "光鸭下载失败，请人工核验" if task_ids == '[]'
+                    else "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
+                )
+                self.assertEqual(row["error"], expected_error)
+                logs = db.list_download_logs()
+                self.assertEqual(len(logs), 1)
+                self.assertEqual((logs[0]["status"], logs[0]["error"]), ("failed", expected_error))
+                self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
+                self.assertEqual(row["notification_delivery_status"], "sent")
+                self.assertEqual(build_download_lifecycle_event(row).footer, expected_error)
+                self.assertNotIn(request_id, {r["id"] for r in db.list_active_download_requests()})
                 self.assertEqual(
                     db.list_active_media_download_admissions(subscription_id), []
                 )
@@ -248,8 +296,12 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
         ):
             self.assertTrue(download_dispatcher.dispatch_request(request_id, "guangya")["ok"])
             subscription_id = self._bind_admission(request_id)
+            tasks = self._gy_batch(4, 0)
+            tasks[0] = GuangYaClient._to_offline_task({
+                "taskId": "gy-1", "status": 4, "errCode": 112, "errMsg": "参数错误",
+            })
             self.tracker._update_request(
-                db.get_download_request(request_id), [], self._gy_batch(4, 0), qb_available=False,
+                db.get_download_request(request_id), [], tasks, qb_available=False,
             )
             row = db.get_download_request(request_id)
             active = db.list_active_media_download_admissions(subscription_id)
@@ -257,6 +309,8 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
 
         assert row is not None
         self.assertEqual((row["status"], row["gy_status"]), ("downloading", "downloading"))
+        self.assertEqual(row["error"], "光鸭错误 112：参数错误")
+        self.assertEqual(db.list_download_logs()[0]["error"], row["error"])
         self.assertIsNone(row["completed_at"])
         self.assertEqual(len(active), 1)
         self.assertFalse(retry["ok"])
@@ -311,15 +365,89 @@ class DownloadTrackerStateRaceTests(unittest.TestCase):
             gy_task_ids='["gy-1","gy-2"]', gy_batch_count=2,
         )
         subscription_id = self._bind_admission(request_id)
+        db.add_download_log(source="guangya", request_id=request_id)
+        tasks = self._gy_batch(4, 2)
+        tasks[0] = GuangYaClient._to_offline_task({
+            "taskId": "gy-1", "status": 4, "errCode": 112, "errMsg": "参数错误",
+        })
+        tasks[1].update(error_code="999", error="已完成任务的旧错误")
         self.tracker._update_request(
-            db.get_download_request(request_id), [], self._gy_batch(4, 2), qb_available=False,
+            db.get_download_request(request_id), [], tasks, qb_available=False,
         )
         row = db.get_download_request(request_id)
         assert row is not None
         self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
         self.assertEqual(row["notification_event_status"], "manual_review")
+        self.assertEqual(row["qb_status"], "completed")
+        self.assertEqual(row["error"], "光鸭错误 112：参数错误")
+        self.assertEqual(db.list_download_logs()[0]["error"], row["error"])
+        self.assertEqual(json.loads(row["notification_payload_json"])["error"], row["error"])
         self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
         self.organize.assert_not_called()
+
+    def test_guangya_batch_errors_are_deduplicated_without_affecting_qb_or_retrying(self) -> None:
+        request_id = self._request(
+            gy_task_ids='["gy-1","gy-2","gy-3","gy-4"]', gy_batch_count=4,
+        )
+        subscription_id = self._bind_admission(request_id)
+        db.add_download_log(source="guangya", request_id=request_id)
+        db.add_download_log(source="qb", request_id=request_id)
+        tasks = [
+            GuangYaClient._to_offline_task({
+                "taskId": f"gy-{index}", "status": state, "errCode": code, "errMsg": message,
+            })
+            for index, (state, code, message) in enumerate((
+                (3, 112, "参数错误"), (5, 404, "资源不存在"),
+                (3, 112, "参数错误"), (2, 999, "已完成任务的旧错误"),
+            ), 1)
+        ]
+        expected_error = "光鸭错误 112：参数错误；光鸭错误 404：资源不存在"
+        self.notify.side_effect = DownloadTracker._notify_completion
+        with (
+            patch.object(DownloadTracker, "_publish_lifecycle", return_value=True) as publish,
+            patch.object(download_dispatcher, "_submit_guangya") as submit,
+        ):
+            for _ in range(2):
+                self.tracker._update_request(
+                    db.get_download_request(request_id), [self._qb_task(0.5)], tasks,
+                )
+            submit.assert_not_called()
+            publish.assert_called_once_with(request_id)
+        row = db.get_download_request(request_id)
+        assert row is not None
+        self.assertEqual((row["status"], row["gy_status"], row["qb_status"]),
+                         ("manual_review", "manual_review", "downloading"))
+        self.assertEqual(row["error"], expected_error)
+        logs = {log["source"]: log for log in db.list_download_logs()}
+        self.assertEqual((logs["guangya"]["status"], logs["guangya"]["error"]),
+                         ("manual_review", expected_error))
+        self.assertEqual((logs["qb"]["status"], logs["qb"]["error"]), ("downloading", ""))
+        self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
+        self.assertEqual(len(db.list_active_media_download_admissions(subscription_id)), 1)
+        self.organize.assert_not_called()
+
+    def test_completed_guangya_clears_old_errors_but_preserves_qb_failure(self) -> None:
+        for task_ids, qb_status in (('[]', ''), ('["gy-1"]', 'completed'), ('["gy-1"]', 'failed')):
+            with self.subTest(task_ids=task_ids, qb_status=qb_status), isolated_test_database():
+                old_error = "qb: 下载失败" if qb_status == "failed" else "光鸭错误 112：参数错误"
+                request_id = self._request(
+                    targets="both" if qb_status else "guangya", qb_status=qb_status,
+                    local_import_status="completed", gy_task_ids=task_ids, error=old_error,
+                )
+                db.add_download_log(source="guangya", request_id=request_id, error=old_error)
+                tasks = self._gy_batch(2)
+                tasks[0].update(error_code="112", error="已完成任务的旧错误")
+                self.tracker._update_request(
+                    db.get_download_request(request_id), [], tasks, qb_available=False,
+                )
+                row = db.get_download_request(request_id)
+                assert row is not None
+                expected_error = old_error if qb_status == "failed" else ""
+                self.assertEqual((row["status"], row["gy_status"], row["qb_status"]),
+                                 ("completed", "completed", qb_status))
+                self.assertEqual(row["error"], expected_error)
+                self.assertEqual(db.list_download_logs()[0]["error"], "")
+                self.assertEqual(json.loads(row["notification_payload_json"])["error"], expected_error)
 
     def test_guangya_batch_without_id_list_cannot_collapse_to_one_terminal_task(self) -> None:
         for state in (4, 2):

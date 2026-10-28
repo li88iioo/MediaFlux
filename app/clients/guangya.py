@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 from app.config import PATHS
-from app.logger import get_logger, log_throttled
+from app.logger import get_logger, log_throttled, redact_sensitive_text
 from app.modules.process_lock import CrossProcessLock
 from app.private_files import protect_private_file
 
@@ -2988,6 +2988,14 @@ class GuangYaClient:
             progress = 0.0
         task_state = guangya_offline_task_state(status)
         completed = task_state == "completed"
+        error_code = ""
+        error = ""
+        if task_state in {"failed", "manual_review"}:
+            error_code = redact_sensitive_text(str(raw.get("errCode") or raw.get("errorCode") or ""))[:40]
+            reason = redact_sensitive_text(str(raw.get("errMsg") or raw.get("errorMsg") or ""))
+            reason = re.sub(r"(?:https?://|magnet:\?)[^\s<>]+", "[地址已脱敏]", reason)[:500]
+            error = f"光鸭错误 {error_code}" if error_code else ""
+            error = "：".join(part for part in (error, reason) if part)
         size = raw.get("size") or raw.get("totalSize") or raw.get("fileSize") or 0
         downloaded = raw.get("downloaded") or raw.get("completedSize") or raw.get("doneSize") or 0
         speed = raw.get("speed") or raw.get("downloadSpeed") or raw.get("dlspeed") or 0
@@ -3006,6 +3014,8 @@ class GuangYaClient:
                 "manual_review": "部分完成，需核验", "downloading": "下载中",
             }[task_state]),
             "status_kind": "done" if completed else "failed" if task_state in {"failed", "manual_review"} else "running",
+            "error_code": error_code,
+            "error": error,
             "progress": max(0.0, min(progress, 1.0)),
             "size": size,
             "downloaded": downloaded,

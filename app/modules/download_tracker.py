@@ -347,6 +347,7 @@ class DownloadTracker:
 
         matched_qb_task = None
         matched_gy_tasks = []
+        gy_error = ""
         local_import_pending = str(
             self._row_value(row, "local_import_status", "") or ""
         ) in {"", "pending"}
@@ -404,7 +405,7 @@ class DownloadTracker:
                 progress = sum(progress_values) / expected_batches if expected_batches else 0.0
                 if expected_batches > len(task_ids):
                     updates["gy_status"] = "manual_review"
-                    updates["error"] = (
+                    gy_error = (
                         "光鸭仅返回部分任务 ID，部分提交可能已经生效；"
                         "请核对云端任务，勿直接重复提交"
                     )
@@ -414,7 +415,7 @@ class DownloadTracker:
                         updates["gy_task_missing_since"] = db.now()
                     elif self._missing_expired(missing_since):
                         updates["gy_status"] = "manual_review"
-                        updates["error"] = "光鸭后端任务长时间未找到，请核对云端任务后人工处理"
+                        gy_error = "光鸭后端任务长时间未找到，请核对云端任务后人工处理"
                     else:
                         updates["gy_status"] = "downloading"
                 else:
@@ -428,7 +429,7 @@ class DownloadTracker:
                         updates["gy_status"] = "completed"
                     else:
                         updates["gy_status"] = "failed" if states == {"failed"} else "manual_review"
-                        updates["error"] = "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
+                        gy_error = "光鸭下载存在失败或部分完成任务，已停止自动整理，请人工核验"
                 backend_logs.append((
                     "guangya", updates.get("gy_status", gy_status), progress,
                     task_ids[0] if task_ids else str(self._row_value(row, "gy_task_id", "") or ""),
@@ -439,8 +440,10 @@ class DownloadTracker:
                     matched_gy_tasks = [task]
                     progress = max(0.0, min(float(task.get("progress") or 0), 1.0))
                     updates["gy_status"] = self._gy_task_state(task)
-                    if updates["gy_status"] == "manual_review":
-                        updates["error"] = "光鸭下载仅部分完成，已停止自动整理，请人工核验"
+                    if updates["gy_status"] == "failed":
+                        gy_error = "光鸭下载失败，请人工核验"
+                    elif updates["gy_status"] == "manual_review":
+                        gy_error = "光鸭下载仅部分完成，已停止自动整理，请人工核验"
                     updates["gy_task_missing_since"] = None
                     if task.get("id"):
                         matched_task_id = str(task["id"])
@@ -454,7 +457,7 @@ class DownloadTracker:
                     ))
                 elif gy_status == "outcome_unknown":
                     updates["gy_status"] = "manual_review"
-                    updates["error"] = (
+                    gy_error = (
                         "光鸭提交结果未知且无法匹配云端任务；"
                         "请人工核对后再决定是否重试"
                     )
@@ -467,10 +470,18 @@ class DownloadTracker:
                         updates["gy_task_missing_since"] = db.now()
                     elif self._missing_expired(missing_since):
                         updates["gy_status"] = "manual_review"
-                        updates["error"] = (
+                        gy_error = (
                             "光鸭云端任务长时间无法匹配，可能已完成或提交失败；"
                             "请核对云端文件后人工处理"
                         )
+            errors = dict.fromkeys(
+                str(task.get("error") or "").strip()
+                for task in matched_gy_tasks
+                if self._gy_task_state(task) in {"failed", "manual_review"}
+            )
+            gy_error = "；".join(error for error in errors if error) or gy_error
+            if gy_error:
+                updates["error"] = gy_error
 
         if not usable_download_title(download_display_title(row)):
             names = {str(task.get("name") or "").strip() for task in matched_gy_tasks}
@@ -495,6 +506,8 @@ class DownloadTracker:
         except (KeyError, IndexError):
             root_status = ""
         if root_status != "resubmitted":
+            if updates.get("gy_status") == "completed" and all(status == "completed" for status in statuses):
+                updates["error"] = ""
             if any(status == "manual_review" for status in statuses):
                 updates["status"] = "manual_review"
                 updates["completed_at"] = db.now()
@@ -518,6 +531,7 @@ class DownloadTracker:
                 "qb_status": str(effective_qb or ""),
                 "gy_status": str(effective_gy or ""),
                 "chat_id": str(self._row_value(row, "chat_id", "") or ""),
+                "error": str(updates.get("error", self._row_value(row, "error", "")) or ""),
             }
             updates.update({
                 "notification_event_status": next_root_status,
@@ -539,7 +553,10 @@ class DownloadTracker:
         effective_qb = str(row["qb_status"] or "")
         effective_gy = str(row["gy_status"] or "")
         for source, status, progress, task_id in backend_logs:
-            self._update_backend_log(request_id, source, status, progress, task_id)
+            self._update_backend_log(
+                request_id, source, status, progress, task_id,
+                error=gy_error if source == "guangya" else None,
+            )
 
         if effective_qb == "completed" and matched_qb_task is not None:
             self._start_local_import(row, matched_qb_task)
@@ -1216,7 +1233,7 @@ class DownloadTracker:
 
     @staticmethod
     def _update_backend_log(request_id: int, source: str, status: str,
-                            progress: float, task_id: str) -> None:
+                            progress: float, task_id: str, *, error: str | None = None) -> None:
         with db.get_conn() as conn:
             row = conn.execute(
                 "SELECT id FROM download_log WHERE request_id=? AND source=? ORDER BY id DESC LIMIT 1",
@@ -1227,6 +1244,7 @@ class DownloadTracker:
                 int(row["id"]), status="success" if status == "completed" else status,
                 progress=progress, backend_task_id=task_id,
                 completed_at=db.now() if status in {"completed", "failed"} else None,
+                **({"error": error} if error is not None else {}),
             )
 
     @staticmethod
