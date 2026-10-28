@@ -333,8 +333,8 @@ class IndexerAPITests(unittest.TestCase):
 
         http = FakeHttp({
             AIPAN_SEARCH: response(AIPAN_SEARCH, json.dumps({"movies": [{"id": 1, "title": "三体"}]})),
-            "https://www.aipan.me/api/movies/detail/1": response("https://www.aipan.me/api/movies/detail/1",
-                json.dumps({"resources": [{"kind": "magnet", "name": "三体 S01E01", "url": "magnet:?xt=urn:btih:" + HASH_ONE}]})),
+            "https://www.aipan.me/api/movies/1/magnet-links": response("https://www.aipan.me/api/movies/1/magnet-links",
+                json.dumps({"items": [{"kind": "magnet", "name": "三体 S01E01", "url": "magnet:?xt=urn:btih:" + HASH_ONE}]})),
         })
         http.allowed_hosts = {"www.aipan.me"}
         service = IndexerService(registry=IndexerRegistry({"aipan": AipanAdapter(http=http)}), result_store=IndexerResultStore())

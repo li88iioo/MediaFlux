@@ -46,10 +46,10 @@ class AipanAdapterTests(unittest.IsolatedAsyncioTestCase):
         search = response(AIPAN_SEARCH, json.dumps({"movies": [
             {"id": 1, "title": "三体"},
         ]}))
-        detail_url = "https://www.aipan.me/api/movies/detail/1"
+        detail_url = "https://www.aipan.me/api/movies/1/magnet-links"
         magnet_one = f"magnet:?xt=urn:btih:{HASH_ONE}&dn=The.Three.Body.Problem.S01E02.1080p"
         magnet_two = f"magnet:?xt=urn:btih:{HASH_TWO}&dn=三体.S01E03.2160p"
-        detail = response(detail_url, json.dumps({"resources": [
+        detail = response(detail_url, json.dumps({"items": [
             {"kind": "magnet", "name": "The Three Body Problem S01E02 1080p WEB-DL", "url": magnet_one},
             {"kind": "magnet", "name": "三体 S01E03 2160p", "url": magnet_two},
         ]}))
@@ -68,11 +68,29 @@ class AipanAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.magnet, magnet_two)
         self.assertEqual(first.download_state, "ready")
         self.assertEqual(first.download_kinds, ("magnet",))
+        self.assertEqual([url for url, _ in adapter.http.calls], [AIPAN_SEARCH, detail_url])
+
+    async def test_empty_resource_list_is_not_a_broken_detail_contract(self):
+        resource_url = "https://www.aipan.me/api/movies/2075/magnet-links"
+        for payload in ({"items": []}, {"panLinks": [], "magnetCount": 0}, {"resources": []}):
+            with self.subTest(keys=list(payload)):
+                http = FakeHttp({
+                    AIPAN_SEARCH: response(AIPAN_SEARCH, '{"movies":[{"id":2075,"title":"黑镜"}]}'),
+                    resource_url: response(resource_url, json.dumps(payload)),
+                })
+                adapter = AipanAdapter(http=http)
+                if "items" in payload:
+                    page = await adapter.search(IndexerSearchRequest.create("黑镜"))
+                    self.assertEqual(page.items, [])
+                    self.assertEqual(page.errors, ())
+                else:
+                    with self.assertRaises(HttpInvalidResponse):
+                        await adapter.search(IndexerSearchRequest.create("黑镜"))
 
     async def test_ignores_invalid_magnets_but_keeps_multiple_valid_hashes_per_detail(self):
         search = response(AIPAN_SEARCH, '{"movies":[{"id":2,"title":"作品"}]}')
-        detail_url = "https://www.aipan.me/api/movies/detail/2"
-        detail = response(detail_url, json.dumps({"resources": [
+        detail_url = "https://www.aipan.me/api/movies/2/magnet-links"
+        detail = response(detail_url, json.dumps({"items": [
             {"kind": "magnet", "name": "发行一 1080p", "url": f"magnet:?xt=urn:btih:{HASH_ONE}"},
             {"kind": "magnet", "name": "发行二 720p", "url": f"magnet:?xt=urn:btih:{HASH_TWO}"},
             {"kind": "magnet", "name": "坏磁力", "url": "magnet:?xt=urn:btih:bad"},
@@ -120,20 +138,20 @@ class AipanAdapterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_partial_detail_failure_is_safe_and_total_failure_raises(self):
         search = response(AIPAN_SEARCH, '{"movies":[{"id":3,"title":"三体"},{"id":4,"title":"三体2"}]}')
-        failed_url = "https://www.aipan.me/api/movies/detail/3"
-        good_url = "https://www.aipan.me/api/movies/detail/4"
+        failed_url = "https://www.aipan.me/api/movies/3/magnet-links"
+        good_url = "https://www.aipan.me/api/movies/4/magnet-links"
         magnet = f"magnet:?xt=urn:btih:{HASH_ONE}"
         http = FakeHttp({
             AIPAN_SEARCH: search,
             failed_url: RuntimeError("https://secret.invalid/?token=private"),
-            good_url: response(good_url, json.dumps({"resources": [
+            good_url: response(good_url, json.dumps({"items": [
                 {"kind": "magnet", "name": "三体2 S01E01", "url": magnet},
             ]})),
         })
         page = await AipanAdapter(http=http).search(IndexerSearchRequest.create("三体"))
         self.assertEqual(len(page.items), 1)
         self.assertEqual(len(page.errors), 1)
-        self.assertEqual(page.errors[0].site_id, "btbtla")
+        self.assertEqual(page.errors[0].site_id, "aipan")
         self.assertIn("Aipan", page.errors[0].message)
         self.assertNotIn("secret.invalid", page.errors[0].message)
         self.assertNotIn("private", page.errors[0].message)
@@ -157,12 +175,12 @@ class AipanAdapterTests(unittest.IsolatedAsyncioTestCase):
             started.set()
             try:
                 await release.wait()
-                return response(url, '{"resources":[]}')
+                return response(url, '{"items":[]}')
             finally:
                 tracker["active"] -= 1
 
         for index in range(1, 5):
-            routes[f"https://www.aipan.me/api/movies/detail/{index}"] = slow_detail
+            routes[f"https://www.aipan.me/api/movies/{index}/magnet-links"] = slow_detail
         adapter = AipanAdapter(http=FakeHttp(routes))
         task = asyncio.create_task(adapter.search(IndexerSearchRequest.create("作品")))
         await asyncio.wait_for(started.wait(), timeout=1)

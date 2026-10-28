@@ -92,19 +92,13 @@ class AipanAdapter(DirectResultAdapter):
         if failures and successes == 0:
             raise failures[0]
         errors = tuple(
-            IndexerProviderError("btbtla", error.code, "Aipan 子站详情获取失败")
+            IndexerProviderError(self.site_id, error.code, "Aipan 部分资源获取失败")
             for error in failures
         )
         return self._page(request, items, errors=errors)
 
     async def _load_details(self, candidates: list[tuple[str, str]]) -> list[list[IndexerItem] | BaseException]:
-        semaphore = asyncio.Semaphore(_MAX_DETAIL_CANDIDATES)
-
-        async def load(candidate: tuple[str, str]) -> list[IndexerItem]:
-            async with semaphore:
-                return await self._load_detail(*candidate)
-
-        tasks = [asyncio.create_task(load(candidate)) for candidate in candidates[:_MAX_DETAIL_CANDIDATES]]
+        tasks = [asyncio.create_task(self._load_detail(*candidate)) for candidate in candidates[:_MAX_DETAIL_CANDIDATES]]
         try:
             return await asyncio.gather(*tasks, return_exceptions=True)
         finally:
@@ -116,13 +110,13 @@ class AipanAdapter(DirectResultAdapter):
 
     async def _load_detail(self, movie_id: str, movie_title: str) -> list[IndexerItem]:
         try:
-            detail_url = fixed_host_join(self.base_url, f"/api/movies/detail/{quote(movie_id, safe='')}")
+            detail_url = fixed_host_join(self.base_url, f"/api/movies/{quote(movie_id, safe='')}/magnet-links")
             response = await self._get(detail_url, headers={"Referer": self.base_url})
             self._validate_response(response, json_response=True)
             payload = self._parse_json(response.body, "Aipan detail")
-            resources = payload.get("resources") if isinstance(payload, dict) else None
+            resources = payload.get("items") if isinstance(payload, dict) else None
             if not isinstance(resources, list):
-                raise HttpInvalidResponse("Aipan detail response omitted resources")
+                raise HttpInvalidResponse("Aipan resource response omitted items")
 
             page_url = fixed_host_join(self.base_url, f"/movie/{quote(movie_id, safe='')}")
             items: list[IndexerItem] = []
