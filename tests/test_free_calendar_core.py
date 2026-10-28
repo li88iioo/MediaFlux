@@ -187,6 +187,24 @@ class CalendarCoreTests(unittest.TestCase):
         self.now += timedelta(seconds=3591)
         self.assertEqual(self.cache.get(self.service.key("tencent")).status, "stale")
 
+    def test_initial_metadata_completion_does_not_extend_platform_fact_deadlines(self):
+        fetched_at = self.now
+
+        def enrich(entries):
+            self.now += timedelta(seconds=12)
+            self.tick += 12
+            return [{**item.to_dict(), "mapping_status": "matched", "tmdb_id": "42"}
+                    for item in entries]
+
+        self.service.metadata = SimpleNamespace(enrich=enrich)
+        data = self.service.get_week()
+        self.assertEqual(data["days"][0]["items"][0]["tmdb_id"], "42")
+        self.assertEqual(self.source.calls, 1)
+        self.now = fetched_at + timedelta(hours=1)
+        self.assertEqual(self.cache.get(self.service.key("tencent")).status, "stale")
+        self.now = fetched_at + timedelta(days=2)
+        self.assertEqual(self.cache.get(self.service.key("tencent")).status, "expired")
+
     def test_metadata_next_batch_cannot_be_starved_by_already_unmatched_programmes(self):
         self.source.entries = (entry(source_id="one"), entry(source_id="two"), entry(source_id="three"))
         calls = []
@@ -378,11 +396,19 @@ class CalendarCoreTests(unittest.TestCase):
                 entry(free_weekdays=weekdays)
 
     def test_unexpected_metadata_failure_cannot_discard_verified_source_entries(self):
-        self.service.metadata = SimpleNamespace(enrich=Mock(side_effect=RuntimeError("metadata unavailable")))
+        fetched_at = self.now
+
+        def fail_metadata(entries):
+            self.now += timedelta(seconds=12)
+            raise RuntimeError("metadata unavailable")
+
+        self.service.metadata = SimpleNamespace(enrich=fail_metadata)
         data = self.service.get_week()
         self.assertEqual(data["items_count"], 1)
         self.assertEqual(data["sources"][0]["status"], "partial")
         self.assertEqual(data["days"][0]["items"][0]["mapping_status"], "unmatched")
+        self.now = fetched_at + timedelta(hours=1)
+        self.assertEqual(self.cache.get(self.service.key("tencent")).status, "stale")
 
 
 class GatedSource(Source):

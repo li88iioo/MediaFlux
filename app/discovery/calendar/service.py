@@ -292,22 +292,23 @@ class CalendarService:
         # 首屏今日优先；同组保持平台原顺序，后续预算轮次继续未完成条目。
         return tuple(sorted(entries, key=lambda entry: not any(event.date == today for event in entry.events)))
 
-    def _refresh_metadata(self, source):
-        """仅补已缓存节目的元资料，不重新抓三平台，也不延长平台事实的有效期。"""
+    def _refresh_metadata(self, source, *, initial=False):
+        """首轮与续批共用补全链路，平台事实始终按原抓取时间到期。"""
         cached = self.cache.get(self.key(source))
-        if cached.status != "fresh" or cached.last_error or not cached.payload or not self._needs_metadata(cached.payload):
+        if (cached.status != "fresh" or cached.last_error or not cached.payload
+                or (not initial and not self._needs_metadata(cached.payload))):
             return
         payload = dict(cached.payload)
-        rounds = payload.get("metadata_rounds", 0) + 1
+        rounds = 0 if initial else payload.get("metadata_rounds", 0) + 1
         try:
             fetched_at = datetime.fromisoformat(payload["fetched_at"])
             age = max(0, int((self._now() - fetched_at).total_seconds()))
             if age >= 3600:
                 return
-            # 只继续尚未处理的节目；未匹配/暂缺备用图不能反复抢占后续节目的预算。
+            # 首轮检查所有节目，续批仅处理 pending，避免已处理节目抢占预算。
             pending_rows = [row for row in payload["entries"]
                             if isinstance(row, dict) and row.get("category") == "animation"
-                            and row.get("mapping_status") == "pending"]
+                            and (initial or row.get("mapping_status") == "pending")]
             entries = tuple(CalendarEntry(**{key: value for key, value in row.items() if key in _ENTRY_FIELDS})
                             for row in pending_rows)
             completed = {(row["source"], row["source_id"]): row
@@ -366,19 +367,7 @@ class CalendarService:
                 self.cache.set_success(self.key(source), "calendar:" + source, payload,
                                        ttl_seconds=3600, stale_seconds=2 * 86400)
                 self._guard.notify_all()
-            try:
-                entries = self.metadata.enrich(self._metadata_order(result.entries))
-            except Exception as exc:
-                logger.warning("日历TMDB资料补充失败 source=%s type=%s", source, type(exc).__name__)
-                entries = payload["entries"]
-            payload = {"version": 1, "source": source, "entries": entries,
-                       "fetched_at": fetched_at,
-                       "status": result.status, "message": result.message,
-                       "sampled": result.sampled, "ignored": result.ignored}
-            with self._guard:
-                if not self._closed:
-                    self.cache.set_success(self.key(source), "calendar:" + source, payload,
-                                           ttl_seconds=3600, stale_seconds=2 * 86400)
+            self._refresh_metadata(source, initial=True)
         except Exception as exc:
             message = str(exc)[:400] if isinstance(exc, SourceUnavailable) else "平台更新日历获取失败，请稍后重试"
             logger.warning("日历来源刷新失败 source=%s type=%s", source, type(exc).__name__)
