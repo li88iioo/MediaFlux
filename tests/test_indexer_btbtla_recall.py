@@ -26,6 +26,70 @@ _MOVIE = '<div id="download-list"><div class="module-row-info"><a class="module-
 
 
 class BTBtlaRecallTests(unittest.IsolatedAsyncioTestCase):
+    async def test_first_window_arrives_before_next_detail_without_extra_requests(self):
+        for status in (200, 503):
+            with self.subTest(status=status):
+                http, _, detail = self.partial_detail_http(status)
+                if status == 200:
+                    http.responses[-1] = detail.replace(b'/tdown/1.html', b'/tdown/recovered.html')
+                original_get = http.get
+                waiting, release, arrived = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+                async def get(url, **kwargs):
+                    if url.endswith('/detail/bad.html'):
+                        waiting.set()
+                        await release.wait()
+                    return await original_get(url, **kwargs)
+
+                http.get = get
+                service = IndexerService(
+                    registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http, page_size=2)}),
+                    result_store=IndexerResultStore(), max_results_per_site=2,
+                )
+                frames = []
+                def observe(frame):
+                    if frame.items:
+                        frames.append(frame)
+                        arrived.set()
+                task = asyncio.create_task(service.search('Demo', sort_mode='source_order', on_progress=observe))
+                try:
+                    await asyncio.wait_for(waiting.wait(), 1)
+                    await asyncio.wait_for(arrived.wait(), 0.5)
+                    self.assertFalse(task.done())
+                    self.assertFalse(frames[0].complete)
+                    self.assertEqual(len(frames[0].items), 2)
+                    first = frames[0].items[0]
+                    release.set()
+                    final = await task
+                    self.assertTrue(final.complete)
+                    self.assertEqual(final.partial, status == 503)
+                    self.assertEqual(final.items[0].result_id, first.result_id)
+                    self.assertEqual(final.items[0].detail_url, first.detail_url)
+                    self.assertEqual(len(http.calls), 3)
+                finally:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    await service.aclose()
+
+    async def test_cold_second_page_never_emits_first_page_candidates(self):
+        http, _, detail = self.partial_detail_http(200)
+        http.responses[-1] = detail.replace(b'/tdown/1.html', b'/tdown/recovered.html')
+        service = IndexerService(
+            registry=IndexerRegistry({'btbtla': BTBtlaAdapter(http=http, page_size=2)}),
+            result_store=IndexerResultStore(), max_results_per_site=2,
+        )
+        frames = []
+        try:
+            second = await service.search('Demo', page=2, on_progress=frames.append)
+            self.assertEqual(second.page, 2)
+            self.assertEqual(len(second.items), 2)
+            self.assertFalse(frames)
+            first = await service.search('Demo', page=1)
+            self.assertFalse({i.detail_url for i in first.items} & {i.detail_url for i in second.items})
+            self.assertEqual(len(http.calls), 3)
+        finally:
+            await service.aclose()
+
     async def test_title_search_does_not_stop_after_first_homonymous_movie(self):
         http = FakeHttpClient(_EMPTY)
         http.responses = [_SEARCH, _MOVIE, _DETAIL]

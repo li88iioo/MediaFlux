@@ -35,6 +35,7 @@ from .base import (
     is_likely_challenge_page,
     magnet_infohash,
     parse_size_bytes,
+    report_page,
     require_html_response,
 )
 
@@ -125,13 +126,10 @@ class BTBtlaAdapter(IndexerAdapter):
             while len(catalog.pages) < request.page and catalog.next_native_page is not None:
                 if fetches == 2:
                     raise IndexerResultExpired("BTBtla resource page requires earlier pages", public_message="资源分页已过期，请重新搜索后继续加载")
-                native = await self._search_native(replace(request, page=catalog.next_native_page))
-                media = IndexerMediaSearchRequest.create(
-                    title=request.query, year=request.year, media_type=request.media_type,
-                    season=request.season, episode=request.episode,
+                native = await self._search_native(
+                    replace(request, page=catalog.next_native_page), progressive=request.page == 1,
                 )
-                ranked = [rank_item(item, media=media, fallback_query=request.query) for item in native.items]
-                ranked = [entry[1] for entry in sorted(enumerate(ranked), key=lambda entry: candidate_sort_key((0, entry[0], entry[1]), request.sort_mode))]
+                ranked = self._rank_items(request, native.items)
                 known = {item.detail_url for resource_page in catalog.pages for item in resource_page.items if item.detail_url}
                 ranked = [item for item in ranked if not item.detail_url or item.detail_url not in known]
                 fetches += 1
@@ -166,11 +164,20 @@ class BTBtlaAdapter(IndexerAdapter):
                 if request.page == len(catalog.pages) and catalog.truncated_count else None,
             )
 
-    async def _search_native(self, request: IndexerSearchRequest) -> IndexerPage:
+    @staticmethod
+    def _rank_items(request: IndexerSearchRequest, items: list[IndexerItem]) -> list[IndexerItem]:
+        media = IndexerMediaSearchRequest.create(
+            title=request.query, year=request.year, media_type=request.media_type,
+            season=request.season, episode=request.episode,
+        )
+        ranked = [rank_item(item, media=media, fallback_query=request.query) for item in items]
+        return [entry[1] for entry in sorted(enumerate(ranked), key=lambda entry: candidate_sort_key((0, entry[0], entry[1]), request.sort_mode))]
+
+    async def _search_native(self, request: IndexerSearchRequest, *, progressive: bool = False) -> IndexerPage:
         last_error: IndexerRateLimited | IndexerUnavailable | None = None
         for base_url in self._host_bases:
             try:
-                return await self._search_base(base_url, request)
+                return await self._search_base(base_url, request, progressive=progressive)
             except (IndexerRateLimited, IndexerUnavailable) as exc:
                 last_error = exc
         assert last_error is not None
@@ -180,6 +187,8 @@ class BTBtlaAdapter(IndexerAdapter):
         self,
         base_url: str,
         request: IndexerSearchRequest,
+        *,
+        progressive: bool = False,
     ) -> IndexerPage:
         # 原词优先：数字可能本就是片名（银翼杀手2049、1917）。仅原生明确空结果
         # 才拆出末尾年份；年份用于选详情而非继续拼进只索引片名的站点查询。
@@ -264,6 +273,14 @@ class BTBtlaAdapter(IndexerAdapter):
             for item in detail_items:
                 items.setdefault(item.detail_url, item)
             matched_tier = tier
+            if progressive and items:
+                # 复用服务层的渐进通道与最终排序；只发首个资源窗口，后续页不能混入第一页。
+                ranked = self._rank_items(request, list(items.values()))
+                report_page(self.site_id, IndexerPage(
+                    ranked[:self.page_size], 1, has_more or len(ranked) > self.page_size, True,
+                    complete=False,
+                    errors=tuple(IndexerProviderError(self.site_id, error.code, error.public_message) for error in errors),
+                ))
         if not items and errors:
             raise errors[0]
         return IndexerPage(
