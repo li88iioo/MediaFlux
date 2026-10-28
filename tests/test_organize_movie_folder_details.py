@@ -7,7 +7,7 @@ from app.modules.scraper import TMDBScraper
 
 import hashlib
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.clients.guangya import GuangYaFile
 from app.modules.naming import build_context, render_template
@@ -63,6 +63,43 @@ class MovieFolderNamingTests(unittest.TestCase):
         probe = patch("app.modules.media_probe.probe_media_profile", return_value=None)
         probe.start()
         self.addCleanup(probe.stop)
+
+    def test_title_dot_variants_reuse_the_same_directory_without_changing_metadata(self):
+        title = "乱世千金倪亚·利斯顿转生为娇弱千金的弑神武人华丽无双录"
+        directory = title + " (2026) {tmdb-312850}"
+        cloud = Mock()
+        cloud.list_dir.return_value = [
+            GuangYaFile("canonical", directory, True),
+            GuangYaFile("historical", directory.replace("·", "‧"), True),
+        ]
+        organizer = Organizer(client=cloud, scraper=cast(TMDBScraper, object()))
+        file = GuangYaFile("video", "Original‧Title.S01E03.mp4", False)
+        for dot in ("·", "‧"):
+            with self.subTest(dot=dot):
+                raw_title = title.replace("·", dot)
+                match = MatchResult("312850", raw_title, "2026", "tv")
+                actual_dir = organizer.build_media_dir(match)
+                self.assertEqual(actual_dir, directory)
+                self.assertEqual(organizer._ensure_dir_chain("anime", actual_dir), "canonical")
+                self.assertEqual(organizer.build_new_name(
+                    match, file, {"season": 1, "episode": 3},
+                    include_media_info=False, include_variant_tags=False,
+                ), title + ".2026.S01E03.mp4")
+                self.assertEqual(match.title, raw_title)
+        cloud.create_dir.assert_not_called()
+        self.assertEqual(file.name, "Original‧Title.S01E03.mp4")
+        context = build_context(title="A‧B・C．D", year="", original_name=file.name)
+        self.assertEqual(context.title, "A·B・C．D")
+        self.assertEqual(context.original_name, file.name)
+        with (
+            patch("app.modules.organize.render_template", side_effect=ValueError("test")),
+            patch("app.modules.organize.render_media_template", side_effect=ValueError("test")),
+        ):
+            self.assertEqual(organizer.build_media_dir(match), directory)
+            self.assertEqual(organizer.build_new_name(
+                match, file, {"season": 1, "episode": 3},
+                include_media_info=False, include_variant_tags=False,
+            ), title + ".2026.S01E03.mp4")
 
     def test_media_info_dot_suffix_is_separator_safe(self):
         context = build_context(

@@ -220,9 +220,6 @@ REGION_MAP = {
     "JP": "日韩", "KR": "日韩",
 }
 
-SAFE_RE = re.compile(r'[\\/:*?"<>|]')
-
-
 _DIRECTORY_PACKAGE_IDENTITY_PROOF_KEY = "verified_directory_package_identity_proof"
 _DIRECTORY_PACKAGE_IDENTITY_ACCEPTED_KEY = (
     "verified_directory_package_identity_proof_accepted"
@@ -1159,7 +1156,6 @@ class Organizer:
                        include_media_info: bool = True,
                        include_variant_tags: bool = True) -> str:
         rules = enforce_fixed_organize_rules(rules or OrganizeRules())
-        title = SAFE_RE.sub("_", match.title or "")
         year = match.year or ""
         tmdb = match.tmdb_id or ""
         identity_id = self._match_identity_key(match)
@@ -1172,7 +1168,7 @@ class Organizer:
                 self._extract_media_info(file.name) if rules.media_info_enabled else ""
             )
         context = build_context(
-            title=title,
+            title=match.title,
             year=year,
             tmdb_id=tmdb,
             identity_id=identity_id,
@@ -1183,6 +1179,7 @@ class Organizer:
             ext=ext,
             original_name=file.name,
         )
+        title = context.title
         scope = {part.strip() for part in (rules.naming_scope or "guangya").split(",") if part.strip()}
         templates_enabled = "both" in scope or "guangya" in scope
         configured_template = rules.tv_template if is_tv else rules.movie_template
@@ -1262,15 +1259,15 @@ class Organizer:
         """电影和剧集共用的独立媒体目录入口。"""
         rules = enforce_fixed_organize_rules(rules or OrganizeRules())
         template = self._media_directory_template(match, rules)
-        title = SAFE_RE.sub("_", match.title or "")
         year = match.year or ""
         tmdb = match.tmdb_id or ""
         identity_id = self._match_identity_key(match)
         identity_tag = "" if template == NSFW_DIR_DEFAULT else self._match_identity_tag(match)
         context = build_context(
-            title=title, year=year, tmdb_id=tmdb,
+            title=match.title, year=year, tmdb_id=tmdb,
             identity_id=identity_id, identity_tag=identity_tag,
         )
+        title = context.title
         scope = {part.strip() for part in (rules.naming_scope or "guangya").split(",") if part.strip()}
         fallback = f"{title} ({year}) {identity_tag}" if year else f"{title} {identity_tag}"
         if not ({"both", "guangya"} & scope) or not template:

@@ -232,7 +232,8 @@ def build_context(*, title: str, year: str | int, tmdb_id: str | int = "",
     if episode_text:
         season_episode += f"E{episode_text}"
     original_stem = original_name.rsplit(".", 1)[0] if "." in original_name else original_name
-    safe_title = _INVALID_NAME.sub("_", (title or ""))
+    # 上游可能只把标题中点改成形似字符；统一归档名称，不改元数据或原文件名。
+    safe_title = _INVALID_NAME.sub("_", (title or "").replace("‧", "·"))
     tmdb_value = str(tmdb_id or "")
     stable_id = str(identity_id or tmdb_value)
     tmdb_tag = f"{{tmdb-{tmdb_value}}}" if tmdb_value else ""

@@ -24,9 +24,9 @@ from tests.test_local_media_service import FakeScraper
 class ReleaseChainNamingTests(IsolatedDatabaseTestCase):
     def test_long_default_names_survive_local_movie_and_tv_moves(self):
         for media_type in ("movie", "tv"):
-            for title in ("A" * 240, "很长的媒体标题" * 50):
+            for case, title in enumerate(("A" * 240, "很长的媒体标题" * 50, "倪亚‧利斯顿")):
                 with (
-                    self.subTest(media_type=media_type, unicode=not title.isascii()),
+                    self.subTest(media_type=media_type, case=case),
                     TemporaryDirectory() as raw,
                 ):
                     root = Path(raw)
@@ -45,7 +45,7 @@ class ReleaseChainNamingTests(IsolatedDatabaseTestCase):
                         b"isolated subtitle"
                     )
                     source_id = db.create_local_media_source(
-                        name=f"B-long-{media_type}-{title.isascii()}",
+                        name=f"B-naming-{media_type}-{case}",
                         qb_profile="",
                         qb_path_prefix="",
                         local_root=str(source),
@@ -100,6 +100,9 @@ class ReleaseChainNamingTests(IsolatedDatabaseTestCase):
                         moved = videos[0].path
                         self.assertEqual(moved.suffix, ".mkv")
                         self.assertEqual(moved.read_bytes(), b"isolated fake media")
+                        self.assertNotIn("‧", str(moved.relative_to(target)))
+                        if title == "倪亚‧利斯顿":
+                            self.assertIn("倪亚·利斯顿", moved.name)
                         self.assertLessEqual(len(moved.name.encode()), 240)
                         self.assertIn("{tmdb-123}", str(moved.parent))
                         if media_type == "tv":
