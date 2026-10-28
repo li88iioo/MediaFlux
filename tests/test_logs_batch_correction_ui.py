@@ -109,6 +109,7 @@ const detailFor=id=>{
     allowed_actions:allowed,
     items:[{file_id:'f'+id,role:'video',current_name:'Series.S01E02.mkv',original_name:'Series.S01E02.mkv',current_parent_id:'p',status:'success'}],
     operations:[],delete_audits:[],related_logs:window.__testConfig.relatedLogsById?.[id]||[],
+    ...window.__testConfig.detailOverrides,
   };
 };
 window.__releasePreview=id=>{
@@ -283,6 +284,28 @@ class LogsBatchCorrectionBrowserTests(unittest.TestCase):
     def tearDown(self):
         self.page.close()
         self.assertEqual(self.errors, [])
+
+    def test_recycled_status_is_consistent_in_filter_list_and_detail(self):
+        self.page.evaluate("""async () => {
+            const item={file_id:'recycled-video',role:'video',current_name:'Example.mkv',status:'deleted'};
+            Object.assign(window.__testConfig, {
+                rows:[{...window.__testConfig.rows[0],status:'deleted',raw_status:'deleted'}],
+                detailOverrides:{status:'deleted',items:[item],allowed_actions:{}},
+            });
+            await loadOrganize(1);
+        }""")
+        self.page.select_option('#orgStatus', 'deleted')
+        self.assertEqual(self.page.locator('#orgStatus option:checked').inner_text(), '已移入回收站')
+        row = self.page.locator('#organizeList tr')
+        self.assertEqual(row.locator('.status-pill.done').inner_text(), '已移入回收站')
+        self.assertEqual(row.locator('.status-pill.failed').count(), 0)
+        row.locator('.detail-btn').click()
+        self.page.wait_for_function("() => document.getElementById('organizeDetailSubtitle').textContent.includes('已移入回收站')")
+        for selector in ('#organizeDetailSubtitle .organize-detail-status-badge',
+                         '#organizeDetailSummary .organize-flow-status-pill',
+                         '#organizeDetailItems .status-pill'):
+            self.assertEqual(self.page.locator(selector + '.done').inner_text(), '已移入回收站')
+        self.assertEqual(self.page.locator('#organizeDetailModal .failed').count(), 0)
 
     def test_clear_freezes_filters_across_confirmation_and_disables_duplicate_submit(self):
         self.page.select_option('#orgOrigin', 'guangya')

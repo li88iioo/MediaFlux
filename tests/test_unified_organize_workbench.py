@@ -229,8 +229,14 @@ class UnifiedOrganizeWorkbenchTests(IsolatedDatabaseTestCase):
         self.assertEqual({row["id"] for row in data["items"]}, expected)
         self.assertTrue(all(row["origin"] == "guangya" for row in data["items"]))
         self.assertEqual(db.get_dashboard_automation_summary()["organize_issues"], data["total"])
-        # 保持旧“失败”筛选含已删除的兼容语义，不顺带重定义已有筛选。
-        self.assertIn(deleted, {row["id"] for row in db.list_organize_timeline(origin="guangya", status="failed", limit=100)})
+        self.assertEqual(expected, {row["id"] for row in db.list_organize_timeline(origin="guangya", status="failed", limit=100)})
+        recycled = self.client.get("/api/logs/organize/timeline", params={"status": "deleted"})
+        self.assertEqual(recycled.status_code, 200, recycled.text)
+        self.assertEqual(recycled.json()["total"], 1)
+        self.assertEqual([(row["id"], row["status"], row["raw_status"]) for row in recycled.json()["items"]],
+                         [(deleted, "deleted", "deleted")])
+        overview = self.client.get("/api/logs/overview").json()["timeline"]
+        self.assertEqual((overview["failed"], overview["deleted"], overview["success"]), (24, 1, 0))
 
     @unittest.skipUnless(shutil.which("node"), "需要 Node 验证日志页链接参数")
     def test_log_deep_link_restores_only_supported_origin_and_status(self):
@@ -243,6 +249,7 @@ const html=fs.readFileSync('app/templates/logs.html','utf8');
 const helper=source.slice(source.indexOf('function restoreOrganizeFiltersFromUrl()'),source.indexOf('// 初次加载：'));
 for(const [search,origin,status] of [
  ['?origin=guangya&status=issues','guangya','issues'],
+ ['?origin=guangya&status=deleted','guangya','deleted'],
  ['?origin=local&status=manual','local','manual'],
  ['?origin=unknown&status=%3Cscript%3E','all',''],
  ['', 'all',''],
@@ -318,7 +325,7 @@ for(const [search,origin,status] of [
             400,
         )
         self.assertEqual(
-            self.client.get("/api/logs/organize/timeline", params={"status": "deleted"}).status_code,
+            self.client.get("/api/logs/organize/timeline", params={"status": "unknown"}).status_code,
             400,
         )
         page = self.client.get("/logs")

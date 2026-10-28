@@ -51,7 +51,10 @@ class OrganizeLogClearTests(unittest.TestCase):
         selected = db.list_organize_timeline(status="issues", limit=100)
         result = db.clear_organize_logs(status="issues")
         self.assertEqual(result["deleted"], len(selected))
-        self.assertEqual({row["raw_status"] for row in db.list_organize_timeline(status="failed")}, {"deleted"})
+        self.assertEqual(db.count_organize_timeline(status="failed"), 0)
+        self.assertEqual({row["raw_status"] for row in db.list_organize_timeline(status="deleted")}, {"deleted"})
+        self.assertEqual(db.clear_organize_logs(status="deleted")["deleted"], 1)
+        self.assertEqual(db.clear_organize_logs(status="deleted")["deleted"], 0)
         self.assertEqual(db.clear_organize_logs(origin="local", status="success")["deleted"], 1)
         self.assertIsNotNone(db.list_organize_timeline(status="success")[0])
 

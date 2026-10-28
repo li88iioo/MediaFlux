@@ -21,7 +21,7 @@ function api(path, opts={}) { return fetch(path, {headers:{'Content-Type':'appli
 function _esc(v) { const d=document.createElement('div'); d.textContent=v==null?'':String(v); return d.innerHTML; }
 function _attr(v) { return _esc(v).replaceAll('\"','&quot;').replaceAll("'",'&#39;'); }
 
-const orgStatusMap = {success:['成功','done'], failed:['失败','failed'], skipped:['跳过','paused'], manual:['待确认','paused'], processing:['处理中','running'], reverted:['已回退','running'], interrupted:['操作中断','failed'], reorganizing:['重新整理中','running'], returning:['送回中','running'], reverting:['回退中','running'], deleting:['删除中','running'], deleted:['已删除','failed'], partial_failed:['部分失败','failed'], revert_failed:['回退失败','failed']};
+const orgStatusMap = {success:['成功','done'], failed:['失败','failed'], skipped:['跳过','paused'], manual:['待确认','paused'], processing:['处理中','running'], reverted:['已回退','running'], interrupted:['操作中断','failed'], reorganizing:['重新整理中','running'], returning:['送回中','running'], reverting:['回退中','running'], deleting:['移入回收站中','running'], deleted:['已移入回收站','done'], partial_failed:['部分失败','failed'], revert_failed:['回退失败','failed']};
 
 function lockElementHeight(element) {
     if (!element) return () => {};
@@ -775,7 +775,7 @@ function _renderOrganizeDetail(data){
         const roleIcon = role==='video' ? 'video' : role==='subtitle' ? 'captions' : 'file-text';
         const roleLabel = _formatRole(rawRole);
         const st = item.status || '-';
-        const stClass = st==='success'?'done':st==='deleted'?'failed':'paused';
+        const [stLabel, stClass] = orgStatusMap[st] || [st, 'paused'];
         return `
             <div class="organize-item organize-item-card">
                 <div class="organize-item-role-col">
@@ -797,7 +797,7 @@ function _renderOrganizeDetail(data){
                     ${item.error ? `<div class="organize-item-reason"><i data-lucide="alert-circle"></i><span>${item.status==='skipped'?'跳过原因':'错误'}：${_esc(item.error)}</span></div>` : ''}
                 </div>
                 <div class="organize-item-status-col">
-                    <span class="status-pill ${stClass}">${_esc(st)}</span>
+                    <span class="status-pill ${stClass}">${_esc(stLabel)}</span>
                 </div>
             </div>
         `;

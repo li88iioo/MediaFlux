@@ -1208,6 +1208,7 @@ def count_organize_logs(status: str | None = None, keyword: str = "") -> int:
 _TIMELINE_STATUS_VALUES = {
     "success",
     "failed",
+    "deleted",
     "issues",
     "skipped",
     "reverted",
@@ -1234,7 +1235,8 @@ def _organize_timeline_query(
                 l.status AS raw_status,
                 CASE
                     WHEN l.status='success' THEN 'success'
-                    WHEN l.status IN ('failed','interrupted','partial_failed','revert_failed','deleted') THEN 'failed'
+                    WHEN l.status='deleted' THEN 'deleted'
+                    WHEN l.status IN ('failed','interrupted','partial_failed','revert_failed') THEN 'failed'
                     WHEN l.status='manual' OR (
                         l.status='skipped' AND (
                             instr(COALESCE(l.error,''),'人工确认')>0 OR
@@ -1306,7 +1308,7 @@ def _organize_timeline_query(
         sql += " AND origin=?"
         params.append(normalized_origin)
     if normalized_status == "issues":
-        # 对齐看板历史异常口径；旧failed筛选仍保留“已删除”的兼容语义。
+        # 对齐看板历史异常口径，不把主动回收成功当作异常。
         sql += " AND raw_status IN ('failed','interrupted','partial_failed','revert_failed')"
     elif normalized_status:
         sql += " AND status=?"
@@ -1356,6 +1358,7 @@ def count_organize_timeline_by_status(*, owner: str = "admin") -> dict[str, int]
     counts = {
         "success": 0,
         "failed": 0,
+        "deleted": 0,
         "skipped": 0,
         "manual": 0,
         "processing": 0,
