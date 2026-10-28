@@ -57,6 +57,26 @@ class BackupStreamingTests(unittest.TestCase):
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM fixture').fetchone()[0], 2)
             self.assertEqual(paths.env_file.read_text(), 'WEB_PORT=1258\n')
 
+    def test_backup_round_trip_in_temporary_path_with_uri_delimiters(self):
+        with tempfile.TemporaryDirectory() as raw:
+            paths = self.make_database(Path(raw), mib=1)
+            with sqlite3.connect(paths.database_path) as conn:
+                conn.execute('PRAGMA user_version=1')
+            staging = Path(raw) / '备份 #100%? 暂存'
+            staging.mkdir()
+            with patch.object(tempfile, 'tempdir', str(staging)):
+                archive = create_backup(paths)
+                self.assertEqual(verify_backup(archive).as_dict()['database_schema_version'], 1)
+                with sqlite3.connect(paths.database_path) as conn:
+                    conn.execute('DELETE FROM fixture')
+                paths.env_file.write_text('WEB_PORT=9000\n')
+                restore_backup(paths, archive)
+            with sqlite3.connect(paths.database_path) as conn:
+                self.assertEqual(conn.execute('SELECT COUNT(*) FROM fixture').fetchone()[0], 1)
+            self.assertEqual(paths.env_file.read_text(), 'WEB_PORT=1258\n')
+            self.assertEqual(list(staging.iterdir()), [])
+            self.assertFalse((Path(raw) / '备份 ').exists())
+
     def test_large_backup_and_verification_have_bounded_python_allocations(self):
         with tempfile.TemporaryDirectory() as raw:
             paths = self.make_database(Path(raw), mib=24)

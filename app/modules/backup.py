@@ -105,11 +105,8 @@ def _sqlite_backup_file(
 def _database_schema_version(path: Path | None) -> int:
     if path is None:
         return 0
-    connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
         return int(connection.execute("PRAGMA user_version").fetchone()[0])
-    finally:
-        connection.close()
 
 
 def _entry(name: str, path: Path) -> dict[str, Any]:
@@ -253,17 +250,13 @@ def _safe_archive_name(name: str) -> str:
 
 
 def _verify_sqlite(path: Path) -> int:
-    connection: sqlite3.Connection | None = None
     try:
-        connection = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-        integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
-        foreign = connection.execute("PRAGMA foreign_key_check").fetchall()
-        schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            foreign = connection.execute("PRAGMA foreign_key_check").fetchall()
+            schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
     except sqlite3.Error as exc:
         raise BackupError(f"备份数据库无法读取：{exc}") from exc
-    finally:
-        if connection is not None:
-            connection.close()
     if integrity != "ok" or foreign:
         raise BackupError("备份数据库完整性校验失败")
     return schema_version
