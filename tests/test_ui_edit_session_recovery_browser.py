@@ -39,6 +39,13 @@ SUBSCRIPTIONS = [
 ]
 SCRAPE = "/api/guangya/directory-scrape"
 MEDIA = "/api/subscriptions/media"
+PROXY = "/api/media-proxy"
+PROXY_INSTANCES = [
+    dict(id=i, name=f"反代 {i}", config_source="custom", server_type="jellyfin",
+         upstream_url="http://jellyfin.invalid", listen_host="127.0.0.1",
+         listen_port=18096 + i, enabled=True, status="running")
+    for i in (1, 2)
+]
 # 先读取 fake JSON，再阻塞交付；这是 AbortController 无法撤回的已完成响应。
 REPLY_GATE = """
 (() => {
@@ -115,7 +122,7 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
                 static_url=lambda value: "/static/" + value,
                 url_for=lambda name: "/" + name.split(".")[-1],
             )
-            for name in ("rss", "guangya")
+            for name in ("rss", "guangya", "media_proxy")
         }
 
     @classmethod
@@ -173,9 +180,11 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.page.set_default_timeout(2500)
         self.page.on("pageerror", lambda error: self.errors.append(str(error)))
         self.page.goto("http://offline.invalid/" + template)
-        ready = (
-            '[data-subscription-id="1"]' if template == "rss" else '[data-media-id="A"]'
-        )
+        ready = {
+            "rss": '[data-subscription-id="1"]',
+            "guangya": '[data-media-id="A"]',
+            "media_proxy": '[data-select-instance="1"]',
+        }[template]
         self.page.locator(ready).wait_for()
         return self.page
 
@@ -207,6 +216,18 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
             if self.replies.get(key):
                 status, payload = self.replies[key].pop(0)
                 route.fulfill(status=status, json=payload)
+                return
+            if path == PROXY + "/profiles":
+                route.fulfill(json=[])
+                return
+            if path == PROXY and request.method == "GET":
+                route.fulfill(json=PROXY_INSTANCES)
+                return
+            if path in (PROXY + "/1", PROXY + "/2") and request.method == "PUT":
+                route.fulfill(json={"instance": PROXY_INSTANCES[int(path[-1]) - 1]})
+                return
+            if path in (PROXY + "/1/bindings", PROXY + "/2/bindings"):
+                route.fulfill(json=[] if request.method == "GET" else {"ok": True})
                 return
             if path == MEDIA and request.method == "GET":
                 route.fulfill(json={"items": SUBSCRIPTIONS, "total": len(SUBSCRIPTIONS), "has_more": False, "next": None})
@@ -283,6 +304,124 @@ class UiEditSessionRecoveryBrowserTests(unittest.TestCase):
         self.page.evaluate(
             "() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))"
         )
+
+    def proxy_late_save(self, *, binding=False, status=200, new_pending=False, width=1280, same_object=False):
+        page = self.make_page("media_proxy", width)
+        modal, field, save, notice = (
+            ("bindingModal", "bindingItemId", "saveBindingBtn", "bindingSaveState")
+            if binding else ("proxyModal", "proxyName", "saveProxyBtn", "proxySaveState")
+        )
+
+        def edit(ident):
+            if binding:
+                page.locator("#proxyTabButton_instances").click()
+                page.locator(f'[data-select-instance="{ident}"] strong').first.click()
+                page.locator("#proxyTabButton_advanced").click()
+                page.locator("#newBindingBtn").click()
+                page.locator("#bindingGuangyaId").fill(f"cloud-{ident}")
+            else:
+                page.locator(f'[data-edit-instance="{ident}"]').click()
+            page.locator(f"#{field}").fill(f"draft-{ident}")
+
+        edit(1)
+        path = PROXY + ("/1/bindings" if binding else "/1")
+        method = "POST" if binding else "PUT"
+        self.hold_reply(path, "old-save", payload={"error": "旧保存失败"} if status == 500 else None,
+                        status=status, method=method)
+        page.locator(f"#{save}").click()
+        self.wait_reply("old-save")
+        if status == 500:
+            page.locator(f'#{modal} .media-config-footer [data-{"binding" if binding else "proxy"}-close]').click()
+        else:
+            page.keyboard.press("Escape")
+        page.locator(f"#{modal}").wait_for(state="hidden")
+        edit(1 if same_object else 2)
+        page.locator(f"#{field}").fill("draft-2")
+        if new_pending:
+            self.assertTrue(page.locator(f"#{save}").is_enabled(), "新会话必须能保存")
+            self.hold_reply(PROXY + ("/2/bindings" if binding else "/2"), "new-save", method=method)
+            page.locator(f"#{save}").click()
+            self.wait_reply("new-save")
+        page.locator(f"#{modal}").evaluate("""async el => {
+            await Promise.all(el.getAnimations({subtree:true})
+                .filter(a => a.effect.getTiming().iterations !== Infinity)
+                .map(a => a.finished.catch(() => {})));
+        }""")
+        before = page.locator(f"#{save}").bounding_box()
+        self.release_reply("old-save")
+        self.assertTrue(page.locator(f"#{modal}").is_visible(), "旧成功不能关闭新会话")
+        self.assertEqual(page.locator(f"#{field}").input_value(), "draft-2")
+        self.assertEqual(page.locator(f"#{notice}").inner_text(), "保存中..." if binding and new_pending
+                         else "保存并热加载中..." if new_pending else "")
+        self.assertEqual(page.locator(f"#{save}").is_disabled(), new_pending)
+        self.assertEqual(page.locator(f"#{save}").bounding_box(), before)
+        if new_pending:
+            self.release_reply("new-save")
+            page.locator(f"#{modal}").wait_for(state="hidden")
+            if not binding:
+                page.locator('[data-select-instance="2"].active').wait_for()
+                self.assertTrue(page.locator("#newBindingBtn").is_enabled())
+                self.assertIn("反代 2", page.locator("#bindingPanelHint").inner_text())
+        saves = [r for r in self.requests if r["method"] == method]
+        self.assertEqual(saves[0]["path"], path)
+        self.assertEqual(saves[0]["body"]["media_item_id" if binding else "name"], "draft-1")
+
+    def test_proxy_instance_late_success_keeps_new_draft(self):
+        self.proxy_late_save()
+
+    def test_proxy_instance_late_error_keeps_new_draft(self):
+        self.proxy_late_save(status=500)
+
+    def test_proxy_instance_old_completion_cannot_release_new_save(self):
+        self.proxy_late_save(status=500, new_pending=True)
+
+    def test_proxy_binding_late_success_keeps_new_draft_on_mobile(self):
+        self.proxy_late_save(binding=True, width=390)
+
+    def test_proxy_binding_late_error_keeps_new_draft(self):
+        self.proxy_late_save(binding=True, status=500)
+
+    def test_proxy_binding_old_completion_cannot_release_new_save(self):
+        self.proxy_late_save(binding=True, new_pending=True)
+
+    def test_proxy_instance_reopened_same_object_is_a_new_session(self):
+        self.proxy_late_save(same_object=True)
+
+    def test_proxy_binding_reopened_same_instance_is_a_new_session(self):
+        self.proxy_late_save(binding=True, same_object=True)
+
+    def proxy_current_failure_retry(self, *, binding=False):
+        page = self.make_page("media_proxy")
+        if binding:
+            page.locator('[data-select-instance="1"] strong').first.click()
+            page.locator("#proxyTabButton_advanced").click()
+            page.locator("#newBindingBtn").click()
+            page.locator("#bindingGuangyaId").fill("cloud-1")
+        else:
+            page.locator('[data-edit-instance="1"]').click()
+        modal, field, save, notice, method, path = (
+            ("bindingModal", "bindingItemId", "saveBindingBtn", "bindingSaveState", "POST", PROXY + "/1/bindings")
+            if binding else ("proxyModal", "proxyName", "saveProxyBtn", "proxySaveState", "PUT", PROXY + "/1")
+        )
+        page.locator(f"#{field}").fill("retry-draft")
+        self.hold_reply(path, "failure", payload={"error": "当前失败，可重试"}, status=500, method=method)
+        page.locator(f"#{save}").click()
+        self.wait_reply("failure")
+        page.locator(f"#{save}").dispatch_event("click")
+        self.assertEqual(len([r for r in self.requests if r["method"] == method]), 1)
+        self.release_reply("failure")
+        self.assertTrue(page.locator(f"#{save}").is_enabled())
+        self.assertEqual(page.locator(f"#{field}").input_value(), "retry-draft")
+        self.assertEqual(page.locator(f"#{notice}").inner_text(), "当前失败，可重试")
+        page.locator(f"#{save}").click()
+        page.locator(f"#{modal}").wait_for(state="hidden")
+        self.assertEqual(len([r for r in self.requests if r["method"] == method]), 2)
+
+    def test_proxy_instance_current_error_preserves_draft_and_can_retry(self):
+        self.proxy_current_failure_retry()
+
+    def test_proxy_binding_current_error_preserves_draft_and_can_retry(self):
+        self.proxy_current_failure_retry(binding=True)
 
     def manual(self, name):
         self.page.locator(f'[data-media-id="{name}"] .gy-dir-action-btn').click()
