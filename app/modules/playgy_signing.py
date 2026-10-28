@@ -47,7 +47,7 @@ def sign_playgy(file_id: str | int, etag: str, size: str | int) -> str:
 
 
 def verify_playgy(file_id: str | int, etag: str, size: str | int, version: str | int, signature: str) -> bool:
-    if version != _VERSION or len(signature or "") != 64:
+    if version != _VERSION or len(signature or "") != 64 or not signature.isascii():
         return False
     expected = sign_playgy(file_id, etag, size)
     return hmac.compare_digest(expected, signature)

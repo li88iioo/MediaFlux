@@ -263,6 +263,7 @@ class PlayGyQualityTests(unittest.TestCase):
             (parsed.path.replace(str(_SIZE), "1"), signed, {"view": "resolve", "quality": "original"}),
             (parsed.path, {**signed, "v": ["2"]}, {"view": "variants"}),
             (parsed.path, {**signed, "sig": ["0" * 64]}, {"view": "resolve", "quality": _HLS_GCID}),
+            (parsed.path, {**signed, "sig": ["鸭" * 64]}, {"view": "variants"}),
             (parsed.path, {}, {"view": "unknown", "quality": "original"}),
         ]
         for path, credentials, view in cases:
