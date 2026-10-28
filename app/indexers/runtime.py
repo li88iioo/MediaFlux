@@ -413,6 +413,7 @@ def build_indexer_service() -> IndexerService:
     registry = build_default_registry(
         user_agent=_user_agent(),
         nyaa_endpoint_timeout_seconds=nyaa_endpoint_timeout_seconds,
+        mikan_endpoint_timeout_seconds=site_timeout_seconds,
         btbtla_min_interval_seconds=_bounded_int(
             "INDEXER_BTBTLA_MIN_INTERVAL_SECONDS", 5, 0, 60
         ),

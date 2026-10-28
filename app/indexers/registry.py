@@ -64,6 +64,7 @@ def build_default_registry(
     http_clients: Mapping[str, object] | None = None,
     user_agent: str = "MediaFlux/1.0",
     nyaa_endpoint_timeout_seconds: float = 4,
+    mikan_endpoint_timeout_seconds: float = 10,
     btbtla_min_interval_seconds: float = 5,
     btbtla_page_size: int = 40,
     btbtla_cache_ttl_seconds: int = 120,
@@ -83,6 +84,7 @@ def build_default_registry(
     mikan_http = supplied.get("mikan") or FixedHostHttpClient(
         allowed_hosts={(urlsplit(MIKAN_URL).hostname or ""), (urlsplit(MIKAN_MIRROR_URL).hostname or "")},
         user_agent=user_agent,
+        timeout_seconds=mikan_endpoint_timeout_seconds,
         pin_resolved_address=True,
         # Mikan 搜索页内嵌全部剧集条目，热门作品实测 4MiB+，默认 2MiB 会截断。
         max_response_bytes=8 * 1024 * 1024,
@@ -127,7 +129,9 @@ def build_default_registry(
                 http=sukebei_http,
                 default_enabled=False,
             ),
-            "mikan": MikanAdapter(http=mikan_http),
+            "mikan": MikanAdapter(
+                http=mikan_http, endpoint_timeout_seconds=mikan_endpoint_timeout_seconds,
+            ),
             "btbtla": BTBtlaAdapter(
                 http=btbtla_http,
                 min_interval_seconds=btbtla_min_interval_seconds,

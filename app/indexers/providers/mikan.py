@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -42,12 +43,23 @@ class MikanAdapter(DirectResultAdapter):
     default_enabled = True
     capabilities = IndexerCapabilities(pagination_supported=False, download_kinds=("magnet", "torrent"))
 
-    def __init__(self, *, http, mirror_base_urls: tuple[str, ...] | None = None):
+    def __init__(
+        self,
+        *,
+        http,
+        mirror_base_urls: tuple[str, ...] | None = None,
+        endpoint_timeout_seconds: float = 10,
+    ):
         self.http = http
         self.mirror_base_urls = tuple(
             dict.fromkeys(self.mirror_base_urls if mirror_base_urls is None else mirror_base_urls)
         )
         self._host_bases = tuple(dict.fromkeys((self.base_url, *self.mirror_base_urls)))
+        self.endpoint_timeout_seconds = max(0.1, float(endpoint_timeout_seconds))
+
+    def search_timeout_overhead_seconds(self) -> float:
+        # 保留主站完整读取预算，备用端点另获同等预算，仍逐个串行回落。
+        return self.endpoint_timeout_seconds * (len(self._host_bases) - 1)
 
     async def search(self, request: IndexerSearchRequest) -> IndexerPage:
         if request.page > 1:
@@ -55,8 +67,10 @@ class MikanAdapter(DirectResultAdapter):
         last_error: HttpInvalidResponse | IndexerRateLimited | IndexerTimeout | IndexerUnavailable | None = None
         for base_url in self._host_bases:
             try:
-                return await self._search_base(base_url, request)
-            except httpx.TimeoutException:
+                return await asyncio.wait_for(
+                    self._search_base(base_url, request), timeout=self.endpoint_timeout_seconds,
+                )
+            except (asyncio.TimeoutError, httpx.TimeoutException):
                 last_error = IndexerTimeout(f"Mikan endpoint timed out: {base_url}")
             except httpx.TransportError:
                 last_error = IndexerUnavailable(f"Mikan endpoint connection failed: {base_url}")

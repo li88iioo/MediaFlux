@@ -121,11 +121,51 @@ class IndexerRuntimeTests(unittest.IsolatedAsyncioTestCase):
         build.assert_called_once_with(
             user_agent="MediaFlux/Test",
             nyaa_endpoint_timeout_seconds=4.0,
+            mikan_endpoint_timeout_seconds=10,
             btbtla_min_interval_seconds=5,
             btbtla_page_size=40,
             btbtla_cache_ttl_seconds=120,
         )
         self.assertIs(service.registry, registry)
+
+    def test_build_service_uses_full_configured_site_budget_for_mikan(self):
+        for configured, expected in ((1, 2), (17, 17), (100, 60)):
+            with self.subTest(configured=configured), patch(
+                "app.indexers.runtime.config.get", side_effect=lambda _key, default="": default,
+            ), patch(
+                "app.indexers.runtime.config.get_int",
+                side_effect=lambda key, default: configured if key == "INDEXER_SITE_TIMEOUT_SECONDS" else default,
+            ), patch(
+                "app.indexers.runtime.config.get_bool", side_effect=lambda _key, default: default,
+            ), patch(
+                "app.indexers.runtime.build_default_registry", return_value=FakeRegistry(),
+            ) as build:
+                service = runtime.build_indexer_service()
+
+                self.assertEqual(build.call_args.kwargs["mikan_endpoint_timeout_seconds"], expected)
+                self.assertEqual(service.site_timeout_seconds, expected)
+
+    def test_default_registry_passes_mikan_budget_without_changing_http_safety(self):
+        from app.indexers.providers.mikan import MikanAdapter
+        from app.indexers.registry import build_default_registry
+
+        clients = {site_id: object() for site_id in (*FakeRegistry().ids(), "kpkuang") if site_id != "mikan"}
+        http = object()
+        with patch("app.indexers.registry.FixedHostHttpClient", return_value=http) as build_http:
+            registry = build_default_registry(http_clients=clients, mikan_endpoint_timeout_seconds=17)
+
+        build_http.assert_called_once_with(
+            allowed_hosts={"mikanani.me", "mikanime.tv"},
+            user_agent="MediaFlux/1.0",
+            timeout_seconds=17,
+            pin_resolved_address=True,
+            max_response_bytes=8 * 1024 * 1024,
+        )
+        adapter = registry.get("mikan")
+        self.assertIsInstance(adapter, MikanAdapter)
+        self.assertIs(adapter.http, http)
+        self.assertEqual(adapter.endpoint_timeout_seconds, 17)
+        self.assertEqual(adapter.search_timeout_overhead_seconds(), 17)
 
     def test_build_service_enables_env_example_default_sites(self):
         registry = FakeRegistry()
