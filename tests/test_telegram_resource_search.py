@@ -26,6 +26,7 @@ from app.modules.telegram_resource_search import (
     TelegramResourceSearchStore,
     _search_snapshot,
 )
+from tests.support import InitializedWebTestCase
 
 
 class _Markup:
@@ -487,7 +488,7 @@ class TelegramResourceSearchViewTests(unittest.TestCase):
         self.assertLessEqual(len(resource_button.text), 37)
 
 
-class TelegramResourceSearchCommandTests(unittest.TestCase):
+class TelegramResourceSearchCommandTests(InitializedWebTestCase):
     def test_group_resource_search_requires_allowed_user_but_private_chat_stays_compatible(
         self,
     ):

@@ -843,7 +843,7 @@ class IndexerAPITests(unittest.TestCase):
             "can_resubmit": True,
             "resubmit_target": "guangya",
         }
-        with patch(
+        with patch("app.routes.indexers_api.get_indexer_service", return_value=FakeIndexerService()), patch(
             "app.routes.indexers_api.download_indexer_result",
             new=AsyncMock(return_value=item),
         ):

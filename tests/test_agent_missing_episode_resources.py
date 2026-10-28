@@ -15,6 +15,7 @@ from app.agent.domains.library.episode_resource_actions import (
 )
 from app.agent.errors import AgentToolError
 from app.agent.models import Evidence, ToolResult
+from app.indexers.result_store import IndexerResultStore
 
 
 def _identity(arguments):
@@ -95,19 +96,15 @@ def _search_result(*, ok=True, status="success", query="示例剧 S02E03", items
 
 class MissingEpisodeResourceToolTests(unittest.TestCase):
     def setUp(self):
-        enabled_service = Mock(enabled_site_ids=("nyaa",))
+        enabled_service = Mock(enabled_site_ids=("nyaa",), result_store=IndexerResultStore())
         enabled_service.site_ids_for_scope.return_value = ("nyaa",)
-        get_bool_patch = patch(
+        self.enterContext(patch(
             "app.agent.domains.resources.indexer_actions.config.get_bool", return_value=True
-        )
-        service_patch = patch(
-            "app.agent.domains.resources.indexer_actions.get_indexer_service",
-            return_value=enabled_service,
-        )
-        get_bool_patch.start()
-        service_patch.start()
-        self.addCleanup(service_patch.stop)
-        self.addCleanup(get_bool_patch.stop)
+        ))
+        for module in ("resources.indexer_actions", "library.episode_resource_actions"):
+            self.enterContext(patch(
+                f"app.agent.domains.{module}.get_indexer_service", return_value=enabled_service,
+            ))
 
     def test_arguments_normalize_and_reject_unsafe_fields(self):
         normalized = missing_episode_resource_arguments(
