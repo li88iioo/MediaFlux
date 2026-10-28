@@ -7,8 +7,10 @@ NativeRuntime 的 HTTP 请求全部经过 MockTransport；测试禁止外网连�
 import asyncio
 import json
 import socket
+import threading
 from copy import deepcopy
 from dataclasses import replace
+from unittest.mock import patch
 
 import pytest
 
@@ -26,7 +28,7 @@ from app.agent.kernel.events import AgentEventType as E
 from app.agent.kernel.model import ModelEvent, ModelToolCall
 from app.agent.kernel.model import ModelEventType as M
 from app.agent.kernel.persistence import SQLiteKernelStore
-from app.agent.kernel.state_types import AgentInput
+from app.agent.kernel.state_types import AgentInput, SessionBusyError
 from tests.support import isolated_test_database
 from tests.test_pending_explanation_transports import NativeRuntime
 
@@ -164,6 +166,51 @@ def test_button_cancellation_is_in_cold_history_and_native_model_input(runtime):
         assert runtime.writes == [] and len(runtime.prepares) == 1
         await followup(runtime)
         assert_cancelled(await cold_state(runtime), plan_id)
+
+    asyncio.run(run())
+
+
+def test_interrupted_ticket_cancellation_keeps_lock_until_cold_history_is_settled(runtime):
+    async def run():
+        plan_id = await preview(runtime)
+        entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+        cancel = runtime.effects.cancel
+
+        def held_cancel(**kwargs):
+            entered.set()
+            try:
+                assert release.wait(5), "取消票据线程未释放"
+                return cancel(**kwargs)
+            finally:
+                finished.set()
+
+        with patch.object(runtime.effects, "cancel", side_effect=held_cancel):
+            task = asyncio.create_task(runtime.session.cancel_effect(
+                owner=OWNER, session_id=SID, plan_id=plan_id,
+            ))
+            try:
+                assert await asyncio.to_thread(entered.wait, 5)
+                for _ in range(3):
+                    task.cancel()
+                    delivered = asyncio.Event()
+                    asyncio.get_running_loop().call_soon(delivered.set)
+                    await delivered.wait()
+                    assert not task.done(), "撤票工作项结束前不能释放会话或丢弃真实结果"
+                    with pytest.raises(SessionBusyError):
+                        await SQLiteKernelStore().begin_turn(
+                            owner=OWNER, session_id=SID, request_id="peer-during-cancel",
+                        )
+            finally:
+                release.set()
+                outcome = (await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5))[0]
+                assert await asyncio.to_thread(finished.wait, 5)
+        assert outcome is True
+        cold_reopen(runtime)
+        state = await cold_state(runtime)
+        assert state.pending_effect_plan_id == ""
+        assert_cancelled(state, plan_id)
+        assert runtime.writes == []
+        await followup(runtime)
 
     asyncio.run(run())
 

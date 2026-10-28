@@ -938,10 +938,11 @@ class ToolPipeline:
             return False
         generation = self._pending_generation(current)
         try:
-            cancelled_plan = await asyncio.to_thread(
+            # 撤票及其历史收尾共用当前会话锁；请求取消不能先于实际撤票放锁。
+            cancelled_plan = await guarded_state_call(lease.owner, lease.session_id, partial(
                 self.effect_store.cancel, owner=lease.owner, session_id=lease.session_id,
                 generation=generation if generation is not None else current.generation, plan_id=plan_id,
-            )
+            ), kind="commit", complete_on_cancel=True)
             cancelled = cancelled_plan is not None
         except EffectPlanExpiredError as exc:
             cancelled_plan, cancelled = exc.plan, False
