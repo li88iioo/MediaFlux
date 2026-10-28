@@ -92,6 +92,7 @@ from tests.support import (
     InitializedWebTestCase,
     IsolatedDatabaseTestCase,
     PagedDirectoryTestMixin,
+    isolated_test_database,
     release_parse_fields,
     release_parse_result,
 )
@@ -6175,6 +6176,7 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(add_log.call_count, 2)
 
     def test_download_tracker_marks_qb_error_state_failed(self):
+        self.enterContext(isolated_test_database())
         tracker = DownloadTracker()
         row = {
             "id": 41,
@@ -6191,12 +6193,15 @@ class SecurityTests(InitializedWebTestCase):
         task = SimpleNamespace(
             hash="hash-1", name="Broken", progress=0.2, state="error"
         )
+        # 检查真实日志结果，不绑定私有函数是否显式传入默认参数。
+        db.add_download_log(
+            source="qb", title="Broken", request_id=41, error="qB 原有错误"
+        )
         with (
             patch(
                 "app.modules.download_tracker.apply_download_tracker_update", side_effect=lambda snapshot, **fields: {**snapshot, **fields}
             ) as update,
             patch("app.database.update_download_request"),
-            patch.object(tracker, "_update_backend_log") as update_log,
             patch(
                 "app.database.claim_download_request_notification",
                 return_value={"token": "notice-41", "attempts": 0},
@@ -6212,7 +6217,11 @@ class SecurityTests(InitializedWebTestCase):
             tracker._update_request(row, [task], [])
         self.assertEqual(update.call_args.kwargs["qb_status"], "failed")
         self.assertEqual(update.call_args.kwargs["status"], "failed")
-        update_log.assert_called_once_with(41, "qb", "failed", 0.2, "hash-1")
+        log, = db.list_download_logs(source="qb")
+        self.assertEqual((log["request_id"], log["status"], log["progress"], log["backend_task_id"]),
+                         (41, "failed", 0.2, "hash-1"))
+        self.assertEqual(log["error"], "qB 原有错误")
+        self.assertTrue(log["completed_at"])
         notify.assert_called_once()
 
     def test_download_tracker_starts_organize_after_guangya_completion(self):
