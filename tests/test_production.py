@@ -4035,6 +4035,15 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(response.headers["X-Frame-Options"], "DENY")
         self._authenticated()
         self.assertEqual(self.client.post("/api/config", json={}).status_code, 403)
+        for token in (b"invalid", "错误令牌".encode("utf-8")):
+            with self.subTest(token=token):
+                rejected = self.client.post(
+                    "/api/config", json={}, headers={b"X-CSRF-Token": token}
+                )
+                self.assertEqual(rejected.status_code, 403)
+                self.assertEqual(rejected.json(), {"error": "CSRF token invalid"})
+        rejected = self.client.post("/login", data={"csrf_token": "错误令牌"})
+        self.assertEqual(rejected.status_code, 403)
 
     def test_unauthenticated_dynamic_html_is_no_store_and_uses_versioned_shared_js(
         self,

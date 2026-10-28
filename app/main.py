@@ -201,7 +201,7 @@ class SecurityMiddleware(BaseHTTPMiddleware):
                 body = await request.body()
                 values = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
                 supplied = (values.get("csrf_token") or [""])[0]
-            if not (expected and supplied and hmac.compare_digest(expected, supplied)):
+            if not (expected and supplied and hmac.compare_digest(expected.encode("utf-8"), supplied.encode("utf-8"))):
                 if request.url.path == "/login":
                     from app.modules.login_wallpaper import get_login_wallpaper
 
