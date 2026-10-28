@@ -4,8 +4,13 @@ from __future__ import annotations
 from typing import Any, cast
 
 import copy
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
+
+import httpx
+from guangyaclient import GuangyaClient as RawClient
 
 from app.clients.guangya import GuangYaClient
 from app.modules import offline
@@ -48,7 +53,7 @@ class GuangYaSingleFileManifestTests(unittest.TestCase):
             "index": 0, "name": "Fixture.Single.mp4", "size": 160 * 1024 * 1024, "excluded": False,
         }])
 
-    def test_magnet_and_torrent_submit_selected_zero_without_legacy_download(self):
+    def test_magnet_and_torrent_submit_verified_single_file_without_indexes(self):
         for torrent in (None, b"fixture-original-torrent"):
             with self.subTest(torrent=torrent is not None):
                 client = FakeSelectionClient(copy.deepcopy(SINGLE))
@@ -56,11 +61,46 @@ class GuangYaSingleFileManifestTests(unittest.TestCase):
                                                 client=cast(GuangYaClient, client), torrent_data=torrent)
                 self.assertTrue(result["ok"], result)
                 self.assertEqual(result["selected_count"], 1)
-                self.assertEqual(result["selection_mode"], "files")
-                self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
-                self.assertEqual(client.legacy_calls, [])
+                self.assertEqual(result["selection_mode"], "single_file")
+                self.assertEqual(client.selection_calls, [])
+                self.assertEqual(len(client.legacy_calls), 1)
+                self.assertEqual(client.legacy_calls[0]["target_dir_id"], self.rules.target_dir_id)
+                self.assertEqual(result["excluded_count"], 0)
+                self.assertFalse(result["unverified_manifest"])
                 self.assertEqual(len(client.resolve_calls), 0 if torrent else 1)
                 self.assertEqual(len(client.torrent_resolve_calls), 1 if torrent else 0)
+
+    def test_one_file_in_a_bt_tree_still_submits_its_real_index(self):
+        response = copy.deepcopy(SINGLE)
+        response["data"]["btResInfo"].update(subfilesNum=1, subfiles=[{
+            "fileIndex": 0, "fileName": "Fixture.Single.mp4", "fileSize": 160 * 1024 * 1024,
+        }])
+        client = FakeSelectionClient(response)
+        result = offline.submit_offline("magnet:?xt=urn:btih:" + "a" * 40, client=cast(GuangYaClient, client))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["selection_mode"], "files")
+        self.assertEqual(client.selection_calls[0]["file_indexes"], [0])
+        self.assertEqual(client.legacy_calls, [])
+
+    def test_single_file_sdk_payload_omits_file_indexes_and_retains_task_id(self):
+        folder = self.enterContext(tempfile.TemporaryDirectory())
+        client = GuangYaClient(token_file=Path(folder) / "missing-token.json")
+        raw = RawClient(access_token="fixture-token", device_id="fixture-device")
+        raw.request = Mock(side_effect=[
+            httpx.Response(200, json=copy.deepcopy(SINGLE)),
+            httpx.Response(200, json={"msg": "success", "data": {"taskId": "single-task"}}),
+        ])
+        client._raw = raw
+        self.addCleanup(client.close)
+        magnet = "magnet:?xt=urn:btih:" + "a" * 40
+        result = offline.submit_offline(magnet, client=client)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["task_ids"], ["single-task"])
+        self.assertEqual((result["batch_count"], result["completed_batches"], result["selected_count"]), (1, 1, 1))
+        self.assertEqual(raw.request.call_count, 2)
+        create = raw.request.call_args
+        self.assertTrue(create.args[0].endswith("/create_task"))
+        self.assertEqual(create.kwargs["json"], {"url": magnet, "parentId": self.rules.target_dir_id})
 
     def test_multifile_hints_without_tree_do_not_become_single_file(self):
         for key, value in (
@@ -113,7 +153,7 @@ class GuangYaSingleFileManifestTests(unittest.TestCase):
                 self.assertTrue(GuangYaClient.normalize_offline_files(response)[0]["excluded"])
 
     def test_single_file_still_obeys_video_and_size_rules(self):
-        for name, size in (("notes.txt", 160 * 1024 * 1024), ("Small.mp4", 1024)):
+        for name, size in (("notes.txt", 160 * 1024 * 1024), ("Small.mp4", 1024), ("Sample.mp4", 160 * 1024 * 1024)):
             with self.subTest(name=name):
                 response = copy.deepcopy(SINGLE)
                 response["data"]["btResInfo"].update(fileName=name, fileSize=size)

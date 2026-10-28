@@ -905,11 +905,11 @@ def _excluded_indexes(raw: dict) -> set[int]:
     return result
 
 
-def _single_bt_root_file(response: dict) -> dict | None:
+def single_bt_root_file(response: dict) -> dict | None:
     """光鸭单文件 BT 直接放在 data.btResInfo；多文件才携带树/数量字段。
 
     只识别真实接口的成功信封和完整根文件形状，不把任意空树、缺失多文件树
-    或仅有磁力标题的占位响应猜成 index=0。该索引是单文件 BT 的唯一文件。
+    或仅有磁力标题的占位响应猜成 index=0。0仅供本地筛选，单文件提交不能携带fileIndexes。
     """
     if not isinstance(response, dict) or response.get("msg") != "success":
         return None
@@ -3036,7 +3036,7 @@ class GuangYaClient:
     def normalize_offline_files(response: dict) -> list[dict]:
         """把不同 resolve_res 响应归一化为 index/name/size/excluded。"""
         output: list[dict] = []
-        single_file = _single_bt_root_file(response)
+        single_file = single_bt_root_file(response)
         if single_file is not None:
             output.append(single_file)
         _collect_offline_files(response, output, set())

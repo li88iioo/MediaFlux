@@ -4,12 +4,12 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
-from app.clients.guangya import GuangYaClient, close_guangya_client
+from app.clients.guangya import GuangYaClient, close_guangya_client, single_bt_root_file
 from app.config import get, get_bool, get_int
 from app.indexers.providers.base import augment_public_magnet
 from app.logger import get_logger, redact_sensitive_text
@@ -20,8 +20,8 @@ logger = get_logger(__name__)
 
 MAGNET_PREFIX = "magnet:?"
 ED2K_PREFIX = "ed2k://"
-# 光鸭“仅视频”在客户端解析文件树后通过 fileIndexes 提交；默认列表只含
-# 视频/光盘镜像格式，避免音频、图片、文本和广告附件进入云盘。
+# 光鸭“仅视频”先按清单过滤；多文件用真实 fileIndexes，单文件根直接提交。
+# 默认只含视频/光盘镜像格式，避免音频、图片、文本和广告附件进入云盘。
 DEFAULT_VIDEO_EXTS = (
     "mkv", "mp4", "ts", "m2ts", "mts", "iso", "avi", "mov", "m4v",
     "webm", "mpeg", "mpg", "wmv", "flv", "vob", "tp", "f4v", "rm", "rmvb",
@@ -473,8 +473,8 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
 
     自动入口先解析文件树并强制应用仅视频扩展名、排除词和最小体积。
     原始种子优先上传到光鸭解析，避免只转换为磁力后依赖 DHT 获取元数据；
-    磁力无法取得可验证文件树时一律失败关闭，不再整单下载。隔离目录只会
-    在已经得到明确 fileIndexes 后创建，用于后续下载落稳与安全整理。
+    磁力无法取得可验证清单时一律失败关闭。单文件根资源通过同一筛选后普通提交；隔离目录只会
+    在已经确认应下载的文件后创建，用于后续下载落稳与安全整理。
     """
     rules = OfflineRules.from_config()
     decision = analyze_offline_url(
@@ -601,79 +601,37 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
                         "error": "持久化任务隔离目录失败，未提交离线任务",
                     }
 
+        # 单文件根资源的0是本地规则筛选索引，不是服务端选集索引。
+        # 只依据同一严格解析器确认根资源，不能把“多文件里只选一个”当成单文件。
+        single_file = single_bt_root_file(resolution.response) is not None
+        selection_mode = "single_file" if single_file else "files" if choices else "legacy"
         try:
-            if choices:
-                created: dict[str, Any] = client.add_offline_selection(url, effective.target_dir_id, selected)
-                ok = bool(created.get("ok"))
-                task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
-                completed_batches = int(created.get("completed_batches") or 0)
-                partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
-                outcome_unknown = bool(created.get("outcome_unknown"))
-                tracking_incomplete = bool(created.get("tracking_incomplete"))
-                staging_cleanup_status = "pending" if staging_id else ""
-                staging_cleanup_error = ""
-                # 云端离线任务为异步写入；只要已有任一批次被接受，就不能依据
-                # “目录当前为空”删除 staging。结果未知/跟踪信息不完整同样意味着
-                # 服务端可能已受理请求，必须保留目录供 tracker 与人工核验。
-                if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
-                    staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
-                        client,
-                        staging_id,
-                        expected_parent_id=(decision.target_dir_id or "0"),
-                        expected_name=staging_name,
-                    )
-                elif not ok and staging_id:
-                    staging_cleanup_status = "retained"
-                    staging_cleanup_error = "提交结果待核对，已保留隔离目录"
-                common = {
-                    "decision": effective.as_dict(),
-                    "selection_mode": "files",
-                    "unverified_manifest": False,
-                    "resolve_attempts": resolution.attempts,
-                    "selected_count": len(selected),
-                    "excluded_count": max(0, len(choices) - len(selected)),
-                    "task_ids": task_ids,
-                    "batch_count": int(created.get("batch_count") or 0),
-                    "completed_batches": completed_batches,
-                    "partial_success": partial_success,
-                    "outcome_unknown": outcome_unknown,
-                    "tracking_incomplete": tracking_incomplete,
-                    "staging": {
-                        "id": staging_id,
-                        "parent_id": (decision.target_dir_id or "0"),
-                        "name": staging_name if isolate_task else "",
-                        "isolated": bool(staging_id),
-                        "cleanup_status": staging_cleanup_status,
-                        "cleanup_error": staging_cleanup_error,
-                    },
-                }
-                if not ok:
-                    return {
-                        "ok": False, **common,
-                        "error": str(created.get("error") or "光鸭任务创建失败"),
-                    }
-                return {"ok": True, **common, "error": ""}
-
-            # HTTP/ED2K 的上游响应可能只描述单文件而没有文件树，保留兼容提交；
-            # 磁力已在上方强制要求可验证 fileIndexes。
-            created = client.add_offline_task(
-                url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
+            created = (
+                client.add_offline_selection(url, effective.target_dir_id, selected)
+                if selection_mode == "files"
+                else client.add_offline_task(
+                    url=url, target_dir_id=effective.target_dir_id, task_type=effective.protocol,
+                )
             )
-            outcome_unknown = False
-            tracking_incomplete = False
             if isinstance(created, dict):
                 ok = bool(created.get("ok"))
                 task_ids = [str(item) for item in (created.get("task_ids") or []) if str(item)]
                 batch_count = int(created.get("batch_count") or (1 if ok else 0))
-                create_error = str(created.get("error") or "")
+                completed_batches = int(created.get("completed_batches") or (batch_count if ok else 0))
+                partial_success = bool(created.get("partial_success") or task_ids or completed_batches)
                 outcome_unknown = bool(created.get("outcome_unknown"))
                 tracking_incomplete = bool(created.get("tracking_incomplete"))
+                create_error = str(created.get("error") or "")
             else:
                 ok = bool(created)
                 task_ids = []
-                batch_count = 1 if ok else 0
+                batch_count = completed_batches = 1 if ok else 0
+                partial_success = outcome_unknown = tracking_incomplete = False
                 create_error = ""
-            if not ok and not outcome_unknown and not tracking_incomplete:
+            staging_cleanup_status = "pending" if staging_id else ""
+            staging_cleanup_error = ""
+            # 三类提交共用受理判断。只要已有任务或回执不明，就不能删除可能仍会写入的目录。
+            if not ok and not partial_success and not outcome_unknown and not tracking_incomplete:
                 staging_cleanup_status, staging_cleanup_error = _remove_empty_staging(
                     client,
                     staging_id,
@@ -683,16 +641,14 @@ def submit_offline(url: str, title: str = "", client: GuangYaClient | None = Non
             elif not ok and staging_id:
                 staging_cleanup_status = "retained"
                 staging_cleanup_error = "提交结果待核对，已保留隔离目录"
-            else:
-                staging_cleanup_status = "pending" if staging_id else ""
-                staging_cleanup_error = ""
             return {
                 "ok": ok, "decision": effective.as_dict(),
-                "selection_mode": "legacy",
+                "selection_mode": selection_mode,
                 "unverified_manifest": False,
                 "resolve_attempts": resolution.attempts,
-                "selected_count": 0, "excluded_count": len(choices),
+                "selected_count": len(selected), "excluded_count": len(choices) - len(selected),
                 "task_ids": task_ids, "batch_count": batch_count,
+                "completed_batches": completed_batches, "partial_success": partial_success,
                 "outcome_unknown": outcome_unknown,
                 "tracking_incomplete": tracking_incomplete,
                 "staging": {"id": staging_id, "parent_id": (decision.target_dir_id or "0"),
