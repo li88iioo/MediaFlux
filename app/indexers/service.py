@@ -538,7 +538,8 @@ class IndexerService:
                 continue
             page_result = outcome.page
             errors.extend(page_result.errors)
-            if page_result.items or (not page_result.errors and outcome.error is None and page_result.complete) or any(
+            coverage_limited = bool(page_result.errors) and all(error.code == "coverage_limited" for error in page_result.errors)
+            if page_result.items or (outcome.error is None and (coverage_limited or not page_result.errors and page_result.complete)) or any(
                 row.status in {"success", "empty", "partial"} for row in page_result.source_statuses
             ):
                 succeeded.append(site_id)
@@ -1264,6 +1265,10 @@ class IndexerService:
                 )
             if not isinstance(page, IndexerPage):
                 raise HttpInvalidResponse("provider returned an invalid page")
+            # search 已返回；complete=False 不应在后续合并中变成“已穷尽”。
+            # 使用既有部分结果通道传递范围限制，不把调用结束状态锁在 searching。
+            if not page.complete and not page.errors:
+                page.errors = (IndexerProviderError(site_id, "coverage_limited", "仅检索部分候选，未覆盖范围仍未知"),)
             return _ProviderOutcome(
                 site_id=site_id,
                 page=page,

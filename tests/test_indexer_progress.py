@@ -65,6 +65,37 @@ def service_for(source):
 
 
 class SearchProgressTests(unittest.IsolatedAsyncioTestCase):
+    async def test_finished_but_limited_search_is_partial_not_down_or_still_running(self):
+        from app.modules.telegram_resource_search import _search_snapshot
+        for found in (True, False):
+            with self.subTest(found=found):
+                source = ProgressiveSource()
+                service = service_for(source)
+                page = IndexerPage([source.first] if found else [], 1, False, False, complete=False)
+                try:
+                    with patch.object(source, "search", new=AsyncMock(return_value=page)):
+                        result = await service.search("Demo")
+                    self.assertTrue(result.complete)
+                    self.assertTrue(result.partial)
+                    self.assertEqual(result.sites_succeeded, ("btbtla",))
+                    self.assertEqual([error.code for error in result.errors], ["coverage_limited"])
+                    web = indexers_api._search_payload(service, result)
+                    telegram = _search_snapshot(service, result)
+                    for status in (web["site_statuses"][0], telegram["sites"][0]):
+                        self.assertEqual(status["status"], "partial")
+                        self.assertIn("未覆盖范围仍未知", status["message"])
+                        self.assertNotIn("未找到", status["message"])
+                    self.assertFalse(web["site_statuses"][0]["retryable"])
+                    self.assertEqual(web["errors"][0]["code"], "coverage_limited")
+                    # 范围提醒不能覆盖同站真实故障，无论两类信息的到达顺序。
+                    result.errors.insert(0, IndexerProviderError("btbtla", "timeout", "fixture timeout"))
+                    web = indexers_api._search_payload(service, result)
+                    telegram = _search_snapshot(service, result)
+                    self.assertEqual(web["site_statuses"][0]["code"], "timeout")
+                    self.assertEqual(telegram["sites"][0]["message"], "响应超时")
+                finally:
+                    await service.aclose()
+
     async def test_first_snapshot_precedes_finish_and_reference_is_frozen(self):
         source = ProgressiveSource(delayed=True)
         service = service_for(source)

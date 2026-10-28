@@ -383,7 +383,8 @@ def search_resources(
                    else "本轮未找到匹配资源，部分来源未完成，暂不能确认是否无资源")
     elif not items:
         summary = "已完成多站搜索，暂未找到匹配资源"
-    truncated = any(result.site_truncated_counts.values()) or len(matching_items) > len(items)
+    truncated = (any(result.site_truncated_counts.values()) or len(matching_items) > len(items)
+                 or any(error.code == "coverage_limited" for error in result.errors))
     if truncated:
         summary += "；仅覆盖本次返回范围，未覆盖部分仍未知"
     visible = [item for item in items if "episode_conflict" not in item["match_reasons"]]

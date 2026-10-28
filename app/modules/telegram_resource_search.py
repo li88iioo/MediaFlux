@@ -26,6 +26,7 @@ _SITE_ERROR_MESSAGES = {
     "challenge_required": "需要人机验证，本次未完成检索",
     "response_too_large": "响应内容异常",
     "security_error": "安全校验失败",
+    "coverage_limited": "仅检索部分作品候选，未覆盖范围仍未知；可细化片名、年份或季集",
 }
 
 
@@ -360,6 +361,8 @@ def _search_snapshot(service, result) -> dict[str, Any]:
         site_id = str(item.get("site_id") or "")
         counts[site_id] = counts.get(site_id, 0) + 1
     errors = {str(error.site_id): str(error.code or "unavailable") for error in result.errors}
+    errors.update((str(error.site_id), str(error.code or "unavailable"))
+                  for error in result.errors if error.code != "coverage_limited")
     attempted = set(result.sites_attempted)
     sites = []
     for site_id in service.registry.ids():
@@ -370,7 +373,8 @@ def _search_snapshot(service, result) -> dict[str, Any]:
         status = indexer_site_status(result, site_id, counts.get(site_id, 0)) or "error"
         message = ""
         if status == "partial":
-            message = "本轮未找到匹配资源，部分来源未完成"
+            message = (_SITE_ERROR_MESSAGES[code] if code == "coverage_limited"
+                       else "本轮未找到匹配资源，部分来源未完成")
         elif status == "searching":
             message = "正在补充检索"
         elif status == "error":

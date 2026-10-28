@@ -399,7 +399,8 @@ def indexer_site_status(result, site_id: str, count: int) -> str | None:
     """Web/TG共用可用性判断：子源故障不是有结果的综合服务整体故障。"""
     sources = (getattr(result, "source_statuses", {}) or {}).get(site_id, ())
     count = max(count, (getattr(result, "site_item_counts", {}) or {}).get(site_id, 0))
-    failed = any(error.site_id == site_id for error in result.errors)
+    errors = [error for error in result.errors if error.site_id == site_id]
+    failed = bool(errors)
     succeeded = site_id in result.sites_succeeded
     if site_id not in result.sites_attempted and not (sources or count or failed or succeeded):
         return None
@@ -412,7 +413,7 @@ def indexer_site_status(result, site_id: str, count: int) -> str | None:
     if sources and failed and any(row.status in {"success", "empty", "partial"} for row in sources):
         return "partial"
     if failed:
-        return "error"
+        return "partial" if all(error.code == "coverage_limited" for error in errors) else "error"
     if succeeded:
         return "success" if count else "empty"
     if site_id in result.sites_attempted:

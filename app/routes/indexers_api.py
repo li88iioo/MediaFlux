@@ -57,6 +57,7 @@ _SITE_ERROR_CATALOG: dict[str, tuple[str, bool]] = {
     "challenge_required": ("站点要求人机验证，本次未完成检索", False),
     "response_too_large": ("站点响应异常，暂无法处理", False),
     "security_error": ("站点连接未通过安全校验", False),
+    "coverage_limited": ("仅检索部分作品候选，未覆盖范围仍未知；可细化片名、年份或季集", False),
 }
 
 
@@ -140,6 +141,7 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
         for item in result.items:
             counts[item.site_id] = counts.get(item.site_id, 0) + 1
     errors = {error.site_id: error for error in result.errors}
+    errors.update((error.site_id, error) for error in result.errors if error.code != "coverage_limited")
     site_queries = getattr(result, "site_queries", {}) or {}
     site_attempt_counts = getattr(result, "site_attempt_counts", {}) or {}
     visible_counts = getattr(result, "site_visible_counts", {}) or {}
@@ -172,7 +174,10 @@ def _search_site_statuses(service, result) -> list[dict[str, Any]]:
         if status == "searching":
             message = "正在补充检索"
         elif status == "partial":
-            message, retryable = "本轮未找到匹配资源，部分来源未完成", True
+            if site_id in errors and errors[site_id].code == "coverage_limited":
+                code, message, retryable = _safe_site_error(errors[site_id])
+            else:
+                message, retryable = "本轮未找到匹配资源，部分来源未完成", True
         elif status == "error":
             if site_id in errors:
                 code, message, retryable = _safe_site_error(errors[site_id])

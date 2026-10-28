@@ -5,7 +5,7 @@ import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
-from app.indexers.models import IndexerMediaSearchRequest
+from app.indexers.models import IndexerMediaSearchRequest, indexer_site_status
 from app.indexers.providers.base import magnet_infohash, report_page
 from app.indexers.providers.kpkuang import KPkuangAdapter
 from app.indexers.registry import IndexerRegistry
@@ -45,6 +45,37 @@ class KPkuangServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.addAsyncCleanup(service.aclose)
         return service
+
+    async def test_candidate_limit_keeps_coverage_warning_through_merge_and_cache(self):
+        for found in (True, False):
+            with self.subTest(found=found):
+                routes = {API: response(API, api([candidate(i, "Example Show", 2023) for i in range(1, 5)]))}
+                for i in range(1, 4):
+                    routes[detail_url(i)] = response(detail_url(i), detail_html(i))
+                    routes[down_url(i)] = response(down_url(i), download_html(
+                        [("Example Show 1080p", magnet(f"{i:040x}"))] if found else []))
+                http = FakeHttp(routes)
+                service = self.service(http, max_results_per_site=100)
+                result = await service.search("Example Show", scope="agent")
+                self.assertTrue(result.complete)  # 本轮结束，不等于检索已穷尽。
+                self.assertTrue(result.partial)
+                self.assertEqual(result.sites_succeeded, ("kpkuang",))
+                self.assertEqual(len(result.items), 3 if found else 0)
+                self.assertEqual([e.code for e in result.errors], ["coverage_limited"])
+                self.assertIn("3/4", result.errors[0].message)
+                self.assertEqual(indexer_site_status(result, "kpkuang", len(result.items)), "partial")
+                self.assertNotIn(detail_url(4), http.calls)
+                self.assertNotIn("kpkuang", service._breaker_states)
+                if found:
+                    calls = list(http.calls)
+                    cached = await service.search("Example Show", scope="agent")
+                    self.assertTrue(cached.cached)
+                    self.assertTrue(cached.partial)
+                    self.assertTrue(cached.complete)
+                    self.assertEqual(cached.errors, result.errors)
+                    self.assertEqual(http.calls, calls)
+                else:
+                    self.assertFalse(service._cache)  # 未覆盖范围不能缓存成全站无结果。
 
     async def test_short_query_tries_valid_alias_without_http_or_breaker_failure(self):
         infohash = "a" * 40

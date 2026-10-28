@@ -166,7 +166,9 @@ class KPkuangAdapter(DirectResultAdapter):
         successful_details = 0
         fatal_error: HttpError | None = None
         seen_hashes: set[str] = set()
-        for candidate in candidates[:_MAX_CANDIDATES]:
+        checked = 0
+        candidate_limit_reached = False
+        for checked, candidate in enumerate(candidates[:_MAX_CANDIDATES], start=1):
             detail_url = fixed_host_join(self.base_url, f"{_CONFIG['detail_path_prefix']}{candidate['id']}/")
             try:
                 detail = await self._get(detail_url, headers={"Referer": self.base_url})
@@ -210,6 +212,8 @@ class KPkuangAdapter(DirectResultAdapter):
                     for item in items
                 ):
                     break  # 先交付已取得的候选；后续别名超时也不能抹掉精确季集结果。
+        else:
+            candidate_limit_reached = checked < len(candidates)
 
         if errors and successful_details == 0:
             raise fatal_error or errors[0]
@@ -217,11 +221,16 @@ class KPkuangAdapter(DirectResultAdapter):
             IndexerProviderError(self.site_id, error.code, "KPkuang 部分详情暂不可用")
             for error in errors
         )
+        if candidate_limit_reached:
+            provider_errors += (IndexerProviderError(
+                self.site_id, "coverage_limited",
+                f"本轮仅检索 {checked}/{len(candidates)} 个作品候选，未检索部分仍未知；可细化片名、年份或季集",
+            ),)
         return self._page(
             request,
             items,
             errors=provider_errors,
-            complete=not errors and len(candidates) <= _MAX_CANDIDATES,
+            complete=not provider_errors,
         )
 
     async def _get(self, url: str, **kwargs):

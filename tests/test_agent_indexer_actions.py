@@ -294,13 +294,16 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
 
     def test_search_reports_service_and_tool_caps_without_site_failure(self):
         service = FakeIndexerService(partial=False)
-        for service_capped in (True, False):
-            with self.subTest(service_capped=service_capped):
+        for limit_source in ("service", "tool", "provider"):
+            with self.subTest(limit_source=limit_source):
                 result = AggregatedIndexerResult(query="Demo", page=1, items=[service.item],
                                                  sites_attempted=("nyaa",), sites_succeeded=("nyaa",))
-                if service_capped:
+                if limit_source == "service":
                     result.site_collected_counts = {"nyaa": 60}
                     result.site_truncated_counts = {"nyaa": 20}
+                elif limit_source == "provider":
+                    result.errors = [IndexerProviderError("nyaa", "coverage_limited", "本轮仅检索 3/15 个作品候选")]
+                    result.partial = True
                 else:
                     result.items = [service.item, service.item]
                 with (
@@ -312,9 +315,12 @@ class AgentIndexerActionUnitTests(unittest.TestCase):
                                                "aliases": [], "year": None, "media_type": "",
                                                "page": 1, "sites": ["nyaa"], "limit": 1})
                 self.assertTrue(output.ok)
-                self.assertEqual(output.status, "success")
+                self.assertEqual(output.status, "partial" if limit_source == "provider" else "success")
                 self.assertTrue(output.data["truncated"])
                 self.assertIn("未覆盖部分仍未知", output.summary)
+                if limit_source == "provider":
+                    self.assertEqual(output.data["errors"][0]["code"], "coverage_limited")
+                    self.assertIn("3/15", output.data["errors"][0]["message"])
 
     def test_search_resources_returns_only_public_projection(self):
         service = FakeIndexerService()
