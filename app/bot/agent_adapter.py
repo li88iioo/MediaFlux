@@ -1510,6 +1510,7 @@ def handle_agent_control_action(
             user_id=user_id,
             operation="agent_control",
             value={"action": action_name, "confirmed": True},
+            message_thread_id=getattr(call.message, "message_thread_id", None),
         )
         markup = telebot_module.types.InlineKeyboardMarkup(row_width=2)
         markup.add(

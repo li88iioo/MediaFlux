@@ -257,6 +257,46 @@ class AgentKernelTelegramAdapterTests(unittest.TestCase):
         self.assertEqual(len(lifecycle.calls), 1)
         self.assertIn("已确认写操作正在执行", bot.replies[-1][0])
 
+    def test_global_control_confirmation_buttons_keep_source_topic(self):
+        from app.bot.handlers import _handle_write_confirmation_callback
+        from app.modules.telegram_write_confirmations import TelegramWriteConfirmationStore
+        from tests.support import isolated_test_database
+
+        for decision in ("confirm", "cancel"):
+            with self.subTest(decision=decision), isolated_test_database():
+                bot, store = FakeBot(), TelegramWriteConfirmationStore()
+                source = Message("/agent")
+                source.message_thread_id = 41
+                access = self._patch_access()
+                with (
+                    access[0], access[1], access[2],
+                    patch.object(adapter, "get_telegram_write_confirmation_store", return_value=store),
+                    patch("app.modules.telegram_write_confirmations.get_telegram_write_confirmation_store", return_value=store),
+                    patch.object(adapter, "_apply_agent_control_action", return_value="Media Agent 已关闭") as apply,
+                ):
+                    adapter.handle_agent_guide(bot, source, TELEBOT)
+                    buttons = bot.replies[-1][1]["reply_markup"].buttons
+                    preview = next(button for button in buttons if button.text == "关闭全部")
+                    _handle_write_confirmation_callback(bot, Call(preview.callback_data, source), TELEBOT)
+                    self.assertEqual(bot.answers[-1][1], "请再次确认")
+                    buttons = bot.edits[-1][3]["reply_markup"].buttons
+                    selected = next(button for button in buttons if button.text == (
+                        "确认关闭全部" if decision == "confirm" else "取消"
+                    ))
+                    other_topic = Message("other topic")
+                    other_topic.message_thread_id = 42
+                    _handle_write_confirmation_callback(bot, Call(selected.callback_data, other_topic), TELEBOT)
+                    self.assertIn("不属于", bot.answers[-1][1])
+                    apply.assert_not_called()
+                    _handle_write_confirmation_callback(bot, Call(selected.callback_data, source), TELEBOT)
+                    self.assertEqual(bot.answers[-1][1], (
+                        "Media Agent 已关闭" if decision == "confirm" else "操作已取消"
+                    ))
+                    if decision == "confirm":
+                        apply.assert_called_once_with("disable_all")
+                    else:
+                        apply.assert_not_called()
+
     def _query_candidate_response(self, answer, candidates, *, status="success"):
         transport = FakeTelegramTransport(TurnView(
             session_id="tg_session", turn_id="turn-candidate-answer", request_id="candidate-answer",
