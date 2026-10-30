@@ -1,15 +1,30 @@
 # 客户端直连 STRM 的云盘画质切换
 
-适用于客户端连接原 Jellyfin、读取 `MediaSource.Path` 中 MediaFlux 签名 STRM 地址，再直接播放云盘内容的场景。不需要把 Jellyfin 地址改成反代，不需要修改 Jellyfin 插件，也不需要为不同画质生成多个 STRM。
+适用于客户端连接原 Jellyfin 或 MediaFlux 媒体反代，取得 MediaFlux 签名 STRM 地址，再直接播放云盘内容的场景。不需要修改 Jellyfin 插件，也不需要为不同画质生成多个 STRM。
 
 ## 请求流程
 
-1. 从 Jellyfin `PlaybackInfo` 的选定媒体源取得 HTTP(S) `Path`，保留完整路径及 `v`、`sig`、可选 `enc` 查询参数。
+1. 从 Jellyfin `PlaybackInfo` 的选定媒体源取得 HTTP(S) `Path`；经 MediaFlux 反代时优先读取下述 `MediaFluxPlayback.source_url`。保留完整路径及 `v`、`sig`、可选 `enc` 查询参数。
 2. 对这个 URL 增加 `view=variants`，用 **GET** 查询该文件当前已有的云端画质。
 3. 用户选档后，对同一个原 URL 增加 `view=resolve&quality=<variant.id>`，取得短时 CDN 地址及格式。
 4. 播放器直接请求返回的 `url`；切换时保存当前时间和播放/暂停状态，用新资源恢复到这个时间。
 
 只改变查询参数，不拼接新的目录、不去掉原签名、不重新生成 STRM。`quality` 以返回的 `id` 为准，不能用“1080”或按数组下标猜。列表可能只有原画；本功能只读取云盘已有资源，不创建转码任务。
+
+### 通过 MediaFlux 媒体反代发现入口
+
+反代会改写 `Path`、`DirectStreamUrl` 用于普通 302 播放，同时在对应的 `MediaSource` 上保留独立的画质入口：
+
+```json
+"MediaFluxPlayback": {
+  "protocol": "mediaflux.playback.v1",
+  "source_url": "https://mediaflux.example/playgy/<file>/<etag>/<size>/<filename>?v=1&sig=<signature>"
+}
+```
+
+客户端确认 `protocol` 后，使用 `source_url` 调用同一套 `variants` / `resolve` 接口，不受代理将 `Protocol` 改为 `File` 的影响。入口只来自原有签名 STRM，且必须与反代实际绑定的文件相符；本地文件、缺少签名或绑定到另一文件的来源不会获得该入口。多个版本各自携带自己的入口，不能在版本间复用。
+
+Pathfin 仍需开启“STRM 原始地址”。关闭时沿用 Jellyfin 画质协商；开启后原服务器和反代服务器共用云盘切档流程。旧客户端忽略此扩展，继续原有 302 行为。`source_url` 必须能由手机访问，反代不会把不可达的内网地址自动转换成公网地址。
 
 ### 画质列表
 
@@ -69,7 +84,7 @@ GET /playgy/<file>/<etag>/<size>/<filename>?v=1&sig=<signature>&view=resolve&qua
 
 现有 `PlaybackResolver` 已可选用 `MediaSource.Path`，`PlaybackViewModel` 已会把 `ResolvedPlayback.mimeType` 传给 `MediaItem.Builder.setMimeType()`，并支持带位置更换媒体。可复用这些路径：
 
-- **画质来源分开**：当前 `PlaybackQuality.HIGH/STANDARD/DATA_SAVER` 表示 Jellyfin 转码码率上限，不等于云盘清晰度。云盘 STRM 使用上面的真实 `variants` 列表，不能通过 `api.playbackInfo(quality=...)` 实现切档，否则会重新走 Jellyfin 转码。
+- **画质来源分开**：普通媒体的 `PlaybackQuality.HIGH/STANDARD/DATA_SAVER` 表示 Jellyfin 转码码率上限；支持协议的云盘 STRM 在同一菜单中使用真实 `variants` 列表。云盘切档调用 `resolve`，不通过 `api.playbackInfo(quality=...)` 触发 Jellyfin 转码。
 - **短时资源与原始来源分开**：保留原始签名 STRM URL 用于下次枚举/解析，播放 URI 才换成 CDN URL；切档仍属于同一 Jellyfin item/source，正常上报播放进度。
 - **显式 MIME**：光鸭 HLS 地址未必以 `.m3u8` 结尾。构建 `ResolvedPlayback` 时设置 `mimeType = response.variant.mime_type`、`trustedServer = false`；HLS 必须显式 `application/x-mpegURL`。
 - **保留时间和状态**：复用现有切源/失败回退流程；不要清零播放进度。转码资源内的音轨可能与原文件不同，应读取新流的真实轨道，不能直接照搬原文件轨道索引。

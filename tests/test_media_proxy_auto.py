@@ -5450,9 +5450,10 @@ class HybridMediaProxyTests(unittest.TestCase):
             media_proxy._pin_signed_media_target("https://cdn.invalid/file")
 
     def test_post_playback_info_body_is_forwarded_and_response_is_rewritten(self):
+        signed_source = "https://media.invalid/playgy/file-post/e/1/a.mkv?v=1&sig=" + "a" * 64
         payload = {
             "MediaSources": [
-                {"Id": "cloud", "Path": "/playgy/file-post/e/1/a.mkv"}
+                {"Id": "cloud", "Path": signed_source}
             ]
         }
         _FakeAsyncClient.responses = [
@@ -5482,6 +5483,9 @@ class HybridMediaProxyTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["MediaSources"][0]["MediaFluxPlayback"], {
+            "protocol": "mediaflux.playback.v1", "source_url": signed_source,
+        })
         direct_url = response.json()["MediaSources"][0]["DirectStreamUrl"]
         self.assertEqual(urlsplit(direct_url).path, "/Videos/item-post/stream")
         self.assertEqual(_FakeAsyncClient.requests[0].method, "POST")

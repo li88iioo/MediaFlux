@@ -2186,7 +2186,29 @@ def _mark_direct_source(
     direct_stream_url: str | None = None,
     *,
     native_client_mode: str = "",
+    cloud_file_id: str = "",
 ) -> None:
+    # 代理播放地址与云盘画质入口各司其职；不能覆盖 Path 后丢掉原 STRM 签名。
+    # 手动绑定可能指向另一文件，只公布与实际播放对象一致的已有入口。
+    source.pop("MediaFluxPlayback", None)
+    original_path = str(source.get("Path") or "").strip()
+    if cloud_file_id and _extract_guangya_file_id(original_path) == cloud_file_id:
+        parsed = urlsplit(original_path)
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if (
+            parsed.scheme in {"http", "https"}
+            and parsed.netloc
+            and not parsed.username
+            and not parsed.password
+            and not parsed.fragment
+            and query.get("v") == "1"
+            and re.fullmatch(r"[a-fA-F0-9]{64}", query.get("sig", ""))
+            and len(parsed.path.rstrip("/").split("/")) >= 6
+        ):
+            source["MediaFluxPlayback"] = {
+                "protocol": "mediaflux.playback.v1",
+                "source_url": original_path,
+            }
     requested_mode = (native_client_mode or "").strip().casefold()
     mode = (
         requested_mode
@@ -4062,6 +4084,10 @@ def rewrite_playback_info(
                 client_path,
                 client_direct_url,
                 native_client_mode=native_client_mode,
+                cloud_file_id=(
+                    str(_binding_value(binding, "guangya_file_id") or "")
+                    if _binding_value(binding, "source_type") == "guangya" else ""
+                ),
             )
             if (
                 browser_direct_play_eligible
@@ -4125,6 +4151,7 @@ def rewrite_playback_info(
             client_direct_url,
             client_direct_url,
             native_client_mode=native_client_mode,
+            cloud_file_id=file_id,
         )
         if (
             browser_direct_play_eligible

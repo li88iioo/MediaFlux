@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from app.clients import guangya as guangya_module
 from app.clients.guangya import GuangYaClient
 from app.modules.playgy_signing import sign_playgy
+from app.modules import media_proxy
 from app.modules.strm import build_play_url
 from app.routes import proxy
 
@@ -159,6 +160,58 @@ class PlayGyQualityTests(unittest.TestCase):
         for private in (_ACCESS_TOKEN, _REFRESH_TOKEN, _PRIVATE_DETAIL,
                         "Traceback", "AttributeError", "RuntimeError", "FileNotFoundError"):
             self.assertNotIn(private, public)
+
+    def test_proxy_source_keeps_quality_entry_and_resolves_original_and_cloud_variant(self):
+        for binding in (None, {"id": 1, "source_type": "guangya", "guangya_file_id": _FILE_ID,
+                               "media_source_id": "cloud"}):
+            with self.subTest(binding=bool(binding)):
+                # 同时覆盖含斜线 etag 的 b64 路径，不重构/丢失原签名参数。
+                strm_url = (build_play_url("http://testserver", _FILE_ID, "et/ag", _SIZE, _FILENAME)
+                            if binding else self.strm_url)
+                payload = {"MediaSources": [
+                    {"Id": "cloud", "Protocol": "Http", "Path": strm_url},
+                    {"Id": "local", "Protocol": "File", "Path": "/media/local.mp4"},
+                ]}
+                local = deepcopy(payload["MediaSources"][1])
+                with patch.object(media_proxy.database, "get_media_proxy_binding",
+                                  side_effect=lambda _instance, _item, source: binding if source == "cloud" else None):
+                    result, changed = media_proxy.rewrite_playback_info(
+                        payload, 7, "quality-item",
+                        dynamic_mappings=media_proxy.DynamicGuangYaMappings(),
+                    )
+                self.assertTrue(changed)
+                source = result["MediaSources"][0]
+                self.assertEqual(result["MediaSources"][1], local)
+                self.assertEqual(source["Path"], "/Videos/quality-item/stream?MediaSourceId=cloud")
+                self.assertEqual(source["Protocol"], "File")
+                entry = source["MediaFluxPlayback"]
+                self.assertEqual(entry, {"protocol": "mediaflux.playback.v1", "source_url": strm_url})
+                self._variants(self.http.get(self._url(base=entry["source_url"], view="variants")))
+                for quality in ("original", _HLS_GCID):
+                    resolved = self._resolved(self.http.get(self._url(
+                        base=entry["source_url"], view="resolve", quality=quality,
+                    )))
+                    self.assertEqual(resolved["variant"]["id"], quality)
+                self.assertEqual(self.http.get(entry["source_url"]).status_code, 302)
+
+    def test_proxy_quality_entry_is_only_for_the_bound_file_and_signed_http_source(self):
+        cases = [
+            (self.strm_url, "another-file"),
+            (self.strm_url.split("?")[0], _FILE_ID),
+            (self.strm_url.replace("http://testserver", "file://testserver"), _FILE_ID),
+            (self.strm_url.replace("http://testserver", "http://user:password@testserver"), _FILE_ID),
+            ("/local/movie.mp4", _FILE_ID),
+        ]
+        for path, file_id in cases:
+            with self.subTest(path=path, file_id=file_id):
+                payload = {"MediaSources": [{"Id": "cloud", "Path": path,
+                           "MediaFluxPlayback": {"protocol": "stale", "source_url": self.strm_url}}]}
+                binding = {"id": 1, "source_type": "guangya", "guangya_file_id": file_id,
+                           "media_source_id": "cloud"}
+                with patch.object(media_proxy.database, "get_media_proxy_binding", return_value=binding):
+                    result, changed = media_proxy.rewrite_playback_info(payload, 7, "quality-item")
+                self.assertTrue(changed)
+                self.assertNotIn("MediaFluxPlayback", result["MediaSources"][0])
 
     def test_variants_preserve_resource_identity_crop_and_real_format_family(self):
         for mime_from_provider in (True, False):
