@@ -5484,7 +5484,8 @@ class HybridMediaProxyTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["MediaSources"][0]["MediaFluxPlayback"], {
-            "protocol": "mediaflux.playback.v1", "source_url": signed_source,
+            "protocol": "mediaflux.playback.v1",
+            "source_url": signed_source.replace("https://media.invalid", "http://testserver"),
         })
         direct_url = response.json()["MediaSources"][0]["DirectStreamUrl"]
         self.assertEqual(urlsplit(direct_url).path, "/Videos/item-post/stream")

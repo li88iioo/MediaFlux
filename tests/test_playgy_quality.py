@@ -1,15 +1,19 @@
 """同一签名 STRM 的云端画质合同：真实路由、客户端与隔离 Provider。"""
 from __future__ import annotations
 
+from contextlib import contextmanager, ExitStack
 from copy import deepcopy
-from typing import Any
+from typing import Any, cast
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from starlette.types import ASGIApp
+from uvicorn._types import ASGI3Application
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app.clients import guangya as guangya_module
 from app.clients.guangya import GuangYaClient
@@ -35,6 +39,8 @@ _VOD_URL = _API + "userres/v1/file/get_vod_download_url"
 _ACCESS_TOKEN = "quality-test-access-token-never-real"
 _REFRESH_TOKEN = "quality-test-refresh-token-never-real"
 _PRIVATE_DETAIL = "private-provider-diagnostic"
+_PRIVATE_BASE = "http://192.168.1.12:1258"
+_PUBLIC_BASE = "https://mf.example:8443"
 _VARIANT_FIELDS = {
     "id", "original", "label", "width", "height", "video_codec",
     "audio_codec", "bitrate", "duration", "transport", "mime_type", "container",
@@ -131,6 +137,53 @@ class PlayGyQualityTests(unittest.TestCase):
     def _calls(self):
         return [call["url"] for call in self.provider.calls]
 
+    @contextmanager
+    def _proxy_http(self, source_url=None, *, binding=None, enabled=1, forwarded_https=False):
+        upstream_requests = []
+        payload = {"MediaSources": [
+            {"Id": "cloud", "Protocol": "Http", "Path": source_url or build_play_url(
+                _PRIVATE_BASE, _FILE_ID, _ETAG, _SIZE, _FILENAME,
+            )},
+            {"Id": "local", "Protocol": "File", "Path": "/media/local.mp4"},
+        ]}
+
+        def upstream(request):
+            upstream_requests.append(request)
+            # 只允许读取 PlaybackInfo；访问旧内网入口或 JF 转码都会失败。
+            self.assertEqual((request.method, request.url.host, request.url.port),
+                             ("POST", "127.0.0.1", 8096))
+            self.assertIn(request.url.path, (
+                "/Items/quality-item/PlaybackInfo", "/emby/Items/quality-item/PlaybackInfo",
+            ))
+            return httpx.Response(200, json=deepcopy(payload))
+
+        async_client = httpx.AsyncClient
+        with ExitStack() as stack:
+            for name in ("_dynamic_guangya_mappings", "_item_level_binding_scopes",
+                         "_playback_grants", "_playback_sessions"):
+                stack.enter_context(patch.object(media_proxy, name, type(getattr(media_proxy, name))()))
+            stack.enter_context(patch.object(media_proxy.database, "get_media_proxy_instance", return_value={
+                "id": 7, "enabled": enabled, "upstream_url": "http://127.0.0.1:8096", "local_root": "",
+            }))
+            stack.enter_context(patch.object(media_proxy.database, "get_media_proxy_binding",
+                side_effect=lambda _instance, _item, source: binding if source == "cloud" else None))
+            stack.enter_context(patch.object(media_proxy.httpx, "AsyncClient", side_effect=lambda **kwargs:
+                async_client(transport=httpx.MockTransport(upstream), **kwargs)))
+            stack.enter_context(patch.object(media_proxy, "GuangYaClient", return_value=self.client))
+            stack.enter_context(patch.object(media_proxy, "close_guangya_client"))
+            authorized = stack.enter_context(patch.object(media_proxy, "_client_is_authorized",
+                new=AsyncMock(return_value=False)))
+            recorder = media_proxy.PlaybackRecordWriter(write_record=lambda _payload: None)
+            app = media_proxy.create_proxy_app(7, playback_record_writer=recorder)
+            if forwarded_https:
+                app = ProxyHeadersMiddleware(cast(ASGI3Application, app), trusted_hosts=["127.0.0.1"])
+            http = stack.enter_context(TestClient(
+                cast(ASGIApp, app), base_url=_PUBLIC_BASE.replace("https://", "http://") if forwarded_https else _PUBLIC_BASE,
+                headers={"X-Forwarded-Proto": "https"} if forwarded_https else None,
+                client=("127.0.0.1", 50000), follow_redirects=False,
+            ))
+            yield http, upstream_requests, authorized
+
     def _variants(self, response):
         self.assertEqual(response.status_code, 200, response.text)
         payload = response.json()
@@ -162,37 +215,138 @@ class PlayGyQualityTests(unittest.TestCase):
             self.assertNotIn(private, public)
 
     def test_proxy_source_keeps_quality_entry_and_resolves_original_and_cloud_variant(self):
-        for binding in (None, {"id": 1, "source_type": "guangya", "guangya_file_id": _FILE_ID,
-                               "media_source_id": "cloud"}):
-            with self.subTest(binding=bool(binding)):
-                # 同时覆盖含斜线 etag 的 b64 路径，不重构/丢失原签名参数。
-                strm_url = (build_play_url("http://testserver", _FILE_ID, "et/ag", _SIZE, _FILENAME)
-                            if binding else self.strm_url)
-                payload = {"MediaSources": [
-                    {"Id": "cloud", "Protocol": "Http", "Path": strm_url},
-                    {"Id": "local", "Protocol": "File", "Path": "/media/local.mp4"},
-                ]}
-                local = deepcopy(payload["MediaSources"][1])
-                with patch.object(media_proxy.database, "get_media_proxy_binding",
-                                  side_effect=lambda _instance, _item, source: binding if source == "cloud" else None):
-                    result, changed = media_proxy.rewrite_playback_info(
-                        payload, 7, "quality-item",
-                        dynamic_mappings=media_proxy.DynamicGuangYaMappings(),
-                    )
-                self.assertTrue(changed)
-                source = result["MediaSources"][0]
-                self.assertEqual(result["MediaSources"][1], local)
-                self.assertEqual(source["Path"], "/Videos/quality-item/stream?MediaSourceId=cloud")
-                self.assertEqual(source["Protocol"], "File")
-                entry = source["MediaFluxPlayback"]
-                self.assertEqual(entry, {"protocol": "mediaflux.playback.v1", "source_url": strm_url})
-                self._variants(self.http.get(self._url(base=entry["source_url"], view="variants")))
-                for quality in ("original", _HLS_GCID):
-                    resolved = self._resolved(self.http.get(self._url(
-                        base=entry["source_url"], view="resolve", quality=quality,
-                    )))
-                    self.assertEqual(resolved["variant"]["id"], quality)
-                self.assertEqual(self.http.get(entry["source_url"]).status_code, 302)
+        for prefix, file_id, etag, forwarded_https in (
+            ("", _FILE_ID, _ETAG, False),
+            ("/emby", "目录/文件-id", "etag/片段", False),
+            ("/emby", "目录/文件-id", "etag/片段", True),
+        ):
+            for manual_binding in (False, True):
+                with self.subTest(prefix=prefix, binding=manual_binding, forwarded_https=forwarded_https):
+                    strm_url = build_play_url(_PRIVATE_BASE + prefix, file_id, etag, _SIZE, _FILENAME)
+                    original = urlsplit(strm_url)
+                    self.provider.detail["data"]["fileInfo"]["fileId"] = file_id
+                    self.provider.calls.clear()
+                    binding = ({"id": 1, "source_type": "guangya", "guangya_file_id": file_id,
+                                "media_source_id": "cloud"} if manual_binding else None)
+                    with self._proxy_http(strm_url, binding=binding, forwarded_https=forwarded_https) as (
+                        http, upstream, authorized,
+                    ):
+                        response = http.post(prefix + "/Items/quality-item/PlaybackInfo",
+                                             params={"api_key": "quality-client-token"}, json={})
+                        self.assertEqual(response.status_code, 200, response.text)
+                        self.assertEqual(response.request.url.scheme, "http" if forwarded_https else "https")
+                        sources = response.json()["MediaSources"]
+                        self.assertEqual(sources[1], {
+                            "Id": "local", "Protocol": "File", "Path": "/media/local.mp4",
+                        })
+                        source = sources[0]
+                        self.assertEqual(urlsplit(source["Path"]).path, prefix + "/Videos/quality-item/stream")
+                        self.assertEqual(parse_qs(urlsplit(source["Path"]).query)["MediaSourceId"], ["cloud"])
+                        self.assertEqual(source["Protocol"], "File")
+                        entry = source["MediaFluxPlayback"]
+                        self.assertEqual(entry, {"protocol": "mediaflux.playback.v1",
+                            "source_url": _PUBLIC_BASE + original.path + "?" + original.query})
+                        if prefix:
+                            self.assertEqual(parse_qs(original.query)["enc"], ["b64"])
+
+                        # 离开内网后的匿名请求只持有签名入口，无 JF token 或播放 capability。
+                        http.cookies.clear()
+                        variants = self._variants(http.get(self._url(base=entry["source_url"], view="variants")))
+                        self.assertEqual(set(variants), {"original", _MP4_GCID, _AV1_GCID, _HLS_GCID})
+                        for quality in ("original", _HLS_GCID):
+                            resolved = self._resolved(http.get(self._url(
+                                base=entry["source_url"], view="resolve", quality=quality,
+                            )))
+                            expected = (self.provider.original_response if quality == "original"
+                                        else self.provider.vod_responses[quality])["data"]
+                            self.assertEqual(resolved["variant"], variants[quality])
+                            self.assertEqual(resolved["url"], expected["signedURL"])
+                            self.assertEqual(resolved["expires_in"], expected["urlDuration"])
+                        self.assertEqual(len(upstream), 1)
+                        authorized.assert_not_awaited()
+                    self.assertEqual(self._calls(), [_DETAIL, _DETAIL, _ORIGINAL_URL, _DETAIL, _VOD_URL])
+                    self.assertTrue(all(call["json"]["fileId"] == file_id for call in self.provider.calls))
+                    self.assertEqual(self.provider.calls[-1]["json"], {"fileId": file_id, "gcid": _HLS_GCID})
+
+    def test_proxy_quality_rejects_bad_signatures_parameters_and_head_before_network(self):
+        base = urlsplit(build_play_url(_PUBLIC_BASE + "/emby", "目录/文件-id", "etag/片段", _SIZE, _FILENAME))
+        signed = {key: values[0] for key, values in parse_qs(base.query).items()}
+        cases = (
+            ("GET", {"sig": None, "view": "variants"}, 403),
+            ("GET", {"sig": "0" * 64, "view": "resolve", "quality": _HLS_GCID}, 403),
+            ("GET", {"v": "2", "view": "variants"}, 403),
+            ("GET", {"sig": "0" * 64, "view": "unknown"}, 403),
+            ("GET", {"enc": "unknown", "view": "variants"}, 400),
+            ("GET", {"view": "unknown"}, 400),
+            ("GET", {"view": "resolve"}, 400),
+            ("GET", {"view": "resolve", "quality": ""}, 400),
+            ("GET", {"view": "variants", "quality": "original"}, 400),
+            ("GET", {"quality": "original"}, 400),
+            ("HEAD", {"view": "variants"}, 405),
+            ("HEAD", {"view": "resolve", "quality": _HLS_GCID}, 405),
+        )
+        with self._proxy_http() as (http, upstream, authorized):
+            for method, updates, status in cases:
+                with self.subTest(method=method, query=updates):
+                    query = {key: value for key, value in {**signed, **updates}.items() if value is not None}
+                    response = http.request(method, base.path, params=query, headers={"Range": "bytes=0-0"})
+                    if method == "HEAD":
+                        self.assertEqual(response.status_code, status)
+                        self.assertEqual(response.headers.get("allow"), "GET")
+                        self.assertEqual(response.content, b"")
+                    else:
+                        self._error(response, status)
+                    self.assertNotIn("location", response.headers)
+                    self.assertNotIn("content-range", response.headers)
+            for path in (base.path.rsplit("/", 1)[0], base.path.rsplit("/", 1)[0].removeprefix("/emby")):
+                with self.subTest(path=path):
+                    self._error(http.get(path, params={**signed, "view": "variants"}), 404)
+            authorized.assert_not_awaited()
+            self.assertEqual(upstream, [])
+        self.factory.assert_not_called()
+        self.assertEqual(self.provider.calls, [])
+
+    def test_proxy_disabled_instance_rejects_signed_quality_requests_before_network(self):
+        base = build_play_url(_PUBLIC_BASE, _FILE_ID, _ETAG, _SIZE, _FILENAME)
+        with self._proxy_http(enabled=0) as (http, upstream, authorized):
+            for method, query in (("GET", {"view": "variants"}),
+                                  ("GET", {"view": "resolve", "quality": "original"}),
+                                  ("HEAD", {"view": "variants"})):
+                with self.subTest(method=method, query=query):
+                    response = http.request(method, self._url(base=base, **query))
+                    self.assertEqual(response.status_code, 503)
+                    self.assertNotIn("location", response.headers)
+                    if method == "HEAD":
+                        self.assertEqual(response.content, b"")
+                    else:
+                        self._error(response, 503)
+            authorized.assert_not_awaited()
+            self.assertEqual(upstream, [])
+        self.factory.assert_not_called()
+        self.assertEqual(self.provider.calls, [])
+
+    def test_proxy_without_quality_view_keeps_legacy_redirect_authorization(self):
+        base = build_play_url(_PUBLIC_BASE, _FILE_ID, _ETAG, _SIZE, _FILENAME)
+        with self._proxy_http() as (http, upstream, authorized):
+            for method in ("GET", "HEAD"):
+                with self.subTest(method=method):
+                    response = http.request(method, base)
+                    self.assertEqual(response.status_code, 401)
+                    self.assertNotIn("location", response.headers)
+            self.assertEqual(authorized.await_count, 2)
+            self.assertEqual(self.provider.calls, [])
+            self.assertEqual(upstream, [])
+
+            response = http.post("/Items/quality-item/PlaybackInfo",
+                                 params={"api_key": "quality-client-token"}, json={})
+            self.assertEqual(response.status_code, 200, response.text)
+            authorized.return_value = True
+            redirect = http.get(self._url(base=base, api_key="quality-client-token"))
+            self.assertEqual(redirect.status_code, 302, redirect.text)
+            self.assertEqual(redirect.headers["location"], self.provider.original_url)
+            self.assertEqual(authorized.await_count, 3)
+            self.assertEqual(len(upstream), 1)
+        self.assertEqual(self._calls(), [_ORIGINAL_URL])
 
     def test_proxy_quality_entry_is_only_for_the_bound_file_and_signed_http_source(self):
         cases = [

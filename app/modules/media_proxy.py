@@ -2187,6 +2187,7 @@ def _mark_direct_source(
     *,
     native_client_mode: str = "",
     cloud_file_id: str = "",
+    client_base_url: str = "",
 ) -> None:
     # 代理播放地址与云盘画质入口各司其职；不能覆盖 Path 后丢掉原 STRM 签名。
     # 手动绑定可能指向另一文件，只公布与实际播放对象一致的已有入口。
@@ -2207,7 +2208,12 @@ def _mark_direct_source(
         ):
             source["MediaFluxPlayback"] = {
                 "protocol": "mediaflux.playback.v1",
-                "source_url": original_path,
+                # STRM 可使用面板内网地址，手机应从当前反代入口查询画质。
+                # 签名绑定文件而非域名，原路径与查询参数保持不变。
+                "source_url": (
+                    f"{client_base_url.rstrip('/')}{parsed.path}?{parsed.query}"
+                    if client_base_url else original_path
+                ),
             }
     requested_mode = (native_client_mode or "").strip().casefold()
     mode = (
@@ -4084,6 +4090,7 @@ def rewrite_playback_info(
                 client_path,
                 client_direct_url,
                 native_client_mode=native_client_mode,
+                client_base_url=client_base_url,
                 cloud_file_id=(
                     str(_binding_value(binding, "guangya_file_id") or "")
                     if _binding_value(binding, "source_type") == "guangya" else ""
@@ -4152,6 +4159,7 @@ def rewrite_playback_info(
             client_direct_url,
             native_client_mode=native_client_mode,
             cloud_file_id=file_id,
+            client_base_url=client_base_url,
         )
         if (
             browser_direct_play_eligible
@@ -5380,6 +5388,18 @@ def create_proxy_app(
         )
         playgy_file_id = _extract_guangya_file_id(str(request.url))
         if playgy_file_id and request.method in {"GET", "HEAD"}:
+            if "view" in request.query_params or "quality" in request.query_params:
+                from app.routes.proxy import play_gy
+
+                # 与面板共用签名、参数校验及云盘实现；不转发到 STRM 的内网域名。
+                parts = request.url.path[len(_route_prefix(request.url.path)):].split("/", 5)
+                if len(parts) != 6:
+                    return JSONResponse({"error": "播放地址路径不完整"}, status_code=404)
+                return await asyncio.to_thread(
+                    play_gy, *parts[2:], request=request,
+                    **{name: request.query_params.get(name, "")
+                       for name in ("v", "sig", "enc", "view", "quality")},
+                )
             if auth_scope and not _playback_grants.allows_file(auth_scope, instance_id, playgy_file_id):
                 return JSONResponse({"error": "当前凭据没有该文件的播放授权"}, status_code=403)
             return await guangya_redirect(instance, request, playgy_file_id)
