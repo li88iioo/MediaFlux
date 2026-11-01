@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import unittest
 from pathlib import Path
@@ -35,6 +36,33 @@ class LucideLocalRenderingTests(unittest.TestCase):
                 offenders.append(str(path))
 
         self.assertEqual(offenders, [])
+
+    def test_referenced_icon_names_exist_in_vendored_lucide(self) -> None:
+        # lucide 按 kebab→PascalCase 查找图标，未知名称静默保留为空 <i>，只能靠静态核对兜底。
+        bundled = set(re.findall(r"[,{]([A-Z][A-Za-z0-9]*):", ICON_SCRIPT.read_text(encoding="utf-8")))
+        sources = [
+            *(ROOT / "app/static/js").rglob("*.js"),
+            *(ROOT / "app/templates").rglob("*.html"),
+        ]
+        missing = set()
+        for path in sources:
+            if path.name.endswith(".min.js"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            names = re.findall(r"""(?:setAttribute\(['"]data-lucide['"],\s*|dataset\.lucide\s*=\s*)['"]([a-z0-9-]+)['"]""", text)
+            for value in re.findall(r'data-lucide="([^"]+)"', text):
+                if not re.search(r"[{$]", value):
+                    names.append(value)
+                    continue
+                # 动态值只能核对其中写死的候选名（三元分支、Jinja if/else）。
+                names += re.findall(r"(?:[?:]|\|\||\{\{|\belse)\s*'([a-z0-9-]+)'", value)
+                names += re.findall(r"%\}\s*([a-z0-9-]+)\s*\{%", value)
+            for name in names:
+                if "".join(part[:1].upper() + part[1:] for part in name.split("-")) not in bundled:
+                    missing.add(f"{path.relative_to(ROOT)}: {name}")
+
+        self.assertGreater(len(bundled), 1000)
+        self.assertEqual(sorted(missing), [])
 
 
 @unittest.skipIf(sync_playwright is None, "未安装 Playwright")

@@ -545,7 +545,7 @@
         if(!sources.length){
             const empty=document.createElement('div');
             empty.className='organize-source-empty';
-            empty.innerHTML='<i data-lucide="folder-dashed"></i><span>尚未选择源目录，请点击右上角批量选择</span>';
+            empty.innerHTML='<i data-lucide="folder-search"></i><span>尚未选择源目录，请点击右上角批量选择</span>';
             list.appendChild(empty);
             renderLucideIcons(list);
             return;

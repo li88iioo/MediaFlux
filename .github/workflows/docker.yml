@@ -29,7 +29,7 @@ jobs:
           ref: ${{ github.sha }}
 
       - uses: actions/setup-node@v6
-        with: {node-version: "24.22.1", package-manager-cache: false}
+        with: {node-version: "24.22.2", package-manager-cache: false}
 
       - uses: actions/setup-python@v6
         with:
@@ -39,15 +39,15 @@ jobs:
 
       - name: Install dependencies
         run: |
-          npm install --global npm@12.2.0 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
+          npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
           npm ci --ignore-scripts --no-audit --no-fund
           python -m pip install --require-hashes -r requirements-release-runtime.lock
-          python -m pip install "pytest==9.1.1"
-          python -m pip install "ruff==0.17.1"
+          python -m pip install "pytest==9.2.0"
+          python -m pip install "ruff==0.17.3"
           python -m pip install "pyrefly==1.4.0"
-          python -m pip install "types-PyYAML==6.0.12.20260906" "types-croniter==6.2.4.20261006"
-          python -c 'from importlib.metadata import version; assert version("pytest") == "9.1.1"'
-          python -c 'from importlib.metadata import version; assert version("ruff") == "0.17.1"'
+          python -m pip install "types-PyYAML==6.0.12.20261030" "types-croniter==6.2.4.20261006"
+          python -c 'from importlib.metadata import version; assert version("pytest") == "9.2.0"'
+          python -c 'from importlib.metadata import version; assert version("ruff") == "0.17.3"'
           python -c 'from importlib.metadata import version; assert version("pyrefly") == "1.4.0"'
           python -m pip check
 

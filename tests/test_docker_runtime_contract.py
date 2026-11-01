@@ -51,7 +51,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
         self.assertIn("# 后台调度器与 Telegram Bot 采用进程内单例", self.dockerfile)
 
     def test_build_identity_arguments_are_scoped_after_dependency_installation(self) -> None:
-        self.assertIn("RUN npm install --global npm@12.2.0 --ignore-scripts", self.dockerfile)
+        self.assertIn("RUN npm install --global npm@12.2.1 --ignore-scripts", self.dockerfile)
         self.assertLess(
             self.dockerfile.index("RUN apk upgrade --no-cache"),
             self.dockerfile.index("RUN npm ci"),
@@ -358,7 +358,7 @@ class DockerRuntimeContractTests(unittest.TestCase):
 
     def test_dockerfile_pins_multiarch_base_and_hashed_runtime_lock(self) -> None:
         self.assertIn(
-            "FROM python:3.13-slim@sha256:cf50a4f6ac4f026458b08d5222023d700ac806410dff5e9ca8728fa44f2b850f",
+            "FROM python:3.13-slim@sha256:2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb",
             self.dockerfile,
         )
         self.assertIn("COPY requirements-release-runtime.lock", self.dockerfile)

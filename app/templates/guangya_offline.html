@@ -94,7 +94,7 @@
                         <div class="offline-dir-card-box">
                             <div class="offline-dir-value" id="offlineTargetDirValue">
                                 <div class="offline-dir-badge{% if not offline_initial.target_dir %} is-empty{% endif %}">
-                                    <span class="offline-dir-icon"><i data-lucide="{% if offline_initial.target_dir %}folder{% else %}folder-dashed{% endif %}"></i></span>
+                                    <span class="offline-dir-icon"><i data-lucide="{% if offline_initial.target_dir %}folder{% else %}folder-search{% endif %}"></i></span>
                                     <div class="offline-dir-text"><strong>{{ offline_initial.target_dir_name or '未选择' }}</strong><span class="offline-dir-id">{% if offline_initial.target_dir %}ID: {{ offline_initial.target_dir }}{% else %}未选择关联目录{% endif %}</span></div>
                                 </div>
                             </div>
@@ -127,7 +127,7 @@
                             <div class="offline-dir-card-box">
                                 <div class="offline-dir-value" id="offlineSecondaryDirValue">
                                     <div class="offline-dir-badge{% if not offline_initial.secondary_dir %} is-empty{% endif %}">
-                                        <span class="offline-dir-icon"><i data-lucide="{% if offline_initial.secondary_dir %}folder{% else %}folder-dashed{% endif %}"></i></span>
+                                        <span class="offline-dir-icon"><i data-lucide="{% if offline_initial.secondary_dir %}folder{% else %}folder-search{% endif %}"></i></span>
                                         <div class="offline-dir-text"><strong>{{ offline_initial.secondary_dir_name or '未选择' }}</strong><span class="offline-dir-id">{% if offline_initial.secondary_dir %}ID: {{ offline_initial.secondary_dir }}{% else %}未选择关联目录{% endif %}</span></div>
                                     </div>
                                 </div>
@@ -373,7 +373,7 @@
             if(hasVal){
                 valEl.innerHTML=`<div class="offline-dir-badge"><span class="offline-dir-icon"><i data-lucide="folder"></i></span><div class="offline-dir-text"><strong>${esc(name)}</strong><span class="offline-dir-id">ID: ${esc(id)}</span></div></div>`;
             }else{
-                valEl.innerHTML=`<div class="offline-dir-badge is-empty"><span class="offline-dir-icon"><i data-lucide="folder-dashed"></i></span><div class="offline-dir-text"><strong>${esc(fallback)}</strong><span class="offline-dir-id">未选择关联目录</span></div></div>`;
+                valEl.innerHTML=`<div class="offline-dir-badge is-empty"><span class="offline-dir-icon"><i data-lucide="folder-search"></i></span><div class="offline-dir-text"><strong>${esc(fallback)}</strong><span class="offline-dir-id">未选择关联目录</span></div></div>`;
             }
         });
         window.renderLucideIcons?.(document.getElementById('offlineConfigForm'));
