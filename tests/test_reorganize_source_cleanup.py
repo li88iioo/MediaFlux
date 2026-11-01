@@ -8,6 +8,8 @@ from app.modules.scraper import TMDBScraper
 import json
 import sqlite3
 import threading
+import tempfile
+from pathlib import Path
 from dataclasses import replace
 from types import SimpleNamespace
 from time import monotonic, sleep
@@ -136,6 +138,7 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
             for table in (
                 "download_staging_reconcile", "organize_confirmations", "download_request_keys",
                 "download_requests", "organize_log", "organize_delete_audit",
+                "strm_change_queue", "strm_index", "strm_path_cleanup", "strm_metadata_queue",
             ):
                 conn.execute(f"DELETE FROM {table}")
         self.cloud = _Cloud()
@@ -145,6 +148,8 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
             library_notify=False, nsfw_enabled=False,
         )
         self.permanent_sources = [{"id": "incoming", "name": "Incoming"}]
+        self.strm_sources = [{"id": "target", "name": "Archive"}]
+        self.enterContext(patch("app.modules.strm.get", side_effect=self._config))
         config_patch = patch.object(config, "get", side_effect=self._config)
         config_patch.start()
         self.addCleanup(config_patch.stop)
@@ -166,6 +171,8 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
     def _config(self, key, default=""):
         if key == "GY_ORGANIZE_SOURCE_DIRS":
             return json.dumps(self.permanent_sources)
+        if key == "GY_STRM_SOURCE_DIRS":
+            return json.dumps(self.strm_sources)
         return default
 
     def _add_item(self, file_id, role):
@@ -400,6 +407,31 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
         self.assertEqual(self.cloud.nodes['video'].name, 'Original.S01E01.mkv')
         self.assertNotIn('leaf', self.cloud.nodes)
 
+    def test_skipped_correction_enqueues_only_its_archive_and_companions(self):
+        self.rules.link_strm = True
+        self.cloud.add("subtitle", "leaf", "Original.S01E01.zh.srt")
+        self._add_item("subtitle", "subtitle")
+        db.update_organize_log(self.log_id, status="skipped")
+        with patch("app.modules.strm.get", side_effect=lambda key, default="":
+                   json.dumps([{"id": "target", "name": "Archive"}, {"id": "nsfw", "name": "NSFW"}])
+                   if key == "GY_STRM_SOURCE_DIRS" else default), patch(
+            "app.modules.organize.get", side_effect=lambda key, default="": {
+                "GY_STRM_BASE_URL": "http://synthetic.invalid", "STRM_ROOT": "/synthetic/strm",
+            }.get(key, default),
+        ), patch("app.modules.scheduler.get_scheduler") as scheduler:
+            scheduler.return_value.trigger.return_value = {"ok": True, "queued": True}
+            result = self._reorganize()
+        self.assertTrue(result["success"])
+        self.assertEqual(result["warnings"], [])
+        options = scheduler.return_value.trigger.call_args.kwargs
+        self.assertEqual(options.get("sync_mode"), "fast")
+        self.assertEqual(options.get("selected_source_ids"), ["target"])
+        changes = options["organize_changes"]
+        self.assertEqual({(row["file_id"], row["kind"], row["action"]) for row in changes},
+                         {("video", "video", "upsert"), ("subtitle", "metadata", "upsert")})
+        self.assertTrue(all(row["parent_id"] == result["target_dir_id"] for row in changes))
+        self.assertTrue(all(row["name"] == self.cloud.nodes[row["file_id"]].name for row in changes))
+
     def test_corrections_report_rejected_strm_handoff_without_replaying_cloud_writes(self):
         self.rules.link_strm = True
         actions = (
@@ -438,16 +470,149 @@ class ReorganizeSourceCleanupTests(IsolatedDatabaseTestCase):
             for receipt in ({'ok': True, 'queued': True}, {'ok': False, 'skipped': True}):
                 with self.subTest(receipt=receipt):
                     trigger.return_value = receipt
-                    self.assertEqual(self.service._run_post_actions(
-                        items=[], rules=self.rules, moved=1,
-                    ), [])
+                    self.assertEqual(self._reorganize()["warnings"], [])
             trigger.side_effect = RuntimeError('synthetic queue failure')
-            warnings = self.service._run_post_actions(items=[], rules=self.rules, moved=1)
+            warnings = self._reorganize()["warnings"]
             self.assertIn('STRM 联动启动失败', '；'.join(warnings))
             trigger.reset_mock()
             self.rules.link_strm = False
-            self.assertEqual(self.service._run_post_actions(items=[], rules=self.rules, moved=1), [])
+            self.assertEqual(self.service._run_post_actions(items=[], rules=self.rules, transitions=[]), [])
             trigger.assert_not_called()
+
+    def test_correction_incremental_creates_moves_and_retires_only_selected_strm(self):
+        from app.modules.strm import STRM_SUBDIR, sync_strm_incremental
+
+        self.rules.link_strm = True
+        outcomes = []
+        batches = []
+        with tempfile.TemporaryDirectory() as root:
+            def submit(_trigger, **options):
+                changes = options["organize_changes"]
+                batches.append(changes)
+                self.assertEqual(options["sync_mode"], "fast")
+                # 真实执行增量写文件/更新索引；禁止退回列云端目录。
+                with patch.object(self.cloud, "list_dir", side_effect=AssertionError("不应全量扫描")):
+                    for source_id in options["selected_source_ids"]:
+                        result = sync_strm_incremental(
+                            source_id, changes, "http://synthetic.invalid", root,
+                            client=cast(GuangYaClient, self.cloud),
+                        )
+                        self.assertFalse(result["fallback_required"], result)
+                        outcomes.append(result)
+                return {"ok": True}
+
+            with patch("app.modules.organize.get", side_effect=lambda key, default="": {
+                "GY_STRM_BASE_URL": "http://synthetic.invalid", "STRM_ROOT": root,
+            }.get(key, default)), patch("app.modules.scheduler.get_scheduler") as scheduler:
+                scheduler.return_value.trigger.side_effect = submit
+                self.assertEqual(self._reorganize()["warnings"], [])
+                first = list((Path(root) / STRM_SUBDIR).rglob("*.strm"))
+                self.assertEqual(len(first), 1)
+                # 改分类后重新整理，同 file_id 旧路径应退休，只有新路径留下。
+                self.rules.year_split = True
+                self.assertEqual(self._reorganize()["warnings"], [])
+                current = list((Path(root) / STRM_SUBDIR).rglob("*.strm"))
+                self.assertEqual(len(current), 1)
+                self.assertNotEqual(current, first)
+                self.assertFalse(first[0].exists())
+                result = self.service.return_to_source(
+                    self.log_id, "return-incremental", self.service.detail(self.log_id)["version"],
+                )
+                self.assertEqual(result["warnings"], [])
+                self.assertEqual(list((Path(root) / STRM_SUBDIR).rglob("*.strm")), [])
+                self.assertEqual(batches[-1][0]["action"], "remove")
+                self.assertTrue(self.cloud.file_info("video"))
+            self.assertTrue(all(item["scanned_files"] == 0 for item in outcomes))
+
+    def test_pending_upsert_is_superseded_when_return_happens_before_sync(self):
+        self.rules.link_strm = True
+        def submit(_trigger, **options):
+            db.enqueue_strm_change_targets(options["organize_changes"])
+            return {"ok": True, "queued": True}
+        with patch("app.modules.organize.get", side_effect=lambda key, default="": {
+            "GY_STRM_BASE_URL": "http://synthetic.invalid", "STRM_ROOT": "/synthetic/strm",
+        }.get(key, default)), patch("app.modules.scheduler.get_scheduler") as scheduler:
+            scheduler.return_value.trigger.side_effect = submit
+            self.assertEqual(self._reorganize()["warnings"], [])
+            result = self.service.return_to_source(
+                self.log_id, "return-pending", self.service.detail(self.log_id)["version"],
+            )
+            self.assertEqual(result["warnings"], [])
+        with db.get_conn() as conn:
+            changes = [item for row in conn.execute("SELECT pending_changes_json FROM strm_change_queue")
+                       for item in json.loads(row[0])]
+        self.assertEqual([(row["source_id"], row["file_id"], row["action"]) for row in changes],
+                         [("target", "video", "remove")])
+
+    def test_revert_between_sources_preserves_both_scopes_and_final_identity(self):
+        self.rules.link_strm = True
+        self.strm_sources.append({"id": "incoming", "name": "Incoming"})
+        with patch("app.modules.organize.get", side_effect=lambda key, default="": {
+            "GY_STRM_BASE_URL": "http://synthetic.invalid", "STRM_ROOT": "/synthetic/strm",
+        }.get(key, default)), patch("app.modules.scheduler.get_scheduler") as scheduler:
+            scheduler.return_value.trigger.return_value = {"ok": True, "queued": True}
+            self.assertEqual(self._reorganize()["warnings"], [])
+            first = scheduler.return_value.trigger.call_args.kwargs["organize_changes"]
+            self.assertEqual({(row["source_id"], row["action"]) for row in first},
+                             {("incoming", "remove"), ("target", "upsert")})
+            result = self.service.revert_latest(
+                self.log_id, "revert-scopes", self.service.detail(self.log_id)["version"],
+            )
+            self.assertEqual(result["warnings"], [])
+            after = scheduler.return_value.trigger.call_args.kwargs["organize_changes"]
+            self.assertEqual({(row["source_id"], row["action"]) for row in after},
+                             {("incoming", "upsert"), ("target", "remove")})
+            self.assertTrue(all(row["name"] == "Original.S01E01.mkv" for row in after))
+
+    def test_batch_corrections_keep_each_files_incremental_target(self):
+        from tests.test_logs_batch_correction import _OfflineScraper
+
+        self.service.scraper = cast(TMDBScraper, _OfflineScraper())
+        self.service.organizer.scraper = self.service.scraper
+        self.rules.link_strm = True
+        first_id = self.log_id
+        self.cloud.add("video-2", "leaf", "Original.S01E02.mkv")
+        self.log_id = db.add_organize_log(
+            source="guangya", original_path="Synthetic source/Season 1", new_path="",
+            file_id="video-2", status="skipped", source_dir_id="source",
+            original_parent_id="leaf", original_name="Original.S01E02.mkv",
+            current_parent_id="leaf", current_name="Original.S01E02.mkv",
+            media_type="tv", title="Original", legacy_incomplete=False,
+        )
+        self._add_item("video-2", "video")
+        entries = [{"log_id": log_id, "expected_version": self.service.detail(log_id)["version"],
+                    "operation_token": f"batch-incremental-{log_id}"} for log_id in (first_id, self.log_id)]
+        candidate = {"tmdb_id": "4242", "media_type": "tv"}
+        preview = self.service.preview_batch(entries, candidate)
+        def submit(_trigger, **options):
+            self.assertEqual(options["selected_source_ids"], ["target"])
+            db.enqueue_strm_change_targets(options["organize_changes"])
+            return {"ok": True, "queued": True}
+        with patch("app.modules.organize.get", side_effect=lambda key, default="": {
+            "GY_STRM_BASE_URL": "http://synthetic.invalid", "STRM_ROOT": "/synthetic/strm",
+        }.get(key, default)), patch("app.modules.scheduler.get_scheduler") as scheduler:
+            scheduler.return_value.trigger.side_effect = submit
+            result = self.service.run_batch("reorganize", entries, candidate=candidate,
+                                            preview_digest=preview["preview_digest"])
+        self.assertTrue(result["success"], result)
+        with db.get_conn() as conn:
+            changes = [item for row in conn.execute("SELECT pending_changes_json FROM strm_change_queue")
+                       for item in json.loads(row[0])]
+        self.assertEqual({row["file_id"] for row in changes}, {"video", "video-2"})
+        self.assertTrue(all(row["action"] == "upsert" for row in changes))
+
+    def test_unknown_source_ancestry_does_not_turn_completed_move_into_full_scan(self):
+        self.rules.link_strm = True
+        # 上游详情读不出祖先，但操作涉及的文件/父目录本身可正常核验。
+        original_info = self.cloud.file_info
+        with patch.object(self.cloud, "file_info", side_effect=lambda key:
+                          None if key == "incoming" else original_info(key)), patch(
+            "app.modules.scheduler.get_scheduler",
+        ) as scheduler:
+            result = self._reorganize()
+        self.assertTrue(result["success"])
+        self.assertIn("STRM/Jellyfin 后处理未受理", "；".join(result["warnings"]))
+        scheduler.assert_not_called()
 
     def test_reorganize_after_return_cleans_restored_source_and_can_return_again(self):
         self._reorganize()

@@ -3557,6 +3557,7 @@ class Organizer:
         download_request_ids: list[int] | None = None,
         chat_id: str = "",
         force_incremental: bool = False,
+        sync_mode: str = "auto",
         debounce_seconds: float = 0.0,
         notification_threads: list[dict[str, Any]] | None = None,
     ) -> None:
@@ -3595,6 +3596,11 @@ class Organizer:
                         bool(stats.get("strm_force_full")) or not bool(stats.get("strm_changes"))
                     ),
                 }
+                if sync_mode == "fast":
+                    trigger_options["sync_mode"] = "fast"
+                    trigger_options["selected_source_ids"] = sorted({
+                        change["source_id"] for change in trigger_options["organize_changes"]
+                    })
                 if linked_threads:
                     trigger_options["notification_threads"] = linked_threads
                 if chat_id:

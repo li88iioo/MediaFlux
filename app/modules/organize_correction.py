@@ -55,7 +55,7 @@ from app.modules.scraper import (
     TMDBScraper,
     extract_recognition_context,
 )
-from app.modules.strm import cleanup_deleted_cloud_files
+from app.modules.strm import cleanup_deleted_cloud_files, configured_strm_source_plans, safe_path_component
 
 logger = get_logger(__name__)
 
@@ -1378,13 +1378,61 @@ class OrganizeCorrectionService:
                 warnings.append("部分整理目标空目录未能清理，目录已安全保留")
         return cleaned, list(dict.fromkeys(warnings))
 
+    def _strm_changes(self, transitions: list[AppliedTransition]) -> list[dict]:
+        """只沿本次文件的前后祖先链定位来源；在清理空目录前调用。"""
+        sources, error = configured_strm_source_plans()
+        if error or not sources:
+            raise ValueError(error or "未配置 STRM 同步来源")
+        source_ids = {source["id"] for source in sources}
+        directories: dict[str, GuangYaFile] = {}
+
+        def locations(parent_id: str) -> dict[str, str]:
+            found: dict[str, str] = {}
+            parts: list[str] = []
+            visited: set[str] = set()
+            while True:
+                if not parent_id or parent_id in visited:
+                    raise ValueError("无法核验 STRM 来源目录链")
+                visited.add(parent_id)
+                if parent_id in source_ids:
+                    found[parent_id] = "/".join(reversed(parts))
+                if parent_id == "0":
+                    return found
+                if parent_id not in directories:
+                    directory = self.client.file_info(parent_id)
+                    if directory is None or not directory.is_dir or directory.file_id != parent_id:
+                        raise ValueError("无法读取 STRM 来源目录，未扩大同步范围")
+                    directories[parent_id] = directory
+                directory = directories[parent_id]
+                parts.append(safe_path_component(directory.name))
+                parent_id = directory.parent_id
+
+        changes: list[dict] = []
+        for transition in transitions:
+            item = transition.item
+            # 确认执行后的身份，不使用执行前的文件名/父目录生成 STRM。
+            self._verify_item(replace(item, current_parent_id=transition.after_parent_id,
+                                      current_name=transition.after_name))
+            before = locations(transition.before_parent_id)
+            after = locations(transition.after_parent_id)
+            kind = "video" if item.role == "video" else "metadata"
+            for source_id in sorted(before.keys() | after.keys()):
+                changes.append({
+                    "source_id": source_id, "kind": kind, "file_id": item.file_id,
+                    "action": "upsert" if source_id in after else "remove",
+                    "rel_dir": after.get(source_id, before.get(source_id, "")),
+                    "parent_id": transition.after_parent_id, "name": transition.after_name,
+                    "etag": item.etag, "size": item.size,
+                })
+        return changes
+
     def _run_post_actions(
         self,
         *,
         items: list[CorrectionItem],
         rules: OrganizeRules,
         match: dict | None = None,
-        moved: int = 0,
+        transitions: list[AppliedTransition],
         parent_path: str = "",
         rejected_tmdb_ids: list[str] | None = None,
     ) -> list[str]:
@@ -1403,11 +1451,16 @@ class OrganizeCorrectionService:
             except Exception as exc:
                 warnings.append(f"TMDB 映射锁保存失败: {exc}")
                 logger.warning(warnings[-1])
-        if rules.link_strm:
-            stats = {"moved": moved}
-            Organizer._post_organize_link(stats, rules)
-            if error := organize_strm_error(stats):
-                warnings.append(f"云端操作已完成，STRM/Jellyfin 后处理未受理：{error}")
+        if rules.link_strm and transitions:
+            try:
+                changes = self._strm_changes(transitions)
+                if changes:
+                    stats = {"moved": len(transitions), "strm_changes": changes}
+                    Organizer._post_organize_link(stats, rules, sync_mode="fast")
+                    if error := organize_strm_error(stats):
+                        warnings.append(f"云端操作已完成，STRM/Jellyfin 后处理未受理：{error}")
+            except Exception as exc:
+                warnings.append(f"云端操作已完成，STRM/Jellyfin 后处理未受理：{exc}")
         return warnings
 
     def _download_recovery_snapshot(self, source_dir_id: str) -> dict | None:
@@ -1684,25 +1737,21 @@ class OrganizeCorrectionService:
             self._cleanup_created_dirs(created_dirs)
             db.update_organize_log(log_id, status=self._failure_status(log_id, "failed"), error=str(exc))
             raise
+        post_warnings = self._run_post_actions(
+            items=items, rules=rules, match=match, transitions=completed,
+            parent_path=parent_path, rejected_tmdb_ids=rejected_tmdb_ids,
+        )
         empty_dirs_cleaned, directory_warnings = self._cleanup_empty_directories(
             log_id=log_id, directories=cleanup_directories,
             protected=cleanup_protected | {target_id}, target_root_id=rules.target_dir_id,
             trigger="reorganize_empty_dir_cleanup",
         )
-        warnings = [*cleanup_warnings, *directory_warnings]
+        warnings = [*cleanup_warnings, *directory_warnings, *post_warnings]
         warnings.extend(self._finalize_reorganized_source(
             str(previous_log["source_dir_id"] or "") if previous_log else "", rules,
             request_snapshot=request_snapshot, cleanup_source=not already_archived,
         ))
         warnings.extend(self._notify_reorganize_result(preview, items, rules))
-        warnings.extend(self._run_post_actions(
-            items=items,
-            rules=rules,
-            match=match,
-            moved=len(items),
-            parent_path=parent_path,
-            rejected_tmdb_ids=rejected_tmdb_ids,
-        ))
         return {
             "success": True, "log_id": log_id, "target_dir_id": target_id,
             "item_count": len(items), "empty_dirs_cleaned": empty_dirs_cleaned,
@@ -1781,6 +1830,7 @@ class OrganizeCorrectionService:
                 log_id, status=self._failure_status(log_id, "failed" if targets_verified else detail["status"]), error=str(exc)
             )
             raise
+        post_warnings = self._run_post_actions(items=items, rules=rules, transitions=completed)
         empty_dirs_cleaned, directory_warnings = (
             self._cleanup_empty_directories(
                 log_id=log_id,
@@ -1789,10 +1839,7 @@ class OrganizeCorrectionService:
                 target_root_id=rules.target_dir_id,
             )
         )
-        warnings = [*cleanup_warnings, *directory_warnings]
-        warnings.extend(
-            self._run_post_actions(items=items, rules=rules, moved=len(items))
-        )
+        warnings = [*cleanup_warnings, *directory_warnings, *post_warnings]
         if not cleanup_directories:
             cleanup_status = "retained" if cleanup_warnings else "not_applicable"
         elif empty_dirs_cleaned >= len(cleanup_directories):
@@ -1903,7 +1950,7 @@ class OrganizeCorrectionService:
             raise
         rules = OrganizeRules.from_config()
         warnings = ([legacy_warning] if legacy_warning else []) + self._run_post_actions(
-            items=refreshed_items, rules=rules, moved=len(completed)
+            items=refreshed_items, rules=rules, transitions=completed
         )
         return {
             "success": True, "log_id": log_id, "item_count": len(completed),
