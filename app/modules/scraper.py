@@ -4084,9 +4084,8 @@ class TMDBScraper:
         self._last_search_empty_cache_hit = False
         self._search_outcome_local = threading.local()
         self._recognition_detail_cache: OrderedDict[
-            tuple[str, str], dict
+            tuple[str, str], tuple[float, dict, bool]
         ] = OrderedDict()
-        self._recognition_detail_failures: set[tuple[str, str]] = set()
         self._detail_cache: dict[tuple[str, str], dict] = {}
         self._credits_detail_cache: dict[tuple[str, str], dict] = {}
         self._season_detail_cache: dict[tuple[str, int], dict] = {}
@@ -4233,33 +4232,26 @@ class TMDBScraper:
     ) -> None:
         with self._tmdb_state_lock:
             self._recognition_detail_cache.pop(key, None)
-            self._recognition_detail_cache[key] = dict(detail)
-            if failed:
-                self._recognition_detail_failures.add(key)
-            else:
-                self._recognition_detail_failures.discard(key)
+            self._recognition_detail_cache[key] = (time.monotonic(), dict(detail), failed)
             while (
                 len(self._recognition_detail_cache)
                 > _RECOGNITION_DETAIL_CACHE_LIMIT
             ):
-                evicted_key, _value = self._recognition_detail_cache.popitem(
-                    last=False
-                )
-                self._recognition_detail_failures.discard(evicted_key)
+                self._recognition_detail_cache.popitem(last=False)
 
     def _cached_recognition_detail(
         self, key: tuple[str, str],
     ) -> tuple[bool, dict, bool]:
         with self._tmdb_state_lock:
-            detail = self._recognition_detail_cache.get(key)
-            if detail is None and key not in self._recognition_detail_cache:
+            cached = self._recognition_detail_cache.get(key)
+            if cached is None:
+                return False, {}, False
+            saved_at, detail, failed = cached
+            if failed and time.monotonic() - saved_at > _TMDB_FAILURE_CACHE_TTL_SECONDS:
+                del self._recognition_detail_cache[key]
                 return False, {}, False
             self._recognition_detail_cache.move_to_end(key)
-            return (
-                True,
-                dict(detail or {}),
-                key in self._recognition_detail_failures,
-            )
+            return True, dict(detail), failed
 
     @staticmethod
     def _active_ai_failure(
@@ -4491,7 +4483,6 @@ class TMDBScraper:
                 self._detail_cache.pop(key, None)
                 self._credits_detail_cache.pop(key, None)
                 self._recognition_detail_cache.pop(key, None)
-                self._recognition_detail_failures.discard(key)
                 self._detail_failure_cache.pop(key, None)
         with self._tmdb_state_lock:
             cached = self._credits_detail_cache.get(key) or self._detail_cache.get(key)
@@ -5225,8 +5216,14 @@ class TMDBScraper:
                     raw_detail = detail_method(tmdb_id, media_type)
                 else:
                     raw_detail = self.client.detail(tmdb_id, media_type)
-                detail_failed = not isinstance(raw_detail, dict)
-                detail = dict(raw_detail) if isinstance(raw_detail, dict) else {}
+                if (
+                    not isinstance(raw_detail, dict)
+                    or str(raw_detail.get("id") or "").strip() != tmdb_id
+                    or str(raw_detail.get("media_type") or media_type).strip().lower() != media_type
+                ):
+                    raise ValueError("TMDB 候选详情身份不一致或缺失")
+                detail_failed = False
+                detail = dict(raw_detail)
                 self._remember_recognition_detail(
                     key, detail, failed=detail_failed
                 )
@@ -5239,10 +5236,8 @@ class TMDBScraper:
                 detail = {}
                 detail_failed = True
                 self._remember_recognition_detail(key, detail, failed=True)
-        if not detail:
-            # ``{}`` 可以是客户端成功返回的空对象；它代表没有补充别名，
-            # 但覆盖请求已完成。只有异常或非字典响应才是不完整覆盖。
-            return candidate, not detail_failed
+        if detail_failed:
+            return candidate, False
         merged = dict(candidate)
         for field_name in (
             "name", "title", "original_name", "original_title",
@@ -5761,6 +5756,7 @@ class TMDBScraper:
         except Exception as exc:
             logger.debug("人工媒体别名查询失败 type=%s", type(exc).__name__)
             learned = []
+        learned_coverage_incomplete = len(learned) > MAX_ALIAS_ENRICHMENT_CANDIDATES
         if len(learned) <= MAX_ALIAS_ENRICHMENT_CANDIDATES:
             for hint in learned:
                 key = (context.media_type, str(hint["tmdb_id"]))
@@ -5769,17 +5765,20 @@ class TMDBScraper:
                 raw, available = self._enrich_candidate_for_scoring(
                     {"id": key[1], "media_type": key[0]}, context.media_type,
                 )
-                _cached, detail, _failed = self._cached_recognition_detail(key)
-                if available and str(detail.get("id") or "") == key[1] and (raw.get("name") or raw.get("title")):
+                if available and (raw.get("name") or raw.get("title")):
                     raw_candidates[key] = raw
                     learned_ids.append(key[1])
+                else:
+                    learned_coverage_incomplete = True
 
         if not raw_candidates:
             failed_attempt = next((
                 item for item in search_attempts
                 if item.get("status") in {"config_error", "request_error"}
             ), None)
-            if failed_attempt is not None:
+            if learned_coverage_incomplete:
+                status, error = "request_error", "人工学习候选详情未完整获取，暂不能确定媒体身份"
+            elif failed_attempt is not None:
                 status = str(failed_attempt.get("status") or "request_error")
                 error = str(failed_attempt.get("error") or "TMDB 搜索失败")
             elif type_mismatch_seen and any(
@@ -5960,7 +5959,7 @@ class TMDBScraper:
         decision_constraints = list(
             best.score_breakdown.rejected_constraints if best.score_breakdown else []
         )
-        if len(learned) > MAX_ALIAS_ENRICHMENT_CANDIDATES:
+        if learned_coverage_incomplete:
             decision_constraints.append("manual_alias_coverage_incomplete")
             rejected_constraints.append("manual_alias_coverage_incomplete")
         best_genre_ids = _tmdb_genre_ids(scored[0][1])
@@ -6243,8 +6242,8 @@ class TMDBScraper:
                 result.error = "存在同名同年且得分接近的多个 TMDB 条目，需要人工确认"
             elif decision.get("reason") == "romaji_candidate_overflow":
                 result.error = "拉丁标题候选过多，无法在安全上限内排除同名条目，需要人工确认"
-            elif decision.get("reason") == "romaji_alias_coverage_incomplete":
-                result.error = "部分 TMDB 候选详情不可用，无法排除同名条目，需要人工确认"
+            elif decision.get("reason") in {"romaji_alias_coverage_incomplete", "manual_alias_coverage_incomplete"}:
+                result.error = "部分 TMDB 候选尚未完成核验，暂不能排除同名条目，请稍后重试或明确指定作品"
             elif decision.get("reason") == "distinctive_title_tokens_missing":
                 result.error = "候选仅命中部分标题，完整标题仍有显著片段未匹配，需要人工确认"
             elif decision.get("reason") == "search_only_variant":
@@ -7744,7 +7743,11 @@ class TMDBScraper:
         rejected = set(deterministic.rejected_constraints or [])
         if (
             any(item.startswith("tmdb_position_") for item in rejected)
-            or rejected.intersection({"ambiguous_exact_title", "ambiguous_romaji_alias"})
+            or rejected.intersection({
+                "ambiguous_exact_title", "ambiguous_romaji_alias",
+                "manual_alias_coverage_incomplete", "romaji_alias_coverage_incomplete",
+                "romaji_candidate_overflow",
+            })
         ):
             # 年份/季集已在确定性阶段尝试消歧；仍共享同一身份标签时，
             # AI 或外部标题线索不能凭空替无年份文件选择某个重制版本。

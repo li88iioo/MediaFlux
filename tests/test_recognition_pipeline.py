@@ -3027,7 +3027,9 @@ class _DeterministicClient:
 
     def detail(self, tmdb_id, media_type):
         self.detail_calls.append((str(tmdb_id), media_type))
-        return dict(self.details.get(str(tmdb_id), {}))
+        # 正常 TMDB 详情包含请求身份；显式传入的错误/空ID仍原样保留，
+        # 不能用省略协议字段的正例夹具迫使生产识别信任无身份的别名。
+        return {"id": str(tmdb_id), **self.details.get(str(tmdb_id), {})}
 
     def detail_with_alternative_titles(self, tmdb_id, media_type):
         return self.detail(tmdb_id, media_type)

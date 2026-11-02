@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import cast
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from app import database as db
 from app.clients.tmdb import TMDBClient
@@ -127,6 +127,67 @@ class MediaAliasPersistenceTests(IsolatedDatabaseTestCase):
                 self.assertEqual(result.status, "matched", result.error)
                 self.assertEqual(result.tmdb_id, "200")
                 self.assertNotIn("search_only_variant_used", result.metadata)
+
+    def test_wrong_detail_identity_cannot_supply_aliases_or_pollute_detail_cache(self):
+        candidate = {"id": 100, "title": "Unrelated Work", "release_date": "2026-01-01"}
+        for identity in ({"id": 200}, {"id": 100, "media_type": "tv"}, {}):
+            with self.subTest(identity=identity):
+                scraper = self.scraper({"100": candidate}, [candidate])
+                cast(Mock, scraper.client.detail_with_alternative_titles).side_effect = None
+                cast(Mock, scraper.client.detail_with_alternative_titles).return_value = {
+                    **identity, "title": "Actual Movie", "release_date": "2026-01-01",
+                    "alternative_titles": {"titles": [{"title": "Query Movie"}]},
+                }
+                result = scraper.deterministic_recognize("Query.Movie.2026.mkv", media_type_hint="movie")
+                self.assertNotEqual(result.status, "matched")
+                self.assertNotIn("Query Movie", result.candidates[0].aliases)
+                self.assertEqual(scraper.get_detail("100", "movie"), candidate)
+
+    def test_unavailable_known_identity_blocks_guessing_and_recovers_after_failure_ttl(self):
+        from app.modules.scraper import _TMDB_FAILURE_CACHE_TTL_SECONDS, RecognitionResult
+
+        for ident in (100, 200):
+            record_manual_confirmation(["同名电影"], tmdb_id=ident, media_type="movie")
+        first = {"id": 100, "title": "同名电影", "release_date": "2000-01-01"}
+        second = {"id": 200, "title": "不同作品", "release_date": "2010-01-01"}
+        scraper = self.scraper({"100": first, "200": second}, [first])
+        attempts = []
+
+        def fetch(ident, _kind):
+            if str(ident) == "200":
+                attempts.append(ident)
+                if len(attempts) == 1:
+                    raise TimeoutError("synthetic detail timeout")
+            return first if str(ident) == "100" else second
+
+        cast(Mock, scraper.client.detail_with_alternative_titles).side_effect = fetch
+        with patch("app.modules.scraper.time.monotonic", return_value=1000) as clock, patch.object(
+            scraper, "_external_hint_fallback", return_value=RecognitionResult(status="matched", tmdb_id="999")
+        ) as fallback:
+            for tick in (1000, 1001):
+                clock.return_value = tick
+                result = scraper.match("同名电影.1080p.mkv", media_type_hint="movie")
+                self.assertNotEqual(result.status, "matched")
+                self.assertIsInstance(result, RecognitionResult)
+                assert isinstance(result, RecognitionResult)
+                self.assertIn("manual_alias_coverage_incomplete", result.rejected_constraints)
+                self.assertNotIn("低于", result.error)
+            self.assertEqual(len(attempts), 1)
+            fallback.assert_not_called()
+            clock.return_value = 1000 + _TMDB_FAILURE_CACHE_TTL_SECONDS + 1
+            recovered = scraper.match("同名电影.1080p.mkv", media_type_hint="movie")
+            self.assertEqual(recovered.status, "matched", recovered.error)
+            self.assertEqual(recovered.tmdb_id, "100")
+            self.assertEqual(len(attempts), 2)
+
+    def test_unavailable_learned_details_are_not_reported_as_no_results(self):
+        scraper = self.scraper({})
+        unknown = scraper.deterministic_recognize("Known.Movie.mkv", media_type_hint="movie")
+        self.assertEqual(unknown.status, "no_result")
+        record_manual_confirmation(["Known Movie"], tmdb_id="100", media_type="movie")
+        unresolved = scraper.deterministic_recognize("Known.Movie.mkv", media_type_hint="movie")
+        self.assertEqual(unresolved.status, "request_error")
+        self.assertIn("详情", unresolved.error)
 
     @staticmethod
     def black_clover_detail(first_season_count=170):
