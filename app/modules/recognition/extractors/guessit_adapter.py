@@ -4,12 +4,15 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
-from app.modules.recognition.extractors.deterministic import _valid_unlabeled_episode
+from app.modules.recognition.extractors.deterministic import (
+    _PLAIN_TRAILING_EPISODE_SUFFIX,
+    _valid_unlabeled_episode,
+)
 
 
 
 _GUESSIT_CJK_EPISODE_WORD_COLLISION = re.compile(
-    r"第\s*(?:\d{1,4}|[零〇一二两三四五六七八九十]{1,3})\s*"
+    r"第\s*(?:\d{1,4}|[零〇一二两兩三四五六七八九十]{1,3})\s*"
     r"(?:集|[话話])(?=[\u3040-\u30ff\u3400-\u9fff])"
 )
 
@@ -70,6 +73,17 @@ def _guessit_episode_is_untrusted(
     raw_value = (value or "")
     if _GUESSIT_CJK_EPISODE_WORD_COLLISION.search(raw_value):
         return True
+    # 普通标题尾号只允许显式 TV 映射解析；不能经 GuessIt 回填绕过
+    # 默认限制，也不能把 ``Title 104`` 的猜测 S01E04 当成来源位置。
+    plain = _PLAIN_TRAILING_EPISODE_SUFFIX.search(raw_value)
+    if plain and raw_value[:plain.start()].strip():
+        token = str(int(plain.group(1)))
+        if token == str(guessed_episode) or (
+            guessed_season is not None
+            and guessed_episode is not None
+            and token == f"{guessed_season}{guessed_episode:02d}"
+        ):
+            return True
     for match in re.finditer(r"(?<!\d)(\d{3,4})(?!\d)", raw_value):
         token = match.group(1)
         if _valid_unlabeled_episode(int(token)):

@@ -46,24 +46,24 @@ _BRACKET_TV_SEASON_TOKEN = re.compile(
 
 _EPISODE_TOKEN = re.compile(
     r"(?i)\bs\d{1,2}e(\d{1,4})(?:v\d+)?"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
+    r"(?=$|[\s._\-—–－:：,，;；\[\]［］【】()（）])"
     r"|(?:\be(?:p(?:isode)?)?[ ._-]*)(\d{1,4})(?:v\d+)?"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
+    r"(?=$|[\s._\-—–－:：,，;；\[\]［］【】()（）])"
     r"|第\s*(\d{1,4})\s*(?:集|[话話])"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
+    r"(?=$|[\s._\-—–－:：,，;；\[\]［］【】()（）])"
 )
 
 _CHINESE_EPISODE_TOKEN = re.compile(
-    r"第\s*([零〇一二两三四五六七八九十]{1,3})\s*(?:集|[话話])"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
+    r"第\s*([零〇一二两兩三四五六七八九十]{1,3})\s*(?:集|[话話])"
+    r"(?=$|[\s._\-—–－:：,，;；\[\]［］【】()（）])"
 )
 
-_CHINESE_SEASON_TOKEN = re.compile(r"第\s*([零〇一二两三四五六七八九十]{1,3})\s*季")
+_CHINESE_SEASON_TOKEN = re.compile(r"第\s*([零〇一二两兩三四五六七八九十]{1,3})\s*季")
 
 _SEASON_RANGE_TOKEN = re.compile(
     r"(?i)(?:\bs\d{1,2}\s*[-~～–—]\s*s\d{1,2}\b"
-    r"|第\s*[零〇一二两三四五六七八九十\d]{1,3}\s*"
-    r"[-~～–—]\s*[零〇一二两三四五六七八九十\d]{1,3}\s*季)"
+    r"|第\s*[零〇一二两兩三四五六七八九十\d]{1,3}\s*"
+    r"[-~～–—]\s*[零〇一二两兩三四五六七八九十\d]{1,3}\s*季)"
 )
 
 _SPECIAL_EPISODE_TOKEN = re.compile(
@@ -174,7 +174,7 @@ def _extract_number(pattern: re.Pattern, text: str) -> int | None:
 
 def _chinese_number(value: str) -> int | None:
     """解析常见中文季号（零至九十九）；无法确认时返回 ``None``。"""
-    text = (value or "").strip().replace("两", "二").replace("〇", "零")
+    text = (value or "").strip().replace("两", "二").replace("兩", "二").replace("〇", "零")
     digits = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
               "六": 6, "七": 7, "八": 8, "九": 9}
     if not text:

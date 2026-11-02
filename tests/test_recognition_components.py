@@ -147,6 +147,31 @@ class DeterministicExtractorTests(unittest.TestCase):
                     3,
                 )
 
+    def test_traditional_numerals_and_fullwidth_episode_boundaries(self):
+        from app.modules import scraper
+        from app.modules.recognition.extractors import deterministic
+
+        cases = (
+            ("示例劇 第兩季 第三話 [1080p]", 2, 3),
+            ("示例劇 第二季 第兩集 [1080p]", 2, 2),
+            ("Example Show S02E03［1080p］", 2, 3),
+            ("Example Show EP03－副标题", None, 3),
+        )
+        for title, season, episode in cases:
+            with self.subTest(title=title):
+                self.assertEqual(deterministic._extract_explicit_season(title), season)
+                self.assertEqual(deterministic._extract_episode(title), episode)
+                self.assertEqual(
+                    scraper.parse_release_position(f"{title}.mkv"),
+                    {"season": season, "episode": episode, "episode_end": None},
+                )
+
+        self.assertEqual(deterministic._extract_explicit_season("第兩季"), 2)
+        self.assertIsNone(deterministic._extract_explicit_season("第兩-三季"))
+        for title in ("第兩話題", "第兩集錦", "兩個人的世界"):
+            with self.subTest(title=title):
+                self.assertIsNone(deterministic._extract_episode(title))
+
     def test_scraper_reexports_same_deterministic_functions(self):
         from app.modules import scraper
         from app.modules.recognition.extractors import deterministic
@@ -157,6 +182,64 @@ class DeterministicExtractorTests(unittest.TestCase):
 
 
 class GuessItAdapterTests(unittest.TestCase):
+    def test_plain_title_numbers_do_not_authorize_source_positions(self):
+        from app.modules import scraper
+
+        parser = scraper.TMDBScraper()
+        self.addCleanup(parser.close)
+        cases = (
+            ("Example Movie 13", "/电影/Example Movie 13", "movie", None),
+            ("Example Movie 104", "/电影/Example Movie 104", "movie", None),
+            ("Example Movie 1408", "/电影/Example Movie 1408", "movie", None),
+            ("Example Show 104", "/剧集/Example Show 104/Season 2", "tv", 2),
+        )
+        for title, parent, media_type, season in cases:
+            filename = f"{title}.mkv"
+            with self.subTest(filename=filename, parent=parent):
+                context = scraper.extract_recognition_context(filename, parent)
+                self.assertEqual(
+                    (context.normalized_title, context.media_type, context.season, context.episode),
+                    (title, media_type, season, None),
+                )
+                parsed = parser.parse_media(filename, parent)
+                self.assertEqual((parsed.source_season, parsed.source_episode), (season, None))
+                self.assertEqual(parsed.title, title)
+                self.assertEqual(context.folder_title, title)
+                self.assertFalse(any(item.kind == "episode" for item in parsed.evidence))
+                self.assertEqual(parser.clean_title(filename), title)
+
+        explicit = parser.parse_media("Example Show 104 S02E03.mkv")
+        self.assertEqual((explicit.title, explicit.source_season, explicit.source_episode), (
+            "Example Show 104", 2, 3,
+        ))
+        self.assertEqual(
+            scraper.parse_release_position("Example Show 014.mkv", tv_episode_mapping_context=True),
+            {"season": None, "episode": 14, "episode_end": None},
+        )
+        grouped = parser.parse_media("[LoliHouse] 05 [1080p].mkv", "/TV/Example Show/Season 2")
+        self.assertEqual((grouped.source_season, grouped.source_episode), (2, 5))
+        bracketed_title = parser.parse_media("[Movie Title] 13.mkv", "/电影")
+        self.assertIsNone(bracketed_title.source_episode)
+
+    def test_structural_number_cleanup_keeps_file_directory_and_release_titles_aligned(self):
+        from app.modules.scraper import TMDBScraper, extract_recognition_context
+
+        parser = TMDBScraper()
+        self.addCleanup(parser.close)
+        for filename, parent, title, season, episode in (
+            ("03.mkv", "/剧集/示例剧/第兩季", "示例剧", 2, 3),
+            ("示例劇 第二季 第兩話 [1080p].mkv", "", "示例劇", 2, 2),
+            ("Example Show S02E03［1080p］.mkv", "", "Example Show", 2, 3),
+            ("Example Show Episode-03.mkv", "", "Example Show", None, 3),
+            ("2001 A Space Odyssey.1968.mkv", "", "2001 A Space Odyssey", None, None),
+        ):
+            with self.subTest(filename=filename):
+                context = extract_recognition_context(filename, parent)
+                parsed = parser.parse_media(filename, parent)
+                self.assertEqual(context.normalized_title, title)
+                self.assertEqual(parsed.title, title)
+                self.assertEqual((parsed.source_season, parsed.source_episode), (season, episode))
+
     def test_cache_and_copy_isolation_remain_inside_adapter(self):
         import guessit as guessit_module
         from app.modules.recognition.extractors import guessit_adapter

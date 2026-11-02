@@ -80,9 +80,8 @@ def _special_filename_identity_hint(filename: str) -> str:
     """
     if not is_special_media_name(filename):
         return ""
-    stem = (filename or "").rsplit("/", 1)[-1]
-    if "." in stem:
-        stem = stem.rsplit(".", 1)[0]
+    context = extract_recognition_context((filename or "").rsplit("/", 1)[-1], "")
+    stem = context.filename_title or context.normalized_title
     cleaned = strip_special_media_markers(stem)
     cleaned = _SPECIAL_FILENAME_IDENTITY_MARKER_RE.sub(" ", cleaned)
     cleaned = re.sub(r"[ ._\-]+", " ", cleaned).strip(" []()【】._-")

@@ -62,6 +62,15 @@ from app.modules.recognition.cleaner import (
     strip_media_file_suffix,
 )
 from app.modules.recognition.extractors.deterministic import (
+    _BRACKET_EPISODE_TOKEN,
+    _BRACKET_TV_SEASON_TOKEN,
+    _CHINESE_EPISODE_TOKEN,
+    _CHINESE_SEASON_TOKEN,
+    _ENGLISH_ORDINAL_SEASON_TOKEN,
+    _EPISODE_TOKEN,
+    _SEASON_RANGE_TOKEN,
+    _SEASON_TOKEN,
+    _SPECIAL_EPISODE_TOKEN,
     _ANGLE_EPISODE_TOKEN,
     _BARE_EPISODE_SUFFIX,
     _DUAL_EPISODE_PATTERNS,
@@ -407,26 +416,6 @@ _YEAR_TOKEN = re.compile(
 _ORDINAL_SEASON_TOKEN = re.compile(
     r"(?i)(?<!\d)(\d{1,2})(?:st|nd|rd|th)[ ._-]*season\b"
 )
-_ENGLISH_ORDINAL_SEASON_TOKEN = re.compile(
-    r"(?i)\b(first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
-    r"eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|"
-    r"eighteenth|nineteenth|twentieth)[ ._-]+season\b"
-)
-_ENGLISH_ORDINAL_SEASONS = {
-    word: index
-    for index, word in enumerate((
-        "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
-        "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth",
-        "fourteenth", "fifteenth", "sixteenth", "seventeenth", "eighteenth",
-        "nineteenth", "twentieth",
-    ), start=1)
-}
-# 某些动画续作把季号写进官方副标题（例如 ``2nd Attack``）。该标记只用于
-# 季号解析，不参与标题清洗，避免把官方标题退化成“不要欺负我，长瀞同学”。
-_ORDINAL_ATTACK_SEASON_TOKEN = re.compile(
-    r"(?i)(?<!\d)(\d{1,2})(?:st|nd|rd|th)[ ._-]+attack"
-    r"(?=\s*(?:[（(【\[].{0,48}[）)】\]])?\s*(?:-|e(?:p(?:isode)?)?|第|[【\[]|$))"
-)
 _IMPLICIT_SEASON_EPISODE_TOKEN = re.compile(
     r"(?ix)(?<![A-Za-z0-9])"
     r"(?P<season>20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X|"
@@ -509,31 +498,6 @@ _UNRESOLVED_SEQUEL_HINT = re.compile(
     r"[ ._-]*(?:20|1[0-9]|[2-9]|VIII|VII|VI|IV|III|II|IX|V|X)"
     r"(?=$|[\s._\-\[【(（])"
 )
-_SEASON_TOKEN = re.compile(
-    r"(?i)(?:(?<![A-Za-z0-9])season(?:[ ._]*|-(?=\d))|"
-    r"(?<![A-Za-z0-9])s)"
-    r"(\d{1,2})(?:\b|e\d{1,4}(?:v\d+)?)"
-    r"|第\s*(\d{1,2})\s*季"
-    r"|(?<!\d)(\d{1,2})(?:st|nd|rd|th)[ ._-]*season\b"
-)
-# 少量动画发布把季号写成独立的 ``[TV-3]`` / ``[ТВ-3]``。只接受
-# 完整方括号、1-99 的季号，避免把 ``TV-1080`` 或普通标题片段误判为季号。
-_BRACKET_TV_SEASON_TOKEN = re.compile(
-    r"(?i)[\[【]\s*(?:tv|тв)\s*-\s*(?P<season>0[1-9]|[1-9]\d?)\s*[\]】]"
-)
-_EPISODE_TOKEN = re.compile(
-    r"(?i)\bs\d{1,2}e(\d{1,4})(?:v\d+)?"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
-    r"|(?:\be(?:p(?:isode)?)?[ ._-]*)(\d{1,4})(?:v\d+)?"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
-    r"|第\s*(\d{1,4})\s*(?:集|[话話])"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
-)
-_CHINESE_EPISODE_TOKEN = re.compile(
-    r"第\s*([零〇一二两三四五六七八九十]{1,3})\s*(?:集|[话話])"
-    r"(?=$|[\s._\-—–:：,，;；\[\]【】()（）])"
-)
-_CHINESE_SEASON_TOKEN = re.compile(r"第\s*([零〇一二两三四五六七八九十]{1,3})\s*季")
 _CHINESE_SEASON_COMPLETION_TOKEN = re.compile(
     r"第\s*(?:\d{1,2}|[零〇一二两三四五六七八九十]{1,3})\s*季\s*(?:全集|全季)"
 )
@@ -541,21 +505,6 @@ _CHINESE_SEASON_COMPLETION_TOKEN = re.compile(
 # 未编号的“年番”可能是稳定节目名的一部分（如“斗破苍穹 年番”），必须保留。
 _CHINESE_ANNUAL_RELEASE_TOKEN = re.compile(
     r"(?<![\u3400-\u9fff])年番\s*\d{1,2}(?![\u3400-\u9fff])"
-)
-_SEASON_RANGE_TOKEN = re.compile(
-    r"(?i)(?:\bs\d{1,2}\s*[-~～–—]\s*s\d{1,2}\b"
-    r"|第\s*[零〇一二两三四五六七八九十\d]{1,3}\s*"
-    r"[-~～–—]\s*[零〇一二两三四五六七八九十\d]{1,3}\s*季)"
-)
-_SPECIAL_EPISODE_TOKEN = re.compile(
-    r"(?i)(?:^|[ ._\-\[\(【])(?:"
-    r"ova(?:[ ._-]*(\d{1,3}))?"
-    r"|oav(?:[ ._-]*(\d{1,3}))?"
-    r"|oad(?:[ ._-]*(\d{1,3}))?"
-    r"|sp(?:[ ._-]*(\d{1,3}))?"
-    r"|specials?(?:[ ._-]*(\d{1,3}))?"
-    r"|(?:特别篇|特別篇|番外篇?|特典)(?:[ ._-]*(\d{1,3}))?"
-    r")(?=$|[ ._\-\]\)】])"
 )
 _SPECIAL_EPISODE_RANGE = re.compile(
     r"(?i)(?:^|[ ._\-\[\(【])(?:ova|oad|oav|sp|specials?|特别篇|特別篇|番外篇?|特典)"
@@ -577,7 +526,6 @@ _AVAILABILITY_TAG = re.compile(
     r"[^()（）\[\]【】]{1,24}(?:[\)）\]】]|$)",
     re.IGNORECASE,
 )
-_BRACKET_EPISODE_TOKEN = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]")
 _BRACKET_EPISODE_SUFFIX = re.compile(r"(?i)[\[【(（]\s*(\d{1,4})(?:v\d+)?\s*[\]】)）]\s*$")
 # 混合整包只在“集范围 + TV/完结状态”后接受完整的已知附加项；不能把
 # 真实括号副标题或独立 OVA/S00 当作整包范围。整段由既有清洗链记录到
@@ -591,10 +539,11 @@ _BRACKET_EPISODE_RANGE = re.compile(
 )
 # 方括号内允许圆括号（例如 [序章(上)]），只能由同类右括号结束。
 _BRACKETED_SEGMENT = re.compile(
-    r"[\[【(（]((?<=\[)[^\]\r\n]{1,160}(?=\])"
+    r"[\[［【(（]((?<=\[)[^\]\r\n]{1,160}(?=\])"
+    r"|(?<=［)[^］\r\n]{1,160}(?=］)"
     r"|(?<=【)[^】\r\n]{1,160}(?=】)"
     r"|(?<=\()[^)\r\n]{1,160}(?=\))"
-    r"|(?<=（)[^）\r\n]{1,160}(?=）))[\]】)）]"
+    r"|(?<=（)[^）\r\n]{1,160}(?=）))[\]］】)）]"
 )
 _RELEASE_EPISODE_RANGE = re.compile(
     r"(?i)\bs\d{1,2}e(\d{1,3})\s*[-~～–—]\s*(?:e)?(\d{1,3})\b"
@@ -611,13 +560,6 @@ _BARE_COMPLETED_EPISODE_RANGE = re.compile(
     r"(?i)(?:^|[\s._\-\[\(【])(?:e?p?\s*)?(\d{1,3})\s*[-~～–—]\s*(\d{1,3})"
     r"\s*(?:fin(?:al)?|complete|全集)(?=$|[\s._\-\]\)】])"
 )
-_RELEASE_X_POSITION = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(\d{1,2})x(\d{1,3})(?![A-Za-z0-9])"
-)
-_RELEASE_X_NUMERIC_TOKEN = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(\d{1,4})x(\d{1,4})(?![A-Za-z0-9])"
-)
-_RELEASE_X_ASPECT_RATIOS = frozenset({(4, 3), (16, 9), (21, 9), (32, 9)})
 _RELEASE_REVISION_BRACKET = re.compile(
     r"(?i)[\[【(（]\s*(v\d{1,3})\s*[\]】)）]"
 )
@@ -739,7 +681,7 @@ _RELEASE_GROUP_SUFFIX_RESERVED = {
     "avc", "x264", "x265", "h264", "h265", "op", "ed", "ova", "oad",
     "sp", "ncop", "nced",
 }
-_PLAIN_EPISODE_SUFFIX = re.compile(r"(?i)(?:^|[ ._-])(\d{1,4})(?:v\d+)?\s*$")
+_PLAIN_EPISODE_SUFFIX = re.compile(r"(?i)(?:^|[ ._-])(?:e(?:p(?:isode)?)?[ ._-]*)?(\d{1,4})(?:v\d+)?\s*$")
 
 
 
@@ -1432,9 +1374,6 @@ def _strip_known_episode_suffix(
     return _PLAIN_EPISODE_SUFFIX.sub(replace, cleaned)
 
 
-_UNLABELED_EPISODE_RESERVED_VALUES = {
-    360, 480, 576, 720, 1080, 1440, 2160, 4320,
-}
 
 
 
@@ -2162,7 +2101,14 @@ def _folder_context(
             if explicit_episode is not None
             else _position_number(info.get("episode"))
         )
-        guessed_title, _ = _clean_release_stem(str(info.get("title") or ""))
+        untrusted_episode = _guessit_episode_is_untrusted(
+            parse_part, explicit_episode, guessed_episode, _season_number(info.get("season")),
+        )
+        if untrusted_episode:
+            guessed_episode = None
+        guessed_title, _ = _clean_release_stem(
+            "" if untrusted_episode else str(info.get("title") or "")
+        )
         if not guessed_title:
             first_group = _RELEASE_PREFIX.match(parse_part)
             group_text = first_group.group(1)[1:-1].strip() if first_group else ""
@@ -2235,6 +2181,10 @@ def _parse_release_surface(
     explicit_episode = _extract_episode(source)
     guessed_episode = _position_number(guessed.get("episode"))
     guessed_season = _season_number(guessed.get("season"))
+    if explicit_episode is None and guessed_episode is not None and not guessed_title_raw:
+        # 仅发布组+裸集号没有作品标题；清理已知发布噪声后仍由确定性规则确认。
+        clean_position, _ = _clean_release_stem(source)
+        explicit_episode = _extract_episode(clean_position)
     if _SEASON_RANGE_TOKEN.search(source):
         guessed_season = None
     # 编号形态可用于标题去噪，但可信季集只由 context 输出。
@@ -2337,6 +2287,8 @@ def _parse_release_surface(
         release_title = guessed_title_raw
         if canonical_title and (
             not release_title
+            or untrusted_guessed_episode
+            or any(_is_bracket_noise(item.group(1)) for item in _BRACKETED_SEGMENT.finditer(release_title))
             or implicit_season is not None
             or episode_title_prefix is not None
             or _low_information_query(release_title)
