@@ -1434,7 +1434,6 @@ class OrganizeCorrectionService:
         match: dict | None = None,
         transitions: list[AppliedTransition],
         parent_path: str = "",
-        rejected_tmdb_ids: list[str] | None = None,
     ) -> list[str]:
         warnings: list[str] = []
         if match and str(match.get("provider") or "tmdb").strip().lower() == "tmdb":
@@ -1446,7 +1445,6 @@ class OrganizeCorrectionService:
                     match["year"],
                     match["media_type"],
                     parent_path=parent_path,
-                    rejected_tmdb_ids=rejected_tmdb_ids or [],
                 )
             except Exception as exc:
                 warnings.append(f"TMDB 映射锁保存失败: {exc}")
@@ -1665,10 +1663,7 @@ class OrganizeCorrectionService:
         cleanup_directories, cleanup_protected, cleanup_warnings = ([], set(), [])
         request_snapshot = self._download_recovery_snapshot(str(previous_log['source_dir_id'] or ''))
         parent_path = str(previous_log["original_path"] or "") if previous_log else ""
-        previous_tmdb_id = str(before["log"].get("tmdb_id") or "").strip()
         match = preview["match"]
-        selected_tmdb_id = str(match.get("tmdb_id") or "").strip()
-        rejected_tmdb_ids = [previous_tmdb_id] if previous_tmdb_id and previous_tmdb_id != selected_tmdb_id else []
         release_parse = self._decode_release_parse(before["log"].get("release_parse_json")) or {}
         if preview.get("manual_position") is not None:
             release_parse["manual_position"] = dict(preview["manual_position"])
@@ -1739,7 +1734,7 @@ class OrganizeCorrectionService:
             raise
         post_warnings = self._run_post_actions(
             items=items, rules=rules, match=match, transitions=completed,
-            parent_path=parent_path, rejected_tmdb_ids=rejected_tmdb_ids,
+            parent_path=parent_path,
         )
         empty_dirs_cleaned, directory_warnings = self._cleanup_empty_directories(
             log_id=log_id, directories=cleanup_directories,

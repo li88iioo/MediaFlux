@@ -390,20 +390,12 @@ def scrape_confirm(request: Request, data: dict | None = Body(default=None)):
     year = (data.get("year") or "").strip()
     media_type = (data.get("media_type") or "").strip()
     parent_path = str(data.get("parent_path") or "").strip()[:4096]
-    rejected_tmdb_ids = [
-        str(value or "").strip()
-        for value in (data.get("rejected_tmdb_ids") or [])
-        if str(value or "").strip()
-    ] if isinstance(data.get("rejected_tmdb_ids") or [], list) else []
     if not raw_name or not tmdb_id:
         return api_error("缺少文件名或 tmdb_id", 400)
     scraper = TMDBScraper()
     try:
-        confirm_kwargs: dict = {"parent_path": parent_path}
-        if rejected_tmdb_ids:
-            confirm_kwargs["rejected_tmdb_ids"] = rejected_tmdb_ids
         scraper.confirm(
-            raw_name, tmdb_id, title, year, media_type, **confirm_kwargs,
+            raw_name, tmdb_id, title, year, media_type, parent_path=parent_path,
         )
         return api_response({"success": True})
     except Exception as exc:

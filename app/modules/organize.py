@@ -163,6 +163,7 @@ from app.modules.recognition_policy import (
 from app.modules.scraper import (
     Candidate,
     MatchResult,
+    RecognitionContext,
     ReleaseParseResult,
     TMDBScraper,
     extract_recognition_context,
@@ -818,6 +819,7 @@ class Organizer:
         source_season: int,
         source_episode: int,
         raw_source_season: int | None,
+        source_context: RecognitionContext,
         parent_path: str,
         directory_episode_evidence: DirectoryEpisodeEvidence | None,
         directory_sequence_evidence: DirectoryEpisodeEvidence | None,
@@ -865,6 +867,14 @@ class Organizer:
         if mapping.reason == "verified_special_mapping_required":
             # 固定 TMDB 身份不等于尾项顺序已证实；不能用绝对编号降级绕过保护。
             return mapping
+        if (
+            automatic and not mapping.changed and not match.preprocess_rules
+            and isinstance(self.scraper, TMDBScraper)
+            and (source_context.season, source_context.episode) == (source_season, source_episode)
+        ):
+            confirmed = self.scraper.confirmed_numbering_mapping(source_context, match.tmdb_id, detail)
+            if confirmed is not None:
+                return confirmed
         if (
             automatic
             and explicit_tmdb_id
@@ -6267,6 +6277,7 @@ class Organizer:
                 source_season=mapping_source_season,
                 source_episode=mapping_source_episode,
                 raw_source_season=source_season_value,
+                source_context=release_parse.context,
                 parent_path=parent_path,
                 directory_episode_evidence=directory_episode_evidence,
                 directory_sequence_evidence=directory_sequence_evidence,
@@ -6316,6 +6327,7 @@ class Organizer:
                             source_season=mapping_source_season,
                             source_episode=mapping_source_episode,
                             raw_source_season=source_season_value,
+                            source_context=release_parse.context,
                             parent_path=parent_path,
                             directory_episode_evidence=directory_episode_evidence,
                             directory_sequence_evidence=directory_sequence_evidence,

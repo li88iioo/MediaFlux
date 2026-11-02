@@ -43,6 +43,22 @@ class RecognitionContractMixin(unittest.TestCase):
 
 
 class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
+    def test_folder_explicit_season_does_not_leave_season_word_in_title(self):
+        scraper = self.recognition_module()
+        context = scraper.extract_recognition_context(
+            "[ANi] 黑色五葉草 Season 2 - 175 [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4",
+            "/MF-503-[ANi] Black Clover _ 黑色五叶草 Season 2 - 175 [1080P][Baha][WEB-DL]",
+        )
+        self.assertNotIn("Season", context.folder_title)
+        self.assertEqual((context.season, context.episode), (2, 175))
+        score = scraper.score_candidate(context, {
+            "id": 73223, "name": "黑色五叶草", "media_type": "tv",
+            "original_name": "ブラッククローバー", "first_air_date": "2017-10-03",
+            "aliases": ["黑色五葉草", "Black Clover"],
+        })
+        self.assertGreaterEqual(score.final_score, 0.9)
+        self.assertNotIn("distinctive_title_tokens_missing", score.rejected_constraints)
+
     def test_instance_technical_metadata_does_not_reject_complete_movie_identity(self):
         scraper = self.recognition_module()
         cases = (
@@ -410,7 +426,7 @@ class RecognitionStageTests(RecognitionContractMixin, unittest.TestCase):
         matcher = scraper_module.TMDBScraper()
 
         with patch(
-            "app.modules.media_aliases.lookup_manual_alias", return_value=None
+            "app.modules.media_aliases.lookup_manual_aliases", return_value=[]
         ), patch.object(
             matcher, "_get_lock", return_value=None
         ), patch.object(matcher, "deterministic_recognize") as deterministic:
@@ -4031,7 +4047,7 @@ class DeterministicPipelineTests(RecognitionContractMixin, unittest.TestCase):
         with patch.object(tmdb, "_get_lock", return_value=None), patch(
             "app.modules.tmdb_regex_rules.find_tmdb_regex_match", return_value=None,
         ), patch(
-            "app.modules.media_aliases.lookup_manual_alias", return_value=None,
+            "app.modules.media_aliases.lookup_manual_aliases", return_value=[],
         ):
             result = tmdb.match(filename, "1")
         parsed = tmdb.parse_media(filename, "1", result)

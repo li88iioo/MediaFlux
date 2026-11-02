@@ -1462,12 +1462,6 @@ class DirectoryScrapeService:
         }
         if not successful_ids:
             return
-        rejected_ids = sorted({
-            (candidate.tmdb_id or "").strip()
-            for candidate in record.match.candidates or []
-            if (candidate.tmdb_id or "").strip()
-            and (candidate.tmdb_id or "").strip() != selected_id
-        })
         for item in record.inspection.videos:
             if item.file_id not in successful_ids:
                 continue
@@ -1484,7 +1478,6 @@ class DirectoryScrapeService:
                     record.match.year,
                     record.match.media_type,
                     parent_path=parent_path,
-                    rejected_tmdb_ids=rejected_ids,
                 )
             except Exception as exc:
                 # 学习属于附加收益，绝不能把已经完成的网盘移动回报成失败。

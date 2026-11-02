@@ -1,153 +1,233 @@
 from __future__ import annotations
 
-from unittest.mock import Mock, patch
+from typing import cast
+from unittest.mock import Mock
 
-from app.database import get_conn
-from app.modules.media_aliases import (
-    lookup_manual_alias,
-    record_manual_confirmation,
-)
-from app.modules.scraper import MatchResult, TMDBScraper
+from app import database as db
+from app.clients.tmdb import TMDBClient
+from app.clients.guangya import GuangYaFile
+from app.modules.media_aliases import lookup_manual_aliases, record_manual_confirmation
+from app.modules.organize import OrganizeRules, Organizer
+from app.modules.scraper import TMDBScraper
 from tests.support import IsolatedDatabaseTestCase
 
 
 class MediaAliasPersistenceTests(IsolatedDatabaseTestCase):
-    def setUp(self) -> None:
-        # 正式 schema 初始化该表；同一个测试类共享临时数据库，逐用例清空。
-        with get_conn() as conn:
+    def setUp(self):
+        with db.get_conn() as conn:
             conn.execute("DELETE FROM media_title_aliases")
+            conn.execute("DELETE FROM tmdb_lock")
+            conn.execute("DELETE FROM organize_log")
 
-    def test_manual_confirmation_can_be_reused_by_title_and_year(self):
-        written = record_manual_confirmation(
-            ["Virgin Punk Clockwork Girl", "ヴァージン・パンク"],
-            tmdb_id="1360829",
-            title="Virgin Punk: Clockwork Girl",
-            year="2025",
-            media_type="movie",
-        )
+    def test_confirmation_recalls_candidates_even_without_release_year(self):
+        record_manual_confirmation(["Virgin Punk Clockwork Girl", "ヴァージン・パンク"],
+                                   tmdb_id="1360829", title="Virgin Punk: Clockwork Girl",
+                                   year="2025", media_type="movie")
+        matches = lookup_manual_aliases(["Virgin Punk Clockwork Girl", "ヴァージン・パンク"],
+                                        media_type="movie")
+        self.assertEqual([item["tmdb_id"] for item in matches], ["1360829"])
+        self.assertEqual(matches[0]["year"], "2025")
+        self.assertEqual(lookup_manual_aliases(["Virgin Punk Clockwork Girl"], media_type="tv"), [])
 
-        match = lookup_manual_alias(
-            ["Virgin Punk Clockwork Girl"], media_type="movie", year="2025"
-        )
+    def test_single_file_choice_does_not_disable_other_identity_or_remake(self):
+        for ident, year in (("100", "2025"), ("200", "2025"), ("300", "1999")):
+            record_manual_confirmation(["Shared Title"], tmdb_id=ident, title="Shared Title",
+                                       year=year, media_type="movie")
+        self.assertEqual({item["tmdb_id"] for item in lookup_manual_aliases(
+            ["Shared Title"], media_type="movie")}, {"100", "200", "300"})
+        with db.get_conn() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM media_title_aliases WHERE blocked=1").fetchone()[0], 0)
 
-        self.assertEqual(written, 2)
-        assert (match) is not None
-        self.assertEqual(match["tmdb_id"], "1360829")
-        self.assertEqual(match["source"], "manual")
+    def scraper(self, details, search_results=()):
+        client = Mock(spec=TMDBClient)
+        client.api_key = "synthetic-key"
+        client.base_url = "https://synthetic.invalid"
+        client.config_error = ""
+        client.search.return_value = list(search_results)
+        client.detail.side_effect = lambda ident, kind: details.get(str(ident), {})
+        client.detail_with_alternative_titles.side_effect = client.detail.side_effect
+        scraper = TMDBScraper(client=cast(TMDBClient, client))
+        self.addCleanup(scraper.close)
+        return scraper
 
-    def test_reconfirming_same_alias_blocks_old_same_year_mapping(self):
-        record_manual_confirmation(
-            ["Shared Title"], tmdb_id="100", title="Old", year="2025",
-            media_type="movie",
-        )
-        record_manual_confirmation(
-            ["Shared Title"], tmdb_id="200", title="New", year="2025",
-            media_type="movie", rejected_tmdb_ids=["100"],
-        )
-
-        match = lookup_manual_alias(
-            ["Shared Title"], media_type="movie", year="2025"
-        )
-        with get_conn() as conn:
-            old = conn.execute(
-                "SELECT blocked,source FROM media_title_aliases "
-                "WHERE normalized_alias=? AND tmdb_id=?",
-                ("shared title", "100"),
-            ).fetchone()
-
-        assert (match) is not None
-        self.assertEqual(match["tmdb_id"], "200")
-        self.assertEqual(int(old["blocked"]), 1)
-        self.assertEqual(old["source"], "manual_rejected")
-
-    def test_year_keeps_remakes_disambiguated(self):
-        record_manual_confirmation(
-            ["Example"], tmdb_id="101", title="Example", year="1999",
-            media_type="movie",
-        )
-        record_manual_confirmation(
-            ["Example"], tmdb_id="202", title="Example", year="2025",
-            media_type="movie",
-        )
-
-        old = lookup_manual_alias(["Example"], media_type="movie", year="1999")
-        new = lookup_manual_alias(["Example"], media_type="movie", year="2025")
-        ambiguous = lookup_manual_alias(["Example"], media_type="movie")
-
-        assert old is not None
-        self.assertEqual(old["tmdb_id"], "101")
-        assert new is not None
-        self.assertEqual(new["tmdb_id"], "202")
-        self.assertIsNone(ambiguous)
-
-    def test_year_bound_alias_requires_exact_year(self):
-        record_manual_confirmation(
-            ["Example"], tmdb_id="101", title="Example", year="2025",
-            media_type="movie",
-        )
-
-        self.assertIsNone(
-            lookup_manual_alias(["Example"], media_type="movie", year="2024")
-        )
-        lookup_manual_alias_result = lookup_manual_alias(["Example"], media_type="movie", year="2025")
-        assert lookup_manual_alias_result is not None
-        self.assertEqual(
-            lookup_manual_alias_result["tmdb_id"],
-            "101",
-        )
-
-    def test_yearless_lookup_does_not_reuse_year_bound_alias(self):
-        record_manual_confirmation(
-            ["Example"], tmdb_id="101", title="Example", year="1999",
-            media_type="movie",
-        )
-
-        match = lookup_manual_alias(["Example"], media_type="movie", year="")
-
-        self.assertIsNone(match)
-
-    def test_yearless_lookup_can_reuse_explicitly_yearless_alias(self):
-        record_manual_confirmation(
-            ["Example"], tmdb_id="101", title="Example", year="",
-            media_type="movie",
-        )
-
-        match = lookup_manual_alias(["Example"], media_type="movie", year="")
-
-        assert (match) is not None
-        self.assertEqual(match["tmdb_id"], "101")
-
-
-class MediaAliasRecognitionTests(IsolatedDatabaseTestCase):
-    def test_scraper_revalidates_manual_alias_through_tmdb_detail(self):
-        scraper = TMDBScraper()
-        scraper.match_from_tmdb = Mock(return_value=MatchResult(
-            tmdb_id="1360829",
-            title="Virgin Punk: Clockwork Girl",
-            year="2025",
-            media_type="movie",
-            confidence=1.0,
-            status="matched",
-            matched_by="tmdb_id",
-        ))
-
-        with patch(
-            "app.modules.media_aliases.lookup_manual_alias",
-            return_value={
-                "tmdb_id": "1360829",
-                "alias": "Virgin Punk Clockwork Girl",
-            },
-        ):
-            result = scraper.match(
-                "[Studio GreenTea] Virgin Punk Clockwork Girl "
-                "[Movie v2][BDRip][HEVC-10bit 1080p AAC][JPTC].mkv",
-                media_type_hint="movie",
-            )
-
-        scraper.match_from_tmdb.assert_called_once_with("1360829", "movie")
+    def test_learned_movie_alias_uses_official_detail_without_global_lock(self):
+        detail = {"id": 1360829, "title": "Virgin Punk: Clockwork Girl", "release_date": "2025-06-27"}
+        scraper = self.scraper({"1360829": detail})
+        scraper.confirm("Virgin Punk Clockwork Girl.2025.mkv", "1360829",
+                        detail["title"], "2025", "movie")
+        result = scraper.match("Virgin Punk Clockwork Girl.1080p.mkv", media_type_hint="movie")
         self.assertEqual(result.status, "matched")
-        self.assertEqual(result.matched_by, "manual_alias")
-        self.assertTrue(result.locked)
-        self.assertEqual(
-            result.metadata["manual_alias"], "Virgin Punk Clockwork Girl"
+        self.assertEqual(result.tmdb_id, "1360829")
+        self.assertFalse(result.locked)
+        self.assertEqual(result.metadata["learned_candidate_ids"], ["1360829"])
+
+    def test_wrong_single_file_correction_cannot_poison_other_episode(self):
+        correct = {"id": 303287, "name": "一斩苍穹", "original_name": "一斩苍穹", "first_air_date": "2026-01-01", "seasons": [{"season_number": 1, "episode_count": 26}]}
+        wrong = {"id": 326695, "name": "择日飞升", "first_air_date": "2026-01-01", "seasons": [{"season_number": 1, "episode_count": 30}]}
+        scraper = self.scraper({"303287": correct, "326695": wrong}, [correct])
+        scraper.confirm("一斩苍穹 S01E17.mkv", "326695", "择日飞升", "2026", "tv")
+        result = scraper.match("一斩苍穹.S01E15.2026.mkv", media_type_hint="tv")
+        self.assertEqual(result.tmdb_id, "303287")
+        self.assertEqual(result.status, "matched")
+        self.assertFalse(result.locked)
+        # 原文件仍尊重精确人工锁；不把该文件选择强加给其它集。
+        exact = scraper.match("一斩苍穹 S01E17.mkv", media_type_hint="tv")
+        self.assertTrue(exact.locked)
+        self.assertEqual(exact.tmdb_id, "326695")
+
+    def test_historical_poisoned_alias_does_not_supply_title_evidence(self):
+        detail = {"id": 326695, "name": "择日飞升", "first_air_date": "2026-01-01", "seasons": [{"season_number": 1, "episode_count": 30}]}
+        record_manual_confirmation(["一斩苍穹"], tmdb_id="326695", title="择日飞升", year="2026", media_type="tv")
+        scraper = self.scraper({"326695": detail})
+        result = scraper.deterministic_recognize("一斩苍穹.S01E15.2026.mkv", media_type_hint="tv")
+        self.assertNotEqual(result.status, "matched")
+        self.assertFalse(result.locked)
+
+    def test_yearless_remakes_are_not_resolved_by_latest_confirmation(self):
+        details = {str(ident): {"id": ident, "title": "Shared Title", "release_date": year+"-01-01"}
+                   for ident, year in ((100, "1999"), (200, "2025"))}
+        scraper = self.scraper(details)
+        for ident, year in (("100", "1999"), ("200", "2025")):
+            record_manual_confirmation(["Shared Title"], tmdb_id=ident, title="Shared Title", year=year, media_type="movie")
+        result = scraper.deterministic_recognize("Shared.Title.1080p.mkv", media_type_hint="movie")
+        self.assertNotEqual(result.status, "matched")
+        exact = scraper.deterministic_recognize("Shared.Title.2025.1080p.mkv", media_type_hint="movie")
+        self.assertEqual(exact.tmdb_id, "200")
+        self.assertEqual(exact.status, "matched")
+
+    def test_learned_animation_preserves_official_genres(self):
+        detail = {"id": 303287, "name": "一斩苍穹", "first_air_date": "2026-01-01",
+                  "genres": [{"id": 16, "name": "Animation"}],
+                  "seasons": [{"season_number": 1, "episode_count": 26}]}
+        record_manual_confirmation(["一斩苍穹"], tmdb_id="303287", media_type="tv")
+        scraper = self.scraper({"303287": detail})
+        result = scraper.deterministic_recognize("[GM-Team][国漫][一斩苍穹][Gu An][2026][15][1080p].mp4", media_type_hint="tv")
+        self.assertEqual(result.status, "matched", result.error)
+        self.assertTrue(result.metadata["content_kind_evidence"]["verified"])
+
+    def test_learned_candidate_overflow_cannot_hide_identity_ambiguity(self):
+        from app.modules.scraper import MAX_ALIAS_ENRICHMENT_CANDIDATES
+        for ident in range(100, 101 + MAX_ALIAS_ENRICHMENT_CANDIDATES):
+            record_manual_confirmation(["Shared Movie"], tmdb_id=ident, media_type="movie")
+        detail = {"id": 100, "title": "Shared Movie", "release_date": "2025-01-01"}
+        scraper = self.scraper({"100": detail}, [detail])
+        result = scraper.deterministic_recognize("Shared.Movie.mkv", media_type_hint="movie")
+        self.assertNotEqual(result.status, "matched")
+        self.assertIn("manual_alias_coverage_incomplete", result.rejected_constraints)
+
+    def test_fuzzy_search_does_not_taint_independently_verified_learned_candidate(self):
+        correct = {"id": 200, "title": "Example Movie Dub", "release_date": "2026-01-01"}
+        wrong = {"id": 100, "title": "Example Movie", "release_date": "1999-01-01"}
+        record_manual_confirmation(["Example Movie Dub"], tmdb_id="200", media_type="movie")
+        for fallback in (wrong, correct):
+            with self.subTest(fallback=fallback["id"]):
+                scraper = self.scraper({"100": wrong, "200": correct})
+                cast(Mock, scraper.client.search).side_effect = lambda query, *args: [fallback] if query == "Example Movie" else []
+                result = scraper.deterministic_recognize("Example Movie Dub.2026.mkv", media_type_hint="movie")
+                self.assertEqual(result.status, "matched", result.error)
+                self.assertEqual(result.tmdb_id, "200")
+                self.assertNotIn("search_only_variant_used", result.metadata)
+
+    @staticmethod
+    def black_clover_detail(first_season_count=170):
+        return {
+            "id": 73223, "name": "黑色五叶草", "original_name": "ブラッククローバー",
+            "first_air_date": "2017-10-03",
+            "aliases": ["黑色五葉草", "Black Clover"],
+            "seasons": [{"season_number": 1, "episode_count": first_season_count},
+                        {"season_number": 2, "episode_count": 26}],
+        }
+
+    @staticmethod
+    def release(episode, group="ANi"):
+        return f"[{group}] 黑色五葉草 Season 2 - {episode} [1080P][Baha][WEB-DL][AAC AVC][CHT].mp4"
+
+    def remember_episode(self, target_episode=5, **overrides):
+        fields = dict(
+            source="guangya", original_path="/", new_path="archive/Season 2",
+            file_id="synthetic-video", status="success", tmdb_id="73223",
+            original_name=self.release(175), original_parent_id="synthetic-source",
+            media_type="tv", season=2, episode=target_episode,
+            release_parse={"manual_position": {"version": 1, "source": "manual_correction",
+                                              "season": 2, "episode": target_episode}},
         )
+        fields.update(overrides)
+        return db.add_organize_log(**fields)
+
+    def test_confirmed_continuous_numbering_reaches_next_release_and_exact_lock(self):
+        detail = self.black_clover_detail()
+        self.remember_episode()
+        scraper = self.scraper({"73223": detail}, [detail])
+        scraper.confirm(self.release(175), "73223", "黑色五叶草", "2017", "tv", parent_path="/")
+        for source, target in ((175, 5), (176, 6), (6, 6)):
+            with self.subTest(source=source):
+                name = self.release(source)
+                parent = "/" if source == 175 else "/MF-503-" + name.removesuffix(".mp4")
+                match = scraper.match(name, parent, media_type_hint="tv")
+                self.assertEqual(match.status, "matched", match.error)
+                self.assertFalse(match.need_confirm)
+                parsed = scraper.parse_media(name, parent, match)
+                self.assertEqual((parsed.source_season, parsed.source_episode), (2, source))
+                self.assertEqual((parsed.effective_season, parsed.effective_episode), (2, target))
+                if source > 26:
+                    self.assertIn("manual_confirmed", match.metadata["episode_mapping"]["reason"])
+                else:
+                    self.assertNotIn("episode_mapping", match.metadata)
+
+        # 组内和跨目录缓存只能记住作品，不得把176的S02E06带给177；
+        # 缓存也不能跳过本集对人工编号历史的重新核验。
+        matched = scraper.match(self.release(176), media_type_hint="tv")
+        organizer = Organizer(local_only=True, scraper=scraper)
+        self.addCleanup(organizer.close)
+        rules = OrganizeRules(target_dir_id="archive", small_file_mb=0, region_split=False,
+                              year_split=False, clean_empty=False, link_strm=False, notify_enabled=False)
+        for cached in (organizer._identity_neutral_work_match(matched),
+                       organizer._task_identity_neutral_match(matched)):
+            plan = organizer._plan_one(
+                GuangYaFile("synthetic-next", self.release(177), False, 1024, "etag", "source"),
+                "/", rules, match_override=cached, automatic=True,
+            )
+            self.assertEqual(plan.action, "move", plan.note)
+            self.assertEqual((plan.season, plan.episode), (2, 7))
+
+    def test_mapping_requires_successful_same_identity_publisher_confirmation(self):
+        detail = self.black_clover_detail()
+        cases = (
+            {"status": "failed"}, {"status": "skipped"},
+            {"tmdb_id": "99999"}, {"media_type": "movie"},
+            {"original_name": self.release(175, "GM-Team")},
+            {"original_name": self.release(175).replace("黑色五葉草", "另一部动画")},
+            {"original_name": self.release(175).replace("Season 2", "Season 3")},
+            {"release_parse": {}},
+        )
+        scraper = self.scraper({"73223": detail}, [detail])
+        for fields in cases:
+            with self.subTest(fields=fields):
+                with db.get_conn() as conn:
+                    conn.execute("DELETE FROM organize_log")
+                self.remember_episode(**fields)
+                result = scraper.deterministic_recognize(self.release(176), media_type_hint="tv")
+                self.assertNotEqual(result.status, "matched")
+                self.assertNotIn("episode_mapping", result.metadata)
+
+    def test_changed_tmdb_counts_or_conflicting_manual_positions_cannot_reuse_offset(self):
+        self.remember_episode()
+        for changed_counts, conflicting in ((169, False), (170, True)):
+            with self.subTest(changed_counts=changed_counts, conflicting=conflicting):
+                if conflicting:
+                    self.remember_episode(target_episode=8)
+                detail = self.black_clover_detail(changed_counts)
+                scraper = self.scraper({"73223": detail}, [detail])
+                result = scraper.deterministic_recognize(self.release(176), media_type_hint="tv")
+                self.assertNotEqual(result.status, "matched")
+                self.assertNotIn("episode_mapping", result.metadata)
+
+    def test_unconfirmed_overflow_and_exceeding_total_remain_unmapped(self):
+        detail = self.black_clover_detail()
+        scraper = self.scraper({"73223": detail}, [detail])
+        result = scraper.deterministic_recognize(self.release(175), media_type_hint="tv")
+        self.assertNotEqual(result.status, "matched")
+        self.remember_episode()
+        result = scraper.deterministic_recognize(self.release(197), media_type_hint="tv")
+        self.assertNotEqual(result.status, "matched")
+        self.assertNotIn("episode_mapping", result.metadata)

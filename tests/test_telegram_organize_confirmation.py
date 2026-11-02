@@ -1946,7 +1946,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "Nagatoro - 04.mp4", "105556", "不要欺负我，长瀞同学", "2021", "tv"
         ))
         self.assertEqual(kwargs["parent_path"], "长瀞同学 2nd Attack")
-        self.assertEqual(kwargs["rejected_tmdb_ids"], ["999999"])
+        self.assertNotIn("rejected_tmdb_ids", kwargs)
         self.assertFalse(post_action_kwargs[0]["notify_result"])
         self.assertEqual(post_action_kwargs[0]["strm_debounce_seconds"], 8)
         thread_ref = post_action_kwargs[0]["notification_threads"][0]

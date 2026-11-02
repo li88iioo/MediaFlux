@@ -44,6 +44,39 @@ class _TreeClient:
 
 
 class DirectoryIdentityCacheTests(IsolatedDatabaseTestCase):
+    def test_two_episode_scan_reuses_manual_numbering_after_identity_probe(self):
+        from app import database as db
+        from app.clients.tmdb import TMDBClient
+
+        original = "[ANi] Example Show Season 2 - 15 [1080P].mp4"
+        db.add_organize_log(
+            "guangya", "/", "archive", "previous", "success", "100",
+            original_name=original, original_parent_id="source", media_type="tv", season=2, episode=3,
+            release_parse={"manual_position": {"version": 1, "source": "manual_correction", "season": 2, "episode": 3}},
+        )
+        detail = {"id": 100, "name": "Example Show", "first_air_date": "2026-01-01",
+                  "seasons": [{"season_number": 1, "episode_count": 12},
+                              {"season_number": 2, "episode_count": 8}]}
+        tmdb = Mock(spec=TMDBClient)
+        tmdb.api_key, tmdb.base_url, tmdb.config_error = "synthetic", "https://synthetic.invalid", ""
+        tmdb.search.return_value = [detail]
+        tmdb.detail.return_value = tmdb.detail_with_alternative_titles.return_value = detail
+        scraper = TMDBScraper(client=cast(TMDBClient, tmdb))
+        self.addCleanup(scraper.close)
+        folder = GuangYaFile("show", "Example Show Season 2", True, parent_id="source")
+        files = [GuangYaFile(str(n), original.replace(" - 15 ", f" - {n} "), False, 1024, str(n), "show") for n in (16, 17)]
+        cloud = _TreeClient(
+            {"source": [folder], "show": files, "archive": []},
+            {"source": GuangYaFile("source", "1", True, parent_id="0"), "show": folder,
+             "archive": GuangYaFile("archive", "整理", True, parent_id="0")},
+        )
+        organizer = Organizer(client=cast(GuangYaClient, cloud), scraper=scraper)
+        self.addCleanup(organizer.close)
+        plans, stats = organizer.organize("source", self._rules(), dry_run=True, automatic=True)
+        self.assertEqual([(p.action, p.season, p.episode) for p in plans], [("move", 2, 4), ("move", 2, 5)])
+        self.assertEqual(stats["need_confirm"], 0)
+        self.assertEqual([p.source_episode for p in plans], [16, 17])
+
     @staticmethod
     def _rules() -> OrganizeRules:
         return OrganizeRules(

@@ -2695,7 +2695,7 @@ class OrganizeCorrectionTests(unittest.TestCase):
             args, kwargs = confirm_calls[0]
             self.assertEqual(args[:5], ("Movie.mkv", "99", "新电影", "2027", "movie"))
             self.assertEqual(kwargs["parent_path"], "source")
-            self.assertEqual(kwargs["rejected_tmdb_ids"], ["1"])
+            self.assertNotIn("rejected_tmdb_ids", kwargs)
 
     def test_reorganize_rolls_back_current_file_when_rename_fails(self):
         with tempfile.TemporaryDirectory() as root:

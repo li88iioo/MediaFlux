@@ -104,7 +104,11 @@ from app.modules.special_media import (
     is_special_directory_name,
     strip_special_media_markers,
 )
-from app.repositories.recognition import get_tmdb_lock, upsert_tmdb_lock
+from app.repositories.recognition import (
+    get_tmdb_lock,
+    list_manual_episode_confirmations,
+    upsert_tmdb_lock,
+)
 from app.sensitive_data import contains_sensitive_credential
 
 logger = get_logger(__name__)
@@ -2164,6 +2168,8 @@ def _folder_context(
             parse_part,
             episode_context=episode_context or guessed_episode is not None,
         )
+        if _SEASON_TOKEN.search(parse_part) or _CHINESE_SEASON_TOKEN.search(parse_part):
+            implicit_folder_season, implicit_folder_span = None, None
         raw_source = _strip_known_episode_suffix(
             parse_part,
             guessed_episode,
@@ -4995,15 +5001,27 @@ class TMDBScraper:
             episode=context.episode,
         )
 
-    @staticmethod
-    def _attach_preprocess(result: MatchResult, processed) -> MatchResult:
+    def _attach_preprocess(self, result: MatchResult, processed) -> MatchResult:
         result.preprocess_evaluated = True
         result.recognition_filename = processed.filename
         result.recognition_parent_path = processed.parent_path
         result.effective_season = processed.season
         result.effective_episode = processed.episode
         result.preprocess_rules = list(processed.applied_rules)
-        mapping = dict((result.metadata or {}).get("episode_mapping") or {})
+        mapping: dict[str, Any] = dict((result.metadata or {}).get("episode_mapping") or {})
+        if (
+            not mapping.get("changed") and not processed.applied_rules
+            and result.status == "matched" and not result.need_confirm
+            and result.media_type == "tv" and result.provider == "tmdb"
+            and processed.season is not None and processed.season >= 2
+        ):
+            # 精确人工锁与批次身份缓存只复用身份；当前文件的编号仍重新核验。
+            confirmed = self.confirmed_numbering_mapping(
+                extract_recognition_context(processed.filename, processed.parent_path), result.tmdb_id,
+            )
+            if confirmed is not None:
+                mapping.update(confirmed.to_dict())
+                result.metadata["episode_mapping"] = mapping
         if (
             mapping.get("changed")
             and mapping.get("source_season") == processed.season
@@ -5229,7 +5247,7 @@ class TMDBScraper:
         for field_name in (
             "name", "title", "original_name", "original_title",
             "first_air_date", "release_date", "overview", "poster_path",
-            "backdrop_path",
+            "backdrop_path", "genres", "genre_ids",
         ):
             if not merged.get(field_name) and detail.get(field_name):
                 merged[field_name] = detail[field_name]
@@ -5589,6 +5607,68 @@ class TMDBScraper:
         }
         return selected_id, selected_mapping, diagnostic
 
+    def confirmed_numbering_mapping(
+        self, context: RecognitionContext, tmdb_id: str, detail: dict | None = None,
+    ) -> EpisodeMappingPlan | None:
+        """复用同作品、同标题/发布组/源季的成功人工编号确认，不学习任意偏移。"""
+        if context.season is None or context.season < 2 or context.episode is None:
+            return None
+        if detail is not None and context.episode <= season_episode_counts(detail).get(context.season, 0):
+            return None  # 普通季内编号不受连续编号历史影响。
+
+        def groups(value: RecognitionContext) -> set[str]:
+            return {
+                _comparison_key(_bracket_content(item))
+                for key in ("release_prefixes", "release_groups")
+                for item in value.cleaned_components.get(key, [])
+            }
+
+        source_groups = groups(context)
+        source_title = _comparison_key(context.normalized_title)
+        if not source_groups or not source_title:
+            return None
+        evidence_id = None
+        for row in list_manual_episode_confirmations(tmdb_id):
+            try:
+                payload = json.loads(row["release_parse_json"])
+            except (TypeError, ValueError):
+                continue
+            target = payload.get("manual_position") if isinstance(payload, dict) else None
+            if not isinstance(target, dict) or target.get("version") != 1 or target.get("source") != "manual_correction":
+                continue
+            if (target.get("season"), target.get("episode")) != (row["season"], row["episode"]):
+                continue
+            # 老日志只有人工目标；从原始文件名重建源编号，不使用已归档的新文件名。
+            previous = extract_recognition_context(row["original_name"], row["original_path"])
+            if (
+                previous.season != context.season
+                or groups(previous) != source_groups
+                or _comparison_key(previous.normalized_title) != source_title
+            ):
+                continue
+            if detail is None:
+                detail = self.get_detail(tmdb_id, "tv")
+            if str(detail.get("id") or "") != tmdb_id:
+                return None
+            counts = season_episode_counts(detail)
+            if context.episode <= counts.get(context.season, 0):
+                return None
+            historical = infer_episode_mapping(
+                source_season=previous.season, source_episode=previous.episode,
+                detail=detail, mode="season_continuous",
+            )
+            if (historical.target_season, historical.target_episode) != (row["season"], row["episode"]):
+                return None  # 人工记录冲突或 TMDB 季划分变化，不能沿用旧偏移。
+            if historical.changed:
+                evidence_id = row["id"]
+        if evidence_id is None:
+            return None
+        mapping = infer_episode_mapping(
+            source_season=context.season, source_episode=context.episode,
+            detail=detail, mode="season_continuous",
+        )
+        return replace(mapping, reason=f"manual_confirmed_season_continuous:log:{evidence_id}") if mapping.changed else None
+
     def _recognize_context(
         self,
         context: RecognitionContext,
@@ -5612,7 +5692,6 @@ class TMDBScraper:
         expected_year = context.filename_year or context.folder_year
         raw_candidates: dict[tuple[str, str], dict] = {}
         search_only_queries: list[str] = []
-        search_only_variant_used = False
         type_mismatch_seen = False
         search_attempts: list[dict[str, Any]] = []
 
@@ -5668,7 +5747,32 @@ class TMDBScraper:
                 collect(expected_year, search_only_queries, search_only=True)
                 if not raw_candidates and expected_year:
                     collect("", search_only_queries, search_only=True)
-                search_only_variant_used = bool(raw_candidates)
+
+        # 学到的是候选身份线索，不是跨文件强锁。即使标题搜索没有命中，
+        # 也可按已确认ID召回，但标题证据必须来自官方详情而非我们自己学的别名。
+        from app.modules.media_aliases import lookup_manual_aliases
+
+        learned_ids: list[str] = []
+        try:
+            learned = lookup_manual_aliases(
+                [context.normalized_title, context.filename_title, *context.title_variants],
+                media_type=context.media_type,
+            )
+        except Exception as exc:
+            logger.debug("人工媒体别名查询失败 type=%s", type(exc).__name__)
+            learned = []
+        if len(learned) <= MAX_ALIAS_ENRICHMENT_CANDIDATES:
+            for hint in learned:
+                key = (context.media_type, str(hint["tmdb_id"]))
+                if key in raw_candidates and not raw_candidates[key].get("_search_only_variant"):
+                    continue
+                raw, available = self._enrich_candidate_for_scoring(
+                    {"id": key[1], "media_type": key[0]}, context.media_type,
+                )
+                _cached, detail, _failed = self._cached_recognition_detail(key)
+                if available and str(detail.get("id") or "") == key[1] and (raw.get("name") or raw.get("title")):
+                    raw_candidates[key] = raw
+                    learned_ids.append(key[1])
 
         if not raw_candidates:
             failed_attempt = next((
@@ -5773,6 +5877,7 @@ class TMDBScraper:
             )
         )
 
+        search_only_variant_used = bool(scored[0][1].get("_search_only_variant"))
         if (
             not search_only_variant_used
             and self._attach_unique_target_season_year_evidence(
@@ -5848,12 +5953,16 @@ class TMDBScraper:
             ))
 
         best = candidates[0]
+        search_only_variant_used = bool(scored[0][1].get("_search_only_variant"))
         selected_season_year_evidence = _validated_target_season_year_evidence(
             scored[0][1], context, expected_year,
         )
         decision_constraints = list(
             best.score_breakdown.rejected_constraints if best.score_breakdown else []
         )
+        if len(learned) > MAX_ALIAS_ENRICHMENT_CANDIDATES:
+            decision_constraints.append("manual_alias_coverage_incomplete")
+            rejected_constraints.append("manual_alias_coverage_incomplete")
         best_genre_ids = _tmdb_genre_ids(scored[0][1])
         animation_verified = (
             not animation_marker
@@ -5888,7 +5997,7 @@ class TMDBScraper:
                 and runner_up.score >= threshold
                 and abs(best.score - runner_up.score) <= 0.02
                 and best_labels.intersection(runner_labels)
-                and (not best.year or not runner_up.year or best.year == runner_up.year)
+                and (not expected_year or not best.year or not runner_up.year or best.year == runner_up.year)
             )
         if ambiguous_aliases and alias_position_resolution is None:
             decision_constraints.append("ambiguous_romaji_alias")
@@ -5955,6 +6064,7 @@ class TMDBScraper:
                     }
                     if animation_marker else {}
                 ),
+                "learned_candidate_ids": learned_ids,
                 "recognition_evidence": {
                     "matched_query": (
                         best.score_breakdown.matched_query
@@ -5995,6 +6105,11 @@ class TMDBScraper:
                     mode="auto",
                 )
             )
+
+            if position_required and not mapping.changed:
+                confirmed_mapping = self.confirmed_numbering_mapping(context, result.tmdb_id, detail)
+                if confirmed_mapping is not None:
+                    mapping = confirmed_mapping
 
             # 一些分割放送作品在发布组中写作 S02E01+，但 TMDB 把两段
             # 合并为唯一的 Season 01。普通位置校验会把它判成 season_not_found。
@@ -7766,47 +7881,9 @@ class TMDBScraper:
             )
             return self._attach_preprocess(result, processed)
 
-        # 人工确认形成的标题别名只在证据唯一时生效，并且仍回读 TMDB
-        # 详情；这比继续扩张发布组硬编码更稳定，也不会绕过类型校验。
-        processed_core = core
-        if (
-            processed.filename != filename
-            or processed.parent_path != parent_path
-        ):
-            processed_core = _parse_release_core(
-                processed.filename, processed.parent_path,
-            )
-        try:
-            from app.modules.media_aliases import lookup_manual_alias
-
-            alias_context = processed_core.context
-            alias_entry = lookup_manual_alias(
-                _unique_text((
-                    alias_context.normalized_title,
-                    alias_context.filename_title,
-                    alias_context.folder_title,
-                    *alias_context.title_variants,
-                )),
-                media_type=media_type,
-                year=alias_context.filename_year or alias_context.folder_year,
-            )
-        except Exception as exc:
-            logger.debug("人工媒体别名查询失败 type=%s", type(exc).__name__)
-            alias_entry = None
-        if alias_entry:
-            result = self.match_from_tmdb(alias_entry["tmdb_id"], media_type)
-            if result.status == "matched":
-                result.matched_by = "manual_alias"
-                result.locked = True
-                result.metadata = {
-                    **dict(result.metadata or {}),
-                    "manual_alias": str(alias_entry.get("alias") or ""),
-                }
-                return self._attach_preprocess(result, processed)
-
         # 文件名和父目录属于外部输入。若其中混入真实凭据，禁止把标题投影
-        # 发送给 TMDB、辅助搜索或 AI；显式 TMDB ID、人工锁、管理员规则和
-        # 已确认别名只按 ID 回读详情，已在此前安全处理。
+        # 发送给 TMDB、辅助搜索或 AI；显式 TMDB ID、人工锁和管理员规则
+        # 只按 ID 回读详情，已在此前安全处理。
         if contains_sensitive_credential(filename) or contains_sensitive_credential(parent_path):
             result = MatchResult(
                 media_type=media_type,
@@ -7818,6 +7895,9 @@ class TMDBScraper:
             )
             return self._attach_preprocess(result, processed)
 
+        processed_core = core
+        if processed.filename != filename or processed.parent_path != parent_path:
+            processed_core = _parse_release_core(processed.filename, processed.parent_path)
         deterministic_kwargs: dict[str, Any] = {
             "source_context": raw_context,
             "_core": processed_core,
@@ -7961,8 +8041,7 @@ class TMDBScraper:
         )
 
     def confirm(self, raw_name: str, tmdb_id: str | int, title: str,
-                year: str | int, media_type: str = "", parent_path: str = "",
-                rejected_tmdb_ids: list[str] | None = None) -> None:
+                year: str | int, media_type: str = "", parent_path: str = "") -> None:
         """人工确认后按文件名、父目录、类型与季号锁定映射。"""
         self._set_lock(
             raw_name, str(tmdb_id), title, str(year), media_type, parent_path=parent_path
@@ -7984,7 +8063,6 @@ class TMDBScraper:
                 title=title,
                 year=year,
                 media_type=alias_type,
-                rejected_tmdb_ids=rejected_tmdb_ids or (),
             )
         except Exception as exc:
             # 映射锁是人工确认的主契约；别名学习失败不得让确认操作失败。

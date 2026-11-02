@@ -86,6 +86,19 @@ def list_tmdb_locks(keyword: str = "", limit: int = 200) -> list[sqlite3.Row]:
         return conn.execute(sql, params).fetchall()
 
 
+def list_manual_episode_confirmations(tmdb_id: str) -> list[sqlite3.Row]:
+    """只返回成功的人工作品纠偏；普通自动整理不能成为自我学习证据。"""
+    with _database().get_conn() as conn:
+        return conn.execute(
+            "SELECT id,original_name,original_path,season,episode,release_parse_json "
+            "FROM organize_log WHERE tmdb_id=? AND media_type='tv' "
+            "AND status='success' AND provider IN ('','tmdb') "
+            "AND confirmation_actor!='agent' "
+            "AND instr(release_parse_json,'\"manual_position\"')>0 ORDER BY id DESC",
+            (tmdb_id,),
+        ).fetchall()
+
+
 def delete_tmdb_lock(lock_id: int) -> bool:
     with _database().get_conn() as conn:
         cur = conn.execute("DELETE FROM tmdb_lock WHERE id=?", (lock_id,))

@@ -2009,12 +2009,6 @@ def _record_confirmation_learning(
     """Best-effort persist an explicit Telegram choice without affecting cloud writes."""
     warnings: list[str] = []
     selected_tmdb_id = str(candidate.get("tmdb_id") or match.tmdb_id or "").strip()
-    rejected_tmdb_ids = list(dict.fromkeys(
-        str(item.get("tmdb_id") or "").strip()
-        for item in (payload.get("candidates") or [])
-        if str(item.get("tmdb_id") or "").strip()
-        and str(item.get("tmdb_id") or "").strip() != selected_tmdb_id
-    ))
     parent_path = str(payload.get("directory") or "").strip()
     seen_names: set[str] = set()
     for item in payload.get("files") or []:
@@ -2030,7 +2024,6 @@ def _record_confirmation_learning(
                 str(match.year or candidate.get("year") or "").strip(),
                 str(match.media_type or candidate.get("media_type") or "").strip(),
                 parent_path=parent_path,
-                rejected_tmdb_ids=rejected_tmdb_ids,
             )
         except Exception as exc:
             warnings.append(f"人工确认识别知识保存失败: {raw_name}")

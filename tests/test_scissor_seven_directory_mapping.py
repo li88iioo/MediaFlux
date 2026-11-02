@@ -200,6 +200,7 @@ class ScissorSevenPlanningTests(IsolatedDatabaseTestCase):
                 ])["source"]
                 for number in range(11, 15):
                     mapping = organizer._infer_tmdb_episode_mapping(
+                        source_context=scraper.parse_media(f"Scissor Seven.S01E{number:02d}.mkv").context,
                         match=match, detail=detail, source_season=1, source_episode=number,
                         raw_source_season=1, parent_path="Scissor Seven {tmdb-79141}",
                         directory_episode_evidence=evidence, directory_sequence_evidence=evidence,
