@@ -71,6 +71,12 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
     def records(tmdb_id="73223"):
         return [dict(row) for row in recognition.list_manual_episode_confirmations(tmdb_id)]
 
+    @staticmethod
+    def stored_log(log_id: int) -> dict:
+        row = db.get_organize_log(log_id)
+        assert row is not None, f"整理日志 {log_id} 应存在"
+        return dict(row)
+
     def test_recycle_and_filtered_log_clear_keep_independent_learning(self):
         lid = self.learn()
         before = self.records()
@@ -116,7 +122,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
                 self.assertEqual(self.records("999"), [])
                 if fields.get("status") == "reorganizing":
                     db.init_db()
-                    self.assertEqual(db.get_organize_log(lid)["status"], "interrupted")
+                    self.assertEqual(self.stored_log(lid)["status"], "interrupted")
                     self.assertEqual(self.records(), before)
 
     def test_invalid_markers_and_agent_confirmation_do_not_become_learning(self):
@@ -137,13 +143,13 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
 
     def test_failed_learning_write_rolls_back_the_business_result(self):
         lid = self.learn(status="skipped")
-        before = dict(db.get_organize_log(lid))
+        before = self.stored_log(lid)
         with db.get_conn() as conn:
             conn.execute("CREATE TRIGGER reject_learning BEFORE INSERT ON manual_episode_confirmations "
                          "BEGIN SELECT RAISE(ABORT, 'synthetic disk failure'); END")
         with self.assertRaisesRegex(sqlite3.IntegrityError, "synthetic disk failure"):
             db.update_organize_log(lid, status="success", operation_type="reorganize")
-        self.assertEqual(dict(db.get_organize_log(lid)), before)
+        self.assertEqual(self.stored_log(lid), before)
         self.assertEqual(self.records(), [])
 
     def test_snapshot_undo_restores_previous_knowledge_and_actor(self):
@@ -159,7 +165,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
         db.update_organize_log(lid, error="后处理提示不应改变识别事实")
         db.init_db()
         self.assertEqual(self.records(), [before["manual_episode_confirmation"]])
-        self.assertEqual(db.get_organize_log(lid)["confirmation_actor"], before["log"]["confirmation_actor"])
+        self.assertEqual(self.stored_log(lid)["confirmation_actor"], before["log"]["confirmation_actor"])
         db.update_organize_log(lid, status="reverted", operation_type="return_to_source")
         self.assertEqual(self.records(), [])
 
@@ -172,7 +178,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
         self.assertEqual(len(self.records()), 1)
         db.restore_organize_business_snapshot(lid, before, status="reverted", operation_type="revert")
         self.assertEqual(self.records(), [])
-        self.assertEqual(db.get_organize_log(lid)["release_parse_json"], "")
+        self.assertEqual(self.stored_log(lid)["release_parse_json"], "")
 
     def test_restart_revokes_learning_only_for_completed_return_receipts(self):
         for completed in (True, False):
@@ -190,7 +196,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
                                                to_parent_id="source", to_name="original.mp4",
                                                status="success" if completed else "running")
                 db.init_db()
-                self.assertEqual(db.get_organize_log(lid)["status"], "reverted" if completed else "interrupted")
+                self.assertEqual(self.stored_log(lid)["status"], "reverted" if completed else "interrupted")
                 self.assertEqual(self.records(), [] if completed else before)
 
     def test_multiple_files_and_providers_are_not_collapsed_into_one_example(self):
@@ -215,7 +221,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
                     conn.execute(f"PRAGMA user_version={version}")
                 db.init_db()
                 self.assertEqual([r["file_id"] for r in self.records()], ["valid"])
-                self.assertEqual(db.get_organize_log(agent)["confirmation_actor"], "agent")
+                self.assertEqual(self.stored_log(agent)["confirmation_actor"], "agent")
                 with db.get_conn() as conn:
                     self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.SCHEMA_VERSION)
                     self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
@@ -242,7 +248,7 @@ class ManualEpisodeConfirmationTests(unittest.TestCase):
         with db.get_conn() as conn:
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 36)
             self.assertIsNone(conn.execute("SELECT 1 FROM sqlite_master WHERE name='manual_episode_confirmations'").fetchone())
-        self.assertEqual(db.get_organize_log(lid)["status"], "success")
+        self.assertEqual(self.stored_log(lid)["status"], "success")
         db.init_db()
         self.assertEqual([r["log_id"] for r in self.records()], [lid])
 
