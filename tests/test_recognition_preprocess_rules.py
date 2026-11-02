@@ -164,6 +164,49 @@ class RecognitionPreprocessScraperTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM tmdb_regex_rules")
             conn.execute("DELETE FROM tmdb_lock")
 
+    def test_organizer_preserves_explicit_numbering_rules_and_still_validates_target(self):
+        from typing import cast
+        from app.clients.guangya import GuangYaFile
+        from app.clients.tmdb import TMDBClient
+        from app.modules import recognition_preprocess_rules as preprocess, tmdb_regex_rules as regex
+        from app.modules.organize import Organizer, OrganizeRules
+        from app.modules.scraper import TMDBScraper
+        from tests.test_recognition_pipeline import _DeterministicClient
+
+        detail = {"id": 42, "name": "Example Show", "first_air_date": "2026-01-01",
+                  "seasons": [{"season_number": season, "episode_count": count}
+                              for season, count in ((1, 12), (2, 8), (3, 30))]}
+        filename = "Example Show S02E03.mkv"
+        scraper = TMDBScraper(client=cast(TMDBClient, _DeterministicClient([detail], {"42": detail})))
+        self.addCleanup(scraper.close)
+        organizer = Organizer(local_only=True, scraper=scraper)
+        self.addCleanup(organizer.close)
+        rules = OrganizeRules(target_dir_id="archive", small_file_mb=0, link_strm=False, notify_enabled=False)
+        for action, value, expected in (
+            ("season_override", 3, (3, 3)), ("season_offset", 1, (3, 3)),
+            ("episode_offset", 1, (2, 4)), ("regex", 3, (3, 3)),
+            ("episode_offset", 100, (2, 103)),
+        ):
+            module = regex if action == "regex" else preprocess
+            payload: dict[str, object] = {"name": "显式编号", "pattern": "Example Show", "disabled": False}
+            if action == "regex":
+                payload.update(tmdb_id="42", media_type="tv", season_override=value)
+            else:
+                payload.update(matcher_type="text", scope="filename", action=action, numeric_value=value)
+            rule = module.create_rule(payload)
+            try:
+                for override in (None, (2, 3)):
+                    with self.subTest(action=action, value=value, scan_position=override):
+                        plan = organizer._plan_one(
+                            GuangYaFile("video", filename, False, 1024, "etag", "source"),
+                            "/", rules, parsed_override=override, automatic=True,
+                        )
+                        self.assertEqual((plan.season, plan.episode), expected)
+                        self.assertEqual(plan.action, "skip" if value == 100 else "move", plan.note)
+                        self.assertEqual((plan.source_season, plan.source_episode), (2, 3))
+            finally:
+                module.delete_rule(rule["id"])
+
     def test_search_consumes_cleaned_name_and_result_carries_effective_position(self):
         from app.modules import recognition_preprocess_rules as rules
         from app.modules.scraper import RecognitionResult, TMDBScraper

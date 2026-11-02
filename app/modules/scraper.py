@@ -366,6 +366,14 @@ class MatchResult:
     # 文件/任务，避免辅助线索被无意放大到同目录的其它媒体。
     directory_identity_cache_eligible: bool = False
 
+    @property
+    def has_position_override(self) -> bool:
+        """明确编号调整优先于自动映射；纯标题清洗不改变编号授权。"""
+        return self.season_override is not None or any(
+            rule.get("action") in {"season_override", "season_offset", "episode_offset"}
+            for rule in self.preprocess_rules
+        )
+
 
 @dataclass
 class RecognitionResult(MatchResult):
@@ -4934,7 +4942,7 @@ class TMDBScraper:
             effective_episode = match.effective_episode
         mapping = dict((getattr(match, "metadata", None) or {}).get("episode_mapping") or {})
         if (
-            mapping.get("changed")
+            mapping.get("changed") and not (match and match.has_position_override)
             and mapping.get("source_season") == effective_season
             and mapping.get("source_episode") == effective_episode
         ):
@@ -4999,9 +5007,11 @@ class TMDBScraper:
         result.effective_season = processed.season
         result.effective_episode = processed.episode
         result.preprocess_rules = list(processed.applied_rules)
+        if result.has_position_override:
+            result.metadata.pop("episode_mapping", None)
         mapping: dict[str, Any] = dict((result.metadata or {}).get("episode_mapping") or {})
         if (
-            not mapping.get("changed") and not processed.applied_rules
+            not mapping.get("changed") and not result.has_position_override
             and result.status == "matched" and not result.need_confirm
             and result.media_type == "tv" and result.provider == "tmdb"
             and processed.season is not None and processed.season >= 2

@@ -562,7 +562,7 @@ class Organizer:
         )
 
     def _maps_tmdb_source_positions(self, match: MatchResult | None) -> bool:
-        if not self._supports_tmdb_position_validation(match):
+        if not self._supports_tmdb_position_validation(match) or (match and match.has_position_override):
             return False
         if isinstance(self.scraper, TMDBScraper):
             return True
@@ -868,7 +868,7 @@ class Organizer:
             # 固定 TMDB 身份不等于尾项顺序已证实；不能用绝对编号降级绕过保护。
             return mapping
         if (
-            automatic and not mapping.changed and not match.preprocess_rules
+            automatic and not mapping.changed and not match.has_position_override
             and isinstance(self.scraper, TMDBScraper)
             and (source_context.season, source_context.episode) == (source_season, source_episode)
         ):
@@ -6014,7 +6014,7 @@ class Organizer:
         source_episode = release_parse.source_episode
         if source_position_override is not None:
             source_season, source_episode = source_position_override
-        if effective_parsed_override is not None:
+        if effective_parsed_override is not None and not match.has_position_override:
             parsed["season"], parsed["episode"] = effective_parsed_override
         return release_parse, parsed, (source_season, source_episode)
 
