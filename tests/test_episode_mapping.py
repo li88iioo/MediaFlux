@@ -259,6 +259,83 @@ class EpisodeMappingTests(unittest.TestCase):
         self.assertFalse(special.changed)
         self.assertFalse(unknown.changed)
 
+    def test_cumulative_mapping_requires_complete_previous_seasons(self):
+        scenarios = (
+            (1, 1, 1, "auto"),
+            (1, 1, 1, "absolute"),
+            (2, 1, 13, "auto"),
+            (2, 1, 13, "absolute"),
+            (1, 3, 13, "auto"),
+            (1, 3, 13, "season_continuous"),
+            (2, 3, 13, "auto"),
+            (2, 3, 13, "season_continuous"),
+        )
+        # 分别覆盖整季缺失、容量字段缺失、未知容量和零容量。
+        for unavailable in (None, {}, {"episode_count": None}, {"episode_count": 0}):
+            for missing_season, source_season, episode, mode in scenarios:
+                with self.subTest(
+                    missing_season=missing_season, unavailable=unavailable,
+                    source_season=source_season, mode=mode,
+                ):
+                    seasons: list[dict[str, object]] = [
+                        {"season_number": number, "episode_count": 12}
+                        for number in (1, 2, 3) if number != missing_season
+                    ]
+                    if unavailable is not None:
+                        seasons.append({"season_number": missing_season, **unavailable})
+                    mapping = infer_episode_mapping(
+                        source_season=source_season, source_episode=episode,
+                        parent_path=(
+                            f"Example Show S{source_season:02d}"
+                            f"E{episode:02d}-E{episode + 11:02d}"
+                        ),
+                        detail={"seasons": seasons}, mode=mode,
+                    )
+
+                    self.assertFalse(mapping.changed)
+                    self.assertEqual(
+                        (mapping.target_season, mapping.target_episode),
+                        (source_season, episode),
+                    )
+                    self.assertEqual(mapping.confidence, 0.0)
+
+    def test_complete_prefix_maps_without_requiring_later_season_counts(self):
+        detail = {"seasons": [
+            {"season_number": 3, "episode_count": 0},
+            {"season_number": 2, "episode_count": 12},
+            {"season_number": 4, "episode_count": 12},
+            {"season_number": 1, "episode_count": 12},
+        ]}
+        for source_season, mode in (
+            (1, "auto"), (1, "absolute"),
+            (2, "auto"), (2, "season_continuous"),
+        ):
+            with self.subTest(source_season=source_season, mode=mode):
+                mapping = infer_episode_mapping(
+                    source_season=source_season, source_episode=13,
+                    parent_path=f"Example Show S{source_season:02d}E13-E24",
+                    detail=detail, mode=mode,
+                )
+                self.assertEqual((mapping.target_season, mapping.target_episode), (2, 1))
+                self.assertTrue(mapping.changed)
+                self.assertGreaterEqual(mapping.confidence, 0.9)
+
+        ordinary = infer_episode_mapping(
+            source_season=4, source_episode=1, detail=detail,
+        )
+        self.assertFalse(ordinary.changed)
+        self.assertEqual(ordinary.confidence, 1.0)
+
+    def test_single_tmdb_season_still_maps_proven_merged_absolute_range(self):
+        mapping = infer_episode_mapping(
+            source_season=3, source_episode=49,
+            parent_path="Example Show S03E49-E60",
+            detail={"seasons": [{"season_number": 1, "episode_count": 92}]},
+        )
+        self.assertEqual((mapping.target_season, mapping.target_episode), (1, 49))
+        self.assertEqual(mapping.mode, "absolute")
+        self.assertGreaterEqual(mapping.confidence, 0.9)
+
     def test_isolated_continued_episode_is_not_rebased_without_directory_evidence(self):
         detail = {"seasons": [
             {"season_number": 1, "episode_count": 12},

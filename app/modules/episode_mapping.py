@@ -715,6 +715,16 @@ def infer_overflow_tmdb_special_mapping(
     )
 
 
+def _complete_season_prefix(counts: dict[int, int]) -> dict[int, int]:
+    """累计编号只使用从 S01 起连续、容量已知的正片季。"""
+    prefix: dict[int, int] = {}
+    for season in sorted(counts):
+        if season != len(prefix) + 1:
+            break
+        prefix[season] = counts[season]
+    return prefix
+
+
 def _absolute_target(episode: int, counts: dict[int, int]) -> tuple[int, int] | None:
     remaining = episode
     for season in sorted(counts):
@@ -810,7 +820,11 @@ def infer_episode_mapping(
         and evidence.range_start <= episode <= evidence.range_end
     )
     current_count = counts.get(season)
-    previous_total = sum(count for number, count in counts.items() if number < season)
+    prefix_counts = _complete_season_prefix(counts)
+    previous_total = (
+        sum(prefix_counts[number] for number in range(1, season))
+        if season - 1 <= len(prefix_counts) else None
+    )
 
     # 自动模式必须有同目录连续集数证据。手动模式仍允许显式转换。
     if normalized_mode == "auto" and not evidence_valid:
@@ -882,7 +896,7 @@ def infer_episode_mapping(
             )
 
     if normalized_mode in {"auto", "absolute"}:
-        target = _absolute_target(episode, counts)
+        target = _absolute_target(episode, prefix_counts)
         source_position_missing = current_count is None or episode > current_count
         # 显式 S02/S03/S04 且 TMDB 中确有该季时，自动模式不能再把越界
         # 集号跨回前一季。发布季在 TMDB 中不存在时也不能只凭“起点大于 1”
