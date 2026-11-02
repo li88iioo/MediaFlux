@@ -6,6 +6,7 @@ import sqlite3
 from typing import Any
 
 from app.logger import get_logger
+from app.repositories import recognition
 
 logger = get_logger(__name__)
 
@@ -150,6 +151,8 @@ def _recover_return_receipts_conn(conn, timestamp: str, *, limit: int) -> int:
              video["current_name"] if complete and video is not None else log["current_name"],
              "return_to_source" if complete else log["operation_type"], notice, timestamp, log["id"]),
         )
+        if complete:
+            recognition.sync_manual_episode_confirmation(conn, log["id"], revoke=True)
         if not complete:
             conn.execute(
                 "UPDATE organize_operation_steps SET status='interrupted',error=?,finished_at=? "
@@ -187,7 +190,16 @@ def _validated_snapshot(value: Any) -> dict[str, Any]:
         seen_ids.add(item_id)
         clean_items.append({"id": item_id, "file_id": file_id,
                             "target_parent_id": item["target_parent_id"], "target_name": item["target_name"]})
-    return {"version": 1, "log": {key: log[key] for key in _BUSINESS_LOG_FIELDS}, "items": clean_items}
+    clean_log = {key: log[key] for key in _BUSINESS_LOG_FIELDS}
+    if "confirmation_actor" in log:
+        clean_log["confirmation_actor"] = log["confirmation_actor"]
+    state: dict[str, Any] = {"version": 1, "log": clean_log, "items": clean_items}
+    if "manual_episode_confirmation" in value:
+        learning = value["manual_episode_confirmation"]
+        if learning is not None and not isinstance(learning, dict):
+            raise ValueError("人工学习前像格式无效")
+        state["manual_episode_confirmation"] = learning
+    return state
 
 
 def capture_organize_business_snapshot(log_id: int) -> dict[str, Any]:
@@ -195,7 +207,7 @@ def capture_organize_business_snapshot(log_id: int) -> dict[str, Any]:
     with db.get_conn() as conn:
         conn.execute("BEGIN")
         log = conn.execute(
-            f"SELECT {','.join(_BUSINESS_LOG_FIELDS)} FROM organize_log WHERE id=?", (log_id,),
+            f"SELECT {','.join(_BUSINESS_LOG_FIELDS)},confirmation_actor FROM organize_log WHERE id=?", (log_id,),
         ).fetchone()
         if log is None:
             raise LookupError("整理日志不存在")
@@ -203,7 +215,12 @@ def capture_organize_business_snapshot(log_id: int) -> dict[str, Any]:
             "SELECT id,file_id,target_parent_id,target_name FROM organize_log_items "
             "WHERE log_id=? ORDER BY id", (log_id,),
         ).fetchall()
-        return {"version": 1, "log": dict(log), "items": [dict(row) for row in items]}
+        learning = conn.execute(
+            "SELECT c.* FROM manual_episode_confirmations c JOIN organize_log l "
+            "ON l.source=c.source AND l.file_id=c.file_id WHERE l.id=?", (log_id,),
+        ).fetchone()
+        return {"version": 1, "log": dict(log), "items": [dict(row) for row in items],
+                "manual_episode_confirmation": dict(learning) if learning is not None else None}
 
 
 def restore_organize_business_snapshot(log_id: int, snapshot: dict, **log_fields) -> bool:
@@ -236,6 +253,11 @@ def restore_organize_business_snapshot(log_id: int, snapshot: dict, **log_fields
                 "WHERE id=? AND log_id=? AND file_id=?",
                 (item["target_parent_id"], item["target_name"], timestamp, item["id"], log_id, item["file_id"]),
             )
+        if "manual_episode_confirmation" in state:
+            recognition.restore_manual_episode_confirmation(conn, log_id, state["manual_episode_confirmation"])
+        else:
+            # 旧前像没有独立学习记录；沿用可验证的旧状态，不猜测已删除的经验。
+            recognition.sync_manual_episode_confirmation(conn, log_id, revoke=log_fields.get("status") == "reverted")
     return True
 
 

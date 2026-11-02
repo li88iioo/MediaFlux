@@ -1742,3 +1742,22 @@ _RECOGNITION_FORMAT_RULE_STATEMENTS = (
     )""",
 )
 _SCHEMA += ";\n".join(_RECOGNITION_FORMAT_RULE_STATEMENTS) + ";\n"
+
+# 学习事实不依赖可清理日志；log_id 仅用于追溯，不设级联外键。
+_MANUAL_EPISODE_CONFIRMATION_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS manual_episode_confirmations (
+        source TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        log_id INTEGER NOT NULL,
+        original_name TEXT NOT NULL,
+        original_path TEXT NOT NULL,
+        tmdb_id TEXT NOT NULL,
+        season INTEGER NOT NULL CHECK(season BETWEEN 0 AND 999),
+        episode INTEGER NOT NULL CHECK(episode BETWEEN 1 AND 999),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(source, file_id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_manual_episode_confirmations_tmdb "
+    "ON manual_episode_confirmations(tmdb_id)",
+)
+_SCHEMA += ";\n".join(_MANUAL_EPISODE_CONFIRMATION_STATEMENTS) + ";\n"

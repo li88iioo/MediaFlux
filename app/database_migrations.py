@@ -1693,6 +1693,31 @@ def _migrate_rss_delivery_ownership_v36(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_manual_episode_confirmations_v37(conn: sqlite3.Connection) -> None:
+    """一次性迁出有效人工编号确认，之后日志仅负责审计和业务回退。"""
+    from app.database_schema import _MANUAL_EPISODE_CONFIRMATION_STATEMENTS
+    from app.repositories.recognition import sync_manual_episode_confirmation
+
+    for statement in _MANUAL_EPISODE_CONFIRMATION_STATEMENTS:
+        conn.execute(statement)
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(organize_log)")}
+    if not {"release_parse_json", "confirmation_actor"} <= columns:
+        return  # 未打版本的早期数据库先补列，再由初始化基线调用本迁移。
+    has_steps = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='organize_operation_steps'").fetchone()
+    event_time = (
+        "COALESCE((SELECT MAX(finished_at) FROM organize_operation_steps WHERE log_id=organize_log.id "
+        "AND action IN ('move_rename','return_to_source','revert') AND status='success'),created_at)"
+        if has_steps else "created_at"
+    )
+    rows = conn.execute(
+        "SELECT id,status,operation_type FROM organize_log WHERE "
+        "instr(COALESCE(release_parse_json,''),'\"manual_position\"')>0 OR operation_type='reorganize' "
+        f"ORDER BY {event_time},id"
+    ).fetchall()
+    for row in rows:
+        sync_manual_episode_confirmation(conn, row[0], revoke=row[1] == "reverted" and row[2] in {"return_to_source", "revert"})
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1730,4 +1755,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     33: _migrate_agent_library_patrol_cycle_runs_v34,
     34: _migrate_download_submission_clocks_v35,
     35: _migrate_rss_delivery_ownership_v36,
+    36: _migrate_manual_episode_confirmations_v37,
 }

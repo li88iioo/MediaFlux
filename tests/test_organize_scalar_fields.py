@@ -141,14 +141,7 @@ class OrganizeScalarFieldTests(unittest.TestCase):
     def test_database_boundary_never_binds_position_lists(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
-        conn.execute(
-            "CREATE TABLE organize_log("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT,source,original_path,new_path,file_id,status,tmdb_id,"
-            "provider,external_id,"
-            "operation_type,source_dir_id,original_parent_id,original_name,current_parent_id,current_name,"
-            "target_parent_id,media_type,title,year,season,episode,error,release_parse_json,parent_log_id,operation_token,"
-            "version,legacy_incomplete,created_at,updated_at)"
-        )
+        conn.executescript(db._SCHEMA)
 
         @contextmanager
         def memory_conn():

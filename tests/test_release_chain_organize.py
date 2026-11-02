@@ -19,6 +19,7 @@ from app.modules.organize_execution import execute_organize_plans
 from app.modules.guangya_compensation import restore_guangya_file
 from app.modules.organize_probe_worker import OrganizeProbeWorker
 from app.modules.scraper import MatchResult
+from app.repositories.recognition import list_manual_episode_confirmations
 from tests.support import IsolatedDatabaseTestCase
 
 
@@ -506,6 +507,11 @@ class ReleaseChainCompensationTests(IsolatedDatabaseTestCase):
 
 
 class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
+    def setUp(self):
+        super().setUp()
+        with db.get_conn() as conn:
+            conn.execute("DELETE FROM manual_episode_confirmations")
+
     def _fixture(self):
         from app.modules.scraper import TMDBScraper
 
@@ -595,6 +601,9 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         import json
 
         log_id, cloud, service = self._fixture()
+        self.assertTrue(db.update_organize_log(log_id, confirmation_actor="agent"))
+        before = db.capture_organize_business_snapshot(log_id)
+        self.assertEqual(list_manual_episode_confirmations("1"), [])
         service.reorganize(
             log_id,
             "manual-pos",
@@ -608,6 +617,13 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         assert get_organize_log_result_10 is not None
         row = dict(get_organize_log_result_10)
         self.assertEqual((row["season"], row["episode"]), (2, 3))
+        self.assertEqual(row["confirmation_actor"], "human")
+        learning = [dict(item) for item in list_manual_episode_confirmations("1")]
+        self.assertEqual(len(learning), 1)
+        self.assertEqual(
+            (learning[0]["log_id"], learning[0]["file_id"], learning[0]["season"], learning[0]["episode"]),
+            (log_id, "video", 2, 3),
+        )
         self.assertEqual(
             json.loads(row["release_parse_json"])["original_evidence"], "keep"
         )
@@ -621,6 +637,10 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         self.assertEqual((preview["season"], preview["episode"]), (2, 4))
         self.assertIn("S02E03", cloud.files["video"].name)
         self.assertEqual(row["original_name"], "First.S01E07.mkv")
+        service.revert_latest(log_id, "undo-human-correction", service.detail(log_id)["version"])
+        self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(service.detail(log_id)["confirmation_actor"], "agent")
+        self.assertEqual(list_manual_episode_confirmations("1"), [])
 
     def test_no_manual_marker_keeps_inferred_anime_position(self):
         import json
@@ -644,7 +664,14 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
 
     def test_revert_restores_business_identity_position_and_member_targets(self):
         log_id, cloud, service = self._fixture()
+        service.reorganize(
+            log_id, "first-confirmation", service.detail(log_id)["version"],
+            "1", "tv", season=1, episode=8,
+        )
         before = db.capture_organize_business_snapshot(log_id)
+        archived = replace(cloud.files["video"])
+        learning_before = [dict(row) for row in list_manual_episode_confirmations("1")]
+        self.assertEqual(len(learning_before), 1)
         service.reorganize(
             log_id,
             "correct",
@@ -654,19 +681,45 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             season=2,
             episode=3,
         )
+        self.assertEqual(list_manual_episode_confirmations("1"), [])
+        changed_learning = list_manual_episode_confirmations("2")
+        self.assertEqual(len(changed_learning), 1)
+        self.assertEqual(
+            (changed_learning[0]["log_id"], changed_learning[0]["season"], changed_learning[0]["episode"]),
+            (log_id, 2, 3),
+        )
         steps = [dict(row) for row in db.list_organize_operation_steps(log_id)]
         self.assertTrue(any(step["state_before_json"] for step in steps))
         service.revert_latest(log_id, "undo", service.detail(log_id)["version"])
         self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(cloud.files["video"], archived)
         self.assertEqual(
-            (cloud.files["video"].parent_id, cloud.files["video"].name),
-            ("old-season", "First.2025.S01E07.mkv"),
+            [dict(row) for row in list_manual_episode_confirmations("1")], learning_before,
         )
+        self.assertEqual(list_manual_episode_confirmations("2"), [])
         get_organize_log_result_6 = db.get_organize_log(log_id)
         assert get_organize_log_result_6 is not None
+        self.assertEqual(get_organize_log_result_6["confirmation_actor"], "human")
         self.assertEqual(
             get_organize_log_result_6["current_name"], cloud.files["video"].name
         )
+
+        # 送回前发现源目录同名文件：只记录失败，不能撤销刚恢复的经验。
+        cloud.files["source-conflict"] = GuangYaFile(
+            "source-conflict", "First.S01E07.mkv", False, 100, "other-etag", "incoming",
+        )
+        writes_before = list(cloud.calls)
+        with self.assertRaisesRegex(RuntimeError, "目标目录存在同名文件"):
+            service.return_to_source(log_id, "blocked-return", service.detail(log_id)["version"])
+        self.assertEqual(cloud.calls, writes_before)
+        self.assertEqual(cloud.files["video"], archived)
+        detail = service.detail(log_id)
+        self.assertEqual((detail["status"], detail["confirmation_actor"]), ("reverted", "human"))
+        self.assertEqual(db.capture_organize_business_snapshot(log_id), before)
+        self.assertEqual(
+            [dict(row) for row in list_manual_episode_confirmations("1")], learning_before,
+        )
+        self.assertEqual(list_manual_episode_confirmations("2"), [])
 
     def test_legacy_path_only_revert_explicitly_discloses_missing_identity_snapshot(
         self,
@@ -704,6 +757,18 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         import sqlite3
 
         log_id, cloud, service = self._fixture()
+        original = replace(cloud.files["video"])
+        cloud.fail_operation = "rename"
+        with self.assertRaisesRegex(TimeoutError, "服务端已提交，但响应丢失"):
+            service.reorganize(
+                log_id, "failed-first-correction", service.detail(log_id)["version"],
+                "2", "tv", season=2, episode=3,
+            )
+        self.assertEqual(cloud.files["video"], original)
+        self.assertEqual(service.detail(log_id)["status"], "failed")
+        self.assertEqual(list_manual_episode_confirmations("1"), [])
+        self.assertEqual(list_manual_episode_confirmations("2"), [])
+
         service.reorganize(
             log_id,
             "correct",
@@ -714,6 +779,8 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
             episode=3,
         )
         before_undo = replace(cloud.files["video"])
+        learning_before = [dict(row) for row in list_manual_episode_confirmations("2")]
+        self.assertEqual(len(learning_before), 1)
         with patch.object(
             db,
             "restore_organize_business_snapshot",
@@ -730,6 +797,10 @@ class ReleaseChainBusinessSnapshotTests(IsolatedDatabaseTestCase):
         get_organize_log_result_9 = db.get_organize_log(log_id)
         assert get_organize_log_result_9 is not None
         self.assertEqual(get_organize_log_result_9["status"], "revert_failed")
+        self.assertEqual(get_organize_log_result_9["confirmation_actor"], "human")
+        self.assertEqual(
+            [dict(row) for row in list_manual_episode_confirmations("2")], learning_before,
+        )
 
     def test_revert_uses_complete_operation_not_display_limit_and_stores_one_snapshot(
         self,

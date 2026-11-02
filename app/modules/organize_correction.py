@@ -23,6 +23,7 @@ from app.clients.guangya import (
 from app.logger import get_logger
 from app.modules.guangya_compensation import restore_guangya_file
 from app.modules.directory_scrape_errors import DirectoryScrapeConflictError
+from app.modules.media_identity import confirmed_manual_position
 from app.repositories.organize_history import begin_return_compensation
 from app.modules.nsfw import (
     CleanTitleCandidate,
@@ -133,20 +134,6 @@ class OrganizeCorrectionService:
         except (TypeError, ValueError):
             return None
         return payload if isinstance(payload, dict) else None
-
-    @staticmethod
-    def _confirmed_position(release_parse: object) -> dict | None:
-        if not isinstance(release_parse, dict):
-            return None
-        position = release_parse.get("manual_position")
-        if not isinstance(position, dict) or position.get("source") != "manual_correction" or position.get("version") != 1:
-            return None
-        season, episode = position.get("season"), position.get("episode")
-        if isinstance(season, bool) or not isinstance(season, int) or not 0 <= season <= 999:
-            return None
-        if episode is not None and (isinstance(episode, bool) or not isinstance(episode, int) or not 1 <= episode <= 999):
-            return None
-        return dict(position)
 
     @staticmethod
     def _snapshot_complete(data: dict, items: list[dict]) -> tuple[bool, str]:
@@ -625,7 +612,7 @@ class OrganizeCorrectionService:
             parsed["season"] = normalize_media_number(detail.get("season"))
         if parsed.get("episode") is None:
             parsed["episode"] = normalize_media_number(detail.get("episode"))
-        confirmed = self._confirmed_position(detail.get("release_parse")) if match.media_type == "tv" else None
+        confirmed = confirmed_manual_position(detail.get("release_parse")) if match.media_type == "tv" else None
         if confirmed is not None:
             # 人工位置是独立于原始发布名的已确认事实；只有显式新覆盖才改变它。
             parsed["season"], parsed["episode"] = confirmed["season"], confirmed.get("episode")
@@ -1707,7 +1694,7 @@ class OrganizeCorrectionService:
                     db.finish_organize_operation_step(step_id, "failed", str(exc))
                     raise
             if not db.update_organize_log(
-                log_id, status="success", operation_type="reorganize",
+                log_id, status="success", operation_type="reorganize", confirmation_actor="human",
                 current_parent_id=target_id, current_name=preview["file_name"], target_parent_id=target_id,
                 new_path=preview["target_path"] + "/" + preview["file_name"], tmdb_id=match["tmdb_id"],
                 provider=str(match.get("provider") or ""), external_id=str(match.get("external_id") or ""),

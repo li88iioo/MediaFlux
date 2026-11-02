@@ -38,6 +38,7 @@ from app.modules.media_identity import (
 )
 from app.private_files import protect_sqlite_files
 from app.runtime_paths import get_runtime_paths
+from app.repositories import recognition
 
 logger = get_logger(__name__)
 
@@ -47,7 +48,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -595,6 +596,8 @@ def init_db() -> None:
                 database_migrations._migrate_download_submission_clocks_v35(connection)
                 if needs_rss_delivery_migration:
                     database_migrations._migrate_rss_delivery_ownership_v36(connection)
+                if previous_schema_version == 0:
+                    database_migrations._migrate_manual_episode_confirmations_v37(connection)
 
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
@@ -942,6 +945,7 @@ def add_organize_log(
             ),
         )
         assert cur.lastrowid is not None
+        recognition.sync_manual_episode_confirmation(conn, cur.lastrowid)
         return cur.lastrowid
 
     if _conn is not None:
@@ -1121,6 +1125,8 @@ def mark_organize_logs_confirmation_actor(
             "WHERE operation_token=?",
             (normalized_actor, now(), token),
         )
+        for row in conn.execute("SELECT id FROM organize_log WHERE operation_token=?", (token,)).fetchall():
+            recognition.sync_manual_episode_confirmation(conn, row["id"])
         return cursor.rowcount
 
 
@@ -1531,6 +1537,7 @@ def update_organize_log(log_id: int, **fields) -> bool:
         "operation_type",
         "operation_token",
         "legacy_incomplete",
+        "confirmation_actor",
     }
     sets, values = [], []
     for key, value in fields.items():
@@ -1545,6 +1552,11 @@ def update_organize_log(log_id: int, **fields) -> bool:
         cur = conn.execute(
             f"UPDATE organize_log SET {', '.join(sets)} WHERE id=?", values
         )
+        revoke_learning = fields.get("status") == "reverted" and fields.get("operation_type") in {"return_to_source", "revert"}
+        if cur.rowcount and (revoke_learning or fields.keys() & {
+            "tmdb_id", "provider", "media_type", "season", "episode", "release_parse_json", "confirmation_actor",
+        } or (fields.get("status") == "success" and fields.get("operation_type") == "reorganize")):
+            recognition.sync_manual_episode_confirmation(conn, log_id, revoke=revoke_learning)
         return cur.rowcount == 1
 
 

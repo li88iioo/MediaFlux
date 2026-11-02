@@ -67,6 +67,21 @@ def normalize_media_number(value: Any) -> int | None:
     return None
 
 
+def confirmed_manual_position(release_parse: object) -> dict | None:
+    """读取已确认的季集覆盖；预览与持久学习使用同一份格式约束。"""
+    if not isinstance(release_parse, dict):
+        return None
+    position = release_parse.get("manual_position")
+    if not isinstance(position, dict) or position.get("source") != "manual_correction" or type(position.get("version")) is not int or position["version"] != 1:
+        return None
+    season, episode = position.get("season"), position.get("episode")
+    if type(season) is not int or not 0 <= season <= 999:
+        return None
+    if episode is not None and (type(episode) is not int or not 1 <= episode <= 999):
+        return None
+    return dict(position)
+
+
 def tmdb_alias_values(candidate: dict) -> list[object]:
     """共享 TMDB 别名/翻译遍历；调用方保留各自的去重和标题比较语义。"""
     values: list[object] = []

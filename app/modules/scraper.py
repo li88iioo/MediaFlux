@@ -5586,16 +5586,7 @@ class TMDBScraper:
             return None
         evidence_id = None
         for row in list_manual_episode_confirmations(tmdb_id):
-            try:
-                payload = json.loads(row["release_parse_json"])
-            except (TypeError, ValueError):
-                continue
-            target = payload.get("manual_position") if isinstance(payload, dict) else None
-            if not isinstance(target, dict) or target.get("version") != 1 or target.get("source") != "manual_correction":
-                continue
-            if (target.get("season"), target.get("episode")) != (row["season"], row["episode"]):
-                continue
-            # 老日志只有人工目标；从原始文件名重建源编号，不使用已归档的新文件名。
+            # 从独立经验的原始文件名重建源编号，不使用已归档的新文件名。
             previous = extract_recognition_context(row["original_name"], row["original_path"])
             if (
                 previous.season != context.season
@@ -5617,14 +5608,14 @@ class TMDBScraper:
             if (historical.target_season, historical.target_episode) != (row["season"], row["episode"]):
                 return None  # 人工记录冲突或 TMDB 季划分变化，不能沿用旧偏移。
             if historical.changed:
-                evidence_id = row["id"]
+                evidence_id = row["log_id"]
         if evidence_id is None:
             return None
         mapping = infer_episode_mapping(
             source_season=context.season, source_episode=context.episode,
             detail=detail, mode="season_continuous",
         )
-        return replace(mapping, reason=f"manual_confirmed_season_continuous:log:{evidence_id}") if mapping.changed else None
+        return replace(mapping, reason=f"manual_confirmed_season_continuous:confirmation:{evidence_id}") if mapping.changed else None
 
     def _recognize_context(
         self,

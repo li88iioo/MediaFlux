@@ -18,6 +18,7 @@ class MediaAliasPersistenceTests(IsolatedDatabaseTestCase):
             conn.execute("DELETE FROM media_title_aliases")
             conn.execute("DELETE FROM tmdb_lock")
             conn.execute("DELETE FROM organize_log")
+            conn.execute("DELETE FROM manual_episode_confirmations")
 
     def test_confirmation_recalls_candidates_even_without_release_year(self):
         record_manual_confirmation(["Virgin Punk Clockwork Girl", "ヴァージン・パンク"],
@@ -266,6 +267,7 @@ class MediaAliasPersistenceTests(IsolatedDatabaseTestCase):
             with self.subTest(fields=fields):
                 with db.get_conn() as conn:
                     conn.execute("DELETE FROM organize_log")
+                    conn.execute("DELETE FROM manual_episode_confirmations")
                 self.remember_episode(**fields)
                 result = scraper.deterministic_recognize(self.release(176), media_type_hint="tv")
                 self.assertNotEqual(result.status, "matched")
@@ -276,7 +278,7 @@ class MediaAliasPersistenceTests(IsolatedDatabaseTestCase):
         for changed_counts, conflicting in ((169, False), (170, True)):
             with self.subTest(changed_counts=changed_counts, conflicting=conflicting):
                 if conflicting:
-                    self.remember_episode(target_episode=8)
+                    self.remember_episode(target_episode=8, file_id="other-video")
                 detail = self.black_clover_detail(changed_counts)
                 scraper = self.scraper({"73223": detail}, [detail])
                 result = scraper.deterministic_recognize(self.release(176), media_type_hint="tv")
@@ -292,3 +294,16 @@ class MediaAliasPersistenceTests(IsolatedDatabaseTestCase):
         result = scraper.deterministic_recognize(self.release(197), media_type_hint="tv")
         self.assertNotEqual(result.status, "matched")
         self.assertNotIn("episode_mapping", result.metadata)
+
+    def test_clearing_logs_and_restarting_preserve_confirmed_numbering(self):
+        self.remember_episode()
+        deleted = db.clear_organize_logs(status="success")
+        self.assertEqual(deleted["deleted_guangya"], 1)
+        self.assertEqual(db.count_organize_logs(), 0)
+        db.init_db()
+        detail = self.black_clover_detail()
+        scraper = self.scraper({"73223": detail}, [detail])
+        result = scraper.match(self.release(176), media_type_hint="tv")
+        parsed = scraper.parse_media(self.release(176), "", result)
+        self.assertEqual(result.status, "matched", result.error)
+        self.assertEqual((parsed.effective_season, parsed.effective_episode), (2, 6))
