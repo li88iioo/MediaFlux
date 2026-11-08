@@ -2074,20 +2074,18 @@ class Resources:
     @sdk_method('control')
     def present(result_ids: list[str], *, resolution: str | EllipsisType = ...,
                 dynamic_range: str | EllipsisType = ..., exclude_hdr: bool | EllipsisType = ...) -> dict:
-        """将当前会话已读取的真实result_id投递为Web/TG候选卡，不下载、不预检或新建确认。
+        """展示当前会话读到的候选，支持跨作品、查询和分页选择0–50个唯一 result_id；[] 撤卡。
+        此方法只更新Web/TG候选卡；下载预览用 resources.download，取消确认用 session.pending_plan("cancel")。
 
-        每次0至50个唯一ID，完整批次不裁成前20项；翻页保留此前ID，无需重搜首页。
-        可跨作品、查询及分页组合；只展示明确选中的ID，卡片重新连续编号。伪造或其他会话ID拒绝。
-        必须从实际返回items/result_ids选取，不传scope_ref、位置或通知目标。
-        省略规格保留每项原搜索约束，显式规格继续筛选；需要放宽须先按用户要求重新search。
-        已核对季集的查询只展示匹配单集或范围包；其它集、未知映射及作品冲突不投递，原始items仍可研究。
-        rank_episode可用已有查询补充映射或改核对集数，重排匹配同样可展示，不需要重新搜索。
-        返回实际展示result_ids、queries逐查询条件/来源覆盖和coverage_notice；单一查询另有effective_query。
-        excluded_count为所选ID中未满足查询条件的数量。
-        scope.complete仅表示选全会话已观察ID，不表示搜遍来源；来源不完整也会在卡片直接提示。
-        []明确撤卡。原始搜索结果仍完整保存在工作文件/RPC响应中。
-        下载预览用resources.download；取消待确认计划用session.pending_plan("cancel")，不以撤候选卡代替。
-        search_missing的全部verification_targets随选中ID保留，卡片批选/回复仍进入原下载确认。
+        省略规格沿用各项原查询，显式规格继续筛选；放宽条件需重新搜索。
+        有季集条件时只展示匹配单集/范围包；rank_episode 重排结果也可展示。
+        返回实际 result_ids、queries（各查询条件与来源覆盖）、coverage_notice、excluded_count；
+        单查询另有 effective_query。scope.complete 表示选全会话已观察ID，来源覆盖另行报告。
+        search_missing 的 verification_targets 随选中ID保留；原始候选仍可从查询结果研究。
+
+            selected = r["recommendation"]["selected"]
+            if selected:
+                cards = resources.present([selected["result_id"]])
         """
         from app.modules.resource_candidates import select_candidates
 
@@ -2128,29 +2126,21 @@ class Resources:
         page: int = 1, sites: list[str] | None = None, sort_mode: str = "relevance_desc",
         resolution: str = "", dynamic_range: str = "", exclude_hdr: bool = False,
     ) -> dict:
-        """多站资源检索；给出 season 和 episode 时同时核对目标季集，不会下载。
+        """多站搜索当前页资源；传 season/episode 时同时核对季集，调用保持只读。
 
-        返回字典：items 是完整当前页候选，每项含 result_id/title/site_name/size_bytes/seeders；
-        size_bytes/seeders 可为 None，表示未知，不等于 0。
-        request 是完整查询参数（含站点和画质），可复制后只修改变化的字段传回 search；
-        site_statuses 给出各站状态与 next_page，
-        partial/has_more/complete 表示实际覆盖，technical_filter 记录画质筛选依据。
-        工作区搜索开始即撤下旧候选卡；返回的 presentation.result_ids 是此时实际展示的ID，
-        空列表表示页面无候选卡。items 是查询事实，只有 present 才会展示为卡片。
-        指定季集时，items 各项附 quality（match/eligible/tags），recommendation 含
-        target/selected/alternatives/matched_count/status；未知映射与冲突项仍保留在 items。
-        matched_count 合计 eligible=true 的 exact_episode（单集）与 episode_pack（范围包），
-        matched_counts 分别给出这两类数量，合计等于 matched_count；仅统计本次返回范围。
-        selected 为 None 表示尚无匹配建议，不能把 items 数量当匹配数。
+        返回 items（result_id/title/site_name/size_bytes/seeders）、request（可复用的完整查询条件）、
+        site_statuses（各站状态/next_page）、partial/has_more/complete（覆盖）、technical_filter（画质依据）。
+        体积/做种数为 None 表示未知。items 是全部候选，展示卡片使用 present；新搜索撤下旧卡，
+        presentation.result_ids 反映当前卡片。指定季集时 items[].quality 给出 match/eligible/tags；
+        recommendation 含 target/selected/alternatives/status，selected 可为 None。
+        recommendation.matched_count 为 matched_counts 中 exact_episode 单集与 episode_pack 范围包之和，仅计当前范围。
 
-        resolution: 2160p/1080p/720p/480p；dynamic_range: SDR/HDR/HDR10/HDR10+/DoVi/HLG。
-        空字符串不限；exclude_hdr 仅排除已标 HDR，未标记不等于已证实 SDR。
-        季集与画质来自发布标题，未探测视频、音轨、字幕或真实码率。
+        resolution: 2160p/1080p/720p/480p；dynamic_range: SDR/HDR/HDR10/HDR10+/DoVi/HLG，空串不限。
+        exclude_hdr 仅排除已标 HDR；明确要求 SDR 用 dynamic_range="SDR"。标题判据不等于实测文件质量。
 
-        例：r = resources.search(title="目标剧", season=1, episode=2, resolution="1080p")
-        print(r["recommendation"]); json.dump(r, open("search.json", "w"), ensure_ascii=False)
-        只换季：r = resources.search(**{**r["request"], "season": 2})；其他条件原样保留。
-        后续从文件读取，rank_episode 可复用这些候选核对其他集或补充 audit 映射。
+            r = resources.search("目标剧", season=1, episode=2, resolution="1080p")
+            print(r["recommendation"])
+            next_season = resources.search(**{**r["request"], "season": 2})
         """
         from app.indexers.models import IndexerMediaSearchRequest
         from app.indexers.ranking import filter_technical_candidates, technical_filter_arguments
@@ -2180,33 +2170,27 @@ class Resources:
     def search_missing(items: list[dict], as_of: str | None = None, sites: list[str] | None = None,
                        page: int = 1, max_episodes: int | None = None, limit_per_episode: int = 8,
                        preference_overrides: dict | None = None) -> dict:
-        """核对1至12部/季的已播缺集后搜索资源，不下载；普通找资源用 search。
+        """批量核对已播缺集并搜索资源，保持只读。items 为1–12项，每项必填 query/season，
+        可选 tmdb_id/library_name/episodes。默认每部20集；指定 episodes 最多100集，max_episodes 可缩小。
+        默认采用用户偏好，preference_overrides 可覆盖；page/sites 选择来源页。
+        单季最多6次、整批24次搜索，共享45秒；limit_per_episode 仅限制每集推荐ID数量。
 
-        items 各项必填 query/season，可选 tmdb_id/library_name/episodes（如 [3, 4]）。
-        默认每部20集，指定 episodes 时覆盖指定范围（最多100），max_episodes 可缩小。
-        page/sites 选择来源页；默认采用用户资源偏好，preference_overrides 显式覆盖。
-        limit_per_episode 只限制每集 recommended_result_ids；单季最多6次、整批最多24次搜索，共享45秒期限。
+        返回：
+        - items：按 result_id 去重的原始候选全文。
+        - groups[]：query/season/status/audit、remaining_episodes/failed_episodes/stop_reason。
+        - groups[].episodes[]：season/episode/recommended_result_ids/search。
+          search.recommendation.selected 为首选或 None，source_url 可为空；search.result_ids 引用根 items，
+          按逐集排名排列。quality/preference_match 以 result_id 为键保存判据，未设偏好时后者为空。
+        - groups[].searches[]：实际请求页，以 result_ids 引用根 items，保留 site_statuses/next_page。
+          两处 search 都保留 request、状态、错误和覆盖，不重复嵌入候选全文。
+        - result_ids/verification_targets：首选ID及完整季集关联，传递给展示或下载时一起保留。
+        partial/has_more/complete 是覆盖；失败或剩余目标是未完成范围，不等于没有资源。
 
-        返回结构：
-        - items：按 result_id 去重的全部原始候选正文，仅根级保存；数量不表示匹配数。
-        - groups：按作品/季分组，含 query/season/status、完整 audit、remaining_episodes、
-          failed_episodes、stop_reason。后两种未完成范围不能当作“没有资源”。
-        - groups[].episodes[]：season/episode、recommended_result_ids、search。
-          search.recommendation.selected 为首选或 None；首选含公开 source_url，无可用链接时为 None。
-          search.result_ids 是完整候选的逐集排名顺序，引用根 items；search.quality[result_id]
-          保留每个候选的全部逐集判据，search.preference_match[result_id] 保留偏好判据（无偏好时为空字典）。
-          search 不含 items；request、状态、site_statuses、errors、分页和覆盖事实原样保留。
-        - groups[].searches[]：实际请求的原始页，以 result_ids 按页内顺序引用根 items，不含 items；
-          site_statuses 含各站状态/next_page，来源失败和分页事实完整保留。
-        - result_ids/verification_targets：每集首选的去重ID与完整目标关联，展示/下载时保留。
-        根级 partial/has_more/complete 表示覆盖；标题匹配不证明文件内容或已下载。
-
-        已有返回值 r 时，按集读取推荐摘要（不必打印全部 audit 和原始候选）：
+            r = resources.search_missing([{"query": "目标剧", "season": 1}])
             for group in r["groups"]:
                 print(group["query"], group["remaining_episodes"], group["failed_episodes"])
                 for episode in group["episodes"]:
-                    print(episode["season"], episode["episode"],
-                          episode["search"]["recommendation"]["selected"])
+                    print(episode["season"], episode["episode"], episode["search"]["recommendation"]["selected"])
         """
         from app.modules.missing_resources import search_missing
 
@@ -2229,17 +2213,14 @@ class Resources:
         search: dict, season: int, episode: int, audit: dict | None = None,
         preferences: dict | None = None,
     ) -> dict:
-        """复用已有 search 返回值核对另一集或补充映射，不再次请求资源站。
+        """用已有 search 返回值核对指定季集，可传 library.audit 的完整 audit 补充映射；不请求资源站。
+        返回新字典，保留原 request/items/site_statuses/覆盖，更新 items[].quality 和 recommendation。
+        recommendation.target 是本次季集，selected/alternatives 是建议；matched_count 为 eligible 单集与
+        范围包之和，matched_counts 分列两者，candidate_count 还含编号待核对项。标题匹配不等于文件已验证。
+        preferences 是软排序偏好（preferred_resolution/preferred_codecs/preferred_subtitles），保留 search 硬过滤。
 
-        返回新字典，保留 request/items/site_statuses/覆盖信息；request 仍是原检索条件，
-        recommendation.target 是本次核对的季集。items 保留所有候选并更新 quality；
-        recommendation.selected/alternatives 是匹配建议，matched_count 合计 eligible=true
-        的 exact_episode（单集）与 episode_pack（范围包），matched_counts 分别给出两类数量；
-        candidate_count 还包含编号待核对的可下载项。匹配来自标题，不等于文件已验证。
-
-        audit 可直接传 library.audit(..., season=...) 的完整返回值，提供季集和播出映射。
-        preferences 为软排序偏好，例如 preferred_resolution='1080p'、preferred_codecs=['hevc']、
-        preferred_subtitles=['中字']；硬性画质条件在 search 指定，重排不会放宽原搜索过滤。
+            ranked = resources.rank_episode(r, season=1, episode=3, audit=audit)
+            print(ranked["recommendation"])
         """
         from app.indexers.models import IndexerMediaSearchRequest
         from app.modules.episode_resource_ranking import rank_episode_search

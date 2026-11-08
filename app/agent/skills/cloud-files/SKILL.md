@@ -1,21 +1,10 @@
-# 云盘文件调查、批量变更、撤销检查与后台任务核对
+# 云盘文件变更、整理、STRM 与入库核对
 
 用于查找、复制、移动、改名或回收光鸭文件。先定位用户指定范围，复用同一次目录读取，在工作区筛选并组合整批操作。
 
 ## 调查与保存
 
 `cloud.list(parent_id)` 返回完整目录及真实 `file_id`、`parent_id`、`name`、`is_dir`。根目录 ID 为 `0`；子目录使用查询得到的 ID。按名称定位时保留父目录，同名文件不能互相替代。递归遍历只进入任务范围内的目录，不为改一个文件遍历全盘。
-
-```python
-import json
-from mf import cloud
-
-root = cloud.list("0")
-with open("cloud-root.json", "w") as stream:
-    json.dump(root, stream, ensure_ascii=False)
-for item in root["items"]:
-    print(item["file_id"], item["name"], item["is_dir"])
-```
 
 完整目录、选中对象和计划保存在 `/work`；只打印数量、路径和需要判断的字段。后续需要核实某个对象时用 `cloud.info(file_id)`，不靠旧输出推断当前文件仍在原位。
 
@@ -37,7 +26,14 @@ for item in root["items"]:
 
 以同一个操作编号检查整批逐项结果。复制被受理或正在运行时，继续查原任务，不重新提交复制。失败、部分成功或核验未知时，先核对已执行的对象和剩余范围，再决定下一步。文件变更完成、STRM 联动完成和媒体库入库是不同阶段，按回执中实际完成的阶段交付。
 
-改名、移动或复制不等于元数据识别。用户要求整理入库时，还要使用实际可用的整理能力完成对应步骤；不要只改目录名就宣称入库成功。
+## 整理、STRM 与媒体库验收
+
+下载请求先按 media-research 技能的 `activity.timeline("download", request_id)` 核对已有整理/STRM 阶段，避免重复发起。用户要求继续整理入库时按实际链路处理：
+
+1. 已配置来源用 `cloud.preview_organize(source_ids=...)` 读取计划、目标与 `data.sources[].id`，确认范围后 `cloud.organize(source_ids=...)`，用确认执行回执 `data.run_id` 调 `cloud.organize_status(run_id)`。省略来源是全部配置来源；max_files 仅限制预览，执行仍处理所选来源全部文件，不把样本当执行上限。
+2. 针对单个真实文件/目录的识别纠正，先 `cloud.inspect_media(file_id)`、必要时 `cloud.search_media` 核实身份，再 `cloud.scrape` 传真实媒体身份及必要季集；其回执 `data.operation_ref` 用 `cloud.operation` 跟踪。此编号与批量整理的 run_id 不可混用；简单 change 移动/改名不等于完成识别。
+3. 整理已配置 STRM 联动时先核对原任务。需补同步时，从 `strm.status()["data"]["sources"]` 取真实 STRM 来源 id，用 `strm.run(source_ids=[...])`，再以回执 `data.run_id` 查 `strm.status(run_id)` 的 `data.task`；不要把整理来源 ID 当 STRM 来源 ID。partial/failed 时用 `strm.failures` 按 data.next_offset 核对明细，需要重试时 `strm.retry_failures(ids)` 只传选中的 open 记录 id；unknown 不以最近运行替代或重投。
+4. 同步结束仍要验收媒体库：`library.libraries(server=...)` 确定真实库；需扫描时 `library.refresh(server, library_id)`，accepted 仅表示排队。剧集用 `library.audit(query, tmdb_id=..., season=..., library_name=..., refresh=True)` 对照目标集；电影用 `library.presence` 核对身份存在性，其返回来源范围不能替代指定库归属验收。按真实范围报告可见性，possible/indeterminate、来源失败和不完整库存保留未知；索引可见不证明可播放。
 
 ## 检查最近可撤销的操作
 
@@ -65,4 +61,4 @@ with open("undo-inspection.json", "w") as stream:
 print(json.dumps(inspected, ensure_ascii=False))
 ```
 
-查完所有页面仍为 `None` 才表示当前日志没有可撤销项。检查成功后使用结果里的真实 `log_id`、`changes` 和 `affected` 解释回退范围。`receipt_id` 只是一份检查凭据；用户明确要求回退时才调用 `activity.undo(receipt_id)` 生成原有确认计划。下载提交和已经发出的通知不在这个回退范围内。
+查完所有页面仍为 `None` 才表示当前日志没有可撤销项。检查成功后使用结果 `data` 里的真实 `log_id`、`changes` 和 `affected` 解释回退范围。`data.receipt_id` 只是一份检查凭据；用户明确要求回退时才调用 `activity.undo(receipt_id)` 生成原有确认计划。下载提交和已经发出的通知不在这个回退范围内。
