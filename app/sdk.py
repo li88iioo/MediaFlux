@@ -1085,8 +1085,9 @@ class Media:
     @staticmethod
     def resolve(provider: str, external_id: str, media_type: str, title: str, year: str = "") -> dict:
         """只读返回已确认的 TMDB 映射或完整候选；候选含真实 tmdb_id、标题、年份、media_type 和评分，不自动保存。"""
-        from app.discovery.service import get_discovery_service
+        from app.discovery.service import get_discovery_service, require_discovery_enabled
 
+        require_discovery_enabled()
         return get_discovery_service().lookup_tmdb_mapping(
             provider, external_id, media_type, title, year,
         )

@@ -72,6 +72,24 @@ def qb_session(monkeypatch):
         yield session
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_media_resolve_respects_discovery_switch_before_service_creation(monkeypatch, enabled):
+    monkeypatch.setenv("DISCOVERY_ENABLED", "1" if enabled else "0")
+    service = Mock()
+    service.lookup_tmdb_mapping.return_value = {"tmdb_id": "90101", "confirmed": True, "candidates": []}
+    with patch("app.discovery.service.get_discovery_service", return_value=service) as factory:
+        if enabled:
+            result = sdk.media.resolve("douban", "101", "movie", "示例影片", "2026")
+            assert result == {"tmdb_id": "90101", "confirmed": True, "candidates": []}
+            factory.assert_called_once_with()
+            service.lookup_tmdb_mapping.assert_called_once_with("douban", "101", "movie", "示例影片", "2026")
+        else:
+            with pytest.raises(ValueError, match="影视探索功能当前已关闭"):
+                sdk.media.resolve("douban", "101", "movie", "示例影片", "2026")
+            factory.assert_not_called()
+            service.lookup_tmdb_mapping.assert_not_called()
+
+
 def test_watchlist_cursor_preserves_all_provider_identities():
     with isolated_test_database():
         for provider, identity, title in (("tmdb", "100", "第一部"), ("tmdb", "200", "第二部"), ("bangumi", "100", "第三部")):
