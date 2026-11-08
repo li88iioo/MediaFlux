@@ -12,6 +12,7 @@ from app import database as db
 from app.agent.confirmation import SQLiteConfirmationStore
 from app.agent.errors import ConfirmationClaimError, ToolPipelineError
 from app.agent.kernel.capabilities import ToolCatalog, ToolEffect
+from app.agent.kernel.conversation_codec import conversation_cost
 from app.agent.kernel.effects import ConfirmationEffectPlanStore
 from app.agent.kernel.events import AgentEventType as Event
 from app.agent.kernel.model import ModelEvent, ModelEventType, ModelToolCall
@@ -312,4 +313,56 @@ def test_full_session_different_tv_automatic_movie_and_revoked_scope_pause(rig):
         assert db.get_media_watchlist("tmdb", "503", "tv") is None
         state = await rig.store.load(owner=OWNER, session_id=SESSION)
         assert "scope_digest" not in json.dumps(rig.pipeline.scoped_trust.view(state))
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("near_capacity", [False, True], ids=["short-history", "retained-history"])
+@pytest.mark.parametrize("effect_count", [1, 2], ids=["answer", "next-effect"])
+def test_automatic_confirmation_retention_keeps_user_and_receipt_identity(rig, near_capacity, effect_count):
+    async def run():
+        context = await rig.context()
+        await rig.grant(context, await rig.preview(context))
+        request = "把另一部电视剧也加入探索收藏"
+        rows = [row for index in range(17) for row in (
+            {"role": "user", "content": f"旧请求{index}:" + "字" * 3100,
+             "history_id": f"old-{index}", "history_order": index},
+            {"role": "assistant", "content": "已记录"},
+        )] if near_capacity else []
+        rows.extend([
+            {"role": "user", "content": request, "history_id": "same-text-earlier"},
+            {"role": "assistant", "content": "先前问题已结束"},
+        ])
+        if near_capacity:
+            rows[-1]["content"] += "a" * (163700 - conversation_cost(rows))
+        seeded = await rig.store.commit(context.lease, conversation=rows)
+        session = rig.session([*(call(arguments(501 + index)) for index in range(effect_count)), FINAL])
+        events = await collect(session.run(AgentInput(owner=OWNER, session_id=SESSION, message=request)))
+        assert events[-1].type is Event.TURN_COMPLETED and events[-1].payload["status"] == "success"
+        assert [item["external_id"] for item in rig.attempts] == [str(501 + index) for index in range(effect_count)]
+        cold = await rig.store.load(owner=OWNER, session_id=SESSION)
+        if near_capacity:
+            assert any(row["history_id"] not in {item.get("history_id") for item in cold.conversation}
+                       for row in seeded.conversation if row.get("history_id"))
+        users = [row for row in cold.conversation if row.get("role") == "user" and row["content"] == request]
+        assert len(users) == 2 and len({row["history_id"] for row in users}) == 2
+        effects = [event.payload for event in events if event.type is Event.EFFECT_COMPLETED]
+        for effect in effects:
+            tool_rows = [row for row in cold.conversation
+                         if row.get("role") == "tool" and row.get("effect_plan_id") == effect["plan_id"]]
+            assert len(tool_rows) == 1
+            result = json.loads(tool_rows[0]["content"])
+            assert result["status"] == effect["result"]["status"]
+            assert result["summary"] == effect["result"]["summary"]
+            assert len([row for row in cold.conversation
+                        if row.get("completion_receipt_id") == effect["plan_id"]]) == 1
+        for model_request in session.model.requests[1:]:
+            pending = set()
+            for message in model_request.messages:
+                if message.tool_calls:
+                    assert not pending
+                    pending.update(call.call_id for call in message.tool_calls)
+                elif message.role == "tool":
+                    assert message.tool_call_id in pending
+                    pending.remove(message.tool_call_id)
+            assert not pending
     asyncio.run(run())

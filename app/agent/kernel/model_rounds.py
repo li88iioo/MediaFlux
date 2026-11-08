@@ -376,16 +376,17 @@ async def next_round(
 
 async def model_loop(turn: AgentTurn) -> None:
     turn.model_calls = 0
-    consumed_end = turn.history_end
+    consumed_current = 0
     while True:
         turn.round_index = turn.model_calls
         # 任务提案绑定模型本轮所见快照；同批后续提案不能覆盖前一项更新。
         round_task = deepcopy(turn.state.metadata.get("task"))
         turn.tool_context.cancellation.raise_if_cancelled()
-        input_end = len(turn.messages)
+        input_current = len(turn.messages) - turn.history_end
         model_request = turn.pending_initial_read is None and turn.pending_resume_call is None
         try:
-            reply = await next_round(turn, round_task, consumed_end=consumed_end)
+            # 确认回执可重载已裁剪的历史；已消费边界始终相对当前用户事件计算。
+            reply = await next_round(turn, round_task, consumed_end=turn.history_end + consumed_current)
         except ToolPipelineError as exc:
             if exc.code not in {"model_round_budget_exceeded", "task_budget_exceeded", "token_budget_exceeded", "active_time_budget_exceeded"}:
                 raise
@@ -395,7 +396,7 @@ async def model_loop(turn: AgentTurn) -> None:
             continue
         # 只有完整 FINISH 才证明请求输入已消费；恢复 READ 和失败流不推进。
         if model_request:
-            consumed_end = input_end
+            consumed_current = input_current
         calls, assistant_text = reply.calls, reply.text
         provider_state, finish_reason = reply.provider_state, reply.finish_reason
         business_batch_calls = len(calls)

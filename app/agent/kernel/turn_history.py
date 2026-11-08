@@ -175,6 +175,8 @@ async def remember_result(turn: AgentTurn,
     safe_content = (content or "").strip()
     if not safe_content:
         return False
+    current_user_id = (turn.messages[turn.current_user_index].history_id
+                       if turn.current_user_index is not None else None)
     conversation = [dict(item) for item in turn.state.conversation]
     # 完成原调用的结果，而非仅追加一条模型自述；旧预览仍保留在事件审计中。
     # 不新增虚构调用或孤立tool消息，保持各Provider的一问一答配对。
@@ -219,7 +221,13 @@ async def remember_result(turn: AgentTurn,
         )
         await acknowledge_effect_receipt(turn.session.state_store, owner=lease.owner,
             session_id=lease.session_id, plan_id=receipt_plan_id)
-        turn.messages = restore_messages(turn.state)
+        messages = restore_messages(turn.state)
+        if current_user_id is not None:
+            # 自动确认仍属于当前用户事件；裁剪后的行号不能沿用旧列表位置。
+            current_user_index = next(index for index, message in enumerate(messages)
+                                      if message.role == "user" and message.history_id == current_user_id)
+            turn.current_user_index = turn.history_end = current_user_index
+        turn.messages = messages
         return True
     except StalePublicationError:
         raise
