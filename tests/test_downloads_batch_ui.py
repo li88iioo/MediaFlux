@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import unittest
 from pathlib import Path
 
@@ -221,10 +222,118 @@ class DownloadBatchUiContractTests(unittest.TestCase):
 
     def test_log_batch_cleanup_is_explicitly_non_destructive_to_tasks_and_files(self):
         for contract in (
-            "async function clearLogsBatch()",
+            "async function clearLogsBatch(allMatching=false)",
             "'/api/downloads/logs/batch/clear'",
             "不会停止 qB/光鸭任务",
             "不会删除已下载文件或下载请求",
             "currentLogIds.forEach",
         ):
             self.assertIn(contract, self.template)
+
+
+class DownloadLogCleanupBrowserTests(unittest.TestCase):
+    def test_clear_matching_pages_cancel_and_preserve_new_logs(self):
+        """真实页面和 Chromium；API 替身只保存日志，不调用下载器。"""
+        from urllib.parse import urlsplit
+        from fastapi.testclient import TestClient
+        try:
+            from playwright.sync_api import sync_playwright, expect
+        except ImportError:
+            self.skipTest('需要 Playwright 执行真实浏览器验证')
+        from app.config import web_credentials
+        from app.main import create_app
+        from tests.support import initialized_web_runtime
+
+        with initialized_web_runtime(), TestClient(create_app()) as client, sync_playwright() as pw:
+            executable = Path(pw.chromium.executable_path)
+            system_browser = next((p for name in ('google-chrome', 'chromium', 'chromium-browser') if (p := shutil.which(name))), None)
+            if not executable.is_file() and not system_browser:
+                self.skipTest('未找到 Chromium')
+            browser = pw.chromium.launch(
+                executable_path=str(executable) if executable.is_file() else system_browser,
+                headless=True, args=['--no-sandbox'],
+            )
+            login = client.get('/login')
+            token = re.search(r'name="csrf_token" (?:content|value)="([^"]+)"', login.text)
+            assert token
+            username, password = web_credentials()
+            client.post('/login', data={'csrf_token': token[1], 'username': username, 'password': password})
+            html = client.get('/downloads?view=logs').text
+            for width in (360, 1440):
+                with self.subTest(width=width):
+                    page = browser.new_page(viewport={'width': width, 'height': 960})
+                    errors = []
+                    page.on('pageerror', lambda error: errors.append(str(error)))
+                    rows = [{'id': i, 'source': 'guangya', 'title': f'剧集{i}.mp4',
+                             'status': 'failed', 'path': '', 'created_at': '2026-11-09 00:00:00'}
+                            for i in range(1, 54)]
+                    rows.append({**rows[0], 'id': 54, 'source': 'qb', 'title': '保留的日志'})
+                    posted = []
+
+                    def route_request(route):
+                        path = urlsplit(route.request.url).path
+                        if path == '/downloads':
+                            route.fulfill(body=html, content_type='text/html')
+                        elif path.startswith('/static/'):
+                            response = client.get(path)
+                            route.fulfill(status=response.status_code, body=response.content,
+                                          content_type=response.headers.get('content-type', 'text/plain'))
+                        elif path == '/api/downloads/logs':
+                            from urllib.parse import parse_qs
+                            query = parse_qs(urlsplit(route.request.url).query)
+                            source = query.get('source', [''])[0]
+                            matched = [r for r in rows if not source or r['source'] == source]
+                            number = min(int(query.get('page', ['1'])[0]), max(1, (len(matched)+19)//20))
+                            route.fulfill(json={'items': matched[(number-1)*20:number*20],
+                                                'total': len(matched), 'pages': (len(matched)+19)//20,
+                                                'page': number, 'through_id': max((r['id'] for r in matched), default=0)})
+                        elif path == '/api/downloads/logs/batch/clear':
+                            payload = route.request.post_data_json
+                            posted.append(payload)
+                            ids = payload.get('log_ids', [])
+                            selected = [r for r in rows if r['id'] in ids or (
+                                payload.get('scope') == 'filtered' and r['id'] <= payload['through_id']
+                                and (not payload['source'] or r['source'] == payload['source']))]
+                            rows[:] = [r for r in rows if r not in selected]
+                            route.fulfill(json={'ok': True, 'deleted': len(selected), 'missing': 0})
+                        elif path.startswith('/api/'):
+                            route.fulfill(json={})
+                        else:
+                            route.fulfill(status=404, body='')
+
+                    page.route('**/*', route_request)
+                    page.goto('http://fixture.test/downloads?view=logs')
+                    expect(page.locator('#logClearAll')).to_be_enabled()
+                    page.evaluate('window.appAlert=async()=>{}')
+                    page.select_option('#logSource', 'guangya')
+                    expect(page.locator('#downloadLogPageInfo')).to_contain_text('共 53 条')
+                    expect(page.locator('#logClearAll')).to_have_text('清空筛选结果')
+                    page.locator('#downloadLogNext').click()
+                    expect(page.locator('#downloadLogPageInfo')).to_contain_text('第 2')
+                    page.locator('#logClearAll').scroll_into_view_if_needed()
+                    before = page.locator('#logBatchToolbar').bounding_box()
+                    page.locator('#logClearAll').click()
+                    expect(page.locator('#appConfirmTitle')).to_have_text('清空 53 条下载日志')
+                    expect(page.locator('#logClearAll')).to_be_disabled()
+                    self.assertEqual(page.locator('#logBatchToolbar').bounding_box(), before)
+                    page.locator('#appConfirmCancel').click()
+                    expect(page.locator('#logClearAll')).to_be_enabled()
+                    self.assertEqual(posted, [])
+                    page.locator('#logClearAll').click()
+                    rows.append({**rows[0], 'id': 55, 'title': '确认期间新日志'})
+                    page.locator('#appConfirmSubmit').click()
+                    expect(page.locator('#downloadLogPageInfo')).to_contain_text('共 1 条')
+                    self.assertEqual(posted[0], {'scope': 'filtered', 'source': 'guangya',
+                                                'status': '', 'keyword': '', 'through_id': 53})
+                    self.assertEqual({r['id'] for r in rows}, {54, 55})
+                    page.locator('#logSelectAll').check()
+                    page.locator('#logBulkClear').click()
+                    expect(page.locator('#appConfirmTitle')).to_have_text('删除 1 条下载日志')
+                    page.locator('#appConfirmSubmit').click()
+                    expect(page.locator('#downloadLogPageInfo')).to_have_text('共 0 条')
+                    self.assertEqual(posted[1], {'log_ids': [55]})
+                    expect(page.locator('#logClearAll')).to_be_disabled()
+                    self.assertLessEqual(page.evaluate('document.documentElement.scrollWidth'), width)
+                    self.assertEqual(errors, [])
+                    page.close()
+            browser.close()

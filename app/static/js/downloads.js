@@ -16,6 +16,7 @@ let currentQbDisplaySignature = '';
 let hasRenderedQbSummary = false;
 let currentIssueIds = [];
 let currentLogIds = [];
+let downloadLogScope = null;
 const selectedQbHashes = new Set();
 const selectedIssueIds = new Set();
 const selectedLogIds = new Set();
@@ -177,10 +178,13 @@ function syncLogSelectionControls() {
     const toolbar=document.getElementById('logBatchToolbar');
     toolbar.setAttribute('aria-busy',logBatchBusy?'true':'false');
     toolbar.querySelector('.download-batch-select-all').classList.toggle('is-active',count>0);
-    document.getElementById('logSelectionLabel').textContent=logBatchBusy?`正在清理 ${count} 项…`:(count?`已选择 ${count} 项`:'选择日志');
+    document.getElementById('logSelectionLabel').textContent=count?`已选择 ${count} 项`:'选择日志';
     ['logBulkClear'].forEach(id=>{
         document.getElementById(id).disabled=!count||logBatchBusy;
     });
+    const clearAll=document.getElementById('logClearAll');
+    clearAll.disabled=logBatchBusy||!downloadLogScope?.total;
+    clearAll.querySelector('span').textContent=downloadLogScope&&(downloadLogScope.source||downloadLogScope.status||downloadLogScope.keyword)?'清空筛选结果':'清空全部日志';
     document.querySelectorAll('[data-log-select]').forEach(input=>{
         const id=Number(input.value)||0;
         const selected=selectedLogIds.has(id);
@@ -573,6 +577,7 @@ function loadLogs(page=1){
     if(s)q.push('source='+encodeURIComponent(s));if(st)q.push('status='+encodeURIComponent(st));if(k)q.push('keyword='+encodeURIComponent(k));
     return api('/api/downloads/logs?'+q.join('&')).then(readApiResponse).then(data=>{
         if(requestSerial!==downloadLogRequestSerial)return false;
+        downloadLogScope={source:s,status:st,keyword:k,total:Number(data.total)||0,through_id:Number(data.through_id)||0};
         renderLogs(data);hasLoadedDownloadLogs=true;return true;
     }).catch(error=>{
         if(requestSerial!==downloadLogRequestSerial)return false;
@@ -817,22 +822,28 @@ async function clearIssuesBatch(){
     }
 }
 
-async function clearLogsBatch(){
+async function clearLogsBatch(allMatching=false){
     const logIds=[...selectedLogIds];
-    if(logBatchBusy||!logIds.length)return false;
-    const confirmed=await appConfirm({
-        title:`删除 ${logIds.length} 条下载日志`,
-        message:'将永久删除选中的日志记录；不会停止 qB/光鸭任务，也不会删除已下载文件或下载请求。',
-        confirmText:`删除 ${logIds.length} 条日志`,
-        danger:true,
-    });
-    if(!confirmed)return false;
-
+    const snapshot=downloadLogScope;
+    const count=allMatching?(snapshot?.total||0):logIds.length;
+    if(logBatchBusy||!count||allMatching&&!snapshot?.through_id)return false;
+    const payload=allMatching?{scope:'filtered',source:snapshot.source,status:snapshot.status,keyword:snapshot.keyword,through_id:snapshot.through_id}:{log_ids:logIds};
+    const scopeLabel=allMatching?[
+        ...[['logSource','source'],['logStatus','status']].map(([id,key])=>snapshot[key]&&[...document.getElementById(id).options].find(option=>option.value===snapshot[key])?.textContent),
+        snapshot.keyword&&`关键词「${snapshot.keyword}」`,
+    ].filter(Boolean).join(' · ')||'全部来源、全部状态':'';
     logBatchBusy=true;
     syncLogSelectionControls();
     let receivedResponse=false;
     try{
-        const response=await api('/api/downloads/logs/batch/clear',{method:'POST',body:JSON.stringify({log_ids:logIds})});
+        const confirmed=await appConfirm({
+            title:`${allMatching?'清空':'删除'} ${count} 条下载日志`,
+            message:allMatching?`筛选范围：${scopeLabel}。将清空所有页的匹配日志；保留确认期间新产生的记录。下载任务、请求和文件不受影响。`:'将永久删除选中的日志记录；不会停止 qB/光鸭任务，也不会删除已下载文件或下载请求。',
+            confirmText:`${allMatching?'清空':'删除'} ${count} 条日志`,
+            danger:true,
+        });
+        if(!confirmed)return false;
+        const response=await api('/api/downloads/logs/batch/clear',{method:'POST',body:JSON.stringify(payload)});
         receivedResponse=true;
         const data=await response.json().catch(()=>({}));
         if(!response.ok||!data.ok)throw new Error(data.error||'日志清理失败');
@@ -935,7 +946,8 @@ document.getElementById('logSelectAll').addEventListener('change',event=>{
     currentLogIds.forEach(id=>{if(event.target.checked)selectedLogIds.add(id);else selectedLogIds.delete(id);});
     syncLogSelectionControls();
 });
-document.getElementById('logBulkClear').addEventListener('click',clearLogsBatch);
+document.getElementById('logBulkClear').addEventListener('click',()=>clearLogsBatch());
+document.getElementById('logClearAll').addEventListener('click',()=>clearLogsBatch(true));
 document.getElementById('downloadLogPrev').addEventListener('click',()=>loadLogs(downloadLogPage-1));
 document.getElementById('downloadLogNext').addEventListener('click',()=>loadLogs(downloadLogPage+1));
 document.getElementById('downloadIssuePrev').addEventListener('click',()=>loadIssues(downloadIssuePage-1));

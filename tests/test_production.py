@@ -5871,20 +5871,18 @@ class SecurityTests(InitializedWebTestCase):
         self.assertEqual(downloaded.json()["result"]["failure_count"], 1)
         download_many.assert_called_once_with([11, 12])
 
-        with (
-            patch("app.database.count_download_logs", return_value=0) as count_logs,
-            patch("app.database.list_download_logs", return_value=[]) as logs,
-        ):
+        log_id = db.add_download_log("qb", title="download-page-contract")
+        try:
             searched = self.client.get(
-                "/api/downloads/logs?keyword=demo", headers=headers
+                "/api/downloads/logs?keyword=download-page-contract", headers=headers
             )
+        finally:
+            db.delete_download_logs([log_id])
         self.assertEqual(searched.status_code, 200)
         self.assertEqual(searched.json()["page_size"], 20)
-        self.assertEqual(searched.json()["items"], [])
-        count_logs.assert_called_once_with(source=None, status=None, keyword="demo")
-        logs.assert_called_once_with(
-            source=None, status=None, keyword="demo", limit=20, offset=0
-        )
+        self.assertEqual(searched.json()["total"], 1)
+        self.assertEqual(searched.json()["through_id"], log_id)
+        self.assertEqual([row["id"] for row in searched.json()["items"]], [log_id])
 
         rss_page = self.client.get("/rss")
         self.assertIn('id="entryCheckAll"', rss_page.text)

@@ -314,6 +314,107 @@ class ShareTransferSubmissionLifecycleTests(unittest.TestCase):
         self.assertEqual(dict(get_download_request_result_5), recovered)
         self.assertEqual(self.client.restore_calls, [])
 
+    def test_retry_claim_after_log_clear_is_atomic_and_cannot_reset_after_second_failure(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        request_id, _ = db.create_share_transfer_request("retry-race", title="Share")
+
+        def finish():
+            return db.finish_share_transfer_request(
+                request_id, success=False, target_dir_id="target", target_dir_name="Target", title="Share",
+            )
+
+        self.assertTrue(finish())
+        self.assertEqual(self.request()["share_retry_count"], 0)
+        logs = [row["id"] for row in db.list_download_logs(source="guangya_share")]
+        self.assertEqual(db.delete_download_logs(logs), logs)
+        barrier = threading.Barrier(6)
+
+        def claim():
+            barrier.wait(timeout=5)
+            return db.claim_failed_share_transfer_request(request_id)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            claimed = list(pool.map(lambda _: claim(), range(6)))
+        self.assertEqual(sum(claimed), 1)
+        self.assertEqual(self.request()["share_retry_count"], 1)
+        self.assertEqual((self.request()["status"], self.request()["gy_status"]), ("submitting", "submitting"))
+        self.assertTrue(finish())
+        logs = [row["id"] for row in db.list_download_logs(source="guangya_share")]
+        db.delete_download_logs(logs)
+        db.init_db()
+        self.assertEqual(self.request()["share_retry_count"], 1)
+        self.assertFalse(db.claim_failed_share_transfer_request(request_id))
+
+    def test_retry_requires_both_request_and_provider_to_be_definitely_failed(self):
+        for status, gy_status in (("failed", "manual_review"), ("manual_review", "failed"),
+                                  ("failed", "submitting"), ("failed", "")):
+            with self.subTest(status=status, gy_status=gy_status):
+                request_id, _ = db.create_share_transfer_request(f"unsafe-{status}-{gy_status}", title="Share")
+                db.update_download_request(request_id, status=status, gy_status=gy_status)
+                self.assertFalse(db.claim_failed_share_transfer_request(request_id))
+                row = db.get_download_request(request_id)
+                assert row is not None
+                self.assertEqual((row["status"], row["gy_status"], row["share_retry_count"]),
+                                 (status, gy_status, 0))
+
+
+class ShareRetryCountMigrationTests(unittest.TestCase):
+    def test_upgrade_preserves_retry_budget_and_unknown_states_across_cleanup_and_restart(self):
+        cases = (
+            ("first-failed", "failed", "failed", 1, 0, True),
+            ("retried-failed", "failed", "failed", 2, 1, False),
+            ("many-failed", "failed", "failed", 3, 1, False),
+            ("missing-failed", "failed", "failed", 0, 1, False),
+            ("first-submitting", "submitting", "submitting", 0, 0, False),
+            ("retry-submitting", "submitting", "submitting", 1, 1, False),
+            ("legacy-pending", "pending", "", 1, 1, False),
+            ("uncertain", "manual_review", "manual_review", 1, 0, False),
+            ("provider-uncertain", "failed", "manual_review", 1, 0, False),
+            ("completed", "completed", "completed", 1, 0, False),
+        )
+        for version in (40, 0):
+            with self.subTest(version=version), isolated_test_database():
+                requests = []
+                for key, status, gy_status, logs, retry_count, retryable in cases:
+                    request_id, _ = db.create_share_transfer_request(key, title=key)
+                    db.update_download_request(request_id, status=status, gy_status=gy_status)
+                    for _ in range(logs):
+                        db.add_download_log("guangya_share", title=key, status="failed", request_id=request_id)
+                    # 其他来源的日志不能充当分享重试证据。
+                    db.add_download_log("qb", title=key, request_id=request_id)
+                    requests.append((request_id, status, gy_status, retry_count, retryable))
+                regular, _ = db.create_download_request("ordinary", "magnet")
+                original_logs = [dict(row) for row in db.list_download_logs(limit=100)]
+                with db.get_conn() as conn:
+                    conn.execute("ALTER TABLE download_requests DROP COLUMN share_retry_count")
+                    conn.execute(f"PRAGMA user_version={version}")
+                db.init_db()
+                for request_id, status, gy_status, retry_count, _ in requests:
+                    row = db.get_download_request(request_id)
+                    assert row is not None
+                    self.assertEqual(row["share_retry_count"], retry_count)
+                    if status in {"pending", "submitting"}:
+                        self.assertEqual((row["status"], row["gy_status"]), ("manual_review", "manual_review"))
+                    else:
+                        self.assertEqual((row["status"], row["gy_status"]), (status, gy_status))
+                self.assertEqual([dict(row) for row in db.list_download_logs(limit=100)], original_logs)
+                ordinary = db.get_download_request(regular)
+                assert ordinary is not None
+                self.assertEqual((ordinary["status"], ordinary["share_retry_count"]), ("pending", 0))
+                with db.get_conn() as conn:
+                    self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 41)
+                    self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                    self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+                db.delete_download_logs([row["id"] for row in original_logs])
+                db.init_db()
+                for request_id, _, _, retry_count, retryable in requests:
+                    row = db.get_download_request(request_id)
+                    assert row is not None
+                    self.assertEqual(row["share_retry_count"], retry_count)
+                    self.assertEqual(db.claim_failed_share_transfer_request(request_id), retryable)
+
 
 class ShareTransferProcessRestoreTests(unittest.TestCase):
     def test_exit_during_provider_write_and_zip_restore_keep_manual_gate(self):

@@ -30,7 +30,9 @@ from app.modules.qb_control import (
 )
 from app.repositories.download_requests import (
     can_retry_download_local_import,
+    delete_filtered_download_logs,
     download_display_title,
+    download_log_page,
     download_postprocess_issues,
     retry_download_local_import,
 )
@@ -351,11 +353,26 @@ def logs(
 
 @router.post("/logs/batch/clear")
 def clear_logs_batch(request: Request, data: dict | None = Body(default=None)):
-    """删除选中的下载日志；不会停止下载任务或删除实际文件。"""
+    """按 ID 或显式筛选快照清理日志，不停止任务或删除文件。"""
     require_api_login(request)
     if not isinstance(data, dict):
         return api_error("请求数据必须是 JSON 对象", 400)
     try:
+        if data.get("scope") == "filtered":
+            if set(data) != {"scope", "source", "status", "keyword", "through_id"}:
+                raise ValueError("筛选清理必须且只能提供 scope/source/status/keyword/through_id")
+            if any(not isinstance(data[key], str) for key in ("source", "status", "keyword")):
+                raise ValueError("筛选条件必须是字符串")
+            through_id = data["through_id"]
+            if type(through_id) is not int or not 0 <= through_id <= 9223372036854775807:
+                raise ValueError("日志快照 through_id 必须是非负整数")
+            deleted = delete_filtered_download_logs(
+                source=data["source"], status=data["status"], keyword=data["keyword"].strip(),
+                through_id=through_id,
+            )
+            return api_response({"ok": True, "deleted": deleted, "requested": deleted, "missing": 0})
+        if set(data) != {"log_ids"}:
+            raise ValueError("日志清理参数无效")
         log_ids = _normalize_record_ids(data.get("log_ids"), field="log_ids")
     except ValueError as exc:
         return api_error(str(exc), 400)
@@ -584,17 +601,10 @@ def clear_issue(request_id: int, request: Request):
 
 def _logs(source: str | None, status: str | None, keyword: str = "",
           page: int = 1, page_size: int = 20):
-    total = db.count_download_logs(source=source, status=status, keyword=keyword)
-    pages = (total + page_size - 1) // page_size if total else 0
-    effective_page = min(page, pages) if pages else 1
-    rows = db.list_download_logs(
-        source=source,
-        status=status,
-        keyword=keyword,
-        limit=page_size,
-        offset=(effective_page - 1) * page_size,
+    result = download_log_page(
+        source=source, status=status, keyword=keyword, page=page, page_size=page_size,
     )
-    items = [{
+    result["items"] = [{
         "id": row["id"],
         "source": row["source"],
         "title": row["title"] or "",
@@ -606,14 +616,8 @@ def _logs(source: str | None, status: str | None, keyword: str = "",
         "progress": row["progress"] if "progress" in row.keys() else 0,
         "error": row["error"] if "error" in row.keys() else "",
         "created_at": row["created_at"],
-    } for row in rows]
-    return {
-        "items": items,
-        "page": effective_page,
-        "page_size": page_size,
-        "total": total,
-        "pages": pages,
-    }
+    } for row in result["items"]]
+    return result
 
 
 @router.post("/qb/{action}")

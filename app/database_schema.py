@@ -273,6 +273,7 @@ CREATE TABLE IF NOT EXISTS download_requests (
     gy_unverified_manifest INTEGER NOT NULL DEFAULT 0,
     qb_status TEXT DEFAULT '',
     gy_status TEXT DEFAULT '',
+    share_retry_count INTEGER NOT NULL DEFAULT 0,
     qb_submitting_at TEXT,
     gy_submitting_at TEXT,
     qb_task_missing_since TEXT,

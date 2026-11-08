@@ -1790,6 +1790,27 @@ def _migrate_missing_resource_source_v40(conn: sqlite3.Connection) -> None:
         conn.execute(sql)
 
 
+def _migrate_share_retry_count_v41(conn: sqlite3.Connection) -> None:
+    """一次性把分享重试资格从可清理日志迁入请求，保留未知结果的人工门禁。"""
+    columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(download_requests)")}
+    if not columns:
+        return
+    if "share_retry_count" not in columns:
+        conn.execute("ALTER TABLE download_requests ADD COLUMN share_retry_count INTEGER NOT NULL DEFAULT 0")
+    elif conn.execute("PRAGMA user_version").fetchone()[0] != 0:
+        return
+    has_logs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='download_log'").fetchone()
+    count_sql = ("SELECT COUNT(*) FROM download_log WHERE request_id=download_requests.id "
+                 "AND source='guangya_share'") if has_logs else "SELECT 0"
+    conn.execute(
+        "UPDATE download_requests SET share_retry_count=MAX(share_retry_count,CASE "
+        "WHEN status='failed' THEN CASE WHEN (" + count_sql + ")=1 THEN 0 ELSE 1 END "
+        "WHEN status NOT IN ('completed','cancelled','resubmitted','manual_review') "
+        "OR gy_status='submitting' THEN CASE WHEN (" + count_sql + ")>0 THEN 1 ELSE 0 END "
+        "ELSE CASE WHEN (" + count_sql + ")>=2 THEN 1 ELSE 0 END END) WHERE kind='guangya_share'"
+    )
+
+
 # 正式 schema 升级按“当前版本 -> 下一版本”登记迁移函数。
 _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     1: _migrate_agent_session_context_v2,
@@ -1831,4 +1852,5 @@ _SCHEMA_MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     37: _migrate_download_verification_targets_v38,
     38: _migrate_agent_compensation_payload_v39,
     39: _migrate_missing_resource_source_v40,
+    40: _migrate_share_retry_count_v41,
 }

@@ -575,6 +575,39 @@ class ShareTransferRequestTests(IsolatedDatabaseTestCase):
         self.assertTrue(third["duplicate"])
         self.assertEqual(self.client.restore_share.call_count, 2)
 
+    def test_cleaning_logs_between_failures_does_not_change_single_retry_budget(self):
+        from app.modules.share_transfer import create_share_request
+
+        self.client.restore_share = Mock(side_effect=[
+            {"success": False, "retry_safe": True},
+            {"success": False, "retry_safe": True},
+            {"success": True},
+        ])
+
+        def submit():
+            return create_share_request(
+                self.preview_id, ["file-2"], "dir-cleaned-retry", "chat-100",
+                user_id="user-200", client=cast(GuangYaClient, self.client), store=self.store,
+            )
+
+        first = submit()
+        row = db.get_download_request(first["request_id"])
+        assert row is not None
+        self.assertEqual((row["status"], row["share_retry_count"]), ("failed", 0))
+        db.delete_download_logs([row["id"] for row in db.list_download_logs(source="guangya_share")])
+        second = submit()
+        self.assertTrue(second["retried"])
+        self.assertFalse(second["success"])
+        self.assertEqual(second["request_id"], first["request_id"])
+        db.delete_download_logs([row["id"] for row in db.list_download_logs(source="guangya_share")])
+        third = submit()
+        self.assertTrue(third["duplicate"])
+        self.assertEqual(third["status"], "failed")
+        row = db.get_download_request(first["request_id"])
+        assert row is not None
+        self.assertEqual(row["share_retry_count"], 1)
+        self.assertEqual(self.client.restore_share.call_count, 2)
+
     def test_success_without_configured_follow_up_does_not_wake_tracker(self):
         from app.modules.share_transfer import create_share_request
 

@@ -6,6 +6,7 @@ from tests.support import assert_present
 import re
 import sqlite3
 import threading
+from typing import Any
 from unittest.mock import patch
 
 from fastapi.testclient import TestClient
@@ -276,6 +277,120 @@ class DownloadManagementBatchApiTests(IsolatedDatabaseTestCase):
         self.assertEqual(after.json()["page"], 1)
         self.assertEqual(after.json()["pages"], 1)
         self.assertEqual(len(after.json()["items"]), 20)
+
+    def test_filtered_log_clear_spans_pages_and_preserves_new_logs_requests_and_files(self):
+        request_id = self._attention("filtered-clear")
+        original = dict(assert_present(db.get_download_request(request_id)))
+        media = db.resolve_db_path().with_name("preserved.mkv")
+        media.write_bytes(b"downloaded media")
+        matching = [
+            db.add_download_log("guangya_share", status="failed", request_id=request_id,
+                                title=title, path=path, backend_task_id=backend, error=error)
+            for title, path, backend, error in (
+                ("needle", "", "", ""), ("", "needle", "", ""),
+                ("", "", "needle", ""), ("", "", "", "needle"),
+            )
+        ]
+        matching.extend(db.add_download_log("guangya_share", title="needle", status="failed",
+                                            request_id=request_id) for _ in range(101))
+        preserved = [
+            db.add_download_log("qb", title="needle", status="failed"),
+            db.add_download_log("guangya_share", title="needle", status="success"),
+            db.add_download_log("guangya_share", title="other", status="failed"),
+        ]
+        filters = {"source": "guangya_share", "status": "failed", "keyword": " needle "}
+        headers = self._headers()
+        page = self.client.get("/api/downloads/logs", headers=headers,
+                               params={**filters, "page": 3, "page_size": 20}).json()
+        self.assertEqual((page["total"], page["pages"], page["page"]), (105, 6, 3))
+        self.assertEqual(page["through_id"], matching[-1])
+        self.assertGreater(page["through_id"], page["items"][0]["id"])
+        newer = db.add_download_log("guangya_share", title="needle", status="failed")
+
+        with patch("app.routes.downloads_api.remove_qb_tasks") as remove, patch(
+            "app.routes.downloads_api._qb"
+        ) as backend:
+            response = self.client.post("/api/downloads/logs/batch/clear", headers=headers,
+                                        json={"scope": "filtered", **filters,
+                                              "through_id": page["through_id"]})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"ok": True, "requested": 105, "deleted": 105, "missing": 0})
+        self.assertEqual({row["id"] for row in db.list_download_logs()}, {*preserved, newer})
+        self.assertEqual(dict(assert_present(db.get_download_request(request_id))), original)
+        self.assertEqual(media.read_bytes(), b"downloaded media")
+        remove.assert_not_called()
+        backend.assert_not_called()
+        after = self.client.get("/api/downloads/logs", headers=headers,
+                                params={**filters, "page": 3, "page_size": 20}).json()
+        self.assertEqual((after["total"], after["pages"], after["page"]), (1, 1, 1))
+        self.assertEqual(after["through_id"], newer)
+
+    def test_filtered_log_clear_requires_explicit_filters_and_integer_snapshot(self):
+        log_id = db.add_download_log("qb", title="keep")
+        headers = self._headers()
+        valid = {"scope": "filtered", "source": "", "status": "", "keyword": "", "through_id": log_id}
+        invalid: list[dict[str, Any]] = [
+            {key: value for key, value in valid.items() if key != missing}
+            for missing in valid
+        ]
+        invalid.extend({**valid, key: value} for key, value in (
+            ("source", None), ("status", False), ("keyword", []),
+            ("through_id", True), ("through_id", "1"), ("through_id", 1.0),
+            ("through_id", -1), ("through_id", 2**63), ("scope", "all"),
+            ("log_ids", [log_id]), ("sources", "qb"),
+        ))
+        invalid.extend(({"log_ids": [log_id], "keyword": "keep"}, {"log_ids": [log_id], "scpoe": "filtered"}))
+        for body in invalid:
+            with self.subTest(body=body):
+                response = self.client.post("/api/downloads/logs/batch/clear", headers=headers, json=body)
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(db.count_download_logs(), 1)
+
+    def test_empty_snapshot_and_explicit_unfiltered_clear_do_not_delete_newer_logs(self):
+        headers = self._headers()
+        filters = {"scope": "filtered", "source": "", "status": "", "keyword": ""}
+        empty = self.client.get("/api/downloads/logs", headers=headers).json()
+        self.assertEqual((empty["through_id"], empty["total"], empty["pages"], empty["page"]), (0, 0, 0, 1))
+        first = db.add_download_log("qb", title="first")
+        cleared = self.client.post("/api/downloads/logs/batch/clear", headers=headers,
+                                   json={**filters, "through_id": 0})
+        self.assertEqual(cleared.json(), {"ok": True, "requested": 0, "deleted": 0, "missing": 0})
+        self.assertEqual(db.count_download_logs(), 1)
+        snapshot = self.client.get("/api/downloads/logs", headers=headers).json()
+        self.assertEqual(snapshot["through_id"], first)
+        newer = db.add_download_log("guangya", title="newer", status="success")
+        response = self.client.post("/api/downloads/logs/batch/clear", headers=headers,
+                                    json={**filters, "through_id": snapshot["through_id"]})
+        self.assertEqual(response.json()["deleted"], 1)
+        self.assertEqual([row["id"] for row in db.list_download_logs()], [newer])
+
+    def test_log_page_metadata_and_items_share_a_read_snapshot(self):
+        first = db.add_download_log("qb", title="visible")
+        headers = self._headers()
+        original_connect = db._connect
+        inserted = []
+
+        def interleave(statement):
+            if statement.startswith("SELECT * FROM download_log") and not inserted:
+                with db.get_conn() as writer:
+                    cursor = writer.execute(
+                        "INSERT INTO download_log(source,title,created_at) VALUES('qb','newer',?)", (db.now(),),
+                    )
+                    inserted.append(cursor.lastrowid)
+
+        def connect():
+            conn = original_connect()
+            conn.set_trace_callback(interleave)
+            return conn
+
+        with patch.object(db, "_connect", side_effect=connect):
+            response = self.client.get("/api/downloads/logs", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        page = response.json()
+        self.assertEqual(len(inserted), 1)
+        self.assertEqual((page["total"], page["through_id"]), (1, first))
+        self.assertEqual([item["id"] for item in page["items"]], [first])
+        self.assertEqual(db.count_download_logs(), 2)
 
     def test_batch_resubmit_contains_partial_failures_and_skips(self):
         succeeded_id = self._attention("batch-resubmit:succeeded")

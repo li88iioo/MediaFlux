@@ -128,6 +128,35 @@ def count_download_logs(source: str | None = None, status: str | None = None,
         ).fetchone()[0])
 
 
+def download_log_page(source: str | None = None, status: str | None = None,
+                      keyword: str = "", page: int = 1, page_size: int = 20) -> dict:
+    """同一读事务内取得筛选结果、分页与清理上限。"""
+    filters, params = _download_log_filters(source, status, keyword)
+    with db.get_conn() as conn:
+        conn.execute("BEGIN")
+        total, through_id = conn.execute(
+            "SELECT COUNT(*),COALESCE(MAX(id),0) FROM download_log" + filters, params,
+        ).fetchone()
+        pages = (total + page_size - 1) // page_size
+        effective_page = min(page, pages) if pages else 1
+        rows = conn.execute(
+            "SELECT * FROM download_log" + filters + " ORDER BY id DESC LIMIT ? OFFSET ?",
+            [*params, page_size, (effective_page - 1) * page_size],
+        ).fetchall()
+    return {"items": rows, "page": effective_page, "page_size": page_size,
+            "total": total, "pages": pages, "through_id": through_id}
+
+
+def delete_filtered_download_logs(*, source: str, status: str, keyword: str,
+                                  through_id: int) -> int:
+    """只清理确认快照范围内匹配的日志，不操作请求、后端任务或文件。"""
+    filters, params = _download_log_filters(source, status, keyword)
+    with db.get_conn() as conn:
+        return conn.execute(
+            "DELETE FROM download_log" + filters + " AND id<=?", [*params, through_id],
+        ).rowcount
+
+
 def delete_download_logs(log_ids: list[int]) -> list[int]:
     """删除指定下载日志并返回实际删除的 ID；不操作下载请求、后端任务或文件。"""
     normalized = list(dict.fromkeys(
@@ -818,9 +847,9 @@ def claim_failed_share_transfer_request(request_id: int) -> bool:
     with db.get_conn() as conn:
         cur = conn.execute(
             "UPDATE download_requests SET status='submitting',gy_status='submitting',error='',"
-            "gy_submitting_at=?,completed_at=NULL,updated_at=? WHERE id=? AND kind='guangya_share' "
-            "AND status='failed' AND (SELECT COUNT(*) FROM download_log "
-            "WHERE request_id=download_requests.id AND source='guangya_share')=1",
+            "share_retry_count=share_retry_count+1,gy_submitting_at=?,completed_at=NULL,updated_at=? "
+            "WHERE id=? AND kind='guangya_share' AND status='failed' AND gy_status='failed' "
+            "AND share_retry_count=0",
             (timestamp, timestamp, request_id),
         )
         return cur.rowcount == 1

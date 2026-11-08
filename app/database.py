@@ -48,7 +48,7 @@ _lock = threading.RLock()
 _wal_setup_lock = threading.Lock()
 _wal_mode_cache: dict[str, tuple[int, int, int]] = {}
 _configured_test_mode = False
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 LOCAL_MEDIA_INTERRUPTED_WRITE_ERROR_PREFIX = "上次进程在本地媒体写操作期间中断"
 _LOCAL_MEDIA_INTERRUPTED_PREWRITE_ERROR = (
@@ -600,6 +600,7 @@ def init_db() -> None:
                     database_migrations._migrate_manual_episode_confirmations_v37(connection)
                     database_migrations._migrate_download_verification_targets_v38(connection)
                     database_migrations._migrate_missing_resource_source_v40(connection)
+                    database_migrations._migrate_share_retry_count_v41(connection)
 
             _run_schema_savepoint(conn, operation=prepare_schema_baseline)
             _run_schema_savepoint(
