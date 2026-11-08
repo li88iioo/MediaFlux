@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from app import config
 from app import database as db
 from app.main import create_app
+from app.modules.organize import Organizer
 from app.routes.logs_api import clear_organize_log_records
 from tests.support import initialized_web_runtime, isolated_test_database
 
@@ -86,6 +87,128 @@ class OrganizeLogClearTests(unittest.TestCase):
         self.assertIsNone(db.get_organize_log(cloud))
         self.assertIsNone(db.get_organize_log(token_log))
         self.assertIsNotNone(db.get_organize_confirmation("review-token"))
+
+    def confirmation(self, token, files, *, status="running", result=None):
+        db.create_organize_confirmation(
+            token=token, fingerprint=token, chat_id="", source_name="", directory_path="/",
+            payload={"files": [{"file_id": file_id} for file_id in files]},
+            expires_at="2099-01-01 00:00:00",
+        )
+        db.update_organize_confirmation(
+            token, status=status, result_json=json.dumps(result or {}),
+            completed_at=db.now() if status == "completed" else None,
+        )
+
+    def test_completed_confirmation_settles_skipped_and_failed_file_receipts_atomically(self):
+        previous = [self.cloud("manual", name) for name in ("skipped-file", "failed-file")]
+        self.confirmation("partial", ["skipped-file", "failed-file"])
+        receipts = [self.cloud(status, name, operation_token="recognition-confirm:partial")
+                    for status, name in (("skipped", "skipped-file"), ("failed", "failed-file"))]
+        db.complete_organize_confirmation_with_delivery(
+            "partial", result_json=json.dumps({"skipped": 1, "failed": 1}),
+            event_json="{}", chat_id="", message_id=None, enqueue_delivery=False,
+        )
+        for log_id in previous:
+            log = db.get_organize_log(log_id)
+            assert log is not None
+            self.assertEqual(log["status"], "confirmed")
+        self.assertEqual({r["id"] for r in db.list_organize_timeline()}, set(receipts))
+        self.assertEqual(db.clear_organize_logs()["deleted"], 2)
+
+    def test_restart_recovers_legacy_skipped_member_and_clear_is_idempotent(self):
+        loser = self.cloud("manual", "loser")
+        winner = self.cloud("confirmed", "winner")
+        db.add_organize_log_items(loser, [{"file_id": "loser", "status": "manual"}])
+        self.confirmation("legacy", ["loser", "winner"], status="completed", result={
+            "total": 2, "moved": 1, "skipped": 1, "failed": 0, "need_confirm": 0,
+        })
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_confirmations SET payload_json=json_remove(payload_json,'$._organize_log_upper_bound')")
+            conn.execute("UPDATE organize_log SET created_at='2026-10-01 00:00:00'")
+            conn.execute("UPDATE organize_log SET updated_at=created_at WHERE id=?", (loser,))
+        db.init_db()
+        log = db.get_organize_log(loser)
+        assert log is not None
+        self.assertEqual(log["status"], "skipped")
+        self.assertIn("入库 1 个、跳过 1 个", log["error"])
+        self.assertEqual(db.list_organize_log_items(loser)[0]["status"], "skipped")
+        db.init_db()
+        recovered = db.get_organize_log(loser)
+        unchanged = db.get_organize_log(winner)
+        assert recovered is not None and unchanged is not None
+        self.assertEqual(recovered["version"], log["version"])
+        self.assertEqual(unchanged["status"], "confirmed")
+        self.assertEqual(db.clear_organize_logs(status="skipped")["deleted"], 1)
+        self.assertEqual(db.clear_organize_logs(status="skipped")["deleted"], 0)
+
+    def test_mixed_group_counts_cannot_identify_skipped_member_without_winner_evidence(self):
+        first, second = self.cloud("manual", "first"), self.cloud("manual", "second")
+        self.confirmation("mixed", ["first", "second"], status="completed", result={
+            "total": 2, "moved": 1, "skipped": 1, "failed": 0, "need_confirm": 0,
+        })
+        self.confirmation("new-second", ["second"], status="pending")
+        db.init_db()
+        for log_id in (first, second):
+            log = db.get_organize_log(log_id)
+            assert log is not None
+            self.assertEqual(log["status"], "manual")
+
+    def test_confirmation_success_preserves_new_manual_log_in_same_second(self):
+        with patch.object(db, "now", return_value="2026-11-09 01:00:00"):
+            previous = self.cloud("manual", "same-file")
+            self.confirmation("frozen", ["same-file"])
+            newer = self.cloud("manual", "same-file")
+            Organizer._write_organize_audit(
+                ("guangya", "/same-file", "/target", "same-file", "success"),
+                {"operation_token": "recognition-confirm:frozen"},
+                [{"file_id": "same-file", "status": "success"}],
+            )
+            db.complete_organize_confirmation_with_delivery(
+                "frozen", result_json='{"total":1,"moved":1,"skipped":0,"failed":0,"need_confirm":0}',
+                event_json="{}", chat_id="", message_id=None, enqueue_delivery=False,
+            )
+        old_log, new_log = db.get_organize_log(previous), db.get_organize_log(newer)
+        assert old_log is not None and new_log is not None
+        self.assertEqual(old_log["status"], "confirmed")
+        self.assertEqual(new_log["status"], "manual")
+        self.assertEqual([r["id"] for r in db.list_organize_timeline(status="manual")], [newer])
+
+    def test_completed_history_does_not_close_new_or_uncertain_manual_work(self):
+        base = {"total": 1, "moved": 0, "skipped": 1, "failed": 0, "need_confirm": 0}
+        kept = []
+        for name, result in (
+            ("new-card", base), ("new-log", base), ("unfinished", {**base, "need_confirm": 1}),
+            ("failed", {**base, "failed": 1}), ("malformed", {**base, "skipped": "1"}),
+            ("missing-result", {}), ("stopped", {**base, "stopped": 1}),
+        ):
+            kept.append(self.cloud("manual", name))
+            self.confirmation(name, [name], status="completed", result=result)
+        self.confirmation("newer", ["new-card"], status="pending")
+        with db.get_conn() as conn:
+            conn.execute("UPDATE organize_log SET updated_at='2099-01-01 00:00:00' WHERE file_id='new-log'")
+        db.init_db()
+        for log_id in kept:
+            log = db.get_organize_log(log_id)
+            assert log is not None
+            self.assertEqual(log["status"], "manual")
+        self.assertEqual(db.clear_organize_logs()["skipped_busy"], len(kept))
+
+    def test_confirmation_log_settlement_failure_rolls_back_terminal_state(self):
+        pending = self.cloud("manual", "atomic")
+        self.confirmation("atomic", ["atomic"])
+        self.cloud("skipped", "atomic", operation_token="recognition-confirm:atomic")
+        with db.get_conn() as conn:
+            conn.execute("CREATE TRIGGER reject_settlement BEFORE UPDATE ON organize_log "
+                         "BEGIN SELECT RAISE(ABORT, 'settlement failure'); END")
+        with self.assertRaisesRegex(Exception, "settlement failure"):
+            db.complete_organize_confirmation_with_delivery(
+                "atomic", result_json="{}", event_json="{}", chat_id="", message_id=None,
+            )
+        confirmation = db.get_organize_confirmation("atomic")
+        log = db.get_organize_log(pending)
+        assert confirmation is not None and log is not None
+        self.assertEqual(confirmation["status"], "running")
+        self.assertEqual(log["status"], "manual")
 
     def test_local_page_clear_and_timeline_share_confirmation_protection(self):
         pending = self.local("requires_manual", "pending")

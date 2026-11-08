@@ -1282,6 +1282,7 @@ def _organize_timeline_query(
                     SELECT 1 FROM organize_log completed
                     WHERE completed.source=l.source AND completed.file_id=l.file_id
                       AND completed.id>l.id AND completed.status='success'
+                      AND completed.operation_token NOT LIKE 'recognition-confirm:%'
                 )
             )
             UNION ALL
@@ -2987,9 +2988,15 @@ def create_organize_confirmation(
 ) -> int:
     """持久化一组 Telegram 整理候选，并使同指纹旧按钮失效。"""
     timestamp = now()
-    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     with get_conn() as conn:
         conn.execute("BEGIN IMMEDIATE")
+        # 冻结确认创建时的日志范围，秒级时间戳不能区分同秒的新扫描记录。
+        payload = dict(payload)
+        if "_organize_log_upper_bound" not in payload:
+            payload["_organize_log_upper_bound"] = conn.execute(
+                "SELECT COALESCE(MAX(id),0) FROM organize_log"
+            ).fetchone()[0]
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         conn.execute(
             "UPDATE organize_confirmations SET status='expired',"
             "result_json=?,error='新的候选卡已替代本次确认',"
@@ -3620,7 +3627,9 @@ def complete_organize_confirmation_with_delivery(
         from app.repositories.download_staging_reconcile import (
             enqueue_confirmation_cleanup,
         )
+        from app.repositories.organize_history import settle_completed_confirmation_logs
 
+        settle_completed_confirmation_logs(conn, token=token)
         enqueue_confirmation_cleanup(conn, token=token, timestamp=timestamp)
         if enqueue_delivery:
             telegram_notifications._enqueue_confirmation_delivery(

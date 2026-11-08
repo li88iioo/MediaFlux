@@ -207,7 +207,7 @@ def _fingerprint(payload: dict) -> str:
         for key, value in payload.items()
         if key not in {
             "organize_task_id", "organize_rollup", "download_request_ids", "_telegram_message_id",
-            _RETRY_SELECTED_INDEX_KEY, _NOTIFICATION_SUPPRESSED_KEY,
+            _RETRY_SELECTED_INDEX_KEY, _NOTIFICATION_SUPPRESSED_KEY, "_organize_log_upper_bound",
         }
     }
     encoded = json.dumps(

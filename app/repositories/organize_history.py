@@ -39,6 +39,87 @@ def active_organize_confirmation_refs(conn: sqlite3.Connection) -> tuple[set[str
     return files, tasks, tokens
 
 
+def settle_completed_confirmation_logs(conn: sqlite3.Connection, *, token: str = "") -> int:
+    """确认终态与原待确认日志一起结算；启动恢复也使用同一规则。"""
+    rows = conn.execute(
+        """
+        WITH matches AS (
+            SELECT l.id AS log_id,l.file_id,l.updated_at AS log_updated_at,c.*,
+                   ROW_NUMBER() OVER (PARTITION BY l.id ORDER BY c.id DESC) AS latest
+            FROM organize_log l JOIN organize_confirmations c
+            JOIN json_each(CASE WHEN json_valid(c.payload_json)
+                           THEN c.payload_json ELSE '{}' END,'$.files') f
+              ON json_extract(CASE WHEN f.type='object' THEN f.value ELSE '{}' END,'$.file_id')=l.file_id
+            WHERE l.source='guangya' AND l.file_id<>'' AND (
+                l.status='manual' OR (l.status='skipped' AND (
+                    instr(COALESCE(l.error,''),'人工确认')>0 OR instr(COALESCE(l.error,''),'待确认')>0)))
+              AND COALESCE(json_extract(CASE WHEN json_valid(c.payload_json)
+                                        THEN c.payload_json ELSE '{}' END,'$.kind'),'guangya')='guangya'
+        )
+        SELECT * FROM matches WHERE latest=1 AND status='completed'
+          AND (?='' OR token=?) AND (
+              (json_type(payload_json,'$._organize_log_upper_bound')='integer'
+               AND log_id<=json_extract(payload_json,'$._organize_log_upper_bound') AND log_updated_at<=created_at)
+              OR (json_type(payload_json,'$._organize_log_upper_bound') IS NULL AND log_updated_at<created_at))
+        """, (token, token),
+    ).fetchall()
+    if not rows:
+        return 0
+    active_files, _, _ = active_organize_confirmation_refs(conn)
+    settled = 0
+    for row in rows:
+        if row["file_id"] in active_files:
+            continue
+        receipt = conn.execute(
+            "SELECT status FROM organize_log WHERE source='guangya' AND file_id=? AND id>? "
+            "AND operation_token=? ORDER BY id DESC LIMIT 1",
+            (row["file_id"], row["log_id"], "recognition-confirm:" + row["token"]),
+        ).fetchone()
+        status, reason = "confirmed", ""
+        if receipt is None:
+            # 旧版本的执行日志可能已清理。仅凭完整、无异常的组结果恢复跳过项，
+            # 不把未知结果猜成成功，也不改写重新扫描后产生的新待确认记录。
+            try:
+                stats = json.loads(row["result_json"])
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(stats, dict) or not (
+                all(type(stats.get(key)) is int for key in ("total", "moved", "skipped", "failed", "need_confirm"))
+                and stats["skipped"] > 0
+                and stats.get("failed") == 0 and stats.get("need_confirm") == 0
+                and not any(stats.get(key) for key in ("stopped", "conflict", "rename_failed"))
+                and stats.get("total") == len(payload["files"])
+                and stats["total"] == stats.get("moved", 0) + stats["skipped"]
+            ):
+                continue
+            members = {str(item.get("file_id") or "") for item in payload["files"] if isinstance(item, dict)}
+            moved = {r["file_id"] for r in conn.execute(
+                "SELECT DISTINCT file_id FROM organize_log WHERE source='guangya' AND status='confirmed' "
+                "AND file_id IN (SELECT value FROM json_each(?)) AND created_at<? AND updated_at=?",
+                (json.dumps(sorted(members)), row["created_at"], row["completed_at"]),
+            )}
+            # 混合组必须保留入库成员的结算证据；组计数本身不能推断哪一项跳过。
+            if len(moved) != stats["moved"] or len(members - moved) != stats["skipped"] or row["file_id"] in moved:
+                continue
+            status = "skipped"
+            reason = f"确认处理已结束；本组入库 {stats['moved']} 个、跳过 {stats['skipped']} 个"
+        elif receipt["status"] not in {"success", "skipped", "failed"}:
+            continue
+        stamp = row["completed_at"] or row["updated_at"]
+        conn.execute(
+            "UPDATE organize_log SET status=?,error=?,confirmation_actor=?,version=version+1,updated_at=? WHERE id=?",
+            (status, reason, row["confirmation_actor"], stamp, row["log_id"]),
+        )
+        conn.execute(
+            "UPDATE organize_log_items SET status=?,error=?,updated_at=? "
+            "WHERE log_id=? AND status IN ('manual','skipped')",
+            (status, reason, stamp, row["log_id"]),
+        )
+        settled += 1
+    return settled
+
+
 def list_related_organize_logs(log_id: int) -> list[sqlite3.Row]:
     """同一云端主文件的其它历史记录；只提供导航，不替换任一历史快照。"""
     with db.get_conn() as conn:
@@ -379,6 +460,7 @@ def next_unsettled_organize_task_run(after_id: int = 0) -> sqlite3.Row | None:
 
 def _recover_after_restart(conn, timestamp: str) -> None:
     """恢复整理确认、写审计与版本化运行结果；回执使用同一事务。"""
+    settle_completed_confirmation_logs(conn)
     _recover_return_receipts_conn(conn, timestamp, limit=-1)
     for run in conn.execute(
         "SELECT id,result FROM task_runs WHERE task_name='guangya_organize' AND status='partial' "

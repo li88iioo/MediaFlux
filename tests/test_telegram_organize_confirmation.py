@@ -1354,6 +1354,8 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
             "support": 1,
         })
         token, callback = self._capture_confirmation_worker(group=group)
+        # 其它扫描产生新日志不能扩大原确认的重试范围，也不能改变快照指纹。
+        db.add_organize_log("guangya", "/other", "", "other-file", "manual")
         with db.get_conn() as conn:
             conn.execute(
                 "UPDATE organize_confirmations SET expires_at=? WHERE token=?",
@@ -1395,6 +1397,7 @@ class ConfirmationPersistenceTests(IsolatedDatabaseTestCase):
         self.assertEqual(retry_row["fingerprint"], old_row["fingerprint"])
         old_payload = json.loads(old_row["payload_json"])
         retry_payload = json.loads(retry_row["payload_json"])
+        self.assertEqual(confirmation_module._fingerprint(old_payload), old_row["fingerprint"])
         self.assertEqual(retry_payload.pop("_retry_selected_index"), 0)
         self.assertEqual(retry_payload, old_payload)
         with self.assertRaisesRegex(ValueError, "已绑定其他候选"):

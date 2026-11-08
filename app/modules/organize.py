@@ -7350,7 +7350,8 @@ class Organizer:
             log_id = add_organize_log(*log_args, **log_kwargs, _conn=conn)
             try:
                 add_organize_log_items(log_id, items, _conn=conn)
-                if len(log_args) >= 5 and str(log_args[4] or "") == "success":
+                if (len(log_args) >= 5 and str(log_args[4] or "") == "success"
+                        and not str(log_kwargs.get("operation_token") or "").startswith("recognition-confirm:")):
                     try:
                         db.resolve_pending_organize_logs(
                             str(log_args[0] or ""),
