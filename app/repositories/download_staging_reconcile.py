@@ -192,9 +192,11 @@ def _recover_reorganized_request(conn, recovery: dict, *, source_ids: list[str])
 
 def reconcile_reorganized_confirmations(source_ids: list[str], *, conn=None,
                                        recovery: dict | None = None) -> list[str]:
-    """以成功重整的文件快照关闭旧确认，并复用持久收尾队列；不凭下载完成猜入库。"""
+    """以成功重整快照关闭旧确认，同事务登记收尾和回执，并补齐旧重整终态。"""
     if not source_ids:
         return []
+    from app.modules.organize_confirmations import enqueue_reorganized_confirmation_delivery
+
     resolved: list[str] = []
     placeholders = ','.join('?' for _ in source_ids)
     with (nullcontext(conn) if conn is not None else db.get_conn()) as connection:
@@ -204,7 +206,9 @@ def reconcile_reorganized_confirmations(source_ids: list[str], *, conn=None,
             _recover_reorganized_request(connection, recovery, source_ids=source_ids)
         confirmations = connection.execute(
             "SELECT c.* FROM organize_confirmations c "
-            "WHERE c.status IN ('pending','failed','expired','cancelled') "
+            "WHERE (c.status IN ('pending','failed','expired','cancelled') OR "
+            "(c.status='completed' AND CASE WHEN json_valid(c.result_json) THEN "
+            "json_extract(c.result_json,'$.resolution') END='reorganized')) "
             f"AND NOT {_RELOCATED_CONFIRMATION_SQL} "
             "AND CASE WHEN json_valid(c.payload_json) THEN "
             f"CAST(json_extract(c.payload_json,'$.source_dir_id') AS TEXT) END IN ({placeholders}) "
@@ -212,6 +216,13 @@ def reconcile_reorganized_confirmations(source_ids: list[str], *, conn=None,
             "WHERE newer.fingerprint=c.fingerprint AND newer.id>c.id)", source_ids,
         ).fetchall()
         for confirmation in confirmations:
+            if confirmation['status'] == 'completed':
+                # 已提交的成功不重写历史，也不再触碰可能已清理的目录。
+                if _success(confirmation['result_json']):
+                    enqueue_reorganized_confirmation_delivery(
+                        connection, confirmation, timestamp=db.now(), repair_existing=True,
+                    )
+                continue
             payload = _object(confirmation['payload_json'])
             source_id = str(payload.get('source_dir_id') or '')
             owners = requests_for_download_confirmation(payload, conn=connection)
@@ -290,6 +301,11 @@ def reconcile_reorganized_confirmations(source_ids: list[str], *, conn=None,
                 )
                 token = str(confirmation['token'])
                 enqueue_confirmation_cleanup(connection, token=token, timestamp=timestamp)
+                completed = connection.execute(
+                    'SELECT * FROM organize_confirmations WHERE id=?', (int(confirmation['id']),),
+                ).fetchone()
+                assert completed is not None  # 同一写事务内刚刚更新的确认必定存在。
+                enqueue_reorganized_confirmation_delivery(connection, completed, timestamp=timestamp)
                 resolved.append(token)
     return resolved
 

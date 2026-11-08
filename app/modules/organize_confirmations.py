@@ -511,6 +511,7 @@ def publish_confirmation_event(
     error: bool = False,
     deliver_now: bool = True,
     expected_confirmation_delivery: tuple[int, int] | None = None,
+    expected_revision: int | None = None,
 ) -> bool:
     """把候选卡及其终态写入同一个可靠 Telegram 消息线程。"""
     from app.modules.telegram_notification_center import publish_notification_thread
@@ -537,6 +538,7 @@ def publish_confirmation_event(
             preferred_message_id=(message_id or 0),
             deliver_now=deliver_now,
             expected_confirmation_delivery=expected_confirmation_delivery,
+            expected_revision=expected_revision,
         )
     finally:
         if not terminal:
@@ -1401,6 +1403,7 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
 
     delivery_id = int(item["id"])
     generation = int(item["lease_generation"])
+    expected_revision = _decode_json_object(item['event_json']).get('_expected_notification_revision')
     try:
         event = deserialize_notification_event(item["event_json"])
     except ValueError:
@@ -1425,7 +1428,17 @@ def _dispatch_due_confirmation_delivery(token: str = "") -> bool:
             error=str(event.title).startswith(("❌", "⚠️")),
             deliver_now=terminal,
             expected_confirmation_delivery=(delivery_id, generation),
+            expected_revision=expected_revision,
         )
+        if not accepted and expected_revision is not None:
+            from app.modules.telegram_notification_center import get_notification_thread_snapshot
+            from app.modules.telegram_notification_policy import NotificationTopic
+
+            snapshot = get_notification_thread_snapshot(
+                f'confirmation:{token}', topic=NotificationTopic.CONFIRMATION, chat_id=chat_id,
+            )
+            # 历史补偿排队后线程已更新或清理，旧首版卡的更新即作废。
+            accepted = snapshot is None or snapshot.revision != expected_revision
     except Exception as exc:
         accepted = False
         logger.warning(
@@ -2129,6 +2142,92 @@ def _confirmation_message_id(payload: dict) -> int | None:
 
 def _confirmation_delivery_enabled(payload: dict) -> bool:
     return not bool(payload.get(_NOTIFICATION_SUPPRESSED_KEY))
+
+
+def enqueue_reorganized_confirmation_delivery(
+    conn, confirmation: Row, *, timestamp: str, repair_existing: bool = False,
+) -> None:
+    """在重整收口事务内登记终态；相同回执不重置租约、重试或后续卡片。"""
+    from app.modules.telegram_media_projection import attach_bounded_media_details
+    from app.modules.telegram_notification_center import notification_thread_event_key
+    from app.modules.telegram_notification_policy import NotificationTopic
+    from app.notifier import _format_season_episode_range
+    from app.repositories.telegram_notifications import _enqueue_confirmation_delivery
+
+    payload = _decode_row(confirmation)
+    if not _confirmation_delivery_enabled(payload):
+        return
+    message_id = _confirmation_message_id(payload)
+    expected_revision = None
+    if repair_existing:
+        key = notification_thread_event_key(
+            f"confirmation:{confirmation['token']}", topic=NotificationTopic.CONFIRMATION,
+            chat_id=str(confirmation['chat_id'] or ''),
+        )
+        previous = conn.execute(
+            "SELECT * FROM telegram_notification_outbox WHERE event_key=? AND message_id>0 "
+            "AND status='sent' AND revision=1 AND delivered_revision=1", (key,),
+        ).fetchone()
+        if previous is None or not any(
+            isinstance(action, dict)
+            and str(action.get('callback_data') or '').startswith(f"orgc:{confirmation['token']}:")
+            for action in _decode_json_object(previous['event_json']).get('actions', [])
+        ):
+            return
+        message_id = int(previous['message_id'])
+        expected_revision = int(previous['revision'])
+    stats = json.loads(confirmation['result_json'])
+    event = NotificationEvent(
+        "✅ Web 重新整理完成",
+        fields=(
+            ("源文件目录", _confirmation_source_display({
+                "source_name": confirmation['source_name'],
+                "directory": confirmation['directory_path'], **payload,
+            })),
+            NOTIFICATION_SECTION_BREAK,
+            ("执行结果", f"{safe_int(stats.get('moved'), 0, minimum=0)} 个文件已整理完成"),
+        ),
+        footer="本确认已通过 Web 重新整理完成，无需再次选择候选。",
+        layout="relaxed",
+    )
+    log_ids = list(dict.fromkeys(
+        value for value in stats.get('organize_log_ids', []) if type(value) is int and value > 0
+    ))
+    blocks = []
+    if log_ids:
+        marks = ','.join('?' for _ in log_ids)
+        for media in conn.execute(
+            "SELECT title,year,media_type,season,json_group_array(episode) AS episodes "
+            f"FROM organize_log WHERE id IN ({marks}) AND source='guangya' "
+            "AND status='success' AND legacy_incomplete=0 "
+            "GROUP BY provider,tmdb_id,external_id,title,year,media_type,season ORDER BY MIN(id)", log_ids,
+        ):
+            title = str(media['title'] or '媒体标题未记录')
+            year = f" ({media['year']})" if media['year'] else ''
+            position = ''
+            if media['media_type'] == 'tv':
+                position = _format_season_episode_range(media['season'], json.loads(media['episodes']))
+                if not position and media['season'] is not None:
+                    position = f"S{media['season']:02d}"
+            blocks.append(f"{title}{year}" + (f" · {position}" if position else ''))
+    event = attach_bounded_media_details(event, blocks)
+    encoded = json.loads(serialize_notification_event(event))
+    existing = conn.execute(
+        'SELECT event_json FROM organize_confirmation_delivery_outbox WHERE confirmation_token=?',
+        (confirmation['token'],),
+    ).fetchone()
+    if existing is not None:
+        previous_event = _decode_json_object(existing['event_json'])
+        previous_event.pop('_expected_notification_revision', None)
+        if previous_event == encoded:
+            return
+    if expected_revision is not None:
+        encoded['_expected_notification_revision'] = expected_revision
+    _enqueue_confirmation_delivery(
+        conn, token=str(confirmation['token']), event_json=json.dumps(encoded, ensure_ascii=False),
+        chat_id=str(confirmation['chat_id'] or ''), message_id=message_id,
+        timestamp=timestamp,
+    )
 
 
 def _local_confirmation_result_event(
