@@ -5,7 +5,7 @@ RUN apk upgrade --no-cache
 
 WORKDIR /src
 
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json .npmrc ./
 RUN npm install --global npm@12.2.1 --ignore-scripts --no-audit --no-fund --registry=https://registry.npmjs.org
 RUN npm ci --ignore-scripts --no-audit --no-fund
 

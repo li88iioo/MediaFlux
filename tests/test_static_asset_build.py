@@ -85,7 +85,14 @@ class StaticAssetBuildTests(unittest.TestCase):
         self.assertEqual(package["devDependencies"]["lightningcss"], "1.33.0")
         self.assertEqual(package["devDependencies"]["lucide"], "1.70.0")
         self.assertEqual(package["devDependencies"]["gsap"], "3.15.1")
-        self.assertTrue((self.ROOT / "package-lock.json").is_file())
+        lock = json.loads((self.ROOT / "package-lock.json").read_text(encoding="utf-8"))
+        for name, entry in lock["packages"].items():
+            if name:
+                with self.subTest(package=name):
+                    self.assertTrue(entry["resolved"].startswith("https://registry.npmjs.org/"),
+                                    "锁文件不能混入与构建 registry 不同的镜像源")
+        self.assertIn("registry=https://registry.npmjs.org",
+                      (self.ROOT / ".npmrc").read_text(encoding="utf-8").splitlines())
 
     def test_output_preserves_every_static_asset_path(self) -> None:
         self.assertEqual(self._files(self.STATIC_ROOT), self._files(self.output))
@@ -198,6 +205,7 @@ class StaticAssetDockerContractTests(unittest.TestCase):
             "2d44738ebf4ce5f63b9d9ea871e9c7cfdc0426f7b0c97cac915fd88ded1d86bb"
         )
         self.assertIn(builder, dockerfile)
+        self.assertIn("COPY package.json package-lock.json .npmrc ./", dockerfile)
         self.assertIn("RUN npm ci --ignore-scripts --no-audit --no-fund", dockerfile)
         self.assertIn("npm run build:static -- --input /src/app/static --output /out", dockerfile)
         self.assertIn("COPY --from=static-builder /out/ /app/app/static/", dockerfile)
