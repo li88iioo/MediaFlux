@@ -460,8 +460,12 @@ def test_rpc_merged_pages_keep_frozen_selection_and_cold_confirmation(native, re
         pipeline = native.pipeline(cold)
         second = await read_query(pipeline, context, resource_query, page=2)
         ids = [first['items'][0]['result_id'], second['items'][-1]['result_id']]
+        if resource_query.method == 'resources.search_missing':
+            # 库存只确认缺少 E01/E02，原始页尾 E26 应保留研究，不能进入下载卡。
+            ids = [first['result_ids'][0], second['result_ids'][-1]]
         response, view = await display(pipeline, context, ids)
         assert 'error' not in response and view, response
+        assert response['result']['result_ids'] == ids
         assert response['result']['scope']['candidate_count'] == 52
         state = await cold.load(owner=context.owner, session_id=context.session_id)
         selection = await validate_selection({'ref': view['selection_ref'], 'positions': [1, 2], 'target': 'qb'}, state=state, store=cold)
@@ -796,16 +800,26 @@ def test_rpc_parallel_search_completion_keeps_facts_without_replacing_card(nativ
     asyncio.run(exercise())
 
 
-def test_rpc_missing_pack_preserves_every_verification_goal_through_selection_and_effect_preview(native, monkeypatch):
+@pytest.mark.parametrize('choice', ['rejected', 'alternatives'])
+def test_rpc_missing_pack_preserves_every_verification_goal_through_selection_and_effect_preview(native, monkeypatch, choice):
     from app.modules import missing_resources
     from app.indexers import downloads
     from tests.test_missing_resources import audit_for
     from tests.support import _prepare_batch
     async def search(request, site_ids=None, **kwargs):
-        item = IndexerItem('nyaa', 'Nyaa', f'{request.title}.S01E01-02.1080p.WEB-DL', download_state='ready',
-            download_kinds=('magnet',), magnet='magnet:?xt=urn:btih:'+('a' if request.title == 'First' else 'b')*40)
-        identity = native.service.result_store.put(item)
-        return AggregatedIndexerResult(query=request.title, page=1, items=[replace(item, result_id=identity)], sites_attempted=('nyaa',), sites_succeeded=('nyaa',))
+        items = []
+        for number, title in enumerate([
+            f'{request.title}.S01E01-02.2160p.WEB-DL',
+            f'{request.title}.S01E01-02.1080p.WEB-DL',
+            f'{request.title}.S01E09.1080p.WEB-DL',
+            f'{request.title}.1080p.WEB-DL',
+            'Unrelated.S01E01.1080p.WEB-DL',
+        ], 1):
+            item = IndexerItem('nyaa', 'Nyaa', title, download_state='ready',
+                download_kinds=('magnet',), magnet='magnet:?xt=urn:btih:' + f'{number:040x}')
+            items.append(replace(item, result_id=native.service.result_store.put(item)))
+        return AggregatedIndexerResult(query=request.title, page=1, items=items,
+            sites_attempted=('nyaa',), sites_succeeded=('nyaa',))
     def audit(arguments, **kwargs):
         return audit_for(arguments['query'], episodes=[1, 2], identity='1' if arguments['query'] == 'First' else '2')
     monkeypatch.setattr(native.service, 'search_media', search)
@@ -821,17 +835,47 @@ def test_rpc_missing_pack_preserves_every_verification_goal_through_selection_an
         assert 'error' not in response, response
         value = response['result']
         assert len(value['result_ids']) == 2 and len(value['verification_targets']) == 4
-        response, view = await display(pipeline, context, value['result_ids'])
+        original = deepcopy(value)
+        assert len(value['items']) == 10  # 研究数据保留错集、未知编号和其它作品。
+        ids = [item['result_id'] for item in value['items']
+               if item['title'].endswith('.S01E01-02.1080p.WEB-DL')]
+        assert len(ids) == 2 and not set(ids).intersection(value['result_ids'])
+        if choice == 'rejected':
+            ids = [item['result_id'] for item in value['items']
+                   if '.S01E01-02.' not in item['title']]
+            response, view = await display(pipeline, context, ids)
+            assert 'error' not in response, response
+            assert response['result']['result_ids'] == [] and view is None
+            assert response['result']['excluded_count'] == 6
+            assert value == original
+            return
+        expected = [{**goal, 'result_id': identity}
+            for identity, group in zip(ids, value['groups'], strict=True)
+            for goal in value['verification_targets'] if goal['query'] == group['query']]
+        response, view = await display(pipeline, context, ids)
         assert 'error' not in response and view, response
-        assert response['result']['verification_targets'] == value['verification_targets']
-        state = await native.store.load(owner=context.owner, session_id=context.session_id)
-        selection = await validate_selection({'ref':view['selection_ref'],'positions':[1,2],'target':'guangya'}, state=state, store=native.store)
-        assert list(selection.arguments['verification_targets']) == value['verification_targets']
-        prepared = await pipeline.prepare('resources.download', {'result_ids':value['result_ids'],'target':'guangya'}, context=context)
+        assert response['result']['verification_targets'] == expected
+        assert all(item['match'] == 'episode_pack' and item['requested_episode'] == [1, 1] for item in view['items'])
+        assert all(item['warnings'] for item in view['items'])  # 标题匹配不等于文件已核验。
+        cold = SQLiteKernelStore(secret_provider=lambda: SECRET)
+        state = await cold.load(owner=context.owner, session_id=context.session_id)
+        selection = await validate_selection({'ref':view['selection_ref'],'positions':[1,2],'target':'guangya'}, state=state, store=cold)
+        assert list(selection.arguments['verification_targets']) == expected
+        native.service.result_store = IndexerResultStore()
+        pipeline = native.pipeline(cold)
+        context = await context_for(cold)
+        prepared = await pipeline.prepare('resources.download', {'result_ids':ids,'target':'guangya'}, context=context)
         assert prepared.effect_plan is not None
         assert sum(map(len, prepared.effect_plan.metadata['verification_targets'].values())) == 4
-        assert list(prepared.effect_plan.arguments['verification_targets']) == value['verification_targets']
+        assert list(prepared.effect_plan.arguments['verification_targets']) == expected
         assert prepared.effect_plan.metadata['resource_selection']['ref'] == view['ref']
+        submitted = AsyncMock(return_value={'ok': True, 'status': 'accepted', 'summary': '已受理', 'error': '', 'items': []})
+        monkeypatch.setattr(downloads, 'submit_indexer_download_batch', submitted)
+        await pipeline.execute_confirmed(prepared.effect_plan.plan_id, context=context)
+        submitted.assert_awaited_once()
+        assert submitted.call_args.args[1:3] == (ids, 'guangya')
+        assert submitted.call_args.kwargs['verification_targets'] == prepared.effect_plan.metadata['verification_targets']
+        assert value == original
         from app import database as db
         with db.get_conn() as conn:
             assert conn.execute('SELECT COUNT(*) FROM download_requests').fetchone()[0] == 0

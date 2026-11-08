@@ -17,6 +17,26 @@ def capture_candidates(result: dict, arguments: dict, service, search_id: str) -
     from app.modules.episode_resource_ranking import matched_episode_items
 
     goals = deepcopy(result.get("verification_targets") or [])
+    qualities = {}
+    if "groups" in result:
+        # 根 items 是研究原文；逐目标判据才决定哪些资源可展示及需核验哪些缺集。
+        targets = {}
+        for group in result["groups"]:
+            proof = group["verification"]
+            if not proof.get("verified_missing"):
+                continue
+            for episode in group["episodes"]:
+                search = episode["search"]
+                for identity in search["result_ids"]:
+                    quality = search["quality"][identity]
+                    if not quality["eligible"] or quality["match"] not in {"exact_episode", "episode_pack"}:
+                        continue
+                    qualities.setdefault(identity, quality)
+                    goal = {"result_id": identity, "query": proof["title"], "tmdb_id": proof["tmdb_id"],
+                            "season": episode["season"], "episode": episode["episode"],
+                            "as_of": proof["as_of"], "library_name": proof.get("library_name", "")}
+                    targets.setdefault(tuple(goal.items()), goal)
+        goals = list(targets.values())
     proof_by_id = {goal["result_id"]: goal for goal in reversed(goals)}
     candidates, display, private = [], [], []
     seen = set()
@@ -33,13 +53,8 @@ def capture_candidates(result: dict, arguments: dict, service, search_id: str) -
         if proof := proof_by_id.get(identity):
             source["_verification_context"] = {"title": proof["query"],
                 **{key: value for key, value in proof.items() if key not in {"result_id", "query"}}}
-            # 推荐核验来自 search_missing 的正式目标，不由模型提供。
-            for group in result.get("groups") or []:
-                for episode in group.get("episodes") or []:
-                    selected = episode.get("search", {}).get("recommendation", {}).get("selected")
-                    if selected and selected.get("result_id") == identity:
-                        source["quality"] = selected.get("quality") or selected
-                        break
+        if identity in qualities:
+            source["quality"] = qualities[identity]
         display.append(candidate_item(source, position))
         private.append(_serialize_private_item(identity, item))
     query = {key: deepcopy(value) for key, value in (result.get("request") or arguments).items() if key != "page"}
@@ -48,7 +63,9 @@ def capture_candidates(result: dict, arguments: dict, service, search_id: str) -
     source = {"query": query, "result_ids": [item["result_id"] for item in candidates], "_display_items": display,
               "pages": [{"page": arguments.get("page", 1),
                 **{key: deepcopy(result[key]) for key in ("partial", "truncated", "complete", "has_more", "page") if key in result}}]}
-    if recommendation := result.get("recommendation"):
+    if "groups" in result:
+        source["matching_ids"] = [item["result_id"] for item in candidates if item["result_id"] in qualities]
+    elif recommendation := result.get("recommendation"):
         query.update(recommendation["target"])
         source["matching_ids"] = [item["result_id"] for item in matched_episode_items(result)]
     return {"search_id": search_id,
