@@ -100,7 +100,7 @@ class DockerWorkflowTests(unittest.TestCase):
         from tests.test_bootstrap_release_contract import BootstrapReleaseContractTests
 
         harness = BootstrapReleaseContractTests()
-        for mode, expected in (("success", 0), ("setup", 37), ("login", 41)):
+        for mode, expected in (("success", 0), ("setup", 37), ("login", 41), ("sandbox", 43)):
             with self.subTest(mode=mode):
                 # The harness also checks every generated password is absent from stdout/stderr/argv.
                 code, events = harness.run_smoke(mode, step_name="Start image and wait for health check")
@@ -108,6 +108,8 @@ class DockerWorkflowTests(unittest.TestCase):
                 starts = [e for e in events if "--detach" in e["args"]]
                 forms = [e for e in events if "requests" in e]
                 self.assertEqual(len(starts), 1)
+                self.assertIn("seccomp=unconfined", starts[0]["args"])
+                self.assertIn("apparmor=unconfined", starts[0]["args"])
                 self.assertEqual(len(forms), 1)
                 self.assertGreaterEqual(len(forms[0]["settings"]["ENV_WEB_PASSWORD"]), 32)
                 if mode == "success":
@@ -115,8 +117,12 @@ class DockerWorkflowTests(unittest.TestCase):
                         ("GET", "/setup"), ("POST", "/setup"), ("GET", "/login"),
                         ("POST", "/login"), ("GET", "/readyz"),
                     ])
-                else:
+                elif mode in {"setup", "login"}:
                     self.assertFalse(any("version" in e["args"] or "doctor" in e["args"] for e in events))
+                if mode in {"success", "sandbox"}:
+                    probes = [e for e in events if "/app/app/agent/kernel/sandbox_child.py" in e["args"]]
+                    self.assertEqual(len(probes), 1)
+                    self.assertEqual(probes[0]["args"][-1], "--check")
 
     def test_graceful_shutdown_accepts_uvicorn_sigterm_and_requires_lifespan_exit(
         self,

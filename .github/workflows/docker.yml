@@ -185,6 +185,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/mediaflux-db" "$RUNNER_TEMP/mediaflux-strm"
           sudo chown -R 10001:10001 "$RUNNER_TEMP/mediaflux-db" "$RUNNER_TEMP/mediaflux-strm"
           docker run --detach --name mediaflux-smoke \
+            --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
             --publish 127.0.0.1:1258:1258 \
             --volume "$RUNNER_TEMP/mediaflux-db:/app/db" \
             --volume "$RUNNER_TEMP/mediaflux-strm:/data/strm" \
@@ -203,6 +204,9 @@ jobs:
                 > "$RUNNER_TEMP/docker-doctor.json"
               jq -e 'all(.[]; .status != "error")' \
                 "$RUNNER_TEMP/docker-doctor.json"
+              # 与官方 Compose 相同的权限下实际创建 Agent 沙箱，网页健康不代表工作区可用。
+              docker exec mediaflux-smoke python -I -S -B \
+                /app/app/agent/kernel/sandbox_child.py --check
               curl --fail --silent --show-error \
                 http://127.0.0.1:1258/static/js/app.js >/dev/null
               source_app_js_bytes=$(wc -c < app/static/js/app.js)

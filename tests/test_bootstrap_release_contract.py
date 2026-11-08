@@ -3,13 +3,12 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import signal
 import subprocess
 import sys
 import tempfile
 import unittest
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -91,6 +90,9 @@ elif name == 'docker':
             elif 'sh' in args:
                 if 'wc -c' in args[-1]:
                     print('1')
+            elif '/app/app/agent/kernel/sandbox_child.py' in args:
+                assert args[-1] == '--check'
+                fail('sandbox', 43)
             else:
                 fail('readiness', 1)
         else:
