@@ -24,7 +24,7 @@ from app.agent.errors import ToolPipelineError
 from app.agent.public_safety import public_tool_label, sanitize_public_text
 from app.modules.process_lock import CrossProcessLock
 from app.runtime_paths import get_runtime_paths
-from app.sdk import METHODS, WRITE_METHODS, call_owner, describe_methods, describe_namespaces
+from app.sdk import METHODS, METHOD_EFFECTS, call_owner, describe_methods, describe_namespaces
 from app.sensitive_data import redact_sensitive_text
 
 from .capabilities import KernelToolSpec, ToolEffect
@@ -275,6 +275,9 @@ class _SDKRequests:
             function = METHODS.get(method)
             if function is None:
                 raise ValueError(f"未知 SDK 方法：{method}；可运行 mf --help 查看接口")
+            effect = METHOD_EFFECTS.get(method)
+            if effect not in {"read", "write", "control", "local_write"}:
+                raise ToolPipelineError("SDK 方法未声明行为类别，调用未执行", code="sdk_method_unclassified")
             arguments = request["arguments"]
             if not isinstance(arguments, dict):
                 raise TypeError("arguments 必须是对象")
@@ -287,12 +290,12 @@ class _SDKRequests:
                     if not self.task_budget_admitted:
                         await self.context.task_budget()
                         self.task_budget_admitted = True
-            if self.context.read_only and method in WRITE_METHODS | {"skills.save", "skills.restore"}:
+            if self.context.read_only and effect in {"write", "local_write"}:
                 raise ToolPipelineError("工作区行动接力仅允许只读 SDK。", code="read_scope_required")
             activity = _sdk_activity(activity_id, method, arguments)
             if activity:
                 await self.context.report_progress({"activity": activity})
-            if method in WRITE_METHODS:
+            if effect == "write":
                 async with self.effect_lock:
                     if self.proposal is not None:
                         raise ToolPipelineError("已有操作等待确认；本次调用未执行", code="approval_pending")
@@ -319,7 +322,7 @@ class _SDKRequests:
                 snapshot = await self.presentation.snapshot() if method == "resources.present" and bound.arguments.get("result_ids") else None
                 def invoke():
                     # 技能保存/恢复是内部写入，也不能当作只读观察归档。
-                    if method not in {"skills.save", "skills.restore"}:
+                    if effect != "local_write":
                         observation.update(method=method,
                                            arguments={key: value for key, value in bound.arguments.items() if value is not Ellipsis},
                                            called_at=datetime.now(timezone.utc).isoformat())

@@ -64,7 +64,7 @@ def register_sdk_fixture(monkeypatch, tools):
         if not hasattr(sdk, namespace):
             monkeypatch.setattr(sdk, namespace, SimpleNamespace(), raising=False)
     monkeypatch.setattr(sdk, "WRITE_METHODS", sdk.WRITE_METHODS | {tool.name for tool in tools})
-    monkeypatch.setattr(sandbox, "WRITE_METHODS", sdk.WRITE_METHODS)
+    monkeypatch.setattr(sandbox, "METHOD_EFFECTS", {**sdk.METHOD_EFFECTS, **{tool.name: "write" for tool in tools}})
 
 
 def step(name):

@@ -780,6 +780,23 @@ def sdk_client(tmp_path, monkeypatch):
     return module, calls
 
 
+def test_sdk_registration_requires_an_explicit_effect_without_wrapping_functions():
+    class Undeclared:
+        @staticmethod
+        def remove():
+            raise AssertionError("registration must not execute methods")
+
+    with pytest.raises(ValueError, match="必须声明"):
+        sdk._collect_methods({"new": Undeclared()})
+
+    Undeclared.remove = staticmethod(sdk.sdk_method("write")(Undeclared.remove))
+    methods, effects = sdk._collect_methods({"new": Undeclared()})
+    assert methods["new.remove"] is Undeclared.remove
+    assert effects == {"new.remove": "write"}
+    assert set(sdk.METHOD_EFFECTS) == set(sdk.METHODS)
+    assert sdk.WRITE_METHODS == {name for name, effect in sdk.METHOD_EFFECTS.items() if effect == "write"}
+
+
 def test_python_client_and_cli_share_real_signatures(tmp_path, sdk_client):
     module, calls = sdk_client
     assert "本地媒体库" in module.library.__doc__

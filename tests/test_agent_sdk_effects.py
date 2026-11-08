@@ -327,7 +327,10 @@ def test_entire_batch_survives_restart_and_confirmation_is_once_only(resources_b
         monkeypatch.setattr(service.result_store, "_clock", lambda: clock[0])
         assert isinstance(first.effect_store, ConfirmationEffectPlanStore)
         monkeypatch.setattr(first.effect_store.store, "_clock", lambda: clock[0].timestamp())
-        assert all(first.catalog.has(name) for name in WRITE_METHODS)
+        # batch 是仅供 SDK 使用的执行端点，不进入模型可见工具目录。
+        registered_writes = {tool.name for tool in first.catalog.visible() if tool.effect.value != "read"}
+        registered_writes.add(first.catalog.get("session.batch").name)
+        assert registered_writes == WRITE_METHODS
         ids = [f"candidate-{i:016d}" for i in range(20)]
         if requested is not None:
             with sdk.call_owner(context.owner):

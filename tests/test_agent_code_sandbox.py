@@ -1016,6 +1016,20 @@ class NativeWorkspaceTests(unittest.IsolatedAsyncioTestCase):
             await service.aclose()
             runtime.unbind_indexer_event_loop(loop)
 
+    async def test_unclassified_registered_method_is_rejected_without_calling_it(self):
+        invoked = []
+
+        def unclassified():
+            invoked.append(True)
+            return {"ok": True}
+
+        with patch.dict(sandbox.METHODS, {"cloud.unclassified": unclassified}):
+            data = await self.execute('mf.cloud.unclassified()')
+        self.assertNotEqual(data["exit_code"], 0)
+        self.assertIn("未声明行为类别", data["stderr"])
+        self.assertEqual(invoked, [])
+        self.assertFalse(data["sdk_calls"][0]["ok"])
+
     async def test_internal_skill_writes_do_not_archive_write_arguments_or_results(self):
         with patch.dict(sandbox.METHODS, {
             "skills.save": lambda name: {"write_receipt": "private-save"},
