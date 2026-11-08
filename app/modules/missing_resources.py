@@ -507,7 +507,7 @@ def search_missing(
     )
     if when > datetime.now().astimezone().date():
         raise ValueError("as_of 不能晚于今天")
-    _integer(page, "page", 1000)
+    _integer(page, "page", 100)
     _integer(limit_per_episode, "limit_per_episode", 10)
     if max_episodes is not None:
         _integer(max_episodes, "max_episodes", 100)

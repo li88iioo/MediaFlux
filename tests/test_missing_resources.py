@@ -252,6 +252,7 @@ def test_invalid_targets_never_start_audit_or_indexer(backend, items):
         {"limit_per_episode": 0},
         {"page": True},
         {"page": 0},
+        pytest.param({"page": 101}, id="page_above_indexer_maximum"),
         {"as_of": (datetime.now().astimezone().date() + timedelta(days=1)).isoformat()},
         {"preference_overrides": {"preferred_server": "emby"}},
         {"preference_overrides": {"max_episode_size_gb": -1}},
@@ -260,9 +261,14 @@ def test_invalid_targets_never_start_audit_or_indexer(backend, items):
     ],
 )
 def test_invalid_options_never_start_io(backend, kwargs):
-    with pytest.raises((TypeError, ValueError)):
-        sdk.resources.search_missing([{"query": "Show", "season": 1}], **kwargs)
+    with patch.object(
+        actions, "get_indexer_service", wraps=actions.get_indexer_service
+    ) as service:
+        with pytest.raises((TypeError, ValueError)):
+            sdk.resources.search_missing([{"query": "Show", "season": 1}], **kwargs)
+    service.assert_not_called()
     backend.audit.assert_not_called()
+    backend.service.search_media.assert_not_called()
 
 
 @pytest.mark.parametrize("verdict", [None, "true", 1, [], {}])
@@ -1000,7 +1006,13 @@ def test_real_indexer_service_keeps_site_page_cursors_when_continuing_native_sea
     assert {r["result_id"] for r in first["items"]}.isdisjoint(
         r["result_id"] for r in second["items"]
     )
-    assert set(seen) == {1, 2}
+    last = sdk.resources.search_missing(
+        [{"query": "Show", "season": 1, "episodes": [1]}],
+        sites=["nyaa"], page=100,
+    )
+    assert last["ok"] and last["status"] == "success" and last["complete"]
+    assert last["page"] == last["groups"][0]["searches"][0]["page"] == 100
+    assert set(seen) == {1, 2, 100}
 
 
 @pytest.mark.parametrize("library_name", ["", None])
