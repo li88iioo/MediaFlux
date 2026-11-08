@@ -2600,36 +2600,49 @@ def media_path_mapping_tools() -> tuple[KernelToolSpec, ...]:
     return tuple(tools)
 
 
-def feature_config_tool() -> KernelToolSpec:
-    """只将单项配置发布接入确认账本；解析、CAS、回读与 reload 归公共服务。"""
+def _settings_config_tool(kind: str) -> KernelToolSpec:
+    """功能与策略共用单项配置确认；CAS、回读及锁外 reload 仍归各公共服务。"""
     from app import sdk
-    from app.modules import feature_config as service
+
+    if kind == "feature":
+        from app.modules import feature_config as service
+        label, conflict = "功能", service.FeatureConflict
+        required = ["feature", "enabled"]
+        properties = {"feature": {"type": "string", "enum": list(service.FEATURES)}, "enabled": {"type": "boolean"}}
+    else:
+        from app.modules import policy_config as service
+        label, conflict = "策略", service.PolicyConflict
+        required = ["policy", "value"]
+        properties = {"policy": {"type": "string", "enum": list(service.POLICY_IDS)},
+                      "value": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}
+    name = "settings.set_" + kind
+    fingerprint_key = kind + "_fingerprint"
 
     def prepare(arguments, context):
         try:
             with confirmation_runtime(context) as prefix:
                 context.cancellation.raise_if_cancelled()
-                values = sdk.prepare_sdk_method("settings.set_feature", arguments, owner=context.owner)
-                prepared = service.prepare_feature(**values)
+                values = sdk.prepare_sdk_method(name, arguments, owner=context.owner)
+                prepared = getattr(service, "prepare_" + kind)(**values)
                 preview = ToolResult(**prepared["preview"])
                 if not preview.ok:
                     raise ToolPipelineError(preview.summary, code=preview.status)
                 if preview.status == "no_changes":
                     return DefaultProjector().project(preview)
-                return PreparedEffect(preview=preview.to_dict(), arguments=values,
+                return PreparedEffect(preview=preview.to_dict(), arguments=prepared["arguments"] if kind == "policy" else values,
                     snapshot_fingerprint=prefix + prepared["fingerprint"],
-                    metadata={"risk": "low_write", "feature_fingerprint": prepared["fingerprint"], "confirmation": build_confirmation_contract(
-                        tool_name="settings.set_feature", risk=RiskLevel.LOW_WRITE, preview=preview)})
+                    metadata={"risk": "low_write", fingerprint_key: prepared["fingerprint"], "confirmation": build_confirmation_contract(
+                        tool_name=name, risk=RiskLevel.LOW_WRITE, preview=preview)})
         except (AgentRuntimeDisabled, RuntimeFenceError) as exc:
             raise ToolPipelineError("Media Agent 授权或运行状态已变化", code="agent_disabled") from exc
         except (ValueError, TypeError) as exc:
-            raise ToolPipelineError("功能名称或状态无效", code="precondition_failed") from exc
+            raise ToolPipelineError(f"{label}名称或状态无效", code="precondition_failed") from exc
 
     def execute(arguments, expected_snapshot, context):
         from contextlib import contextmanager
         started = False
         active = context.active_effect_plan
-        fingerprint = active.metadata.get("feature_fingerprint") if active else None
+        fingerprint = active.metadata.get(fingerprint_key) if active else None
 
         @contextmanager
         def admission():
@@ -2637,7 +2650,7 @@ def feature_config_tool() -> KernelToolSpec:
             with confirmation_runtime(context) as prefix:
                 active = context.active_effect_plan
                 if (active is None or (active.owner, active.session_id, active.tool_name) !=
-                        (context.owner, context.session_id, "settings.set_feature") or dict(active.arguments) != arguments):
+                        (context.owner, context.session_id, name) or dict(active.arguments) != arguments):
                     raise ToolPipelineError("缺少原确认执行范围", code="confirmation_invalid")
                 if not isinstance(fingerprint, str) or prefix + fingerprint != expected_snapshot:
                     raise ToolPipelineError("确认时的配置已变化，请重新预检", code="confirmation_stale")
@@ -2646,13 +2659,13 @@ def feature_config_tool() -> KernelToolSpec:
                 yield
 
         try:
-            return ToolResult(**service.set_feature(**arguments, expected_fingerprint=str(fingerprint or ""),
+            return ToolResult(**getattr(service, "set_" + kind)(**arguments, expected_fingerprint=str(fingerprint or ""),
                 check_write=context.cancellation.raise_if_cancelled, admission=admission))
         except Exception as exc:
-            if started and not isinstance(exc, service.FeatureConflict):
-                return ToolResult(False, "outcome_unknown", "功能配置保存结果待核验",
+            if started and not isinstance(exc, conflict):
+                return ToolResult(False, "outcome_unknown", f"{label}配置保存结果待核验",
                     data={"execution_started": True}, error="请先读取状态核实，不要重放确认或原脚本。")
-            if isinstance(exc, service.FeatureConflict):
+            if isinstance(exc, conflict):
                 code = "confirmation_stale"
             elif isinstance(exc, (AgentRuntimeDisabled, RuntimeFenceError)):
                 code = "agent_disabled"
@@ -2660,15 +2673,18 @@ def feature_config_tool() -> KernelToolSpec:
                 code = exc.code
             else:
                 code = "precondition_failed"
-            error = ToolPipelineError("功能配置或确认范围已变化，请重新读取后预检", code=code)
+            error = ToolPipelineError(f"{label}配置或确认范围已变化，请重新读取后预检", code=code)
             error.mark_execution_started(False)
             raise error from exc
 
-    return KernelToolSpec(name="settings.set_feature", domain="config", effect=ToolEffect.WRITE,
-        description=sdk.settings.set_feature.__doc__ or "", metadata={"risk": "low_write"},
-        input_schema={"type": "object", "additionalProperties": False, "required": ["feature", "enabled"],
-                      "properties": {"feature": {"type": "string", "enum": list(service.FEATURES)}, "enabled": {"type": "boolean"}}},
+    return KernelToolSpec(name=name, domain="config", effect=ToolEffect.WRITE,
+        description=getattr(sdk.settings, "set_" + kind).__doc__ or "", metadata={"risk": "low_write"},
+        input_schema={"type": "object", "additionalProperties": False, "required": required, "properties": properties},
         prepare=prepare, execute_confirmed=execute)
+
+
+def feature_config_tool() -> KernelToolSpec:
+    return _settings_config_tool("feature")
 
 
 def notification_test_tool() -> KernelToolSpec:
@@ -2720,75 +2736,7 @@ def notification_test_tool() -> KernelToolSpec:
 
 
 def policy_config_tool() -> KernelToolSpec:
-    """只将单项配置发布接入确认账本；解析、CAS、回读与 reload 归公共服务。"""
-    from app import sdk
-    from app.modules import policy_config as service
-
-    def prepare(arguments, context):
-        try:
-            with confirmation_runtime(context) as prefix:
-                context.cancellation.raise_if_cancelled()
-                values = sdk.prepare_sdk_method("settings.set_policy", arguments, owner=context.owner)
-                prepared = service.prepare_policy(**values)
-                preview = ToolResult(**prepared["preview"])
-                if not preview.ok:
-                    raise ToolPipelineError(preview.summary, code=preview.status)
-                if preview.status == "no_changes":
-                    return DefaultProjector().project(preview)
-                return PreparedEffect(preview=preview.to_dict(), arguments=prepared["arguments"],
-                    snapshot_fingerprint=prefix + prepared["fingerprint"],
-                    metadata={"risk": "low_write", "policy_fingerprint": prepared["fingerprint"], "confirmation": build_confirmation_contract(
-                        tool_name="settings.set_policy", risk=RiskLevel.LOW_WRITE, preview=preview)})
-        except (AgentRuntimeDisabled, RuntimeFenceError) as exc:
-            raise ToolPipelineError("Media Agent 授权或运行状态已变化", code="agent_disabled") from exc
-        except (ValueError, TypeError) as exc:
-            raise ToolPipelineError("策略名称或状态无效", code="precondition_failed") from exc
-
-    def execute(arguments, expected_snapshot, context):
-        from contextlib import contextmanager
-        started = False
-        active = context.active_effect_plan
-        fingerprint = active.metadata.get("policy_fingerprint") if active else None
-
-        @contextmanager
-        def admission():
-            nonlocal started
-            with confirmation_runtime(context) as prefix:
-                active = context.active_effect_plan
-                if (active is None or (active.owner, active.session_id, active.tool_name) !=
-                        (context.owner, context.session_id, "settings.set_policy") or dict(active.arguments) != arguments):
-                    raise ToolPipelineError("缺少原确认执行范围", code="confirmation_invalid")
-                if not isinstance(fingerprint, str) or prefix + fingerprint != expected_snapshot:
-                    raise ToolPipelineError("确认时的配置已变化，请重新预检", code="confirmation_stale")
-                context.cancellation.raise_if_cancelled()
-                started = True
-                yield
-
-        try:
-            return ToolResult(**service.set_policy(**arguments, expected_fingerprint=str(fingerprint or ""),
-                check_write=context.cancellation.raise_if_cancelled, admission=admission))
-        except Exception as exc:
-            if started and not isinstance(exc, service.PolicyConflict):
-                return ToolResult(False, "outcome_unknown", "策略配置保存结果待核验",
-                    data={"execution_started": True}, error="请先读取状态核实，不要重放确认或原脚本。")
-            if isinstance(exc, service.PolicyConflict):
-                code = "confirmation_stale"
-            elif isinstance(exc, (AgentRuntimeDisabled, RuntimeFenceError)):
-                code = "agent_disabled"
-            elif isinstance(exc, ToolPipelineError):
-                code = exc.code
-            else:
-                code = "precondition_failed"
-            error = ToolPipelineError("策略配置或确认范围已变化，请重新读取后预检", code=code)
-            error.mark_execution_started(False)
-            raise error from exc
-
-    return KernelToolSpec(name="settings.set_policy", domain="config", effect=ToolEffect.WRITE,
-        description=sdk.settings.set_policy.__doc__ or "", metadata={"risk": "low_write"},
-        input_schema={"type": "object", "additionalProperties": False, "required": ["policy", "value"],
-                      "properties": {"policy": {"type": "string", "enum": list(service.POLICY_IDS)},
-                                     "value": {"oneOf": [{"type": "string"}, {"type": "integer"}]}}},
-        prepare=prepare, execute_confirmed=execute)
+    return _settings_config_tool("policy")
 
 
 def recognition_rule_tool() -> KernelToolSpec:

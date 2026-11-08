@@ -54,19 +54,23 @@ def item(policy):
     return next(row for row in sdk.settings.policies()["data"]["policies"] if row["policy"] == policy)
 
 
-@pytest.mark.parametrize(("policy", "key", "value"), CASES)
-def test_all_thirteen_original_policies_cold_confirm_only_one_key(backend, policy, key, value):
+@pytest.mark.parametrize(("policy", "key", "requested", "value"), [(*case, case[2]) for case in CASES] + [
+    pytest.param("tmdb_match_mode", "TMDB_MATCH_MODE", " LOOSE ", "loose", id="normalized-choice"),
+])
+def test_all_thirteen_original_policies_cold_confirm_only_one_key(backend, policy, key, requested, value):
     config.set_and_save({"TMDB_API_KEY": "not-a-real-secret"})
     async def exercise():
         effects = executor()
         context = await context_for(effects.state_store, owner=OWNER)
         _, before = config.read_env_snapshot(config.ENV_FILE)
-        plan = (await effects.prepare(WRITE, {"policy": policy, "value": value}, context=context)).effect_plan
+        plan = (await effects.prepare(WRITE, {"policy": policy, "value": requested}, context=context)).effect_plan
         assert plan is not None and plan.arguments == {"policy": policy, "value": value}
         assert "not-a-real-secret" not in json.dumps([plan.public_dict(), dict(plan.metadata)])
         cold = executor()
         pending = await cold.get_pending_plan(owner=OWNER, session_id=context.session_id)
         assert pending is not None and pending.plan_id == plan.plan_id
+        assert pending.arguments == plan.arguments
+        assert pending.metadata["policy_fingerprint"] == plan.metadata["policy_fingerprint"]
         with patch("app.modules.login_wallpaper.schedule_login_wallpaper_refresh", return_value=True) as wallpaper:
             result = (await cold.execute_confirmed(plan.plan_id, context=context)).outcome.public_content
             assert result["ok"] and result["status"] == "completed"
